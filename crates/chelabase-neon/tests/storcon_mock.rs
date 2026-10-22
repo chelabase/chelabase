@@ -740,3 +740,782 @@ async fn a_detach_that_outlasts_its_timeout_is_other() {
         .unwrap_err();
     assert!(matches!(err, StorconError::Other(_)), "{err:?}");
 }
+
+// ---- Transient refusals: unschedulable 409s and the Attaching 503 (carried-gaps T1) ----
+
+const CREATE_409: &str =
+    r#"{"msg":"Conflict: Failed to schedule shard(s): No pageserver found matching constraint"}"#;
+const DELETE_409: &str =
+    r#"{"msg":"Conflict: Scheduling error: No pageserver found matching constraint"}"#;
+const NO_PAGESERVERS_409: &str =
+    r#"{"msg":"Conflict: Failed to schedule shard(s): No pageservers found"}"#;
+const ATTACHING_503: &str =
+    r#"{"msg":"Timed out waiting 5s for tenant active state. Latest state: Some(Attaching)"}"#;
+
+/// A client that retries unschedulable refusals quickly (1 ms base, 5 ms cap) within `budget`.
+fn quick(client: StorconClient, budget: Duration) -> StorconClient {
+    client.with_schedule_retry(Duration::from_millis(1), Duration::from_millis(5), budget)
+}
+
+/// Answers every request with `(status, body)` after `delay`; returns the base URL and a
+/// request counter.
+async fn repeating(
+    status: u16,
+    body: &'static str,
+    delay: Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
+    let app = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+            (
+                AxumStatus::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+        }
+    });
+    (serve(app).await, count)
+}
+
+fn requests(count: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    count.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn rejected(status: u16, message: &str) -> StorconError {
+    StorconError::Rejected {
+        status: StatusCode::from_u16(status).unwrap(),
+        message: message.to_string(),
+    }
+}
+
+#[test]
+fn is_unschedulable_matches_only_the_two_scheduling_conflicts() {
+    for message in [
+        "Conflict: Failed to schedule shard(s): No pageserver found matching constraint",
+        "Conflict: Scheduling error: No pageserver found matching constraint",
+        "Conflict: Failed to schedule shard(s): No pageservers found",
+        "Conflict: Scheduling error: No pageservers found",
+    ] {
+        assert!(rejected(409, message).is_unschedulable(), "{message}");
+    }
+    for message in [
+        "tenant exists",
+        "Conflict: has children",
+        "Conflict: Tenant policy Detached",
+        "No pageserver found matching constraint",
+        "Conflict: No pageserver found matching constraint but more",
+        "",
+    ] {
+        assert!(!rejected(409, message).is_unschedulable(), "{message}");
+    }
+    // Only a 409 counts, and a transport or 5xx error never does.
+    let same_text = "Conflict: Failed to schedule shard(s): No pageserver found matching constraint";
+    assert!(!rejected(400, same_text).is_unschedulable());
+    assert!(!rejected(503, same_text).is_unschedulable());
+    assert!(!StorconError::Other(anyhow::anyhow!(same_text)).is_unschedulable());
+}
+
+#[test]
+fn is_tenant_attaching_rejects_everything_that_is_not_that_503() {
+    assert!(!rejected(409, "Timed out waiting 5s for tenant active state. Latest state: Some(Attaching)")
+        .is_tenant_attaching());
+    assert!(!rejected(404, "Attaching").is_tenant_attaching());
+    assert!(!StorconError::Other(anyhow::anyhow!("connection refused")).is_tenant_attaching());
+    assert!(!StorconError::Other(anyhow::anyhow!("Shutting down")).is_tenant_attaching());
+    assert!(!rejected(409, "Conflict: No pageserver found matching constraint")
+        .is_tenant_attaching());
+}
+
+#[tokio::test]
+async fn is_tenant_attaching_matches_the_real_503_and_nothing_else() {
+    for (body, expected) in [
+        (ATTACHING_503, true),
+        // Wrapped by storcon's proxying of the pageserver's answer.
+        (
+            r#"{"msg":"Error from pageserver 1: Timed out waiting 5s for tenant active state. Latest state: Some(Attaching)"}"#,
+            true,
+        ),
+        (
+            r#"{"msg":"Timed out waiting 5s for tenant active state. Latest state: Some(Stopping)"}"#,
+            false,
+        ),
+        (r#"{"msg":"Shutting down"}"#, false),
+        (r#"{"msg":"Attaching"}"#, false),
+    ] {
+        let m = mock(vec![(503, body)]).await;
+        let err = quick(StorconClient::new(&m.base, 0), Duration::ZERO)
+            .create_timeline(&id(1), &id(2), 17, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.is_tenant_attaching(), expected, "{body}: {err:?}");
+        assert!(!err.is_unschedulable(), "{err:?}");
+    }
+}
+
+// ---- create_tenant ----
+
+/// Default settings (base 250 ms): a few unschedulable answers, then success.
+#[tokio::test]
+async fn create_tenant_retries_an_unschedulable_409_with_default_settings() {
+    let m = mock(vec![(409, CREATE_409), (409, CREATE_409), (201, "{}")]).await;
+    StorconClient::new(&m.base, 1)
+        .create_tenant(&id(1))
+        .await
+        .unwrap();
+    let seen = m.seen();
+    assert_eq!(seen.len(), 3);
+    assert!(seen.iter().all(|s| s.method == "POST" && s.path == "/v1/tenant"));
+}
+
+#[tokio::test]
+async fn create_tenant_rides_out_k_unschedulable_answers() {
+    for k in [1usize, 5, 12] {
+        let mut replies = vec![(409, CREATE_409); k];
+        replies.push((201, "{}"));
+        let m = mock(replies).await;
+        quick(StorconClient::new(&m.base, 1), Duration::from_secs(10))
+            .create_tenant(&id(1))
+            .await
+            .unwrap();
+        assert_eq!(m.seen().len(), k + 1, "k={k}");
+    }
+}
+
+/// Create is idempotent, so a retry (a lost success included) resends the identical body.
+#[tokio::test]
+async fn create_tenant_retry_resends_the_same_body() {
+    let m = mock(vec![(409, CREATE_409), (201, "{}")]).await;
+    let tenant = id(7);
+    quick(StorconClient::new(&m.base, 2), Duration::from_secs(10))
+        .create_tenant(&tenant)
+        .await
+        .unwrap();
+    let seen = m.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].body, seen[1].body);
+    assert_eq!(
+        seen[1].body,
+        json!({ "new_tenant_id": tenant.as_str(), "placement_policy": { "Attached": 2 } })
+    );
+}
+
+#[tokio::test]
+async fn create_tenant_retries_no_pageservers_found_too() {
+    let m = mock(vec![(409, NO_PAGESERVERS_409), (409, CREATE_409), (200, "{}")]).await;
+    quick(StorconClient::new(&m.base, 1), Duration::from_secs(10))
+        .create_tenant(&id(1))
+        .await
+        .unwrap();
+    assert_eq!(m.seen().len(), 3);
+}
+
+/// Every other refusal is final at once, with the same error as before.
+#[tokio::test]
+async fn create_tenant_never_retries_other_409s_or_statuses() {
+    for (status, body, message) in [
+        (409, r#"{"msg":"tenant exists"}"#, "tenant exists"),
+        (409, r#"{"msg":"Conflict: has children"}"#, "Conflict: has children"),
+        (
+            409,
+            r#"{"msg":"Conflict: Tenant policy Detached"}"#,
+            "Conflict: Tenant policy Detached",
+        ),
+        (400, r#"{"msg":"bad request"}"#, "bad request"),
+        (404, r#"{"msg":"gone"}"#, "gone"),
+    ] {
+        let m = mock(vec![(status, body), (201, "{}")]).await;
+        let err = quick(StorconClient::new(&m.base, 1), Duration::from_secs(10))
+            .create_tenant(&id(1))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, StorconError::Rejected { message: got, .. } if got == message),
+            "{err:?}"
+        );
+        assert_eq!(m.seen().len(), 1, "{body}");
+    }
+    // A 5xx (not the Attaching one) on tenant create is not retried either.
+    let m = mock(vec![(500, r#"{"msg":"boom"}"#), (201, "{}")]).await;
+    let err = quick(StorconClient::new(&m.base, 1), Duration::from_secs(10))
+        .create_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert_eq!(m.seen().len(), 1);
+}
+
+/// A permanently unschedulable stack: gives up after the budget, keeping the original text.
+#[tokio::test]
+async fn create_tenant_gives_up_after_the_budget_with_the_original_message() {
+    let (base, count) = repeating(409, CREATE_409, Duration::ZERO).await;
+    let started = Instant::now();
+    let err = quick(StorconClient::new(&base, 1), Duration::from_millis(300))
+        .create_tenant(&id(1))
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    let text = err.to_string();
+    assert!(
+        text.contains("Failed to schedule shard(s): No pageserver found matching constraint"),
+        "{text}"
+    );
+    assert!(text.contains("after") && text.contains("attempts"), "{text}");
+    assert!(elapsed >= Duration::from_millis(300), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+    assert!(requests(&count) > 2, "{}", requests(&count));
+}
+
+/// A zero budget still asks once and does not retry.
+#[tokio::test]
+async fn create_tenant_with_a_zero_budget_asks_once() {
+    let (base, count) = repeating(409, CREATE_409, Duration::ZERO).await;
+    let err = quick(StorconClient::new(&base, 1), Duration::ZERO)
+        .create_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("No pageserver found"), "{err}");
+    assert_eq!(requests(&count), 1);
+}
+
+/// Dropping the future during a backoff sleep leaves nothing running: no further request.
+#[tokio::test]
+async fn create_tenant_cancelled_during_a_sleep_sends_nothing_more() {
+    let (base, count) = repeating(409, CREATE_409, Duration::ZERO).await;
+    let client = StorconClient::new(&base, 1).with_schedule_retry(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+    );
+    let timed_out = tokio::time::timeout(Duration::from_millis(300), client.create_tenant(&id(1)))
+        .await
+        .is_err();
+    assert!(timed_out, "create_tenant returned instead of backing off");
+    assert_eq!(requests(&count), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(requests(&count), 1);
+}
+
+// ---- delete ----
+
+/// Default behaviour: an unschedulable 409 is like a 202 (poll again), then 404 or 200.
+#[tokio::test]
+async fn delete_tenant_polls_through_unschedulable_409s_to_404() {
+    let m = mock(vec![
+        (409, DELETE_409),
+        (409, DELETE_409),
+        (409, DELETE_409),
+        (404, r#"{"msg":"not found"}"#),
+    ])
+    .await;
+    let tenant = id(1);
+    fast_deletes(StorconClient::new(&m.base, 0), 10)
+        .delete_tenant(&tenant)
+        .await
+        .unwrap();
+    let seen = m.seen();
+    assert_eq!(seen.len(), 4);
+    let path = format!("/v1/tenant/{tenant}");
+    assert!(seen.iter().all(|s| s.method == "DELETE" && s.path == path));
+}
+
+#[tokio::test]
+async fn delete_tenant_polls_through_unschedulable_409s_to_200() {
+    let m = mock(vec![(409, DELETE_409), (409, NO_PAGESERVERS_409), (200, "")]).await;
+    fast_deletes(StorconClient::new(&m.base, 0), 10)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap();
+    assert_eq!(m.seen().len(), 3);
+}
+
+/// 202 and unschedulable 409 answers draw on the same attempts/deadline.
+#[tokio::test]
+async fn delete_alternating_202_and_409_share_one_budget() {
+    let m = mock(vec![
+        (202, ""),
+        (409, DELETE_409),
+        (202, ""),
+        (409, DELETE_409),
+        (202, ""),
+    ])
+    .await;
+    let err = fast_deletes(StorconClient::new(&m.base, 0), 4)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert_eq!(m.seen().len(), 4);
+
+    let m = mock(vec![
+        (202, ""),
+        (409, DELETE_409),
+        (202, ""),
+        (409, DELETE_409),
+        (200, ""),
+    ])
+    .await;
+    fast_deletes(StorconClient::new(&m.base, 0), 5)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap();
+    assert_eq!(m.seen().len(), 5);
+}
+
+/// A permanently unschedulable delete times out like a permanent 202, after the attempts.
+#[tokio::test]
+async fn delete_with_permanent_unschedulable_409_times_out_after_the_attempts() {
+    let (base, count) = repeating(409, DELETE_409, Duration::ZERO).await;
+    let err = fast_deletes(StorconClient::new(&base, 0), 5)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert_eq!(requests(&count), 5);
+}
+
+/// The deadline bounds slow 409 answers (shape of `delete_polling_has_an_overall_deadline`).
+#[tokio::test]
+async fn delete_409_polling_has_an_overall_deadline() {
+    let (base, _count) = repeating(409, DELETE_409, Duration::from_millis(100)).await;
+    let started = Instant::now();
+    // Budget: 1000 × 1 ms + 300 ms ≈ 1.3 s. Without a deadline: 1000 × ~100 ms ≈ 100 s.
+    let err = StorconClient::new(&base, 0)
+        .with_timeout(Duration::from_millis(300))
+        .with_delete_poll(Duration::from_millis(1), 1000)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+/// Other conflicts stay final for tenant and timeline deletes, even mid-poll.
+#[tokio::test]
+async fn delete_other_409s_stay_final_even_after_unschedulable_ones() {
+    let m = mock(vec![
+        (409, DELETE_409),
+        (409, r#"{"msg":"Conflict: Tenant policy Detached"}"#),
+        (200, ""),
+    ])
+    .await;
+    let err = fast_deletes(StorconClient::new(&m.base, 0), 10)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, StorconError::Rejected { message, .. }
+            if message == "Conflict: Tenant policy Detached"),
+        "{err:?}"
+    );
+    assert_eq!(m.seen().len(), 2);
+
+    let m = mock(vec![(409, r#"{"msg":"tenant exists"}"#), (200, "")]).await;
+    let err = fast_deletes(StorconClient::new(&m.base, 0), 10)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, StorconError::Rejected { .. }), "{err:?}");
+    assert_eq!(m.seen().len(), 1);
+}
+
+// ---- create_timeline and the Attaching 503 ----
+
+/// Default settings: the Attaching 503 is retried like an unschedulable conflict.
+#[tokio::test]
+async fn create_timeline_retries_the_attaching_503_with_default_settings() {
+    let m = mock(vec![
+        (503, ATTACHING_503),
+        (
+            201,
+            r#"{"timeline_id":"x","ancestor_lsn":null,"last_record_lsn":"0/14EE0B8"}"#,
+        ),
+    ])
+    .await;
+    let (tenant, timeline) = (id(1), id(2));
+    let info = StorconClient::new(&m.base, 0)
+        .create_timeline(&tenant, &timeline, 17, None)
+        .await
+        .unwrap();
+    assert_eq!(info.last_record_lsn, lsn("0/14EE0B8"));
+    let seen = m.seen();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0].body, seen[1].body);
+    assert_eq!(seen[0].path, format!("/v1/tenant/{tenant}/timeline"));
+}
+
+#[tokio::test]
+async fn create_timeline_rides_out_k_attaching_503s() {
+    for k in [1usize, 6] {
+        let mut replies = vec![(503, ATTACHING_503); k];
+        replies.push((
+            201,
+            r#"{"ancestor_lsn":"0/14EE0B8","last_record_lsn":"0/14EE0B8"}"#,
+        ));
+        let m = mock(replies).await;
+        let main = id(2);
+        quick(StorconClient::new(&m.base, 0), Duration::from_secs(10))
+            .create_timeline(&id(1), &id(3), 17, Some((&main, None)))
+            .await
+            .unwrap();
+        assert_eq!(m.seen().len(), k + 1, "k={k}");
+    }
+}
+
+/// Any other 503, any 5xx and every 4xx (the scheduling 409 included: timeline calls don't
+/// schedule) is final at once.
+#[tokio::test]
+async fn create_timeline_does_not_retry_other_failures() {
+    for (status, body) in [
+        (503, r#"{"msg":"Shutting down"}"#),
+        (503, r#"{"msg":"Timed out waiting 5s for tenant active state. Latest state: Some(Stopping)"}"#),
+        (503, r#"{"msg":"unavailable"}"#),
+        (500, r#"{"msg":"boom"}"#),
+        (409, CREATE_409),
+        (409, r#"{"msg":"timeline exists"}"#),
+        (404, r#"{"msg":"gone"}"#),
+    ] {
+        let m = mock(vec![
+            (status, body),
+            (
+                201,
+                r#"{"ancestor_lsn":null,"last_record_lsn":"0/14EE0B8"}"#,
+            ),
+        ])
+        .await;
+        let err = quick(StorconClient::new(&m.base, 0), Duration::from_secs(10))
+            .create_timeline(&id(1), &id(2), 17, None)
+            .await
+            .unwrap_err();
+        assert_eq!(m.seen().len(), 1, "{status} {body}: {err}");
+    }
+}
+
+#[tokio::test]
+async fn create_timeline_gives_up_on_a_permanent_attaching_503_with_the_original_message() {
+    let (base, count) = repeating(503, ATTACHING_503, Duration::ZERO).await;
+    let started = Instant::now();
+    let err = quick(StorconClient::new(&base, 0), Duration::from_millis(300))
+        .create_timeline(&id(1), &id(2), 17, None)
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("Timed out waiting 5s for tenant active state. Latest state: Some(Attaching)"),
+        "{text}"
+    );
+    assert!(text.contains("after") && text.contains("attempts"), "{text}");
+    assert!(started.elapsed() >= Duration::from_millis(300));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(requests(&count) > 2);
+}
+
+/// Cancelling during a backoff sleep sends nothing more.
+#[tokio::test]
+async fn create_timeline_cancelled_during_a_sleep_sends_nothing_more() {
+    let (base, count) = repeating(503, ATTACHING_503, Duration::ZERO).await;
+    let client = StorconClient::new(&base, 0).with_schedule_retry(
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(30),
+    );
+    let timed_out = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.create_timeline(&id(1), &id(2), 17, None),
+    )
+    .await
+    .is_err();
+    assert!(timed_out, "create_timeline returned instead of backing off");
+    assert_eq!(requests(&count), 1);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(requests(&count), 1);
+}
+
+// ---- F-storcon: request timeouts, the budget cap, kept error classes (carried-gaps I2/H1/M2/H2) ----
+
+const TIMELINE_OK: &str = r#"{"ancestor_lsn": null, "last_record_lsn": "0/16B3748"}"#;
+
+/// The first request is answered with `first` after `first_delay`; every later one with `rest`
+/// after `rest_delay`. Returns the base URL and a request counter (counted on arrival).
+async fn phased(
+    first: (u16, &'static str),
+    first_delay: Duration,
+    rest: (u16, &'static str),
+    rest_delay: Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = count.clone();
+    let app = Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ((status, body), delay) = if n == 0 {
+                (first, first_delay)
+            } else {
+                (rest, rest_delay)
+            };
+            tokio::time::sleep(delay).await;
+            (
+                AxumStatus::from_u16(status).unwrap(),
+                [("content-type", "application/json")],
+                body,
+            )
+        }
+    });
+    (serve(app).await, count)
+}
+
+/// I2/P6: a tenant create whose first answer outlasts the request timeout is sent again
+/// (create_tenant is idempotent, a lost success included) and succeeds, within the budget.
+#[tokio::test]
+async fn create_tenant_retries_a_request_timeout() {
+    let (base, count) = phased(
+        (201, "{}"),
+        Duration::from_millis(80),
+        (201, "{}"),
+        Duration::ZERO,
+    )
+    .await;
+    let started = Instant::now();
+    quick(
+        StorconClient::new(&base, 1).with_timeout(Duration::from_millis(50)),
+        Duration::from_secs(2),
+    )
+    .create_tenant(&id(1))
+    .await
+    .expect("a request timeout is retried for create_tenant");
+    assert_eq!(requests(&count), 2);
+    // One timed-out attempt plus one backoff, far below the budget.
+    assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+}
+
+/// I2/P6: a tenant create that times out every time stops at the budget (plus at most one
+/// request timeout; with H1's cap, about the budget) and reports a timeout, not success.
+#[tokio::test]
+async fn create_tenant_timeouts_stop_at_the_budget() {
+    let (base, count) = repeating(201, "{}", Duration::from_secs(5)).await;
+    let started = Instant::now();
+    let err = quick(
+        StorconClient::new(&base, 1).with_timeout(Duration::from_millis(50)),
+        Duration::from_millis(400),
+    )
+    .create_tenant(&id(1))
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert!(requests(&count) > 1, "{}", requests(&count));
+    assert!(elapsed >= Duration::from_millis(350), "{elapsed:?}");
+    assert!(elapsed < Duration::from_millis(400 + 50 + 250), "{elapsed:?}");
+}
+
+/// I2/P6: only create_tenant retries a request timeout. A timeline create that times out is
+/// final (it is not idempotent for a lost success); regression guard.
+#[tokio::test]
+async fn create_timeline_does_not_retry_a_request_timeout() {
+    let (base, count) = phased(
+        (201, TIMELINE_OK),
+        Duration::from_millis(80),
+        (201, TIMELINE_OK),
+        Duration::ZERO,
+    )
+    .await;
+    let err = quick(
+        StorconClient::new(&base, 0)
+            .with_timeline_timeouts(Duration::from_millis(50), Duration::from_secs(5)),
+        Duration::from_secs(2),
+    )
+    .create_timeline(&id(1), &id(2), 17, None)
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert_eq!(requests(&count), 1);
+}
+
+/// I2/P6: a delete that times out is not retried as a timeout either; regression guard.
+#[tokio::test]
+async fn delete_does_not_retry_a_request_timeout() {
+    let (base, count) = phased(
+        (200, "{}"),
+        Duration::from_millis(80),
+        (200, "{}"),
+        Duration::ZERO,
+    )
+    .await;
+    let err = fast_deletes(
+        quick(
+            StorconClient::new(&base, 0).with_timeout(Duration::from_millis(50)),
+            Duration::from_secs(2),
+        ),
+        5,
+    )
+    .delete_tenant(&id(1))
+    .await
+    .unwrap_err();
+    assert!(matches!(err, StorconError::Other(_)), "{err:?}");
+    assert_eq!(requests(&count), 1);
+}
+
+/// H1: the last attempt's timeout is capped at what is left of the budget. The first answer
+/// is an unschedulable 409, the second hangs; the request timeout (2 s) is far above the
+/// budget (100 ms), so only the cap ends it in time.
+#[tokio::test]
+async fn create_tenant_last_attempt_never_overruns_the_budget() {
+    let (base, count) = phased(
+        (409, CREATE_409),
+        Duration::ZERO,
+        (201, "{}"),
+        Duration::from_secs(10),
+    )
+    .await;
+    let started = Instant::now();
+    let err = quick(
+        StorconClient::new(&base, 1).with_timeout(Duration::from_secs(2)),
+        Duration::from_millis(100),
+    )
+    .create_tenant(&id(1))
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(requests(&count) >= 2, "{}", requests(&count));
+    assert!(elapsed < Duration::from_millis(100 + 400), "{elapsed:?} ({err})");
+}
+
+/// H1 for the timeline create: its own 2 s timeout must not outlast a 100 ms budget.
+#[tokio::test]
+async fn create_timeline_last_attempt_never_overruns_the_budget() {
+    let (base, count) = phased(
+        (503, ATTACHING_503),
+        Duration::ZERO,
+        (201, TIMELINE_OK),
+        Duration::from_secs(10),
+    )
+    .await;
+    let started = Instant::now();
+    let err = quick(
+        StorconClient::new(&base, 0)
+            .with_timeline_timeouts(Duration::from_secs(2), Duration::from_secs(5)),
+        Duration::from_millis(100),
+    )
+    .create_timeline(&id(1), &id(2), 17, None)
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(requests(&count) >= 2, "{}", requests(&count));
+    assert!(elapsed < Duration::from_millis(100 + 400), "{elapsed:?} ({err})");
+}
+
+/// The timeline create has its own budget: one slow request may outlast the create budget
+/// (the tenant create's) as long as it fits the timeline budget.
+#[tokio::test]
+async fn create_timeline_uses_its_own_budget_not_the_tenant_one() {
+    let base = slow(Duration::from_millis(600)).await;
+    let client = quick(
+        StorconClient::new(&base, 0)
+            .with_timeline_timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+        Duration::from_millis(100),
+    )
+    .with_timeline_retry_budget(Duration::from_secs(3));
+    client
+        .create_timeline(&id(1), &id(2), 17, None)
+        .await
+        .expect("a 600 ms request fits the 3 s timeline budget");
+}
+
+/// ...and the timeline budget still bounds a request that hangs.
+#[tokio::test]
+async fn the_timeline_budget_still_bounds_a_hanging_request() {
+    let base = slow(Duration::from_secs(10)).await;
+    let client = quick(
+        StorconClient::new(&base, 0)
+            .with_timeline_timeouts(Duration::from_secs(5), Duration::from_secs(5)),
+        Duration::from_millis(100),
+    )
+    .with_timeline_retry_budget(Duration::from_millis(500));
+    let started = Instant::now();
+    client
+        .create_timeline(&id(1), &id(2), 17, None)
+        .await
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_millis(500 + 400), "{elapsed:?}");
+}
+
+/// H1 for a create whose very first request hangs: the budget caps it too.
+#[tokio::test]
+async fn create_tenant_first_attempt_is_capped_by_the_budget_too() {
+    let (base, count) = repeating(201, "{}", Duration::from_secs(10)).await;
+    let started = Instant::now();
+    let err = quick(
+        StorconClient::new(&base, 1).with_timeout(Duration::from_secs(2)),
+        Duration::from_millis(100),
+    )
+    .create_tenant(&id(1))
+    .await
+    .unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(requests(&count) >= 1);
+    assert!(elapsed < Duration::from_millis(100 + 400), "{elapsed:?} ({err})");
+}
+
+/// M2: after exhaustion the error still answers `is_unschedulable` (the note must not break
+/// the `ends_with` check), like `is_tenant_attaching`.
+#[tokio::test]
+async fn an_exhausted_create_tenant_is_still_unschedulable() {
+    let (base, _count) = repeating(409, CREATE_409, Duration::ZERO).await;
+    let err = quick(StorconClient::new(&base, 1), Duration::from_millis(100))
+        .create_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("after"), "{err}");
+    assert!(err.is_unschedulable(), "{err}");
+    assert!(matches!(err, StorconError::Rejected { .. }), "{err:?}");
+    let (base, _count) = repeating(409, NO_PAGESERVERS_409, Duration::ZERO).await;
+    let err = quick(StorconClient::new(&base, 1), Duration::from_millis(100))
+        .create_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.is_unschedulable(), "{err}");
+}
+
+/// H2: a delete whose unschedulable 409 never clears times out but keeps the last 409's text.
+#[tokio::test]
+async fn an_exhausted_delete_keeps_the_last_409_text() {
+    let (base, _count) = repeating(409, DELETE_409, Duration::ZERO).await;
+    let err = fast_deletes(StorconClient::new(&base, 0), 3)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("timed out"), "{text}");
+    assert!(
+        text.contains("Scheduling error: No pageserver found matching constraint"),
+        "{text}"
+    );
+    // The same for a timeline delete.
+    let err = fast_deletes(StorconClient::new(&base, 0), 3)
+        .delete_timeline(&id(1), &id(2))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("No pageserver found matching constraint"), "{err}");
+}
+
+/// H2 boundary: a delete that only ever got 202s has no 409 to report.
+#[tokio::test]
+async fn an_exhausted_delete_of_202s_has_no_409_text() {
+    let (base, _count) = repeating(202, "{}", Duration::ZERO).await;
+    let err = fast_deletes(StorconClient::new(&base, 0), 3)
+        .delete_tenant(&id(1))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(!err.to_string().contains("Conflict"), "{err}");
+}

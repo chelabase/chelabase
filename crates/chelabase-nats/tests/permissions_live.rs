@@ -651,3 +651,207 @@ async fn the_orchestrator_still_reads_the_control_stream() {
         .await
         .expect("STREAM.INFO on CHELABASE_CONTROL");
 }
+
+// --- the tenant-attached events (carried gaps T4, P9, R10) --------------------------------------
+//
+// Only the orchestrator publishes attach events and creates or updates their stream; the worker
+// only reads them, through consumers filtered to one tenant; realtime has nothing there; nobody
+// deletes or purges the stream.
+
+/// JetStream as `user`, through the crate's own connect (credentials and `_INBOX_<user>`).
+async fn js_as(user: &str) -> jetstream::Context {
+    let client = connect(&NatsConfig {
+        url: url(),
+        user: Some(user.into()),
+        password: Some(password(user)),
+        inbox_prefix: Some(format!("_INBOX_{user}")),
+    })
+    .await
+    .unwrap_or_else(|e| panic!("{user} connects with its credentials: {e}"));
+    jetstream::new(client)
+}
+
+/// A fresh tenant id (32 lowercase hex) and its attached subject.
+fn attached_tenant() -> (String, String) {
+    let t = id().simple().to_string();
+    let subject = chelabase_nats::tenant_attached_subject(&t).unwrap();
+    (t, subject)
+}
+
+fn attached_event(tenant: &str) -> chelabase_nats::TenantAttachedEvent {
+    chelabase_nats::TenantAttachedEvent {
+        tenant_id: tenant.to_string(),
+        shards: vec![chelabase_nats::TenantAttachedShard {
+            node_id: 1,
+            shard_number: 0,
+        }],
+        stripe_size: None,
+        preferred_az: None,
+    }
+}
+
+/// The runner's JetStream with the events stream ensured.
+async fn runner_events_js() -> jetstream::Context {
+    let js = js_as("runner").await;
+    chelabase_nats::ensure_neon_events_stream(&js)
+        .await
+        .expect("the runner ensures the events stream");
+    js
+}
+
+/// S3 for an attached subject: the violation, and nothing stored for that (fresh) tenant.
+async fn assert_attached_publish_refused(who: &mut Probe, tenant: &str, subject: &str) {
+    who.publish(subject).await;
+    who.assert_publish_refused(subject).await;
+    let js = runner_events_js().await;
+    let stored = chelabase_nats::wait_tenant_attached(&js, tenant, Duration::from_secs(1))
+        .await
+        .expect("the runner reads the events stream");
+    assert_eq!(
+        stored, None,
+        "{}: {subject} was refused but reached the events stream",
+        who.user
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_orchestrator_ensures_the_events_stream_and_publishes_attach_events() {
+    let js = js_as("orchestrator").await;
+    chelabase_nats::ensure_neon_events_stream(&js)
+        .await
+        .expect("STREAM.INFO/CREATE/UPDATE on CHELABASE_NEON_EVENTS");
+    let (t, _) = attached_tenant();
+    chelabase_nats::publish_tenant_attached(&js, &attached_event(&t))
+        .await
+        .expect("the orchestrator's attach event is acked");
+    let got = chelabase_nats::wait_tenant_attached(
+        &runner_events_js().await,
+        &t,
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(got, Some(attached_event(&t)));
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_worker_and_realtime_cannot_publish_attach_events() {
+    runner_events_js().await;
+    for user in ["worker", "realtime"] {
+        let mut p = probe(user).await;
+        let (t, subject) = attached_tenant();
+        assert_attached_publish_refused(&mut p, &t, &subject).await;
+    }
+}
+
+// The worker's wait runs with the worker's own rights: a filtered consumer create, its pulls
+// and its delete (no STREAM.INFO: the wait must not look the stream up first).
+#[tokio::test]
+#[ignore]
+async fn the_worker_waits_for_attach_events_with_its_own_rights() {
+    let runner = runner_events_js().await;
+    let worker = js_as("worker").await;
+    let (t, _) = attached_tenant();
+    chelabase_nats::publish_tenant_attached(&runner, &attached_event(&t))
+        .await
+        .unwrap();
+    let got = chelabase_nats::wait_tenant_attached(&worker, &t, Duration::from_secs(5))
+        .await
+        .expect("the worker's wait is allowed");
+    assert_eq!(got, Some(attached_event(&t)));
+    let (quiet, _) = attached_tenant();
+    let got = chelabase_nats::wait_tenant_attached(&worker, &quiet, Duration::from_secs(1))
+        .await
+        .expect("a wait that times out is allowed too");
+    assert_eq!(got, None);
+    // Its consumers are gone: the delete was allowed.
+    let stream = runner.get_stream(chelabase_nats::STREAM_NEON_EVENTS).await.unwrap();
+    let names: Vec<String> = stream
+        .consumer_names()
+        .map(|n| n.unwrap())
+        .collect()
+        .await;
+    for tenant in [&t, &quiet] {
+        assert!(
+            !names.iter().any(|n| n.starts_with(&format!("attached-{tenant}-"))),
+            "the worker's consumer for {tenant} is still there: {names:?}"
+        );
+    }
+}
+
+// A consumer the worker creates names one tenant's subject; an unfiltered one, one filtered to
+// another subject, or a durable one is refused.
+#[tokio::test]
+#[ignore]
+async fn the_worker_creates_only_consumers_filtered_to_one_tenant() {
+    runner_events_js().await;
+    let mut worker = probe("worker").await;
+    let (_, subject) = attached_tenant();
+    let allowed = format!("$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.attached-x-1.{subject}");
+    worker.publish(&allowed).await;
+    worker.assert_no_violation("publish", &allowed).await;
+    for refused in [
+        "$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS".to_string(),
+        "$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.attached-x-1".to_string(),
+        format!(
+            "$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.attached-x-1.chelabase.neon.other.{}",
+            id().simple()
+        ),
+        format!("$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.attached-x-1.{subject}.extra"),
+        "$JS.API.CONSUMER.DURABLE.CREATE.CHELABASE_NEON_EVENTS.attached-x-1".to_string(),
+    ] {
+        worker.publish(&refused).await;
+        worker.assert_publish_refused(&refused).await;
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn the_orchestrator_and_realtime_read_no_attach_events() {
+    runner_events_js().await;
+    for user in ["orchestrator", "realtime"] {
+        let mut p = probe(user).await;
+        let (_, subject) = attached_tenant();
+        for refused in [
+            format!("$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.attached-x-1.{subject}"),
+            "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_NEON_EVENTS.attached-x-1".to_string(),
+        ] {
+            p.publish(&refused).await;
+            p.assert_publish_refused(&refused).await;
+        }
+    }
+}
+
+// R10: only the orchestrator creates and updates the stream; nobody deletes or purges it.
+#[tokio::test]
+#[ignore]
+async fn nobody_deletes_or_purges_the_events_stream_and_only_the_orchestrator_shapes_it() {
+    let runner = runner_events_js().await;
+    for user in ["orchestrator", "worker", "realtime", "runner"] {
+        let mut p = probe(user).await;
+        for subject in [
+            "$JS.API.STREAM.DELETE.CHELABASE_NEON_EVENTS",
+            "$JS.API.STREAM.PURGE.CHELABASE_NEON_EVENTS",
+        ] {
+            p.publish(subject).await;
+            p.assert_publish_refused(subject).await;
+        }
+    }
+    for user in ["worker", "realtime"] {
+        let mut p = probe(user).await;
+        for subject in [
+            "$JS.API.STREAM.CREATE.CHELABASE_NEON_EVENTS",
+            "$JS.API.STREAM.UPDATE.CHELABASE_NEON_EVENTS",
+            "$JS.API.STREAM.INFO.CHELABASE_NEON_EVENTS",
+        ] {
+            p.publish(subject).await;
+            p.assert_publish_refused(subject).await;
+        }
+    }
+    runner
+        .get_stream(chelabase_nats::STREAM_NEON_EVENTS)
+        .await
+        .expect("CHELABASE_NEON_EVENTS still exists");
+}

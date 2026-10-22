@@ -1,7 +1,7 @@
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_metadata::{MetadataClient, MetadataConfig};
 use chelabase_query::app_users::PgUsersDb;
-use chelabase_nats::{connect, ensure_control_stream, NatsConfig};
+use chelabase_nats::{connect, ensure_control_stream, ensure_neon_events_stream, NatsConfig};
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::{DockerLocator, StorconClient};
 use chelabase_types::mode::Mode;
@@ -51,6 +51,8 @@ async fn main() -> anyhow::Result<()> {
 
     let nats = connect(&nats_config).await?;
     let js = ensure_control_stream(&nats).await?;
+    // The storage events (carried gaps T4, R10): only the orchestrator creates or fixes them.
+    ensure_neon_events_stream(&js).await?;
 
     let secrets = SecretKey::from_env()?;
     ensure_secrets_key(&metadata, &secrets).await?;
@@ -109,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.compute_control_network,
             &internal_config.stack,
         )?,
+        attach_events: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
     });
 
     // The console and the SQL editor reach computes over TLS on the control network.

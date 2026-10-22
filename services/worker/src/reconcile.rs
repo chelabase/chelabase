@@ -11,7 +11,7 @@ use chelabase_metadata::{
 use chelabase_neon::{ComputeBackend, NeonId, StorconError};
 use chelabase_types::{BranchId, DatabaseId};
 use reqwest::StatusCode;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::{COMPUTE_SETTINGS_VERSION, Worker};
@@ -38,6 +38,9 @@ pub struct Snapshot {
     pub endpoints: Vec<EndpointState>,
     /// Endpoint ids of every labelled compute container, running or not.
     pub computes: HashSet<String>,
+    /// The ones of `computes` whose container exists but isn't running (exited, dead or
+    /// restarting; never `created`, which an in-flight create passes through).
+    pub not_running: HashSet<String>,
     /// Tenant ids on the storage controller.
     pub tenants: HashSet<String>,
     /// Each tenant's timelines, listed with the tenants (so before the branches are read). A
@@ -72,8 +75,8 @@ pub enum Action {
     RetryBranchDelete(BranchId),
     /// A branch `resetting` for too long: finish the reset or restore.
     FinishSwitch(BranchId),
-    /// `(branch, endpoint)`: a ready `normal` branch's compute container is gone (main's
-    /// included): start a new one.
+    /// `(branch, endpoint)`: a ready `normal` branch's compute container is gone, or there but
+    /// not running (R5) (main's included): start a new one.
     RecreateBranchCompute(BranchId, String),
     /// `(branch, endpoint)`: a ready `normal` branch's compute was created with settings older
     /// than [`COMPUTE_SETTINGS_VERSION`] (R11): remove it and create a new one.
@@ -116,6 +119,10 @@ pub enum Action {
     ReportUnknownTimeline(String, String),
     /// An endpoint row no branch links to. Logged only.
     ReportEndpointWithoutDatabase(String),
+    /// R3: a database with a ready `normal` branch whose tenant isn't on the storage
+    /// controller (its listing worked). Logged each pass at error; nothing is touched (a
+    /// compute without its tenant can never start), the rows stay ready.
+    ReportMissingTenant { database: DatabaseId },
 }
 
 impl Action {
@@ -142,14 +149,16 @@ impl Action {
             Action::ReportUnknownTenant(_) => 17,
             Action::ReportUnknownTimeline(..) => 18,
             Action::ReportEndpointWithoutDatabase(_) => 19,
+            Action::ReportMissingTenant { .. } => 20,
         }
     }
 
     fn subject(&self) -> String {
         match self {
-            Action::FailStale(id) | Action::RetryDelete(id) | Action::PatchHistoryWindow(id) => {
-                id.to_string()
-            }
+            Action::FailStale(id)
+            | Action::RetryDelete(id)
+            | Action::PatchHistoryWindow(id)
+            | Action::ReportMissingTenant { database: id } => id.to_string(),
             Action::FailStaleBranch(id)
             | Action::RetryBranchDelete(id)
             | Action::RemoveRehearsal(id)
@@ -209,6 +218,21 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
         .filter(|d| d.status == DatabaseStatus::Deleting)
         .map(|d| d.id)
         .collect();
+    // R3: databases whose tenant the storage controller's listing (which worked: `observe`
+    // fails otherwise) doesn't have. Rows are read after the listing, and a database is ready
+    // only once its tenant exists, so a fresh one is never among them.
+    let missing_tenant: HashSet<DatabaseId> = s
+        .databases
+        .iter()
+        .filter(|d| d.status != DatabaseStatus::Deleting)
+        .filter(|d| {
+            d.neon_tenant_id
+                .as_ref()
+                .is_some_and(|t| !s.tenants.contains(t))
+        })
+        .map(|d| d.id)
+        .collect();
+    let mut reported: HashSet<DatabaseId> = HashSet::new();
     for b in &s.branches {
         // A rehearsal outlives its job only when the job crashed or its teardown failed. Until
         // it's old it's its job's, whatever its status (T14 M7): never a normal branch's rules.
@@ -239,10 +263,28 @@ pub fn plan(s: &Snapshot) -> Vec<Action> {
             BranchStatus::Failed if b.pending_timeline_id.is_some() => {
                 actions.push(Action::ReportStuckRestore(b.id));
             }
+            // R3: its tenant is gone, so no compute of it can start: reported (once per
+            // database), and nothing else is planned for the branch.
+            BranchStatus::Ready
+                if b.kind == BranchKind::Normal && missing_tenant.contains(&b.database_id) =>
+            {
+                if reported.insert(b.database_id) {
+                    actions.push(Action::ReportMissingTenant {
+                        database: b.database_id,
+                    });
+                }
+            }
             // Backups have no compute. Recreating a compute runs the data API bootstrap and
-            // the resync too.
+            // the resync too. A container that's there but not running (R5: crash-looping, or
+            // exited) is recreated like a missing one; `create` replaces the old container.
+            // This also recreates a compute an operator stopped with `docker stop`. No job is
+            // racing it: a job moves the branch out of ready first, and a create in flight is
+            // in Docker state `created`, never listed as not running. Docker's restart policy
+            // can race it, though: it may bring the container back between `observe` and the
+            // action, so `execute` re-checks the status when it acts. This is the worker's own
+            // compute, not an orphan, so `CHELABASE_WORKER_REMOVE_ORPHANS` doesn't apply.
             BranchStatus::Ready if b.kind == BranchKind::Normal => match &b.endpoint_id {
-                Some(ep) if !s.computes.contains(ep) => {
+                Some(ep) if !s.computes.contains(ep) || s.not_running.contains(ep) => {
                     actions.push(Action::RecreateBranchCompute(b.id, ep.clone()));
                 }
                 Some(ep)
@@ -486,6 +528,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// reported once as unknown; that's only a log line.
     async fn observe(&self) -> anyhow::Result<Snapshot> {
         let computes = self.computes.list().await.context("listing computes")?;
+        // Right after `list`; a failed listing fails the pass (never "none stopped").
+        let not_running = self
+            .computes
+            .list_not_running()
+            .await
+            .context("listing computes that aren't running")?;
         let tenants = self
             .storage
             .list_tenant_ids()
@@ -522,6 +570,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .context("listing endpoints")?;
         let computes: HashSet<String> = computes.into_iter().collect();
+        // Only containers `list` saw: one created and stopped in between is next pass's.
+        let not_running: HashSet<String> = not_running
+            .into_iter()
+            .filter(|ep| computes.contains(ep))
+            .collect();
         let mut needs_data_api: HashSet<BranchId> = self
             .metadata
             .branches_missing_data_api()
@@ -529,7 +582,25 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .context("listing branches missing the data API")?
             .into_iter()
             .collect();
-        let checked = self.round_robin_checks(&branches, &computes).await;
+        let tenant_ids: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
+        // The health checks look only at computes that can answer: running ones (a stopped one
+        // is recreated, R5) of databases whose tenant is there (R3: reported, never touched).
+        let missing_tenant: HashSet<DatabaseId> = databases
+            .iter()
+            .filter(|d| {
+                d.neon_tenant_id
+                    .as_ref()
+                    .is_some_and(|t| !tenant_ids.contains(t))
+            })
+            .map(|d| d.id)
+            .collect();
+        let checkable: Vec<LiveBranch> = branches
+            .iter()
+            .filter(|b| !missing_tenant.contains(&b.database_id))
+            .cloned()
+            .collect();
+        let running: HashSet<String> = computes.difference(&not_running).cloned().collect();
+        let checked = self.round_robin_checks(&checkable, &running).await;
         needs_data_api.extend(checked.missing_data_api);
         let enabling = match self.metadata.enabling_databases().await {
             Ok(rows) => rows,
@@ -539,7 +610,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         };
         let stale_enabling = self.stale_enabling_rows(enabling, std::time::Instant::now());
-        let tenants: HashSet<String> = tenants.iter().map(|t| t.as_str().to_string()).collect();
+        let tenants = tenant_ids;
         // Only the tenants `plan` may patch: ready databases' tenants on the controller.
         let mut pitr = HashMap::new();
         for tenant in databases
@@ -565,6 +636,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             branches,
             endpoints,
             computes,
+            not_running,
             tenants,
             tenant_timelines,
             pitr,
@@ -695,9 +767,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             // Refused (the refusal recorded, the branch left as it is) while it has children.
             Action::RetryBranchDelete(id) => self.handle_branch_delete(*id).await,
             Action::FinishSwitch(id) => self.finish_switch(*id).await,
-            Action::RecreateBranchCompute(id, ep) => self.recreate_compute(*id, ep).await,
-            // Serial like the re-creation above. A failure after the removal leaves no
-            // container: the next pass plans `RecreateBranchCompute`.
+            Action::RecreateBranchCompute(id, ep) => {
+                // Docker's restart policy may have brought the container back since `observe`:
+                // recreate only one that is absent or still not running. If the status can't be
+                // read, skip: a truly dead compute waits one pass (30 s), whereas recreating
+                // could replace a compute that just recovered and drop its connections.
+                match self.computes.status(ep).await {
+                    Ok(Some(chelabase_neon::ComputeStatus::Running)) => {
+                        info!(
+                            branch_id = %id,
+                            endpoint_id = %ep,
+                            "compute is running again; not recreating it"
+                        );
+                        Ok(())
+                    }
+                    Ok(_) => self.recreate_compute(*id, ep).await,
+                    Err(e) => {
+                        warn!(
+                            branch_id = %id,
+                            endpoint_id = %ep,
+                            "reading the compute's status before recreating it, skipping: {e:#}"
+                        );
+                        Ok(())
+                    }
+                }
+            }
+            // Serial like the re-creation above. A new compute that never gets ready is removed
+            // too (`recreate_compute`), so no container is left and the next pass plans
+            // `RecreateBranchCompute`; one that got ready and failed a later step keeps running
+            // with its settings unrecorded, so the next pass plans this upgrade again.
             Action::UpgradeCompute(id, ep) => {
                 info!(branch_id = %id, endpoint_id = %ep, "re-creating a compute with old settings");
                 self.computes
@@ -777,6 +875,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 );
                 Ok(())
             }
+            Action::ReportMissingTenant { database } => self.report_missing_tenant(*database).await,
             Action::ReportEndpointWithoutDatabase(ep) => {
                 warn!(
                     endpoint_id = %ep,
@@ -786,6 +885,41 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 Ok(())
             }
         }
+    }
+
+    /// R3: logs, at error, that `database`'s tenant is missing from the storage controller,
+    /// naming the tenant and every ready branch (read again here). Touches nothing: no
+    /// compute is created or removed and the rows stay ready, so restoring the tenant (or
+    /// deleting the database) is the operator's call. Logged every pass until then.
+    async fn report_missing_tenant(&self, database: DatabaseId) -> Result<(), String> {
+        let record = self
+            .metadata
+            .get_database(database)
+            .await
+            .map_err(|e| format!("reading the database: {e}"))?;
+        let Some(record) = record else {
+            return Ok(());
+        };
+        let tenant = record.neon_tenant_id.unwrap_or_default();
+        let mut ready: Vec<String> = self
+            .metadata
+            .list_branches(database)
+            .await
+            .map_err(|e| format!("listing the branches: {e}"))?
+            .into_iter()
+            .filter(|b| b.status == BranchStatus::Ready)
+            .map(|b| b.id.to_string())
+            .collect();
+        ready.sort();
+        error!(
+            database_id = %database,
+            tenant_id = %tenant,
+            ready_branches = %ready.join(","),
+            "the database's tenant is missing from the storage controller; its ready branches \
+             can't start a compute. Nothing is changed: restore the tenant, or delete the \
+             database"
+        );
+        Ok(())
     }
 
     /// R3: tears down an old rehearsal branch unless its merge (the one its name is for, a merge
@@ -1183,7 +1317,13 @@ mod tests {
             branches: vec![main_of(&ready)],
             databases: vec![ready, stale],
             computes: [EP2.to_string()].into(),
-            tenants: ["fedcba9876543210fedcba9876543210".to_string()].into(),
+            // The ready database's own tenant is there (R3) and in sync.
+            tenants: [
+                TENANT.to_string(),
+                "fedcba9876543210fedcba9876543210".to_string(),
+            ]
+            .into(),
+            pitr: [(TENANT.to_string(), WEEK)].into(),
             ..Default::default()
         };
         assert_eq!(
@@ -1269,6 +1409,222 @@ mod tests {
                 Action::RecreateBranchCompute(dev, EP3.to_string()),
                 Action::RecreateBranchCompute(main, EP.to_string()),
             ]
+        );
+    }
+
+    // --- The leaked computes (carried gaps T2) -------------------------------------------
+
+    // R3: a ready branch whose database's tenant isn't on the storage controller (the listing
+    // worked) is reported, once per database, instead of getting a compute recreated or
+    // upgraded: a compute without its tenant can never start.
+    #[test]
+    fn a_ready_branch_whose_tenant_is_missing_is_reported_not_recreated() {
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        let database = s.databases[0].id;
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        s.pitr.clear();
+        // Both computes gone: today each would be recreated.
+        s.computes.clear();
+        assert_eq!(plan(&s), [Action::ReportMissingTenant { database }]);
+
+        // With old settings: not upgraded either.
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        s.endpoints[1].compute_settings_version = crate::COMPUTE_SETTINGS_VERSION - 1;
+        let planned = plan(&s);
+        assert!(
+            planned.contains(&Action::ReportMissingTenant { database: s.databases[0].id }),
+            "{planned:?}"
+        );
+        assert!(
+            !planned.iter().any(|a| matches!(
+                a,
+                Action::RecreateBranchCompute(..) | Action::UpgradeCompute(..)
+            )),
+            "{planned:?}"
+        );
+
+        // Its compute still there and current: reported all the same, each pass.
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        let planned = plan(&s);
+        assert_eq!(
+            planned
+                .iter()
+                .filter(|a| matches!(a, Action::ReportMissingTenant { .. }))
+                .count(),
+            1,
+            "{planned:?}"
+        );
+
+        // Only one database's tenant gone: only that one is reported, the other recreated.
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        let other_tenant = "fedcba9876543210fedcba9876543210";
+        let mut other = db(DatabaseStatus::Ready, Some(EP2), 3600);
+        other.neon_tenant_id = Some(other_tenant.to_string());
+        let other_id = other.id;
+        s.branches.push(main_of(&other));
+        s.endpoints.push(EndpointState {
+            tenant_id: other_tenant.to_string(),
+            ..endpoint(EP2, Some(&other), false)
+        });
+        s.databases.push(other);
+        s.tenants = [TENANT.to_string()].into();
+        s.computes.clear();
+        let main = s.branches[0].id;
+        let mut want = vec![
+            Action::RecreateBranchCompute(dev, EP3.to_string()),
+            Action::RecreateBranchCompute(main, EP.to_string()),
+            Action::ReportMissingTenant { database: other_id },
+        ];
+        want.sort_by_cached_key(|a| (a.rank(), a.subject()));
+        assert_eq!(plan(&s), want);
+    }
+
+    // R3 and the existing rules: only ready `normal` branches. A branch a job is working on
+    // (provisioning, resetting, deleting), a failed one and a rehearsal keep their own rules,
+    // and a missing tenant of theirs is never reported.
+    #[test]
+    fn a_missing_tenant_is_reported_only_for_ready_normal_branches() {
+        for status in [
+            BranchStatus::Pending,
+            BranchStatus::Provisioning,
+            BranchStatus::Resetting,
+            BranchStatus::Deleting,
+            BranchStatus::Failed,
+        ] {
+            let (mut s, dev) = with_dev(status, 5);
+            // Main isn't ready either: its database is provisioning.
+            s.databases[0].status = DatabaseStatus::Provisioning;
+            s.databases[0].age_secs = 5;
+            let main = s.branches[0].id;
+            branch_mut(&mut s, main).status = BranchStatus::Provisioning;
+            branch_mut(&mut s, main).age_secs = 5;
+            branch_mut(&mut s, dev).age_secs = 5;
+            s.tenants.clear();
+            s.tenant_timelines.clear();
+            let planned = plan(&s);
+            assert!(
+                !planned
+                    .iter()
+                    .any(|a| matches!(a, Action::ReportMissingTenant { .. })),
+                "{status:?}: {planned:?}"
+            );
+        }
+        // A rehearsal (main itself in another database state isn't the point here).
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        s.databases[0].status = DatabaseStatus::Provisioning;
+        s.databases[0].age_secs = 5;
+        let main = s.branches[0].id;
+        branch_mut(&mut s, main).status = BranchStatus::Provisioning;
+        branch_mut(&mut s, main).age_secs = 5;
+        branch_mut(&mut s, dev).kind = BranchKind::Rehearsal;
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        assert!(
+            !plan(&s)
+                .iter()
+                .any(|a| matches!(a, Action::ReportMissingTenant { .. })),
+            "{:?}",
+            plan(&s)
+        );
+    }
+
+    // R5: a ready branch's compute whose container exists but isn't running (exited, dead,
+    // restarting) is recreated like a missing one; the re-creation runs the data API bootstrap
+    // and the resync itself, and wins over an upgrade.
+    #[test]
+    fn a_ready_branch_whose_compute_is_not_running_gets_a_new_one() {
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 3600);
+        s.not_running.insert(EP3.to_string());
+        assert_eq!(
+            plan(&s),
+            [Action::RecreateBranchCompute(dev, EP3.to_string())]
+        );
+        s.needs_data_api.insert(dev);
+        s.resync.insert(dev);
+        s.endpoints[1].compute_settings_version = crate::COMPUTE_SETTINGS_VERSION - 1;
+        assert_eq!(
+            plan(&s),
+            [Action::RecreateBranchCompute(dev, EP3.to_string())]
+        );
+        // Main's too.
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.not_running.insert(EP.to_string());
+        let main = s.branches[0].id;
+        assert_eq!(
+            plan(&s),
+            [Action::RecreateBranchCompute(main, EP.to_string())]
+        );
+    }
+
+    // R5 never races a job: a branch being provisioned, reset or deleted (its job stops or
+    // starts the compute itself), a failed one, a backup and a rehearsal keep their rules; a
+    // static compute that isn't running is never recreated; a not-running compute with no
+    // endpoint row is still an orphan.
+    #[test]
+    fn a_not_running_compute_is_recreated_only_for_a_ready_normal_branch() {
+        for status in [
+            BranchStatus::Pending,
+            BranchStatus::Provisioning,
+            BranchStatus::Resetting,
+            BranchStatus::Deleting,
+            BranchStatus::Failed,
+        ] {
+            let (mut s, _) = with_dev(status, 5);
+            s.not_running.insert(EP3.to_string());
+            let planned = plan(&s);
+            assert!(
+                !planned
+                    .iter()
+                    .any(|a| matches!(a, Action::RecreateBranchCompute(..))),
+                "{status:?}: {planned:?}"
+            );
+        }
+        // A young rehearsal (an old one is removed, R3 of step 6g).
+        let (mut s, dev) = with_dev(BranchStatus::Ready, 5);
+        branch_mut(&mut s, dev).kind = BranchKind::Rehearsal;
+        s.not_running.insert(EP3.to_string());
+        assert!(plan(&s).is_empty(), "{:?}", plan(&s));
+        branch_mut(&mut s, dev).kind = BranchKind::Backup;
+        assert!(plan(&s).is_empty(), "{:?}", plan(&s));
+
+        // A static compute (step 6g) still reading: left alone, stopped or not.
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.endpoints.push(static_endpoint(EP2, 5));
+        s.computes.insert(EP2.to_string());
+        s.not_running.insert(EP2.to_string());
+        assert!(plan(&s).is_empty(), "{:?}", plan(&s));
+
+        // An orphan that isn't running is removed as before (with removal on).
+        let mut s = linked(db(DatabaseStatus::Ready, Some(EP), 3600), false);
+        s.computes.insert(EP2.to_string());
+        s.not_running.insert(EP2.to_string());
+        assert_eq!(plan(&s), [Action::RemoveCompute(EP2.to_string())]);
+    }
+
+    // R3 wins over R5: a stopped compute whose tenant is gone can't start; it's reported.
+    #[test]
+    fn a_not_running_compute_whose_tenant_is_missing_is_reported() {
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        let database = s.databases[0].id;
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        s.pitr.clear();
+        s.not_running.insert(EP3.to_string());
+        let planned = plan(&s);
+        assert!(
+            planned.contains(&Action::ReportMissingTenant { database }),
+            "{planned:?}"
+        );
+        assert!(
+            !planned
+                .iter()
+                .any(|a| matches!(a, Action::RecreateBranchCompute(..))),
+            "{planned:?}"
         );
     }
 
@@ -1468,7 +1824,13 @@ mod tests {
         s.pitr.clear();
         s.tenants.clear();
         s.tenant_timelines.clear();
-        assert!(plan(&s).is_empty());
+        // It's reported missing instead (R3).
+        assert_eq!(
+            plan(&s),
+            [Action::ReportMissingTenant {
+                database: s.databases[0].id
+            }]
+        );
     }
 
     // Deleting storage on a guess can't be undone.
@@ -2691,6 +3053,319 @@ mod tests {
         );
     }
 
+    // --- The leaked computes (carried gaps T2) -------------------------------------------
+
+    fn creates(journal: &Journal, ep: &str) -> usize {
+        let prefix = format!("compute.create {ep}");
+        entries(journal)
+            .iter()
+            .filter(|e| e.starts_with(&prefix))
+            .count()
+    }
+
+    // T2 behaviour 1, the deterministic reproduction: a ready branch's compute is gone, the
+    // recreated one never gets ready. The pass removes it, so the next pass plans
+    // `RecreateBranchCompute` again (today the crash-looping container stays listed and no
+    // pass ever retries). Orphan removal being off changes nothing: this is the worker's own
+    // compute, not an orphan.
+    #[tokio::test]
+    async fn a_recreate_that_never_gets_ready_is_retried_next_pass() {
+        for remove_orphans in [true, false] {
+            let (mut w, journal) = worker();
+            w.remove_orphans = remove_orphans;
+            let d = dev_setup(&w, &journal).await;
+            w.computes.remove(&d.ep);
+            *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+
+            w.reconcile_once().await.unwrap();
+
+            assert!(
+                !w.computes.list().await.unwrap().contains(&d.ep),
+                "remove_orphans={remove_orphans}: the never-ready compute stays: {:?}",
+                entries(&journal)
+            );
+            assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
+
+            w.reconcile_once().await.unwrap();
+
+            assert_eq!(
+                creates(&journal, &d.ep),
+                2,
+                "remove_orphans={remove_orphans}: the second pass doesn't retry: {:?}",
+                entries(&journal)
+            );
+            assert!(!w.computes.list().await.unwrap().contains(&d.ep));
+
+            // Once the compute can get ready, the next pass brings it back for good.
+            *w.computes.sql_failures_left.lock().unwrap() = 0;
+            w.reconcile_once().await.unwrap();
+            assert!(w.computes.list().await.unwrap().contains(&d.ep));
+            assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Ready);
+        }
+    }
+
+    // T2 behaviour 1 through `UpgradeCompute`: the old compute is removed, the new one never
+    // gets ready: none is left, and the next pass recreates it.
+    #[tokio::test]
+    async fn an_upgrade_that_never_gets_ready_leaves_no_compute() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.metadata
+            .state()
+            .endpoints
+            .get_mut(&d.ep)
+            .unwrap()
+            .compute_settings_version = 0;
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(
+            !w.computes.list().await.unwrap().contains(&d.ep),
+            "{:?}",
+            entries(&journal)
+        );
+        w.reconcile_once().await.unwrap();
+        assert_eq!(creates(&journal, &d.ep), 2, "{:?}", entries(&journal));
+    }
+
+    /// Everything logged on this thread while the guard lives, as plain text (no colours).
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl Logs {
+        /// `#[tokio::test]` runs on one thread, so a thread-local default sees the whole test.
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The lines at ERROR level containing every one of `needles`.
+        fn errors_with(&self, needles: &[&str]) -> usize {
+            String::from_utf8_lossy(&self.0.lock().unwrap())
+                .lines()
+                .filter(|l| l.contains("ERROR") && needles.iter().all(|n| l.contains(n)))
+                .count()
+        }
+    }
+
+    fn drop_tenant(w: &FakeWorker, tenant: &str) {
+        let tenant: NeonId = tenant.parse().unwrap();
+        w.storage.tenants.lock().unwrap().remove(&tenant);
+        w.storage
+            .timelines
+            .lock()
+            .unwrap()
+            .retain(|(t, _), _| *t != tenant);
+    }
+
+    // R3 over the fakes: the tenant is gone from the storage controller. Each pass logs an
+    // error naming the database, the tenant and the branch, and touches nothing: no compute
+    // is created or removed, no storage call is made, the rows stay ready.
+    #[tokio::test]
+    async fn a_missing_tenant_is_logged_each_pass_and_nothing_is_touched() {
+        let (logs, _guard) = Logs::capture();
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let main_ep = w.metadata.main(d.db).endpoint_id.unwrap();
+        drop_tenant(&w, &d.tenant);
+        // Crash-looping computes removed by hand: today reconcile recreates them, and they
+        // can never start.
+        w.computes.remove(&d.ep);
+        w.computes.remove(&main_ep);
+        journal.lock().unwrap().clear();
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(
+            position(&journal, "compute.create").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+        assert!(position(&journal, "compute.delete").is_none(), "{:?}", entries(&journal));
+        assert!(
+            !entries(&journal).iter().any(|e| e.starts_with("storage.")
+                && !e.starts_with("storage.list")),
+            "{:?}",
+            entries(&journal)
+        );
+        assert_eq!(w.metadata.database(d.db).status, DatabaseStatus::Ready);
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Ready);
+        assert_eq!(w.metadata.database(d.db).neon_tenant_id.as_deref(), Some(d.tenant.as_str()));
+        let db = d.db.to_string();
+        let dev = d.dev.to_string();
+        let once = logs.errors_with(&[&d.tenant]);
+        assert!(once >= 1, "no error names the tenant");
+        assert!(
+            logs.errors_with(&[&db, &d.tenant, &dev]) >= 1,
+            "an error names the database, the tenant and the branch"
+        );
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(logs.errors_with(&[&d.tenant]) > once, "logged again on the next pass");
+        assert!(position(&journal, "compute.create").is_none());
+    }
+
+    // R3: when the storage controller's tenant listing fails, nothing is known missing: the
+    // pass ends (observing failed) without reporting or recreating anything.
+    #[tokio::test]
+    async fn a_failed_tenant_listing_reports_no_missing_tenant() {
+        let (logs, _guard) = Logs::capture();
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.remove(&d.ep);
+        *w.storage.fail.lock().unwrap() = Some("list_tenant_ids");
+
+        assert!(w.reconcile_once().await.is_err());
+
+        assert!(position(&journal, "compute.create").is_none(), "{:?}", entries(&journal));
+        assert_eq!(logs.errors_with(&[&d.tenant]), 0);
+        assert_eq!(w.metadata.branch(d.dev).status, BranchStatus::Ready);
+    }
+
+    // R5 over the fakes: a ready branch's container exists but has exited: the pass creates
+    // a new one, with a fresh token, whatever orphan removal says.
+    #[tokio::test]
+    async fn reconcile_recreates_a_compute_that_is_not_running() {
+        for remove_orphans in [true, false] {
+            let (mut w, journal) = worker();
+            w.remove_orphans = remove_orphans;
+            let d = dev_setup(&w, &journal).await;
+            let old_hash = token_hash(&w, &d.ep);
+            w.computes.set_running(&d.ep, false);
+
+            w.reconcile_once().await.unwrap();
+
+            assert_eq!(
+                creates(&journal, &d.ep),
+                1,
+                "remove_orphans={remove_orphans}: {:?}",
+                entries(&journal)
+            );
+            assert_eq!(
+                w.computes.status(&d.ep).await.unwrap(),
+                Some(chelabase_neon::ComputeStatus::Running),
+                "remove_orphans={remove_orphans}"
+            );
+            assert_ne!(token_hash(&w, &d.ep), old_hash);
+            assert_eq!(
+                sha256_hex(&w.computes.token_of(&d.ep).unwrap()),
+                token_hash(&w, &d.ep)
+            );
+
+            // Running again: the next pass leaves it.
+            journal.lock().unwrap().clear();
+            w.reconcile_once().await.unwrap();
+            assert_eq!(creates(&journal, &d.ep), 0, "{:?}", entries(&journal));
+        }
+    }
+
+    // I1: Docker's restart policy can bring a not-running compute back between `observe` and
+    // the moment the serial pass executes the planned `RecreateBranchCompute`. The action
+    // re-checks the compute's status when it acts and skips one that is running again: no
+    // delete, no create, the same token.
+    #[tokio::test]
+    async fn a_compute_that_recovered_before_the_recreate_acts_is_left_alone() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let old_hash = token_hash(&w, &d.ep);
+        let old_token = w.computes.token_of(&d.ep).unwrap();
+        w.computes.set_running(&d.ep, false);
+
+        let snapshot = w.observe().await.unwrap();
+        let planned = plan(&snapshot);
+        assert!(
+            planned.contains(&Action::RecreateBranchCompute(d.dev, d.ep.clone())),
+            "{planned:?}"
+        );
+
+        // The restart policy brings it back before the action runs.
+        w.computes.set_running(&d.ep, true);
+        journal.lock().unwrap().clear();
+        w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(creates(&journal, &d.ep), 0, "{:?}", entries(&journal));
+        assert!(
+            !entries(&journal)
+                .iter()
+                .any(|e| e.starts_with("compute.delete")),
+            "{:?}",
+            entries(&journal)
+        );
+        assert_eq!(token_hash(&w, &d.ep), old_hash);
+        assert_eq!(w.computes.token_of(&d.ep).unwrap(), old_token);
+        assert_eq!(
+            w.computes.status(&d.ep).await.unwrap(),
+            Some(chelabase_neon::ComputeStatus::Running)
+        );
+    }
+
+    // I1 positive control: still not running when the action acts, so it is recreated.
+    #[tokio::test]
+    async fn a_compute_still_not_running_when_the_recreate_acts_is_recreated() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let old_hash = token_hash(&w, &d.ep);
+        w.computes.set_running(&d.ep, false);
+
+        let snapshot = w.observe().await.unwrap();
+        let planned = plan(&snapshot);
+        assert!(
+            planned.contains(&Action::RecreateBranchCompute(d.dev, d.ep.clone())),
+            "{planned:?}"
+        );
+        journal.lock().unwrap().clear();
+        w.execute(&Action::RecreateBranchCompute(d.dev, d.ep.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(creates(&journal, &d.ep), 1, "{:?}", entries(&journal));
+        assert_ne!(token_hash(&w, &d.ep), old_hash);
+        assert_eq!(
+            w.computes.status(&d.ep).await.unwrap(),
+            Some(chelabase_neon::ComputeStatus::Running)
+        );
+    }
+
+    // R5: the fake's listing, which `observe` reads: a stopped compute is listed both as a
+    // compute and as not running; a running one only as a compute.
+    #[tokio::test]
+    async fn the_fake_lists_stopped_computes_as_not_running() {
+        let (w, _journal) = worker();
+        w.computes.insert(EP);
+        w.computes.insert(EP2);
+        w.computes.set_running(EP2, false);
+        assert_eq!(w.computes.list_not_running().await.unwrap(), [EP2]);
+        let mut all = w.computes.list().await.unwrap();
+        all.sort();
+        assert_eq!(all, [EP, EP2]);
+    }
+
     #[tokio::test]
     async fn unknown_timelines_survive_reconcile() {
         let (w, journal) = worker();
@@ -2959,5 +3634,74 @@ mod tests {
             sql.iter().any(|(e, _, s)| *e == ep && s.starts_with("GRANT \"reporting\" TO authenticator")),
             "the secret key's role is granted again"
         );
+    }
+
+    // --- The leaked computes (carried gaps T2): the coder's edge cases -------------------
+
+    // R5: the pass's health checks skip a stopped compute (it can't answer; it's recreated
+    // instead): no SQL reaches it before its new container exists.
+    #[tokio::test]
+    async fn the_health_checks_skip_a_compute_that_is_not_running() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.set_running(&d.ep, false);
+
+        w.reconcile_once().await.unwrap();
+
+        let log = entries(&journal);
+        let created = position(&journal, &format!("compute.create {}", d.ep)).expect("recreated");
+        let sql = format!("compute.sql {} ", d.ep);
+        assert!(
+            !log[..created].iter().any(|e| e.starts_with(&sql)),
+            "{log:?}"
+        );
+    }
+
+    // R3: a database whose tenant is gone gets no health check either, though its computes
+    // still run: nothing of it is touched.
+    #[tokio::test]
+    async fn the_health_checks_skip_a_database_whose_tenant_is_missing() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        let main_ep = w.metadata.main(d.db).endpoint_id.unwrap();
+        drop_tenant(&w, &d.tenant);
+
+        w.reconcile_once().await.unwrap();
+
+        assert!(
+            position(&journal, "compute.").is_none(),
+            "{:?}",
+            entries(&journal)
+        );
+        assert!(w.computes.list().await.unwrap().contains(&main_ep));
+        assert!(w.computes.list().await.unwrap().contains(&d.ep));
+    }
+
+    // R3: a deleting database's tenant may be gone already: that's its delete, not a report.
+    #[test]
+    fn a_deleting_database_s_missing_tenant_is_not_reported() {
+        let (mut s, _) = with_dev(BranchStatus::Ready, 3600);
+        s.databases[0].status = DatabaseStatus::Deleting;
+        s.databases[0].age_secs = 5;
+        s.tenants.clear();
+        s.tenant_timelines.clear();
+        assert!(
+            !plan(&s)
+                .iter()
+                .any(|a| matches!(a, Action::ReportMissingTenant { .. })),
+            "{:?}",
+            plan(&s)
+        );
+    }
+
+    // R5: `observe` fills `not_running` from the backend, a subset of `computes`.
+    #[tokio::test]
+    async fn observe_lists_a_stopped_compute_as_not_running() {
+        let (w, journal) = worker();
+        let d = dev_setup(&w, &journal).await;
+        w.computes.set_running(&d.ep, false);
+        let s = w.observe().await.unwrap();
+        assert!(s.computes.contains(&d.ep));
+        assert_eq!(s.not_running, [d.ep.clone()].into());
     }
 }

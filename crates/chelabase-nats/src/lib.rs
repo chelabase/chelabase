@@ -10,6 +10,9 @@ use uuid::Uuid;
 
 pub mod rt;
 
+#[cfg(test)]
+mod t4_tests;
+
 /// Subject for database provisioning jobs.
 pub const SUBJECT_PROVISION: &str = "chelabase.provision";
 
@@ -843,6 +846,301 @@ pub async fn ensure_control_stream(
     Ok(js)
 }
 
+// --- Storage events: a tenant's shards attached (carried gaps T4, R7) -----------------------
+
+/// The stream of storage events the storage controller's hooks report (only the orchestrator
+/// creates and updates it, R10). Never part of [`control_subjects`]: a work queue would hand
+/// each event to one consumer, and every waiter must see it.
+pub const STREAM_NEON_EVENTS: &str = "CHELABASE_NEON_EVENTS";
+
+/// The subjects' common prefix; one more token names the tenant.
+const SUBJECT_TENANT_ATTACHED_PREFIX: &str = "chelabase.neon.attached";
+
+/// One shard of a tenant-attached event: the pageserver it is attached to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAttachedShard {
+    pub node_id: u64,
+    pub shard_number: u8,
+}
+
+/// A tenant's shards are attached (the storage controller's `notify-attach` body, by the same
+/// names): its pageservers answer for it, so a timeline create there won't 404.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantAttachedEvent {
+    pub tenant_id: String,
+    #[serde(default)]
+    pub shards: Vec<TenantAttachedShard>,
+    #[serde(default)]
+    pub stripe_size: Option<u32>,
+    #[serde(default)]
+    pub preferred_az: Option<String>,
+}
+
+/// `chelabase.neon.attached.<tenant>`: one token per tenant. Only a Neon id (32 lowercase hex)
+/// is accepted, so a value can never widen the subject (`*`, `>`), add a token (`.`) or spell
+/// another tenant's subject differently (upper case).
+pub fn tenant_attached_subject(tenant: &str) -> Result<String, NatsError> {
+    let valid = tenant.len() == 32
+        && tenant
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    if !valid {
+        return Err(NatsError::JetStream(format!(
+            "invalid tenant id {tenant:?}: expected 32 lowercase hex characters"
+        )));
+    }
+    Ok(format!("{SUBJECT_TENANT_ATTACHED_PREFIX}.{tenant}"))
+}
+
+/// The events stream (P8): limits retention (nothing is consumed away; every waiter reads the
+/// history), the last event per tenant for an hour, bounded in count and bytes, the oldest
+/// dropped first. No `Nats-Msg-Id` dedupe: a re-attach after a restart must land.
+pub fn neon_events_stream_config() -> async_nats::jetstream::stream::Config {
+    use async_nats::jetstream::stream::{Config, DiscardPolicy, RetentionPolicy, StorageType};
+    Config {
+        name: STREAM_NEON_EVENTS.to_string(),
+        subjects: vec![format!("{SUBJECT_TENANT_ATTACHED_PREFIX}.*")],
+        retention: RetentionPolicy::Limits,
+        storage: StorageType::File,
+        max_messages_per_subject: 1,
+        max_age: std::time::Duration::from_secs(3600),
+        max_messages: 100_000,
+        max_bytes: 64 * 1024 * 1024,
+        discard: DiscardPolicy::Old,
+        num_replicas: 1,
+        ..Default::default()
+    }
+}
+
+/// Whether an existing stream's config differs from `want` in a setting P8 pins.
+fn neon_events_drifted(
+    have: &async_nats::jetstream::stream::Config,
+    want: &async_nats::jetstream::stream::Config,
+) -> bool {
+    have.subjects != want.subjects
+        || have.retention != want.retention
+        || have.storage != want.storage
+        || have.max_messages_per_subject != want.max_messages_per_subject
+        || have.max_age != want.max_age
+        || have.max_messages != want.max_messages
+        || have.max_bytes != want.max_bytes
+        || have.discard != want.discard
+        || have.num_replicas != want.num_replicas
+}
+
+/// Creates the events stream, or puts back the P8 settings of one that drifted. The orchestrator
+/// calls it at start (after [`ensure_control_stream`]); the control stream is never touched.
+pub async fn ensure_neon_events_stream(
+    js: &async_nats::jetstream::Context,
+) -> Result<(), NatsError> {
+    let want = neon_events_stream_config();
+    match js.get_stream(STREAM_NEON_EVENTS).await {
+        Ok(stream) => {
+            let have = &stream.cached_info().config;
+            if neon_events_drifted(have, &want) {
+                js.update_stream(want)
+                    .await
+                    .map_err(|e| NatsError::JetStream(e.to_string()))?;
+                info!(
+                    stream = STREAM_NEON_EVENTS,
+                    "jetstream stream config restored"
+                );
+            } else {
+                info!(stream = STREAM_NEON_EVENTS, "jetstream stream exists");
+            }
+        }
+        Err(err)
+            if matches!(
+                err.kind(),
+                async_nats::jetstream::context::GetStreamErrorKind::JetStream(e)
+                    if e.error_code() == async_nats::jetstream::ErrorCode::STREAM_NOT_FOUND
+            ) =>
+        {
+            js.create_stream(want)
+                .await
+                .map_err(|e| NatsError::JetStream(e.to_string()))?;
+            info!(stream = STREAM_NEON_EVENTS, "jetstream stream created");
+        }
+        Err(err) => return Err(NatsError::JetStream(err.to_string())),
+    }
+    Ok(())
+}
+
+/// Publishes `event` on its tenant's subject and waits for JetStream's ack: once this returns
+/// `Ok`, the event is stored. No message id is set (see [`neon_events_stream_config`]).
+pub async fn publish_tenant_attached(
+    js: &async_nats::jetstream::Context,
+    event: &TenantAttachedEvent,
+) -> Result<(), NatsError> {
+    let subject = tenant_attached_subject(&event.tenant_id)?;
+    let payload = serde_json::to_vec(event)?;
+    js.publish(subject, payload.into())
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?
+        .await
+        .map_err(|e| NatsError::JetStream(e.to_string()))?;
+    Ok(())
+}
+
+/// The consumer of one wait (P11): named `attached-<tenant>-<8 random hex>` (one token, so it
+/// fits `CONSUMER.CREATE.<stream>.<name>.<filter>`; two waiters never share one), filtered to
+/// the tenant's subject, reading its last event (published before the wait or not), no acks,
+/// in memory, removed by the server 30 s after its waiter is gone.
+pub fn tenant_attached_consumer_config(
+    tenant: &str,
+) -> Result<async_nats::jetstream::consumer::pull::Config, NatsError> {
+    use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
+    let subject = tenant_attached_subject(tenant)?;
+    let suffix = &Uuid::new_v4().simple().to_string()[..8];
+    Ok(pull::Config {
+        name: Some(format!("attached-{tenant}-{suffix}")),
+        durable_name: None,
+        filter_subject: subject,
+        deliver_policy: DeliverPolicy::LastPerSubject,
+        ack_policy: AckPolicy::None,
+        memory_storage: true,
+        inactive_threshold: std::time::Duration::from_secs(30),
+        ..Default::default()
+    })
+}
+
+/// The longest one pull waits on the server before the wait asks again.
+const ATTACH_FETCH_EXPIRES: std::time::Duration = std::time::Duration::from_secs(5);
+/// A pull shorter than this isn't asked for: the deadline is as good as reached.
+const ATTACH_FETCH_MIN: std::time::Duration = std::time::Duration::from_millis(20);
+/// The pause after a failed NATS call before the next try (within the deadline).
+const ATTACH_RETRY_PAUSE: std::time::Duration = std::time::Duration::from_millis(250);
+/// How long the consumer's delete may take once the wait is over (the deadline may be spent by
+/// then; the consumer's `inactive_threshold` removes one whose delete failed).
+const ATTACH_DELETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Waits up to `timeout` for `tenant`'s attach event (P11): `Some` as soon as one is stored
+/// (one published before the wait included), `None` at the deadline. A NATS failure is retried
+/// within the deadline; `Err` when no NATS call succeeded during the whole wait (NATS down, no
+/// stream: the caller says why it didn't wait). Every NATS call is bounded by what is left of the
+/// deadline; the wait's consumer is deleted before it returns. It never looks the stream up
+/// (`STREAM.INFO`): the worker may only create, pull from and delete its own consumers.
+pub async fn wait_tenant_attached(
+    js: &async_nats::jetstream::Context,
+    tenant: &str,
+    timeout: std::time::Duration,
+) -> Result<Option<TenantAttachedEvent>, NatsError> {
+    use async_nats::jetstream::consumer::PullConsumer;
+    use tokio::time::{Instant, timeout_at};
+
+    let config = tenant_attached_consumer_config(tenant)?;
+    let name = config.name.clone().unwrap_or_default();
+    let deadline = Instant::now() + timeout;
+    // Whether any NATS call answered, and the last failure.
+    let mut reached = false;
+    let mut last_error: Option<String> = None;
+    let mut consumer: Option<PullConsumer> = None;
+    let mut created = false;
+
+    let found = loop {
+        let now = Instant::now();
+        if deadline.saturating_duration_since(now) < ATTACH_FETCH_MIN {
+            break None;
+        }
+        if consumer.is_none() {
+            match timeout_at(
+                deadline,
+                js.create_consumer_on_stream(config.clone(), STREAM_NEON_EVENTS),
+            )
+            .await
+            {
+                Ok(Ok(c)) => {
+                    reached = true;
+                    created = true;
+                    consumer = Some(c);
+                }
+                Ok(Err(e)) => {
+                    last_error = Some(format!("creating the wait's consumer: {e}"));
+                    pause_until(deadline).await;
+                    continue;
+                }
+                Err(_) => break None,
+            }
+        }
+        let Some(c) = consumer.as_ref() else {
+            continue;
+        };
+        let expires = ATTACH_FETCH_EXPIRES.min(deadline.saturating_duration_since(Instant::now()));
+        if expires < ATTACH_FETCH_MIN {
+            break None;
+        }
+        let pulled = timeout_at(deadline, async {
+            let mut batch = c
+                .batch()
+                .max_messages(1)
+                .expires(expires)
+                .messages()
+                .await
+                .map_err(|e| format!("pulling: {e}"))?;
+            match batch.next().await {
+                Some(Ok(message)) => Ok(Some(message)),
+                Some(Err(e)) => Err(format!("pulling: {e}")),
+                None => Ok(None),
+            }
+        })
+        .await;
+        match pulled {
+            Ok(Ok(Some(message))) => {
+                reached = true;
+                match serde_json::from_slice::<TenantAttachedEvent>(&message.payload) {
+                    Ok(event) if event.tenant_id == tenant => break Some(event),
+                    Ok(event) => warn!(
+                        tenant,
+                        other = %event.tenant_id,
+                        "an attach event for another tenant on this tenant's subject; ignored"
+                    ),
+                    Err(e) => warn!(tenant, "an unreadable attach event; ignored: {e}"),
+                }
+                // Not the event wanted: pause, then ask again (the create is by name, so it is
+                // the same consumer, which still delivers a later event).
+                consumer = None;
+                pause_until(deadline).await;
+            }
+            Ok(Ok(None)) => reached = true,
+            Ok(Err(e)) => {
+                // The consumer may be gone (deleted, or removed while NATS was away): a fresh
+                // one is created on the next turn (create is create-or-update by name).
+                last_error = Some(e);
+                consumer = None;
+                pause_until(deadline).await;
+            }
+            Err(_) => break None,
+        }
+    };
+
+    if created {
+        let deleted = tokio::time::timeout(
+            ATTACH_DELETE_TIMEOUT,
+            js.delete_consumer_from_stream(&name, STREAM_NEON_EVENTS),
+        )
+        .await;
+        match deleted {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => warn!(consumer = %name, "deleting the attach wait's consumer: {e}"),
+            Err(_) => warn!(consumer = %name, "deleting the attach wait's consumer timed out"),
+        }
+    }
+
+    match found {
+        Some(event) => Ok(Some(event)),
+        None if reached => Ok(None),
+        None => Err(NatsError::JetStream(last_error.unwrap_or_else(|| {
+            format!("no answer from NATS within {timeout:?}")
+        }))),
+    }
+}
+
+/// Sleeps [`ATTACH_RETRY_PAUSE`], or until `deadline` if that comes first.
+async fn pause_until(deadline: tokio::time::Instant) {
+    let until = deadline.min(tokio::time::Instant::now() + ATTACH_RETRY_PAUSE);
+    tokio::time::sleep_until(until).await;
+}
+
 pub async fn publish_provision(
     js: &async_nats::jetstream::Context,
     job: &JobEnvelope<ProvisionDatabaseJob>,
@@ -1044,10 +1342,17 @@ where
     run_consumer(js, CONSUMER_PROVISION, SUBJECT_PROVISION, handler).await
 }
 
-/// How long a job may run before NATS redelivers it. The worst case is a provision that fails
-/// late and tears down: two storage-controller calls (10 s each), the 60 s readiness wait, up
-/// to 30 s of admin SQL, then the teardown (a tenant delete waits up to 60 s, plus 10 s per
-/// request), about 180 s. A redelivery in the middle would run a second copy of the job.
+/// How long a job may go silent before NATS redelivers it. It is not a job's total time: while
+/// a handler runs, the runner sends an in-progress ack every `ack_wait / 3`, which restarts the
+/// timer, so only a job that stops acking (a worker that died, a runner that hung) is
+/// redelivered after this long.
+///
+/// For scale, a single provision can run long: the tenant create about 46 s (its 45 s budget
+/// plus at most one 250 ms attempt), the wait for the tenant's attach event up to about 61 s
+/// (its 60 s timeout plus the 1 s consumer delete; R8 then creates the timeline anyway), the
+/// timeline create up to about 121 s (its own 120 s budget), the 60 s readiness wait, up to
+/// 30 s of admin SQL, and a teardown of about 70 s. The in-progress acks keep such a job alive
+/// through all of it.
 ///
 /// Limits:
 /// - Docker calls (bollard) have no timeout of their own, so a hung Docker can outlast it.
@@ -1219,6 +1524,61 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // T4 coder: the drift check sees a change in each setting P8 pins, and none in the
+    // config itself (an existing stream with it is left alone).
+    #[test]
+    fn the_events_stream_drift_check_covers_every_pinned_setting() {
+        use async_nats::jetstream::stream::{DiscardPolicy, RetentionPolicy, StorageType};
+        let want = neon_events_stream_config();
+        assert!(!neon_events_drifted(&want, &want));
+        // Server-filled settings P8 doesn't pin are no drift.
+        let mut filled = want.clone();
+        filled.duplicate_window = std::time::Duration::from_secs(120);
+        assert!(!neon_events_drifted(&filled, &want));
+        let changes: Vec<fn(&mut async_nats::jetstream::stream::Config)> = vec![
+            |c| c.subjects = vec!["chelabase.neon.attached.>".into()],
+            |c| c.retention = RetentionPolicy::Interest,
+            |c| c.storage = StorageType::Memory,
+            |c| c.max_messages_per_subject = 5,
+            |c| c.max_age = std::time::Duration::from_secs(600),
+            |c| c.max_messages = 10,
+            |c| c.max_bytes = 1024,
+            |c| c.discard = DiscardPolicy::New,
+            |c| c.num_replicas = 3,
+        ];
+        for (i, change) in changes.into_iter().enumerate() {
+            let mut have = want.clone();
+            change(&mut have);
+            assert!(neon_events_drifted(&have, &want), "change {i} not seen");
+        }
+    }
+
+    // T4 coder: an event for an invalid tenant is refused before NATS is asked (nothing
+    // listens there, so a publish would hang until JetStream's timeout).
+    #[tokio::test]
+    async fn an_event_for_an_invalid_tenant_is_refused_before_publishing() {
+        let client = async_nats::ConnectOptions::new()
+            .retry_on_initial_connect()
+            .connect("nats://127.0.0.1:1")
+            .await
+            .unwrap();
+        let js = async_nats::jetstream::new(client);
+        let started = std::time::Instant::now();
+        for tenant in ["", "*", ">", "0123456789ABCDEF0123456789abcdef", "a.b"] {
+            let event = TenantAttachedEvent {
+                tenant_id: tenant.into(),
+                shards: vec![],
+                stripe_size: None,
+                preferred_az: None,
+            };
+            assert!(
+                publish_tenant_attached(&js, &event).await.is_err(),
+                "{tenant:?}"
+            );
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn role_create_request_uses_owner_level() {

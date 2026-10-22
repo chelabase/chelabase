@@ -1021,6 +1021,8 @@ struct AppSetup {
     control: FakeLocator,
     /// C4 (SP4): `InternalState.realtime_logins`.
     realtime_logins: chelabase_neon::spec::MemberLogins,
+    /// Carried gaps T4 (P10): where notify-attach publishes its tenant-attached events.
+    attach_events: FakeAttachEvents,
 }
 
 impl Default for AppSetup {
@@ -1035,7 +1037,63 @@ impl Default for AppSetup {
             rt_events: FakeRtEvents::default(),
             control: FakeLocator::default(),
             realtime_logins: Default::default(),
+            attach_events: FakeAttachEvents::default(),
         }
+    }
+}
+
+/// How the fake's publish of a tenant-attached event ends.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AttachPublish {
+    /// JetStream acks it.
+    #[default]
+    Acked,
+    /// The publish fails (NATS down, no stream).
+    Fails,
+    /// No ack ever comes.
+    Hangs,
+    /// The ack comes when the test calls `gate.notify_one()`.
+    Gated,
+}
+
+/// Records every tenant-attached event the hook publishes (whatever the publish's outcome).
+#[derive(Clone, Default)]
+struct FakeAttachEvents {
+    published: Arc<Mutex<Vec<chelabase_nats::TenantAttachedEvent>>>,
+    outcome: Arc<Mutex<AttachPublish>>,
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl FakeAttachEvents {
+    fn with(outcome: AttachPublish) -> Self {
+        let fake = Self::default();
+        *fake.outcome.lock().unwrap() = outcome;
+        fake
+    }
+
+    fn published(&self) -> Vec<chelabase_nats::TenantAttachedEvent> {
+        self.published.lock().unwrap().clone()
+    }
+}
+
+impl orchestrator::internal::AttachEvents for FakeAttachEvents {
+    fn tenant_attached(
+        &self,
+        event: chelabase_nats::TenantAttachedEvent,
+    ) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            self.published.lock().unwrap().push(event);
+            let outcome = *self.outcome.lock().unwrap();
+            match outcome {
+                AttachPublish::Acked => Ok(()),
+                AttachPublish::Fails => anyhow::bail!("nats is down"),
+                AttachPublish::Hangs => std::future::pending::<anyhow::Result<()>>().await,
+                AttachPublish::Gated => {
+                    self.gate.notified().await;
+                    Ok(())
+                }
+            }
+        })
     }
 }
 
@@ -1156,6 +1214,7 @@ async fn spawn_with_app(
         member_logins: Default::default(),
         control_locator: app.control,
         realtime_logins: app.realtime_logins,
+        attach_events: Arc::new(app.attach_events),
     });
     let addr = serve(build_internal_router(state)).await;
     Internal {
@@ -3869,6 +3928,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             rt_events: rt_events.clone(),
             control: FakeLocator::default(),
             realtime_logins: Default::default(),
+            attach_events: FakeAttachEvents::default(),
         },
     )
     .await;
@@ -5730,5 +5790,250 @@ mod f2 {
         assert!(body["replication_host"].is_null(), "{body}");
         assert_eq!(body["port"], 55432);
         assert_eq!(body["password"], "auth-pw");
+    }
+}
+
+/// Carried gaps T4 (R7, P10): notify-attach publishes a tenant-attached event to JetStream
+/// (awaiting the ack) alongside the reconfigures, under the hook's one deadline; 200 only when
+/// both succeed, else 503 (the storage controller retries, so no attach goes unrecorded).
+mod t4 {
+    use super::*;
+    use chelabase_nats::{TenantAttachedEvent, TenantAttachedShard};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// The storage controller gives up on the hook after 10 s; it must answer before that.
+    const HOOK_ANSWER_WITHIN: Duration = Duration::from_millis(9_500);
+
+    async fn spawn_attach(neon: FakeNeon, locator: FakeLocator, events: FakeAttachEvents) -> Internal {
+        spawn_with_app(
+            neon,
+            locator,
+            &storcon(true).await,
+            rules(Mode::SelfHosted, false),
+            FakeCache::default(),
+            "http://127.0.0.1:9",
+            AppSetup { attach_events: events, ..AppSetup::default() },
+        )
+        .await
+    }
+
+    fn event(tenant: &str, shards: &[(u64, u8)]) -> TenantAttachedEvent {
+        TenantAttachedEvent {
+            tenant_id: tenant.to_string(),
+            shards: shards
+                .iter()
+                .map(|&(node_id, shard_number)| TenantAttachedShard { node_id, shard_number })
+                .collect(),
+            stripe_size: None,
+            preferred_az: None,
+        }
+    }
+
+    // Whatever the tenant's endpoints: a tenant no endpoint names (a fresh provision's) is
+    // published too; that is the event the worker waits for.
+    #[tokio::test]
+    async fn each_call_publishes_one_event_with_the_bodys_tenant_and_shards() {
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 200);
+        assert_eq!(events.published(), [event(TENANT, &[(1, 0)])]);
+
+        let sharded = json!({ "tenant_id": TENANT, "preferred_az": "az-1", "stripe_size": 32768,
+                              "shards": [{ "node_id": 3, "shard_number": 0 },
+                                         { "node_id": 4, "shard_number": 1 }] })
+        .to_string();
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &sharded).await, 200);
+        let mut want = event(TENANT, &[(3, 0), (4, 1)]);
+        want.stripe_size = Some(32768);
+        want.preferred_az = Some("az-1".into());
+        assert_eq!(events.published(), [event(TENANT, &[(1, 0)]), want.clone()]);
+
+        // A retry of the same notify publishes again (the stream keeps the last per tenant).
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &sharded).await, 200);
+        assert_eq!(events.published().len(), 3);
+        assert_eq!(events.published()[2], want);
+    }
+
+    // A3: only `tenant_id` is required; the rest defaults.
+    #[tokio::test]
+    async fn a_body_with_only_the_tenant_still_publishes() {
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        let body = json!({ "tenant_id": TENANT }).to_string();
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &body).await, 200);
+        assert_eq!(events.published(), [event(TENANT, &[])]);
+    }
+
+    #[tokio::test]
+    async fn a_known_tenant_is_published_and_its_computes_reconfigured() {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        let (addr, seen) = compute(200).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(neon, locator, events.clone()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 200);
+        assert_eq!(events.published(), [event(TENANT, &[(1, 0)])]);
+        assert_eq!(seen.0.lock().unwrap().len(), 1);
+    }
+
+    // The hook answers only once JetStream has acked the event: a 200 means it is recorded.
+    #[tokio::test]
+    async fn the_hook_answers_only_after_the_publish_is_acked() {
+        let events = FakeAttachEvents::with(AttachPublish::Gated);
+        let app = Arc::new(spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await);
+        let call = {
+            let app = app.clone();
+            tokio::spawn(async move { app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while events.published().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the hook never published");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!call.is_finished(), "the hook answered before the ack");
+        events.gate.notify_one();
+        assert_eq!(call.await.unwrap(), 200);
+    }
+
+    // A failed publish is retried by the storage controller: 503, even with nothing to
+    // reconfigure.
+    #[tokio::test]
+    async fn a_failed_publish_is_503_even_with_no_endpoints() {
+        let events = FakeAttachEvents::with(AttachPublish::Fails);
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 503);
+        assert_eq!(events.published().len(), 1, "it was tried once");
+    }
+
+    #[tokio::test]
+    async fn a_failed_publish_still_reconfigures_the_tenants_computes() {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        let (addr, seen) = compute(200).await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let events = FakeAttachEvents::with(AttachPublish::Fails);
+        let app = spawn_attach(neon, locator, events.clone()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 503);
+        assert_eq!(seen.0.lock().unwrap().len(), 1, "the compute was still reconfigured");
+    }
+
+    /// A compute_ctl stand-in that answers at once and records when (on the paused clock) each
+    /// `/configure` arrived.
+    async fn quick_compute() -> (SocketAddr, Arc<Mutex<Vec<Instant>>>) {
+        let at = Arc::new(Mutex::new(Vec::new()));
+        let seen = at.clone();
+        let app = Router::new()
+            .route(
+                "/status",
+                get(|| async {
+                    axum::Json(json!({ "status": "running", "capabilities": ["storage_token_refresh"] }))
+                }),
+            )
+            .route(
+                "/configure",
+                axum::routing::post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(Instant::now());
+                        (AxumStatus::OK, "{}")
+                    }
+                }),
+            );
+        (serve(app).await, at)
+    }
+
+    // A2: a publish that never acks (NATS hung) is cut at the hook's one deadline, taken at hook
+    // entry: 503 before the storage controller's 10 s, and the reconfigures ran meanwhile rather
+    // than after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_publish_answers_503_in_time_without_holding_up_the_reconfigures() {
+        let neon = FakeNeon::default();
+        neon.add("ep-a", TENANT, TIMELINE);
+        let (addr, configured) = quick_compute().await;
+        let locator = FakeLocator::default();
+        locator.running("ep-a", "172.20.0.9", Some(addr));
+        let events = FakeAttachEvents::with(AttachPublish::Hangs);
+        let app = spawn_attach(neon, locator, events.clone()).await;
+        let started = Instant::now();
+        let code = tokio::time::timeout(
+            Duration::from_secs(12),
+            app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)),
+        )
+        .await
+        .ok();
+        let took = started.elapsed();
+        assert_eq!(code, Some(503), "answered after {took:?}");
+        assert!(took < HOOK_ANSWER_WITHIN, "the hook took {took:?}");
+        assert_eq!(events.published().len(), 1);
+        let configured = configured.lock().unwrap().clone();
+        assert_eq!(configured.len(), 1, "the compute was reconfigured");
+        let after = configured[0].duration_since(started);
+        assert!(
+            after < Duration::from_secs(8),
+            "the reconfigure waited for the publish: it came {after:?} in"
+        );
+    }
+
+    // A3: a `tenant_id` that isn't a Neon id is never published (it would name another subject,
+    // or none): 503 like any unusable body.
+    #[tokio::test]
+    async fn an_invalid_tenant_id_is_503_and_publishes_nothing() {
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        for tenant in [
+            json!("11111111111111111111111111111111".to_uppercase().replace('1', "A")),
+            json!("1111111111111111111111111111111"),
+            json!("111111111111111111111111111111111"),
+            json!("1111111111111111111111111111111."),
+            json!("111111111111111111111111111111>"),
+            json!("*"),
+            json!(""),
+            json!(5),
+            json!(null),
+        ] {
+            let body = json!({ "tenant_id": tenant, "shards": [{ "node_id": 1, "shard_number": 0 }] })
+                .to_string();
+            assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &body).await, 503, "{tenant}");
+        }
+        assert!(events.published().is_empty(), "{:?}", events.published());
+    }
+
+    // A4: the event doesn't depend on the metadata: a failed endpoint lookup still publishes, and
+    // the hook answers 503 so the reconfigure is retried.
+    #[tokio::test]
+    async fn a_failed_metadata_lookup_still_publishes_then_answers_503() {
+        let neon = FakeNeon::default();
+        neon.break_it();
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(neon, FakeLocator::default(), events.clone()).await;
+        assert_eq!(app.put(ATTACH, Some(STORCON_TOKEN), &attach(TENANT)).await, 503);
+        assert_eq!(events.published(), [event(TENANT, &[(1, 0)])]);
+    }
+
+    #[tokio::test]
+    async fn the_token_check_still_comes_before_the_body_and_the_publish() {
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        assert_eq!(app.put(ATTACH, None, &attach(TENANT)).await, 401);
+        assert_eq!(app.put(ATTACH, Some(PROXY_TOKEN), &attach(TENANT)).await, 401);
+        assert_eq!(app.put(ATTACH, Some("wrong"), "not json").await, 401);
+        assert!(events.published().is_empty());
+    }
+
+    // notify-safekeepers is unchanged: it publishes nothing.
+    #[tokio::test]
+    async fn notify_safekeepers_publishes_no_attach_event() {
+        let events = FakeAttachEvents::default();
+        let app = spawn_attach(FakeNeon::default(), FakeLocator::default(), events.clone()).await;
+        let body = json!({ "tenant_id": TENANT, "timeline_id": TIMELINE, "generation": 3,
+                           "safekeepers": [{ "id": 1, "hostname": "sk1" }] })
+        .to_string();
+        assert_eq!(app.put(SAFEKEEPERS, Some(STORCON_TOKEN), &body).await, 200);
+        assert!(events.published().is_empty());
     }
 }

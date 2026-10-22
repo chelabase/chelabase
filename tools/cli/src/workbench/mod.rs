@@ -52,3 +52,6 @@ mod c5_api_tests;
 
 #[cfg(test)]
 mod c5_edge_tests;
+
+#[cfg(test)]
+mod t4_tests;

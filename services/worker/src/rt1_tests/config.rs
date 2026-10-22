@@ -83,7 +83,27 @@ fn built(config: &WorkerConfig) -> anyhow::Result<RealWorker> {
         lazy_metadata(),
         SecretKey::generate(),
         Arc::new(NoopPublisher),
+        crate::ports::AttachSource::Disabled,
     )
+}
+
+// Carried gaps T4 (P11, A8): `build` takes the attach events' source explicitly (no silent
+// default), waits up to 60 s for an attach, and a disabled source never waits.
+#[tokio::test]
+async fn build_takes_the_attach_source_and_waits_60_s() {
+    use crate::ports::{AttachWait, Storage};
+    let dir = tempfile::tempdir().unwrap();
+    let worker = built(&buildable(dir.path())).expect("build");
+    assert_eq!(worker.attach_timeout, std::time::Duration::from_secs(60));
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        worker
+            .storage
+            .wait_attached(&chelabase_neon::NeonId::new(), worker.attach_timeout),
+    )
+    .await
+    .expect("a disabled source answers at once");
+    assert!(matches!(result, AttachWait::Unavailable(_)), "{result:?}");
 }
 
 #[tokio::test]

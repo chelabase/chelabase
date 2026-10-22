@@ -30,6 +30,7 @@ async fn build_without_the_compute_ca_names_the_bootstrap() {
         metadata,
         SecretKey::generate(),
         std::sync::Arc::new(crate::rt_events::NoopPublisher),
+        crate::ports::AttachSource::Disabled,
     ) {
         Ok(_) => panic!("build succeeded without a compute CA"),
         Err(err) => format!("{err:#}"),

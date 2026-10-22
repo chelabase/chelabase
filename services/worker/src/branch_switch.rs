@@ -181,6 +181,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return Ok(());
         };
         undo.pending = Some(pending.clone());
+        // The storage client retries this create while the tenant is still attaching, for up
+        // to its schedule-retry budget (45 s), so a switch that a serial reconcile pass runs
+        // (`FinishSwitch` and the other actions) can take that much longer.
         if let Err(e) = self
             .storage
             .create_branch_timeline(&target.tenant, &pending, &parent_timeline, lsn)
@@ -291,6 +294,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     return Ok(());
                 };
                 undo.pending = Some(pending.clone());
+                // The storage client retries this create while the tenant is still attaching, for up
+                // to its schedule-retry budget (45 s), so a switch that a serial reconcile pass runs
+                // (`FinishSwitch` and the other actions) can take that much longer.
                 if let Err(e) = self
                     .storage
                     .create_branch_timeline(&target.tenant, &pending, &target.timeline, lsn)
@@ -388,7 +394,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .create(ep, &token)
             .await
             .map_err(|e| format!("starting compute: {e:#}"))?;
-        self.wait_until_ready(ep, &database_name).await?;
+        if let Err(err) = self.wait_until_ready(ep, &database_name).await {
+            self.remove_never_ready(ep, &token).await;
+            return Err(err);
+        }
+        // From here the compute got ready: a later failure keeps it (P3); it runs, and
+        // reconcile's later passes repair what failed.
         self.computes
             .admin_sql(ep, &database_name, &bootstrap_sql(self.owner_superuser))
             .await
@@ -425,6 +436,38 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             self.member_role_requests.request(branch);
         }
         resynced
+    }
+
+    /// This run's own create of `ep`'s compute (started with `token`) never got ready: its
+    /// container is removed, best effort, so it doesn't crash-loop under `unless-stopped`
+    /// and reconcile's next pass sees it gone and recreates it. Only while the endpoint still
+    /// stores this run's token (or its row is gone): a racing recreate swaps the token before
+    /// creating its own container, which is then left alone. A token that can't be read leaves
+    /// the container too; reconcile recreates a stopped one (R5). Between the token check and
+    /// the removal a racing recreate could still swap in its container; reconcile is serial and
+    /// a job moves the branch out of ready first, so none races in practice.
+    ///
+    /// Not an orphan removal: this is the worker's own compute, so it happens whatever
+    /// `CHELABASE_WORKER_REMOVE_ORPHANS` says.
+    async fn remove_never_ready(&self, ep: &str, token: &str) {
+        let ours = match self.metadata.neon_endpoint(ep).await {
+            Ok(Some(endpoint)) => endpoint.compute_token_sha256 == sha256_hex(token),
+            // Torn down meanwhile: no other run can have made a compute for a row that's gone
+            // (a recreate swaps the row's token first), and the teardown may have passed it.
+            Ok(None) => true,
+            Err(e) => {
+                warn!(endpoint_id = %ep, "the compute never got ready; reading its token to remove it: {e}");
+                return;
+            }
+        };
+        if !ours {
+            info!(endpoint_id = %ep, "the compute never got ready, but another run replaced it; leaving it");
+            return;
+        }
+        info!(endpoint_id = %ep, "the compute never got ready; removing it");
+        if let Err(e) = self.computes.delete(ep).await {
+            warn!(endpoint_id = %ep, "removing the compute that never got ready: {e:#}");
+        }
     }
 
     /// Records that `ep`'s compute runs [`COMPUTE_SETTINGS_VERSION`]'s settings. A failure
@@ -530,6 +573,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
         }
         // Even when the pending timeline stays: the branch keeps working on its current one.
+        // A container that's there but stopped is left for reconcile's `RecreateBranchCompute`
+        // once the branch is ready (R5). A recreate that never gets ready removes its
+        // container, so the next pass's look finds it missing and tries again.
         let restarted = match self.computes.status(&target.ep).await {
             Ok(Some(_)) => Ok(()),
             Ok(None) => {
@@ -1214,6 +1260,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if !deleted(current.as_ref()) {
             return Ok(false);
         }
+        // A recreate that never got ready removed its compute already: once is enough.
+        if matches!(self.computes.status(&target.ep).await, Ok(None)) {
+            info!(branch_id = %target.id, "deleted meanwhile; the compute is gone already");
+            return Ok(true);
+        }
         info!(branch_id = %target.id, "deleted meanwhile; removing the compute");
         if let Err(e) = self.computes.delete(&target.ep).await {
             warn!(endpoint_id = %target.ep, "reconcile removes this compute: {e:#}");
@@ -1222,7 +1273,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Recreates the compute unless a delete began (false then: stop, the delete job owns the
-    /// rest). A failed recreate is logged, and reconcile recreates it.
+    /// rest). A failed recreate is logged. One that never got ready removed its container,
+    /// and a later step's failure keeps a running compute, so reconcile's next passes either
+    /// recreate it (`RecreateBranchCompute`, also for a container that stopped) or repair it.
     async fn restart_unless_deleted(&self, target: &Target) -> Result<bool, String> {
         let current = self
             .metadata
@@ -1234,6 +1287,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return Ok(false);
         }
         if let Err(err) = self.recreate_compute(target.id, &target.ep).await {
+            // A never-ready compute was removed, so reconcile sees it missing and recreates it.
             warn!(endpoint_id = %target.ep, "restarting the compute failed; reconcile retries: {err}");
         }
         Ok(true)
@@ -2765,6 +2819,221 @@ mod tests {
         );
     }
 
+    // --- recreate_compute: a compute that never gets ready (carried gaps T2) -------------
+
+    /// Waits (polling every millisecond) until the journal has an entry starting with `prefix`.
+    async fn until_journal_has(journal: &Journal, prefix: &str) {
+        while !has(journal, prefix) {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    // T2 behaviour 1: the run's own create never got ready: its container is removed (it would
+    // otherwise crash-loop under `unless-stopped`, listed, and reconcile would never retry).
+    #[tokio::test]
+    async fn a_recreated_compute_that_never_gets_ready_is_removed() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+
+        assert!(
+            !w.computes.list().await.unwrap().contains(&s.dev_ep),
+            "the never-ready compute is left behind: {:?}",
+            entries(&journal)
+        );
+        assert!(err.starts_with("waiting for the compute: "), "{err}");
+        assert!(
+            pos(&journal, &format!("compute.create {}", s.dev_ep))
+                < last(&journal, &format!("compute.delete {}", s.dev_ep)),
+            "{:?}",
+            entries(&journal)
+        );
+        assert_eq!(count(&journal, &format!("compute.delete {}", s.dev_ep)), 1);
+    }
+
+    // T2 behaviour 1: a container that exits during the wait ends it at once (T14 M5); it's
+    // still this run's own create that never got ready, so it's removed too.
+    #[tokio::test]
+    async fn a_recreated_compute_that_exits_while_waited_for_is_removed() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_secs(5);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        let create = format!("compute.create {}", s.dev_ep);
+        let exits = async {
+            until_journal_has(&journal, &create).await;
+            w.computes.set_running(&s.dev_ep, false);
+        };
+
+        let (result, ()) = tokio::join!(w.recreate_compute(s.dev, &s.dev_ep), exits);
+
+        assert!(
+            !w.computes.list().await.unwrap().contains(&s.dev_ep),
+            "the exited compute is left behind: {:?}",
+            entries(&journal)
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("its container exited"), "{err}");
+    }
+
+    // T2 edge: while compute_ctl reports a live state the wait stretches to READY_CAP
+    // (provision.rs:345-354): a compute that gets ready inside the cap is kept; one still live
+    // at the cap never got ready and is removed.
+    #[tokio::test]
+    async fn a_live_compute_is_kept_until_the_cap() {
+        use chelabase_neon::reconfigure::ComputeCtlStatus;
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(20);
+        w.ready_cap = std::time::Duration::from_secs(5);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        // Well past `ready_timeout` (one status read per millisecond poll), then running.
+        w.pusher.script_statuses(
+            &s.dev_ep,
+            vec![ComputeCtlStatus::Other("configuration".into()); 80],
+        );
+
+        w.recreate_compute(s.dev, &s.dev_ep).await.unwrap();
+
+        assert!(w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert!(
+            !has(&journal, &format!("compute.delete {}", s.dev_ep)),
+            "{:?}",
+            entries(&journal)
+        );
+
+        // Live until the cap: never ready, removed.
+        w.ready_cap = std::time::Duration::from_millis(40);
+        w.computes.remove(&s.dev_ep);
+        w.pusher
+            .set_status(&s.dev_ep, ComputeCtlStatus::Other("configuration".into()));
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+        assert!(err.contains("configuration"), "{err}");
+        assert!(
+            !w.computes.list().await.unwrap().contains(&s.dev_ep),
+            "{:?}",
+            entries(&journal)
+        );
+    }
+
+    // P3: a compute that became ready and then failed a later step (role bootstrap, resync)
+    // is kept: it runs, and reconcile's later passes repair it.
+    #[tokio::test]
+    async fn a_ready_compute_that_fails_a_later_step_is_kept() {
+        const CATALOG_READ: &str = "SELECT 'r',";
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+
+        w.computes.remove(&s.dev_ep);
+        w.computes.fail_when("CREATE ROLE anon NOLOGIN");
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+        assert!(err.starts_with("bootstrapping roles: "), "{err}");
+        assert!(w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert!(!has(&journal, "compute.delete"), "{:?}", entries(&journal));
+
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some((CATALOG_READ.into(), "connection reset".into()));
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+        assert!(err.starts_with("syncing login roles: "), "{err}");
+        assert!(w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert!(!has(&journal, "compute.delete"), "{:?}", entries(&journal));
+    }
+
+    // T2 edge: only this run's own create is removed. A create that failed made nothing of
+    // this run's: the container already there (another job's) stays.
+    #[tokio::test]
+    async fn a_failed_create_removes_no_compute() {
+        let (w, journal) = worker();
+        let s = setup(&w, &journal).await;
+        *w.computes.fail_create.lock().unwrap() = Some("image missing".into());
+
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+
+        assert!(err.starts_with("starting compute: "), "{err}");
+        assert!(w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert!(!has(&journal, "compute.delete"), "{:?}", entries(&journal));
+    }
+
+    // T2 edge: a racing recreate of the same endpoint (another run) replaced the token and the
+    // container while this run waited; this run's failed wait must not remove that container.
+    #[tokio::test]
+    async fn a_failed_wait_leaves_a_compute_a_racing_recreate_made() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(200);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        let create = format!("compute.create {}", s.dev_ep);
+        let racer = async {
+            until_journal_has(&journal, &create).await;
+            // What the other run's recreate does: its token's hash first, then its container.
+            w.metadata
+                .state()
+                .endpoints
+                .get_mut(&s.dev_ep)
+                .unwrap()
+                .endpoint
+                .compute_token_sha256 = sha256_hex("theirs");
+            w.computes.create(&s.dev_ep, "theirs").await.unwrap();
+        };
+
+        let (result, ()) = tokio::join!(w.recreate_compute(s.dev, &s.dev_ep), racer);
+
+        assert!(result.is_err());
+        assert_eq!(
+            w.computes.token_of(&s.dev_ep).as_deref(),
+            Some("theirs"),
+            "the other run's compute was removed: {:?}",
+            entries(&journal)
+        );
+        assert_eq!(token_hash(&w, &s.dev_ep), sha256_hex("theirs"));
+    }
+
+    // T2 edge: reconcile's end of a reset recreates the compute; it never gets ready while a
+    // delete begins (`gone_meanwhile`, which removes the compute too): removed once, not twice.
+    #[tokio::test]
+    async fn a_never_ready_compute_of_a_branch_deleted_meanwhile_is_removed_once() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(100);
+        let s = setup(&w, &journal).await;
+        claim(&w, s.dev);
+        w.metadata
+            .state()
+            .branch_ages
+            .insert(s.dev, STALE_PROVISION_SECS + 1);
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        let create = format!("compute.create {}", s.dev_ep);
+        let delete_begins = async {
+            until_journal_has(&journal, &create).await;
+            w.metadata
+                .state()
+                .branches
+                .get_mut(&s.dev)
+                .unwrap()
+                .status = BranchStatus::Deleting;
+        };
+
+        let (result, ()) = tokio::join!(w.finish_switch(s.dev), delete_begins);
+
+        result.unwrap();
+        assert!(!w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert_eq!(
+            count(&journal, &format!("compute.delete {}", s.dev_ep)),
+            1,
+            "{:?}",
+            entries(&journal)
+        );
+        assert_eq!(w.metadata.branch(s.dev).status, BranchStatus::Deleting);
+    }
+
     // --- Skips and retries -------------------------------------------------------------
 
     #[tokio::test]
@@ -2973,5 +3242,62 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- recreate_compute: the coder's edge cases (carried gaps T2) ----------------------
+
+    // The endpoint row was torn down while the compute was waited for: nobody else can own a
+    // compute of a gone row, and the teardown may have passed it, so it's removed.
+    #[tokio::test]
+    async fn a_never_ready_compute_whose_endpoint_row_went_is_removed() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(100);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        let create = format!("compute.create {}", s.dev_ep);
+        let teardown = async {
+            until_journal_has(&journal, &create).await;
+            w.metadata.state().endpoints.remove(&s.dev_ep);
+        };
+
+        let (result, ()) = tokio::join!(w.recreate_compute(s.dev, &s.dev_ep), teardown);
+
+        assert!(result.is_err());
+        assert!(!w.computes.list().await.unwrap().contains(&s.dev_ep));
+    }
+
+    // The token can't be read to tell whose compute it is: it's left (reconcile recreates a
+    // stopped one, R5), and the wait's own error is what's returned.
+    #[tokio::test]
+    async fn a_never_ready_compute_whose_token_cant_be_read_is_left() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(20);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        w.metadata.state().fail = Some("neon_endpoint");
+
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+
+        assert!(err.starts_with("waiting for the compute: "), "{err}");
+        assert!(w.computes.list().await.unwrap().contains(&s.dev_ep));
+        assert!(!has(&journal, "compute.delete"), "{:?}", entries(&journal));
+    }
+
+    // A failed removal is only logged: the wait's error is still what's returned.
+    #[tokio::test]
+    async fn a_failed_removal_of_a_never_ready_compute_keeps_the_wait_error() {
+        let (mut w, journal) = worker();
+        w.ready_timeout = std::time::Duration::from_millis(20);
+        let s = setup(&w, &journal).await;
+        w.computes.remove(&s.dev_ep);
+        *w.computes.sql_failures_left.lock().unwrap() = u32::MAX;
+        *w.computes.fail_delete.lock().unwrap() = Some("docker is away".into());
+
+        let err = w.recreate_compute(s.dev, &s.dev_ep).await.unwrap_err();
+
+        assert!(err.starts_with("waiting for the compute: "), "{err}");
+        assert_eq!(count(&journal, &format!("compute.delete {}", s.dev_ep)), 1);
     }
 }

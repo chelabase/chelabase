@@ -156,6 +156,7 @@ pub(crate) fn rt_worker() -> Rt {
         control_plane_uri: w.control_plane_uri,
         ready_poll: w.ready_poll,
         ready_timeout: w.ready_timeout,
+        attach_timeout: w.attach_timeout,
         ready_cap: w.ready_cap,
         claim_refresh: w.claim_refresh,
         schema_check_cursor: w.schema_check_cursor,

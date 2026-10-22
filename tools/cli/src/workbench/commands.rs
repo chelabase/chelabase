@@ -862,7 +862,7 @@ fn start_stack(
     phases.run("cargo build", || cargo_build(stack, &RUST_APPS, true))?;
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
 
-    phases.run("machine keys", || {
+    let nats_auth_changed = phases.run("machine keys", || {
         let auth = crate::paths::migrate_auth_dir(&stack.main)
             .context("moving .chelabase/ui-auth to .chelabase/auth")?;
         crate::dev::bootstrap::ensure_machine_keys(
@@ -879,7 +879,7 @@ fn start_stack(
         // the compute-JWT key pair. Before any container starts: compose mounts them.
         crate::dev::stack_secrets::ensure(&keys)?;
         super::service_auth::write_storage_auth(&keys)?;
-        super::service_auth::write_auth_files(&keys, &stack.state)?;
+        let nats_auth_changed = super::service_auth::write_auth_files(&keys, &stack.state)?;
         // A demo.env from before still names the public bearers, which the apps would now
         // refuse next to their <NAME>_FILE: drop them before the front tier is created.
         let demo = stack.state.join("zitadel/demo.env");
@@ -889,7 +889,7 @@ fn start_stack(
             std::fs::write(&demo, scrubbed)
                 .with_context(|| format!("writing {}", demo.display()))?;
         }
-        Ok(())
+        Ok(nats_auth_changed)
     })?;
 
     // The env files the apps read at create time; recreated below when the bootstrap changed
@@ -901,6 +901,15 @@ fn start_stack(
     phases.run("infra, Zitadel, Mailpit and the gateway", || {
         compose_up(stack, &[], &front)
     })?;
+    // R9: a running NATS reads its auth.conf through a single-file bind mount, which keeps the
+    // old inode after the rename above: only a restart loads new users or permissions. Before
+    // the apps, so they connect with the rights they now need.
+    if nats_needs_restart(was_running, nats_auth_changed) {
+        phases.run("restarting NATS (its auth.conf changed)", || {
+            stack.compose_run(&["restart", "nats"])?;
+            compose_up(stack, &[], &["nats"])
+        })?;
+    }
 
     phases.run("Zitadel's PATs", || {
         let zitadel = stack.state.join("zitadel");
@@ -963,6 +972,13 @@ fn start_stack(
 
     record_binaries(stack, &RUST_APPS)?;
     Ok(())
+}
+
+/// Whether `up` restarts NATS (R9): only on a stack that was running (its NATS predates the
+/// render) and only when the render changed `nats/auth.conf`. A stack that wasn't running starts
+/// NATS from the new file anyway.
+pub fn nats_needs_restart(was_running: bool, auth_changed: bool) -> bool {
+    was_running && auth_changed
 }
 
 fn write_file(path: &Path, contents: &str) -> anyhow::Result<()> {

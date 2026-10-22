@@ -21,6 +21,14 @@ pub const CREATE_TIMELINE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DETACH_TIMEOUT: Duration = Duration::from_secs(600);
 const DELETE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const DELETE_POLL_ATTEMPTS: u32 = 120;
+const SCHEDULE_RETRY_BASE: Duration = Duration::from_millis(250);
+const SCHEDULE_RETRY_CAP: Duration = Duration::from_secs(2);
+/// Above storcon's own 30 s wait for a reconcile, so a create it is still working on can be
+/// asked again after it gave up.
+const SCHEDULE_RETRY_BUDGET: Duration = Duration::from_secs(45);
+/// The least an attempt may take, so a budget that is nearly (or entirely) spent still sends
+/// a request that has a chance to be answered. It is the most a create can overrun the budget.
+const MIN_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorconError {
@@ -30,6 +38,100 @@ pub enum StorconError {
     /// No answer, a timeout, a 5xx, or an answer we couldn't parse.
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+/// A 5xx answer, carried inside [`StorconError::Other`] so that every caller still sees the
+/// same variant and text, while [`StorconError::is_tenant_attaching`] can read the status.
+#[derive(Debug, thiserror::Error)]
+#[error("storage controller returned {status}: {message}")]
+struct ServerError {
+    status: StatusCode,
+    message: String,
+}
+
+impl StorconError {
+    /// The storage controller has no pageserver to place the tenant on (right after a
+    /// pageserver restart, until its next heartbeat): a 409 that clears by itself.
+    pub fn is_unschedulable(&self) -> bool {
+        match self {
+            Self::Rejected { status, message } if *status == StatusCode::CONFLICT => {
+                // `exhausted` may have appended its note.
+                let message = strip_attempts_note(message);
+                message.starts_with("Conflict: ")
+                    && (message.ends_with(": No pageserver found matching constraint")
+                        || message.ends_with(": No pageservers found"))
+            }
+            _ => false,
+        }
+    }
+
+    /// The request timed out (no answer within the per-request timeout).
+    pub fn is_request_timeout(&self) -> bool {
+        match self {
+            Self::Other(e) => e
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_timeout),
+            Self::Rejected { .. } => false,
+        }
+    }
+
+    /// The 503 a timeline create gets while its tenant is still attaching to a pageserver.
+    pub fn is_tenant_attaching(&self) -> bool {
+        match self {
+            Self::Other(e) => e.downcast_ref::<ServerError>().is_some_and(|s| {
+                s.status == StatusCode::SERVICE_UNAVAILABLE
+                    && s.message.contains("tenant active state")
+                    && s.message.contains("Attaching")
+            }),
+            Self::Rejected { .. } => false,
+        }
+    }
+
+    /// The same error with `(after N attempts in Xs)` appended to the storage controller's
+    /// message.
+    fn exhausted(self, attempts: u32, elapsed: Duration) -> Self {
+        let note = format!(
+            "(after {attempts} attempts in {:.1}s)",
+            elapsed.as_secs_f64()
+        );
+        match self {
+            Self::Rejected { status, message } => Self::Rejected {
+                status,
+                message: format!("{message} {note}"),
+            },
+            Self::Other(e) => match e.downcast::<ServerError>() {
+                Ok(s) => Self::Other(
+                    ServerError {
+                        status: s.status,
+                        message: format!("{} {note}", s.message),
+                    }
+                    .into(),
+                ),
+                Err(e) => Self::Other(e),
+            },
+        }
+    }
+}
+
+/// `message` without a trailing ` (after N attempts in X.Xs)` note added by
+/// [`StorconError::exhausted`].
+fn strip_attempts_note(message: &str) -> &str {
+    let Some(start) = message.rfind(" (after ") else {
+        return message;
+    };
+    let Some(inner) = message[start + " (after ".len()..].strip_suffix("s)") else {
+        return message;
+    };
+    let is_note = inner.split_once(" attempts in ").is_some_and(|(n, secs)| {
+        !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && secs.split_once('.').is_some_and(|(whole, frac)| {
+                !whole.is_empty()
+                    && !frac.is_empty()
+                    && whole.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+            })
+    });
+    if is_note { &message[..start] } else { message }
 }
 
 impl From<reqwest::Error> for StorconError {
@@ -124,6 +226,10 @@ pub struct StorconClient {
     detach_timeout: Duration,
     delete_poll_interval: Duration,
     delete_poll_attempts: u32,
+    schedule_retry_base: Duration,
+    schedule_retry_cap: Duration,
+    schedule_retry_budget: Duration,
+    timeline_retry_budget: Duration,
     /// The NeonJWT sent as `Authorization: Bearer` on every request (scope `admin`).
     token: Option<String>,
 }
@@ -154,6 +260,10 @@ impl StorconClient {
             detach_timeout: DETACH_TIMEOUT,
             delete_poll_interval: DELETE_POLL_INTERVAL,
             delete_poll_attempts: DELETE_POLL_ATTEMPTS,
+            schedule_retry_base: SCHEDULE_RETRY_BASE,
+            schedule_retry_cap: SCHEDULE_RETRY_CAP,
+            schedule_retry_budget: SCHEDULE_RETRY_BUDGET,
+            timeline_retry_budget: CREATE_TIMELINE_TIMEOUT,
         }
     }
 
@@ -189,21 +299,105 @@ impl StorconClient {
         self
     }
 
+    /// How a tenant create and a timeline create retry the refusals that clear by themselves
+    /// (no schedulable pageserver; tenant still attaching): exponential backoff from `base`
+    /// doubling up to `cap`, each wait random between half the step and all of it, for at
+    /// most `budget` in all (defaults 250 ms, 2 s, 45 s, above storcon's own 30 s reconcile
+    /// wait; this sets the timeline create's budget too, whose default is 120 s, see
+    /// [`Self::with_timeline_retry_budget`]). Each attempt's timeout is capped at what is left of the budget (at least
+    /// 250 ms), so a create overruns the budget by at most that. A tenant create also retries
+    /// a request timeout (it is idempotent, a lost success included). A zero budget sends one
+    /// request.
+    pub fn with_schedule_retry(mut self, base: Duration, cap: Duration, budget: Duration) -> Self {
+        self.schedule_retry_base = base;
+        self.schedule_retry_cap = cap;
+        self.schedule_retry_budget = budget;
+        self.timeline_retry_budget = budget;
+        self
+    }
+
+    /// The budget of a timeline create alone (default 120 s, [`CREATE_TIMELINE_TIMEOUT`]: one
+    /// slow request may use all of it, and the Attaching 503 retries share it). Set it after
+    /// [`Self::with_schedule_retry`], which sets both budgets.
+    pub fn with_timeline_retry_budget(mut self, budget: Duration) -> Self {
+        self.timeline_retry_budget = budget;
+        self
+    }
+
+    /// Runs `op` (one request per call) again while `retryable` holds for its error, with the
+    /// backoff of [`Self::with_schedule_retry`], until the budget is spent. Dropping the
+    /// future between attempts leaves nothing behind.
+    async fn retry_transient<T, Fut>(
+        &self,
+        what: &str,
+        tenant: &NeonId,
+        retryable: fn(&StorconError) -> bool,
+        budget: Duration,
+        request_timeout: Duration,
+        mut op: impl FnMut(Duration) -> Fut,
+    ) -> Result<T, StorconError>
+    where
+        Fut: std::future::Future<Output = Result<T, StorconError>>,
+    {
+        let started = Instant::now();
+        let mut attempt: u32 = 1;
+        loop {
+            let left = budget.saturating_sub(started.elapsed());
+            let attempt_timeout = request_timeout.min(left.max(MIN_ATTEMPT_TIMEOUT));
+            let err = match op(attempt_timeout).await {
+                Err(e) if retryable(&e) => e,
+                other => return other,
+            };
+            let elapsed = started.elapsed();
+            if elapsed >= budget {
+                if attempt == 1 {
+                    return Err(err);
+                }
+                tracing::warn!(%tenant, attempt, ?elapsed, "{what}: giving up: {err}");
+                return Err(err.exhausted(attempt, elapsed));
+            }
+            tracing::info!(%tenant, attempt, ?elapsed, "{what}: retrying: {err}");
+            let shift = (attempt - 1).min(20);
+            let ceiling = self
+                .schedule_retry_base
+                .saturating_mul(1 << shift)
+                .min(self.schedule_retry_cap);
+            let delay = (ceiling / 2 + jitter(ceiling / 2)).min(budget - elapsed);
+            tokio::time::sleep(delay).await;
+            attempt += 1;
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
     }
 
+    /// Creates the tenant; idempotent, so it is retried while the controller has no
+    /// schedulable pageserver (see [`Self::with_schedule_retry`]).
     pub async fn create_tenant(&self, tenant: &NeonId) -> Result<(), StorconError> {
-        let resp = self
-            .http
-            .post(self.url("/v1/tenant"))
-            .json(&json!({
-                "new_tenant_id": tenant,
-                "placement_policy": { "Attached": self.tenant_secondaries },
-            }))
-            .send()
-            .await?;
-        check(resp).await.map(drop)
+        let body = json!({
+            "new_tenant_id": tenant,
+            "placement_policy": { "Attached": self.tenant_secondaries },
+        });
+        let body = &body;
+        self.retry_transient(
+            "create tenant",
+            tenant,
+            |e| e.is_unschedulable() || e.is_request_timeout(),
+            self.schedule_retry_budget,
+            self.request_timeout,
+            |timeout| async move {
+                let resp = self
+                    .http
+                    .post(self.url("/v1/tenant"))
+                    .timeout(timeout)
+                    .json(&body)
+                    .send()
+                    .await?;
+                check(resp).await.map(drop)
+            },
+        )
+        .await
     }
 
     pub async fn describe_tenant(&self, tenant: &NeonId) -> Result<TenantDescribe, StorconError> {
@@ -238,14 +432,26 @@ impl StorconClient {
                 "pg_version": pg_version,
             }),
         };
-        let resp = self
-            .http
-            .post(self.url(&format!("/v1/tenant/{tenant}/timeline")))
-            .timeout(self.create_timeline_timeout)
-            .json(&body)
-            .send()
-            .await?;
-        Ok(check(resp).await?.json().await?)
+        // The Attaching 503 clears once the pageserver has loaded the tenant.
+        let body = &body;
+        self.retry_transient(
+            "create timeline",
+            tenant,
+            StorconError::is_tenant_attaching,
+            self.timeline_retry_budget,
+            self.create_timeline_timeout,
+            |timeout| async move {
+                let resp = self
+                    .http
+                    .post(self.url(&format!("/v1/tenant/{tenant}/timeline")))
+                    .timeout(timeout)
+                    .json(&body)
+                    .send()
+                    .await?;
+                Ok(check(resp).await?.json().await?)
+            },
+        )
+        .await
     }
 
     pub async fn get_timeline(
@@ -475,34 +681,52 @@ impl StorconClient {
     }
 
     /// Deletion is asynchronous: the storage controller answers 202 while it is in
-    /// progress and 200 once the object is gone (404, or any other 2xx, also means gone).
+    /// progress and 200 once the object is gone (404, or any other 2xx, also means gone). A
+    /// 409 saying no pageserver is schedulable (right after a restart) counts as a 202.
     /// The whole wait is bounded by attempts × interval plus one request timeout, so a
     /// controller that answers 202 slowly can't stretch it out.
     async fn delete_until_gone(&self, url: String) -> Result<(), StorconError> {
+        let mut last_conflict: Option<StorconError> = None;
         let deadline = Instant::now()
             + self.delete_poll_interval * self.delete_poll_attempts
             + self.request_timeout;
         for attempt in 1..=self.delete_poll_attempts {
             let resp = tokio::time::timeout_at(deadline, self.http.delete(&url).send())
                 .await
-                .map_err(|_| anyhow::anyhow!("timed out waiting for deletion of {url}"))??;
+                .map_err(|_| timed_out(&url, last_conflict.as_ref()))??;
             match resp.status() {
-                StatusCode::ACCEPTED => {
-                    if attempt < self.delete_poll_attempts {
-                        tokio::time::sleep_until(
-                            (Instant::now() + self.delete_poll_interval).min(deadline),
-                        )
-                        .await;
-                    }
-                }
+                StatusCode::ACCEPTED => {}
                 StatusCode::NOT_FOUND => return Ok(()),
                 status if status.is_success() => return Ok(()),
                 _ => {
-                    check(resp).await?;
+                    let err = tokio::time::timeout_at(deadline, check(resp))
+                        .await
+                        .map_err(|_| timed_out(&url, last_conflict.as_ref()))?
+                        .expect_err("a non-success status is an error");
+                    if !err.is_unschedulable() {
+                        return Err(err);
+                    }
+                    tracing::info!(%url, attempt, "delete: no schedulable pageserver, asking again");
+                    last_conflict = Some(err);
                 }
             }
+            if attempt < self.delete_poll_attempts {
+                tokio::time::sleep_until(
+                    (Instant::now() + self.delete_poll_interval).min(deadline),
+                )
+                .await;
+            }
         }
-        Err(anyhow::anyhow!("timed out waiting for deletion of {url}").into())
+        Err(timed_out(&url, last_conflict.as_ref()).into())
+    }
+}
+
+/// The error of a delete that ran out of time, with the last "no schedulable pageserver" 409
+/// it saw, if any.
+fn timed_out(url: &str, last_conflict: Option<&StorconError>) -> anyhow::Error {
+    match last_conflict {
+        Some(e) => anyhow::anyhow!("timed out waiting for deletion of {url} (last answer: {e})"),
+        None => anyhow::anyhow!("timed out waiting for deletion of {url}"),
     }
 }
 
@@ -520,8 +744,19 @@ async fn check(resp: reqwest::Response) -> Result<reqwest::Response, StorconErro
     if status.is_client_error() {
         Err(StorconError::Rejected { status, message })
     } else {
-        Err(anyhow::anyhow!("storage controller returned {status}: {message}").into())
+        Err(StorconError::Other(ServerError { status, message }.into()))
     }
+}
+
+/// A uniformly random duration in `0..=ceiling`.
+fn jitter(ceiling: Duration) -> Duration {
+    let nanos = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX);
+    if nanos == 0 {
+        return Duration::ZERO;
+    }
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).expect("OS random number generator");
+    Duration::from_nanos(u64::from_le_bytes(bytes) % nanos.saturating_add(1))
 }
 
 #[cfg(test)]
@@ -541,5 +776,79 @@ mod tests {
     #[test]
     fn head_lsn_higher_commit_wins() {
         assert_eq!(head_lsn(Lsn(0x100), Some(Lsn(0x180))), Lsn(0x180));
+    }
+
+    fn attaching() -> StorconError {
+        StorconError::Other(
+            ServerError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message:
+                    "Timed out waiting 5s for tenant active state. Latest state: Some(Attaching)"
+                        .into(),
+            }
+            .into(),
+        )
+    }
+
+    #[test]
+    fn a_5xx_keeps_its_text_and_variant() {
+        let err = attaching();
+        assert!(matches!(err, StorconError::Other(_)));
+        assert!(
+            err.to_string()
+                .starts_with("storage controller returned 503 Service Unavailable: ")
+        );
+    }
+
+    #[test]
+    fn an_exhausted_error_keeps_its_class() {
+        let err = attaching().exhausted(4, Duration::from_secs(30));
+        assert!(err.is_tenant_attaching(), "{err}");
+        assert!(
+            err.to_string().ends_with("(after 4 attempts in 30.0s)"),
+            "{err}"
+        );
+        let conflict = StorconError::Rejected {
+            status: StatusCode::CONFLICT,
+            message: "Conflict: x: No pageservers found".into(),
+        }
+        .exhausted(2, Duration::from_millis(1500));
+        assert!(matches!(conflict, StorconError::Rejected { .. }));
+        assert!(
+            conflict
+                .to_string()
+                .contains("No pageservers found (after 2 attempts in 1.5s)")
+        );
+    }
+
+    /// M2: the appended note must not change what the predicates see.
+    #[test]
+    fn an_exhausted_error_is_still_unschedulable() {
+        for tail in ["No pageserver found matching constraint", "No pageservers found"] {
+            let err = StorconError::Rejected {
+                status: StatusCode::CONFLICT,
+                message: format!("Conflict: Failed to schedule shard(s): {tail}"),
+            };
+            assert!(err.is_unschedulable());
+            let err = err.exhausted(3, Duration::from_secs(2));
+            assert!(err.is_unschedulable(), "{err}");
+            assert!(err.to_string().ends_with("(after 3 attempts in 2.0s)"), "{err}");
+        }
+        // Other conflicts stay what they are.
+        let other = StorconError::Rejected {
+            status: StatusCode::CONFLICT,
+            message: "Conflict: tenant already exists".into(),
+        }
+        .exhausted(3, Duration::from_secs(2));
+        assert!(!other.is_unschedulable());
+    }
+
+    #[test]
+    fn jitter_stays_within_the_ceiling() {
+        assert_eq!(jitter(Duration::ZERO), Duration::ZERO);
+        for _ in 0..1000 {
+            assert!(jitter(Duration::from_millis(5)) <= Duration::from_millis(5));
+        }
+        assert!(jitter(Duration::MAX) <= Duration::from_nanos(u64::MAX));
     }
 }

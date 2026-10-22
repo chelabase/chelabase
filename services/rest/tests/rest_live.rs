@@ -97,6 +97,9 @@ async fn setup() -> (RealWorker, MetadataClient) {
         metadata.clone(),
         key,
         std::sync::Arc::new(worker::rt_events::NoopPublisher),
+        // No attach wait: these tests don't restart a pageserver (R8 then creates the timeline
+        // at once, as before T4).
+        worker::ports::AttachSource::Disabled,
     )
     .expect("worker");
     (worker, metadata)

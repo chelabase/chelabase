@@ -750,29 +750,54 @@ async fn branch_right_after_a_pageserver_restart_sees_the_last_write() {
 
     let outcome = tokio::spawn({
         let (worker, metadata) = (worker.clone(), metadata.clone());
-        async move { stale_head_story(&worker, &metadata, id, &name).await }
+        async move {
+            stale_head_story(&worker, &metadata, id, &name).await;
+            // Right after the pageserver's re-attach the storage controller may not schedule
+            // it yet; the client retries that (T1), so the delete is plain.
+            worker.handle_delete(id).await.expect("handle_delete");
+        }
+    })
+    .await;
+    // A panic inside the task is caught here, so the cleanup below always runs.
+    if let Err(panic) = outcome {
+        cleanup(&worker, &metadata, id).await;
+        std::panic::resume_unwind(panic.into_panic());
+    }
+    sqlx_delete(&metadata, id).await.unwrap();
+}
+
+/// A provision (tenant create) right after a pageserver restart succeeds: the storage
+/// controller may still hold the restarted pageserver unschedulable, and the client retries
+/// that. The test asserts the provision succeeds, not that a retry happened.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn provision_right_after_a_pageserver_restart_succeeds() {
+    let (worker, metadata, _config) = setup().await;
+    let worker = Arc::new(worker);
+    let id = DatabaseId::new();
+    let name = format!("live-{}", &id.to_string()[..8]);
+    metadata
+        .insert_database_pending(id, DEMO_TENANT_ID.into(), DEMO_PROJECT_ID.into(), &name)
+        .await
+        .expect("insert pending database");
+
+    let outcome = tokio::spawn({
+        let (worker, metadata) = (worker.clone(), metadata.clone());
+        async move {
+            docker("restart", &pageserver_container()).await;
+            tokio::time::timeout(Duration::from_secs(120), worker.handle_provision(id, &name))
+                .await
+                .expect("provision took over 120 s")
+                .expect("handle_provision right after the restart");
+            let record = metadata.get_database(id).await.unwrap().unwrap();
+            assert_eq!(record.status, DatabaseStatus::Ready, "{:?}", record.error);
+            worker.handle_delete(id).await.expect("handle_delete");
+        }
     })
     .await;
     if let Err(panic) = outcome {
         cleanup(&worker, &metadata, id).await;
         std::panic::resume_unwind(panic.into_panic());
-    }
-    // After the pageserver's re-attach the storage controller holds it "warming up" (not
-    // schedulable) until its next heartbeat, a few seconds; a tenant delete needs it
-    // schedulable. Waiting here also leaves the stack settled for the next test.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        match worker.handle_delete(id).await {
-            Ok(()) => break,
-            Err(e)
-                if format!("{e:?}").contains("No pageserver found matching constraint")
-                    && Instant::now() < deadline =>
-            {
-                println!("delete waits for the pageserver to be schedulable: {e:?}");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            Err(e) => panic!("handle_delete: {e:?}"),
-        }
     }
     sqlx_delete(&metadata, id).await.unwrap();
 }

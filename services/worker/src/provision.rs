@@ -12,7 +12,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::names::sanitize_db_name;
-use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
+use crate::ports::{AttachWait, CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::reconcile::should_abort_provision;
 use crate::{OWNER_ROLE, Worker, credentials};
 
@@ -23,6 +23,12 @@ pub const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60
 /// `configuration_pending`, …): longer than RT3-14's 2-minute migration timeout, so a compute
 /// that is migrating isn't given up on at [`READY_TIMEOUT`].
 pub const READY_CAP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a provision waits for its new tenant's attach event (the worker's `attach_timeout`
+/// in production). The storage controller notifies right after the tenant's first attach, so
+/// this only runs out when that attach is late (a pageserver restarting: its next heartbeat, a
+/// few seconds) or the event can't come; the timeline create is tried anyway then (R8).
+pub const ATTACH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Whether compute_ctl's `failed` error is a migration failure that no retry fixes
 /// (`migration N failed: …`, `migrations could not run: …`, U3): the wait ends at once. Any
@@ -256,6 +262,33 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if let Err(err) = self.handle_database_settings(id).await {
             warn!(database_id = %id, "applying the history window failed; reconcile retries: {err}");
         }
+        // The storage controller may answer the tenant create before the tenant is attached
+        // (a reconcile cut short by a restarting pageserver): a timeline create then 404s. Its
+        // attach notice (the orchestrator's event) says the pageservers answer for the tenant.
+        // The event gates; the timeline create stays the authority, so a wait that ends without
+        // it is a warning and the create is tried once anyway (R8).
+        let phase = Instant::now();
+        match self
+            .storage
+            .wait_attached(&rec.tenant, self.attach_timeout)
+            .await
+        {
+            AttachWait::Attached => {}
+            AttachWait::TimedOut => warn!(
+                database_id = %id,
+                tenant = %rec.tenant,
+                "no attach event for tenant {} within {:?}; creating the timeline anyway",
+                rec.tenant,
+                self.attach_timeout
+            ),
+            AttachWait::Unavailable(why) => warn!(
+                database_id = %id,
+                tenant = %rec.tenant,
+                "couldn't wait for tenant {}'s attach event ({why}); creating the timeline anyway",
+                rec.tenant
+            ),
+        }
+        phase_done(ep, "wait_attached", phase);
         let phase = Instant::now();
         self.storage
             .create_timeline(&rec.tenant, &rec.timeline)
@@ -524,6 +557,23 @@ mod tests {
         let id = w.metadata.insert_database(name, DatabaseStatus::Pending);
         w.handle_provision(id, name).await.unwrap();
         id
+    }
+
+    // T4 coder: a failed history-window PATCH (reconcile retries it) doesn't skip the attach
+    // wait: the tenant exists either way, and the timeline create still waits for its attach.
+    #[tokio::test]
+    async fn a_failed_history_window_patch_still_waits_for_the_attach() {
+        let (w, journal) = worker();
+        *w.storage.fail.lock().unwrap() = Some("patch_tenant_config");
+        let id = provision(&w, "app").await;
+        assert_eq!(w.metadata.database(id).status, DatabaseStatus::Ready);
+        assert!(
+            pos(&journal, "storage.create_tenant") < pos(&journal, "storage.wait_attached")
+                && pos(&journal, "storage.wait_attached")
+                    < pos(&journal, "storage.create_timeline"),
+            "{:?}",
+            entries(&journal)
+        );
     }
 
     /// T14 M5: a compute that exited (or vanished) is waited for no longer; one still starting

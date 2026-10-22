@@ -134,6 +134,11 @@ pub trait ComputeBackend: ComputeLocator {
     /// Endpoint ids of every one of this stack's computes (ENDPOINT_LABEL and STACK_LABEL),
     /// running or not.
     fn list(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
+    /// Endpoint ids of this stack's computes whose container exists but isn't running: Docker
+    /// state `exited`, `dead` or `restarting` (a crash loop under `unless-stopped`). Never
+    /// `created` (an in-flight create passes through it), `running`, `paused` or `removing`.
+    /// A listing that fails is an error, never an empty list.
+    fn list_not_running(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
     /// Runs `sql` (stdin) with psql inside the compute, as `opts.user` (`cloud_admin` when
     /// `None`); returns stdout. A call that outlasts `opts.timeout` fails with [`SqlTimedOut`]
     /// (tell it by [`is_timeout`], never by the text), and the psql inside the compute keeps
@@ -265,6 +270,55 @@ fn is_status(err: &DockerError, code: u16) -> bool {
     matches!(err, DockerError::DockerResponseServerError { status_code, .. } if *status_code == code)
 }
 
+/// Removes container `name` (or id), forced, with its anonymous volumes; one already gone is
+/// fine.
+async fn remove_container(docker: &Docker, name: &str) -> Result<(), DockerError> {
+    let options = RemoveContainerOptions {
+        force: true,
+        v: true,
+        link: false,
+    };
+    match docker.remove_container(name, Some(options)).await {
+        Err(e) if is_status(&e, 404) => Ok(()),
+        other => other,
+    }
+}
+
+/// R4: removes a container `create` made if `create`'s future is dropped (a caller's timeout,
+/// a cancelled job) before it returns. It can't wait in `Drop`, so the removal is spawned on
+/// the runtime, best effort; [`RemoveOnDrop::disarm`] before every return.
+struct RemoveOnDrop {
+    /// `None` once disarmed.
+    docker: Option<Docker>,
+    id: String,
+    name: String,
+}
+
+impl RemoveOnDrop {
+    fn disarm(&mut self) {
+        self.docker = None;
+    }
+}
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let Some(docker) = self.docker.take() else {
+            return;
+        };
+        let (id, name) = (std::mem::take(&mut self.id), std::mem::take(&mut self.name));
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(container = %name, id = %id, "compute create dropped outside a runtime; its container stays");
+            return;
+        };
+        tracing::info!(container = %name, id = %id, "compute create dropped; removing its container");
+        runtime.spawn(async move {
+            if let Err(e) = remove_container(&docker, &id).await {
+                tracing::warn!(container = %name, id = %id, "removing the container of a dropped create: {e}");
+            }
+        });
+    }
+}
+
 /// Environment variables for admin_sql execution.
 #[cfg(test)]
 fn admin_exec_env() -> Vec<String> {
@@ -390,15 +444,7 @@ impl DockerBackend {
     }
 
     async fn remove(&self, name: &str) -> Result<(), DockerError> {
-        let options = RemoveContainerOptions {
-            force: true,
-            v: true,
-            link: false,
-        };
-        match self.docker().remove_container(name, Some(options)).await {
-            Err(e) if is_status(&e, 404) => Ok(()),
-            other => other,
-        }
+        remove_container(self.docker(), name).await
     }
 
     async fn run_exec(
@@ -517,6 +563,18 @@ impl ComputeBackend for DockerBackend {
             other => other,
         }
         .with_context(|| format!("creating container {name}"))?;
+        // From here the container exists: if this future is dropped before it returns, the
+        // guard removes it (R4). Removed by id, so a later create of the same name is safe.
+        // Not covered: a future dropped while `create_container` itself is in flight (Docker
+        // may finish the create after the request is abandoned), or during the name-conflict
+        // path's removal or second create. Both windows are tiny (one local API round trip),
+        // and a container left that way is never started, so it serves nothing; the next
+        // `create` of the endpoint replaces it through the name-conflict path.
+        let mut guard = RemoveOnDrop {
+            docker: Some(self.docker().clone()),
+            id: created.id.clone(),
+            name: name.clone(),
+        };
         // Everything after the container exists: a failure removes it again (best effort; the
         // step's own error is what the caller sees), so no stopped container is left behind.
         let steps = async {
@@ -545,8 +603,11 @@ impl ComputeBackend for DockerBackend {
         };
         if let Err(e) = steps.await {
             let _ = self.remove(&created.id).await;
+            // Disarmed only once the removal ran: a drop during it still removes.
+            guard.disarm();
             return Err(e);
         }
+        guard.disarm();
         Ok(())
     }
 
@@ -587,6 +648,32 @@ impl ComputeBackend for DockerBackend {
             .context("listing compute containers")?;
         Ok(containers
             .into_iter()
+            .filter_map(|c| c.labels?.remove(ENDPOINT_LABEL))
+            .collect())
+    }
+
+    async fn list_not_running(&self) -> anyhow::Result<Vec<String>> {
+        use bollard::models::ContainerSummaryStateEnum as State;
+        const NOT_RUNNING: [State; 3] = [State::EXITED, State::DEAD, State::RESTARTING];
+        let mut filters = list_filters(&self.settings.stack);
+        filters.insert(
+            "status".to_string(),
+            NOT_RUNNING.iter().map(|s| s.to_string()).collect(),
+        );
+        let containers = self
+            .docker()
+            .list_containers(Some(ListContainersOptions {
+                all: true,
+                filters: Some(filters),
+                ..Default::default()
+            }))
+            .await
+            .context("listing compute containers that aren't running")?;
+        // Checked again here, so an engine that ignores a filter never makes a running (or
+        // still being created) compute look stopped.
+        Ok(containers
+            .into_iter()
+            .filter(|c| c.state.is_some_and(|s| NOT_RUNNING.contains(&s)))
             .filter_map(|c| c.labels?.remove(ENDPOINT_LABEL))
             .collect())
     }
@@ -868,6 +955,17 @@ pub mod fake {
 
         async fn list(&self) -> anyhow::Result<Vec<String>> {
             let mut ids: Vec<String> = lock(&self.computes).keys().cloned().collect();
+            ids.sort();
+            Ok(ids)
+        }
+
+        /// The computes set not running ([`FakeBackend::set_running`]), sorted.
+        async fn list_not_running(&self) -> anyhow::Result<Vec<String>> {
+            let mut ids: Vec<String> = lock(&self.computes)
+                .iter()
+                .filter(|(_, c)| !c.running)
+                .map(|(id, _)| id.clone())
+                .collect();
             ids.sort();
             Ok(ids)
         }

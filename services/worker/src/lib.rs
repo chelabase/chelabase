@@ -57,6 +57,8 @@ pub mod rt_events;
 pub mod safekeepers;
 pub mod schema_base;
 pub mod settings;
+#[cfg(test)]
+mod t4_tests;
 pub mod token_refresh;
 
 /// The role that owns every database, and whose password is revealed.
@@ -93,6 +95,9 @@ pub struct Worker<M, S, C, N, P> {
     /// How far the wait stretches while compute_ctl reports a live state (5 minutes in
     /// production).
     pub ready_cap: Duration,
+    /// How long a provision waits for its new tenant's attach event before creating the
+    /// timeline anyway (60 s in production; carried gaps T4, R8).
+    pub attach_timeout: Duration,
     /// How often a long reset or restore step refreshes the branch's claim (60 s in
     /// production), well inside reconcile's stale threshold.
     pub claim_refresh: Duration,

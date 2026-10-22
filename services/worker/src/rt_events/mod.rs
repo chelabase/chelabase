@@ -430,6 +430,10 @@ impl<B: ComputeBackend, M: WorkerMetadata> ComputeBackend for StoppingBackend<B,
         self.inner.list().await
     }
 
+    async fn list_not_running(&self) -> anyhow::Result<Vec<String>> {
+        self.inner.list_not_running().await
+    }
+
     async fn admin_sql_with(
         &self,
         endpoint_id: &str,

@@ -7,7 +7,26 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Neon fork round 4 (2026-10-22, in progress: tested, waiting for the user's go to merge)
+## Carried gaps: provisioning through a pageserver restart, no leaked computes (2026-10-22, in progress: tested, waiting for the user's go to merge)
+
+Branch `carried-gaps`; plan `docs/superpowers/plans/2026-10-22-carried-gaps.md`. No fork change.
+
+### A database created right after a pageserver restart just works
+
+- **Problem:** in the first seconds after a pageserver restart, the upstream storage controller refuses tenant create and delete with a 409 ("No pageserver found matching constraint"), answers a timeline create with a 503 ("tenant … Attaching"), and can answer a tenant create with 201 before the tenant is attached (the attach was cancelled by the pageserver's re-attach), so the next timeline create gets a 404. The worker took each of these as final, so the database failed.
+- **What we built:**
+  - The worker's storage-controller client retries only those transient answers, with bounded, jittered backoff (tenant create 45 s, above the controller's own 30 s reconcile wait; timeline create 120 s); every other refusal stays final.
+  - Event-driven attach: the storage controller's attach notification is published on a JetStream stream, and provisioning waits for the new tenant's attach event before creating its timeline (no polling). If the event doesn't come, it warns and tries once.
+  - Least-privilege NATS rights for the new stream (the worker can read only one tenant's subject; nobody can delete it), and `workbench up` restarts NATS when its permissions change.
+- **Evidence:** `storcon_mock` (68 tests: retries, budgets, cancellation); `attach_events_live` 6/6, `permissions_live` 22/22; `branch_live` 5/5, including `provision_right_after_a_pageserver_restart_succeeds`, which reproduced the 404 before the attach event existed.
+
+### Computes the worker can't make ready don't linger
+
+- **Problem:** a compute the worker recreated but that never became ready stayed behind and restarted forever (seen in fork round 4's live pass); reconcile only recreated missing computes, not stopped ones.
+- **What we built:** the worker removes its own never-ready compute (only while the stored token is still its own); reconcile recreates a compute that exists but isn't running (re-checked just before acting, so one Docker brought back is left alone); a Ready branch whose tenant is gone from the storage controller is reported, never churned; an abandoned compute create removes its container.
+- **Evidence:** worker unit tests over the fakes (888), `docker_backend_cleanup_mock`, `docker_backend_live` 3/3, `compute_fork_live` 11/11.
+
+## Neon fork round 4 (2026-10-22, shipped: merged into `main` `fafb3275`)
 
 Branch `neon-fork-round-4`; fork `chelabase/neon` `round-4` `0741b56de`, `chelabase/postgres` `round-4-v17` `7812d66fe85`; plan and full history `docs/superpowers/plans/2026-10-21-neon-fork-round-4.md`. The upstream Neon base passes secrets through the environment and leaves several storage routes open; these are ours.
 

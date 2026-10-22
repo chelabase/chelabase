@@ -18,7 +18,7 @@ use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::role_settings::RoleSettings;
 
 use crate::Worker;
-use crate::ports::{HttpPusher, RealStorage};
+use crate::ports::{AttachSource, HttpPusher, RealStorage};
 use crate::rt_events::{PublishingMetadata, RtPublisher, StoppingBackend};
 use crate::safekeepers::SafekeeperSet;
 
@@ -378,12 +378,15 @@ fn read_realtime_password(file: &Path) -> anyhow::Result<String> {
 
 /// Wires the real ports. Nothing is contacted: Docker, Valkey and the storage controller are
 /// reached on first use. `publisher` carries realtime's events (S20: the process's NATS, or a
-/// no-op or the runner's NATS in tests); `build` never connects NATS itself.
+/// no-op or the runner's NATS in tests); `attach` is where provisions read the tenant-attached
+/// events (the process's JetStream, or [`AttachSource::Disabled`]: given explicitly, A8). `build`
+/// never connects NATS itself.
 pub fn build(
     config: &WorkerConfig,
     metadata: MetadataClient,
     key: SecretKey,
     publisher: Arc<dyn RtPublisher>,
+    attach: AttachSource,
 ) -> anyhow::Result<RealWorker> {
     // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
@@ -440,6 +443,7 @@ pub fn build(
                     })
                     .collect(),
             ),
+            attach,
         },
         computes: StoppingBackend::new(
             DockerBackend::connect(ComputeSettings {
@@ -462,6 +466,7 @@ pub fn build(
         ready_poll: Duration::from_millis(500),
         ready_timeout: crate::provision::READY_TIMEOUT,
         ready_cap: crate::provision::READY_CAP,
+        attach_timeout: crate::provision::ATTACH_TIMEOUT,
         claim_refresh: DEFAULT_CLAIM_REFRESH,
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
@@ -803,6 +808,7 @@ mod tests {
             metadata,
             SecretKey::generate(),
             Arc::new(crate::rt_events::NoopPublisher),
+            crate::ports::AttachSource::Disabled,
         ) {
             Ok(_) => panic!("build succeeded without JWT keys"),
             Err(err) => format!("{err:#}"),

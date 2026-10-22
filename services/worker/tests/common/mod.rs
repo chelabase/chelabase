@@ -9,6 +9,7 @@ use chelabase_neon::{ComputeBackend, NeonId};
 use chelabase_secrets::SecretKey;
 use chelabase_types::DatabaseId;
 use worker::config::{RealWorker, WorkerConfig, build};
+use worker::ports::AttachSource;
 use worker::rt_events::{NoopPublisher, RtPublisher};
 
 pub fn workspace_root() -> PathBuf {
@@ -111,7 +112,15 @@ pub async fn setup_with(
     .expect("metadata database");
     let key =
         SecretKey::from_env().expect("CHELABASE_SECRETS_KEY (run through just workbench test)");
-    let worker = build(&config, metadata.clone(), key, publisher).expect("worker");
+    // Carried gaps T4: provisions wait for the stack orchestrator's attach events, read with
+    // the runner's NATS credentials (it has the worker's rights).
+    let nats = chelabase_nats::connect(
+        &chelabase_nats::NatsConfig::from_env().expect("the runner's NATS config"),
+    )
+    .await
+    .expect("NATS reachable (run through just workbench test)");
+    let attach = AttachSource::Nats(async_nats::jetstream::new(nats));
+    let worker = build(&config, metadata.clone(), key, publisher, attach).expect("worker");
     (worker, metadata, config)
 }
 
@@ -128,6 +137,23 @@ pub async fn cleanup(worker: &RealWorker, metadata: &MetadataClient, id: Databas
             let _ = worker.storage.storcon.delete_tenant(&tenant).await;
         }
         let _ = metadata.delete_endpoint(&ep).await;
+    }
+    // `branches.endpoint_id` is ON DELETE SET NULL, so endpoints no branch links to would stay
+    // behind: sweep every endpoint of the database's tenant.
+    if let Ok(Some(record)) = metadata.get_database(id).await
+        && let Some(tenant_hex) = record.neon_tenant_id.as_deref()
+    {
+        for ep in metadata
+            .neon_endpoints_for_tenant(tenant_hex)
+            .await
+            .unwrap_or_default()
+        {
+            let _ = worker.computes.delete(&ep).await;
+            let _ = metadata.delete_endpoint(&ep).await;
+        }
+        if let Ok(tenant) = tenant_hex.parse::<NeonId>() {
+            let _ = worker.storage.storcon.delete_tenant(&tenant).await;
+        }
     }
     let _ = sqlx_delete(metadata, id).await;
 }

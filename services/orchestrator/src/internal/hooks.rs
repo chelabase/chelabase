@@ -4,25 +4,40 @@
 //! gets a fresh spec. The storage controller retries 503 and treats 400/401/403 as fatal, so
 //! our own failures are always 503, an unparseable body included (the `Json` extractor would
 //! answer 400/415/422).
+//!
+//! `notify-attach` also records the attach as a JetStream event (carried gaps T4, R7): a fresh
+//! tenant's provision waits for it before creating its timeline.
 
 use super::spec::endpoint_config;
-use super::{InternalState, NeonMetadataPort};
+use super::{BoxFuture, InternalState, NeonMetadataPort};
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use chelabase_metadata::MetadataError;
-use chelabase_neon::ComputeLocator;
+use chelabase_nats::TenantAttachedEvent;
 use chelabase_neon::reconfigure;
+use chelabase_neon::{ComputeLocator, NeonId};
 use futures_util::future::join_all;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::{Instant, timeout_at};
 use tracing::{error, info, warn};
 
-/// Other fields (`shards`, `preferred_az`, `stripe_size`) aren't needed.
-#[derive(Debug, Deserialize)]
-pub struct NotifyAttach {
-    tenant_id: String,
+/// Records that a tenant's shards are attached (`chelabase.neon.attached.<tenant>` on the
+/// `CHELABASE_NEON_EVENTS` stream in production, a fake in tests). `Ok` only once the event is
+/// stored (JetStream acked it).
+pub trait AttachEvents: Send + Sync + 'static {
+    fn tenant_attached(&self, event: TenantAttachedEvent) -> BoxFuture<'_, anyhow::Result<()>>;
+}
+
+impl AttachEvents for crate::NatsPorts {
+    fn tenant_attached(&self, event: TenantAttachedEvent) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move {
+            chelabase_nats::publish_tenant_attached(&self.js, &event).await?;
+            Ok(())
+        })
+    }
 }
 
 /// Other fields (`generation`, `safekeepers`) aren't needed: the spec lists the safekeepers.
@@ -43,22 +58,60 @@ pub async fn notify_attach<M: NeonMetadataPort, L: ComputeLocator>(
     State(state): State<Arc<InternalState<M, L>>>,
     body: Bytes,
 ) -> StatusCode {
-    let req: NotifyAttach = match parse(&body) {
+    // One deadline for everything the hook does, taken first (A2).
+    let deadline = Instant::now() + HOOK_DEADLINE;
+    // The body is the event: `tenant_id` is required, the rest defaults (A3).
+    let event: TenantAttachedEvent = match parse(&body) {
         Ok(r) => r,
         Err(code) => return code,
     };
-    info!(tenant = %req.tenant_id, "notify-attach");
-    let endpoints = state
-        .metadata
-        .neon_endpoints_for_tenant(&req.tenant_id)
-        .await;
-    reconfigure_all(&state, endpoints).await
+    // A3: anything but a Neon id would name another subject (or none): never published.
+    if let Err(e) = event.tenant_id.parse::<NeonId>() {
+        error!("notify-attach: {e}");
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    let tenant = event.tenant_id.clone();
+    info!(%tenant, shards = event.shards.len(), "notify-attach");
+    // The event and the reconfigures run side by side, so a hung NATS doesn't hold up the
+    // computes (nor they the event); the event is published whatever the tenant's endpoints or
+    // a failed metadata lookup (A4): a fresh provision's tenant has no running compute yet.
+    let publish = async {
+        match timeout_at(deadline, state.attach_events.tenant_attached(event)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                warn!(%tenant, "publishing the tenant-attached event failed; the storage controller will retry: {e:#}");
+                false
+            }
+            Err(_) => {
+                warn!(%tenant, "the tenant-attached event wasn't acked before the hook's deadline; the storage controller will retry");
+                false
+            }
+        }
+    };
+    let reconfigure = async {
+        let endpoints =
+            match timeout_at(deadline, state.metadata.neon_endpoints_for_tenant(&tenant)).await {
+                Ok(endpoints) => endpoints,
+                Err(_) => {
+                    error!(%tenant, "looking up endpoints: no answer before the hook's deadline");
+                    return StatusCode::SERVICE_UNAVAILABLE;
+                }
+            };
+        reconfigure_all(&state, endpoints, deadline).await
+    };
+    let (published, reconfigured) = tokio::join!(publish, reconfigure);
+    if published && reconfigured == StatusCode::OK {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 pub async fn notify_safekeepers<M: NeonMetadataPort, L: ComputeLocator>(
     State(state): State<Arc<InternalState<M, L>>>,
     body: Bytes,
 ) -> StatusCode {
+    let deadline = Instant::now() + HOOK_DEADLINE;
     let req: NotifySafekeepers = match parse(&body) {
         Ok(r) => r,
         Err(code) => return code,
@@ -68,7 +121,7 @@ pub async fn notify_safekeepers<M: NeonMetadataPort, L: ComputeLocator>(
         .metadata
         .neon_endpoints_for_timeline(&req.timeline_id)
         .await;
-    reconfigure_all(&state, endpoints).await
+    reconfigure_all(&state, endpoints, deadline).await
 }
 
 /// The most one endpoint's reconfigure may take (locating it, its `/status`, building the spec,
@@ -81,10 +134,12 @@ const HOOK_CONCURRENCY: usize = 16;
 /// the hook), and one still running then is cut short.
 const HOOK_DEADLINE: Duration = Duration::from_secs(9);
 
-/// Every endpoint is tried, even after one fails, concurrently (see [`each_bounded`]).
+/// Every endpoint is tried, even after one fails, concurrently, until the hook's `deadline`
+/// (see [`each_bounded_until`]).
 async fn reconfigure_all<M: NeonMetadataPort, L: ComputeLocator>(
     state: &InternalState<M, L>,
     endpoints: Result<Vec<String>, MetadataError>,
+    deadline: Instant,
 ) -> StatusCode {
     let endpoints = match endpoints {
         Ok(ids) => ids,
@@ -93,18 +148,31 @@ async fn reconfigure_all<M: NeonMetadataPort, L: ComputeLocator>(
             return StatusCode::SERVICE_UNAVAILABLE;
         }
     };
-    each_bounded(&endpoints, |id| reconfigure_endpoint(state, id)).await
+    each_bounded_until(deadline, &endpoints, |id| reconfigure_endpoint(state, id)).await
 }
 
-/// Runs `reconfigure` for every id, [`HOOK_CONCURRENCY`] at a time, each bounded by
-/// [`ENDPOINT_RECONFIGURE_TIMEOUT`] and all by [`HOOK_DEADLINE`]: 200 when all succeed, else 503
-/// (the storage controller retries).
+/// [`each_bounded_until`] with a deadline [`HOOK_DEADLINE`] from now.
+#[cfg(test)]
 async fn each_bounded<'a, F, Fut>(ids: &'a [String], reconfigure: F) -> StatusCode
 where
     F: Fn(&'a str) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
 {
-    let deadline = tokio::time::Instant::now() + HOOK_DEADLINE;
+    each_bounded_until(Instant::now() + HOOK_DEADLINE, ids, reconfigure).await
+}
+
+/// Runs `reconfigure` for every id, [`HOOK_CONCURRENCY`] at a time, each bounded by
+/// [`ENDPOINT_RECONFIGURE_TIMEOUT`] and all by `deadline` (the hook's, taken at its entry): 200
+/// when all succeed, else 503 (the storage controller retries).
+async fn each_bounded_until<'a, F, Fut>(
+    deadline: Instant,
+    ids: &'a [String],
+    reconfigure: F,
+) -> StatusCode
+where
+    F: Fn(&'a str) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
     // A fair semaphore: endpoints start in order, `HOOK_CONCURRENCY` at a time.
     let permits = tokio::sync::Semaphore::new(HOOK_CONCURRENCY);
     let results = join_all(ids.iter().map(|id| {
@@ -302,6 +370,23 @@ mod tests {
         .await;
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(*done.lock().unwrap(), ["ep-ok"]);
+    }
+
+    // T4 coder (A2): the reconfigures share the deadline the hook took at its entry: time the
+    // hook already spent (its metadata lookup, while the event publishes) isn't given back.
+    #[tokio::test(start_paused = true)]
+    async fn the_reconfigures_end_at_a_deadline_taken_before_them() {
+        let entry = Instant::now();
+        let deadline = entry + HOOK_DEADLINE;
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        let code = each_bounded_until(deadline, &ids(&["ep-hung"]), |_| async {
+            std::future::pending::<()>().await;
+            Ok(())
+        })
+        .await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        // Not 7 s + the endpoint's own 8 s.
+        assert!(entry.elapsed() < STORCON_TIMEOUT, "{:?}", entry.elapsed());
     }
 
     // No endpoint, or all reconfigured: 200. One failure: 503.

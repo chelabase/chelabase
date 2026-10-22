@@ -64,7 +64,10 @@ async fn main() -> anyhow::Result<()> {
     ensure_secrets_key(&metadata, &key).await?;
 
     let publisher = Arc::new(worker::rt_events::NatsPublisher::new(nats.clone()));
-    let worker = Arc::new(build(&config, metadata, key, publisher)?);
+    // Provisions wait for the orchestrator's tenant-attached events (carried gaps T4), read
+    // with the worker's own NATS rights (filtered consumers only; no stream lookups).
+    let attach = worker::ports::AttachSource::Nats(js.clone());
+    let worker = Arc::new(build(&config, metadata, key, publisher, attach)?);
     worker.resync_requests.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.

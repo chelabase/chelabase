@@ -1474,15 +1474,72 @@ pub trait Storage: Placement + 'static {
         &self,
         tenant: &NeonId,
     ) -> impl Future<Output = Result<Vec<NeonId>, StorconError>> + Send;
+    /// Waits up to `timeout` for the storage controller's attach notice of a fresh `tenant`
+    /// (the orchestrator's tenant-attached event, carried gaps T4): once it came, the tenant's
+    /// pageservers answer for it. Never an error: provisioning goes on either way (R8).
+    fn wait_attached(
+        &self,
+        tenant: &NeonId,
+        timeout: Duration,
+    ) -> impl Future<Output = AttachWait> + Send;
+}
+
+/// How [`Storage::wait_attached`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachWait {
+    /// The tenant's attach event came.
+    Attached,
+    /// None came within the timeout.
+    TimedOut,
+    /// The wait couldn't run (NATS down, no events stream, no source configured): why.
+    Unavailable(String),
+}
+
+/// Where the worker reads the tenant-attached events from (A8: always given explicitly).
+#[derive(Clone)]
+// One per worker, built once: the unboxed context costs nothing worth an indirection.
+#[allow(clippy::large_enum_variant)]
+pub enum AttachSource {
+    /// The events stream, through this JetStream (the worker's own NATS user).
+    Nats(async_nats::jetstream::Context),
+    /// No events: every wait is [`AttachWait::Unavailable`] at once.
+    Disabled,
+}
+
+impl std::fmt::Debug for AttachSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nats(_) => f.write_str("AttachSource::Nats"),
+            Self::Disabled => f.write_str("AttachSource::Disabled"),
+        }
+    }
+}
+
+impl AttachSource {
+    /// [`Storage::wait_attached`] over this source.
+    pub async fn wait(&self, tenant: &NeonId, timeout: Duration) -> AttachWait {
+        match self {
+            Self::Disabled => AttachWait::Unavailable("no attach events configured".to_string()),
+            Self::Nats(js) => {
+                match chelabase_nats::wait_tenant_attached(js, tenant.as_str(), timeout).await {
+                    Ok(Some(_)) => AttachWait::Attached,
+                    Ok(None) => AttachWait::TimedOut,
+                    Err(e) => AttachWait::Unavailable(e.to_string()),
+                }
+            }
+        }
+    }
 }
 
 /// The Postgres major version every new timeline gets (the compute image is v17).
 const PG_VERSION: u32 = 17;
 
-/// The storage controller plus the safekeepers the worker reads commit LSNs from.
+/// The storage controller plus the safekeepers the worker reads commit LSNs from, and the
+/// tenant-attached events.
 pub struct RealStorage {
     pub storcon: StorconClient,
     pub safekeepers: SafekeeperSet<SafekeeperClient>,
+    pub attach: AttachSource,
 }
 
 impl Placement for RealStorage {
@@ -1636,6 +1693,10 @@ impl Storage for RealStorage {
 
     async fn list_timelines(&self, tenant: &NeonId) -> Result<Vec<NeonId>, StorconError> {
         StorconClient::list_timelines(&self.storcon, tenant).await
+    }
+
+    async fn wait_attached(&self, tenant: &NeonId, timeout: Duration) -> AttachWait {
+        self.attach.wait(tenant, timeout).await
     }
 }
 

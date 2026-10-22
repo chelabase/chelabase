@@ -52,6 +52,23 @@ const CONTROL_CONSUMER_API: [&str; 6] = [
     "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_CONTROL.>",
     "$JS.ACK.CHELABASE_CONTROL.>",
 ];
+/// The tenant-attached events (carried gaps T4, P9): the subjects the orchestrator publishes.
+const NEON_EVENTS: &str = "chelabase.neon.attached.*";
+/// Creating or fixing the events stream (`ensure_neon_events_stream`): the orchestrator only
+/// (R10).
+const NEON_EVENTS_STREAM_API: [&str; 3] = [
+    "$JS.API.STREAM.INFO.CHELABASE_NEON_EVENTS",
+    "$JS.API.STREAM.CREATE.CHELABASE_NEON_EVENTS",
+    "$JS.API.STREAM.UPDATE.CHELABASE_NEON_EVENTS",
+];
+/// The worker's attach waits (`wait_tenant_attached`): a consumer filtered to one tenant's
+/// subject (`CREATE.<stream>.<name>.<filter>`, so an unfiltered, otherwise filtered or durable
+/// create is refused), its pulls and its delete. Replies come on `_INBOX_worker.>`.
+const NEON_EVENTS_WAIT_API: [&str; 3] = [
+    "$JS.API.CONSUMER.CREATE.CHELABASE_NEON_EVENTS.*.chelabase.neon.attached.*",
+    "$JS.API.CONSUMER.MSG.NEXT.CHELABASE_NEON_EVENTS.*",
+    "$JS.API.CONSUMER.DELETE.CHELABASE_NEON_EVENTS.*",
+];
 /// What realtime publishes (S2, ruling (a)): its two KV buckets as async-nats drives them
 /// (`$JS.FC.<stream>.…` carries the watches' flow-control replies), rows, watches and presence.
 /// Never `chelabase.rpc.*`, a job subject, `rt.access`, `rt.project` or `rt.compute.stopping`.
@@ -85,6 +102,8 @@ fn orchestrator() -> NatsPermissions {
     publish.extend(CORE_EVENTS);
     publish.extend(["chelabase.rt.project.>", "chelabase.rt.access.>"]);
     publish.extend(CONTROL_STREAM_API);
+    publish.push(NEON_EVENTS);
+    publish.extend(NEON_EVENTS_STREAM_API);
     NatsPermissions {
         publish,
         publish_deny: vec![],
@@ -101,6 +120,7 @@ fn worker() -> NatsPermissions {
     publish.extend(CONTROL_STREAM_API);
     publish.extend(CONTROL_CONSUMER_API);
     publish.extend(["_INBOX_orchestrator.>", "_INBOX_runner.>"]);
+    publish.extend(NEON_EVENTS_WAIT_API);
     let mut subscribe = vec!["chelabase.rpc.>"];
     subscribe.extend(CORE_EVENTS);
     subscribe.push("_INBOX_worker.>");
@@ -126,7 +146,8 @@ fn realtime() -> NatsPermissions {
 /// The test runner runs the worker, the orchestrator and realtime in-process (S24), so it has
 /// the union of their rights, plus scratch streams for the crates' own live tests
 /// (`CHELABASE_TEST_<tag>` on `chelabase.test.<tag>`). It still can't delete or purge the
-/// control stream or realtime's buckets, nor read the shared or another service's inbox.
+/// control stream, the events stream or realtime's buckets, nor read the shared or another
+/// service's inbox.
 fn runner() -> NatsPermissions {
     let mut publish = Vec::new();
     let mut subscribe = Vec::new();
@@ -153,6 +174,7 @@ fn runner() -> NatsPermissions {
         publish,
         publish_deny: vec![
             "$JS.API.STREAM.DELETE.CHELABASE_CONTROL",
+            "$JS.API.STREAM.DELETE.CHELABASE_NEON_EVENTS",
             "$JS.API.STREAM.DELETE.KV_CHELABASE_RT_LEASES",
             "$JS.API.STREAM.DELETE.KV_CHELABASE_RT_SLOTS",
             "$JS.API.STREAM.PURGE.>",
@@ -308,7 +330,9 @@ pub fn render_valkey_acl(passwords: &BTreeMap<String, String>) -> Result<String>
 
 /// Writes `<state>/nats/auth.conf` and `<state>/valkey/users.acl` (0600) from the secret files
 /// under `keys`. A file whose contents don't change is left alone (its mode still tightened).
-pub fn write_auth_files(keys: &Path, state: &Path) -> Result<()> {
+/// True when `nats/auth.conf`'s contents changed (created or rewritten): a running NATS keeps
+/// reading the old file through its single-file bind mount, so `up` restarts it (R9).
+pub fn write_auth_files(keys: &Path, state: &Path) -> Result<bool> {
     let read = |dir: &str, users: &[&str]| -> Result<BTreeMap<String, String>> {
         users
             .iter()
@@ -325,9 +349,10 @@ pub fn write_auth_files(keys: &Path, state: &Path) -> Result<()> {
         .map(|t| previous_nats_hashes(&t))
         .unwrap_or_default();
     let nats = render_nats_auth_reusing(&read("nats", &NATS_USERS)?, &previous)?;
-    write_private(&nats_path, nats.as_bytes())?;
+    let nats_changed = write_private(&nats_path, nats.as_bytes())?;
     let acl = render_valkey_acl(&read("valkey", &VALKEY_USERS)?)?;
-    write_private(&state.join("valkey/users.acl"), acl.as_bytes())
+    write_private(&state.join("valkey/users.acl"), acl.as_bytes())?;
+    Ok(nats_changed)
 }
 
 /// The storage tokens the workbench derives (scope, file under `<keys>/neon/storage-tokens/`).
@@ -402,22 +427,23 @@ pub fn mint_metrics_token_in(neon: &Path, now: u64) -> Result<PathBuf> {
 }
 
 /// Writes `contents` to `path` (0600) through a temporary file and a rename, so a reader never
-/// sees half a file; unchanged contents are not rewritten, but the mode is tightened.
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+/// sees half a file; unchanged contents are not rewritten, but the mode is tightened. True when
+/// the contents changed (the file was written).
+fn write_private(path: &Path, contents: &[u8]) -> Result<bool> {
     write_with_mode(path, contents, 0o600)
 }
 
-fn write_public(path: &Path, contents: &[u8]) -> Result<()> {
+fn write_public(path: &Path, contents: &[u8]) -> Result<bool> {
     write_with_mode(path, contents, 0o644)
 }
 
-fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
+fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<bool> {
     if let Some(dir) = path.parent() {
         create_private_dir(dir)?;
     }
     if std::fs::read(path).is_ok_and(|old| old == contents) {
         set_mode(path, mode)?;
-        return Ok(());
+        return Ok(false);
     }
     let tmp = crate::neon::compute_jwt::temp_name(path);
     let result = (|| -> Result<()> {
@@ -428,7 +454,7 @@ fn write_with_mode(path: &Path, contents: &[u8], mode: u32) -> Result<()> {
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
-    result
+    result.map(|()| true)
 }
 
 #[cfg(unix)]

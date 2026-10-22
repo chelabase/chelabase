@@ -32,6 +32,7 @@ use chelabase_types::BranchId;
 use uuid::Uuid;
 use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 pub use ddl::{BoxFuture, CachePort, DdlPort, ResyncPort};
+pub use hooks::AttachEvents;
 use chelabase_types::role_settings::RoleSettings;
 use std::future::Future;
 use std::sync::Arc;
@@ -422,6 +423,8 @@ pub struct InternalState<M, L> {
     pub realtime_logins: chelabase_neon::spec::MemberLogins,
     /// Finds computes on the control network: the connection route's `replication_host`.
     pub control_locator: L,
+    /// Where `notify-attach` records each attach (the worker's provisions wait for it).
+    pub attach_events: Arc<dyn AttachEvents>,
 }
 
 pub fn build_internal_router<M, L>(state: Arc<InternalState<M, L>>) -> Router

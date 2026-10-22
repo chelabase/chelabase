@@ -36,7 +36,7 @@ use chelabase_metadata::{BranchDatabase, DataApiState, DatabaseOrigin, ServedDat
 
 use crate::Worker;
 use chelabase_neon::reconfigure::ComputeCtlStatus;
-use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
+use crate::ports::{AttachWait, CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
@@ -3209,6 +3209,10 @@ pub struct FakeStorage {
     pub timestamp_at: Mutex<Option<DateTime<Utc>>>,
     /// Each timeline's GC cutoff, once set (none otherwise).
     pub gc_cutoffs: Mutex<HashMap<NeonId, Lsn>>,
+    /// How every `wait_attached` ends ([`worker`] sets `Attached`).
+    pub attach_result: Mutex<AttachWait>,
+    /// Runs once, at the start of the next `wait_attached` (e.g. to land a delete).
+    pub on_wait_attached: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub journal: Journal,
 }
 
@@ -3553,6 +3557,18 @@ impl Storage for FakeStorage {
         ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         Ok(ids)
     }
+
+    async fn wait_attached(&self, tenant: &NeonId, timeout: Duration) -> AttachWait {
+        let hook = lock(&self.on_wait_attached).take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        record(
+            &self.journal,
+            format!("storage.wait_attached {tenant} {}ms", timeout.as_millis()),
+        );
+        lock(&self.attach_result).clone()
+    }
 }
 
 pub struct FakeCache {
@@ -3772,8 +3788,27 @@ impl SpecPusher for FakePusher {
 
 pub type FakeWorker = Worker<FakeMetadata, FakeStorage, FakeBackend, FakeCache, FakePusher>;
 
+/// Tests that check their warnings capture logs with a thread-local subscriber (`set_default`)
+/// while other tests run without one. While tracing-core knows of at most one live dispatcher,
+/// it computes a newly hit callsite's interest from the registering thread's default alone, so
+/// a `warn!` first hit by a test without a subscriber is cached as "never" for every thread, the
+/// capturing test's included, and its check fails now and then. Two dispatchers that live for
+/// the whole test process make tracing-core ask every live dispatcher instead.
+fn pin_tracing_dispatchers() {
+    use tracing::Dispatch;
+    use tracing::subscriber::NoSubscriber;
+    static PINNED: std::sync::OnceLock<[Dispatch; 2]> = std::sync::OnceLock::new();
+    PINNED.get_or_init(|| {
+        [
+            Dispatch::new(NoSubscriber::default()),
+            Dispatch::new(NoSubscriber::default()),
+        ]
+    });
+}
+
 /// A worker over fresh fakes sharing one journal, with millisecond readiness polling.
 pub fn worker() -> (FakeWorker, Journal) {
+    pin_tracing_dispatchers();
     let journal = Journal::default();
     let worker = Worker {
         metadata: FakeMetadata {
@@ -3796,6 +3831,8 @@ pub fn worker() -> (FakeWorker, Journal) {
             lsn_at: Mutex::default(),
             timestamp_at: Mutex::default(),
             gc_cutoffs: Mutex::default(),
+            attach_result: Mutex::new(AttachWait::Attached),
+            on_wait_attached: Mutex::default(),
             journal: journal.clone(),
         },
         computes: FakeBackend::with_journal(journal.clone()),
@@ -3835,6 +3872,8 @@ pub fn worker() -> (FakeWorker, Journal) {
         ready_timeout: Duration::from_millis(20),
         // No longer than the timeout: the wait extends only when a test raises it.
         ready_cap: Duration::from_millis(20),
+        // The fake's wait answers at once; tests that look at the timeout set their own.
+        attach_timeout: crate::provision::ATTACH_TIMEOUT,
         claim_refresh: Duration::from_millis(5),
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
