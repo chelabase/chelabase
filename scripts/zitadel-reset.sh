@@ -30,7 +30,7 @@ fi
 
 rm -f "${ZDIR}/admin.pat" "${ZDIR}/login-client.pat" "${ZDIR}/demo.env" "${ZDIR}/demo-sa.json"
 mkdir -p "$ZDIR"
-chmod 777 "$ZDIR" 2>/dev/null || true
+chmod 700 "$ZDIR" 2>/dev/null || true
 
 echo "[zitadel-reset] starting Zitadel fresh…"
 "${compose[@]}" up -d zitadel-db zitadel
@@ -41,6 +41,8 @@ echo "[zitadel-reset] starting Zitadel fresh…"
 echo "[zitadel-reset] waiting for admin.pat and login-client.pat…"
 for _ in $(seq 1 60); do
   if [[ -s "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/login-client.pat" ]]; then
+    chmod 600 "${ZDIR}/admin.pat"
+    chmod 600 "${ZDIR}/login-client.pat"
     echo "[zitadel-reset] PATs ready — run: just zitadel-bootstrap, then just workbench restart"
     exit 0
   fi

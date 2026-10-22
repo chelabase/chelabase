@@ -332,13 +332,23 @@ pub fn compose_command(env_file: &Path, args: Vec<String>) -> anyhow::Result<Com
     Ok(cmd)
 }
 
-/// Creates the stack's Zitadel dir writable by everyone: Zitadel runs as uid 1000 in its image
-/// and writes its PATs there whatever the host uid (T5 review M1). Idempotent.
+/// Creates the stack's Zitadel dir private to the stack user (0700): Zitadel runs as that user
+/// and writes its PATs there. Idempotent.
 pub fn prepare_zitadel_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777))
-        .with_context(|| format!("making {} writable for Zitadel", dir.display()))
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("making {} private", dir.display()))
+}
+
+/// Sets each PAT file to 0600; a missing file is an error.
+pub fn secure_pats(paths: &[PathBuf]) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    for p in paths {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting {} to 0600", p.display()))?;
+    }
+    Ok(())
 }
 
 /// `CHELABASE_NEXTEST_BIN` in `stack.env`: the host's cargo-nextest, else `/dev/null`, so the
@@ -894,10 +904,9 @@ fn start_stack(
 
     phases.run("Zitadel's PATs", || {
         let zitadel = stack.state.join("zitadel");
-        wait_for_files(
-            &[zitadel.join("admin.pat"), zitadel.join("login-client.pat")],
-            Duration::from_secs(180),
-        )
+        let pats = [zitadel.join("admin.pat"), zitadel.join("login-client.pat")];
+        wait_for_files(&pats, Duration::from_secs(180))?;
+        secure_pats(&pats)
     })?;
 
     phases.run("bootstrap", || {
@@ -1091,6 +1100,7 @@ fn recreate(stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
     let pats = pat_files(&stack.state, apps);
     if !pats.is_empty() {
         wait_for_files(&pats, Duration::from_secs(180))?;
+        secure_pats(&pats)?;
     }
     let mut args = vec![
         "--profile",
@@ -1936,6 +1946,52 @@ mod tests {
         table.sort();
         assert_eq!(mounted, table);
         assert!(!table.is_empty());
+    }
+
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn the_zitadel_dir_is_private_to_the_stack_user() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        // Created fresh (parents included).
+        let fresh = tmp.path().join("state/zitadel");
+        prepare_zitadel_dir(&fresh).unwrap();
+        assert_eq!(mode_of(&fresh), 0o700, "a new dir");
+        // A dir left at 0777 by an older stack is tightened, and the call is idempotent.
+        let old = tmp.path().join("old");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::fs::write(old.join("admin.pat"), "x").unwrap();
+        prepare_zitadel_dir(&old).unwrap();
+        prepare_zitadel_dir(&old).unwrap();
+        assert_eq!(mode_of(&old), 0o700, "an existing 0777 dir");
+        assert!(old.join("admin.pat").exists(), "existing files are kept");
+    }
+
+    #[test]
+    fn secure_pats_makes_each_pat_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let admin = tmp.path().join("admin.pat");
+        let login = tmp.path().join("login-client.pat");
+        for f in [&admin, &login] {
+            std::fs::write(f, "token").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        secure_pats(&[admin.clone(), login.clone()]).unwrap();
+        assert_eq!(mode_of(&admin), 0o600);
+        assert_eq!(mode_of(&login), 0o600);
+        assert_eq!(std::fs::read_to_string(&admin).unwrap(), "token");
+        // Idempotent, and an empty list is fine (recreate() may wait for no PAT).
+        secure_pats(&[admin.clone(), login.clone()]).unwrap();
+        secure_pats(&[]).unwrap();
+        assert_eq!(mode_of(&admin), 0o600);
+        // A PAT that isn't there is an error, not a silent skip.
+        assert!(secure_pats(&[tmp.path().join("nope.pat")]).is_err());
     }
 
     #[test]

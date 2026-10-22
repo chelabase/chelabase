@@ -61,6 +61,11 @@ done
 # The apps mount both PATs as Compose secrets: the reset waits until Zitadel has rewritten both.
 grep -qF '[[ -s "${ZDIR}/admin.pat" ]] && [[ -s "${ZDIR}/login-client.pat" ]]' scripts/zitadel-reset.sh ||
   fail "zitadel-reset waits for both PATs"
+# The PATs are secrets: the reset leaves them 0600 and the dir private (Zitadel runs as the host uid).
+grep -qE 'chmod 600 .*\$\{ZDIR\}/admin\.pat' scripts/zitadel-reset.sh &&
+  grep -qE 'chmod 600 .*\$\{ZDIR\}/login-client\.pat' scripts/zitadel-reset.sh ||
+  fail "zitadel-reset chmods both PATs 0600"
+! grep -q 'chmod 777' scripts/zitadel-reset.sh || fail "zitadel-reset must not make the Zitadel dir 0777"
 for f in scripts/neon-e2e.sh scripts/branch-e2e.sh; do
   grep -q 'chelabase.dev/stack' "$f" || fail "$f selects computes by the stack's label"
 done

@@ -2,7 +2,7 @@
 
 use super::commands::{
     alive_ps_args, check_purge, compose_command, is_legacy_compute, missing_services,
-    nextest_bin_for_env, prepare_zitadel_dir, stop_processes, up_recreates,
+    nextest_bin_for_env, stop_processes, up_recreates,
 };
 use super::registry::{Entry, with_registry};
 use super::slots::touch_slot;
@@ -88,17 +88,6 @@ fn compose_runs_with_the_stack_env() {
     assert_eq!(cmd.get_program(), "docker");
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
     assert_eq!(args, ["compose", "ps"]);
-}
-
-// M1: Zitadel (uid 1000 in its image) can write its PATs whatever the host uid.
-#[test]
-fn the_zitadel_dir_is_world_writable() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let z = dir.path().join("zitadel");
-    prepare_zitadel_dir(&z).unwrap();
-    assert_eq!(std::fs::metadata(&z).unwrap().permissions().mode() & 0o777, 0o777);
-    prepare_zitadel_dir(&z).unwrap();
 }
 
 // M2: without a host cargo-nextest the runner still starts (an empty bind), so `run` works.

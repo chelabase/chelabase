@@ -83,6 +83,8 @@ done
 
 [[ "$(q '.services.zitadel.volumes[] | select(.target == "/zitadel-bootstrap") | .source')" == /m/.chelabase/stacks/feat-x/zitadel ]] ||
   fail "zitadel's PATs go to the stack's state dir"
+[[ "$(q '.services.zitadel.user // empty')" == 1000:1000 ]] ||
+  fail "zitadel runs as the stack's uid:gid, so the PATs it writes are the host user's"
 [[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALDOMAIN')" == auth.feat-x.chelabase.localhost ]] ||
   fail "zitadel's domain is the stack's auth host"
 [[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALPORT')" == 8137 ]] ||

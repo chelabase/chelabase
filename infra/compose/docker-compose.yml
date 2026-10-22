@@ -247,6 +247,8 @@ services:
   zitadel:
     image: ghcr.io/zitadel/zitadel:v4.19.1@sha256:f98935f56505ec6fa3e6523261cd1b8ace0c622e16da4a45acd493cb472f003f
     restart: unless-stopped
+    # Runs as the stack user so its PATs belong to the host user and the dir can be private.
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
     command: start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:?set by chelabase workbench (stack.env)}
     environment:
       ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
