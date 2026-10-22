@@ -49,3 +49,6 @@ infra/neon/.cache/
 
 # Cursor
 .cursor/
+# Impeccable (local hook consent and cache)
+.impeccable/config.local.json
+.impeccable/hook.cache.json

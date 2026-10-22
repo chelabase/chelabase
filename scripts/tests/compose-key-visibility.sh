@@ -8,6 +8,11 @@
 # parent of it decides. A tmpfs there, an empty read-only bind masking `<checkout>/.chelabase`, or
 # no mount at all means "none"; otherwise the mount's read_only flag gives ro or rw.
 #
+# The per-service key files are Compose secrets; a service's file secrets are Docker bind mounts
+# (read-only, at the secret's target), so the rendered config is first rewritten with
+# fixtures/secrets-as-binds.jq to list them among the service's volumes, and every check below
+# applies to them unchanged.
+#
 # Stacks: feat-x (a worktree: checkout outside the keys dir), main (checkout /m, keys dir
 # /m/.chelabase inside it), and a keys dir overridden to /alt/keys.
 set -euo pipefail
@@ -149,7 +154,8 @@ check() {
   local config
   config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE "$@" docker compose -p chelabase-feat-x \
     -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" --env-file "$fixture" \
-    --profile sites --profile runner config --no-env-resolution --format json)" ||
+    --profile sites --profile runner config --no-env-resolution --format json |
+    jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" ||
     fail "$label: compose config failed"
   local got want
   got="$(jq -S --arg k "$keys" --arg c "$checkout" --arg s "$state" --argjson link "$link" --argjson universe "$universe" '

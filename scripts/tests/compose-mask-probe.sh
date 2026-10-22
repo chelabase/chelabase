@@ -48,7 +48,8 @@ echo script >"$checkout/script.sh"
 
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE CHELABASE_CHECKOUT="$checkout" CHELABASE_KEYS_DIR="$keys" \
   CHELABASE_STACK_DIR="$state" docker compose -p chelabase-feat-x -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" \
-  --env-file "$fixture" --profile sites --profile runner config --no-env-resolution --format json)" ||
+  --env-file "$fixture" --profile sites --profile runner config --no-env-resolution --format json |
+  jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" ||
   fail "compose config failed"
 
 # The orchestrator's volumes as `docker run --mount` arguments (the Docker socket stays out).

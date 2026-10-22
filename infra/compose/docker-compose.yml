@@ -7,6 +7,10 @@
 # --env-file <state>/env/stack.env`; stack.env is rendered from .env.example plus the stack's own
 # values (its slug, ports, host names, paths, uid/gid, the workbench image).
 #
+# Per-service key files are Compose secrets (the top-level `secrets:` at the end; each service
+# lists the ones it reads, with the target path): Compose binds the host file read-only at that
+# path, and a missing file fails `up` instead of Docker making a directory.
+#
 # Reachable from the host only through the gateway's port and the proxy's Postgres port, each on
 # 127.0.0.1 and ::1. Everything else talks over the project network by service name; computes get
 # their own `compute` network (see `networks:` at the end). NATS, Valkey and the storage services
@@ -73,8 +77,8 @@ x-checkout-rw: &checkout-rw
 # Machine keys, one file at its own path per service that reads it (U10): a service sees exactly
 # the key files it reads and nothing else under the keys dir. `.chelabase` inside every checkout
 # mount is masked first (an empty tmpfs; on the main stack the keys dir is that directory), then
-# the narrow mounts go on top (Docker applies mounts by target depth). A missing file fails the
-# start (create_host_path: false) instead of Docker making a directory.
+# the narrow mounts go on top (Docker applies mounts by target depth): the per-service key files
+# are Compose secrets (`secrets:` at the end), the directory pairs below stay bind mounts.
 # Both masks are read-only tmpfs. The first covers the keys dir itself: in a worktree
 # `<checkout>/.chelabase` is a symlink to it, Docker follows the link, and it orders mounts by the
 # unresolved target depth, so a mask at the link's path would tie with the key mounts and hide
@@ -89,218 +93,6 @@ x-checkout-mask: &checkout-mask
   type: tmpfs
   target: ${CHELABASE_CHECKOUT_MASK:-${CHELABASE_KEYS_DIR}}
   read_only: true
-x-key-secrets: &key-secrets
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/secrets/secrets.key
-  target: ${CHELABASE_KEYS_DIR}/secrets/secrets.key
-  read_only: true
-  bind: {create_host_path: false}
-x-key-internal-signing: &key-internal-signing
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem
-  target: ${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem
-  read_only: true
-  bind: {create_host_path: false}
-x-key-internal-verify: &key-internal-verify
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem
-  target: ${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem
-  read_only: true
-  bind: {create_host_path: false}
-x-key-cookie: &key-cookie
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/auth/cookie.key
-  target: ${CHELABASE_KEYS_DIR}/auth/cookie.key
-  read_only: true
-  bind: {create_host_path: false}
-x-key-app-jwt-private: &key-app-jwt-private
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/auth/app-jwt.key
-  target: ${CHELABASE_KEYS_DIR}/auth/app-jwt.key
-  read_only: true
-  bind: {create_host_path: false}
-x-key-app-jwt-public: &key-app-jwt-public
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/auth/app-jwt.pub
-  target: ${CHELABASE_KEYS_DIR}/auth/app-jwt.pub
-  read_only: true
-  bind: {create_host_path: false}
-x-key-compute-jwt-private: &key-compute-jwt-private
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem
-  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem
-  read_only: true
-  bind: {create_host_path: false}
-x-key-compute-jwt-public: &key-compute-jwt-public
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub
-  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub
-  read_only: true
-  bind: {create_host_path: false}
-# RT1 T1 (R11, S1, S27): the generated service secrets (`chelabase workbench up` creates each once,
-# 0600, never overwritten), each at its own path and only in the services that read it; a service
-# gets its file's path as <NAME>_FILE in its own `environment:`, never through stack.env.
-x-key-nats-orchestrator: &key-nats-orchestrator
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/nats/orchestrator.password
-  target: ${CHELABASE_KEYS_DIR}/nats/orchestrator.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-nats-worker: &key-nats-worker
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/nats/worker.password
-  target: ${CHELABASE_KEYS_DIR}/nats/worker.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-nats-realtime: &key-nats-realtime
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/nats/realtime.password
-  target: ${CHELABASE_KEYS_DIR}/nats/realtime.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-nats-runner: &key-nats-runner
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/nats/runner.password
-  target: ${CHELABASE_KEYS_DIR}/nats/runner.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-valkey-proxy: &key-valkey-proxy
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
-  target: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-valkey-control: &key-valkey-control
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/valkey/control.password
-  target: ${CHELABASE_KEYS_DIR}/valkey/control.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-valkey-realtime: &key-valkey-realtime
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/valkey/realtime.password
-  target: ${CHELABASE_KEYS_DIR}/valkey/realtime.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-valkey-runner: &key-valkey-runner
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/valkey/runner.password
-  target: ${CHELABASE_KEYS_DIR}/valkey/runner.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-valkey-health: &key-valkey-health
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/valkey/health.password
-  target: ${CHELABASE_KEYS_DIR}/valkey/health.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-realtime-pg: &key-realtime-pg
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/realtime/pg.password
-  target: ${CHELABASE_KEYS_DIR}/realtime/pg.password
-  read_only: true
-  bind: {create_host_path: false}
-x-key-realtime-ticket: &key-realtime-ticket
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/realtime/ticket.key
-  target: ${CHELABASE_KEYS_DIR}/realtime/ticket.key
-  read_only: true
-  bind: {create_host_path: false}
-x-key-realtime-internal: &key-realtime-internal
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/realtime/internal.token
-  target: ${CHELABASE_KEYS_DIR}/realtime/internal.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-rest-internal: &key-token-rest-internal
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-data-keys: &key-token-data-keys
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/data-keys.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/data-keys.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-app-auth: &key-token-app-auth
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/app-auth.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/app-auth.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-app-sessions: &key-token-app-sessions
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-proxy-api: &key-token-proxy-api
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
-  read_only: true
-  bind: {create_host_path: false}
-x-key-token-storcon-hook: &key-token-storcon-hook
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
-  target: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
-  read_only: true
-  bind: {create_host_path: false}
-# Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped NeonJWTs
-# the workbench signs with the pair (<keys>/neon/storage-tokens/). The runner sees them at their
-# own paths (scripts call the storage controller); the Neon containers read them under /run.
-x-key-storage-pem: &key-storage-pem
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
-  target: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
-  read_only: true
-  bind: {create_host_path: false}
-x-key-storage-pageserver-api: &key-storage-pageserver-api
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
-  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
-  read_only: true
-  bind: {create_host_path: false}
-x-key-storage-safekeeper-data: &key-storage-safekeeper-data
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
-  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
-  read_only: true
-  bind: {create_host_path: false}
-x-key-storage-generations-api: &key-storage-generations-api
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
-  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
-  read_only: true
-  bind: {create_host_path: false}
-x-key-storage-storcon-admin: &key-storage-storcon-admin
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
-  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
-  read_only: true
-  bind: {create_host_path: false}
-x-run-storage-pem: &run-storage-pem
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem
-  target: /run/storage-auth.pub.pem
-  read_only: true
-  bind: {create_host_path: false}
-x-run-safekeeper-data: &run-safekeeper-data
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt
-  target: /run/safekeeper-data.jwt
-  read_only: true
-  bind: {create_host_path: false}
-# The platform CA's certificate alone (never ca.key): auth and rest verify every compute's TLS
-# against it (U15, CHELABASE_COMPUTE_CA_FILE).
-x-key-compute-ca-cert: &key-compute-ca-cert
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/compute-ca/ca.crt
-  target: ${CHELABASE_KEYS_DIR}/compute-ca/ca.crt
-  read_only: true
-  bind: {create_host_path: false}
 # The platform CA (ca.crt, ca.key): the worker issues each compute's server certificate (rw);
 # the runner reads it, ro (R-T9a, the live tests that check computes' certificates).
 x-keys-compute-ca-rw: &keys-compute-ca-rw
@@ -338,18 +130,6 @@ x-keys-realtime-tls-ro: &keys-realtime-tls-ro
   type: bind
   source: ${CHELABASE_KEYS_DIR}/realtime-tls
   target: ${CHELABASE_KEYS_DIR}/realtime-tls
-  read_only: true
-  bind: {create_host_path: false}
-# The runner's metrics token (scope metrics, minted by the workbench).
-# A kept metrics.token isn't checked against the current compute-JWT key: after a key
-# rotation, re-mint it with `chelabase neon mint-metrics-token`, then recreate the runner
-# (this single-file mount keeps the old file's inode, so a running runner never sees the new
-# token). The command writes under `CHELABASE_NEON_DIR` (default `.chelabase/neon` in the
-# checkout): for a workbench stack, run it with that stack's `CHELABASE_NEON_DIR`.
-x-key-storage-metrics: &key-storage-metrics
-  type: bind
-  source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token
-  target: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token
   read_only: true
   bind: {create_host_path: false}
 x-state: &state
@@ -426,11 +206,8 @@ services:
         target: /etc/valkey/users.acl
         read_only: true
         bind: {create_host_path: false}
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/valkey/health.password
-        target: /run/valkey-health.password
-        read_only: true
-        bind: {create_host_path: false}
+    secrets:
+      - {source: valkey-health, target: /run/valkey-health.password}
     # Ruling (f): the healthcheck logs in as `health`, which may only PING.
     healthcheck:
       # The password goes through the environment (VALKEYCLI_AUTH), never valkey-cli's arguments.
@@ -612,8 +389,9 @@ services:
       compute: {}
     volumes:
       - neon_safekeeper1_data:/data
-      - *run-storage-pem
-      - *run-safekeeper-data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
       interval: 2s
@@ -649,8 +427,9 @@ services:
       compute: {}
     volumes:
       - neon_safekeeper2_data:/data
-      - *run-storage-pem
-      - *run-safekeeper-data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
       interval: 2s
@@ -686,8 +465,9 @@ services:
       compute: {}
     volumes:
       - neon_safekeeper3_data:/data
-      - *run-storage-pem
-      - *run-safekeeper-data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:7676/v1/status"]
       interval: 2s
@@ -744,19 +524,11 @@ services:
       # superseded timeline leaves its WAL on the safekeepers and in S3.
       - --timelines-onto-safekeepers
       - --timeline-safekeeper-count=3
-    volumes:
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
-        target: /run/storcon-hook.token
-        read_only: true
-        bind: {create_host_path: false}
-      - *run-storage-pem
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt
-        target: /run/pageserver-api.jwt
-        read_only: true
-        bind: {create_host_path: false}
-      - *run-safekeeper-data
+    secrets:
+      - {source: token-storcon-hook, target: /run/storcon-hook.token}
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-pageserver-api, target: /run/pageserver-api.jwt}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1234/ready"]
       interval: 2s
@@ -803,13 +575,10 @@ services:
       compute: {}
     volumes:
       - neon_pageserver_data:/data
-      - *run-storage-pem
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt
-        target: /run/generations-api.jwt
-        read_only: true
-        bind: {create_host_path: false}
-      - *run-safekeeper-data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-generations-api, target: /run/generations-api.jwt}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9898/v1/status"]
       interval: 2s
@@ -845,12 +614,8 @@ services:
           curl -fsS -X POST -H 'Content-Type: application/json' -H "@$$H" \
             -d '{"scheduling_policy":"Active"}' $$S/control/v1/safekeeper/$$ID/scheduling_policy
         done
-    volumes:
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt
-        target: /run/storcon-admin.jwt
-        read_only: true
-        bind: {create_host_path: false}
+    secrets:
+      - {source: storage-storcon-admin, target: /run/storcon-admin.jwt}
     depends_on:
       storage-controller:
         condition: service_healthy
@@ -930,16 +695,9 @@ services:
       compute: {}
     volumes:
       - neon_proxy_tls:/tls:ro
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/valkey/proxy.password
-        target: /run/valkey-proxy.password
-        read_only: true
-        bind: {create_host_path: false}
-      - type: bind
-        source: ${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
-        target: /run/proxy-api.token
-        read_only: true
-        bind: {create_host_path: false}
+    secrets:
+      - {source: valkey-proxy, target: /run/valkey-proxy.password}
+      - {source: token-proxy-api, target: /run/proxy-api.token}
     healthcheck:
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/4432"]
       interval: 2s
@@ -997,22 +755,23 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-secrets
-      - *key-internal-verify
-      - *key-compute-jwt-private
-      - *key-compute-jwt-public
       - *keys-orchestrator-tls-ro
-      - *key-nats-orchestrator
-      - *key-valkey-control
-      - *key-realtime-internal
-      - *key-token-rest-internal
-      - *key-token-data-keys
-      - *key-token-app-auth
-      - *key-token-app-sessions
-      - *key-token-proxy-api
-      - *key-token-storcon-hook
       - *state
       - *docker-sock
+    secrets:
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+      - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+      - {source: nats-orchestrator, target: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}
+      - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+      - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+      - {source: token-rest-internal, target: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+      - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+      - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+      - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+      - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+      - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
     healthcheck:
       <<: *app-health
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8081/health && curl -fsS http://127.0.0.1:8083/health"]
@@ -1055,17 +814,18 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-secrets
-      - *key-compute-jwt-private
-      - *key-compute-jwt-public
       - *keys-compute-ca-rw
       - *keys-orchestrator-tls-rw
       - *keys-realtime-tls-rw
-      - *key-nats-worker
-      - *key-valkey-control
-      - *key-realtime-pg
       - *state
       - *docker-sock
+    secrets:
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+      - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+      - {source: nats-worker, target: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
+      - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+      - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/health"]
@@ -1121,11 +881,12 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-internal-signing
-      - *key-app-jwt-public
-      - *key-token-data-keys
-      - *key-token-app-sessions
       - *state
+    secrets:
+      - {source: internal-signing, target: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
+      - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+      - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${CHELABASE_GATEWAY_PORT}/_gateway/health"]
@@ -1154,13 +915,14 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-cookie
-      - *key-app-jwt-private
-      - *key-app-jwt-public
-      - *key-internal-verify
-      - *key-compute-ca-cert
-      - *key-token-app-auth
       - *state
+    secrets:
+      - {source: cookie, target: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
+      - {source: app-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
+      - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
     # auth has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
       <<: *app-health
@@ -1186,10 +948,11 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-internal-verify
-      - *key-compute-ca-cert
-      - *key-token-rest-internal
       - *state
+    secrets:
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: token-rest-internal, target: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
     # rest has no health route: any HTTP answer (even a 404) means it is serving.
     healthcheck:
       <<: *app-health
@@ -1232,15 +995,16 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - *key-internal-verify
-      - *key-compute-ca-cert
       - *keys-realtime-tls-ro
-      - *key-nats-realtime
-      - *key-valkey-realtime
-      - *key-realtime-pg
-      - *key-realtime-ticket
-      - *key-realtime-internal
       - *state
+    secrets:
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: nats-realtime, target: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
+      - {source: valkey-realtime, target: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
+      - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+      - {source: realtime-ticket, target: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
+      - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/health"]
@@ -1343,44 +1107,98 @@ services:
       - *checkout-rw
       - *keys-mask
       - *checkout-mask
-      - *key-secrets
-      - *key-compute-jwt-private
-      - *key-compute-jwt-public
-      - *key-app-jwt-private
-      - *key-app-jwt-public
       - *keys-compute-ca-ro
       - *keys-orchestrator-tls-ro
       - *keys-realtime-tls-ro
-      - *key-nats-orchestrator
-      - *key-nats-worker
-      - *key-nats-realtime
-      - *key-nats-runner
-      - *key-valkey-proxy
-      - *key-valkey-control
-      - *key-valkey-realtime
-      - *key-valkey-runner
-      - *key-valkey-health
-      - *key-realtime-pg
-      - *key-realtime-ticket
-      - *key-realtime-internal
-      - *key-token-rest-internal
-      - *key-token-data-keys
-      - *key-token-app-auth
-      - *key-token-app-sessions
-      - *key-token-proxy-api
-      - *key-token-storcon-hook
-      - *key-storage-pem
-      - *key-storage-pageserver-api
-      - *key-storage-safekeeper-data
-      - *key-storage-generations-api
-      - *key-storage-storcon-admin
-      - *key-storage-metrics
       - *state
       - *docker-sock
       - type: bind
         source: ${CHELABASE_NEXTEST_BIN:-/usr/local/bin/cargo-nextest}
         target: /usr/local/bin/cargo-nextest
         read_only: true
+    secrets:
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+      - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+      - {source: app-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
+      - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: nats-orchestrator, target: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}
+      - {source: nats-worker, target: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
+      - {source: nats-realtime, target: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
+      - {source: nats-runner, target: "${CHELABASE_KEYS_DIR}/nats/runner.password"}
+      - {source: valkey-proxy, target: "${CHELABASE_KEYS_DIR}/valkey/proxy.password"}
+      - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+      - {source: valkey-realtime, target: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
+      - {source: valkey-runner, target: "${CHELABASE_KEYS_DIR}/valkey/runner.password"}
+      - {source: valkey-health, target: "${CHELABASE_KEYS_DIR}/valkey/health.password"}
+      - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+      - {source: realtime-ticket, target: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
+      - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+      - {source: token-rest-internal, target: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+      - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+      - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+      - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+      - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+      - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+      - {source: storage-pem, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem"}
+      - {source: storage-pageserver-api, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt"}
+      - {source: storage-safekeeper-data, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt"}
+      - {source: storage-generations-api, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt"}
+      - {source: storage-storcon-admin, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt"}
+      - {source: storage-metrics, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token"}
+
+# Per-service key files (U10): each service lists the ones it reads under its own `secrets:`,
+# with `target:` set to the path it expects, so a service sees exactly its files. Compose binds
+# each host file read-only; a missing file fails `up`.
+# RT1 T1 (R11, S1, S27): the generated service secrets (`chelabase workbench up` creates each once,
+# 0600, never overwritten); a service gets its file's path as <NAME>_FILE in its own
+# `environment:`, never through stack.env.
+secrets:
+  secrets-key: {file: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+  internal-signing: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
+  internal-verify: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+  cookie: {file: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
+  app-jwt-private: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
+  app-jwt-public: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+  compute-jwt-private: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+  compute-jwt-public: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+  nats-orchestrator: {file: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}
+  nats-worker: {file: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
+  nats-realtime: {file: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
+  nats-runner: {file: "${CHELABASE_KEYS_DIR}/nats/runner.password"}
+  valkey-proxy: {file: "${CHELABASE_KEYS_DIR}/valkey/proxy.password"}
+  valkey-control: {file: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+  valkey-realtime: {file: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
+  valkey-runner: {file: "${CHELABASE_KEYS_DIR}/valkey/runner.password"}
+  valkey-health: {file: "${CHELABASE_KEYS_DIR}/valkey/health.password"}
+  realtime-pg: {file: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+  realtime-ticket: {file: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
+  realtime-internal: {file: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+  token-rest-internal: {file: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+  token-data-keys: {file: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+  token-app-auth: {file: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+  token-app-sessions: {file: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+  token-proxy-api: {file: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+  token-storcon-hook: {file: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+  # Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped
+  # NeonJWTs the workbench signs with the pair (<keys>/neon/storage-tokens/). The runner sees
+  # them at their own paths (scripts call the storage controller); the Neon containers read them
+  # under /run.
+  storage-pem: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem"}
+  storage-pageserver-api: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt"}
+  storage-safekeeper-data: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt"}
+  storage-generations-api: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt"}
+  storage-storcon-admin: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt"}
+  # The runner's metrics token (scope metrics, minted by the workbench). A kept metrics.token
+  # isn't checked against the current compute-JWT key: after a key rotation, re-mint it with
+  # `chelabase neon mint-metrics-token`, then recreate the runner (a single-file mount keeps the
+  # old file's inode, so a running runner never sees the new token). The command writes under
+  # `CHELABASE_NEON_DIR` (default `.chelabase/neon` in the checkout): for a workbench stack, run
+  # it with that stack's `CHELABASE_NEON_DIR`.
+  storage-metrics: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token"}
+  # The platform CA's certificate alone (never ca.key): auth, rest and realtime verify every
+  # compute's TLS against it (U15, CHELABASE_COMPUTE_CA_FILE).
+  compute-ca-cert: {file: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
 
 networks:
   # Orchestrator and test runner to computes (<project>_control). A fixed subnet per stack from
