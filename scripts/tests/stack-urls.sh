@@ -48,14 +48,17 @@ for pat in '\.chelabase/dev' 'cargo run' '"chelabase-[a-z0-9-]+-1"' 'CHELABASE_I
     bad=1
   fi
 done
-needs() { # needs <pattern> <env var> <what>: every file matching the pattern also reads the var
+needs() { # needs <pattern> <env var regex> <what>: every file matching the pattern also reads the var
   while IFS= read -r f; do
-    grep -q "$2" "$f" || { echo "stack-urls: $f $3 without $2" >&2; bad=1; }
+    grep -qE "$2" "$f" || { echo "stack-urls: $f $3 without $2" >&2; bad=1; }
   done < <(grep -lE "$1" "${tests[@]}" || true)
 }
 needs 'join\("\.chelabase/neon/proxy-ca\.crt"\)' CHELABASE_PROXY_CA_FILE "reads the proxy CA"
 needs 'target/debug|fn chelabase_cli' CHELABASE_CLI "finds the chelabase CLI"
-needs '"docker"' CHELABASE_COMPOSE_PROJECT "runs docker on a stack's containers"
+# The shared helpers in services/worker/tests/common/mod.rs read CHELABASE_COMPOSE_PROJECT
+# (`compose_project`, and the container names built from it), so a file that gets its container
+# names from them honours the rule without naming the variable itself.
+needs '"docker"' 'CHELABASE_COMPOSE_PROJECT|compose_project\(|pageserver_container\(|storage_broker_container\(' "runs docker on a stack's containers"
 needs 'fn internal_addr|INTERNAL_PORT' CHELABASE_INTERNAL_URL "dials the internal listener"
 grep -q 'docker' services/worker/tests/roles_live.rs && grep -q -- '--force-recreate' services/worker/tests/roles_live.rs ||
   { echo "stack-urls: roles_live restarts the orchestrator by recreating its container (compose --force-recreate)" >&2; bad=1; }
