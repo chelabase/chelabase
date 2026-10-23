@@ -5659,6 +5659,12 @@ mod f2 {
 
     /// One endpoint `ep-a` on [`TENANT`], its compute_ctl at `addr`; the notify-attach answer
     /// and how long it took. Gives up after 12 s (the storage controller already did at 10 s).
+    ///
+    /// The tests using it run on the real clock: the hook talks to its compute_ctl stand-in
+    /// over loopback sockets, and a paused clock auto-advances to the next timer whenever the
+    /// runtime is idle, including while a socket connect is still in flight in the kernel.
+    /// Where a loopback connect isn't complete by tokio's zero-timeout poll (WSL2), that fired
+    /// the 12 s guard (or the hook's own timeouts) before the request was even delivered.
     async fn notify(locator: FakeLocator) -> (Option<u16>, Duration) {
         let neon = FakeNeon::default();
         neon.add("ep-a", TENANT, TIMELINE);
@@ -5675,7 +5681,7 @@ mod f2 {
 
     // A compute_ctl that never answers `/status` (hung, or a black-holed address): the hook
     // answers 503 (the storage controller retries) before the storage controller's 10 s.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_hung_status_read_still_answers_the_hook_in_time() {
         let (addr, configured) = stand_in(Answer::Hang, Answer::Running, nothing()).await;
         let locator = FakeLocator::default();
@@ -5686,7 +5692,7 @@ mod f2 {
         assert_eq!(configured.load(Ordering::SeqCst), 0);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_hung_push_still_answers_the_hook_in_time() {
         let (addr, configured) = stand_in(Answer::Running, Answer::Hang, nothing()).await;
         let locator = FakeLocator::default();
@@ -5922,8 +5928,7 @@ mod t4 {
         assert_eq!(seen.0.lock().unwrap().len(), 1, "the compute was still reconfigured");
     }
 
-    /// A compute_ctl stand-in that answers at once and records when (on the paused clock) each
-    /// `/configure` arrived.
+    /// A compute_ctl stand-in that answers at once and records when each `/configure` arrived.
     async fn quick_compute() -> (SocketAddr, Arc<Mutex<Vec<Instant>>>) {
         let at = Arc::new(Mutex::new(Vec::new()));
         let seen = at.clone();
@@ -5949,8 +5954,10 @@ mod t4 {
 
     // A2: a publish that never acks (NATS hung) is cut at the hook's one deadline, taken at hook
     // entry: 503 before the storage controller's 10 s, and the reconfigures ran meanwhile rather
-    // than after it.
-    #[tokio::test(start_paused = true)]
+    // than after it. On the real clock: the hook reaches the stand-in over loopback sockets, and a
+    // paused clock's auto-advance fires pending timers while a connect is still in flight (see
+    // `f2::notify`).
+    #[tokio::test]
     async fn a_hung_publish_answers_503_in_time_without_holding_up_the_reconfigures() {
         let neon = FakeNeon::default();
         neon.add("ep-a", TENANT, TIMELINE);
