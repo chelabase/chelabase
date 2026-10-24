@@ -2,7 +2,7 @@
 //! schema as the data API sees it. Keys are shown once, except the public key, which is sealed
 //! so Studio can show it again.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,7 +30,8 @@ use uuid::Uuid;
 
 use crate::branches::{conflict, load_branch, parse_body, unprocessable};
 use crate::data_api_databases::validate_key_databases;
-use crate::access::{authorize, authorize_database, authorize_key_role, Target};
+use crate::privileges::check_all_rows;
+use crate::access::{authorize, authorize_database, authorize_key_role, refuse_personal_login_key, Target};
 use crate::{AppState, ApiBytes, BACKUP_REFUSAL, AuthPrincipal, JobPort, MetadataPort, ResetError};
 use chelabase_routes::orchestrator as ep;
 
@@ -281,9 +282,9 @@ struct CreateKeyRequest {
         (status = 404, description = "`not_found`: the database (or another tenant's) or the branch doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why); `exposes_data_api`: the role is, or is a member (at any depth) of, a role with the members hub's \"all rows\" policy on the branch, so every row would reach the data API through the key; `chain` lists the roles from the key's role to that one", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, retry", body = ErrorEnvelope),
+        (status = 503, description = "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, or the data API exposure check (\"all rows\" roles, read on the branch's compute) couldn't be completed; nothing was created, retry", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the worker didn't answer in time", body = ErrorEnvelope),
     ),
 )]
@@ -319,6 +320,10 @@ where
     if role.is_empty() {
         return unprocessable("role must not be empty").into_response();
     }
+    // MH-12: a personal login never backs a key, whoever asks.
+    if let Err(err) = refuse_personal_login_key(&state, &record, &role).await {
+        return err.into_response();
+    }
     if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &role).await {
         return err.into_response();
     }
@@ -337,6 +342,14 @@ where
         Ok(identity) => identity,
         Err(err) => return err.into_response(),
     };
+    // EOS-H1: a key whose role is, or reaches, a role with the hub's "all rows" policy on the
+    // branch would hand every row of it to the data API (the policy's own check, MH-26, saw
+    // only the keys that existed then). The worker checks, as `cloud_admin`; any failure
+    // refuses (user ruling 2026-10-23: fail closed).
+    let starting: BTreeSet<String> = [role.clone()].into();
+    if let Err(err) = check_all_rows(&state, branch.id, starting, None, &format!("a key for {role:?}")).await {
+        return err.into_response();
+    }
     // Bound to the role's OID on the timeline the check read it on: a role dropped or
     // recreated after the check, or a timeline switch, leaves a dead key, never one of another
     // role (see `chelabase_metadata`'s data API docs).
@@ -404,6 +417,10 @@ where
     if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &old.role).await {
         return err.into_response();
     }
+    // MH-12: never a new key for a personal login (the worker revokes any such key).
+    if let Err(err) = refuse_personal_login_key(&state, &record, &old.role).await {
+        return err.into_response();
+    }
     // A secret key's role is checked on the compute again, for its OID: the store refuses a
     // role dropped and created again since the old key was made. A refusal may be a rename
     // that landed meanwhile (the key moved with it): the key is read again and its new name
@@ -424,6 +441,9 @@ where
                     Err(err) => return err.into_response(),
                 };
                 if let Err(err) = authorize_key_role(&state, &authorized, branch.id.as_uuid(), &renamed.role).await {
+                    return err.into_response();
+                }
+                if let Err(err) = refuse_personal_login_key(&state, &record, &renamed.role).await {
                     return err.into_response();
                 }
                 old = renamed;

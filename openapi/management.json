@@ -37,6 +37,16 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "member_id",
+            "in": "query",
+            "description": "Only events whose target or actor is this member",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -51,7 +61,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: `before` or `limit` isn't valid",
+            "description": "`invalid_request`: `before`, `limit` or `member_id` isn't valid",
             "content": {
               "application/json": {
                 "schema": {
@@ -2333,7 +2343,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)",
+            "description": "`invalid_request`: the body is valid JSON but the wrong shape, or the name, role or databases list is invalid; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why); `exposes_data_api`: the role is, or is a member (at any depth) of, a role with the members hub's \"all rows\" policy on the branch, so every row would reach the data API through the key; `chain` lists the roles from the key's role to that one",
             "content": {
               "application/json": {
                 "schema": {
@@ -2353,7 +2363,7 @@
             }
           },
           "503": {
-            "description": "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, retry",
+            "description": "`worker_unavailable`: the worker or job queue can't be reached; `unavailable`: the branch's roles are being changed, or the data API exposure check (\"all rows\" roles, read on the branch's compute) couldn't be completed; nothing was created, retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -3557,6 +3567,190 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/privileges": {
+      "get": {
+        "tags": [
+          "tables"
+        ],
+        "summary": "One role's privileges in a Postgres database",
+        "description": "The privileges `role` holds in one Postgres database of a branch (one of the branch's recorded databases), read as the database owner, a page at a time. Without `schema`: the schemas (paged by name) with the role's schema entries, and the default privileges of those schemas. With `schema`: every table, view, materialized view, partitioned or foreign table, sequence, function and procedure of it (paged), with the role's entries on it and on its columns, the hub's \"all rows\" policy for the role, its owner and whether an owner run can act as that owner (`owner_settable`). Every entry carries its grantor and grant option. Each schema, object and default-privileges row carries `acl_hash`, a hash over its whole ACL (every grantee; a relation's covers its columns): send it back as `expect_acl` with a schema change. `role=public` reads PUBLIC's entries. Member logins and personal logins aren't listed.",
+        "operationId": "getPrivileges",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The Postgres database",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "The grantee whose entries are read (required); `public` (lower case) reads PUBLIC's.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "schema",
+            "in": "query",
+            "description": "The schema whose objects are listed; without it, the schema list and the default\nprivileges.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "The previous page's `next_after`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Objects (or schemas) per page, 1 to 500 (default 200).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of the role's privileges; `next_after` names the next page, `null` on the last",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PrivilegesPage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`forbidden`: below Viewer on the project; `permission_denied`: the database owner may not read the catalog; `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the Postgres database doesn't exist (only the branch's recorded databases are read), or the role isn't one the read lists; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`owner_password_unknown`: the owner's password was set in SQL; `backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the query string is malformed, `role` is missing or empty, `limit` isn't 1 to 500, or `after` isn't a `next_after`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`credentials_unavailable`: the stored owner password can't be opened with the current secrets key; `internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the compute isn't running, can't be reached or is out of connections right now (`Retry-After`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the read took over 15 s",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/reset-password": {
       "post": {
         "tags": [
@@ -4656,7 +4850,7 @@
           "roles"
         ],
         "summary": "Delete a login role",
-        "description": "Deletes a login role. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted.",
+        "description": "Deletes a role. Its objects in every database go to `successor` (never the owner): a role the owner can `SET ROLE` to that isn't owner-level, reserved or a personal login, or `chelabase_orphaned` (the default), a powerless role. Databases it owns go to the owner. PUBLIC loses EXECUTE on every routine that moved, and the answer lists the `SECURITY DEFINER` ones for review. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted. A named successor that would let other roles run the role's `SECURITY DEFINER` routines or read its views without `security_invoker` with the successor's rights needs `confirm`, the current token of the delete's preview (`GET …/roles/{role}/delete-preview`); the grants are kept. `chelabase_orphaned` never needs one.",
         "operationId": "deleteRole",
         "parameters": [
           {
@@ -4687,11 +4881,36 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "successor",
+            "in": "query",
+            "description": "The role the deleted role's objects go to: a role the owner can `SET ROLE` to that isn't\nowner-level, reserved or a personal login, or `chelabase_orphaned` (the default), a\npowerless role. Its databases go to the owner.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "description": "The `confirm` token of the delete's preview (`GET …/roles/{role}/delete-preview`), when\nthe move to a named successor exposes routines or views to other roles. Not needed for\n`chelabase_orphaned`, nor when nothing is exposed.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
-          "204": {
-            "description": "The role was deleted"
+          "200": {
+            "description": "The role was deleted; what went to the successor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeletedRole"
+                }
+              }
+            }
           },
           "400": {
             "description": "`invalid_request`: a path id isn't a valid UUID",
@@ -4734,7 +4953,7 @@
             }
           },
           "409": {
-            "description": "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "description": "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `exposure_unconfirmed`: the move to the named successor exposes routines or views to other roles and `confirm` isn't the current token, with the current list in `exposures` (as the preview's) and its token in `confirm`; nothing changed, unless the exposures changed while the delete ran, in which case databases already done stay done and the role is left without LOGIN; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
             "content": {
               "application/json": {
                 "schema": {
@@ -4744,7 +4963,7 @@
             }
           },
           "422": {
-            "description": "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte",
+            "description": "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `invalid_successor`: the successor is the role itself, the owner, reserved, a personal login, owner-level, a role the owner can't SET to, or doesn't exist; `invalid_request`: the query string is malformed (a parameter given twice, say)",
             "content": {
               "application/json": {
                 "schema": {
@@ -4900,7 +5119,7 @@
             }
           },
           "422": {
-            "description": "`reserved_role_name`: the owner, a reserved role or any `chelabase_` role; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set)",
+            "description": "`reserved_role_name`: the owner, a reserved role or any `chelabase_` role; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set); `exposes_data_api`: the new memberships would let a data API key's role, `anon`, `authenticated` or `authenticator` reach a role with the members hub's \"all rows\" policy on the branch (every row through the data API); `chain` lists the roles from that role to it, and nothing changed",
             "content": {
               "application/json": {
                 "schema": {
@@ -4920,7 +5139,164 @@
             }
           },
           "503": {
-            "description": "`not_applied`: the change is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached",
+            "description": "`not_applied`: the change is stored but not applied yet and will be retried; `unavailable`: a `member_of` change's data API exposure check (\"all rows\" roles, read on the branch's compute) couldn't be completed, nothing changed, retry; `worker_unavailable`: the worker can't be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker or database didn't answer in time",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/branches/{branch_id}/roles/{role}/delete-preview": {
+      "get": {
+        "tags": [
+          "roles"
+        ],
+        "summary": "Preview a role delete",
+        "description": "What deleting the role to `successor` would expose: its `SECURITY DEFINER` routines granted to roles other than the successor, and its views without `security_invoker` (and materialized views) granted to anyone but the successor, PUBLIC included. After the delete they run with the successor's rights for those roles. Review them, then pass `confirm` to the delete; a delete to a named successor that exposes something is refused without the current token (`exposure_unconfirmed`). `chelabase_orphaned` (the default) never needs one: its preview lists what it finds with `confirm: null`. Changes nothing. The delete's rules for the role and the successor apply.",
+        "operationId": "previewRoleDelete",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "path",
+            "description": "Role name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "successor",
+            "in": "query",
+            "description": "The successor the delete would name, with the delete's rules; `chelabase_orphaned` (the\ndefault) when omitted.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What the delete would expose, and the token that confirms it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RoleDeletePreview"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the caller isn't an Admin of the project; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the role doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `invalid_successor`: the successor is the role itself, the owner, reserved, a personal login, owner-level, a role the owner can't SET to, or doesn't exist; `invalid_request`: the query string is malformed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: the worker failed to read the exposures",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`worker_unavailable`: the worker can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -7971,6 +8347,425 @@
         ]
       }
     },
+    "/v1/databases/{id}/personal-login": {
+      "put": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Create your personal login on a database",
+        "description": "Your own Postgres login for this database, for Developers and above there (tenant admins included). Its password is generated and answered this once, with `Cache-Control: no-store`; only a SCRAM verifier is stored. It is valid for 90 days (a password reset renews it) and works on every branch where you qualify, acting only as the roles you hold at Developer or above. A revoked or expired login of yours on the database is replaced.",
+        "operationId": "createPersonalLogin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutPersonalLoginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The login and its password, once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalLoginSecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`personal_login_exists`: you have a live login on this database (reset it, or delete it first); `role_exists`: a role on a branch of the database, or another login of it, has the name; `credentials_unavailable`: the main branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_role_name`: the name doesn't fit the rules; `reserved_role_name`: the name is reserved; `invalid_request`: `name` is missing",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/personal-login/reset-password": {
+      "post": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Reset your personal login's password",
+        "description": "A new generated password, answered this once with `Cache-Control: no-store`; the old one is refused at once. It also renews the login for 90 days (an expired login comes back this way). A revoked login can't be reset: make a new one.",
+        "operationId": "resetPersonalLoginPassword",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The login and its new password, once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalLoginSecret"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) doesn't exist, or you have no login there that isn't revoked; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`credentials_unavailable`: the main branch has no endpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/personal-logins": {
+      "get": {
+        "tags": [
+          "members"
+        ],
+        "summary": "List a database's personal logins",
+        "description": "Every personal login of the database, any status, by role name (the Roles tab counts the active ones). Never a password or verifier.",
+        "operationId": "listDatabasePersonalLogins",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The database's logins",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalLoginList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only the project's Admins and tenant admins may (`required`); `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) doesn't exist; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/databases/{id}/personal-logins/{member_id}": {
+      "delete": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Delete a member's personal login",
+        "description": "Any status. The member themself, a tenant admin, or an Admin of the database's project may; for anyone else the login doesn't exist (404). The proxies forget it at once and each branch drops the role.",
+        "operationId": "deletePersonalLogin",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "The login's member",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's) doesn't exist, or there is no such login you may delete; `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/reset-password": {
       "post": {
         "tags": [
@@ -9320,7 +10115,7 @@
           "members"
         ],
         "summary": "List the tenant's members",
-        "description": "Invited, pending and active members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined.",
+        "description": "Invited, pending, active and suspended members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined. Each member carries `access`: the highest platform role over the projects the caller can see and the member's role on each of those projects (`other`: access only on projects the caller can't see; `none`: no project grant). No Postgres roles or overrides.",
         "operationId": "listMembers",
         "responses": {
           "200": {
@@ -9848,6 +10643,402 @@
           },
           "503": {
             "description": "`unavailable`: declined in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); decline again to retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/members/{member_id}/personal-logins": {
+      "get": {
+        "tags": [
+          "members"
+        ],
+        "summary": "List a member's personal logins",
+        "description": "Any status. Filtered by the caller: a member sees all of their own, a tenant admin all of anyone's, an Admin of a project the logins on that project's databases; anyone else gets an empty list. Never a password or verifier.",
+        "operationId": "listMemberPersonalLogins",
+        "parameters": [
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The logins the caller may see",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PersonalLoginList"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such member (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/members/{member_id}/reinstate": {
+      "post": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Reinstate a suspended member",
+        "description": "The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.",
+        "operationId": "reinstateMember",
+        "parameters": [
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The reinstated member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such member (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the member isn't suspended (invited, pending or removed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: reinstated in Chelabase, but Zitadel couldn't unlock the user (or isn't configured); reinstate again to retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/members/{member_id}/revoke-postgres-access": {
+      "post": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Revoke a member's Postgres access now",
+        "description": "Every personal login of the member is revoked at once (the proxies forget it), and their member role on every branch of every project they reach gets a new password, which ends its open sessions (the SQL editor and the console reconnect with the new one). Their Studio access and grants are untouched.",
+        "operationId": "revokeMemberPostgresAccess",
+        "parameters": [
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "What was revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevokeResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such member (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/members/{member_id}/suspend": {
+      "post": {
+        "tags": [
+          "members"
+        ],
+        "summary": "Suspend a member",
+        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+        "operationId": "suspendMember",
+        "parameters": [
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The suspended member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Member"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such member (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: yourself, or a member who isn't active (invited, pending or removed); `last_tenant_admin`: the tenant would have no active tenant admin",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry",
             "content": {
               "application/json": {
                 "schema": {
@@ -10449,6 +11640,16 @@
               "format": "int32",
               "minimum": 0
             }
+          },
+          {
+            "name": "member_id",
+            "in": "query",
+            "description": "Only events whose target or actor is this member",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -10463,7 +11664,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`: a path id isn't a valid UUID, or `before` or `limit` isn't valid",
+            "description": "`invalid_request`: a path id isn't a valid UUID, or `before`, `limit` or `member_id` isn't valid",
             "content": {
               "application/json": {
                 "schema": {
@@ -12876,6 +14077,7 @@
           "target_member_id",
           "project_id",
           "database_id",
+          "branch_id",
           "actor_email",
           "target_email",
           "project_name",
@@ -12886,7 +14088,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "`member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,\n`member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,\n`invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,\n`open_signup_set`, `tenant_renamed`, `member_approved` or `member_declined`."
+            "description": "`member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,\n`member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,\n`invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,\n`open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,\n`member_suspended`, `member_reinstated`, `personal_logins_revoked`,\n`personal_login_created`, `personal_login_reset`, `personal_login_deleted`,\n`role_created`, `role_updated` or `role_deleted`."
           },
           "actor_email": {
             "type": [
@@ -12918,6 +14120,14 @@
               "object",
               "null"
             ]
+          },
+          "branch_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The branch of a per-branch change (a role's); `null` for the others."
           },
           "database_id": {
             "type": [
@@ -12984,6 +14194,24 @@
           }
         }
       },
+      "AccessLevel": {
+        "type": "string",
+        "description": "The highest platform role a member holds over the projects the caller can see.",
+        "enum": [
+          "tenant_admin",
+          "admin",
+          "developer",
+          "viewer",
+          "other",
+          "none"
+        ]
+      },
+      "AccessVia": {
+        "type": "string",
+        "enum": [
+          "own"
+        ]
+      },
       "AcknowledgeReviewRequest": {
         "type": "object",
         "description": "`POST …/review/acknowledge`.",
@@ -13012,6 +14240,18 @@
         "enum": [
           "all"
         ]
+      },
+      "AllRows": {
+        "type": "object",
+        "description": "The hub's \"all rows\" policy on a table, found by shape and marker (MH-26).",
+        "required": [
+          "policy"
+        ],
+        "properties": {
+          "policy": {
+            "type": "string"
+          }
+        }
       },
       "AppUser": {
         "type": "object",
@@ -13817,6 +15057,24 @@
           }
         }
       },
+      "ColumnPrivileges": {
+        "type": "object",
+        "required": [
+          "name",
+          "grants"
+        ],
+        "properties": {
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            }
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "ColumnSpec": {
         "type": "object",
         "required": [
@@ -14609,6 +15867,31 @@
           }
         }
       },
+      "DataApiExposure": {
+        "type": "object",
+        "description": "One grant that exposes its privileges to the data API (P31): the operation, its grantee\nand one shortest membership chain from `anon` or `authenticated` to it (`[anon]` when the\ngrantee is `anon` itself).",
+        "required": [
+          "op_index",
+          "grantee",
+          "chain"
+        ],
+        "properties": {
+          "chain": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "grantee": {
+            "type": "string"
+          },
+          "op_index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
       "DataApiSchema": {
         "type": "object",
         "description": "The Data API schema: everything the asking roles can reach.",
@@ -14954,6 +16237,46 @@
           }
         ]
       },
+      "DefaultObject": {
+        "type": "string",
+        "description": "The objects a default privilege applies to.",
+        "enum": [
+          "tables",
+          "sequences",
+          "functions"
+        ]
+      },
+      "DefaultPrivileges": {
+        "type": "object",
+        "description": "One `pg_default_acl` row's entries for the read's role.",
+        "required": [
+          "for_role",
+          "schema",
+          "object",
+          "grants",
+          "acl_hash"
+        ],
+        "properties": {
+          "acl_hash": {
+            "type": "string"
+          },
+          "for_role": {
+            "type": "string"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            }
+          },
+          "object": {
+            "$ref": "#/components/schemas/DefaultObject"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "DefaultRow": {
         "type": "object",
         "required": [
@@ -14993,6 +16316,23 @@
           "confirm": {
             "type": "string",
             "description": "The project's slug, typed to confirm."
+          }
+        }
+      },
+      "DeletedRole": {
+        "type": "object",
+        "description": "A done role delete.",
+        "required": [
+          "successor",
+          "reassigned"
+        ],
+        "properties": {
+          "reassigned": {
+            "$ref": "#/components/schemas/ReassignedObjects"
+          },
+          "successor": {
+            "type": "string",
+            "description": "The role that received the objects."
           }
         }
       },
@@ -15214,7 +16554,15 @@
           "schema_change_failed",
           "has_dependents",
           "review_changed",
-          "compute_tls_failed"
+          "compute_tls_failed",
+          "privileges_not_applied",
+          "privileges_changed_since_read",
+          "exposes_data_api",
+          "personal_login_exists",
+          "member_suspended",
+          "member_offboarded",
+          "invalid_successor",
+          "exposure_unconfirmed"
         ]
       },
       "ErrorEnvelope": {
@@ -15241,6 +16589,23 @@
           },
           "operator": {
             "$ref": "#/components/schemas/OperatorRef"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ExpectedAcl": {
+        "type": "object",
+        "description": "The `acl_hash` the privileges read gave `object` (P10): a different hash at apply time is\n409 `privileges_changed_since_read`.",
+        "required": [
+          "object",
+          "acl_hash"
+        ],
+        "properties": {
+          "acl_hash": {
+            "type": "string"
+          },
+          "object": {
+            "$ref": "#/components/schemas/PrivilegeTarget"
           }
         },
         "additionalProperties": false
@@ -15323,6 +16688,25 @@
             "$ref": "#/components/schemas/ReturnDesc"
           }
         }
+      },
+      "FunctionRef": {
+        "type": "object",
+        "description": "A function or procedure: `oid` from the privileges read; `identity` its `regprocedure`\ntext then (P11). Only the server's own resolution of `oid` reaches SQL.",
+        "required": [
+          "oid",
+          "identity"
+        ],
+        "properties": {
+          "identity": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "Grant": {
         "type": "object",
@@ -15962,8 +17346,11 @@
           "tenant_admin",
           "status",
           "has_access",
+          "access",
           "created_at",
           "accepted_at",
+          "suspended_at",
+          "suspended_by",
           "invite"
         ],
         "properties": {
@@ -15974,6 +17361,10 @@
             ],
             "format": "date-time",
             "description": "When an invited member first signed in."
+          },
+          "access": {
+            "$ref": "#/components/schemas/MemberAccess",
+            "description": "What the member can reach, over the projects the caller can see."
           },
           "created_at": {
             "type": "string",
@@ -16013,18 +17404,75 @@
           "status": {
             "$ref": "#/components/schemas/MemberStatusView"
           },
+          "suspended_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the member was suspended; `null` unless suspended (or removed after a suspension)."
+          },
+          "suspended_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "The member who suspended it; `null` unless suspended, and for a member suspended before\nthis was recorded."
+          },
           "tenant_admin": {
             "type": "boolean"
           }
         }
       },
+      "MemberAccess": {
+        "type": "object",
+        "description": "What a member can reach, as the caller may see it: only projects the caller can see are\nnamed (a Developer never learns of grants elsewhere), and never a Postgres role or override.",
+        "required": [
+          "level",
+          "projects"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/AccessLevel"
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MemberProjectAccess"
+            },
+            "description": "The member's platform role on each project the caller can see, by project id."
+          }
+        }
+      },
+      "MemberProjectAccess": {
+        "type": "object",
+        "required": [
+          "project_id",
+          "platform_role",
+          "via"
+        ],
+        "properties": {
+          "platform_role": {
+            "$ref": "#/components/schemas/PlatformRole"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId"
+          },
+          "via": {
+            "$ref": "#/components/schemas/AccessVia",
+            "description": "Where the role comes from: always `own` (the member's own grant; a tenant admin's\nadmin is listed the same way)."
+          }
+        }
+      },
       "MemberStatusView": {
         "type": "string",
-        "description": "Where a member is: `invited` (not signed in yet), `pending` (signed up, waiting for an\nadmin to approve), `active`, or `removed`.",
+        "description": "Where a member is: `invited` (not signed in yet), `pending` (signed up, waiting for an\nadmin to approve), `active`, `suspended` (grants kept, no access until a tenant admin\nreinstates them), or `removed`.",
         "enum": [
           "invited",
           "pending",
           "active",
+          "suspended",
           "removed"
         ]
       },
@@ -16418,6 +17866,79 @@
         },
         "additionalProperties": false
       },
+      "ObjectPrivileges": {
+        "type": "object",
+        "description": "One object of the page's schema, with the read's role's entries.",
+        "required": [
+          "kind",
+          "schema",
+          "name",
+          "oid",
+          "owner",
+          "owner_settable",
+          "rls_enabled",
+          "grants",
+          "columns",
+          "acl_hash"
+        ],
+        "properties": {
+          "acl_hash": {
+            "type": "string"
+          },
+          "all_rows": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AllRows"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ColumnPrivileges"
+            }
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            }
+          },
+          "identity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A function's or procedure's `regprocedure` text; `None` for the other kinds."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PrivilegeObjectKind"
+          },
+          "name": {
+            "type": "string"
+          },
+          "oid": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "owner": {
+            "type": "string"
+          },
+          "owner_settable": {
+            "type": "boolean"
+          },
+          "rls_enabled": {
+            "type": "boolean"
+          },
+          "schema": {
+            "type": "string"
+          }
+        }
+      },
       "ObjectSummary": {
         "type": "object",
         "required": [
@@ -16481,6 +18002,42 @@
           }
         },
         "additionalProperties": false
+      },
+      "Offered": {
+        "type": "object",
+        "description": "The privilege names the editor offers per object kind (lower snake case, as the ops take\nthem; `maintain` only on Postgres 17 and later).",
+        "required": [
+          "table",
+          "sequence",
+          "schema",
+          "function"
+        ],
+        "properties": {
+          "function": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "schema": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "sequence": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "table": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
       },
       "OnDelete": {
         "type": "string",
@@ -17213,6 +18770,252 @@
                 }
               }
             }
+          },
+          {
+            "type": "object",
+            "required": [
+              "grant_schema"
+            ],
+            "properties": {
+              "grant_schema": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "grantee",
+                  "privileges"
+                ],
+                "properties": {
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  },
+                  "privileges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SchemaPrivilege"
+                    }
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "revoke_schema"
+            ],
+            "properties": {
+              "revoke_schema": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "grantee",
+                  "privileges"
+                ],
+                "properties": {
+                  "grant_option_only": {
+                    "type": "boolean"
+                  },
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  },
+                  "privileges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SchemaPrivilege"
+                    }
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "grant_sequence"
+            ],
+            "properties": {
+              "grant_sequence": {
+                "type": "object",
+                "required": [
+                  "sequence",
+                  "grantee",
+                  "privileges"
+                ],
+                "properties": {
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  },
+                  "privileges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SequencePrivilege"
+                    }
+                  },
+                  "sequence": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "revoke_sequence"
+            ],
+            "properties": {
+              "revoke_sequence": {
+                "type": "object",
+                "required": [
+                  "sequence",
+                  "grantee",
+                  "privileges"
+                ],
+                "properties": {
+                  "grant_option_only": {
+                    "type": "boolean"
+                  },
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  },
+                  "privileges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/SequencePrivilege"
+                    }
+                  },
+                  "sequence": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "`EXECUTE`.",
+            "required": [
+              "grant_function"
+            ],
+            "properties": {
+              "grant_function": {
+                "type": "object",
+                "description": "`EXECUTE`.",
+                "required": [
+                  "function",
+                  "grantee"
+                ],
+                "properties": {
+                  "function": {
+                    "$ref": "#/components/schemas/FunctionRef"
+                  },
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "revoke_function"
+            ],
+            "properties": {
+              "revoke_function": {
+                "type": "object",
+                "required": [
+                  "function",
+                  "grantee"
+                ],
+                "properties": {
+                  "function": {
+                    "$ref": "#/components/schemas/FunctionRef"
+                  },
+                  "grant_option_only": {
+                    "type": "boolean"
+                  },
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "alter_default_privileges"
+            ],
+            "properties": {
+              "alter_default_privileges": {
+                "type": "object",
+                "required": [
+                  "for_role",
+                  "schema",
+                  "object",
+                  "grant",
+                  "grantee",
+                  "privileges"
+                ],
+                "properties": {
+                  "for_role": {
+                    "type": "string"
+                  },
+                  "grant": {
+                    "type": "boolean"
+                  },
+                  "grantee": {
+                    "$ref": "#/components/schemas/Grantee"
+                  },
+                  "object": {
+                    "$ref": "#/components/schemas/DefaultObject"
+                  },
+                  "privileges": {
+                    "type": "array",
+                    "items": {
+                      "$ref": "#/components/schemas/PrivilegeName"
+                    }
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "set_all_rows"
+            ],
+            "properties": {
+              "set_all_rows": {
+                "type": "object",
+                "required": [
+                  "table",
+                  "role",
+                  "enabled"
+                ],
+                "properties": {
+                  "enabled": {
+                    "type": "boolean"
+                  },
+                  "role": {
+                    "type": "string"
+                  },
+                  "table": {
+                    "$ref": "#/components/schemas/TableRef"
+                  }
+                }
+              }
+            }
           }
         ]
       },
@@ -17254,6 +19057,131 @@
           "unreadable",
           "none"
         ]
+      },
+      "PersonalLoginList": {
+        "type": "object",
+        "required": [
+          "logins"
+        ],
+        "properties": {
+          "logins": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersonalLoginView"
+            }
+          }
+        }
+      },
+      "PersonalLoginRevokeReason": {
+        "type": "string",
+        "description": "Why a login was revoked.",
+        "enum": [
+          "access_lost",
+          "suspended",
+          "revoked_now",
+          "identity_offboarded",
+          "member_removed"
+        ]
+      },
+      "PersonalLoginSecret": {
+        "type": "object",
+        "description": "A login with its password, answered once (create and reset).",
+        "required": [
+          "login",
+          "password",
+          "connection_string",
+          "ready_on_main"
+        ],
+        "properties": {
+          "connection_string": {
+            "type": "string",
+            "description": "For the main branch's default database. The same login works on every branch where the\nmember qualifies, with that branch's host."
+          },
+          "login": {
+            "$ref": "#/components/schemas/PersonalLoginView"
+          },
+          "password": {
+            "type": "string",
+            "description": "Shown this once: it is never stored (only a SCRAM verifier is), listed or logged."
+          },
+          "ready_on_main": {
+            "type": "boolean",
+            "description": "Whether the login already works on the main branch. When `false` (the compute isn't\nrunning, or the worker didn't answer in time), it works there within seconds."
+          }
+        }
+      },
+      "PersonalLoginStatus": {
+        "type": "string",
+        "description": "A personal login's state.",
+        "enum": [
+          "active",
+          "expired",
+          "revoked"
+        ]
+      },
+      "PersonalLoginView": {
+        "type": "object",
+        "description": "A member's personal Postgres login on one Chelabase database. Never its password or\nverifier.",
+        "required": [
+          "member_id",
+          "database_id",
+          "database_name",
+          "project_id",
+          "role_name",
+          "valid_until",
+          "created_at",
+          "status",
+          "revoked_at",
+          "revoked_reason"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "database_id": {
+            "$ref": "#/components/schemas/DatabaseId"
+          },
+          "database_name": {
+            "type": "string"
+          },
+          "member_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId"
+          },
+          "revoked_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "revoked_reason": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PersonalLoginRevokeReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role_name": {
+            "type": "string",
+            "description": "The Postgres role name, the same on every branch."
+          },
+          "status": {
+            "$ref": "#/components/schemas/PersonalLoginStatus"
+          },
+          "valid_until": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the password stops working (90 days after its creation or last reset)."
+          }
+        }
       },
       "PlatformRole": {
         "type": "string",
@@ -17412,6 +19340,201 @@
           "update",
           "delete"
         ]
+      },
+      "PrivilegeName": {
+        "type": "string",
+        "description": "A privilege of `alter_default_privileges` (which ones apply depends on the object).",
+        "enum": [
+          "select",
+          "insert",
+          "update",
+          "delete",
+          "truncate",
+          "references",
+          "trigger",
+          "maintain",
+          "usage",
+          "execute"
+        ]
+      },
+      "PrivilegeObjectKind": {
+        "type": "string",
+        "enum": [
+          "table",
+          "view",
+          "materialized_view",
+          "partitioned_table",
+          "foreign_table",
+          "sequence",
+          "function",
+          "procedure"
+        ]
+      },
+      "PrivilegeTarget": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "schema"
+            ],
+            "properties": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "schema"
+                ],
+                "properties": {
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "relation"
+            ],
+            "properties": {
+              "relation": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "sequence"
+            ],
+            "properties": {
+              "sequence": {
+                "type": "object",
+                "required": [
+                  "schema",
+                  "name"
+                ],
+                "properties": {
+                  "name": {
+                    "type": "string"
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "function"
+            ],
+            "properties": {
+              "function": {
+                "type": "object",
+                "required": [
+                  "oid"
+                ],
+                "properties": {
+                  "oid": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "default_acl"
+            ],
+            "properties": {
+              "default_acl": {
+                "type": "object",
+                "required": [
+                  "for_role",
+                  "schema",
+                  "object"
+                ],
+                "properties": {
+                  "for_role": {
+                    "type": "string"
+                  },
+                  "object": {
+                    "$ref": "#/components/schemas/DefaultObject"
+                  },
+                  "schema": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "description": "An object whose ACL the privileges read hashes (P10, S3)."
+      },
+      "PrivilegesPage": {
+        "type": "object",
+        "description": "The privileges read's JSON body (one page).",
+        "required": [
+          "role",
+          "server_version_num",
+          "offered",
+          "schemas",
+          "default_privileges",
+          "objects"
+        ],
+        "properties": {
+          "default_privileges": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DefaultPrivileges"
+            }
+          },
+          "next_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ObjectPrivileges"
+            }
+          },
+          "offered": {
+            "$ref": "#/components/schemas/Offered"
+          },
+          "role": {
+            "type": "string"
+          },
+          "schemas": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SchemaPrivileges"
+            }
+          },
+          "server_version_num": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
       },
       "Project": {
         "type": "object",
@@ -17635,6 +19758,41 @@
           },
           "platform_role": {
             "$ref": "#/components/schemas/PlatformRole"
+          }
+        }
+      },
+      "PutPersonalLoginRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The login's Postgres role name: `^[a-z_][a-z0-9_]{0,62}$`, not reserved, and not taken\nby any role on any branch of the database nor by another login of it."
+          }
+        }
+      },
+      "ReassignedObjects": {
+        "type": "object",
+        "description": "What a role delete handed to its successor, over every database.",
+        "required": [
+          "count",
+          "definers"
+        ],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The objects the role owned (tables, functions, types, schemas, …).",
+            "minimum": 0
+          },
+          "definers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The `SECURITY DEFINER` routines among them, as `schema.name(argument types)`: review\nthem, they now run as the successor. PUBLIC's EXECUTE on every routine that moved was\nrevoked."
           }
         }
       },
@@ -17961,6 +20119,26 @@
           "type"
         ]
       },
+      "RevokeResult": {
+        "type": "object",
+        "description": "What \"Revoke Postgres access now\" did.",
+        "required": [
+          "revoked",
+          "rotated_branches"
+        ],
+        "properties": {
+          "revoked": {
+            "type": "integer",
+            "description": "The member's personal logins revoked (those that weren't already).",
+            "minimum": 0
+          },
+          "rotated_branches": {
+            "type": "integer",
+            "description": "The branches whose member role of this member gets a new password (its sessions end).",
+            "minimum": 0
+          }
+        }
+      },
       "RlsSpec": {
         "type": "object",
         "properties": {
@@ -17972,6 +20150,74 @@
           }
         },
         "additionalProperties": false
+      },
+      "RoleDeletePreview": {
+        "type": "object",
+        "description": "What deleting a role to `successor` would expose: routines and views that would run with\nthe successor's rights for other roles.",
+        "required": [
+          "successor",
+          "exposures"
+        ],
+        "properties": {
+          "confirm": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The token to pass as the delete's `confirm`; `null` when there is nothing to confirm\n(no exposures, or `chelabase_orphaned`, which never needs one). It changes whenever the\nexposures do."
+          },
+          "exposures": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoleExposure"
+            },
+            "description": "Sorted by database, kind, identity. Empty when nothing is exposed."
+          },
+          "successor": {
+            "type": "string",
+            "description": "The successor previewed."
+          }
+        }
+      },
+      "RoleExposure": {
+        "type": "object",
+        "description": "An object the deleted role owns that would run with the successor's rights for others: a\n`SECURITY DEFINER` routine granted to roles other than the successor (PUBLIC's EXECUTE is\nrevoked on every routine that moves), or a view without `security_invoker` (or a\nmaterialized view) granted to anyone but the successor, PUBLIC included.",
+        "required": [
+          "database",
+          "kind",
+          "identity",
+          "grantees"
+        ],
+        "properties": {
+          "database": {
+            "type": "string",
+            "description": "The database it lives in."
+          },
+          "grantees": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The roles granted a privilege on it (`PUBLIC` for everyone), sorted."
+          },
+          "identity": {
+            "type": "string",
+            "description": "`schema.name(argument types)` for a routine, `schema.name` for a view, quoted as SQL\nquotes it."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/RoleExposureKind"
+          }
+        }
+      },
+      "RoleExposureKind": {
+        "type": "string",
+        "description": "The kind of an exposed object.",
+        "enum": [
+          "function",
+          "procedure",
+          "view",
+          "materialized_view"
+        ]
       },
       "RoleInUseKey": {
         "type": "object",
@@ -18255,6 +20501,12 @@
           "dry_run": {
             "type": "boolean"
           },
+          "expect_acl": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ExpectedAcl"
+            }
+          },
           "lock_timeout_ms": {
             "type": [
               "integer",
@@ -18287,6 +20539,13 @@
         "properties": {
           "committed": {
             "type": "boolean"
+          },
+          "data_api_exposure": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DataApiExposure"
+            },
+            "description": "P31: the request's grants (default privileges included) to `anon` or `authenticated`,\nor to a role either of them inherits, in operation order; empty when none."
           },
           "dependents": {
             "oneOf": [
@@ -18360,6 +20619,45 @@
           }
         }
       },
+      "SchemaPrivilege": {
+        "type": "string",
+        "description": "A schema privilege of the privilege ops.",
+        "enum": [
+          "usage",
+          "create"
+        ]
+      },
+      "SchemaPrivileges": {
+        "type": "object",
+        "description": "One schema's own ACL entries for the read's role.",
+        "required": [
+          "name",
+          "owner",
+          "owner_settable",
+          "grants",
+          "acl_hash"
+        ],
+        "properties": {
+          "acl_hash": {
+            "type": "string"
+          },
+          "grants": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Grant"
+            }
+          },
+          "name": {
+            "type": "string"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "owner_settable": {
+            "type": "boolean"
+          }
+        }
+      },
       "SequenceParams": {
         "type": "object",
         "description": "A sequence's parameters (`pg_sequence`).",
@@ -18401,6 +20699,15 @@
             "format": "int64"
           }
         }
+      },
+      "SequencePrivilege": {
+        "type": "string",
+        "description": "A sequence privilege of the privilege ops.",
+        "enum": [
+          "usage",
+          "select",
+          "update"
+        ]
       },
       "SkipReason": {
         "type": "string",

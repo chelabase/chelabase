@@ -383,6 +383,23 @@ mod tests {
         }
     }
 
+    /// MH-18 (amended, T6-C1): the personal logins' quarantine role is reserved in every rule:
+    /// no API role takes the name, none is changed into it or made a member of it, and no
+    /// member acts as it.
+    #[test]
+    fn the_quarantine_role_is_reserved() {
+        for name in ["chelabase_orphaned", "Chelabase_Orphaned", "CHELABASE_ORPHANED"] {
+            assert!(has_reserved_prefix(name), "{name}");
+            assert!(is_reserved_for(name, "postgres"), "{name}");
+            assert!(is_reserved_for(name, name), "even as the owner: {name}");
+            assert!(is_reserved_target(name, "postgres"), "{name}");
+            assert!(is_membership_reserved(name), "{name}");
+            assert!(crate::access::act_as_reserved(name), "{name}");
+            assert!(!is_member_role(name), "{name}");
+        }
+        assert_eq!(check_login_role_name("chelabase_orphaned"), Err(RoleNameError::Reserved));
+    }
+
     #[test]
     fn reserved_prefixes_exhaustive() {
         let cases = [

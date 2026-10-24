@@ -96,10 +96,12 @@ function EventRow({ event, context, detailsRef }: { event: AccessEvent; context:
   return (
     <li className="border-b border-line last:border-b-0">
       <div className="flex min-h-9 items-center gap-3 text-sm">
-        <time dateTime={event.at} title={utc(event.at)} className="w-28 shrink-0 text-chalk-dim tabular-nums">
-          {relativeTime(event.at)}
-        </time>
-        <span className="min-w-0 flex-1 text-chalk">{eventSentence(event, context)}</span>
+        <div className="flex min-w-0 flex-1 flex-col py-1 sm:flex-row sm:items-center sm:gap-3 sm:py-0">
+          <time dateTime={event.at} title={utc(event.at)} className="text-xs text-chalk-dim tabular-nums sm:w-28 sm:shrink-0 sm:text-sm">
+            {relativeTime(event.at)}
+          </time>
+          <span className="min-w-0 flex-1 text-chalk">{eventSentence(event, context)}</span>
+        </div>
         <button
           ref={detailsRef}
           type="button"

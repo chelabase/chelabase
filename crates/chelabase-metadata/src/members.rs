@@ -18,7 +18,7 @@
 //! claims never both fail or both hold it. A claim refresh logs no event.
 
 use chelabase_types::TenantId;
-use chelabase_types::access::{Grant, PgRole, PlatformRole, RoleSet};
+use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole, PlatformRole, RoleSet};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,6 +26,9 @@ use sqlx::{Postgres, Row, Transaction};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::personal_logins::{
+    AccessEventInput, RevokeReason, revoke_logins, revoke_unqualified_logins,
+};
 use crate::{MetadataClient, MetadataError};
 
 /// The symbolic database owner. Never stored in a grant's or override's `pg_roles` (R7): the
@@ -45,6 +48,10 @@ pub enum MemberStatus {
     Pending,
     Active,
     Removed,
+    /// Suspended by a tenant admin (members hub spec Part 6 "Suspend"): grants are kept, but
+    /// the member reaches nothing (403 `member_suspended`) and holds no live personal login
+    /// until reinstated. A sign-in never reactivates one; only the operator's bootstrap does.
+    Suspended,
 }
 
 impl MemberStatus {
@@ -54,6 +61,7 @@ impl MemberStatus {
             Self::Pending => "pending",
             Self::Active => "active",
             Self::Removed => "removed",
+            Self::Suspended => "suspended",
         }
     }
 
@@ -63,6 +71,7 @@ impl MemberStatus {
             "pending" => Some(Self::Pending),
             "active" => Some(Self::Active),
             "removed" => Some(Self::Removed),
+            "suspended" => Some(Self::Suspended),
             _ => None,
         }
     }
@@ -94,6 +103,22 @@ pub struct MemberRecord {
     pub tenant_admin: bool,
     pub status: MemberStatus,
     pub accepted_at: Option<DateTime<Utc>>,
+    /// D7: the member's Zitadel user was deactivated, locked or removed (the Actions webhook's
+    /// or the identity sweep's mark, `members.offboarded_at`); cleared when Zitadel shows the
+    /// user active again. Independent of `status`.
+    pub offboarded: bool,
+    /// D10: when the member was suspended (`members.suspended_at`); `None` unless suspended.
+    pub suspended_at: Option<DateTime<Utc>>,
+    /// D10: the member who suspended it (`members.suspended_by`); `None` unless suspended, and
+    /// for a member suspended before the column existed.
+    pub suspended_by: Option<Uuid>,
+}
+
+impl MemberRecord {
+    /// Active and not offboarded (D7): a member that may use what its grants give.
+    pub fn in_good_standing(&self) -> bool {
+        self.status == MemberStatus::Active && !self.offboarded
+    }
 }
 
 /// A member as the member list shows it: the row plus what the list adds.
@@ -153,7 +178,7 @@ impl GrantRow {
     /// names), else the named roles (`owner` is never stored, R7).
     pub fn to_grant(&self) -> Grant {
         let roles = if self.every_role() {
-            RoleSet::All
+            RoleSet::all()
         } else {
             RoleSet::Only(self.pg_roles.iter().map(|r| PgRole::parse(r)).collect())
         };
@@ -165,6 +190,14 @@ impl OverrideRow {
     /// True when `pg_roles` names [`OWNER_ROLE`]: refused (R7).
     pub fn names_owner(&self) -> bool {
         self.pg_roles.iter().flatten().any(|r| r == OWNER_ROLE)
+    }
+
+    /// The narrowing it applies.
+    pub fn to_narrowing(&self) -> Narrowing {
+        Narrowing {
+            platform_role: self.platform_role,
+            roles: self.pg_roles.as_ref().map(|roles| roles.iter().map(|r| PgRole::parse(r)).collect()),
+        }
     }
 }
 
@@ -188,15 +221,6 @@ pub struct GrantRow {
 pub struct OverrideRow {
     pub platform_role: Option<PlatformRole>,
     pub pg_roles: Option<Vec<String>>,
-}
-
-/// Every stored level for one (member, project, database), read in one
-/// query. Doesn't look at the member's status: callers check that.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct GrantRows {
-    pub project: Option<GrantRow>,
-    /// The override on the Chelabase database.
-    pub database: Option<OverrideRow>,
 }
 
 /// Reconciler state: a member's hidden login role on one branch (R17: one per member and branch).
@@ -230,6 +254,8 @@ pub struct AccessEvent {
     pub target_email: Option<String>,
     /// The project's name now, if its row still exists.
     pub project_name: Option<String>,
+    /// MH-37: the branch of a per-branch event (role changes); `None` for the others.
+    pub branch_id: Option<Uuid>,
 }
 
 /// An invite that is neither revoked nor accepted (it may be past `expires_at`).
@@ -271,10 +297,30 @@ pub enum AccessAction {
     MemberDeclined,
     /// A person already in the tenant's Zitadel org was invited: added active, no invite code.
     MemberAdded,
+    /// A tenant admin suspended an active member (members hub D5).
+    MemberSuspended,
+    /// A tenant admin reinstated a suspended member.
+    MemberReinstated,
+    /// Personal logins were revoked: `after: {count, reason, logins}` (and `rotated_branches`
+    /// for "Revoke Postgres access now"). Never written for a count of 0, except by revoke-now.
+    PersonalLoginsRevoked,
+    /// `after: {role_name, valid_until, level}`; never a secret.
+    PersonalLoginCreated,
+    /// `after: {role_name, valid_until}`; never a secret.
+    PersonalLoginReset,
+    /// `before: {role_name}`.
+    PersonalLoginDeleted,
+    /// Written by the role routes through [`MetadataClient::record_access_event`], with
+    /// `branch_id`.
+    RoleCreated,
+    RoleUpdated,
+    RoleDeleted,
+    /// Written by the privilege editor: `after: {pg_database, acted_as, ops}`, never SQL.
+    PrivilegesChanged,
 }
 
 impl AccessAction {
-    pub const ALL: [AccessAction; 18] = [
+    pub const ALL: [AccessAction; 28] = [
         Self::MemberJoined,
         Self::AdminClaimed,
         Self::AdminSet,
@@ -293,6 +339,16 @@ impl AccessAction {
         Self::MemberApproved,
         Self::MemberDeclined,
         Self::MemberAdded,
+        Self::MemberSuspended,
+        Self::MemberReinstated,
+        Self::PersonalLoginsRevoked,
+        Self::PersonalLoginCreated,
+        Self::PersonalLoginReset,
+        Self::PersonalLoginDeleted,
+        Self::RoleCreated,
+        Self::RoleUpdated,
+        Self::RoleDeleted,
+        Self::PrivilegesChanged,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -315,6 +371,16 @@ impl AccessAction {
             Self::MemberApproved => "member_approved",
             Self::MemberDeclined => "member_declined",
             Self::MemberAdded => "member_added",
+            Self::MemberSuspended => "member_suspended",
+            Self::MemberReinstated => "member_reinstated",
+            Self::PersonalLoginsRevoked => "personal_logins_revoked",
+            Self::PersonalLoginCreated => "personal_login_created",
+            Self::PersonalLoginReset => "personal_login_reset",
+            Self::PersonalLoginDeleted => "personal_login_deleted",
+            Self::RoleCreated => "role_created",
+            Self::RoleUpdated => "role_updated",
+            Self::RoleDeleted => "role_deleted",
+            Self::PrivilegesChanged => "privileges_changed",
         }
     }
 }
@@ -443,6 +509,31 @@ impl TryFrom<MemberRaw> for MemberRecord {
             tenant_admin: raw.tenant_admin,
             status,
             accepted_at: raw.accepted_at,
+            offboarded: false, suspended_at: None, suspended_by: None,
+        })
+    }
+}
+
+/// A `members` row as [`member_columns`] selects it: the base columns plus D7's mark
+/// (`offboarded_at IS NOT NULL AS offboarded`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct MemberRow {
+    #[sqlx(flatten)]
+    base: MemberRaw,
+    offboarded: bool,
+    suspended_at: Option<DateTime<Utc>>,
+    suspended_by: Option<Uuid>,
+}
+
+impl TryFrom<MemberRow> for MemberRecord {
+    type Error = sqlx::Error;
+
+    fn try_from(row: MemberRow) -> Result<Self, Self::Error> {
+        Ok(MemberRecord {
+            offboarded: row.offboarded,
+            suspended_at: row.suspended_at,
+            suspended_by: row.suspended_by,
+            ..MemberRecord::try_from(row.base)?
         })
     }
 }
@@ -464,10 +555,24 @@ struct EventRaw {
     project_name: Option<String>,
 }
 
+/// An `access_events` row as the log reads it: [`EventRaw`] plus the branch (MH-37).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct EventRow {
+    #[sqlx(flatten)]
+    raw: EventRaw,
+    branch_id: Option<Uuid>,
+}
+
+impl From<EventRow> for AccessEvent {
+    fn from(row: EventRow) -> Self {
+        AccessEvent { branch_id: row.branch_id, ..AccessEvent::from(row.raw) }
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ListingRaw {
     #[sqlx(flatten)]
-    member: MemberRaw,
+    member: MemberRow,
     has_access: bool,
     created_at: DateTime<Utc>,
 }
@@ -488,6 +593,7 @@ impl From<EventRaw> for AccessEvent {
             actor_email: raw.actor_email,
             target_email: raw.target_email,
             project_name: raw.project_name,
+            branch_id: None,
         }
     }
 }
@@ -532,6 +638,30 @@ fn override_from_parts(
     })
 }
 
+/// The one select list every access read shares (MH-2): the own grant `g` and the override
+/// `d`. Step 2 adds the team grants here. A macro, so the queries stay `&'static str`.
+macro_rules! grant_source_columns {
+    () => {
+        "g.platform_role AS g_role, g.pg_roles AS g_roles,
+         d.member_id IS NOT NULL AS d_found, d.platform_role AS d_role, d.pg_roles AS d_roles"
+    };
+}
+
+/// A row of [`grant_source_columns!`] as [`GrantSources`] (no team grants in step 1).
+fn grant_sources_of(r: &sqlx::postgres::PgRow) -> Result<GrantSources, sqlx::Error> {
+    let own = match r.try_get::<Option<String>, _>("g_role")? {
+        Some(role) => Some(grant_from_parts(&role, r.try_get("g_roles")?)?.to_grant()),
+        None => None,
+    };
+    let database = if r.try_get::<bool, _>("d_found")? {
+        let role: Option<String> = r.try_get("d_role")?;
+        Some(override_from_parts(role.as_deref(), r.try_get("d_roles")?)?.to_narrowing())
+    } else {
+        None
+    };
+    Ok(GrantSources::new(own, Vec::new(), database))
+}
+
 /// Role sets are stored sorted, without duplicates.
 fn normalize_roles(roles: &[String]) -> Vec<String> {
     let mut roles = roles.to_vec();
@@ -554,7 +684,8 @@ fn override_json(o: &OverrideRow) -> Value {
 
 macro_rules! member_columns {
     () => {
-        "id, tenant_id, zitadel_user_id, email, display_name, tenant_admin, status, accepted_at"
+        "id, tenant_id, zitadel_user_id, email, display_name, tenant_admin, status, accepted_at,
+         offboarded_at IS NOT NULL AS offboarded, suspended_at, suspended_by"
     };
 }
 
@@ -576,7 +707,7 @@ macro_rules! returning_listing {
     };
 }
 
-type Tx = Transaction<'static, Postgres>;
+pub(crate) type Tx = Transaction<'static, Postgres>;
 
 /// When an invite was revoked or accepted, if it was.
 type Stamp = Option<DateTime<Utc>>;
@@ -599,19 +730,25 @@ pub struct NewInvite<'a> {
 }
 
 /// One `access_events` row, written in the transaction of the change it records.
-struct NewEvent {
+pub(crate) struct NewEvent {
     tenant: Uuid,
     actor: Option<Uuid>,
     action: AccessAction,
     target: Option<Uuid>,
     project: Option<Uuid>,
     database: Option<Uuid>,
+    branch: Option<Uuid>,
     before: Option<Value>,
     after: Option<Value>,
 }
 
 impl NewEvent {
-    fn new(tenant: Uuid, actor: Option<Uuid>, action: AccessAction, target: Option<Uuid>) -> Self {
+    pub(crate) fn new(
+        tenant: Uuid,
+        actor: Option<Uuid>,
+        action: AccessAction,
+        target: Option<Uuid>,
+    ) -> Self {
         NewEvent {
             tenant,
             actor,
@@ -619,12 +756,28 @@ impl NewEvent {
             target,
             project: None,
             database: None,
+            branch: None,
             before: None,
             after: None,
         }
     }
 
-    fn project(mut self, project: Uuid) -> Self {
+    /// Any event, as [`MetadataClient::record_access_event`] takes it.
+    pub(crate) fn from_input(e: &AccessEventInput<'_>) -> Self {
+        NewEvent {
+            tenant: e.tenant.as_uuid(),
+            actor: e.actor,
+            action: e.action,
+            target: e.target,
+            project: e.project,
+            database: e.database,
+            branch: e.branch,
+            before: e.before.cloned(),
+            after: e.after.cloned(),
+        }
+    }
+
+    pub(crate) fn project(mut self, project: Uuid) -> Self {
         self.project = Some(project);
         self
     }
@@ -637,27 +790,27 @@ impl NewEvent {
         self
     }
 
-    fn database(mut self, database: Uuid) -> Self {
+    pub(crate) fn database(mut self, database: Uuid) -> Self {
         self.database = Some(database);
         self
     }
 
-    fn before(mut self, before: Option<Value>) -> Self {
+    pub(crate) fn before(mut self, before: Option<Value>) -> Self {
         self.before = before;
         self
     }
 
-    fn after(mut self, after: Value) -> Self {
+    pub(crate) fn after(mut self, after: Value) -> Self {
         self.after = Some(after);
         self
     }
 
-    async fn write(self, tx: &mut Tx) -> Result<(), sqlx::Error> {
+    pub(crate) async fn write(self, tx: &mut Tx) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO access_events
                  (tenant_id, actor_member_id, action, target_member_id, project_id, database_id,
-                  before, after)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                  branch_id, before, after)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(self.tenant)
         .bind(self.actor)
@@ -665,6 +818,7 @@ impl NewEvent {
         .bind(self.target)
         .bind(self.project)
         .bind(self.database)
+        .bind(self.branch)
         .bind(self.before)
         .bind(self.after)
         .execute(&mut **tx)
@@ -687,7 +841,7 @@ fn write_error(e: sqlx::Error) -> AccessWriteError {
 }
 
 /// Locks the tenant row (see the module docs); false when there is no such tenant.
-async fn lock_tenant(tx: &mut Tx, tenant: Uuid) -> Result<bool, sqlx::Error> {
+pub(crate) async fn lock_tenant(tx: &mut Tx, tenant: Uuid) -> Result<bool, sqlx::Error> {
     Ok(
         sqlx::query_scalar::<_, i32>("SELECT 1 FROM tenants WHERE id = $1 FOR NO KEY UPDATE")
             .bind(tenant)
@@ -697,12 +851,12 @@ async fn lock_tenant(tx: &mut Tx, tenant: Uuid) -> Result<bool, sqlx::Error> {
     )
 }
 
-async fn lock_member_by_zitadel(
+pub(crate) async fn lock_member_by_zitadel(
     tx: &mut Tx,
     tenant: Uuid,
     zitadel_user_id: &str,
 ) -> Result<Option<MemberRecord>, sqlx::Error> {
-    sqlx::query_as::<_, MemberRaw>(concat!(
+    sqlx::query_as::<_, MemberRow>(concat!(
         "SELECT ",
         member_columns!(),
         " FROM members WHERE tenant_id = $1 AND zitadel_user_id = $2 FOR NO KEY UPDATE"
@@ -716,8 +870,8 @@ async fn lock_member_by_zitadel(
 }
 
 /// Locks a member row for a change to it (`FOR NO KEY UPDATE`).
-async fn lock_member(tx: &mut Tx, member: Uuid) -> Result<Option<MemberRecord>, sqlx::Error> {
-    sqlx::query_as::<_, MemberRaw>(concat!(
+pub(crate) async fn lock_member(tx: &mut Tx, member: Uuid) -> Result<Option<MemberRecord>, sqlx::Error> {
+    sqlx::query_as::<_, MemberRow>(concat!(
         "SELECT ",
         member_columns!(),
         " FROM members WHERE id = $1 FOR NO KEY UPDATE"
@@ -746,7 +900,7 @@ async fn lock_writable_member(tx: &mut Tx, member: Uuid) -> Result<MemberRecord,
     Ok(m)
 }
 
-async fn member_tenant(pool: &sqlx::PgPool, member: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
+pub(crate) async fn member_tenant(pool: &sqlx::PgPool, member: Uuid) -> Result<Option<Uuid>, sqlx::Error> {
     sqlx::query_scalar("SELECT tenant_id FROM members WHERE id = $1")
         .bind(member)
         .fetch_optional(pool)
@@ -754,7 +908,7 @@ async fn member_tenant(pool: &sqlx::PgPool, member: Uuid) -> Result<Option<Uuid>
 }
 
 /// Active tenant admins of `tenant` other than `member`.
-async fn other_active_admins(tx: &mut Tx, tenant: Uuid, member: Uuid) -> Result<i64, sqlx::Error> {
+pub(crate) async fn other_active_admins(tx: &mut Tx, tenant: Uuid, member: Uuid) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT count(*) FROM members
          WHERE tenant_id = $1 AND id <> $2 AND status = 'active' AND tenant_admin",
@@ -829,7 +983,7 @@ async fn take_claims(
     name: &str,
 ) -> Result<Option<MemberRecord>, sqlx::Error> {
     release_email(tx, tenant, member, email).await?;
-    sqlx::query_as::<_, MemberRaw>(concat!(
+    sqlx::query_as::<_, MemberRow>(concat!(
         "UPDATE members SET email = lower(btrim($2)), display_name = $3, updated_at = now()
          WHERE id = $1 AND status = 'active'
            AND (email IS DISTINCT FROM lower(btrim($2)) OR display_name <> $3)
@@ -843,6 +997,29 @@ async fn take_claims(
     .await?
     .map(MemberRecord::try_from)
     .transpose()
+}
+
+/// The projects whose branches a member's access change must reconcile, by id: those of its
+/// grants, its overrides, its member roles and its personal logins (any status: a revoked
+/// login's role may still be on a branch).
+pub(crate) async fn touched_projects(tx: &mut Tx, member: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT project_id FROM project_grants WHERE member_id = $1
+         UNION
+         SELECT d.project_id FROM database_grant_overrides o
+           JOIN databases d ON d.id = o.database_id WHERE o.member_id = $1
+         UNION
+         SELECT d.project_id FROM member_branch_roles r
+           JOIN branches b ON b.id = r.branch_id
+           JOIN databases d ON d.id = b.database_id WHERE r.member_id = $1
+         UNION
+         SELECT d.project_id FROM personal_logins l
+           JOIN databases d ON d.id = l.database_id WHERE l.member_id = $1
+         ORDER BY 1",
+    )
+    .bind(member)
+    .fetch_all(&mut **tx)
+    .await
 }
 
 /// Deletes a member's grants and overrides; returns both as event JSON (grants by project,
@@ -985,7 +1162,7 @@ async fn insert_grants(
     Ok(grants_json)
 }
 
-fn members_from(rows: Vec<MemberRaw>) -> Result<Vec<MemberRecord>, sqlx::Error> {
+fn members_from(rows: Vec<MemberRow>) -> Result<Vec<MemberRecord>, sqlx::Error> {
     rows.into_iter().map(MemberRecord::try_from).collect()
 }
 
@@ -995,7 +1172,7 @@ impl MetadataClient {
         tenant: TenantId,
         zitadel_user_id: &str,
     ) -> Result<Option<MemberRecord>, MetadataError> {
-        Ok(sqlx::query_as::<_, MemberRaw>(concat!(
+        Ok(sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
             " FROM members WHERE tenant_id = $1 AND zitadel_user_id = $2"
@@ -1014,7 +1191,8 @@ impl MetadataClient {
     /// address (R8: the newest claim wins, any other live holder's email becomes NULL). Neither
     /// logs an event. The tenant row is also locked to insert a member (the first active admin
     /// of the tenant claims `tenant_admin`, event `admin_claimed`; anyone else `member_joined`)
-    /// or to activate an invited one (`invite_accepted`). A removed member is returned as is.
+    /// or to activate an invited one (`invite_accepted`). A removed or suspended member is
+    /// returned as is (S6: no sign-in reactivates a suspended one, with an open invite either).
     /// An empty email claim is unknown: stored NULL.
     ///
     /// `admission` says what a person with no row becomes (R39). Whoever finds the tenant
@@ -1034,7 +1212,7 @@ impl MetadataClient {
         #[derive(sqlx::FromRow)]
         struct Seen {
             #[sqlx(flatten)]
-            member: MemberRaw,
+            member: MemberRow,
             email_same: bool,
             name_same: bool,
         }
@@ -1055,10 +1233,13 @@ impl MetadataClient {
         if let Some(seen) = seen {
             let member = MemberRecord::try_from(seen.member)?;
             match member.status {
-                MemberStatus::Removed | MemberStatus::Pending => return Ok(member),
+                // S6: a suspended member stays suspended, whatever its claims or invites.
+                MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended => {
+                    return Ok(member);
+                }
                 MemberStatus::Active if seen.email_same && seen.name_same => return Ok(member),
                 MemberStatus::Active if seen.email_same => {
-                    let renamed = sqlx::query_as::<_, MemberRaw>(concat!(
+                    let renamed = sqlx::query_as::<_, MemberRow>(concat!(
                         "UPDATE members SET display_name = $2, updated_at = now()
                          WHERE id = $1 AND status = 'active' AND display_name <> $2
                          RETURNING ",
@@ -1082,7 +1263,16 @@ impl MetadataClient {
             return Err(MetadataError::TenantNotFound(tenant));
         }
         let member = match lock_member_by_zitadel(&mut tx, tenant_id, zitadel_user_id).await? {
-            Some(m) if matches!(m.status, MemberStatus::Removed | MemberStatus::Pending) => m,
+            // S6: the row may have been suspended since the read above; the catch-all arm below
+            // would otherwise activate it when it has an open invite.
+            Some(m)
+                if matches!(
+                    m.status,
+                    MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended
+                ) =>
+            {
+                m
+            }
             Some(m) if m.status == MemberStatus::Active => {
                 take_claims(&mut tx, tenant_id, m.id, email, name)
                     .await?
@@ -1106,7 +1296,7 @@ impl MetadataClient {
                     return Ok(m);
                 }
                 release_email(&mut tx, tenant_id, m.id, email).await?;
-                let active = sqlx::query_as::<_, MemberRaw>(concat!(
+                let active = sqlx::query_as::<_, MemberRow>(concat!(
                     "UPDATE members SET status = 'active', accepted_at = now(),
                          email = lower(btrim($2)), display_name = $3, updated_at = now()
                      WHERE id = $1 RETURNING ",
@@ -1135,6 +1325,7 @@ impl MetadataClient {
                 .after(json!({ "status": "active" }))
                 .write(&mut tx)
                 .await?;
+                revoke_unqualified_logins(&mut tx, Some(m.id), m.id).await?;
                 active
             }
             None => {
@@ -1152,7 +1343,7 @@ impl MetadataClient {
                 };
                 let id = Uuid::new_v4();
                 release_email(&mut tx, tenant_id, id, email).await?;
-                let inserted = sqlx::query_as::<_, MemberRaw>(concat!(
+                let inserted = sqlx::query_as::<_, MemberRow>(concat!(
                     "INSERT INTO members (id, tenant_id, zitadel_user_id, email, display_name,
                                           tenant_admin, status)
                      VALUES ($1, $2, $3, lower(btrim($4)), $5, $6, $7)
@@ -1185,84 +1376,54 @@ impl MetadataClient {
         Ok(member)
     }
 
-    /// Every stored level for one (member, project, database), in one query. A `None` database
-    /// reads no override.
-    pub async fn grant_rows(
+    /// Every source of a member's access on `project` and their override on `database`, in one
+    /// query (MH-2). A `None` database reads no override. Team grants are step 2's: `teams` is
+    /// empty until then. Doesn't look at the member's status: callers check that.
+    pub async fn grant_sources(
         &self,
         member: Uuid,
         project: Uuid,
         database: Option<Uuid>,
-    ) -> Result<GrantRows, MetadataError> {
-        let r = sqlx::query(
-            "SELECT g.platform_role AS g_role, g.pg_roles AS g_roles,
-                    d.member_id IS NOT NULL AS d_found, d.platform_role AS d_role, d.pg_roles AS d_roles
-             FROM (VALUES (1)) one (x)
-             LEFT JOIN project_grants g ON g.member_id = $1 AND g.project_id = $2
-             LEFT JOIN database_grant_overrides d
-                    ON d.member_id = $1 AND d.database_id = $3",
-        )
+    ) -> Result<GrantSources, MetadataError> {
+        let r = sqlx::query(concat!(
+            "SELECT ",
+            grant_source_columns!(),
+            " FROM (VALUES ($1::uuid)) m (id)
+             LEFT JOIN project_grants g ON g.member_id = m.id AND g.project_id = $2
+             LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $3"
+        ))
         .bind(member)
         .bind(project)
         .bind(database)
         .fetch_one(&self.pool)
         .await?;
-        let project = match r.try_get::<Option<String>, _>("g_role")? {
-            Some(role) => Some(grant_from_parts(&role, r.try_get("g_roles")?)?),
-            None => None,
-        };
-        let level =
-            |found: &str, role: &str, roles: &str| -> Result<Option<OverrideRow>, sqlx::Error> {
-                if !r.try_get::<bool, _>(found)? {
-                    return Ok(None);
-                }
-                let role: Option<String> = r.try_get(role)?;
-                Ok(Some(override_from_parts(
-                    role.as_deref(),
-                    r.try_get(roles)?,
-                )?))
-            };
-        Ok(GrantRows {
-            project,
-            database: level("d_found", "d_role", "d_roles")?,
-        })
+        Ok(grant_sources_of(&r)?)
     }
 
-    /// [`Self::grant_rows`] for every member with a grant on `project` or an override on
+    /// [`Self::grant_sources`] for every member with a grant on `project` or an override on
     /// `database`, in one query, by member id (the member-role reconciler's read per branch).
     /// Doesn't look at the members' status: callers check that.
-    pub async fn database_grant_rows(
+    pub async fn database_grant_sources(
         &self,
         project: Uuid,
         database: Uuid,
-    ) -> Result<Vec<(Uuid, GrantRows)>, MetadataError> {
-        let rows = sqlx::query(
-            "SELECT m.id AS member_id, g.platform_role AS g_role, g.pg_roles AS g_roles,
-                    d.member_id IS NOT NULL AS d_found, d.platform_role AS d_role, d.pg_roles AS d_roles
-             FROM members m
+    ) -> Result<Vec<(Uuid, GrantSources)>, MetadataError> {
+        let rows = sqlx::query(concat!(
+            "SELECT m.id AS member_id, ",
+            grant_source_columns!(),
+            " FROM members m
              LEFT JOIN project_grants g ON g.member_id = m.id AND g.project_id = $1
              LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $2
              WHERE g.member_id IS NOT NULL OR d.member_id IS NOT NULL
-             ORDER BY m.id",
-        )
+             ORDER BY m.id"
+        ))
         .bind(project)
         .bind(database)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .iter()
-            .map(|r| {
-                let project = match r.try_get::<Option<String>, _>("g_role")? {
-                    Some(role) => Some(grant_from_parts(&role, r.try_get("g_roles")?)?),
-                    None => None,
-                };
-                let database = if r.try_get::<bool, _>("d_found")? {
-                    let role: Option<String> = r.try_get("d_role")?;
-                    Some(override_from_parts(role.as_deref(), r.try_get("d_roles")?)?)
-                } else {
-                    None
-                };
-                Ok((r.try_get("member_id")?, GrantRows { project, database }))
-            })
+            .map(|r| Ok((r.try_get("member_id")?, grant_sources_of(r)?)))
             .collect::<Result<Vec<_>, sqlx::Error>>()?)
     }
 
@@ -1315,6 +1476,34 @@ impl MetadataClient {
             .collect::<Result<Vec<_>, sqlx::Error>>()?)
     }
 
+    /// T2-4 (P1, MH-2): every project of the tenant that isn't deleted where the member has an
+    /// access source, with its sources at the project level (no database narrowing), by project
+    /// id. The one read `/v1/me`, the project list and realtime's project list take a member's
+    /// projects from; step 2 adds the team grants here. Doesn't look at the member's status.
+    pub async fn member_grant_sources(
+        &self,
+        tenant: TenantId,
+        member: Uuid,
+    ) -> Result<Vec<(Uuid, GrantSources)>, MetadataError> {
+        let rows = sqlx::query(concat!(
+            "SELECT p.id AS project_id, ",
+            grant_source_columns!(),
+            " FROM projects p
+             JOIN project_grants g ON g.project_id = p.id AND g.member_id = $2
+             LEFT JOIN database_grant_overrides d ON false
+             WHERE p.tenant_id = $1 AND p.status <> 'deleted'
+             ORDER BY p.id"
+        ))
+        .bind(tenant.as_uuid())
+        .bind(member)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| Ok((r.try_get("project_id")?, grant_sources_of(r)?)))
+            .collect::<Result<Vec<_>, sqlx::Error>>()?)
+    }
+
     /// The member's overrides on live databases of live projects, as (project, database,
     /// override) by project then database (`/v1/me` lists them).
     pub async fn member_overrides(
@@ -1348,7 +1537,7 @@ impl MetadataClient {
 
     /// The tenant's invited and active members (removed ones are history), by email.
     pub async fn list_members(&self, tenant: TenantId) -> Result<Vec<MemberRecord>, MetadataError> {
-        let rows = sqlx::query_as::<_, MemberRaw>(concat!(
+        let rows = sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
             " FROM members WHERE tenant_id = $1 AND status <> 'removed' ORDER BY email, id"
@@ -1432,7 +1621,7 @@ impl MetadataClient {
 
     /// A member by id, whatever its status (callers check its tenant).
     pub async fn member(&self, member: Uuid) -> Result<Option<MemberRecord>, MetadataError> {
-        Ok(sqlx::query_as::<_, MemberRaw>(concat!(
+        Ok(sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
             " FROM members WHERE id = $1"
@@ -1454,7 +1643,7 @@ impl MetadataClient {
         let Some(email) = claim_email(email) else {
             return Ok(None);
         };
-        Ok(sqlx::query_as::<_, MemberRaw>(concat!(
+        Ok(sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
             " FROM members
@@ -1638,6 +1827,7 @@ impl MetadataClient {
             .after(json!({ "status": "active", "grants": grants_json }))
             .write(&mut tx)
             .await?;
+        revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
         tx.commit().await?;
         Ok(listing)
     }
@@ -1671,6 +1861,7 @@ impl MetadataClient {
             .after(json!({ "status": "removed" }))
             .write(&mut tx)
             .await?;
+        revoke_logins(&mut tx, Some(actor), member, RevokeReason::MemberRemoved).await?;
         tx.commit().await?;
         Ok(m.zitadel_user_id)
     }
@@ -1679,7 +1870,7 @@ impl MetadataClient {
         &self,
         tenant: TenantId,
     ) -> Result<Vec<MemberRecord>, MetadataError> {
-        let rows = sqlx::query_as::<_, MemberRaw>(concat!(
+        let rows = sqlx::query_as::<_, MemberRow>(concat!(
             "SELECT ",
             member_columns!(),
             " FROM members WHERE tenant_id = $1 AND status = 'active' AND tenant_admin
@@ -1751,14 +1942,16 @@ impl MetadataClient {
             .after(json!({ "tenant_admin": admin }))
             .write(&mut tx)
             .await?;
+        revoke_unqualified_logins(&mut tx, actor, member).await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Marks a member removed: its grants and overrides are deleted and its open invites
-    /// revoked. Returns the projects whose branches need a member-role reconcile (its grants',
-    /// its overrides' and those it has member roles in), by id. Removing the last active admin
-    /// is `LastTenantAdmin`; removing a removed member writes nothing.
+    /// Marks a member removed: its grants and overrides are deleted, its open invites revoked
+    /// and its live personal logins revoked (`member_removed`). Returns the projects whose
+    /// branches need a member-role reconcile (its grants', its overrides', those it has member
+    /// roles in and those of its personal logins), by id. Removing the last active admin is
+    /// `LastTenantAdmin`; removing a removed member writes nothing.
     pub async fn remove_member(
         &self,
         actor: Uuid,
@@ -1781,20 +1974,7 @@ impl MetadataClient {
         {
             return Err(AccessWriteError::LastTenantAdmin);
         }
-        let touched: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT project_id FROM project_grants WHERE member_id = $1
-             UNION
-             SELECT d.project_id FROM database_grant_overrides o
-               JOIN databases d ON d.id = o.database_id WHERE o.member_id = $1
-             UNION
-             SELECT d.project_id FROM member_branch_roles r
-               JOIN branches b ON b.id = r.branch_id
-               JOIN databases d ON d.id = b.database_id WHERE r.member_id = $1
-             ORDER BY 1",
-        )
-        .bind(member)
-        .fetch_all(&mut *tx)
-        .await?;
+        let touched = touched_projects(&mut tx, member).await?;
         let (grants, overrides) = delete_member_grants(&mut tx, member).await?;
         sqlx::query(
             "UPDATE invites SET revoked_at = now()
@@ -1825,6 +2005,7 @@ impl MetadataClient {
         .after(json!({ "status": "removed", "tenant_admin": false }))
         .write(&mut tx)
         .await?;
+        revoke_logins(&mut tx, Some(actor), member, RevokeReason::MemberRemoved).await?;
         tx.commit().await?;
         Ok(touched)
     }
@@ -1904,6 +2085,9 @@ impl MetadataClient {
                 changed.push(*project);
             }
         }
+        if !changed.is_empty() {
+            revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
+        }
         tx.commit().await?;
         Ok(changed)
     }
@@ -1937,6 +2121,7 @@ impl MetadataClient {
         .before(Some(grant_json(&before)))
         .write(&mut tx)
         .await?;
+        revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2042,6 +2227,7 @@ impl MetadataClient {
             .after(override_json(&after))
             .write(&mut tx)
             .await?;
+        revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -2101,6 +2287,7 @@ impl MetadataClient {
         .before(Some(override_json(&before)))
         .write(&mut tx)
         .await?;
+        revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2212,6 +2399,7 @@ impl MetadataClient {
         .after(json!({ "email": member.email, "expires_at": expires_at, "grants": grants_json }))
         .write(&mut tx)
         .await?;
+        revoke_unqualified_logins(&mut tx, Some(actor), member.id).await?;
         tx.commit().await?;
         Ok((listing, invite))
     }
@@ -2352,6 +2540,7 @@ impl MetadataClient {
         })
         .write(&mut tx)
         .await?;
+        revoke_logins(&mut tx, Some(actor), member, RevokeReason::MemberRemoved).await?;
         tx.commit().await?;
         Ok(zitadel_user_id)
     }
@@ -2458,19 +2647,22 @@ impl MetadataClient {
 
     /// The tenant's access log, newest first: `before_id` pages back, `project` keeps only
     /// that project's events: those carrying it as `project_id`, and those whose `before` or
-    /// `after` lists a grant on it (invites, additions and removals naming several projects).
+    /// `after` lists a grant on it (invites, additions and removals naming several projects);
+    /// `member` keeps only the events whose target or actor is that member. Both filters apply
+    /// together.
     pub async fn access_events(
         &self,
         tenant: TenantId,
         project: Option<Uuid>,
+        member: Option<Uuid>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<AccessEvent>, MetadataError> {
-        let rows = sqlx::query_as::<_, EventRaw>(
+        let rows = sqlx::query_as::<_, EventRow>(
             "SELECT e.id, e.tenant_id, e.actor_member_id, e.action, e.target_member_id, e.project_id,
                     e.database_id, e.before, e.after, e.at,
                     am.email AS actor_email, tm.email AS target_email,
-                    pr.name AS project_name
+                    pr.name AS project_name, e.branch_id
              FROM access_events e
              LEFT JOIN members am ON am.id = e.actor_member_id
              LEFT JOIN members tm ON tm.id = e.target_member_id
@@ -2479,6 +2671,7 @@ impl MetadataClient {
                AND ($2::uuid IS NULL OR e.project_id = $2
                     OR e.before -> 'grants' @> jsonb_build_array(jsonb_build_object('project_id', $2::text))
                     OR e.after -> 'grants' @> jsonb_build_array(jsonb_build_object('project_id', $2::text)))
+               AND ($5::uuid IS NULL OR e.target_member_id = $5 OR e.actor_member_id = $5)
                AND ($3::bigint IS NULL OR e.id < $3)
              ORDER BY e.id DESC
              LIMIT $4",
@@ -2487,15 +2680,18 @@ impl MetadataClient {
         .bind(project)
         .bind(before_id)
         .bind(i64::from(limit))
+        .bind(member)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(AccessEvent::from).collect())
     }
 
     /// Makes `zitadel_user_id` an active tenant admin (the bootstrap command): inserted, or
-    /// activated and promoted. Event `admin_set` with no actor, only when the status or the flag
-    /// changed. A repeated bootstrap with the same email writes nothing at all. The email takes
-    /// the address from any other live holder (R8).
+    /// activated and promoted. It reactivates any status, a suspended member included: it is
+    /// the operator's recovery path (S6), unlike a sign-in; revoked personal logins stay
+    /// revoked. Event `admin_set` with no actor, only when the status or the flag changed. A
+    /// repeated bootstrap with the same email writes nothing at all. The email takes the
+    /// address from any other live holder (R8).
     pub async fn bootstrap_admin(
         &self,
         tenant: TenantId,
@@ -2512,9 +2708,10 @@ impl MetadataClient {
         let member = match &existing {
             Some(m) => {
                 release_email(&mut tx, tenant_id, m.id, email).await?;
-                sqlx::query_as::<_, MemberRaw>(concat!(
+                sqlx::query_as::<_, MemberRow>(concat!(
                     "UPDATE members SET status = 'active', tenant_admin = true, email = lower(btrim($2)),
                          accepted_at = CASE WHEN status = 'invited' THEN now() ELSE accepted_at END,
+                         suspended_at = NULL, suspended_by = NULL,
                          updated_at = now()
                      WHERE id = $1
                        AND (status <> 'active' OR NOT tenant_admin
@@ -2533,7 +2730,7 @@ impl MetadataClient {
             None => {
                 let id = Uuid::new_v4();
                 release_email(&mut tx, tenant_id, id, email).await?;
-                let raw = sqlx::query_as::<_, MemberRaw>(concat!(
+                let raw = sqlx::query_as::<_, MemberRow>(concat!(
                     "INSERT INTO members (id, tenant_id, zitadel_user_id, email, tenant_admin, status)
                      VALUES ($1, $2, $3, lower(btrim($4)), true, 'active') RETURNING ",
                     member_columns!()
@@ -2565,6 +2762,7 @@ impl MetadataClient {
                 .after(json!({ "status": "active", "tenant_admin": true }))
                 .write(&mut tx)
                 .await?;
+            revoke_unqualified_logins(&mut tx, None, member.id).await?;
         }
         tx.commit().await?;
         Ok(member)
@@ -2642,6 +2840,52 @@ impl MetadataClient {
         Ok(())
     }
 
+    /// EOS-1: [`MetadataClient::upsert_member_branch_role`] as a compare-and-set: the row is
+    /// written only while its stored `password_enc` is still `read`, the value the writer's run
+    /// read (`None`: there was no row). `false`, nothing written, when it changed meanwhile (a
+    /// suspension's or revoke-now's rotation mark, `''`, must survive a reconcile that read the
+    /// row before it).
+    pub async fn upsert_member_branch_role_if(
+        &self,
+        r: &MemberBranchRole,
+        read: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        let written = match read {
+            // No row was read: only an insert. A row made meanwhile (another run's) is kept.
+            None => sqlx::query(
+                "INSERT INTO member_branch_roles
+                     (member_id, branch_id, role_name, password_enc, applied_roles)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (member_id, branch_id) DO NOTHING",
+            )
+            .bind(r.member_id)
+            .bind(r.branch_id)
+            .bind(&r.role_name)
+            .bind(&r.password_enc)
+            .bind(&r.applied_roles)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+            // The row as read: one statement, so the comparison and the write see the same row
+            // (a concurrent writer's UPDATE is waited for, then the condition rechecked).
+            Some(read) => sqlx::query(
+                "UPDATE member_branch_roles
+                 SET role_name = $3, password_enc = $4, applied_roles = $5, applied_at = now()
+                 WHERE member_id = $1 AND branch_id = $2 AND password_enc = $6",
+            )
+            .bind(r.member_id)
+            .bind(r.branch_id)
+            .bind(&r.role_name)
+            .bind(&r.password_enc)
+            .bind(&r.applied_roles)
+            .bind(read)
+            .execute(&self.pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(written == 1)
+    }
+
     pub async fn delete_member_branch_role(
         &self,
         member: Uuid,
@@ -2697,10 +2941,17 @@ mod tests {
             MemberStatus::Pending,
             MemberStatus::Active,
             MemberStatus::Removed,
+            MemberStatus::Suspended,
         ] {
             assert_eq!(MemberStatus::parse(s.as_str()), Some(s));
             assert_eq!(serde_json::to_value(s).unwrap(), json!(s.as_str()));
         }
+        // T3: the suspended status (members hub spec Part 6).
+        assert_eq!(MemberStatus::Suspended.as_str(), "suspended");
+        assert!(matches!(
+            MemberRecord::try_from(raw("suspended")).map(|m| m.status),
+            Ok(MemberStatus::Suspended)
+        ));
         assert_eq!(MemberStatus::Invited.as_str(), "invited");
         assert_eq!(MemberStatus::Pending.as_str(), "pending");
         assert_eq!(MemberStatus::Active.as_str(), "active");
@@ -2722,6 +2973,7 @@ mod tests {
                 tenant_admin: true,
                 status: MemberStatus::Active,
                 accepted_at: None,
+                offboarded: false, suspended_at: None, suspended_by: None,
             }
         );
         // A stale email (taken by a newer claim) maps to None.
@@ -2771,9 +3023,9 @@ mod tests {
         let admin = GrantRow::new(PlatformRole::Admin, &names(&["b", "a"]));
         assert_eq!(admin.pg_roles, Vec::<String>::new());
         assert!(admin.every_role());
-        assert_eq!(admin.to_grant(), Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All });
+        assert_eq!(admin.to_grant(), Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() });
         let old = GrantRow { platform_role: PlatformRole::Admin, pg_roles: names(&["a"]) };
-        assert_eq!(old.to_grant().roles, RoleSet::All);
+        assert_eq!(old.to_grant().roles, RoleSet::all());
         let dev = GrantRow::new(PlatformRole::Developer, &names(&["b", "a", "b"]));
         assert_eq!(dev.pg_roles, names(&["a", "b"]));
         assert!(!dev.every_role());
@@ -2876,6 +3128,17 @@ mod tests {
                 "member_approved",
                 "member_declined",
                 "member_added",
+                // T3 (members hub step 1): every new action, in the plan's table order.
+                "member_suspended",
+                "member_reinstated",
+                "personal_logins_revoked",
+                "personal_login_created",
+                "personal_login_reset",
+                "personal_login_deleted",
+                "role_created",
+                "role_updated",
+                "role_deleted",
+                "privileges_changed",
             ]
         );
     }

@@ -10,7 +10,7 @@
 //!   to reconcile its member roles (`chelabase.member_roles.reconcile`); the worker's sweep is
 //!   the backstop for a lost message.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 
@@ -23,6 +23,9 @@ use chelabase_metadata::members::{
     AccessEvent as EventRecord, AccessWriteError, GrantRow, InviteState, MemberListing, MemberRecord,
     MemberStatus, NewInvite, Observed, OpenInvite,
     OverrideRow, ProjectAccess,
+};
+use chelabase_metadata::personal_logins::{
+    AccessEventInput, LoginEndpoint, LoginWriteError, PersonalLogin, RevokeReason,
 };
 use chelabase_metadata::{
     BranchStatus, DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError,
@@ -116,14 +119,111 @@ pub trait MembersPort: Send + Sync + 'static {
         since: DateTime<Utc>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
-    /// The tenant's access log, newest first.
+    /// The tenant's access log, newest first; `member` keeps the events whose target or actor
+    /// is that member.
     fn access_events(
         &self,
         tenant: TenantId,
         project: Option<Uuid>,
+        member: Option<Uuid>,
         before_id: Option<i64>,
         limit: u32,
     ) -> impl Future<Output = Result<Vec<EventRecord>, MetadataError>> + Send;
+
+    /// Every own grant of the tenant's members: `(member, project, platform_role)` (the
+    /// roster's `access`).
+    fn member_project_roles(
+        &self,
+        tenant: TenantId,
+    ) -> impl Future<Output = Result<Vec<(Uuid, Uuid, PlatformRole)>, MetadataError>> + Send;
+
+    /// Writes one event as given (the role routes').
+    fn record_access_event(
+        &self,
+        event: &AccessEventInput<'_>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// Whether `name` is a personal login of the Chelabase database `database` (any status):
+    /// the privilege ops refuse it as a grantee (MH-18, MH-28).
+    fn is_personal_login_name(
+        &self,
+        database: Uuid,
+        name: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Members hub S12: every personal-login name (any status) of every database of `project`.
+    fn personal_login_names(
+        &self,
+        project: Uuid,
+    ) -> impl Future<Output = Result<BTreeSet<String>, MetadataError>> + Send;
+
+    /// The member's own personal login on `database` (MH-15, D3, P6): `NotQualified`, `Exists`,
+    /// `NameTaken`; a revoked or expired record is replaced.
+    fn create_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+        valid_until: DateTime<Utc>,
+    ) -> impl Future<Output = Result<PersonalLogin, LoginWriteError>> + Send;
+
+    /// A live login's new verifier and `valid_until`, on the record and every row (P8).
+    fn reset_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        scram_verifier: &str,
+        valid_until: DateTime<Utc>,
+    ) -> impl Future<Output = Result<(PersonalLogin, Vec<LoginEndpoint>), LoginWriteError>> + Send;
+
+    /// Deletes the member's record on `database` (any status); returns where its rows were.
+    fn delete_personal_login(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        database: Uuid,
+    ) -> impl Future<Output = Result<Vec<LoginEndpoint>, LoginWriteError>> + Send;
+
+    /// The member's logins, any status.
+    fn member_personal_logins(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<PersonalLogin>, MetadataError>> + Send;
+
+    /// The database's logins, any status (P24).
+    fn database_personal_logins(
+        &self,
+        database: Uuid,
+    ) -> impl Future<Output = Result<Vec<PersonalLogin>, MetadataError>> + Send;
+
+    /// Every personal row of the member, whatever its record's status (the proxy cache).
+    fn member_login_endpoints(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<LoginEndpoint>, MetadataError>> + Send;
+
+    /// D5: suspended, logins revoked, member roles marked for rotation; the touched projects.
+    /// Already suspended: `Ok`, no write (S7).
+    fn suspend_member(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
+
+    /// Suspended → active. Already active: `Ok`, no write (S7).
+    fn reinstate_member(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+    ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
+
+    /// P16 (b): logins revoked, member roles marked for rotation; the touched projects.
+    fn revoke_postgres_access(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
 
     fn set_tenant_admin(
         &self,
@@ -313,10 +413,85 @@ impl MembersPort for MetadataClient {
         &self,
         tenant: TenantId,
         project: Option<Uuid>,
+        member: Option<Uuid>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<EventRecord>, MetadataError> {
-        MetadataClient::access_events(self, tenant, project, before_id, limit).await
+        MetadataClient::access_events(self, tenant, project, member, before_id, limit).await
+    }
+
+    async fn member_project_roles(
+        &self,
+        tenant: TenantId,
+    ) -> Result<Vec<(Uuid, Uuid, PlatformRole)>, MetadataError> {
+        MetadataClient::member_project_roles(self, tenant).await
+    }
+
+    async fn record_access_event(&self, event: &AccessEventInput<'_>) -> Result<(), MetadataError> {
+        MetadataClient::record_access_event(self, event).await
+    }
+
+    async fn is_personal_login_name(&self, database: Uuid, name: &str) -> Result<bool, MetadataError> {
+        MetadataClient::is_personal_login_name(self, database, name).await
+    }
+
+    async fn personal_login_names(&self, project: Uuid) -> Result<BTreeSet<String>, MetadataError> {
+        MetadataClient::personal_login_names(self, project).await
+    }
+
+    async fn create_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+        valid_until: DateTime<Utc>,
+    ) -> Result<PersonalLogin, LoginWriteError> {
+        MetadataClient::create_personal_login(self, member, database, role_name, scram_verifier, valid_until)
+            .await
+    }
+
+    async fn reset_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        scram_verifier: &str,
+        valid_until: DateTime<Utc>,
+    ) -> Result<(PersonalLogin, Vec<LoginEndpoint>), LoginWriteError> {
+        MetadataClient::reset_personal_login(self, member, database, scram_verifier, valid_until).await
+    }
+
+    async fn delete_personal_login(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        database: Uuid,
+    ) -> Result<Vec<LoginEndpoint>, LoginWriteError> {
+        MetadataClient::delete_personal_login(self, actor, member, database).await
+    }
+
+    async fn member_personal_logins(&self, member: Uuid) -> Result<Vec<PersonalLogin>, MetadataError> {
+        MetadataClient::member_personal_logins(self, member).await
+    }
+
+    async fn database_personal_logins(&self, database: Uuid) -> Result<Vec<PersonalLogin>, MetadataError> {
+        MetadataClient::database_personal_logins(self, database).await
+    }
+
+    async fn member_login_endpoints(&self, member: Uuid) -> Result<Vec<LoginEndpoint>, MetadataError> {
+        MetadataClient::member_login_endpoints(self, member).await
+    }
+
+    async fn suspend_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, AccessWriteError> {
+        MetadataClient::suspend_member(self, actor, member).await
+    }
+
+    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<(), AccessWriteError> {
+        MetadataClient::reinstate_member(self, actor, member).await
+    }
+
+    async fn revoke_postgres_access(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, AccessWriteError> {
+        MetadataClient::revoke_postgres_access(self, actor, member).await
     }
 
     async fn set_tenant_admin(
@@ -500,6 +675,9 @@ where
         .routes(routes!(update_member, remove_member))
         .routes(routes!(approve_member))
         .routes(routes!(decline_member))
+        .routes(routes!(suspend_member))
+        .routes(routes!(reinstate_member))
+        .routes(routes!(revoke_member_postgres_access))
         .routes(routes!(create_invite))
         .routes(routes!(resend_invite))
         .routes(routes!(revoke_invite))
@@ -532,14 +710,96 @@ pub(crate) struct Member {
     /// Whether the member can reach anything: a tenant admin, or holding at least one project
     /// grant (an override alone doesn't count). A member without it sees "no access yet".
     has_access: bool,
+    /// What the member can reach, over the projects the caller can see.
+    access: MemberAccess,
     /// When the member row was made (an invited member's: when they were invited).
     created_at: DateTime<Utc>,
     /// When an invited member first signed in.
     #[schema(required = true)]
     accepted_at: Option<DateTime<Utc>>,
+    /// When the member was suspended; `null` unless suspended (or removed after a suspension).
+    #[schema(required = true)]
+    suspended_at: Option<DateTime<Utc>>,
+    /// The member who suspended it; `null` unless suspended, and for a member suspended before
+    /// this was recorded.
+    #[schema(required = true)]
+    suspended_by: Option<Uuid>,
     /// The open invite of an invited member (resend or revoke it by its id); `null` otherwise.
     #[schema(required = true)]
     invite: Option<Invite>,
+}
+
+/// The highest platform role a member holds over the projects the caller can see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccessLevel {
+    /// A tenant admin: admin on every project.
+    TenantAdmin,
+    Admin,
+    Developer,
+    Viewer,
+    /// Access only on projects the caller can't see.
+    Other,
+    /// No project grant anywhere (an override alone is none).
+    None,
+}
+
+/// What a member can reach, as the caller may see it: only projects the caller can see are
+/// named (a Developer never learns of grants elsewhere), and never a Postgres role or override.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct MemberAccess {
+    level: AccessLevel,
+    /// The member's platform role on each project the caller can see, by project id.
+    projects: Vec<MemberProjectAccess>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct MemberProjectAccess {
+    project_id: ProjectId,
+    platform_role: PlatformRole,
+    /// Where the role comes from: always `own` (the member's own grant; a tenant admin's
+    /// admin is listed the same way).
+    via: AccessVia,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AccessVia {
+    Own,
+}
+
+/// What the roster shows of one member: `visible` is the projects the caller can see, `all` the
+/// tenant's grants `(member, project, role)` by member.
+fn member_access(
+    member: &MemberRecord,
+    visible: &HashSet<Uuid>,
+    all: &HashMap<Uuid, Vec<(Uuid, PlatformRole)>>,
+) -> MemberAccess {
+    let own = |project: Uuid, platform_role| MemberProjectAccess {
+        project_id: ProjectId::from(project),
+        platform_role,
+        via: AccessVia::Own,
+    };
+    if member.tenant_admin {
+        let mut projects: Vec<Uuid> = visible.iter().copied().collect();
+        projects.sort();
+        return MemberAccess {
+            level: AccessLevel::TenantAdmin,
+            projects: projects.into_iter().map(|p| own(p, PlatformRole::Admin)).collect(),
+        };
+    }
+    let mut grants = all.get(&member.id).cloned().unwrap_or_default();
+    let any = !grants.is_empty();
+    grants.retain(|(p, _)| visible.contains(p));
+    grants.sort_by_key(|(p, _)| *p);
+    let level = match grants.iter().map(|(_, r)| *r).max() {
+        Some(PlatformRole::Admin) => AccessLevel::Admin,
+        Some(PlatformRole::Developer) => AccessLevel::Developer,
+        Some(PlatformRole::Viewer) => AccessLevel::Viewer,
+        None if any => AccessLevel::Other,
+        None => AccessLevel::None,
+    };
+    MemberAccess { level, projects: grants.into_iter().map(|(p, r)| own(p, r)).collect() }
 }
 
 /// An open invite.
@@ -551,7 +811,7 @@ pub(crate) struct Invite {
 }
 
 impl Member {
-    fn new(l: MemberListing, invite: Option<Invite>) -> Self {
+    fn new(l: MemberListing, invite: Option<Invite>, access: MemberAccess) -> Self {
         let m = l.member;
         Self {
             id: m.id,
@@ -560,8 +820,11 @@ impl Member {
             tenant_admin: m.tenant_admin,
             status: m.status.into(),
             has_access: l.has_access,
+            access,
             created_at: l.created_at,
             accepted_at: m.accepted_at,
+            suspended_at: m.suspended_at,
+            suspended_by: m.suspended_by,
             invite: invite.filter(|_| m.status == MemberStatus::Invited),
         }
     }
@@ -771,6 +1034,7 @@ struct OverrideQuery {
 struct EventsQuery {
     before: Option<i64>,
     limit: Option<u32>,
+    member_id: Option<Uuid>,
 }
 
 /// One access change.
@@ -783,7 +1047,10 @@ pub(crate) struct AccessEvent {
     /// `member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,
     /// `member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,
     /// `invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,
-    /// `open_signup_set`, `tenant_renamed`, `member_approved` or `member_declined`.
+    /// `open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,
+    /// `member_suspended`, `member_reinstated`, `personal_logins_revoked`,
+    /// `personal_login_created`, `personal_login_reset`, `personal_login_deleted`,
+    /// `role_created`, `role_updated` or `role_deleted`.
     action: String,
     #[schema(required = true)]
     target_member_id: Option<Uuid>,
@@ -791,6 +1058,9 @@ pub(crate) struct AccessEvent {
     project_id: Option<Uuid>,
     #[schema(required = true)]
     database_id: Option<Uuid>,
+    /// The branch of a per-branch change (a role's); `null` for the others.
+    #[schema(required = true)]
+    branch_id: Option<Uuid>,
     /// The actor's email now (a removed member's too); `null` for the system, or when their
     /// address went stale.
     #[schema(required = true)]
@@ -843,7 +1113,7 @@ fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
 }
 
 /// A refused write's answer; `not_found` is the message for `NotFound`.
-fn write_failed(what: &str, err: AccessWriteError, not_found: &str) -> ApiError {
+pub(crate) fn write_failed(what: &str, err: AccessWriteError, not_found: &str) -> ApiError {
     match err {
         AccessWriteError::LastTenantAdmin => ApiError::new(
             409,
@@ -905,8 +1175,83 @@ where
     Ok(m)
 }
 
+/// The ids of the projects the caller can see: all of a tenant admin's tenant, else the ones it
+/// holds a grant on (R1).
+async fn visible_projects<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+) -> Result<HashSet<Uuid>, ApiError>
+where
+    M: MetadataPort,
+{
+    let Some(caller) = principal.member.as_ref() else {
+        return Err(ApiError::internal());
+    };
+    if caller.tenant_admin {
+        let projects = state
+            .metadata
+            .list_projects(principal.tenant_id)
+            .await
+            .map_err(|err| internal("list projects", err))?;
+        return Ok(projects.into_iter().map(|p| p.id.as_uuid()).collect());
+    }
+    // T2-4: every access source.
+    let granted = state
+        .metadata
+        .member_grant_sources(principal.tenant_id, caller.id)
+        .await
+        .map_err(|err| internal("caller projects", err))?;
+    Ok(granted.into_iter().map(|(project, _)| project).collect())
+}
+
+/// The tenant's grants by member.
+async fn grants_by_member<M, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+) -> Result<HashMap<Uuid, Vec<(Uuid, PlatformRole)>>, ApiError>
+where
+    M: MetadataPort,
+{
+    let mut out: HashMap<Uuid, Vec<(Uuid, PlatformRole)>> = HashMap::new();
+    for (member, project, role) in state
+        .metadata
+        .member_project_roles(tenant)
+        .await
+        .map_err(|err| internal("member project roles", err))?
+    {
+        out.entry(member).or_default().push((project, role));
+    }
+    Ok(out)
+}
+
+/// One member's `access` as the caller sees it.
+async fn access_for<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    m: &MemberRecord,
+) -> Result<MemberAccess, ApiError>
+where
+    M: MetadataPort,
+{
+    let visible = visible_projects(state, principal).await?;
+    let all = grants_by_member(state, principal.tenant_id).await?;
+    Ok(member_access(m, &visible, &all))
+}
+
+/// T9-I1: the `access` of a member whose every grant a write just made (`rows`: an invite, an
+/// addition, an approval), as the caller sees it (`visible`, read before the write). Nothing is
+/// read after the commit, so no failed read can turn a committed write into a 500.
+fn written_access(m: &MemberRecord, visible: &HashSet<Uuid>, rows: &[(Uuid, GrantRow)]) -> MemberAccess {
+    let all = HashMap::from([(m.id, rows.iter().map(|(p, g)| (*p, g.platform_role)).collect())]);
+    member_access(m, visible, &all)
+}
+
 /// The member as the API shows it, with its open invite.
-async fn member_view<M, J>(state: &AppState<M, J>, m: MemberRecord) -> Result<Member, ApiError>
+async fn member_view<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    m: MemberRecord,
+) -> Result<Member, ApiError>
 where
     M: MetadataPort,
 {
@@ -931,13 +1276,61 @@ where
     } else {
         None
     };
-    Ok(Member::new(listing, invite))
+    let access = access_for(state, principal, &listing.member).await?;
+    Ok(Member::new(listing, invite, access))
 }
 
 /// P10/W18: an access write committed; realtime re-checks `member_sub`'s channels (the whole
 /// tenant's for `None`, S28) within a second.
 fn access_changed<M, J>(state: &AppState<M, J>, tenant: TenantId, member_sub: Option<&str>) {
     crate::internal::realtime::access_changed(&state.rt_events, tenant, member_sub);
+}
+
+/// Every access write's side effects once it committed (members hub P4, MH-5), in this order:
+/// 1. realtime re-checks each member's channels ([`access_changed`]);
+/// 2. the proxies forget every personal-login row of each member ([`invalidate_member_logins`];
+///    the metadata write already took the verifier of any login it revoked, so a lookup the
+///    proxy makes now is refused even when this message is lost);
+/// 3. every branch of `projects` reconciles its member roles ([`reconcile_projects`]).
+///
+/// `members` are `(member id, Zitadel sub)` pairs. Grant, override, tenant-admin, remove,
+/// suspend, reinstate and revoke-now handlers call it; step 2's team writes will too.
+pub(crate) async fn access_changed_for<M, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+    members: &[(Uuid, String)],
+    projects: Vec<Uuid>,
+) where
+    M: MetadataPort,
+    J: JobPort,
+{
+    for (_, sub) in members {
+        access_changed(state, tenant, Some(sub));
+    }
+    for (member, _) in members {
+        invalidate_member_logins(state, *member).await;
+    }
+    reconcile_projects(state, projects).await;
+}
+
+/// Tells the proxies to forget every personal-login row of `member`, revoked records' rows
+/// included (P4). A failed read is logged: the verifiers are already gone from the metadata.
+pub(crate) async fn invalidate_member_logins<M, J>(state: &AppState<M, J>, member: Uuid)
+where
+    M: MetadataPort,
+{
+    match state.metadata.member_login_endpoints(member).await {
+        Ok(rows) => publish_login_rows(state, rows),
+        Err(err) => {
+            warn!(member_id = %member, "personal logins: the proxy cache wasn't told, their rows aren't readable: {err}")
+        }
+    }
+}
+
+/// `password_updated` for each row, grouped by endpoint, now and again 1 s later (spawned:
+/// the answer doesn't wait for Valkey).
+pub(crate) fn publish_login_rows<M, J>(state: &AppState<M, J>, rows: Vec<LoginEndpoint>) {
+    crate::internal::publish_login_rows(&state.proxy_cache, rows);
 }
 
 /// Asks every branch of these projects to reconcile its member roles. Failures are logged:
@@ -1012,12 +1405,17 @@ struct DbRoles {
 /// database) before anything is written when that state breaks it.
 struct RoleContext {
     dbs: Vec<DbRoles>,
+    /// MH-21, S12: personal-login names no grant or override may hold (any status): every
+    /// database's of the project for a grant, the one database's for an override.
+    personal: BTreeSet<String>,
 }
 
 /// What a grant narrowed by an override leaves: the lower platform role, and the grant's roles
 /// the override keeps. R17: an Admin grant is every role, so it keeps the override's roles,
 /// and none when an override takes it below Admin without naming roles (as
-/// [`chelabase_types::access::effective`]); while still Admin, the roles aren't checked.
+/// [`chelabase_types::access::GrantSources::effective`] with the own grant as the only source;
+/// MH-4 moves this validation onto the union in step 2); while still Admin, the roles aren't
+/// checked.
 fn effective_on(grant: &GrantRow, o: Option<&OverrideRow>) -> (PlatformRole, Vec<String>) {
     let role = o
         .and_then(|o| o.platform_role)
@@ -1085,7 +1483,31 @@ impl RoleContext {
                 graphs,
             });
         }
-        Ok(Self { dbs })
+        Ok(Self { dbs, personal: BTreeSet::new() })
+    }
+
+    /// The context of an override on one database, with the personal logins among `names`
+    /// (S12: `is_personal_login_name` on that database).
+    async fn database<M, J>(
+        state: &AppState<M, J>,
+        database: &DatabaseRecord,
+        names: &[String],
+    ) -> Result<Self, ApiError>
+    where
+        M: MetadataPort,
+    {
+        let mut context = Self::of(state, std::slice::from_ref(database)).await?;
+        for name in names {
+            let personal = state
+                .metadata
+                .is_personal_login_name(database.database_id.as_uuid(), name)
+                .await
+                .map_err(|err| internal("grant check: personal logins", err))?;
+            if personal {
+                context.personal.insert(name.clone());
+            }
+        }
+        Ok(context)
     }
 
     /// Every live database of the project.
@@ -1112,7 +1534,15 @@ impl RoleContext {
                 databases.push(db);
             }
         }
-        Self::of(state, &databases).await
+        let mut context = Self::of(state, &databases).await?;
+        // S12: a project grant's roles apply on every database of the project, so a login of
+        // any of them (deleted ones' too: their names are cheap to refuse) is refused.
+        context.personal = state
+            .metadata
+            .personal_login_names(project.as_uuid())
+            .await
+            .map_err(|err| internal("grant check: personal logins", err))?;
+        Ok(context)
     }
 
     /// R7: names no grant or override may hold, at any level: `owner` and the databases'
@@ -1140,6 +1570,10 @@ impl RoleContext {
                 return Err(refused(
                     "the name is reserved for Chelabase and the platform",
                 ));
+            }
+            // MH-21: a personal login is one member's own identity, never a granted role.
+            if self.personal.contains(name) {
+                return Err(refused("it is a member's personal login"));
             }
         }
         Ok(())
@@ -1500,6 +1934,16 @@ where
         )
         .with_extra("member_id", json!(existing.id)));
     }
+    // T9-I1: what the answer needs is read before the write, so a failed read after it can't
+    // turn the committed grants into a 500 (the answer is then built from these).
+    let visible = visible_projects(state, principal).await?;
+    let mut all = grants_by_member(state, principal.tenant_id).await?;
+    let listing_before = state
+        .metadata
+        .member_listing(existing.id)
+        .await
+        .map_err(|err| internal("member listing", err))?
+        .ok_or_else(|| ApiError::not_found("member not found"))?;
     // 1. A member already: every grant checked with its overrides, then all put in one
     // transaction.
     let mut tries = 0;
@@ -1517,8 +1961,24 @@ where
         }
     };
     info!(request_id = %principal.request_id, member_id = %existing.id, changed = changed.len(), "invite: granted to an existing member");
-    reconcile_projects(state, changed).await;
-    let member = member_view(state, existing).await?;
+    if !changed.is_empty() {
+        // A grant replaced by a lower one takes access away like a grant put (P4).
+        let who = [(existing.id, existing.zitadel_user_id.clone())];
+        access_changed_for(state, principal.tenant_id, &who, changed).await;
+    }
+    let member = match member_view(state, principal, existing.clone()).await {
+        Ok(member) => member,
+        Err(err) => {
+            warn!(member_id = %existing.id, "invite: the member isn't readable after its grants were put; answered from the reads before: {err:?}");
+            let held = all.entry(existing.id).or_default();
+            for (project, row) in grant_rows(&grants) {
+                held.retain(|(p, _)| *p != project);
+                held.push((project, row.platform_role));
+            }
+            let access = member_access(&listing_before.member, &visible, &all);
+            Member::new(MemberListing { has_access: true, ..listing_before }, None, access)
+        }
+    };
     Ok((
         StatusCode::OK,
         InviteResult {
@@ -1545,6 +2005,8 @@ where
     let email = Some(user.email.as_str())
         .filter(|e| !e.trim().is_empty())
         .unwrap_or(email);
+    // T9-I1: what the caller sees is read before the write.
+    let visible = visible_projects(state, principal).await?;
     let listing = state
         .metadata
         .add_existing_user(
@@ -1559,11 +2021,12 @@ where
         .map_err(|err| write_failed("invite: add user", err, "project not found"))?;
     info!(request_id = %principal.request_id, member_id = %listing.id, "invite: a user of the organisation was added");
     reconcile_projects(state, granted_projects(&grants)).await;
+    let access = written_access(&listing.member, &visible, &grants);
     Ok((
         StatusCode::CREATED,
         InviteResult {
             outcome: InviteOutcome::Added,
-            member: Member::new(listing, None),
+            member: Member::new(listing, None, access),
             invite_url: None,
         },
     ))
@@ -1588,6 +2051,9 @@ where
     J: JobPort,
 {
     let z = admin_zitadel(state)?;
+    // T9-I1: what the caller sees is read before anything is made (a failed read here leaves
+    // nothing behind).
+    let visible = visible_projects(state, principal).await?;
     let created = existing.is_none();
     // A link carries the code and nothing else: it is for a user who is made now, or one who has
     // never had any way to sign in (password, passkey, OTP or U2F, IdP link). Anyone else is told
@@ -1686,13 +2152,16 @@ where
         }
     };
     info!(request_id = %principal.request_id, member_id = %listing.id, %invite, ?delivery, "invite: created");
-    // Built from what the write returned: nothing is read after the mail.
+    // Built from what the write returned and the grants it made: nothing is read after the
+    // mail (T9-I1: a link invite's URL is never lost to a failed read).
+    let access = written_access(&listing.member, &visible, &grants);
     let member = Member::new(
         listing,
         Some(Invite {
             id: invite,
             expires_at,
         }),
+        access,
     );
     Ok((
         StatusCode::CREATED,
@@ -1788,10 +2257,10 @@ fn grants_view(access: ProjectAccess) -> Vec<ProjectGrant> {
         .collect()
 }
 
-/// `?before&limit`, checked.
+/// `?before&limit&member_id`, checked.
 fn events_query(
     query: Result<Query<EventsQuery>, QueryRejection>,
-) -> Result<(Option<i64>, u32), ApiError> {
+) -> Result<(Option<i64>, u32, Option<Uuid>), ApiError> {
     let Query(q) = query.map_err(|rej| {
         ApiError::invalid_request(400, format!("invalid query: {}", rej.body_text()))
     })?;
@@ -1802,13 +2271,14 @@ fn events_query(
             format!("limit must be 1 to {EVENTS_MAX}"),
         ));
     }
-    Ok((q.before, limit))
+    Ok((q.before, limit, q.member_id))
 }
 
 async fn events_page<M, J>(
     state: &AppState<M, J>,
     tenant: TenantId,
     project: Option<Uuid>,
+    member: Option<Uuid>,
     before: Option<i64>,
     limit: u32,
 ) -> Result<AccessEventPage, ApiError>
@@ -1817,12 +2287,41 @@ where
 {
     let rows = state
         .metadata
-        .access_events(tenant, project, before, limit)
+        .access_events(tenant, project, member, before, limit)
         .await
         .map_err(|err| internal("access events", err))?;
     let next_before = (rows.len() == limit as usize)
         .then(|| rows.last().map(|e| e.id))
         .flatten();
+    // T9-H1, EOS-5: a project's log shows only the project's part of an event.
+    let scope = match project {
+        Some(project) => {
+            let databases: HashSet<Uuid> = state
+                .metadata
+                .project_databases(ProjectId::from(project))
+                .await
+                .map_err(|err| internal("access events: the project's databases", err))?
+                .into_iter()
+                .map(|(d, _, _)| d.as_uuid())
+                .collect();
+            let branches: HashSet<Uuid> = state
+                .metadata
+                .project_branches(project)
+                .await
+                .map_err(|err| internal("access events: the project's branches", err))?
+                .into_iter()
+                .collect();
+            Some(ProjectScope { project, databases, branches })
+        }
+        None => None,
+    };
+    let scoped = |v: Option<Value>| match (&scope, v) {
+        (Some(scope), Some(mut v)) => {
+            scope.apply(&mut v);
+            Some(v)
+        }
+        (_, v) => v,
+    };
     let events = rows
         .into_iter()
         .map(|e| AccessEvent {
@@ -1832,11 +2331,12 @@ where
             target_member_id: e.target_member_id,
             project_id: e.project_id,
             database_id: e.database_id,
+            branch_id: e.branch_id,
             actor_email: e.actor_email,
             target_email: e.target_email,
             project_name: e.project_name,
-            before: e.before,
-            after: e.after,
+            before: scoped(e.before),
+            after: scoped(e.after),
             at: e.at,
         })
         .collect();
@@ -1844,6 +2344,51 @@ where
         events,
         next_before,
     })
+}
+
+/// T9-H1, EOS-5: what of an event's `before`/`after` a project's log may show: its own grants
+/// (`grants`), the overrides and personal logins on its databases (`overrides`, `logins`, whose
+/// `count` follows), and the branches of its databases (`rotated_branches`). An entry that
+/// doesn't name a value of the project is left out (fails closed).
+struct ProjectScope {
+    project: Uuid,
+    databases: HashSet<Uuid>,
+    branches: HashSet<Uuid>,
+}
+
+impl ProjectScope {
+    fn apply(&self, v: &mut Value) {
+        let Some(fields) = v.as_object_mut() else {
+            return;
+        };
+        let id = |item: &Value, key: Option<&str>| {
+            let value = match key {
+                Some(key) => &item[key],
+                None => item,
+            };
+            value.as_str().and_then(|s| Uuid::parse_str(s).ok())
+        };
+        let keep = |fields: &mut serde_json::Map<String, Value>, field: &str, ok: &dyn Fn(&Value) -> bool| {
+            if let Some(Value::Array(items)) = fields.get_mut(field) {
+                items.retain(|item| ok(item));
+            }
+        };
+        keep(fields, "grants", &|g| id(g, Some("project_id")) == Some(self.project));
+        keep(fields, "overrides", &|o| {
+            id(o, Some("database_id")).is_some_and(|d| self.databases.contains(&d))
+        });
+        keep(fields, "rotated_branches", &|b| id(b, None).is_some_and(|b| self.branches.contains(&b)));
+        let logins = match fields.get_mut("logins") {
+            Some(Value::Array(items)) => {
+                items.retain(|l| id(l, Some("database_id")).is_some_and(|d| self.databases.contains(&d)));
+                Some(items.len())
+            }
+            _ => None,
+        };
+        if let (Some(n), Some(count)) = (logins, fields.get_mut("count")) {
+            *count = json!(n);
+        }
+    }
 }
 
 /// Unwraps a handler step, answering its error.
@@ -1864,7 +2409,7 @@ macro_rules! tri {
     operation_id = "listMembers",
     tag = "members",
     summary = "List the tenant's members",
-    description = "Invited, pending and active members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined.",
+    description = "Invited, pending, active and suspended members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined. Each member carries `access`: the highest platform role over the projects the caller can see and the member's role on each of those projects (`other`: access only on projects the caller can't see; `none`: no project grant). No Postgres roles or overrides.",
     responses(
         (status = 200, description = "The members", body = Vec<Member>),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
@@ -1903,6 +2448,8 @@ where
             .await
             .map_err(|err| internal("open invites", err))
     );
+    let visible = tri!(visible_projects(&state, &principal).await);
+    let all = tri!(grants_by_member(&state, principal.tenant_id).await);
     let out: Vec<Member> = members
         .into_iter()
         .map(|m| {
@@ -1913,7 +2460,8 @@ where
                     id: i.id,
                     expires_at: i.expires_at,
                 });
-            Member::new(m, invite)
+            let access = member_access(&m.member, &visible, &all);
+            Member::new(m, invite, access)
         })
         .collect();
     Json(out).into_response()
@@ -1974,11 +2522,11 @@ where
     );
     if changed {
         info!(request_id = %principal.request_id, member_id = %id, tenant_admin = body.tenant_admin, "member: tenant admin changed");
-        access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
+        access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], Vec::new()).await;
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
-    Json(tri!(member_view(&state, m).await)).into_response()
+    Json(tri!(member_view(&state, &principal, m).await)).into_response()
 }
 
 #[utoipa::path(
@@ -2028,8 +2576,7 @@ where
             .map_err(|err| write_failed("remove member", err, "member not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, "member: removed");
-    access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
-    reconcile_projects(&state, touched).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
@@ -2101,6 +2648,8 @@ where
     // Checked with the member's existing overrides, as any grant on a member is.
     tri!(check_invite_grants(&state, Some(id), &grants).await);
     let rows = grant_rows(&grants);
+    // T9-I1: what the caller sees is read before the write.
+    let visible = tri!(visible_projects(&state, &principal).await);
     let listing = tri!(
         state
             .metadata
@@ -2109,9 +2658,9 @@ where
             .map_err(|err| write_failed("approve member", err, "project not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, grants = rows.len(), "member: approved");
-    access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
-    reconcile_projects(&state, granted_projects(&rows)).await;
-    Json(Member::new(listing, None)).into_response()
+    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], granted_projects(&rows)).await;
+    let access = written_access(&listing.member, &visible, &rows);
+    Json(Member::new(listing, None, access)).into_response()
 }
 
 #[utoipa::path(
@@ -2178,6 +2727,249 @@ where
         return zitadel_failed("decline member: end sessions", &err).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+// --- Suspension and "Revoke Postgres access now" (members hub D5, P14–P16) ----------------
+
+/// What "Revoke Postgres access now" did.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct RevokeResult {
+    /// The member's personal logins revoked (those that weren't already).
+    revoked: usize,
+    /// The branches whose member role of this member gets a new password (its sessions end).
+    rotated_branches: usize,
+}
+
+/// 503 after the Chelabase side of a suspension or reinstatement is done: Zitadel didn't lock
+/// (or unlock) the user or end its sessions. The same call again completes it (S7).
+fn zitadel_step_failed(what: &str, err: &ZError, retry: &str) -> ApiError {
+    warn!("{what}: {err}");
+    ApiError::new(
+        503,
+        ErrorCode::Unavailable,
+        format!("done in Chelabase, but the user service couldn't finish it; {retry} again to retry"),
+    )
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/members/{member_id}/suspend",
+    operation_id = "suspendMember",
+    tag = "members",
+    summary = "Suspend a member",
+    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+    params(("member_id" = Uuid, Path, description = "Member id")),
+    responses(
+        (status = 200, description = "The suspended member", body = Member),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: yourself, or a member who isn't active (invited, pending or removed); `last_tenant_admin`: the tenant would have no active tenant admin", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry", body = ErrorEnvelope),
+    ),
+)]
+async fn suspend_member<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    tri!(authorize(&state, &principal, ep::SUSPEND_MEMBER.policy.access, Target::None).await);
+    let actor = tri!(actor(principal.member.as_ref()));
+    let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    // P15: before the last-admin check, which only a self-suspension could reach.
+    if actor == id {
+        return ApiError::new(409, ErrorCode::Conflict, "you can't suspend yourself").into_response();
+    }
+    let touched = tri!(
+        state
+            .metadata
+            .suspend_member(actor, id)
+            .await
+            .map_err(|err| write_failed("suspend member", err, "member not found"))
+    );
+    // T8-3: the side effects are idempotent and run on every call, a retry's (S7) or one that
+    // raced another suspension included: `m` was read before the write, so it can't tell which
+    // call made it (the metadata writes the event once).
+    if m.status == MemberStatus::Active {
+        info!(request_id = %principal.request_id, member_id = %id, "member: suspended");
+    }
+    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
+    if m.tenant_admin {
+        reconcile_tenant(&state, principal.tenant_id).await;
+    }
+    let z = tri!(admin_zitadel(&state));
+    if let Err(err) = z.lock_user(&m.zitadel_user_id).await {
+        return zitadel_step_failed("suspend member: lock user", &err, "suspend").into_response();
+    }
+    if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
+        return zitadel_step_failed("suspend member: end sessions", &err, "suspend").into_response();
+    }
+    let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    Json(tri!(member_view(&state, &principal, m).await)).into_response()
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/members/{member_id}/reinstate",
+    operation_id = "reinstateMember",
+    tag = "members",
+    summary = "Reinstate a suspended member",
+    description = "The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.",
+    params(("member_id" = Uuid, Path, description = "Member id")),
+    responses(
+        (status = 200, description = "The reinstated member", body = Member),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: the member isn't suspended (invited, pending or removed)", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+        (status = 503, description = "`unavailable`: reinstated in Chelabase, but Zitadel couldn't unlock the user (or isn't configured); reinstate again to retry", body = ErrorEnvelope),
+    ),
+)]
+async fn reinstate_member<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    tri!(authorize(&state, &principal, ep::REINSTATE_MEMBER.policy.access, Target::None).await);
+    let actor = tri!(actor(principal.member.as_ref()));
+    let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    tri!(
+        state
+            .metadata
+            .reinstate_member(actor, id)
+            .await
+            .map_err(|err| write_failed("reinstate member", err, "member not found"))
+    );
+    if m.status == MemberStatus::Suspended {
+        info!(request_id = %principal.request_id, member_id = %id, "member: reinstated");
+        let projects = match state.metadata.member_projects(id).await {
+            Ok(grants) => grants.into_iter().map(|(project, _)| project).collect(),
+            Err(err) => {
+                warn!(member_id = %id, "member roles: the reinstated member's projects aren't readable; the sweep will reconcile them: {err}");
+                Vec::new()
+            }
+        };
+        access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], projects).await;
+        if m.tenant_admin {
+            reconcile_tenant(&state, principal.tenant_id).await;
+        }
+    }
+    let z = tri!(admin_zitadel(&state));
+    if let Err(err) = z.unlock_user(&m.zitadel_user_id).await {
+        return zitadel_step_failed("reinstate member: unlock user", &err, "reinstate").into_response();
+    }
+    let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    Json(tri!(member_view(&state, &principal, m).await)).into_response()
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/members/{member_id}/revoke-postgres-access",
+    operation_id = "revokeMemberPostgresAccess",
+    tag = "members",
+    summary = "Revoke a member's Postgres access now",
+    description = "Every personal login of the member is revoked at once (the proxies forget it), and their member role on every branch of every project they reach gets a new password, which ends its open sessions (the SQL editor and the console reconnect with the new one). Their Studio access and grants are untouched.",
+    params(("member_id" = Uuid, Path, description = "Member id")),
+    responses(
+        (status = 200, description = "What was revoked", body = RevokeResult),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
+    ),
+)]
+async fn revoke_member_postgres_access<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath(id): ApiPath<Uuid>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    tri!(authorize(&state, &principal, ep::REVOKE_MEMBER_POSTGRES_ACCESS.policy.access, Target::None).await);
+    let actor = tri!(actor(principal.member.as_ref()));
+    let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    // T8-6: the count the answer reports is what the write revoked: every record revoked now
+    // (`revoked_now`) that wasn't already revoked before it, a login made between this read and
+    // the write included.
+    let before = tri!(
+        state
+            .metadata
+            .member_personal_logins(id)
+            .await
+            .map_err(|err| internal("revoke postgres access: logins", err))
+    );
+    let touched = tri!(
+        state
+            .metadata
+            .revoke_postgres_access(actor, id)
+            .await
+            .map_err(|err| write_failed("revoke postgres access", err, "member not found"))
+    );
+    let live = match state.metadata.member_personal_logins(id).await {
+        Ok(after) => after
+            .iter()
+            .filter(|l| l.revoked_reason == Some(RevokeReason::RevokedNow))
+            .filter(|l| {
+                !before.iter().any(|b| {
+                    b.database_id == l.database_id
+                        && b.created_at == l.created_at
+                        && b.revoked_at.is_some()
+                })
+            })
+            .count(),
+        // The write committed: the answer counts what was live before it.
+        Err(err) => {
+            warn!(member_id = %id, "revoke postgres access: the logins aren't readable after the write: {err}");
+            before.iter().filter(|l| l.revoked_at.is_none()).count()
+        }
+    };
+    info!(request_id = %principal.request_id, member_id = %id, revoked = live, "member: postgres access revoked");
+    let rotated_branches = rotated_branches(&state, id, &touched).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
+    if m.tenant_admin {
+        reconcile_tenant(&state, principal.tenant_id).await;
+    }
+    Json(RevokeResult { revoked: live, rotated_branches }).into_response()
+}
+
+/// How many branches of `projects` hold a member role of `member` (each was just marked for a
+/// new password). A failed read counts as none: the answer only reports it.
+async fn rotated_branches<M, J>(state: &AppState<M, J>, member: Uuid, projects: &[Uuid]) -> usize
+where
+    M: MetadataPort,
+{
+    let mut n = 0;
+    for project in projects {
+        let Ok(branches) = state.metadata.project_branches(*project).await else {
+            continue;
+        };
+        for branch in branches {
+            if state
+                .metadata
+                .member_branch_roles(branch)
+                .await
+                .is_ok_and(|rows| rows.iter().any(|r| r.member_id == member))
+            {
+                n += 1;
+            }
+        }
+    }
+    n
 }
 
 // --- Invites -----------------------------------------------------------------------------------
@@ -2579,8 +3371,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, platform_role = grant.platform_role.as_str(), "grant: put");
-        access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
-        reconcile_projects(&state, vec![id]).await;
+        access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
     }
     match tri!(project_grant(&state, id, member_id).await) {
         Some(view) => Json(view).into_response(),
@@ -2636,8 +3427,7 @@ where
             .map_err(|err| write_failed("delete grant", err, "grant not found"))
     );
     info!(request_id = %principal.request_id, project_id = %id, %member_id, "grant: deleted");
-    access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
-    reconcile_projects(&state, vec![id]).await;
+    access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2697,8 +3487,9 @@ where
     }
     // The role context is read once; the grant it is checked against is read again when the
     // write finds it changed (I4).
-    let context = tri!(RoleContext::of(&state, std::slice::from_ref(&database)).await);
-    tri!(context.check_names(body.pg_roles.as_deref().unwrap_or(&[])));
+    let names = body.pg_roles.as_deref().unwrap_or(&[]);
+    let context = tri!(RoleContext::database(&state, &database, names).await);
+    tri!(context.check_names(names));
     let o = OverrideRow {
         platform_role: body.platform_role,
         pg_roles: body.pg_roles.clone(),
@@ -2743,8 +3534,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, database_id = %body.database_id, "override: put");
-        access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
-        reconcile_projects(&state, vec![id]).await;
+        access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
     }
     let mut pg_roles = o.pg_roles;
     if let Some(roles) = pg_roles.as_mut() {
@@ -2826,8 +3616,7 @@ where
         }
     }
     info!(request_id = %principal.request_id, project_id = %id, %member_id, %database_id, "override: deleted");
-    access_changed(&state, principal.tenant_id, Some(&member.zitadel_user_id));
-    reconcile_projects(&state, vec![id]).await;
+    access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2843,10 +3632,11 @@ where
     params(
         ("before" = Option<i64>, Query, description = "Only events older than this id (`next_before` of the previous page)"),
         ("limit" = Option<u32>, Query, description = "1 to 200 (default 50)"),
+        ("member_id" = Option<Uuid>, Query, description = "Only events whose target or actor is this member"),
     ),
     responses(
         (status = 200, description = "A page of events", body = AccessEventPage),
-        (status = 400, description = "`invalid_request`: `before` or `limit` isn't valid", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: `before`, `limit` or `member_id` isn't valid", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -2870,9 +3660,9 @@ where
         )
         .await
     );
-    let (before, limit) = tri!(events_query(query));
+    let (before, limit, member) = tri!(events_query(query));
     Json(tri!(
-        events_page(&state, principal.tenant_id, None, before, limit).await
+        events_page(&state, principal.tenant_id, None, member, before, limit).await
     ))
     .into_response()
 }
@@ -2888,10 +3678,11 @@ where
         ("id" = Uuid, Path, description = "Project id"),
         ("before" = Option<i64>, Query, description = "Only events older than this id (`next_before` of the previous page)"),
         ("limit" = Option<u32>, Query, description = "1 to 200 (default 50)"),
+        ("member_id" = Option<Uuid>, Query, description = "Only events whose target or actor is this member"),
     ),
     responses(
         (status = 200, description = "A page of events", body = AccessEventPage),
-        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or `before` or `limit` isn't valid", body = ErrorEnvelope),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID, or `before`, `limit` or `member_id` isn't valid", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
@@ -2917,9 +3708,9 @@ where
         )
         .await
     );
-    let (before, limit) = tri!(events_query(query));
+    let (before, limit, member) = tri!(events_query(query));
     Json(tri!(
-        events_page(&state, principal.tenant_id, Some(id), before, limit).await
+        events_page(&state, principal.tenant_id, Some(id), member, before, limit).await
     ))
     .into_response()
 }
@@ -3139,4 +3930,37 @@ where
     );
     info!(request_id = %principal.request_id, "tenant: renamed");
     Json(TenantName { display_name: name }).into_response()
+}
+
+#[cfg(test)]
+mod project_scope_tests {
+    use super::*;
+
+    // T9-H1, EOS-5 (coder's edges): a revocation's `logins` and its `count` follow the
+    // project; an entry that names no value of the project (malformed, missing) is left out.
+    #[test]
+    fn a_project_scope_keeps_only_its_own_values_and_fails_closed() {
+        let (project, db, other_db) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let scope = ProjectScope {
+            project,
+            databases: HashSet::from([db]),
+            branches: HashSet::new(),
+        };
+        let mut v = json!({
+            "count": 3,
+            "logins": [{ "database_id": db, "role_name": "a" }, { "database_id": other_db, "role_name": "b" }, { "role_name": "c" }],
+            "grants": [{ "project_id": "not-a-uuid" }, { "project_id": project }],
+            "rotated_branches": [Uuid::new_v4()],
+            "reason": "revoked_now",
+        });
+        scope.apply(&mut v);
+        assert_eq!(v["count"], 1);
+        assert_eq!(v["logins"], json!([{ "database_id": db, "role_name": "a" }]));
+        assert_eq!(v["grants"], json!([{ "project_id": project }]));
+        assert_eq!(v["rotated_branches"], json!([]));
+        assert_eq!(v["reason"], "revoked_now");
+        let mut scalar = json!("x");
+        scope.apply(&mut scalar);
+        assert_eq!(scalar, json!("x"));
+    }
 }

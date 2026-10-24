@@ -9,12 +9,19 @@
 //! dead run left once they are older than [`STALE_AFTER_SECS`].
 
 use chelabase_metadata::members::{
-    AccessWriteError, Admission, GrantRow, GrantRows, MemberBranchRole, MemberStatus, NewInvite,
-    OverrideRow,
+    AccessAction, AccessEvent, AccessWriteError, Admission, GrantRow, MemberBranchRole,
+    MemberStatus, NewInvite, OverrideRow,
 };
-use chelabase_metadata::{MetadataClient, MetadataConfig};
-use chelabase_types::access::PlatformRole;
-use chelabase_types::{DatabaseId, ProjectId, TenantId};
+use chelabase_metadata::personal_logins::{
+    AccessEventInput, LoginEndpoint, LoginStatus, LoginWriteError, PersonalLogin, RevokeReason,
+};
+use chelabase_metadata::{
+    BranchStatus, CreateBranchOutcome, DatabaseStatus, MetadataClient, MetadataConfig, NewBranch,
+    NewEndpoint, RenameCopyOutcome,
+};
+use chelabase_types::access::{GrantSources, PlatformRole, qualifies, tenant_admin_effective};
+use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
+use serde_json::json;
 use chrono::{Duration, Utc};
 use proptest::prelude::*;
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
@@ -174,7 +181,7 @@ impl Scratch {
 
     async fn last_action(&self, tenant: TenantId) -> String {
         self.client
-            .access_events(tenant, None, None, 1)
+            .access_events(tenant, None, None, None, 1)
             .await
             .unwrap()[0]
             .action
@@ -250,7 +257,7 @@ async fn first_claim_is_atomic() {
     assert_eq!(s.client.active_tenant_admins(t).await.unwrap().len(), 1);
     assert_eq!(s.client.list_members(t).await.unwrap().len(), 20);
     assert!(s.client.tenant_has_members(t).await.unwrap());
-    let events = s.client.access_events(t, None, None, 100).await.unwrap();
+    let events = s.client.access_events(t, None, None, None, 100).await.unwrap();
     assert_eq!(
         events
             .iter()
@@ -560,8 +567,8 @@ async fn owner_is_never_stored() {
     ));
     assert!(s.client.member_projects(m.id).await.unwrap().is_empty());
     assert_eq!(
-        s.client.grant_rows(m.id, p, Some(d)).await.unwrap(),
-        GrantRows::default()
+        s.client.grant_sources(m.id, p, Some(d)).await.unwrap(),
+        GrantSources::default()
     );
     assert!(s.client.member_by_zitadel(t, "zi").await.unwrap().is_none());
     assert_eq!(s.event_count(t).await, before);
@@ -640,7 +647,7 @@ async fn invited_becomes_active_on_ensure() {
     assert!(!active.tenant_admin);
     assert!(s.client.invite(invite).await.unwrap().unwrap().3.is_some());
     assert_eq!(s.client.member_projects(m.id).await.unwrap(), vec![(p, g)]);
-    let accepted = &s.client.access_events(t, None, None, 1).await.unwrap()[0];
+    let accepted = &s.client.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(accepted.action, "invite_accepted");
     assert_eq!(accepted.actor_member_id, Some(m.id));
     assert_eq!(accepted.target_member_id, Some(m.id));
@@ -755,8 +762,8 @@ async fn grant_and_override_race_keeps_the_invariant() {
     assert!(matches!(refused, Err(AccessWriteError::Changed)), "{refused:?}");
     assert_eq!(s.event_count(t).await, events);
     assert_eq!(
-        s.client.grant_rows(m.id, p, None).await.unwrap().project,
-        Some(grant(PlatformRole::Admin, &["plain"]))
+        s.client.member_projects(m.id).await.unwrap(),
+        vec![(p, grant(PlatformRole::Admin, &["plain"]))]
     );
     // A current one goes through.
     let now = observe().await;
@@ -794,9 +801,11 @@ async fn grant_and_override_race_keeps_the_invariant() {
             "round {round}: the loser is told the access changed: {g:?} {o:?}"
         );
         // The state is never the pair neither check allowed: grant with `boss` and the override.
-        let rows = s.client.grant_rows(m.id, p, Some(d)).await.unwrap();
-        let has_boss = rows.project.as_ref().is_some_and(|g| g.pg_roles.contains(&"boss".to_string()));
-        assert!(!(has_boss && rows.database.is_some()), "round {round}: {rows:?}");
+        let grants = s.client.member_projects(m.id).await.unwrap();
+        let overrides = s.client.member_overrides(m.id).await.unwrap();
+        let has_boss = grants.iter().any(|(gp, g)| *gp == p && g.pg_roles.contains(&"boss".to_string()));
+        let has_override = overrides.iter().any(|(_, od, _)| *od == d);
+        assert!(!(has_boss && has_override), "round {round}: {grants:?} {overrides:?}");
     }
     s.finish().await;
 }
@@ -832,7 +841,7 @@ async fn removed_stays_removed() {
         .unwrap();
     assert_eq!(s.client.remove_member(a.id, m.id).await.unwrap(), vec![p]);
     // The event keeps the access that was deleted, overrides included.
-    let removed = &s.client.access_events(t, None, None, 1).await.unwrap()[0];
+    let removed = &s.client.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(removed.action, "member_removed");
     let before = removed.before.as_ref().unwrap();
     assert_eq!(
@@ -845,8 +854,8 @@ async fn removed_stays_removed() {
     );
     assert!(s.client.member_projects(m.id).await.unwrap().is_empty());
     assert_eq!(
-        s.client.grant_rows(m.id, p, Some(d)).await.unwrap(),
-        GrantRows::default()
+        s.client.grant_sources(m.id, p, Some(d)).await.unwrap(),
+        GrantSources::default()
     );
 
     let events = s.event_count(t).await;
@@ -992,18 +1001,16 @@ async fn override_unique_per_member_and_database() {
         .await
         .unwrap();
     assert_eq!(
-        s.client.grant_rows(m.id, p, Some(d)).await.unwrap(),
-        GrantRows {
-            project: Some(grant(PlatformRole::Developer, &["a", "b"])),
-            database: Some(OverrideRow {
-                platform_role: None,
-                pg_roles: Some(vec!["a".into(), "b".into()])
-            }),
-        }
+        s.client.grant_sources(m.id, p, Some(d)).await.unwrap(),
+        GrantSources::new(
+            Some(grant(PlatformRole::Developer, &["a", "b"]).to_grant()),
+            Vec::new(),
+            Some(OverrideRow { platform_role: None, pg_roles: Some(vec!["a".into(), "b".into()]) }.to_narrowing()),
+        )
     );
     assert_eq!(
-        s.client.grant_rows(m.id, p, None).await.unwrap().database,
-        None
+        s.client.grant_sources(m.id, p, None).await.unwrap(),
+        GrantSources::new(Some(grant(PlatformRole::Developer, &["a", "b"]).to_grant()), Vec::new(), None)
     );
     s.client.delete_override(a.id, m.id, d).await.unwrap();
     assert_eq!(count().await, 0);
@@ -1077,7 +1084,7 @@ async fn every_write_logs_one_event() {
         "grant_put",
         c.put_project_grant(a.id, m.id, p, &g).await.unwrap()
     );
-    let put = &c.access_events(t, None, None, 1).await.unwrap()[0];
+    let put = &c.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(put.before, None);
     assert_eq!(
         put.after,
@@ -1095,7 +1102,7 @@ async fn every_write_logs_one_event() {
         "override_put",
         c.put_override(a.id, m.id, d, &o).await.unwrap()
     );
-    let put = &c.access_events(t, None, None, 1).await.unwrap()[0];
+    let put = &c.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!((put.project_id, put.database_id), (Some(p), Some(d)));
     one_event!(
         "override_deleted",
@@ -1166,7 +1173,7 @@ async fn every_write_logs_one_event() {
         (MemberStatus::Active, true, Some("boot@x.com"))
     );
     assert_eq!(
-        c.access_events(t, None, None, 1).await.unwrap()[0].actor_member_id,
+        c.access_events(t, None, None, None, 1).await.unwrap()[0].actor_member_id,
         None
     );
     // A repeated bootstrap writes nothing at all (M4): the row isn't even touched.
@@ -1187,15 +1194,15 @@ async fn every_write_logs_one_event() {
     assert_eq!(stamp().await, touched_at);
 
     // Newest first, paged by id, filtered by project.
-    let all = c.access_events(t, None, None, 100).await.unwrap();
+    let all = c.access_events(t, None, None, None, 100).await.unwrap();
     assert_eq!(all.len() as i64, n);
     assert!(all.windows(2).all(|w| w[0].id > w[1].id));
-    let page = c.access_events(t, None, Some(all[2].id), 2).await.unwrap();
+    let page = c.access_events(t, None, None, Some(all[2].id), 2).await.unwrap();
     assert_eq!(
         page.iter().map(|e| e.id).collect::<Vec<_>>(),
         vec![all[3].id, all[4].id]
     );
-    let in_project = c.access_events(t, Some(p), None, 100).await.unwrap();
+    let in_project = c.access_events(t, Some(p), None, None, 100).await.unwrap();
     // An event is in the project when it names it, or when the grants it records (an invite
     // revoked, a member removed: no single project) include it.
     let grants_name = |v: &Option<serde_json::Value>| {
@@ -1314,17 +1321,20 @@ async fn reconciler_reads_grants_branches_and_forgets_rows() {
     // An override without a project grant is still read (it grants nothing on its own).
     s.client.put_override(a.id, o.id, d1, &narrow).await.unwrap();
 
-    let rows = s.client.database_grant_rows(p, d1).await.unwrap();
+    let rows = s.client.database_grant_sources(p, d1).await.unwrap();
     let members: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
     let mut expected = vec![m.id, o.id];
     expected.sort();
     assert_eq!(members, expected, "members with a grant or an override, by id");
-    for (id, levels) in &rows {
-        assert_eq!(*levels, s.client.grant_rows(*id, p, Some(d1)).await.unwrap());
+    for (id, sources) in &rows {
+        assert_eq!(*sources, s.client.grant_sources(*id, p, Some(d1)).await.unwrap());
     }
-    let on_d2 = s.client.database_grant_rows(p, d2).await.unwrap();
+    // The override alone gives no access (MH-2: never a default level).
+    let lonely = rows.iter().find(|(id, _)| *id == o.id).unwrap();
+    assert_eq!(lonely.1.effective(), None);
+    let on_d2 = s.client.database_grant_sources(p, d2).await.unwrap();
     assert_eq!(on_d2.len(), 1, "only the project grant reaches d2");
-    assert_eq!(on_d2[0].1.database, None);
+    assert_eq!(on_d2[0].1, GrantSources::new(Some(dev(&["r1", "r2"]).to_grant()), Vec::new(), None));
 
     // The sweep visits ready normal branches of tenants with an active member.
     assert!(!s.client.member_role_branches().await.unwrap().contains(&d1), "pending");
@@ -1458,7 +1468,7 @@ async fn refresh_takes_email_from_stale_holder() {
     // Only C's join and I's acceptance were logged.
     let actions: Vec<String> = s
         .client
-        .access_events(t, None, None, 100)
+        .access_events(t, None, None, None, 100)
         .await
         .unwrap()
         .into_iter()
@@ -1614,8 +1624,8 @@ async fn tenant_isolation_is_not_found() {
     assert!(s.client.member_by_zitadel(t, "zx").await.unwrap().is_none());
     assert!(s.client.member_projects(m.id).await.unwrap().is_empty());
     assert_eq!(
-        s.client.grant_rows(m.id, p2, Some(d2)).await.unwrap(),
-        GrantRows::default()
+        s.client.grant_sources(m.id, p2, Some(d2)).await.unwrap(),
+        GrantSources::default()
     );
     assert_eq!(s.event_count(t).await, events);
     assert_eq!(s.event_count(other).await, 0);
@@ -1646,7 +1656,7 @@ async fn bootstrap_activates_an_invited_member() {
     );
     assert!(boot.accepted_at.is_some());
     assert!(s.client.invite(invite).await.unwrap().unwrap().3.is_some());
-    let event = &s.client.access_events(t, None, None, 1).await.unwrap()[0];
+    let event = &s.client.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(
         (event.action.as_str(), event.actor_member_id),
         ("admin_set", None)
@@ -1708,7 +1718,7 @@ async fn concurrent_first_puts_log_one_event() {
             result.unwrap();
         }
         assert_eq!(s.event_count(t).await, events + 1, "{kind}");
-        let event = &s.client.access_events(t, None, None, 1).await.unwrap()[0];
+        let event = &s.client.access_events(t, None, None, None, 1).await.unwrap()[0];
         assert_eq!(event.before, None, "{kind}: the one event is the first put");
     }
     s.finish().await;
@@ -1914,7 +1924,7 @@ async fn project_events_include_listed_grants() {
     c.create_invited_member(a.id, t, new_invite("z1", "one@x.com", &[(p, g.clone())]))
         .await
         .unwrap();
-    let single = &c.access_events(t, None, None, 1).await.unwrap()[0];
+    let single = &c.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!((single.action.as_str(), single.project_id), ("invite_created", Some(p)));
     c.create_invited_member(a.id, t, new_invite("z2", "two@x.com", &[(p, g.clone()), (p2, g.clone())]))
         .await
@@ -1929,11 +1939,11 @@ async fn project_events_include_listed_grants() {
         events.into_iter().map(|e| e.action).collect()
     };
     assert_eq!(
-        actions(c.access_events(t, Some(p), None, 50).await.unwrap()),
+        actions(c.access_events(t, Some(p), None, None, 50).await.unwrap()),
         vec!["member_removed", "grant_put", "invite_created", "invite_created"]
     );
     assert_eq!(
-        actions(c.access_events(t, Some(p2), None, 50).await.unwrap()),
+        actions(c.access_events(t, Some(p2), None, None, 50).await.unwrap()),
         vec!["member_removed", "member_added", "invite_created"]
     );
     s.finish().await;
@@ -1954,13 +1964,13 @@ async fn access_events_join_names() {
         .create_invited_member(a.id, t, new_invite("zm", "m@x.com", &[]))
         .await
         .unwrap();
-    let ev = &c.access_events(t, None, None, 1).await.unwrap()[0];
+    let ev = &c.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(ev.actor_email.as_deref(), Some("a@x.com"));
     assert_eq!(ev.target_email.as_deref(), Some("m@x.com"));
     assert_eq!(ev.project_name, None, "an event with no project has no project name");
 
     c.put_project_grant(a.id, m.id, p, &grant(PlatformRole::Viewer, &[])).await.unwrap();
-    let ev = &c.access_events(t, None, None, 1).await.unwrap()[0];
+    let ev = &c.access_events(t, None, None, None, 1).await.unwrap()[0];
     assert_eq!(ev.action, "grant_put");
     assert_eq!(ev.project_name.as_deref(), Some(format!("p-{p}").as_str()));
 
@@ -1972,7 +1982,7 @@ async fn access_events_join_names() {
         .execute(c.pool())
         .await
         .unwrap();
-    let all = c.access_events(t, None, None, 50).await.unwrap();
+    let all = c.access_events(t, None, None, None, 50).await.unwrap();
     let put = all.iter().find(|e| e.action == "grant_put").unwrap();
     assert_eq!(put.target_email.as_deref(), Some("m@x.com"));
     assert_eq!(put.project_name.as_deref(), Some(format!("p-{p}").as_str()));
@@ -1986,7 +1996,7 @@ async fn access_events_join_names() {
         .execute(c.pool())
         .await
         .unwrap();
-    let all = c.access_events(t, Some(p), None, 50).await.unwrap();
+    let all = c.access_events(t, Some(p), None, None, 50).await.unwrap();
     let put = all.iter().find(|e| e.action == "grant_put").unwrap();
     assert_eq!((put.project_id, put.project_name.as_deref()), (Some(p), None));
     s.finish().await;
@@ -2097,7 +2107,7 @@ async fn tenant_display_name_round_trip() {
     let d = c.open_invite_for_user("zi").await.unwrap().unwrap();
     assert_eq!((d.tenant_slug, d.tenant_display_name), (format!("t-{}", t.as_uuid()), None));
     let events: Vec<_> = c
-        .access_events(t, None, None, 50)
+        .access_events(t, None, None, None, 50)
         .await
         .unwrap()
         .into_iter()
@@ -2132,7 +2142,7 @@ async fn pending_member_lifecycle() {
     let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     assert!(a.tenant_admin);
     let actions = |t: TenantId| async move {
-        c.access_events(t, None, None, 100).await.unwrap().into_iter().rev().map(|e| e.action).collect::<Vec<_>>()
+        c.access_events(t, None, None, None, 100).await.unwrap().into_iter().rev().map(|e| e.action).collect::<Vec<_>>()
     };
 
     // Closed: no row, no event. Pending: a pending row and a `member_joined` event.
@@ -2163,10 +2173,10 @@ async fn pending_member_lifecycle() {
     assert_eq!(listing.member.status, MemberStatus::Active);
     assert!(listing.has_access);
     assert_eq!(s.event_count(t).await, events + 1);
-    let last = c.access_events(t, None, None, 1).await.unwrap().remove(0);
+    let last = c.access_events(t, None, None, None, 1).await.unwrap().remove(0);
     assert_eq!((last.action.as_str(), last.project_id), ("member_approved", Some(p)));
     assert_eq!(
-        c.grant_rows(b.id, p, None).await.unwrap().project.map(|g| g.platform_role),
+        c.grant_sources(b.id, p, None).await.unwrap().effective().map(|e| e.platform_role),
         Some(PlatformRole::Developer)
     );
     assert!(matches!(c.approve_member(a.id, b.id, &[]).await, Err(AccessWriteError::Conflict(_))));
@@ -2480,5 +2490,2032 @@ async fn member_status_write_matrix() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+    s.finish().await;
+}
+
+// ---- Members hub step 1 (T3): personal logins, suspension, revocation and the log ----------
+//
+// Spec Part 6 (`docs/superpowers/specs/2026-10-23-members-hub-design.md`), plan T3 and its seam
+// rulings (S1, S2, S6, S7, S10, S12, S18). Each test runs on its own scratch database.
+
+/// Two SCRAM verifiers as the proxy stores them (the metadata never checks their shape).
+const V1: &str = "SCRAM-SHA-256$4096:c2FsdDE=$c3RvcmVkMQ==:c2VydmVyMQ==";
+const V2: &str = "SCRAM-SHA-256$4096:c2FsdDI=$c3RvcmVkMg==:c2VydmVyMg==";
+
+fn in_days(n: i64) -> chrono::DateTime<Utc> {
+    Utc::now() + Duration::days(n)
+}
+
+/// A tenant with its first (claiming) tenant admin, one project and a ready database whose main
+/// branch has an endpoint.
+struct Hub {
+    t: TenantId,
+    admin: Uuid,
+    p: Uuid,
+    db: Uuid,
+    /// Main's endpoint.
+    ep: String,
+}
+
+impl Scratch {
+    /// A member row in any status (status writes are under test elsewhere).
+    async fn member_row(&self, t: TenantId, zid: &str, status: &str, tenant_admin: bool) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, tenant_admin)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id)
+        .bind(t.as_uuid())
+        .bind(zid)
+        .bind(format!("{zid}@x.com"))
+        .bind(status)
+        .bind(tenant_admin)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Makes a pending database ready with an endpoint on main; returns the endpoint.
+    async fn ready(&self, db: Uuid) -> String {
+        let ep = self.link(BranchId(db)).await;
+        self.client.set_status(DatabaseId(db), DatabaseStatus::Provisioning).await.unwrap();
+        assert!(self.client.set_branch_ready(BranchId(db), "v1:owner", None, None).await.unwrap());
+        ep
+    }
+
+    /// A new endpoint (owner `postgres`) linked to `branch`.
+    async fn link(&self, branch: BranchId) -> String {
+        let ep = format!("ep-{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let tenant = Uuid::new_v4().simple().to_string();
+        let timeline = Uuid::new_v4().simple().to_string();
+        let new = NewEndpoint {
+            id: &ep,
+            tenant_id: &tenant,
+            timeline_id: &timeline,
+            compute_token_sha256: "cd",
+            owner_role: "postgres",
+            owner_verifier: "SCRAM-SHA-256$owner",
+            database_name: "db",
+            role_copies: &[],
+            routable: true,
+            static_lsn: None,
+        };
+        assert!(self.client.create_endpoint_for_branch(branch, &timeline, &new, false).await.unwrap());
+        ep
+    }
+
+    /// A ready child of `db`'s main with its own endpoint: `(branch, endpoint)`.
+    async fn child(&self, db: Uuid, name: &str) -> (Uuid, String) {
+        let b = NewBranch {
+            id: BranchId::new(),
+            database_id: DatabaseId(db),
+            name,
+            parent_branch_id: BranchId(db),
+            branched_at_time: None,
+            branched_at_lsn: None,
+        };
+        assert_eq!(self.client.create_branch(&b).await.unwrap(), CreateBranchOutcome::Created);
+        let ep = self.link(b.id).await;
+        assert!(self
+            .client
+            .set_branch_status(b.id, &[BranchStatus::Pending], BranchStatus::Provisioning)
+            .await
+            .unwrap());
+        assert!(self.client.set_branch_ready(b.id, "v1:branch", Some("0/1A2B3C"), None).await.unwrap());
+        (b.id.as_uuid(), ep)
+    }
+
+    /// A ready database in `p`: `(database, main's endpoint)`.
+    async fn ready_database(&self, t: TenantId, p: Uuid) -> (Uuid, String) {
+        let db = self.database(t, p).await;
+        let ep = self.ready(db).await;
+        (db, ep)
+    }
+
+    async fn hub(&self) -> Hub {
+        let t = self.tenant().await;
+        let admin = self
+            .client
+            .ensure_member(t, "admin", "admin@x.com", "Admin", Admission::Active)
+            .await
+            .unwrap();
+        assert!(admin.tenant_admin, "the first member claims the tenant");
+        let p = self.project(t).await;
+        let (db, ep) = self.ready_database(t, p).await;
+        Hub { t, admin: admin.id, p, db, ep }
+    }
+
+    /// An active member (Zitadel user and display name `zid`, email `<zid>@x.com`).
+    async fn active(&self, h: &Hub, zid: &str) -> Uuid {
+        self.client
+            .ensure_member(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// An active member with `role` on the hub's project.
+    async fn granted(&self, h: &Hub, zid: &str, role: PlatformRole) -> Uuid {
+        let id = self.active(h, zid).await;
+        self.client.put_project_grant(h.admin, id, h.p, &grant(role, &[])).await.unwrap();
+        id
+    }
+
+    /// `member`'s login `name` on `db` with [`V1`], valid 90 days.
+    async fn login(&self, member: Uuid, db: Uuid, name: &str) -> PersonalLogin {
+        self.client
+            .create_personal_login(member, db, name, V1, in_days(90))
+            .await
+            .unwrap_or_else(|e| panic!("create {name}: {e:?}"))
+    }
+
+    /// The personal `neon_roles` rows named `name`: `(endpoint, verifier)` by endpoint.
+    async fn personal_rows(&self, name: &str) -> Vec<(String, Option<String>)> {
+        sqlx::query_as(
+            "SELECT endpoint_id, scram_verifier FROM neon_roles
+             WHERE name = $1 AND origin = 'personal' ORDER BY endpoint_id",
+        )
+        .bind(name)
+        .fetch_all(self.client.pool())
+        .await
+        .unwrap()
+    }
+
+    /// The stored verifier of `member`'s record on `db` (`None` when revoked); panics without one.
+    async fn record_verifier(&self, member: Uuid, db: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT scram_verifier FROM personal_logins WHERE member_id = $1 AND database_id = $2")
+            .bind(member)
+            .bind(db)
+            .fetch_one(self.client.pool())
+            .await
+            .unwrap()
+    }
+
+    /// Every event of the tenant, oldest first.
+    async fn events(&self, t: TenantId) -> Vec<AccessEvent> {
+        let mut all = self.client.access_events(t, None, None, None, 1000).await.unwrap();
+        all.reverse();
+        all
+    }
+
+    async fn events_of(&self, t: TenantId, action: &str) -> Vec<AccessEvent> {
+        self.events(t).await.into_iter().filter(|e| e.action == action).collect()
+    }
+
+    /// The SQL predicate (P2) for `member` on `db`.
+    async fn sql_qualifies(&self, member: Uuid, db: Uuid) -> bool {
+        sqlx::query_scalar("SELECT chelabase_personal_login_qualifies($1, $2)")
+            .bind(member)
+            .bind(db)
+            .fetch_one(self.client.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn status_of(&self, member: Uuid) -> MemberStatus {
+        self.client.member(member).await.unwrap().unwrap().status
+    }
+}
+
+fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort();
+    v
+}
+
+fn endpoint(branch: Uuid, ep: &str, role: &str) -> LoginEndpoint {
+    LoginEndpoint { branch_id: branch, endpoint_id: ep.to_string(), role_name: role.to_string() }
+}
+
+/// The newest event's id (0 without one).
+async fn last_event_id(s: &Scratch, t: TenantId) -> i64 {
+    s.events(t).await.last().map_or(0, |e| e.id)
+}
+
+/// The actions logged after event `since`, oldest first.
+async fn actions_since(s: &Scratch, t: TenantId, since: i64) -> Vec<String> {
+    s.events(t).await.into_iter().filter(|e| e.id > since).map(|e| e.action).collect()
+}
+
+/// The logins of `member`, by database.
+async fn logins_of(s: &Scratch, member: Uuid) -> Vec<PersonalLogin> {
+    let mut all = s.client.member_personal_logins(member).await.unwrap();
+    all.sort_by_key(|l| l.database_id);
+    all
+}
+
+// P2 / S20: the SQL level function and its predicate agree with `access::qualifies` over
+// `GrantSources::effective()` (a tenant admin judged with `tenant_admin_effective()`, as
+// `authorize` does) on every small state: status × tenant admin × grant level × override.
+// A deleted database never qualifies, nor does another tenant's member.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_level_function_agrees_with_qualifies_exhaustively() {
+    #[derive(Clone, Copy, Debug)]
+    enum Ov {
+        None,
+        Level(PlatformRole),
+        /// Roles only: no level cap.
+        RolesOnly,
+    }
+    const STATUSES: [&str; 5] = ["invited", "pending", "active", "suspended", "removed"];
+    let levels = [None, Some(PlatformRole::Viewer), Some(PlatformRole::Developer), Some(PlatformRole::Admin)];
+    let overrides = [
+        Ov::None,
+        Ov::Level(PlatformRole::Viewer),
+        Ov::Level(PlatformRole::Developer),
+        Ov::Level(PlatformRole::Admin),
+        Ov::RolesOnly,
+    ];
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let p = s.project(t).await;
+    let db = s.database(t, p).await;
+    let gone = s.database(t, p).await;
+    sqlx::query("UPDATE databases SET status = 'deleted', deleted_at = now() WHERE id = $1")
+        .bind(gone)
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    let pool = s.client.pool();
+    let mut failures = Vec::new();
+    let mut n = 0;
+    for status in STATUSES {
+        for tenant_admin in [false, true] {
+            for g in levels {
+                for o in overrides {
+                    n += 1;
+                    let id = s.member_row(t, &format!("z{n}"), status, tenant_admin).await;
+                    let grant_row = g.map(|g| GrantRow::new(g, &["app".to_string()]));
+                    if let Some(row) = &grant_row {
+                        sqlx::query(
+                            "INSERT INTO project_grants (member_id, project_id, platform_role, pg_roles)
+                             VALUES ($1, $2, $3, $4)",
+                        )
+                        .bind(id)
+                        .bind(p)
+                        .bind(row.platform_role.as_str())
+                        .bind(&row.pg_roles)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    }
+                    let override_row = match o {
+                        Ov::None => None,
+                        Ov::Level(l) => Some(OverrideRow { platform_role: Some(l), pg_roles: None }),
+                        Ov::RolesOnly => Some(OverrideRow { platform_role: None, pg_roles: Some(vec!["app".into()]) }),
+                    };
+                    for target in [db, gone] {
+                        if let Some(row) = &override_row {
+                            sqlx::query(
+                                "INSERT INTO database_grant_overrides (member_id, database_id, platform_role, pg_roles)
+                                 VALUES ($1, $2, $3, $4)",
+                            )
+                            .bind(id)
+                            .bind(target)
+                            .bind(row.platform_role.map(|r| r.as_str()))
+                            .bind(&row.pg_roles)
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    let active = status == "active";
+                    let effective = if tenant_admin {
+                        Some(tenant_admin_effective())
+                    } else {
+                        GrantSources::new(
+                            grant_row.as_ref().map(GrantRow::to_grant),
+                            Vec::new(),
+                            override_row.as_ref().map(OverrideRow::to_narrowing),
+                        )
+                        .effective()
+                    };
+                    let want_q = qualifies(active, effective.as_ref());
+                    let want_level = if active { effective.map(|e| e.platform_role.as_str().to_string()) } else { None };
+                    let case = format!("{status} admin={tenant_admin} grant={g:?} override={o:?}");
+                    let (level, q): (Option<String>, bool) = sqlx::query_as(
+                        "SELECT chelabase_member_level($1, $2), chelabase_personal_login_qualifies($1, $2)",
+                    )
+                    .bind(id)
+                    .bind(db)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("{case}: {e}"));
+                    if (level.as_deref(), q) != (want_level.as_deref(), want_q) {
+                        failures.push(format!("{case}: SQL ({level:?}, {q}), Rust ({want_level:?}, {want_q})"));
+                    }
+                    let (level, q): (Option<String>, bool) = sqlx::query_as(
+                        "SELECT chelabase_member_level($1, $2), chelabase_personal_login_qualifies($1, $2)",
+                    )
+                    .bind(id)
+                    .bind(gone)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+                    if level.is_some() || q {
+                        failures.push(format!("{case}: a deleted database answered ({level:?}, {q})"));
+                    }
+                }
+            }
+        }
+    }
+    // Another tenant's tenant admin reaches nothing here.
+    let other = s.tenant().await;
+    let stranger = s.member_row(other, "stranger", "active", true).await;
+    if s.sql_qualifies(stranger, db).await {
+        failures.push("another tenant's admin qualifies".into());
+    }
+    assert!(failures.is_empty(), "{} of {n} cases:\n{}", failures.len(), failures.join("\n"));
+    s.finish().await;
+}
+
+/// One write of the revocation model (P3); indexes pick among the pool of members.
+#[derive(Debug, Clone)]
+enum W {
+    /// Member, level (0 viewer, 1 developer, 2 admin).
+    PutGrant(u8, u8),
+    DeleteGrant(u8),
+    /// Member, database, level.
+    PutOverride(u8, u8, u8),
+    DeleteOverride(u8, u8),
+    SetAdmin(u8, bool),
+    Remove(u8),
+    Suspend(u8),
+    Reinstate(u8),
+    RevokeNow(u8),
+    /// A removed member invited again with a Developer grant, then signing in.
+    Reinvite(u8),
+    /// A new person signs up (pending) and is approved with a Developer grant.
+    Approve,
+    /// The member creates its login on a database (and the worker writes its proxy row).
+    Login(u8, u8),
+}
+
+fn w() -> impl Strategy<Value = W> {
+    let level = 0u8..3;
+    prop_oneof![
+        (any::<u8>(), level.clone()).prop_map(|(m, l)| W::PutGrant(m, l)),
+        any::<u8>().prop_map(W::DeleteGrant),
+        (any::<u8>(), 0u8..2, level).prop_map(|(m, d, l)| W::PutOverride(m, d, l)),
+        (any::<u8>(), 0u8..2).prop_map(|(m, d)| W::DeleteOverride(m, d)),
+        (any::<u8>(), any::<bool>()).prop_map(|(m, b)| W::SetAdmin(m, b)),
+        any::<u8>().prop_map(W::Remove),
+        any::<u8>().prop_map(W::Suspend),
+        any::<u8>().prop_map(W::Reinstate),
+        any::<u8>().prop_map(W::RevokeNow),
+        any::<u8>().prop_map(W::Reinvite),
+        Just(W::Approve),
+        (any::<u8>(), 0u8..2).prop_map(|(m, d)| W::Login(m, d)),
+        (any::<u8>(), 0u8..2).prop_map(|(m, d)| W::Login(m, d)),
+    ]
+}
+
+fn level_of(l: u8) -> PlatformRole {
+    [PlatformRole::Viewer, PlatformRole::Developer, PlatformRole::Admin][l as usize % 3]
+}
+
+/// The invariant after every write (P3, MH-9): no live login of a member who doesn't qualify
+/// (judged in Rust from the stored grant, override, status and tenant-admin flag), no verifier
+/// on any proxy row of a revoked login, and no revoked login live again (reinstate and
+/// re-grants never bring one back).
+async fn check_logins(
+    s: &Scratch,
+    t: TenantId,
+    revoked_seen: &mut std::collections::BTreeSet<(Uuid, Uuid, chrono::DateTime<Utc>)>,
+) -> Result<(), String> {
+    use sqlx::Row;
+    let rows = sqlx::query(
+        "SELECT pl.member_id, pl.database_id, pl.created_at, pl.revoked_at IS NULL AS live,
+                m.status, m.tenant_admin, g.platform_role AS g_role, g.pg_roles AS g_roles,
+                o.member_id IS NOT NULL AS o_found, o.platform_role AS o_role, o.pg_roles AS o_roles
+         FROM personal_logins pl
+         JOIN members m ON m.id = pl.member_id
+         JOIN databases d ON d.id = pl.database_id
+         LEFT JOIN project_grants g ON g.member_id = pl.member_id AND g.project_id = d.project_id
+         LEFT JOIN database_grant_overrides o ON o.member_id = pl.member_id AND o.database_id = pl.database_id
+         WHERE m.tenant_id = $1",
+    )
+    .bind(t.as_uuid())
+    .fetch_all(s.client.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+    for r in rows {
+        let member: Uuid = r.get("member_id");
+        let database: Uuid = r.get("database_id");
+        let created: chrono::DateTime<Utc> = r.get("created_at");
+        let live: bool = r.get("live");
+        let status: String = r.get("status");
+        let tenant_admin: bool = r.get("tenant_admin");
+        let own = r.get::<Option<String>, _>("g_role").map(|role| {
+            GrantRow { platform_role: PlatformRole::parse(&role).unwrap(), pg_roles: r.get("g_roles") }.to_grant()
+        });
+        let narrowing = r.get::<bool, _>("o_found").then(|| {
+            OverrideRow {
+                platform_role: r.get::<Option<String>, _>("o_role").map(|x| PlatformRole::parse(&x).unwrap()),
+                pg_roles: r.get("o_roles"),
+            }
+            .to_narrowing()
+        });
+        let effective = if tenant_admin {
+            Some(tenant_admin_effective())
+        } else {
+            GrantSources::new(own, Vec::new(), narrowing).effective()
+        };
+        let q = qualifies(status == "active", effective.as_ref());
+        if live && !q {
+            return Err(format!("a live login of {member} on {database} ({status}, admin={tenant_admin}) doesn't qualify"));
+        }
+        if live && revoked_seen.contains(&(member, database, created)) {
+            return Err(format!("a revoked login of {member} on {database} is live again"));
+        }
+        if !live {
+            revoked_seen.insert((member, database, created));
+        }
+    }
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM neon_roles r
+         JOIN personal_logins pl ON pl.member_id = r.member_id AND pl.database_id = r.personal_database_id
+                                AND pl.role_name = r.name
+         JOIN members m ON m.id = pl.member_id
+         WHERE m.tenant_id = $1 AND pl.revoked_at IS NOT NULL AND r.scram_verifier IS NOT NULL",
+    )
+    .bind(t.as_uuid())
+    .fetch_one(s.client.pool())
+    .await
+    .map_err(|e| e.to_string())?;
+    if leaked != 0 {
+        return Err(format!("{leaked} proxy row(s) of revoked logins keep a verifier"));
+    }
+    Ok(())
+}
+
+/// Runs one generated history on a fresh tenant: three active Developers with a login on each
+/// of two databases, then the writes in order, checking [`check_logins`] after each.
+async fn run_revocation_model(s: &Scratch, steps: Vec<W>) -> Result<(), String> {
+    let h = s.hub().await;
+    let (db2, ep2) = s.ready_database(h.t, h.p).await;
+    let dbs = [(h.db, h.ep.clone()), (db2, ep2)];
+    let c = &s.client;
+    let mut pool: Vec<(Uuid, String)> = Vec::new();
+    let mut names = 0u32;
+    let login = |member: Uuid, d: usize, n: u32| {
+        let (db, ep) = dbs[d].clone();
+        async move {
+            let name = format!("l{n}");
+            match c.create_personal_login(member, db, &name, V1, in_days(90)).await {
+                Ok(_) => c
+                    .upsert_personal_role_row(&ep, member, db, &name, V1)
+                    .await
+                    .map_err(|e| format!("upsert {name}: {e}")),
+                Err(LoginWriteError::NotQualified | LoginWriteError::Exists) => Ok(()),
+                Err(e) => Err(format!("create {name}: {e:?}")),
+            }
+        }
+    };
+    for i in 0..3 {
+        let zid = format!("m{i}-{}", Uuid::new_v4().simple());
+        let id = s.granted(&h, &zid, PlatformRole::Developer).await;
+        pool.push((id, zid));
+        for d in 0..2 {
+            names += 1;
+            login(id, d, names).await?;
+        }
+    }
+    let mut revoked_seen = std::collections::BTreeSet::new();
+    check_logins(s, h.t, &mut revoked_seen).await.map_err(|e| format!("setup: {e}"))?;
+    for (n, step) in steps.into_iter().enumerate() {
+        let pick = |i: u8| pool[i as usize % pool.len()].clone();
+        let result: Result<(), AccessWriteError> = match step.clone() {
+            W::PutGrant(i, l) => c.put_project_grant(h.admin, pick(i).0, h.p, &grant(level_of(l), &[])).await.map(|_| ()),
+            W::DeleteGrant(i) => c.delete_project_grant(h.admin, pick(i).0, h.p).await,
+            W::PutOverride(i, d, l) => {
+                let o = OverrideRow { platform_role: Some(level_of(l)), pg_roles: None };
+                c.put_override(h.admin, pick(i).0, dbs[d as usize].0, &o).await.map(|_| ())
+            }
+            W::DeleteOverride(i, d) => c.delete_override(h.admin, pick(i).0, dbs[d as usize].0).await,
+            W::SetAdmin(i, on) => c.set_tenant_admin(Some(h.admin), pick(i).0, on).await,
+            W::Remove(i) => c.remove_member(h.admin, pick(i).0).await.map(|_| ()),
+            W::Suspend(i) => c.suspend_member(h.admin, pick(i).0).await.map(|_| ()),
+            W::Reinstate(i) => c.reinstate_member(h.admin, pick(i).0).await,
+            W::RevokeNow(i) => c.revoke_postgres_access(h.admin, pick(i).0).await.map(|_| ()),
+            W::Reinvite(i) => {
+                let (_, zid) = pick(i);
+                let email = format!("{zid}@x.com");
+                let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
+                match c.create_invited_member(h.admin, h.t, new_invite(&zid, &email, &grants)).await {
+                    Ok(_) => c
+                        .ensure_member(h.t, &zid, &email, "n", Admission::Active)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| AccessWriteError::Conflict(format!("ensure_member: {e}"))),
+                    Err(e) => Err(e),
+                }
+            }
+            W::Approve => {
+                let zid = format!("a-{}", Uuid::new_v4().simple());
+                let email = format!("{zid}@x.com");
+                let m = c
+                    .ensure_member(h.t, &zid, &email, "n", Admission::Pending)
+                    .await
+                    .map_err(|e| format!("step {n}: sign-up: {e}"))?;
+                let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
+                let approved = c.approve_member(h.admin, m.id, &grants).await.map(|_| ());
+                pool.push((m.id, zid));
+                approved
+            }
+            W::Login(i, d) => {
+                names += 1;
+                login(pick(i).0, d as usize, names).await.map_err(|e| format!("step {n}: {e}"))?;
+                Ok(())
+            }
+        };
+        match result {
+            Ok(())
+            | Err(AccessWriteError::Conflict(_))
+            | Err(AccessWriteError::NotFound)
+            | Err(AccessWriteError::MemberNotFound)
+            | Err(AccessWriteError::LastTenantAdmin) => {}
+            Err(e) => return Err(format!("step {n} {step:?}: {e:?}")),
+        }
+        check_logins(s, h.t, &mut revoked_seen)
+            .await
+            .map_err(|e| format!("after step {n} {step:?}: {e}"))?;
+    }
+    Ok(())
+}
+
+// P3 (invariant): whatever sequence of access writes runs (grant and override puts and
+// deletes, tenant admin set and cleared, remove, suspend, reinstate, revoke-now, invites with
+// grants, approvals, new logins), no live login of a non-qualifying member survives any write,
+// and no proxy row of a revoked login holds a verifier.
+#[test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+fn every_access_write_revokes_unqualified_logins() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let s = rt.block_on(Scratch::new());
+    let mut runner = TestRunner::new(Config {
+        cases: 48,
+        failure_persistence: None,
+        ..Config::default()
+    });
+    let steps = prop::collection::vec(w(), 1..14);
+    let result = runner.run(&steps, |steps| {
+        rt.block_on(run_revocation_model(&s, steps)).map_err(TestCaseError::fail)
+    });
+    rt.block_on(s.finish());
+    result.unwrap();
+}
+
+// D3: the name is unique across every branch of the database and against every login of it,
+// revoked ones included; another database's roles don't count; a refusal writes nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn create_refuses_a_name_taken_on_any_branch_or_by_another_login() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'app_role', 'x', 'sql')")
+        .bind(&child_ep)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    let carol = s.granted(&h, "carol", PlatformRole::Developer).await;
+    // A role on a child branch only, and the owner on main.
+    let on_child = c.create_personal_login(alice, h.db, "app_role", V1, in_days(90)).await;
+    assert!(matches!(on_child, Err(LoginWriteError::NameTaken)), "{on_child:?}");
+    let owner = c.create_personal_login(alice, h.db, "postgres", V1, in_days(90)).await;
+    assert!(matches!(owner, Err(LoginWriteError::NameTaken)), "{owner:?}");
+    // Another member's login.
+    s.login(bob, h.db, "bob_login").await;
+    let theirs = c.create_personal_login(alice, h.db, "bob_login", V1, in_days(90)).await;
+    assert!(matches!(theirs, Err(LoginWriteError::NameTaken)), "{theirs:?}");
+    // A revoked login still holds its name.
+    c.revoke_postgres_access(h.admin, bob).await.unwrap();
+    let revoked = c.create_personal_login(carol, h.db, "bob_login", V1, in_days(90)).await;
+    assert!(matches!(revoked, Err(LoginWriteError::NameTaken)), "{revoked:?}");
+    let none: i64 = sqlx::query_scalar("SELECT count(*) FROM personal_logins WHERE member_id = ANY($1)")
+        .bind(vec![alice, carol])
+        .fetch_one(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(none, 0, "a refused create writes nothing");
+    // Another database's roles don't count.
+    let (_db2, ep2) = s.ready_database(h.t, h.p).await;
+    sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'elsewhere', 'x', 'sql')")
+        .bind(&ep2)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let made = s.login(alice, h.db, "elsewhere").await;
+    assert_eq!((made.role_name.as_str(), made.status, made.database_id), ("elsewhere", LoginStatus::Active, h.db));
+    assert_eq!(made.project_id, h.p);
+    assert!(c.is_personal_login_name(h.db, "elsewhere").await.unwrap());
+    s.finish().await;
+}
+
+// P6 / S10: a live login refuses a second create (`Exists`, whatever the name); a revoked or
+// expired one is replaced (DELETE + INSERT), the same name included while the revoked login's
+// proxy rows remain: they go with it.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn create_replaces_a_revoked_record_and_refuses_a_live_one() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let first = s.login(alice, h.db, "alice").await;
+    assert_eq!((first.status, first.revoked_at, first.revoked_reason), (LoginStatus::Active, None, None));
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    for name in ["alice", "alice2"] {
+        let again = c.create_personal_login(alice, h.db, name, V2, in_days(90)).await;
+        assert!(matches!(again, Err(LoginWriteError::Exists)), "{name}: {again:?}");
+    }
+    assert_eq!(s.record_verifier(alice, h.db).await.as_deref(), Some(V1), "a refused create changes nothing");
+
+    c.revoke_postgres_access(h.admin, alice).await.unwrap();
+    assert_eq!(
+        s.personal_rows("alice").await,
+        sorted(vec![(h.ep.clone(), None), (child_ep.clone(), None)]),
+        "the revoked login's rows stay (no verifier) until the worker drops the role"
+    );
+    // S10: the same name, while those rows remain.
+    let replaced = c
+        .create_personal_login(alice, h.db, "alice", V2, in_days(90))
+        .await
+        .expect("a revoked login is replaced, its own rows don't block its name");
+    assert_eq!((replaced.status, replaced.revoked_at), (LoginStatus::Active, None));
+    assert_eq!(s.personal_rows("alice").await, vec![], "the old record's rows went with it");
+    assert_eq!(s.record_verifier(alice, h.db).await.as_deref(), Some(V2));
+
+    // An expired login is replaced too, under a new name.
+    sqlx::query("UPDATE personal_logins SET valid_until = now() - interval '1 second' WHERE member_id = $1")
+        .bind(alice)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let renamed = s.login(alice, h.db, "alice_new").await;
+    assert_eq!((renamed.role_name.as_str(), renamed.status), ("alice_new", LoginStatus::Active));
+    let records: i64 = sqlx::query_scalar("SELECT count(*) FROM personal_logins WHERE member_id = $1")
+        .bind(alice)
+        .fetch_one(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(records, 1, "one record per (member, database)");
+    assert!(!c.is_personal_login_name(h.db, "alice").await.unwrap(), "the old name is free again");
+    assert_eq!(s.events_of(h.t, "personal_login_created").await.len(), 3);
+    s.finish().await;
+}
+
+// P8: a reset replaces the record's verifier and every proxy row's at once, renews
+// `valid_until`, and returns where the rows are. No live login: `NotFound`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn reset_sets_every_proxy_row_to_the_new_verifier() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    let until = in_days(120);
+    let (login, eps) = c.reset_personal_login(alice, h.db, V2, until).await.unwrap();
+    assert!((login.valid_until - until).num_milliseconds().abs() < 1, "{} vs {until}", login.valid_until);
+    assert_eq!(login.status, LoginStatus::Active);
+    let want = sorted(vec![endpoint(h.db, &h.ep, "alice"), endpoint(child, &child_ep, "alice")]);
+    assert_eq!(sorted(eps), want);
+    assert_eq!(sorted(c.member_login_endpoints(alice).await.unwrap()), want);
+    assert_eq!(s.record_verifier(alice, h.db).await.as_deref(), Some(V2));
+    assert_eq!(
+        s.personal_rows("alice").await,
+        sorted(vec![(h.ep.clone(), Some(V2.to_string())), (child_ep.clone(), Some(V2.to_string()))])
+    );
+    assert_eq!(c.routable_role_secret(&child_ep, "alice").await.unwrap(), Some(Some(V2.to_string())));
+    // No login, or a revoked one: nothing to reset.
+    let missing = c.reset_personal_login(bob, h.db, V2, until).await;
+    assert!(matches!(missing, Err(LoginWriteError::NotFound)), "{missing:?}");
+    c.revoke_postgres_access(h.admin, alice).await.unwrap();
+    let revoked = c.reset_personal_login(alice, h.db, V1, until).await;
+    assert!(matches!(revoked, Err(LoginWriteError::NotFound)), "{revoked:?}");
+    assert_eq!(s.record_verifier(alice, h.db).await, None, "a reset never revives a revoked login");
+    assert_eq!(s.events_of(h.t, "personal_login_reset").await.len(), 1);
+    s.finish().await;
+}
+
+// A delete removes the record, its proxy rows go with it (FK cascade), and it returns where
+// they were, for the proxy cache. Deleting again is `NotFound`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn delete_cascades_the_proxy_rows_and_returns_their_endpoints() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    let eps = c.delete_personal_login(h.admin, alice, h.db).await.unwrap();
+    assert_eq!(sorted(eps), sorted(vec![endpoint(h.db, &h.ep, "alice"), endpoint(child, &child_ep, "alice")]));
+    assert_eq!(s.personal_rows("alice").await, vec![]);
+    assert_eq!(c.routable_role_secret(&h.ep, "alice").await.unwrap(), Some(None));
+    assert!(logins_of(&s, alice).await.is_empty());
+    assert!(!c.is_personal_login_name(h.db, "alice").await.unwrap());
+    let again = c.delete_personal_login(h.admin, alice, h.db).await;
+    assert!(matches!(again, Err(LoginWriteError::NotFound)), "{again:?}");
+    let deleted = s.events_of(h.t, "personal_login_deleted").await;
+    assert_eq!(deleted.len(), 1);
+    assert_eq!((deleted[0].actor_member_id, deleted[0].target_member_id), (Some(h.admin), Some(alice)));
+    s.finish().await;
+}
+
+// MH-9: the worker's row write stores a verifier only for a live record, in the same
+// statement: a revoked login never gets one back, on a branch it was on or a new one.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn revoked_record_never_gets_a_verifier_back() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    assert_eq!(s.personal_rows("alice").await, vec![(h.ep.clone(), Some(V1.to_string()))]);
+    c.revoke_postgres_access(h.admin, alice).await.unwrap();
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    for (ep, verifier) in s.personal_rows("alice").await {
+        assert_eq!(verifier, None, "{ep}: a revoked login's row got a verifier");
+    }
+    assert_eq!(s.record_verifier(alice, h.db).await, None);
+    assert_eq!(c.routable_role_secret(&child_ep, "alice").await.unwrap().flatten(), None);
+    s.finish().await;
+}
+
+/// Waits (10 s at most, no sleep) until `task` is finished or a session of the scratch database
+/// that isn't in `known` waits on a lock; returns every waiting session's pid. The interleavings
+/// below use it to know a statement has reached its lock (or needed none) before going on.
+async fn blocked_or_done<T>(s: &Scratch, known: &[i32], task: &tokio::task::JoinHandle<T>) -> Vec<i32> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: Vec<i32> = sqlx::query_scalar(
+            "SELECT pid FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock' ORDER BY pid",
+        )
+        .fetch_all(s.client.pool())
+        .await
+        .unwrap();
+        if task.is_finished() || waiting.iter().any(|pid| !known.contains(pid)) {
+            return waiting;
+        }
+        assert!(std::time::Instant::now() < deadline, "neither blocked nor done: {waiting:?}");
+        tokio::task::yield_now().await;
+    }
+}
+
+/// A transaction holding `access_events` in SHARE mode: a writer that logs an event stops at
+/// its event, after its other writes, until this commits.
+async fn hold_the_log(s: &Scratch) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut tx = s.client.pool().begin().await.unwrap();
+    sqlx::query("LOCK TABLE access_events IN SHARE MODE").execute(&mut *tx).await.unwrap();
+    tx
+}
+
+// I1 (P8): the proxy answers a personal row with its record's verifier, never the row's own:
+// after a reset, a row still holding an older verifier (or none, the outcome of a worker write
+// racing the reset) answers the new one on every branch at once.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_personal_row_answers_its_records_verifier() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    c.reset_personal_login(alice, h.db, V2, in_days(90)).await.unwrap();
+    // The race's outcome: the child's row stale, main's without a verifier.
+    sqlx::query("UPDATE neon_roles SET scram_verifier = $2 WHERE endpoint_id = $1 AND name = 'alice'")
+        .bind(&child_ep)
+        .bind(V1)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE neon_roles SET scram_verifier = NULL WHERE endpoint_id = $1 AND name = 'alice'")
+        .bind(&h.ep)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        c.routable_role_secret(&child_ep, "alice").await.unwrap(),
+        Some(Some(V2.to_string())),
+        "a stale row answers the old password"
+    );
+    assert_eq!(c.routable_role_secret(&h.ep, "alice").await.unwrap(), Some(Some(V2.to_string())));
+    assert_eq!(c.neon_role_secret(&child_ep, "alice").await.unwrap(), Some(Some(V2.to_string())));
+    s.finish().await;
+}
+
+// I1 (P8): the worker's row write racing a reset. The reset has written V2 into the record and
+// its rows and is held before its commit (at its event); the worker's writes start then, for
+// main's existing row and for the child's new one, read V1 if they don't wait for the record,
+// and finish after the reset commits. Every row and every proxy answer ends at V2.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_worker_write_racing_a_reset_ends_at_the_new_verifier() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    let log = hold_the_log(&s).await;
+    let reset = tokio::spawn({
+        let c = c.clone();
+        async move { c.reset_personal_login(alice, h.db, V2, in_days(90)).await }
+    });
+    let known = blocked_or_done(&s, &[], &reset).await;
+    assert!(!reset.is_finished(), "the reset is held at its event");
+    let on_main = tokio::spawn({
+        let (c, ep) = (c.clone(), h.ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    let known = blocked_or_done(&s, &known, &on_main).await;
+    let on_child = tokio::spawn({
+        let (c, ep) = (c.clone(), child_ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    blocked_or_done(&s, &known, &on_child).await;
+    log.commit().await.unwrap();
+    reset.await.unwrap().unwrap();
+    on_main.await.unwrap().unwrap();
+    on_child.await.unwrap().unwrap();
+    assert_eq!(
+        s.personal_rows("alice").await,
+        sorted(vec![(h.ep.clone(), Some(V2.to_string())), (child_ep.clone(), Some(V2.to_string()))]),
+        "a worker write put the old verifier back after the reset"
+    );
+    assert_eq!(s.record_verifier(alice, h.db).await.as_deref(), Some(V2));
+    for ep in [&h.ep, &child_ep] {
+        assert_eq!(c.routable_role_secret(ep, "alice").await.unwrap(), Some(Some(V2.to_string())), "{ep}");
+    }
+    s.finish().await;
+}
+
+// I1 (MH-9): the worker's row write racing a revocation. The revocation has revoked the record
+// and cleared its rows and is held before its commit (at its event); the worker's writes start
+// then, for main's existing row and for the child's new one. No row of the revoked record ends
+// with a verifier, and the proxy answers none.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_worker_write_racing_a_revocation_leaves_no_verifier() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    let log = hold_the_log(&s).await;
+    let revoke = tokio::spawn({
+        let c = c.clone();
+        async move { c.revoke_postgres_access(h.admin, alice).await }
+    });
+    let known = blocked_or_done(&s, &[], &revoke).await;
+    assert!(!revoke.is_finished(), "the revocation is held at its event");
+    let on_main = tokio::spawn({
+        let (c, ep) = (c.clone(), h.ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    let known = blocked_or_done(&s, &known, &on_main).await;
+    let on_child = tokio::spawn({
+        let (c, ep) = (c.clone(), child_ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    blocked_or_done(&s, &known, &on_child).await;
+    log.commit().await.unwrap();
+    revoke.await.unwrap().unwrap();
+    on_main.await.unwrap().unwrap();
+    on_child.await.unwrap().unwrap();
+    for (ep, verifier) in s.personal_rows("alice").await {
+        assert_eq!(verifier, None, "{ep}: a revoked login's row got a verifier");
+    }
+    assert_eq!(s.record_verifier(alice, h.db).await, None);
+    for ep in [&h.ep, &child_ep] {
+        assert_eq!(c.routable_role_secret(ep, "alice").await.unwrap().flatten(), None, "{ep}");
+    }
+    s.finish().await;
+}
+
+// I1 (MH-9), the other order: the worker's write has read the live record and is about to
+// insert the child's new row (held there by a test trigger) when a revocation starts; the
+// revocation must still clear that row once it lands, whatever its own statements saw first.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_revocation_clears_a_row_the_worker_was_inserting() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    // A personal row's insert waits for advisory lock 4242 (the scratch database only).
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_hold_personal_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock_shared(4242); RETURN NEW; END $$;
+         CREATE TRIGGER test_hold_personal_insert BEFORE INSERT ON neon_roles FOR EACH ROW
+           WHEN (NEW.origin = 'personal') EXECUTE FUNCTION test_hold_personal_insert();",
+    )
+    .execute(c.pool())
+    .await
+    .unwrap();
+    let mut gate = c.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(4242)").execute(&mut *gate).await.unwrap();
+    let on_child = tokio::spawn({
+        let (c, ep) = (c.clone(), child_ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    let known = blocked_or_done(&s, &[], &on_child).await;
+    assert!(!on_child.is_finished(), "the worker's insert is held by the trigger");
+    let revoke = tokio::spawn({
+        let c = c.clone();
+        async move { c.revoke_postgres_access(h.admin, alice).await }
+    });
+    blocked_or_done(&s, &known, &revoke).await;
+    gate.commit().await.unwrap();
+    on_child.await.unwrap().unwrap();
+    revoke.await.unwrap().unwrap();
+    for (ep, verifier) in s.personal_rows("alice").await {
+        assert_eq!(verifier, None, "{ep}: a revoked login's row kept a verifier");
+    }
+    assert_eq!(s.record_verifier(alice, h.db).await, None);
+    assert_eq!(c.routable_role_secret(&child_ep, "alice").await.unwrap().flatten(), None);
+    s.finish().await;
+}
+
+// D5: suspend revokes every live login (`suspended`) and keeps the grants; reinstate makes the
+// member active again with the logins still revoked (the member makes new ones). Suspend and
+// reinstate refuse members that aren't active or suspended.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn suspend_revokes_and_reinstate_keeps_them_revoked() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (db2, ep2) = s.ready_database(h.t, h.p).await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    s.login(alice, db2, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
+
+    let touched = c.suspend_member(h.admin, alice).await.unwrap();
+    assert!(touched.contains(&h.p), "{touched:?}");
+    assert_eq!(s.status_of(alice).await, MemberStatus::Suspended);
+    for l in logins_of(&s, alice).await {
+        assert_eq!((l.status, l.revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::Suspended)), "{l:?}");
+        assert!(l.revoked_at.is_some());
+    }
+    assert!(s.personal_rows("alice").await.iter().all(|(_, v)| v.is_none()));
+    assert_eq!(c.member_projects(alice).await.unwrap().len(), 1, "grants are kept");
+    assert!(!s.sql_qualifies(alice, h.db).await);
+    let suspended = s.events_of(h.t, "member_suspended").await;
+    assert_eq!(suspended.len(), 1);
+    assert_eq!((suspended[0].actor_member_id, suspended[0].target_member_id), (Some(h.admin), Some(alice)));
+
+    c.reinstate_member(h.admin, alice).await.unwrap();
+    assert_eq!(s.status_of(alice).await, MemberStatus::Active);
+    assert!(logins_of(&s, alice).await.iter().all(|l| l.status == LoginStatus::Revoked), "reinstate recreates nothing");
+    assert!(s.personal_rows("alice").await.iter().all(|(_, v)| v.is_none()));
+    assert!(s.sql_qualifies(alice, h.db).await);
+    assert_eq!(s.events_of(h.t, "member_reinstated").await.len(), 1);
+    // The member makes a new one.
+    assert_eq!(s.login(alice, h.db, "alice").await.status, LoginStatus::Active);
+
+    // Neither applies to an invited, pending or removed member.
+    let (invited, _) = c
+        .create_invited_member(h.admin, h.t, new_invite("inv", "inv@x.com", &[]))
+        .await
+        .unwrap();
+    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    assert_eq!(pending.status, MemberStatus::Pending);
+    let removed = s.granted(&h, "gone", PlatformRole::Developer).await;
+    c.remove_member(h.admin, removed).await.unwrap();
+    for (label, id) in [("invited", invited.id), ("pending", pending.id), ("removed", removed)] {
+        let suspend = c.suspend_member(h.admin, id).await;
+        assert!(matches!(suspend, Err(AccessWriteError::Conflict(_))), "suspend {label}: {suspend:?}");
+        let reinstate = c.reinstate_member(h.admin, id).await;
+        assert!(matches!(reinstate, Err(AccessWriteError::Conflict(_))), "reinstate {label}: {reinstate:?}");
+    }
+    s.finish().await;
+}
+
+// P15: the last active tenant admin can't be suspended; a suspended admin doesn't count as
+// active. A refusal writes nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_last_active_tenant_admin_cannot_be_suspended() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let dev = s.granted(&h, "dev", PlatformRole::Developer).await;
+    let before = s.event_count(h.t).await;
+    let refused = c.suspend_member(dev, h.admin).await;
+    assert!(matches!(refused, Err(AccessWriteError::LastTenantAdmin)), "{refused:?}");
+    assert_eq!(s.status_of(h.admin).await, MemberStatus::Active);
+    assert_eq!(s.event_count(h.t).await, before, "nothing written");
+    let second = s.active(&h, "second").await;
+    c.set_tenant_admin(Some(h.admin), second, true).await.unwrap();
+    c.suspend_member(h.admin, second).await.unwrap();
+    assert_eq!(s.status_of(second).await, MemberStatus::Suspended);
+    let last = c.suspend_member(dev, h.admin).await;
+    assert!(matches!(last, Err(AccessWriteError::LastTenantAdmin)), "the suspended admin doesn't count: {last:?}");
+    assert_eq!(c.active_tenant_admins(h.t).await.unwrap().len(), 1);
+    s.finish().await;
+}
+
+// S7: suspending a suspended member and reinstating an active one succeed and write nothing
+// (a retry after a failed Zitadel lock or unlock redoes only that step).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn suspend_and_reinstate_are_idempotent() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    let first = sorted(c.suspend_member(h.admin, alice).await.unwrap());
+    let written = s.event_count(h.t).await;
+    let again = sorted(c.suspend_member(h.admin, alice).await.unwrap());
+    assert_eq!(again, first, "the retry returns the same touched projects");
+    assert_eq!(s.event_count(h.t).await, written, "and writes nothing");
+    assert_eq!(s.status_of(alice).await, MemberStatus::Suspended);
+    c.reinstate_member(h.admin, alice).await.unwrap();
+    let written = s.event_count(h.t).await;
+    c.reinstate_member(h.admin, alice).await.unwrap();
+    assert_eq!(s.event_count(h.t).await, written);
+    assert_eq!(s.status_of(alice).await, MemberStatus::Active);
+    s.finish().await;
+}
+
+/// `(suspended_at, suspended_by)` as the `members` row stores them (D10).
+async fn suspension_of(s: &Scratch, member: Uuid) -> (Option<chrono::DateTime<Utc>>, Option<Uuid>) {
+    sqlx::query_as("SELECT suspended_at, suspended_by FROM members WHERE id = $1")
+        .bind(member)
+        .fetch_one(s.client.pool())
+        .await
+        .unwrap_or_else(|e| panic!("reading the suspension columns: {e}"))
+}
+
+// D10: suspend writes `suspended_at` and `suspended_by` (the acting member) in its transaction,
+// reinstate clears both, a second suspension records its own actor; the record carries them.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn suspend_records_when_and_by_whom_and_reinstate_clears() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let second = s.active(&h, "second").await;
+    c.set_tenant_admin(Some(h.admin), second, true).await.unwrap();
+    assert_eq!(suspension_of(&s, alice).await, (None, None), "an active member has neither");
+
+    let before = Utc::now() - Duration::seconds(5);
+    c.suspend_member(h.admin, alice).await.unwrap();
+    let after = Utc::now() + Duration::seconds(5);
+    let (at, by) = suspension_of(&s, alice).await;
+    let at = at.expect("suspended_at is set");
+    assert!(before <= at && at <= after, "{at} not within {before}..{after}");
+    assert_eq!(by, Some(h.admin));
+    let record = c.member(alice).await.unwrap().unwrap();
+    assert_eq!((record.suspended_at, record.suspended_by), (Some(at), Some(h.admin)), "the record carries them");
+
+    c.reinstate_member(second, alice).await.unwrap();
+    assert_eq!(suspension_of(&s, alice).await, (None, None), "reinstate clears both");
+    let record = c.member(alice).await.unwrap().unwrap();
+    assert_eq!((record.suspended_at, record.suspended_by), (None, None));
+
+    c.suspend_member(second, alice).await.unwrap();
+    let (at2, by2) = suspension_of(&s, alice).await;
+    assert_eq!(by2, Some(second), "a new suspension records its own actor");
+    assert!(at2.unwrap() >= at);
+    s.finish().await;
+}
+
+// D10 with S7: a retried suspend (even by another admin) keeps the first values and writes
+// nothing; a retried reinstate leaves both cleared. Removing or offboarding an active member
+// doesn't write them.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_retried_suspend_keeps_the_first_values_and_other_writes_leave_them_null() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let second = s.active(&h, "second").await;
+    c.set_tenant_admin(Some(h.admin), second, true).await.unwrap();
+    c.suspend_member(h.admin, alice).await.unwrap();
+    let first = suspension_of(&s, alice).await;
+    assert_eq!(first.1, Some(h.admin));
+    let written = s.event_count(h.t).await;
+    c.suspend_member(second, alice).await.unwrap();
+    c.suspend_member(h.admin, alice).await.unwrap();
+    assert_eq!(suspension_of(&s, alice).await, first, "the original values stay");
+    assert_eq!(s.event_count(h.t).await, written);
+    c.reinstate_member(h.admin, alice).await.unwrap();
+    c.reinstate_member(h.admin, alice).await.unwrap();
+    assert_eq!(suspension_of(&s, alice).await, (None, None));
+
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    c.revoke_logins_for_zitadel_user(h.t, "bob").await.unwrap();
+    assert_eq!(suspension_of(&s, bob).await, (None, None), "offboarding doesn't touch them");
+    c.remove_member(h.admin, bob).await.unwrap();
+    assert_eq!(suspension_of(&s, bob).await, (None, None), "nor does removal of an active member");
+    s.finish().await;
+}
+
+// D10: the CHECKs. `suspended_by` needs `suspended_at`; a suspended member has `suspended_at`;
+// `suspended_by` may be null there (the backfill, a deleted actor is not possible: FK).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_suspension_columns_are_checked() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let active = s.member_row(h.t, "act", "active", false).await;
+    let write = |sql: &'static str, id: Uuid, by: Option<Uuid>| {
+        let pool = s.client.pool().clone();
+        async move { sqlx::query(sql).bind(id).bind(by).execute(&pool).await }
+    };
+    // Cannot name an actor without a time.
+    let r = write("UPDATE members SET suspended_by = $2 WHERE id = $1", active, Some(h.admin)).await;
+    assert!(r.is_err(), "suspended_by without suspended_at is refused");
+    // Cannot be suspended without a time.
+    let r = write("UPDATE members SET status = 'suspended' WHERE id = $1 AND $2::uuid IS NULL", active, None).await;
+    assert!(r.is_err(), "a suspended member without suspended_at is refused");
+    // A suspended member with a time and no actor is allowed (backfilled rows); with the FK
+    // enforced for an actor.
+    let r = write(
+        "UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1 AND $2::uuid IS NULL",
+        active,
+        None,
+    )
+    .await;
+    assert!(r.is_ok(), "{r:?}");
+    let r = write("UPDATE members SET suspended_by = $2 WHERE id = $1", active, Some(Uuid::new_v4())).await;
+    assert!(r.is_err(), "suspended_by references members(id)");
+    let r = write("UPDATE members SET suspended_by = $2 WHERE id = $1", active, Some(h.admin)).await;
+    assert!(r.is_ok(), "{r:?}");
+    s.finish().await;
+}
+
+// D10: the migration backfills existing suspended rows: `suspended_at` from the latest
+// `member_suspended` event (its actor as `suspended_by`), else `updated_at` with no actor;
+// members that aren't suspended stay null. Run on a database that has the columns dropped,
+// as before the migration.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_suspended_by_migration_backfills_suspended_members() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let pool = s.client.pool();
+    sqlx::raw_sql("ALTER TABLE members DROP COLUMN IF EXISTS suspended_by, DROP COLUMN IF EXISTS suspended_at")
+        .execute(pool)
+        .await
+        .unwrap();
+    let with_event = s.member_row(h.t, "ev", "suspended", false).await;
+    let without = s.member_row(h.t, "noev", "suspended", false).await;
+    let active = s.member_row(h.t, "act", "active", false).await;
+    let old = Utc::now() - Duration::days(30);
+    let newer = Utc::now() - Duration::days(10);
+    let stamp = Utc::now() - Duration::days(3);
+    sqlx::query("UPDATE members SET updated_at = $2 WHERE id = $1")
+        .bind(without)
+        .bind(stamp)
+        .execute(pool)
+        .await
+        .unwrap();
+    for (at, actor) in [(old, None), (newer, Some(h.admin))] {
+        sqlx::query(
+            "INSERT INTO access_events (tenant_id, actor_member_id, action, target_member_id, at)
+             VALUES ($1, $2, 'member_suspended', $3, $4)",
+        )
+        .bind(h.t.as_uuid())
+        .bind(actor)
+        .bind(with_event)
+        .bind(at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/migrations/20261023000003_members_suspended_by.sql"
+    );
+    let sql = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    sqlx::raw_sql(AssertSqlSafe(sql)).execute(pool).await.unwrap();
+
+    let (at, by) = suspension_of(&s, with_event).await;
+    let at = at.expect("backfilled from the event");
+    assert!((at - newer).num_milliseconds().abs() < 1000, "the latest event wins: {at}");
+    assert_eq!(by, Some(h.admin));
+    let (at, by) = suspension_of(&s, without).await;
+    assert_eq!(at.map(|t| (t - stamp).num_milliseconds().abs() < 1000), Some(true), "updated_at: {at:?}");
+    assert_eq!(by, None);
+    assert_eq!(suspension_of(&s, active).await, (None, None));
+    s.finish().await;
+}
+
+// S2 / P16 (b): revoke-now and suspend mark the member's `cb_m_*` rows for rotation
+// (`password_enc = ''`; the rows and R31's `last_acted_role` stay) in their transaction, and
+// return the touched projects: the `remove_member` union plus the projects of the member's
+// personal logins.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn revoke_now_and_suspend_mark_member_roles_for_rotation() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let backup = s.active(&h, "backup").await;
+    c.set_tenant_admin(Some(h.admin), backup, true).await.unwrap();
+    // Alice: a tenant admin with a grant on the hub's project (her member role there) and a
+    // login on another project's database, where she has no grant and no member role.
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    c.set_tenant_admin(Some(h.admin), alice, true).await.unwrap();
+    let p3 = s.project(h.t).await;
+    let (db3, ep3) = s.ready_database(h.t, p3).await;
+    s.login(alice, db3, "alice").await;
+    c.upsert_personal_role_row(&ep3, alice, db3, "alice", V1).await.unwrap();
+    let role = |member: Uuid, name: &str| MemberBranchRole {
+        member_id: member,
+        branch_id: h.db,
+        role_name: name.into(),
+        password_enc: "v1:sealed".into(),
+        applied_roles: vec!["app".into()],
+    };
+    c.upsert_member_branch_role(&role(alice, "cb_m_alice")).await.unwrap();
+    assert!(c.record_member_acted_role(alice, h.db, "app").await.unwrap());
+
+    let touched = sorted(c.revoke_postgres_access(h.admin, alice).await.unwrap());
+    assert_eq!(touched, sorted(vec![h.p, p3]));
+    let rows = c.member_branch_roles(h.db).await.unwrap();
+    let row = rows.iter().find(|r| r.member_id == alice).expect("the row stays");
+    assert_eq!((row.role_name.as_str(), row.password_enc.as_str()), ("cb_m_alice", ""), "marked for rotation");
+    assert_eq!(row.applied_roles, vec!["app".to_string()]);
+    assert!(c.member_acted_roles(h.db).await.unwrap().contains(&(alice, "app".to_string())), "R31 survives");
+    let login = &logins_of(&s, alice).await[0];
+    assert_eq!((login.status, login.revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::RevokedNow)));
+    assert_eq!(s.personal_rows("alice").await, vec![(ep3.clone(), None)]);
+    assert_eq!(s.status_of(alice).await, MemberStatus::Active, "Studio access is untouched");
+    let revoked = s.events_of(h.t, "personal_logins_revoked").await;
+    let last = revoked.last().expect("one event");
+    let after = last.after.clone().unwrap();
+    assert_eq!((after["count"].as_i64(), after["reason"].as_str()), (Some(1), Some("revoked_now")), "{after}");
+    assert!(after.get("rotated_branches").is_some(), "{after}");
+    assert_eq!((last.actor_member_id, last.target_member_id), (Some(h.admin), Some(alice)));
+
+    // Suspend marks them too.
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    c.upsert_member_branch_role(&role(bob, "cb_m_bob")).await.unwrap();
+    let touched = c.suspend_member(h.admin, bob).await.unwrap();
+    assert!(touched.contains(&h.p), "{touched:?}");
+    let rows = c.member_branch_roles(h.db).await.unwrap();
+    assert_eq!(rows.iter().find(|r| r.member_id == bob).map(|r| r.password_enc.as_str()), Some(""));
+    // Another member's row is left alone.
+    assert!(rows.iter().all(|r| r.member_id == alice || r.member_id == bob));
+    s.finish().await;
+}
+
+// S6: a sign-in never activates a suspended member, with changed claims or an open invite;
+// only the operator's bootstrap (the recovery path) does.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_suspended_member_is_never_reactivated_by_sign_in() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    c.suspend_member(h.admin, alice).await.unwrap();
+    let same = c.ensure_member(h.t, "alice", "alice@x.com", "alice", Admission::Active).await.unwrap();
+    assert_eq!((same.id, same.status), (alice, MemberStatus::Suspended));
+    let changed = c.ensure_member(h.t, "alice", "new@x.com", "New Name", Admission::Active).await.unwrap();
+    assert_eq!(changed.status, MemberStatus::Suspended);
+    let invite = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO invites (id, member_id, zitadel_user_id, invited_by, expires_at, token_hash)
+         VALUES ($1, $2, 'alice', $3, now() + interval '1 day', $4)",
+    )
+    .bind(invite)
+    .bind(alice)
+    .bind(h.admin)
+    .bind(&TOKEN[..])
+    .execute(c.pool())
+    .await
+    .unwrap();
+    let with_invite = c.ensure_member(h.t, "alice", "other@x.com", "Other", Admission::Active).await.unwrap();
+    assert_eq!(with_invite.status, MemberStatus::Suspended, "an open invite doesn't reactivate");
+    assert_eq!(s.status_of(alice).await, MemberStatus::Suspended);
+    let (_, _, _, accepted) = c.invite(invite).await.unwrap().unwrap();
+    assert_eq!(accepted, None, "the invite isn't accepted");
+    assert!(s.events_of(h.t, "invite_accepted").await.is_empty());
+    // The operator's recovery path still reactivates.
+    let boot = c.bootstrap_admin(h.t, "alice", "alice@x.com").await.unwrap();
+    assert_eq!((boot.status, boot.tenant_admin), (MemberStatus::Active, true));
+    s.finish().await;
+}
+
+// S12: every personal-login name (any status) of every database of the project; nothing from
+// another project. `is_personal_login_name` is per database.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn personal_login_names_cover_every_database_of_the_project() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let (db2, _) = s.ready_database(h.t, h.p).await;
+    let p3 = s.project(h.t).await;
+    let (db3, _) = s.ready_database(h.t, p3).await;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    let carol = s.granted(&h, "carol", PlatformRole::Developer).await;
+    let dave = s.active(&h, "dave").await;
+    c.put_project_grant(h.admin, dave, p3, &grant(PlatformRole::Developer, &[])).await.unwrap();
+    s.login(alice, h.db, "a1").await;
+    s.login(bob, db2, "b2").await;
+    s.login(carol, h.db, "c1").await;
+    c.revoke_postgres_access(h.admin, carol).await.unwrap();
+    s.login(dave, db3, "d3").await;
+    let names = c.personal_login_names(h.p).await.unwrap();
+    assert_eq!(names, ["a1", "b2", "c1"].iter().map(|n| n.to_string()).collect());
+    assert_eq!(c.personal_login_names(p3).await.unwrap(), ["d3".to_string()].into_iter().collect());
+    assert!(c.personal_login_names(s.project(h.t).await).await.unwrap().is_empty());
+    for (db, name, want) in [(h.db, "a1", true), (h.db, "b2", false), (h.db, "c1", true), (db2, "b2", true), (h.db, "nope", false)] {
+        assert_eq!(c.is_personal_login_name(db, name).await.unwrap(), want, "{name} on {db}");
+    }
+    s.finish().await;
+}
+
+// MH-37 / MH-15: events carry `branch_id` (written by `record_access_event`); the personal-login
+// events name the database and never carry a secret; the log stays append-only.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn events_carry_branch_and_never_a_secret() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (child, _) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.reset_personal_login(alice, h.db, V2, in_days(90)).await.unwrap();
+    c.delete_personal_login(h.admin, alice, h.db).await.unwrap();
+    let mut seen = 0;
+    for e in s.events(h.t).await {
+        let text = format!("{} {}", json!(e.before), json!(e.after)).to_lowercase();
+        assert!(!text.contains(&V1.to_lowercase()) && !text.contains(&V2.to_lowercase()), "{}: {text}", e.action);
+        assert!(!text.contains("scram") && !text.contains("verifier") && !text.contains("password"), "{}: {text}", e.action);
+        if e.action.starts_with("personal_login_") {
+            seen += 1;
+            assert_eq!((e.database_id, e.target_member_id), (Some(h.db), Some(alice)), "{}", e.action);
+            let named = e.after.as_ref().or(e.before.as_ref()).unwrap();
+            assert_eq!(named["role_name"], "alice", "{}: {named}", e.action);
+        }
+    }
+    assert_eq!(seen, 3, "created, reset, deleted");
+    let created = &s.events_of(h.t, "personal_login_created").await[0];
+    let after = created.after.as_ref().unwrap();
+    assert_eq!(created.actor_member_id, Some(alice), "the member makes their own login");
+    assert_eq!(after["level"], "developer", "{after}");
+    assert!(after.get("valid_until").is_some(), "{after}");
+
+    let after = json!({ "role": "app", "login": false, "attributes": {} });
+    c.record_access_event(&AccessEventInput {
+        tenant: h.t,
+        actor: Some(h.admin),
+        action: AccessAction::RoleCreated,
+        target: None,
+        project: Some(h.p),
+        database: Some(h.db),
+        branch: Some(child),
+        before: None,
+        after: Some(&after),
+    })
+    .await
+    .unwrap();
+    let last = s.events(h.t).await.pop().unwrap();
+    assert_eq!(last.action, "role_created");
+    assert_eq!((last.project_id, last.database_id, last.branch_id), (Some(h.p), Some(h.db), Some(child)));
+    assert_eq!(last.after, Some(after));
+    // The append-only triggers still hold, for the new column too.
+    let changed = sqlx::query("UPDATE access_events SET branch_id = NULL WHERE id = $1")
+        .bind(last.id)
+        .execute(c.pool())
+        .await;
+    assert!(changed.is_err(), "access_events stays append-only");
+    s.finish().await;
+}
+
+// Spec Part 3: the log's `member_id` filter keeps the events whose target or actor is the
+// member, with the project filter and paging as before.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_filter_matches_target_or_actor() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    let carol = s.granted(&h, "carol", PlatformRole::Developer).await;
+    // Alice acts on Bob.
+    c.put_project_grant(alice, bob, h.p, &grant(PlatformRole::Viewer, &[])).await.unwrap();
+    let p2 = s.project(h.t).await;
+    c.put_project_grant(h.admin, alice, p2, &grant(PlatformRole::Viewer, &[])).await.unwrap();
+    let mine = c.access_events(h.t, None, Some(alice), None, 100).await.unwrap();
+    assert!(!mine.is_empty());
+    for e in &mine {
+        assert!(e.actor_member_id == Some(alice) || e.target_member_id == Some(alice), "{e:?}");
+    }
+    assert!(mine.iter().any(|e| e.actor_member_id == Some(alice) && e.target_member_id == Some(bob)), "as actor");
+    assert!(mine.iter().any(|e| e.action == "grant_put" && e.target_member_id == Some(alice)), "as target");
+    assert!(!mine.iter().any(|e| e.target_member_id == Some(carol)), "carol's events are left out");
+    let all_of_alice = s
+        .events(h.t)
+        .await
+        .into_iter()
+        .filter(|e| e.actor_member_id == Some(alice) || e.target_member_id == Some(alice))
+        .count();
+    assert_eq!(mine.len(), all_of_alice);
+    // With the project filter: both apply.
+    let in_p2 = c.access_events(h.t, Some(p2), Some(alice), None, 100).await.unwrap();
+    assert_eq!(in_p2.len(), 1, "{in_p2:?}");
+    assert_eq!(in_p2[0].project_id, Some(p2));
+    // Paging.
+    let page = c.access_events(h.t, None, Some(alice), Some(mine[0].id), 100).await.unwrap();
+    assert_eq!(page.len(), mine.len() - 1);
+    s.finish().await;
+}
+
+// The plan's `remove_member` change: the touched projects include those of the member's
+// personal logins (their branches must drop the role), and removal revokes the logins
+// (`member_removed`) in the same transaction.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn remove_member_touches_personal_login_projects() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let backup = s.active(&h, "backup").await;
+    c.set_tenant_admin(Some(h.admin), backup, true).await.unwrap();
+    // A tenant admin without grants, overrides or member roles, holding one login.
+    let alice = s.active(&h, "alice").await;
+    c.set_tenant_admin(Some(h.admin), alice, true).await.unwrap();
+    let p2 = s.project(h.t).await;
+    let (db2, ep2) = s.ready_database(h.t, p2).await;
+    s.login(alice, db2, "alice").await;
+    c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
+    let touched = c.remove_member(h.admin, alice).await.unwrap();
+    assert_eq!(touched, vec![p2]);
+    let login = &logins_of(&s, alice).await[0];
+    assert_eq!((login.status, login.revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::MemberRemoved)));
+    assert_eq!(s.personal_rows("alice").await, vec![(ep2, None)]);
+    s.finish().await;
+}
+
+// D4: the webhook's and the sweep's write revokes every live login of the tenant's member with
+// that Zitadel user (`identity_offboarded`) and returns where their rows are; one event per
+// member, none when nothing was live (S18); an unknown user or another tenant's is untouched.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn zitadel_offboarding_revokes_by_user() {
+    let s = Scratch::new().await;
+    let other = s.hub().await;
+    let h = s.hub().await;
+    let (child, child_ep) = s.child(h.db, "dev").await;
+    let (db2, ep2) = s.ready_database(h.t, h.p).await;
+    let c = &s.client;
+    // The same Zitadel user id in another tenant, with a live login there.
+    let twin = s.granted(&other, "alice", PlatformRole::Developer).await;
+    s.login(twin, other.db, "alice").await;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    s.login(alice, db2, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
+    let live = c.members_with_live_logins().await.unwrap();
+    assert!(live.contains(&(h.t, alice, "alice".to_string())), "{live:?}");
+    assert!(live.contains(&(other.t, twin, "alice".to_string())), "{live:?}");
+
+    let eps = c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
+    assert_eq!(
+        sorted(eps),
+        sorted(vec![endpoint(h.db, &h.ep, "alice"), endpoint(child, &child_ep, "alice"), endpoint(db2, &ep2, "alice")])
+    );
+    for l in logins_of(&s, alice).await {
+        assert_eq!((l.status, l.revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::IdentityOffboarded)));
+    }
+    assert!(s.personal_rows("alice").await.iter().all(|(_, v)| v.is_none()), "the proxy refuses at once");
+    let revoked = s.events_of(h.t, "personal_logins_revoked").await;
+    assert_eq!(revoked.len(), 1, "one event for the member");
+    let after = revoked[0].after.clone().unwrap();
+    assert_eq!((after["count"].as_i64(), after["reason"].as_str()), (Some(2), Some("identity_offboarded")));
+    let live = c.members_with_live_logins().await.unwrap();
+    assert!(!live.iter().any(|(_, m, _)| *m == alice), "{live:?}");
+    assert!(live.contains(&(other.t, twin, "alice".to_string())), "another tenant's member is untouched");
+    assert_eq!(logins_of(&s, twin).await[0].status, LoginStatus::Active);
+
+    // S18: nothing live, nothing written; an unknown user is nobody.
+    let written = s.event_count(h.t).await;
+    c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
+    assert!(c.revoke_logins_for_zitadel_user(h.t, "nobody").await.unwrap().is_empty());
+    assert_eq!(s.event_count(h.t).await, written);
+    s.finish().await;
+}
+
+// The proxy row removal the worker uses (S16) deletes only a personal row.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn delete_personal_role_row_deletes_only_personal_rows() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'plain', 'x', 'sql')")
+        .bind(&h.ep)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    c.delete_personal_role_row(&h.ep, "plain").await.unwrap();
+    c.delete_personal_role_row(&h.ep, "postgres").await.unwrap();
+    c.delete_personal_role_row(&h.ep, "alice").await.unwrap();
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM neon_roles WHERE endpoint_id = $1 ORDER BY name")
+        .bind(&h.ep)
+        .fetch_all(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(names, vec!["plain".to_string(), "postgres".to_string()]);
+    assert_eq!(logins_of(&s, alice).await[0].status, LoginStatus::Active, "the record stays");
+    s.finish().await;
+}
+
+// MH-17 / R9: only a qualifying member gets a login: not a Viewer, not one narrowed below
+// Developer on that database, not an invited or suspended member, not on a deleted database
+// or another tenant's; a tenant admin without grants does. A refusal writes nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn create_needs_a_qualifying_member() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let other = s.hub().await;
+    let (db2, _) = s.ready_database(h.t, h.p).await;
+    let c = &s.client;
+    let viewer = s.granted(&h, "viewer", PlatformRole::Viewer).await;
+    let narrowed = s.granted(&h, "narrowed", PlatformRole::Developer).await;
+    c.put_override(h.admin, narrowed, h.db, &OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None })
+        .await
+        .unwrap();
+    let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
+    let (invited, _) = c.create_invited_member(h.admin, h.t, new_invite("inv", "inv@x.com", &grants)).await.unwrap();
+    let suspended = s.granted(&h, "susp", PlatformRole::Developer).await;
+    c.suspend_member(h.admin, suspended).await.unwrap();
+    let dev = s.granted(&h, "dev", PlatformRole::Developer).await;
+    let gone = s.database(h.t, h.p).await;
+    sqlx::query("UPDATE databases SET status = 'deleted', deleted_at = now() WHERE id = $1")
+        .bind(gone)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    for (label, member, db) in [
+        ("viewer", viewer, h.db),
+        ("narrowed below developer", narrowed, h.db),
+        ("invited", invited.id, h.db),
+        ("suspended", suspended, h.db),
+        ("deleted database", dev, gone),
+        ("another tenant's database", dev, other.db),
+    ] {
+        let r = c.create_personal_login(member, db, "nope", V1, in_days(90)).await;
+        assert!(matches!(r, Err(LoginWriteError::NotQualified)), "{label}: {r:?}");
+    }
+    let refused: i64 = sqlx::query_scalar("SELECT count(*) FROM personal_logins").fetch_one(c.pool()).await.unwrap();
+    assert_eq!(refused, 0);
+    // The narrowing is per database; a tenant admin needs no grant.
+    assert_eq!(s.login(narrowed, db2, "narrowed").await.status, LoginStatus::Active);
+    assert_eq!(s.login(h.admin, h.db, "admin_login").await.status, LoginStatus::Active);
+    assert_eq!(s.login(dev, h.db, "dev").await.status, LoginStatus::Active);
+    s.finish().await;
+}
+
+// MH-9 / P3 / S18: an access-reducing write revokes the logins it disqualifies in its own
+// transaction (`access_lost`, one `personal_logins_revoked` event), only on the databases it
+// reaches; a write that revokes nothing logs no such event; a later re-grant revives nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn access_loss_revokes_in_the_same_write_and_logs_only_a_nonzero_count() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (db2, ep2) = s.ready_database(h.t, h.p).await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    s.login(alice, db2, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
+    // Bob has no login: his downgrade logs only the grant.
+    let mark = last_event_id(&s, h.t).await;
+    c.delete_project_grant(h.admin, bob, h.p).await.unwrap();
+    assert_eq!(actions_since(&s, h.t, mark).await, vec!["grant_deleted"]);
+
+    // An override below Developer on one database revokes only that database's login.
+    let mark = last_event_id(&s, h.t).await;
+    c.put_override(h.admin, alice, h.db, &OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None })
+        .await
+        .unwrap();
+    assert_eq!(actions_since(&s, h.t, mark).await, vec!["override_put", "personal_logins_revoked"]);
+    let revoked = s.events_of(h.t, "personal_logins_revoked").await;
+    let after = revoked[0].after.clone().unwrap();
+    assert_eq!((after["count"].as_i64(), after["reason"].as_str()), (Some(1), Some("access_lost")), "{after}");
+    let logins = logins_of(&s, alice).await;
+    let on = |db: Uuid| logins.iter().find(|l| l.database_id == db).unwrap().clone();
+    assert_eq!((on(h.db).status, on(h.db).revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::AccessLost)));
+    assert_eq!(on(db2).status, LoginStatus::Active);
+    assert_eq!(c.routable_role_secret(&h.ep, "alice").await.unwrap(), Some(None), "the proxy refuses at once");
+    assert_eq!(c.routable_role_secret(&ep2, "alice").await.unwrap(), Some(Some(V1.to_string())));
+
+    // Lifting the override revives nothing.
+    c.delete_override(h.admin, alice, h.db).await.unwrap();
+    assert_eq!(logins_of(&s, alice).await.iter().find(|l| l.database_id == h.db).unwrap().status, LoginStatus::Revoked);
+
+    // A downgrade to Viewer revokes the rest.
+    c.put_project_grant(h.admin, alice, h.p, &grant(PlatformRole::Viewer, &[])).await.unwrap();
+    assert!(logins_of(&s, alice).await.iter().all(|l| l.status == LoginStatus::Revoked));
+    assert_eq!(c.routable_role_secret(&ep2, "alice").await.unwrap(), Some(None));
+
+    // A tenant admin cleared, holding no grant.
+    let carol = s.active(&h, "carol").await;
+    c.set_tenant_admin(Some(h.admin), carol, true).await.unwrap();
+    s.login(carol, h.db, "carol").await;
+    c.set_tenant_admin(Some(h.admin), carol, false).await.unwrap();
+    assert_eq!(logins_of(&s, carol).await[0].status, LoginStatus::Revoked);
+    s.finish().await;
+}
+
+// P24 and the worker's read: the lists report each login's status (active, expired, revoked
+// with its reason) and its project; the worker's records carry the SQL predicate and no
+// verifier for a revoked login. The roster reads list suspended members and their own grants.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn personal_login_reads_report_status_and_qualifies() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (db2, _) = s.ready_database(h.t, h.p).await;
+    let other = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    let carol = s.granted(&h, "carol", PlatformRole::Admin).await;
+    s.login(alice, h.db, "alice").await;
+    s.login(alice, db2, "alice").await;
+    s.login(bob, h.db, "bob").await;
+    c.revoke_postgres_access(h.admin, bob).await.unwrap();
+    s.login(carol, h.db, "carol").await;
+    sqlx::query("UPDATE personal_logins SET valid_until = now() - interval '1 second' WHERE member_id = $1")
+        .bind(carol)
+        .execute(c.pool())
+        .await
+        .unwrap();
+
+    let listed = c.database_personal_logins(h.db).await.unwrap();
+    let by = |m: Uuid| listed.iter().find(|l| l.member_id == m).unwrap_or_else(|| panic!("{m} listed"));
+    assert_eq!(listed.len(), 3);
+    assert_eq!((by(alice).status, by(alice).revoked_reason), (LoginStatus::Active, None));
+    assert_eq!((by(bob).status, by(bob).revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::RevokedNow)));
+    assert!(by(bob).revoked_at.is_some());
+    assert_eq!(by(carol).status, LoginStatus::Expired);
+    assert!(listed.iter().all(|l| l.project_id == h.p && l.database_id == h.db));
+    assert_eq!(logins_of(&s, alice).await.len(), 2);
+
+    // The worker's records: the predicate, from SQL; a suspended member (written directly
+    // here, bypassing the revoking write) doesn't qualify.
+    sqlx::query("UPDATE members SET status = 'suspended' WHERE id = $1")
+        .bind(carol)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let records = c.personal_login_records(h.db).await.unwrap();
+    let rec = |m: Uuid| records.iter().find(|r| r.member_id == m).unwrap().clone();
+    assert_eq!((rec(alice).scram_verifier.as_deref(), rec(alice).revoked, rec(alice).qualifies), (Some(V1), false, true));
+    assert_eq!((rec(bob).scram_verifier, rec(bob).revoked, rec(bob).qualifies), (None, true, true));
+    assert_eq!((rec(carol).revoked, rec(carol).qualifies), (false, false));
+    assert_eq!(rec(alice).role_name, "alice");
+
+    // The roster: suspended members are listed; every own grant of the tenant, theirs too.
+    let listings = c.list_member_listings(h.t).await.unwrap();
+    assert_eq!(listings.iter().find(|l| l.id == carol).map(|l| l.status), Some(MemberStatus::Suspended));
+    assert_eq!(c.member_listing(carol).await.unwrap().map(|l| l.status), Some(MemberStatus::Suspended));
+    let roles = c.member_project_roles(h.t).await.unwrap();
+    assert!(roles.contains(&(alice, h.p, PlatformRole::Developer)), "{roles:?}");
+    assert!(roles.contains(&(carol, h.p, PlatformRole::Admin)), "{roles:?}");
+    assert!(!roles.iter().any(|(m, _, _)| *m == other.admin), "another tenant's members");
+    s.finish().await;
+}
+
+// ---- Members hub step 1, final fix round, area A -------------------------------------------
+
+// D7: the webhook's and the sweep's write marks the member offboarded (whether or not a login
+// was live), independently of its status; an offboarded member doesn't qualify for a login.
+// Only Zitadel showing the user active again clears the mark (`clear_offboarded`), never a
+// sign-in, and the logins stay revoked. Another tenant's member with the same Zitadel user is
+// untouched.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn offboarding_marks_the_member_until_its_user_is_active_again() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    let elsewhere = s.tenant().await;
+    let twin = c
+        .ensure_member(elsewhere, "alice", "alice@x.com", "alice", Admission::Active)
+        .await
+        .unwrap()
+        .id;
+
+    c.revoke_logins_for_zitadel_user(h.t, "alice").await.unwrap();
+    let marked = c.member(alice).await.unwrap().unwrap();
+    assert!(marked.offboarded, "the webhook's write marks the member");
+    assert_eq!(marked.status, MemberStatus::Active, "the mark isn't a status");
+    c.revoke_logins_for_zitadel_user(h.t, "bob").await.unwrap();
+    assert!(c.member(bob).await.unwrap().unwrap().offboarded, "marked without a live login too");
+    assert!(!c.member(twin).await.unwrap().unwrap().offboarded, "another tenant's member");
+    assert!(
+        c.member_listing(bob).await.unwrap().unwrap().offboarded,
+        "the roster reads the mark"
+    );
+
+    // MH-17 with D7: no login while marked, whatever the grant.
+    assert!(!s.sql_qualifies(alice, h.db).await);
+    let refused = c.create_personal_login(alice, h.db, "alice2", V2, in_days(90)).await;
+    assert!(matches!(refused, Err(LoginWriteError::NotQualified)), "{refused:?}");
+    // By tenant, then member.
+    let mut want = vec![(h.t, alice, "alice".to_string()), (h.t, bob, "bob".to_string())];
+    want.sort_by_key(|(_, m, _)| *m);
+    assert_eq!(c.offboarded_members().await.unwrap(), want);
+
+    // A sign-in never clears it.
+    c.ensure_member(h.t, "bob", "bob@x.com", "bob", Admission::Active).await.unwrap();
+    assert!(c.member(bob).await.unwrap().unwrap().offboarded, "a sign-in cleared the mark");
+
+    assert!(c.clear_offboarded(h.t, "alice").await.unwrap());
+    assert!(!c.member(alice).await.unwrap().unwrap().offboarded);
+    assert!(!c.clear_offboarded(h.t, "alice").await.unwrap(), "no mark left to clear");
+    assert!(!c.clear_offboarded(h.t, "nobody").await.unwrap());
+    assert!(s.sql_qualifies(alice, h.db).await, "qualifies again");
+    let logins = c.member_personal_logins(alice).await.unwrap();
+    assert_eq!(
+        (logins[0].status, logins[0].revoked_reason),
+        (LoginStatus::Revoked, Some(RevokeReason::IdentityOffboarded)),
+        "the login stays revoked"
+    );
+    assert_eq!(
+        c.offboarded_members().await.unwrap(),
+        vec![(h.t, bob, "bob".to_string())]
+    );
+    s.finish().await;
+}
+
+// EOS-1: the reconcile's row write is a compare-and-set on the password it read. A rotation
+// mark (`''`) written by revoke-now (or a suspension) after the read survives; a write that
+// read the mark replaces it; `None` writes only where there is no row.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_rotation_mark_survives_a_reconcile_that_read_the_row_before_it() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let row = |member: Uuid, password: &str| MemberBranchRole {
+        member_id: member,
+        branch_id: h.db,
+        role_name: format!("cb_m_{}", member.simple()),
+        password_enc: password.into(),
+        applied_roles: Vec::new(),
+    };
+    let stored = |member: Uuid| {
+        let c = c.clone();
+        async move {
+            c.member_branch_roles(h.db)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|r| r.member_id == member)
+                .map(|r| r.password_enc)
+        }
+    };
+    c.upsert_member_branch_role(&row(alice, "v1:read")).await.unwrap();
+    c.revoke_postgres_access(h.admin, alice).await.unwrap();
+    assert_eq!(stored(alice).await.as_deref(), Some(""), "revoke-now marked the row");
+
+    assert!(
+        !c.upsert_member_branch_role_if(&row(alice, "v1:stale"), Some("v1:read")).await.unwrap(),
+        "a reconcile that read the row before the mark overwrote it"
+    );
+    assert_eq!(stored(alice).await.as_deref(), Some(""), "the mark survives");
+    assert!(c.upsert_member_branch_role_if(&row(alice, "v1:fresh"), Some("")).await.unwrap());
+    assert_eq!(stored(alice).await.as_deref(), Some("v1:fresh"));
+
+    let bob = s.granted(&h, "bob", PlatformRole::Developer).await;
+    assert!(
+        !c.upsert_member_branch_role_if(&row(bob, "v1:b"), Some("v1:gone")).await.unwrap(),
+        "a row deleted since the read isn't made again"
+    );
+    assert_eq!(stored(bob).await, None);
+    assert!(c.upsert_member_branch_role_if(&row(bob, "v1:b"), None).await.unwrap());
+    assert!(
+        !c.upsert_member_branch_role_if(&row(bob, "v1:other"), None).await.unwrap(),
+        "`None` expects no row"
+    );
+    assert_eq!(stored(bob).await.as_deref(), Some("v1:b"));
+    s.finish().await;
+}
+
+// EOS-6, T3-M3 (the invariant, MH-9 with P2): a login never outlives its database or project.
+// `chelabase_personal_login_qualifies` is false for a database that is deleting or deleted, or
+// whose project is (every combination of the two statuses), and every write that ends a
+// database's or a project's life revokes its live logins (`access_lost`) in its own
+// transaction, so the proxy refuses them at once.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn no_login_outlives_its_database_or_project() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    let ended = |status: &str| matches!(status, "deleting" | "deleted");
+    for db_status in ["pending", "provisioning", "ready", "failed", "deleting", "deleted"] {
+        for project_status in ["active", "deleting", "deleted"] {
+            for (sql, value) in [
+                ("UPDATE databases SET status = $2 WHERE id = $1", (h.db, db_status)),
+                ("UPDATE projects SET status = $2 WHERE id = $1", (h.p, project_status)),
+            ] {
+                sqlx::query(sql)
+                    .bind(value.0)
+                    .bind(value.1)
+                    .execute(c.pool())
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(
+                s.sql_qualifies(alice, h.db).await,
+                !ended(db_status) && !ended(project_status),
+                "database {db_status}, project {project_status}"
+            );
+        }
+    }
+    s.finish().await;
+
+    // The writes, each on a fresh hub with a live login and its proxy row.
+    for write in ["begin_delete", "mark_deleted", "begin_project_delete", "finish_project_delete"] {
+        let s = Scratch::new().await;
+        let h = s.hub().await;
+        let c = &s.client;
+        let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+        s.login(alice, h.db, "alice").await;
+        c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+        match write {
+            "begin_delete" => {
+                c.begin_delete(DatabaseId(h.db)).await.unwrap();
+            }
+            "mark_deleted" => c.mark_deleted(DatabaseId(h.db)).await.unwrap(),
+            "begin_project_delete" => {
+                c.begin_project_delete(h.t, ProjectId(h.p)).await.unwrap();
+            }
+            _ => c.finish_project_delete(ProjectId(h.p)).await.unwrap(),
+        }
+        let logins = c.member_personal_logins(alice).await.unwrap();
+        assert_eq!(
+            (logins[0].status, logins[0].revoked_reason),
+            (LoginStatus::Revoked, Some(RevokeReason::AccessLost)),
+            "{write}: the login outlived its database"
+        );
+        assert_eq!(s.record_verifier(alice, h.db).await, None, "{write}");
+        assert_eq!(
+            c.routable_role_secret(&h.ep, "alice").await.unwrap().flatten(),
+            None,
+            "{write}: the proxy still answers the login"
+        );
+        assert_eq!(s.events_of(h.t, "personal_logins_revoked").await.len(), 1, "{write}");
+        s.finish().await;
+    }
+}
+
+// T8-8: a delete takes the record's lock before it reads where the login's rows are, so a row
+// the worker was inserting when the delete began (its insert held here by a test trigger, the
+// record read `FOR SHARE`) is among the endpoints it returns: the proxy cache is told of it.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_login_delete_lists_a_row_the_worker_was_inserting() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (child, child_ep) = s.child(h.db, "dev").await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    sqlx::raw_sql(
+        "CREATE FUNCTION test_hold_personal_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN PERFORM pg_advisory_xact_lock_shared(4243); RETURN NEW; END $$;
+         CREATE TRIGGER test_hold_personal_insert BEFORE INSERT ON neon_roles FOR EACH ROW
+           WHEN (NEW.origin = 'personal') EXECUTE FUNCTION test_hold_personal_insert();",
+    )
+    .execute(c.pool())
+    .await
+    .unwrap();
+    let mut gate = c.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(4243)").execute(&mut *gate).await.unwrap();
+    let on_child = tokio::spawn({
+        let (c, ep) = (c.clone(), child_ep.clone());
+        async move { c.upsert_personal_role_row(&ep, alice, h.db, "alice", V1).await }
+    });
+    let known = blocked_or_done(&s, &[], &on_child).await;
+    assert!(!on_child.is_finished(), "the worker's insert is held by the trigger");
+    let delete = tokio::spawn({
+        let c = c.clone();
+        async move { c.delete_personal_login(h.admin, alice, h.db).await }
+    });
+    blocked_or_done(&s, &known, &delete).await;
+    gate.commit().await.unwrap();
+    on_child.await.unwrap().unwrap();
+    let rows = delete.await.unwrap().unwrap();
+    assert!(
+        rows.contains(&endpoint(child, &child_ep, "alice")),
+        "the row landed under the delete isn't listed, so no proxy forgets it: {rows:?}"
+    );
+    assert!(rows.contains(&endpoint(h.db, &h.ep, "alice")), "{rows:?}");
+    assert!(s.personal_rows("alice").await.is_empty());
+    s.finish().await;
+}
+
+// T3-M2: the worker's write puts a login's row only on an endpoint of the login's own
+// database's branches; another database's endpoint (of the same project) gets nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_login_row_lands_only_on_its_databases_endpoints() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let (_db2, ep2) = s.ready_database(h.t, h.p).await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&ep2, alice, h.db, "alice", V1).await.unwrap();
+    assert_eq!(
+        s.personal_rows("alice").await,
+        Vec::<(String, Option<String>)>::new(),
+        "a row on another database's endpoint"
+    );
+    assert_eq!(c.routable_role_secret(&ep2, "alice").await.unwrap().flatten(), None);
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    assert_eq!(s.personal_rows("alice").await, vec![(h.ep.clone(), Some(V1.to_string()))]);
+    s.finish().await;
+}
+
+// T3-M1: a personal row is its record's: a rename of it is refused, never answered as done
+// (`Renamed { row: false }` told the caller its keys moved); the row and its name stay.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_personal_row_is_never_renamed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
+    s.login(alice, h.db, "alice").await;
+    c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
+    let out = c
+        .rename_role_copy(&h.ep, BranchId(h.db), "alice", "renamed", None, None)
+        .await
+        .unwrap();
+    assert!(!matches!(out, RenameCopyOutcome::Renamed { .. }), "{out:?}");
+    assert_eq!(s.personal_rows("alice").await, vec![(h.ep.clone(), Some(V1.to_string()))]);
+    assert!(s.personal_rows("renamed").await.is_empty());
     s.finish().await;
 }

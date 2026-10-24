@@ -7,14 +7,14 @@ const NOW = new Date("2026-10-09T12:00:00Z");
 function member(extra: Partial<Member> = {}): Member {
   return {
     id: "m1", email: "ana@example.test", display_name: "Ana", status: "active", tenant_admin: false, has_access: true,
-    invite: null, accepted_at: null, created_at: "2026-10-01T00:00:00Z", ...extra,
+    invite: null, accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z", access: { level: "none", projects: [] }, ...extra,
   };
 }
 
 function event(extra: Partial<AccessEvent>): AccessEvent {
   return {
     id: 1, action: "member_removed", at: "2026-10-09T11:00:00Z", actor_member_id: "m1", actor_email: "ana@example.test",
-    target_member_id: "m2", target_email: "bo@example.test", project_id: null, project_name: null, database_id: null,
+    target_member_id: "m2", target_email: "bo@example.test", project_id: null, project_name: null, database_id: null, branch_id: null,
     before: null, after: null, ...extra,
   };
 }

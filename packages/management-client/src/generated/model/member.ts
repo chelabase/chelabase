@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { Invite } from './invite.ts';
+import type { MemberAccess } from './memberAccess.ts';
 import type { MemberStatusView } from './memberStatusView.ts';
 
 /**
@@ -16,6 +17,8 @@ export interface Member {
      * @nullable
      */
   accepted_at: string | null;
+  /** What the member can reach, over the projects the caller can see. */
+  access: MemberAccess;
   /** When the member row was made (an invited member's: when they were invited). */
   created_at: string;
   /**
@@ -37,5 +40,16 @@ export interface Member {
   id: string;
   invite: Invite | null;
   status: MemberStatusView;
+  /**
+     * When the member was suspended; `null` unless suspended (or removed after a suspension).
+     * @nullable
+     */
+  suspended_at: string | null;
+  /**
+     * The member who suspended it; `null` unless suspended, and for a member suspended before
+     * this was recorded.
+     * @nullable
+     */
+  suspended_by: string | null;
   tenant_admin: boolean;
 }

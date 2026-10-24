@@ -621,3 +621,33 @@ async fn deactivating_twice_is_a_precondition_refusal() {
         other => panic!("{other:?}"),
     }
 }
+
+// Members hub T8 (D5, S7, S18): `lock_user` and `unlock_user` call Zitadel's
+// `POST /v2/users/{id}/lock` and `/unlock`; a user already locked or unlocked, or already gone,
+// is fine, so a retry after a failure completes. The mock keeps the state `get_user` reads.
+#[tokio::test]
+async fn lock_and_unlock_are_idempotent() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user_in("p1", "lou@example.com", "Secret-pass1", true);
+    z.lock_user(&id).await.unwrap();
+    assert!(mock.user_by_id(&id).unwrap().locked);
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Locked);
+    z.lock_user(&id).await.unwrap();
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Locked, "locking twice is fine");
+    z.unlock_user(&id).await.unwrap();
+    assert!(!mock.user_by_id(&id).unwrap().locked);
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Active);
+    z.unlock_user(&id).await.unwrap();
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Active, "unlocking twice is fine");
+    let calls = mock.calls();
+    for verb in ["lock", "unlock"] {
+        let want = format!("POST /v2/users/{id}/{verb}");
+        assert_eq!(calls.iter().filter(|c| **c == want).count(), 2, "{verb}: {calls:?}");
+    }
+    z.lock_user("missing").await.unwrap();
+    z.unlock_user("missing").await.unwrap();
+    // Any other refusal is an error, so the caller can answer 503 and be retried.
+    mock.fail("/lock", 500, "Errors.Internal", 1);
+    assert!(z.lock_user(&id).await.is_err());
+    assert!(!mock.user_by_id(&id).unwrap().locked);
+}

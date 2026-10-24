@@ -8,7 +8,7 @@ export interface Failure {
   role?: string;
   chain?: string[];
   databaseId?: string;
-  /** The database's name (or "a deleted database"). */
+  /** The database's name (or "a deleted database"); absent when the caller doesn't know the databases. */
   database?: string;
   /** The branch whose roles broke the rule, and whether it is main (M16). */
   branch?: string;
@@ -18,10 +18,11 @@ export interface Failure {
 }
 
 /** Reads a 422's `extra` (`role`, `chain`, `database_id`, `branch`); anything else shows the server's message. */
-export function failureOf(err: unknown, project: Project): Failure {
+export function failureOf(err: unknown, project: Pick<Project, "databases"> | null): Failure {
   if (!(err instanceof ApiError)) return { message: errorText(err) };
   const { role, chain, databaseId, branch, branchMain, why } = refusalExtra(err);
-  const database = databaseId ? (project.databases.find((d) => d.database_id === databaseId)?.name ?? "a deleted database") : undefined;
+  // No project given: the databases are unknown, so none is named (never "a deleted database").
+  const database = databaseId && project ? (project.databases.find((d) => d.database_id === databaseId)?.name ?? "a deleted database") : undefined;
   return {
     // Studio's own words when the refusal says enough; the server's sentence otherwise.
     message: refusalMessage({ role, chain, why }, database, branch, branchMain) ?? errorText(err),

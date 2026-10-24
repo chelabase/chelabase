@@ -135,11 +135,30 @@ pub enum ErrorCode {
     ReviewChanged,
     /// The TLS or certificate check between the orchestrator and the compute failed.
     ComputeTlsFailed,
+    /// 409: a privilege change ran, but the ACL read back differs from the requested end state.
+    PrivilegesNotApplied,
+    /// 409: an object's ACL (or a function's identity) changed since the privileges read the
+    /// request was built from.
+    PrivilegesChangedSinceRead,
+    /// 422: "All rows" refused, because the table is reachable by the data API (`extra.chain`).
+    ExposesDataApi,
+    /// 409: the caller already has a live personal login on that database.
+    PersonalLoginExists,
+    /// 403: the caller's membership is suspended.
+    MemberSuspended,
+    /// 403: the caller's identity was deactivated, locked or removed in Zitadel (D7).
+    MemberOffboarded,
+    /// 422: a role delete's successor isn't one the owner can SET to, or is owner-level,
+    /// reserved, a personal login or the role itself.
+    InvalidSuccessor,
+    /// 409: a role delete would expose objects (definer routines, non-invoker views granted to
+    /// others) to its successor and wasn't confirmed with the preview's current token.
+    ExposureUnconfirmed,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 97] = [
+    pub const ALL: [ErrorCode; 105] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -237,6 +256,14 @@ impl ErrorCode {
         Self::HasDependents,
         Self::ReviewChanged,
         Self::ComputeTlsFailed,
+        Self::PrivilegesNotApplied,
+        Self::PrivilegesChangedSinceRead,
+        Self::ExposesDataApi,
+        Self::PersonalLoginExists,
+        Self::MemberSuspended,
+        Self::MemberOffboarded,
+        Self::InvalidSuccessor,
+        Self::ExposureUnconfirmed,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -338,6 +365,14 @@ impl ErrorCode {
             Self::HasDependents => "has_dependents",
             Self::ReviewChanged => "review_changed",
             Self::ComputeTlsFailed => "compute_tls_failed",
+            Self::PrivilegesNotApplied => "privileges_not_applied",
+            Self::PrivilegesChangedSinceRead => "privileges_changed_since_read",
+            Self::ExposesDataApi => "exposes_data_api",
+            Self::PersonalLoginExists => "personal_login_exists",
+            Self::MemberSuspended => "member_suspended",
+            Self::MemberOffboarded => "member_offboarded",
+            Self::InvalidSuccessor => "invalid_successor",
+            Self::ExposureUnconfirmed => "exposure_unconfirmed",
         }
     }
 }
@@ -440,7 +475,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 97] = [
+    const ALL: [(ErrorCode, &str); 105] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -538,6 +573,19 @@ mod tests {
         (ErrorCode::HasDependents, "has_dependents"),
         (ErrorCode::ReviewChanged, "review_changed"),
         (ErrorCode::ComputeTlsFailed, "compute_tls_failed"),
+        // Members hub step 1 (T2).
+        (ErrorCode::PrivilegesNotApplied, "privileges_not_applied"),
+        (ErrorCode::PrivilegesChangedSinceRead, "privileges_changed_since_read"),
+        (ErrorCode::ExposesDataApi, "exposes_data_api"),
+        (ErrorCode::PersonalLoginExists, "personal_login_exists"),
+        (ErrorCode::MemberSuspended, "member_suspended"),
+        // Final round D7: 403, the caller's identity was offboarded in Zitadel.
+        (ErrorCode::MemberOffboarded, "member_offboarded"),
+        // T10: 422, a role delete's successor isn't one the owner can SET to, is owner-level,
+        // reserved, a personal login or the role itself.
+        (ErrorCode::InvalidSuccessor, "invalid_successor"),
+        // T10 fix: 409, a role delete's exposures weren't confirmed with the preview's token.
+        (ErrorCode::ExposureUnconfirmed, "exposure_unconfirmed"),
     ];
 
     #[test]

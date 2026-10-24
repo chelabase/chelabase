@@ -60,12 +60,15 @@ import type {
   DefaultRowRequest,
   DeleteGrantOverrideParams,
   DeleteProjectRequest,
+  DeleteRoleParams,
+  DeletedRole,
   DisableDataApiParams,
   ErrorEnvelope,
   FinishRequest,
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
+  GetPrivilegesParams,
   GetSqlSchema200,
   GetSqlSchemaParams,
   GetTableParams,
@@ -87,11 +90,16 @@ import type {
   MergeSummary,
   ObjectList,
   OperationAccepted,
+  PersonalLoginList,
+  PersonalLoginSecret,
+  PreviewRoleDeleteParams,
+  PrivilegesPage,
   ProjectGrant,
   ProjectInfo,
   PutAppUsersRequest,
   PutGrantOverrideRequest,
   PutGrantRequest,
+  PutPersonalLoginRequest,
   RecomputeRequest,
   RehearseRequest,
   Relation,
@@ -102,6 +110,8 @@ import type {
   Review,
   ReviewFixRequest,
   ReviewFixResponse,
+  RevokeResult,
+  RoleDeletePreview,
   RoleSessions,
   RunSqlRequest,
   SavedQuery,
@@ -2742,6 +2752,139 @@ export const useDisableDataApi = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getDisableDataApiMutationOptions(options), queryClient);
     }
 
+export const getGetPrivilegesUrl = (id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}/privileges?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/pg-databases/${encodeURIComponent(String(name))}/privileges`
+}
+
+/**
+ * The privileges `role` holds in one Postgres database of a branch (one of the branch's recorded databases), read as the database owner, a page at a time. Without `schema`: the schemas (paged by name) with the role's schema entries, and the default privileges of those schemas. With `schema`: every table, view, materialized view, partitioned or foreign table, sequence, function and procedure of it (paged), with the role's entries on it and on its columns, the hub's "all rows" policy for the role, its owner and whether an owner run can act as that owner (`owner_settable`). Every entry carries its grantor and grant option. Each schema, object and default-privileges row carries `acl_hash`, a hash over its whole ACL (every grantee; a relation's covers its columns): send it back as `expect_acl` with a schema change. `role=public` reads PUBLIC's entries. Member logins and personal logins aren't listed.
+ * @summary One role's privileges in a Postgres database
+ */
+export const getPrivileges = async (id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams, options?: Parameters<typeof customFetch>[1]): Promise<PrivilegesPage> => {
+
+  return customFetch<PrivilegesPage>(getGetPrivilegesUrl(id,branchId,name,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetPrivilegesQueryKey = (id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/pg-databases/${name}/privileges`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getGetPrivilegesQueryOptions = <TData = Awaited<ReturnType<typeof getPrivileges>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetPrivilegesQueryKey(id,branchId,name,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getPrivileges>>> = ({ signal }) => getPrivileges(id,branchId,name,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && name !== null && name !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetPrivilegesQueryResult = NonNullable<Awaited<ReturnType<typeof getPrivileges>>>
+export type GetPrivilegesQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetPrivileges<TData = Awaited<ReturnType<typeof getPrivileges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string,
+    params: undefined |  GetPrivilegesParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getPrivileges>>,
+          TError,
+          Awaited<ReturnType<typeof getPrivileges>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetPrivileges<TData = Awaited<ReturnType<typeof getPrivileges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getPrivileges>>,
+          TError,
+          Awaited<ReturnType<typeof getPrivileges>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetPrivileges<TData = Awaited<ReturnType<typeof getPrivileges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary One role's privileges in a Postgres database
+ */
+
+export function useGetPrivileges<TData = Awaited<ReturnType<typeof getPrivileges>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    name: string,
+    params?: GetPrivilegesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getPrivileges>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetPrivilegesQueryOptions(id,branchId,name,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getResetBranchPasswordUrl = (id: string,
     branchId: string,) => {
 
@@ -3483,23 +3626,32 @@ export const useCreateRole = <TError = ErrorType<ErrorEnvelope>,
 
 export const getDeleteRoleUrl = (id: string,
     branchId: string,
-    role: string,) => {
+    role: string,
+    params?: DeleteRoleParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}`
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}`
 }
 
 /**
- * Deletes a login role. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted.
+ * Deletes a role. Its objects in every database go to `successor` (never the owner): a role the owner can `SET ROLE` to that isn't owner-level, reserved or a personal login, or `chelabase_orphaned` (the default), a powerless role. Databases it owns go to the owner. PUBLIC loses EXECUTE on every routine that moved, and the answer lists the `SECURITY DEFINER` ones for review. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted. A named successor that would let other roles run the role's `SECURITY DEFINER` routines or read its views without `security_invoker` with the successor's rights needs `confirm`, the current token of the delete's preview (`GET …/roles/{role}/delete-preview`); the grants are kept. `chelabase_orphaned` never needs one.
  * @summary Delete a login role
  */
 export const deleteRole = async (id: string,
     branchId: string,
-    role: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+    role: string,
+    params?: DeleteRoleParams, options?: Parameters<typeof customFetch>[1]): Promise<DeletedRole> => {
 
-  return customFetch<void>(getDeleteRoleUrl(id,branchId,role),
+  return customFetch<DeletedRole>(getDeleteRoleUrl(id,branchId,role,params),
   {
     ...options,
     method: 'DELETE'
@@ -3529,9 +3681,9 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
 
 
       const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteRole>>, DeleteRoleMutationVariables> = (props) => {
-          const {id,branchId,role} = props ?? {};
+          const {id,branchId,role,params} = props ?? {};
 
-          return  deleteRole(id,branchId,role,requestOptions)
+          return  deleteRole(id,branchId,role,params,requestOptions)
         }
 
 
@@ -3544,7 +3696,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type DeleteRoleMutationResult = NonNullable<Awaited<ReturnType<typeof deleteRole>>>
 
     export type DeleteRoleMutationError = ErrorType<ErrorEnvelope>
-    export type DeleteRoleMutationVariables = {id: string;branchId: string;role: string}
+    export type DeleteRoleMutationVariables = {id: string;branchId: string;role: string;params?: DeleteRoleParams}
 
     /**
  * @summary Delete a login role
@@ -3653,6 +3805,139 @@ export const useUpdateRole = <TError = ErrorType<ErrorEnvelope>,
       > => {
       return useMutation(getUpdateRoleMutationOptions(options), queryClient);
     }
+
+export const getPreviewRoleDeleteUrl = (id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}/delete-preview?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/roles/${encodeURIComponent(String(role))}/delete-preview`
+}
+
+/**
+ * What deleting the role to `successor` would expose: its `SECURITY DEFINER` routines granted to roles other than the successor, and its views without `security_invoker` (and materialized views) granted to anyone but the successor, PUBLIC included. After the delete they run with the successor's rights for those roles. Review them, then pass `confirm` to the delete; a delete to a named successor that exposes something is refused without the current token (`exposure_unconfirmed`). `chelabase_orphaned` (the default) never needs one: its preview lists what it finds with `confirm: null`. Changes nothing. The delete's rules for the role and the successor apply.
+ * @summary Preview a role delete
+ */
+export const previewRoleDelete = async (id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams, options?: Parameters<typeof customFetch>[1]): Promise<RoleDeletePreview> => {
+
+  return customFetch<RoleDeletePreview>(getPreviewRoleDeleteUrl(id,branchId,role,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getPreviewRoleDeleteQueryKey = (id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/roles/${role}/delete-preview`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getPreviewRoleDeleteQueryOptions = <TData = Awaited<ReturnType<typeof previewRoleDelete>>, TError = ErrorType<ErrorEnvelope>>(id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getPreviewRoleDeleteQueryKey(id,branchId,role,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof previewRoleDelete>>> = ({ signal }) => previewRoleDelete(id,branchId,role,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined && role !== null && role !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type PreviewRoleDeleteQueryResult = NonNullable<Awaited<ReturnType<typeof previewRoleDelete>>>
+export type PreviewRoleDeleteQueryError = ErrorType<ErrorEnvelope>
+
+
+export function usePreviewRoleDelete<TData = Awaited<ReturnType<typeof previewRoleDelete>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string,
+    params: undefined |  PreviewRoleDeleteParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof previewRoleDelete>>,
+          TError,
+          Awaited<ReturnType<typeof previewRoleDelete>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function usePreviewRoleDelete<TData = Awaited<ReturnType<typeof previewRoleDelete>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof previewRoleDelete>>,
+          TError,
+          Awaited<ReturnType<typeof previewRoleDelete>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function usePreviewRoleDelete<TData = Awaited<ReturnType<typeof previewRoleDelete>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Preview a role delete
+ */
+
+export function usePreviewRoleDelete<TData = Awaited<ReturnType<typeof previewRoleDelete>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    role: string,
+    params?: PreviewRoleDeleteParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof previewRoleDelete>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getPreviewRoleDeleteQueryOptions(id,branchId,role,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 
 export const getResetRolePasswordUrl = (id: string,
     branchId: string,
@@ -5827,6 +6112,350 @@ export const useRetryMerge = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getRetryMergeMutationOptions(options), queryClient);
     }
 
+export const getCreatePersonalLoginUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/personal-login`
+}
+
+/**
+ * Your own Postgres login for this database, for Developers and above there (tenant admins included). Its password is generated and answered this once, with `Cache-Control: no-store`; only a SCRAM verifier is stored. It is valid for 90 days (a password reset renews it) and works on every branch where you qualify, acting only as the roles you hold at Developer or above. A revoked or expired login of yours on the database is replaced.
+ * @summary Create your personal login on a database
+ */
+export const createPersonalLogin = async (id: string,
+    putPersonalLoginRequest: PutPersonalLoginRequest, options?: Parameters<typeof customFetch>[1]): Promise<PersonalLoginSecret> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<PersonalLoginSecret>(getCreatePersonalLoginUrl(id),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(putPersonalLoginRequest)
+  }
+);}
+
+
+
+
+
+export const getCreatePersonalLoginMutationKey = () => ['createPersonalLogin'] as const;
+
+export const getCreatePersonalLoginMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createPersonalLogin>>, TError,CreatePersonalLoginMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createPersonalLogin>>, TError,CreatePersonalLoginMutationVariables, TContext> => {
+
+const mutationKey = getCreatePersonalLoginMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createPersonalLogin>>, CreatePersonalLoginMutationVariables> = (props) => {
+          const {id,data} = props ?? {};
+
+          return  createPersonalLogin(id,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreatePersonalLoginMutationResult = NonNullable<Awaited<ReturnType<typeof createPersonalLogin>>>
+    export type CreatePersonalLoginMutationBody = PutPersonalLoginRequest
+    export type CreatePersonalLoginMutationError = ErrorType<ErrorEnvelope>
+    export type CreatePersonalLoginMutationVariables = {id: string;data: PutPersonalLoginRequest}
+
+    /**
+ * @summary Create your personal login on a database
+ */
+export const useCreatePersonalLogin = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createPersonalLogin>>, TError,CreatePersonalLoginMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createPersonalLogin>>,
+        TError,
+        CreatePersonalLoginMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreatePersonalLoginMutationOptions(options), queryClient);
+    }
+
+export const getResetPersonalLoginPasswordUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/personal-login/reset-password`
+}
+
+/**
+ * A new generated password, answered this once with `Cache-Control: no-store`; the old one is refused at once. It also renews the login for 90 days (an expired login comes back this way). A revoked login can't be reset: make a new one.
+ * @summary Reset your personal login's password
+ */
+export const resetPersonalLoginPassword = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<PersonalLoginSecret> => {
+
+  return customFetch<PersonalLoginSecret>(getResetPersonalLoginPasswordUrl(id),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getResetPersonalLoginPasswordMutationKey = () => ['resetPersonalLoginPassword'] as const;
+
+export const getResetPersonalLoginPasswordMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resetPersonalLoginPassword>>, TError,ResetPersonalLoginPasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof resetPersonalLoginPassword>>, TError,ResetPersonalLoginPasswordMutationVariables, TContext> => {
+
+const mutationKey = getResetPersonalLoginPasswordMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof resetPersonalLoginPassword>>, ResetPersonalLoginPasswordMutationVariables> = (props) => {
+          const {id} = props ?? {};
+
+          return  resetPersonalLoginPassword(id,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ResetPersonalLoginPasswordMutationResult = NonNullable<Awaited<ReturnType<typeof resetPersonalLoginPassword>>>
+
+    export type ResetPersonalLoginPasswordMutationError = ErrorType<ErrorEnvelope>
+    export type ResetPersonalLoginPasswordMutationVariables = {id: string}
+
+    /**
+ * @summary Reset your personal login's password
+ */
+export const useResetPersonalLoginPassword = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof resetPersonalLoginPassword>>, TError,ResetPersonalLoginPasswordMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof resetPersonalLoginPassword>>,
+        TError,
+        ResetPersonalLoginPasswordMutationVariables,
+        TContext
+      > => {
+      return useMutation(getResetPersonalLoginPasswordMutationOptions(options), queryClient);
+    }
+
+export const getListDatabasePersonalLoginsUrl = (id: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/personal-logins`
+}
+
+/**
+ * Every personal login of the database, any status, by role name (the Roles tab counts the active ones). Never a password or verifier.
+ * @summary List a database's personal logins
+ */
+export const listDatabasePersonalLogins = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<PersonalLoginList> => {
+
+  return customFetch<PersonalLoginList>(getListDatabasePersonalLoginsUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListDatabasePersonalLoginsQueryKey = (id: string,) => {
+    return [
+    `/v1/databases/${id}/personal-logins`
+    ] as const;
+    }
+
+
+export const getListDatabasePersonalLoginsQueryOptions = <TData = Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListDatabasePersonalLoginsQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listDatabasePersonalLogins>>> = ({ signal }) => listDatabasePersonalLogins(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListDatabasePersonalLoginsQueryResult = NonNullable<Awaited<ReturnType<typeof listDatabasePersonalLogins>>>
+export type ListDatabasePersonalLoginsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListDatabasePersonalLogins<TData = Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listDatabasePersonalLogins>>,
+          TError,
+          Awaited<ReturnType<typeof listDatabasePersonalLogins>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListDatabasePersonalLogins<TData = Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listDatabasePersonalLogins>>,
+          TError,
+          Awaited<ReturnType<typeof listDatabasePersonalLogins>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListDatabasePersonalLogins<TData = Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a database's personal logins
+ */
+
+export function useListDatabasePersonalLogins<TData = Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listDatabasePersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListDatabasePersonalLoginsQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getDeletePersonalLoginUrl = (id: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/databases/${encodeURIComponent(String(id))}/personal-logins/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * Any status. The member themself, a tenant admin, or an Admin of the database's project may; for anyone else the login doesn't exist (404). The proxies forget it at once and each branch drops the role.
+ * @summary Delete a member's personal login
+ */
+export const deletePersonalLogin = async (id: string,
+    memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeletePersonalLoginUrl(id,memberId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeletePersonalLoginMutationKey = () => ['deletePersonalLogin'] as const;
+
+export const getDeletePersonalLoginMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deletePersonalLogin>>, TError,DeletePersonalLoginMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deletePersonalLogin>>, TError,DeletePersonalLoginMutationVariables, TContext> => {
+
+const mutationKey = getDeletePersonalLoginMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deletePersonalLogin>>, DeletePersonalLoginMutationVariables> = (props) => {
+          const {id,memberId} = props ?? {};
+
+          return  deletePersonalLogin(id,memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeletePersonalLoginMutationResult = NonNullable<Awaited<ReturnType<typeof deletePersonalLogin>>>
+
+    export type DeletePersonalLoginMutationError = ErrorType<ErrorEnvelope>
+    export type DeletePersonalLoginMutationVariables = {id: string;memberId: string}
+
+    /**
+ * @summary Delete a member's personal login
+ */
+export const useDeletePersonalLogin = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deletePersonalLogin>>, TError,DeletePersonalLoginMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deletePersonalLogin>>,
+        TError,
+        DeletePersonalLoginMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeletePersonalLoginMutationOptions(options), queryClient);
+    }
+
 export const getResetDatabasePasswordUrl = (id: string,) => {
 
 
@@ -7027,7 +7656,7 @@ export const getListMembersUrl = () => {
 }
 
 /**
- * Invited, pending and active members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined.
+ * Invited, pending, active and suspended members, by email: names and emails, for grant pickers. An invited member carries its open invite; a pending one (signed up, waiting for approval) can be approved or declined. Each member carries `access`: the highest platform role over the projects the caller can see and the member's role on each of those projects (`other`: access only on projects the caller can't see; `none`: no project grant). No Postgres roles or overrides.
  * @summary List the tenant's members
  */
 export const listMembers = async ( options?: Parameters<typeof customFetch>[1]): Promise<Member[]> => {
@@ -7448,6 +8077,333 @@ export const useDeclineMember = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getDeclineMemberMutationOptions(options), queryClient);
+    }
+
+export const getListMemberPersonalLoginsUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/personal-logins`
+}
+
+/**
+ * Any status. Filtered by the caller: a member sees all of their own, a tenant admin all of anyone's, an Admin of a project the logins on that project's databases; anyone else gets an empty list. Never a password or verifier.
+ * @summary List a member's personal logins
+ */
+export const listMemberPersonalLogins = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<PersonalLoginList> => {
+
+  return customFetch<PersonalLoginList>(getListMemberPersonalLoginsUrl(memberId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListMemberPersonalLoginsQueryKey = (memberId: string,) => {
+    return [
+    `/v1/members/${memberId}/personal-logins`
+    ] as const;
+    }
+
+
+export const getListMemberPersonalLoginsQueryOptions = <TData = Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListMemberPersonalLoginsQueryKey(memberId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listMemberPersonalLogins>>> = ({ signal }) => listMemberPersonalLogins(memberId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: memberId !== null && memberId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListMemberPersonalLoginsQueryResult = NonNullable<Awaited<ReturnType<typeof listMemberPersonalLogins>>>
+export type ListMemberPersonalLoginsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListMemberPersonalLogins<TData = Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMemberPersonalLogins>>,
+          TError,
+          Awaited<ReturnType<typeof listMemberPersonalLogins>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMemberPersonalLogins<TData = Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMemberPersonalLogins>>,
+          TError,
+          Awaited<ReturnType<typeof listMemberPersonalLogins>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMemberPersonalLogins<TData = Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a member's personal logins
+ */
+
+export function useListMemberPersonalLogins<TData = Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberPersonalLogins>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListMemberPersonalLoginsQueryOptions(memberId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getReinstateMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/reinstate`
+}
+
+/**
+ * The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.
+ * @summary Reinstate a suspended member
+ */
+export const reinstateMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
+
+  return customFetch<Member>(getReinstateMemberUrl(memberId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getReinstateMemberMutationKey = () => ['reinstateMember'] as const;
+
+export const getReinstateMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reinstateMember>>, TError,ReinstateMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof reinstateMember>>, TError,ReinstateMemberMutationVariables, TContext> => {
+
+const mutationKey = getReinstateMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof reinstateMember>>, ReinstateMemberMutationVariables> = (props) => {
+          const {memberId} = props ?? {};
+
+          return  reinstateMember(memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ReinstateMemberMutationResult = NonNullable<Awaited<ReturnType<typeof reinstateMember>>>
+
+    export type ReinstateMemberMutationError = ErrorType<ErrorEnvelope>
+    export type ReinstateMemberMutationVariables = {memberId: string}
+
+    /**
+ * @summary Reinstate a suspended member
+ */
+export const useReinstateMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof reinstateMember>>, TError,ReinstateMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof reinstateMember>>,
+        TError,
+        ReinstateMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getReinstateMemberMutationOptions(options), queryClient);
+    }
+
+export const getRevokeMemberPostgresAccessUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/revoke-postgres-access`
+}
+
+/**
+ * Every personal login of the member is revoked at once (the proxies forget it), and their member role on every branch of every project they reach gets a new password, which ends its open sessions (the SQL editor and the console reconnect with the new one). Their Studio access and grants are untouched.
+ * @summary Revoke a member's Postgres access now
+ */
+export const revokeMemberPostgresAccess = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<RevokeResult> => {
+
+  return customFetch<RevokeResult>(getRevokeMemberPostgresAccessUrl(memberId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getRevokeMemberPostgresAccessMutationKey = () => ['revokeMemberPostgresAccess'] as const;
+
+export const getRevokeMemberPostgresAccessMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeMemberPostgresAccess>>, TError,RevokeMemberPostgresAccessMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof revokeMemberPostgresAccess>>, TError,RevokeMemberPostgresAccessMutationVariables, TContext> => {
+
+const mutationKey = getRevokeMemberPostgresAccessMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof revokeMemberPostgresAccess>>, RevokeMemberPostgresAccessMutationVariables> = (props) => {
+          const {memberId} = props ?? {};
+
+          return  revokeMemberPostgresAccess(memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type RevokeMemberPostgresAccessMutationResult = NonNullable<Awaited<ReturnType<typeof revokeMemberPostgresAccess>>>
+
+    export type RevokeMemberPostgresAccessMutationError = ErrorType<ErrorEnvelope>
+    export type RevokeMemberPostgresAccessMutationVariables = {memberId: string}
+
+    /**
+ * @summary Revoke a member's Postgres access now
+ */
+export const useRevokeMemberPostgresAccess = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof revokeMemberPostgresAccess>>, TError,RevokeMemberPostgresAccessMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof revokeMemberPostgresAccess>>,
+        TError,
+        RevokeMemberPostgresAccessMutationVariables,
+        TContext
+      > => {
+      return useMutation(getRevokeMemberPostgresAccessMutationOptions(options), queryClient);
+    }
+
+export const getSuspendMemberUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/suspend`
+}
+
+/**
+ * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.
+ * @summary Suspend a member
+ */
+export const suspendMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
+
+  return customFetch<Member>(getSuspendMemberUrl(memberId),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getSuspendMemberMutationKey = () => ['suspendMember'] as const;
+
+export const getSuspendMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof suspendMember>>, TError,SuspendMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof suspendMember>>, TError,SuspendMemberMutationVariables, TContext> => {
+
+const mutationKey = getSuspendMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof suspendMember>>, SuspendMemberMutationVariables> = (props) => {
+          const {memberId} = props ?? {};
+
+          return  suspendMember(memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type SuspendMemberMutationResult = NonNullable<Awaited<ReturnType<typeof suspendMember>>>
+
+    export type SuspendMemberMutationError = ErrorType<ErrorEnvelope>
+    export type SuspendMemberMutationVariables = {memberId: string}
+
+    /**
+ * @summary Suspend a member
+ */
+export const useSuspendMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof suspendMember>>, TError,SuspendMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof suspendMember>>,
+        TError,
+        SuspendMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getSuspendMemberMutationOptions(options), queryClient);
     }
 
 export const getListProjectsUrl = () => {

@@ -7,7 +7,8 @@
 
 /**
  * Where a member is: `invited` (not signed in yet), `pending` (signed up, waiting for an
- * admin to approve), `active`, or `removed`.
+ * admin to approve), `active`, `suspended` (grants kept, no access until a tenant admin
+ * reinstates them), or `removed`.
  */
 export type MemberStatusView = typeof MemberStatusView[keyof typeof MemberStatusView];
 
@@ -16,5 +17,6 @@ export const MemberStatusView = {
   invited: 'invited',
   pending: 'pending',
   active: 'active',
+  suspended: 'suspended',
   removed: 'removed',
 } as const;

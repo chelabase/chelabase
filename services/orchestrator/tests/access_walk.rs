@@ -27,6 +27,8 @@ enum Caller {
     OutsideSet,
     /// The positive control: exactly the minimum, with a role in the set for `ActAs`.
     AtMinimum,
+    /// Members hub T8 (P14): suspended by a tenant admin, with a Developer grant it keeps.
+    Suspended,
 }
 
 /// An access answer: status, code and `required`.
@@ -79,6 +81,11 @@ fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
     use Expect::{Pass, Refuse, Skip};
     let access = e.policy.access;
     match (caller, access) {
+        // P14: a suspended member is refused everywhere, whatever the route needs, except
+        // `/v1/me` (the one signed-in route), which tells them they're suspended.
+        (Caller::Suspended, Access::Public | Access::DataKey) => call("suspended", None, Skip),
+        (Caller::Suspended, Access::SignedIn) => call("suspended", None, Pass),
+        (Caller::Suspended, _) => call("suspended", Some("app"), Refuse((403, "member_suspended", None))),
         (Caller::AtMinimum, Access::Public | Access::SignedIn | Access::DataKey) => {
             call("stranger", None, Pass)
         }
@@ -185,6 +192,9 @@ async fn walk_world(mode: Mode, protected: bool) -> MemberWorld {
         &["app"],
     );
     w.metadata.add_member(w.tenant, "pending", MemberStatus::Pending, false);
+    // T8 (P14): suspended, keeping a Developer grant it would otherwise pass with.
+    w.metadata.add_granted(w.tenant, "suspended", w.project, PlatformRole::Developer, &["app"]);
+    w.metadata.set_member(w.tenant, "suspended", |m| m.status = MemberStatus::Suspended);
     // A reconcile gives each member a member role on `dev` that can become `app` (T9).
     let mut rows = Vec::new();
     for role in [
@@ -322,6 +332,8 @@ fn body_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> Option<Value> {
         (r::UPDATE_INSTANCE_SETTINGS.name, json!({ "open_signup": false })),
         (r::UPDATE_TENANT.name, json!({ "display_name": "Walked" })),
         (r::APPROVE_MEMBER.name, json!({ "grants": [] })),
+        // Members hub T8: the personal login's name.
+        ("orchestrator.put_personal_login", json!({ "name": "walked" })),
     ];
     if let Some((_, body)) = typed.into_iter().find(|(n, _)| *n == name) {
         return Some(body);
@@ -400,6 +412,15 @@ async fn every_route_refuses_non_members() {
 async fn every_route_refuses_pending_members() {
     for mode in [Mode::SelfHosted, Mode::Platform] {
         walk(Caller::Pending, mode).await;
+    }
+}
+
+// Members hub T8 (P14, T2-3): every route but `/v1/me` answers a suspended member 403
+// `member_suspended`, the personal-login routes included.
+#[tokio::test]
+async fn every_route_refuses_suspended_members_but_me() {
+    for mode in [Mode::SelfHosted, Mode::Platform] {
+        walk(Caller::Suspended, mode).await;
     }
 }
 

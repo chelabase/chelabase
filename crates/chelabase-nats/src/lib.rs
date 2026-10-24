@@ -406,6 +406,9 @@ pub const SUBJECT_ROLE_RESET: &str = "chelabase.rpc.roles.reset";
 pub const SUBJECT_ROLE_DELETE: &str = "chelabase.rpc.roles.delete";
 /// Core request/reply: change a role's attributes or memberships ([`RoleUpdateRequest`]).
 pub const SUBJECT_ROLE_UPDATE: &str = "chelabase.rpc.roles.update";
+/// T10 fix (preview, then confirm): what a role delete to a successor would expose (a
+/// [`RoleDeleteRequest`] in, a [`RoleReply`] with `preview` out). A read only.
+pub const SUBJECT_ROLE_DELETE_PREVIEW: &str = "chelabase.rpc.roles.delete_preview";
 
 fn yes() -> bool {
     true
@@ -515,6 +518,143 @@ pub struct RoleRequest {
     pub name: String,
 }
 
+/// T10: a role delete and the role its objects go to. `successor` is a role on the branch the
+/// owner can SET to, or `chelabase_orphaned` (the quarantine role); a request without one (an
+/// orchestrator that predates T10) means `chelabase_orphaned`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoleDeleteRequest {
+    pub branch_id: BranchId,
+    pub name: String,
+    #[serde(default = "quarantine_successor")]
+    pub successor: String,
+    /// T10 fix: the preview's `confirm` token, when the Admin confirmed the exposures it
+    /// listed. Absent (and never serialized) when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm: Option<String>,
+}
+
+/// T10 fix: the kind of an exposed object (`function`, `procedure`, `view`,
+/// `materialized_view` on the wire). The derived order is the one exposures sort by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExposureKind {
+    Function,
+    Procedure,
+    View,
+    MaterializedView,
+}
+
+impl ExposureKind {
+    /// Every kind, in order.
+    pub const ALL: [ExposureKind; 4] = [Self::Function, Self::Procedure, Self::View, Self::MaterializedView];
+
+    /// The wire name (as serde writes it).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Procedure => "procedure",
+            Self::View => "view",
+            Self::MaterializedView => "materialized_view",
+        }
+    }
+
+    /// The kind whose wire name is exactly `name`.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| k.as_str() == name)
+    }
+}
+
+/// T10 fix: an object the deleted role owns that would run with the successor's rights for
+/// someone else: a `SECURITY DEFINER` routine or a view (or materialized view) without
+/// `security_invoker = true`, carrying a privilege granted to a grantee other than the
+/// successor (and the deleted role itself, whose own entry becomes the successor's). A routine's
+/// PUBLIC grant alone doesn't count (PUBLIC EXECUTE is revoked on every routine that moves).
+/// `identity`: `regprocedure` / `regclass` text; `grantees` sorted, deduplicated, PUBLIC as
+/// `"PUBLIC"`. A list of them is sorted by this derived order (database, kind, identity,
+/// grantees).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Exposure {
+    pub database: String,
+    pub kind: ExposureKind,
+    pub identity: String,
+    pub grantees: Vec<String>,
+}
+
+/// T10 fix: a role delete's preview (and the current state a refused delete answers with):
+/// the exposures over every database, and the token that confirms them (`None` when there are
+/// none or the successor is the quarantine role).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletePreview {
+    pub successor: String,
+    #[serde(default)]
+    pub exposures: Vec<Exposure>,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+/// T10 fix: the confirm token: the lowercase hex SHA-256 of the canonical JSON of
+/// `{successor, exposures}`: object keys sorted at every level, no whitespace, e.g.
+/// `{"exposures":[{"database":"app","grantees":["anon"],"identity":"public.f()","kind":"function"}],"successor":"heir"}`.
+/// Independent of how `serde_json` orders its maps (the `preserve_order` feature).
+pub fn exposure_token(successor: &str, exposures: &[Exposure]) -> String {
+    use sha2::{Digest, Sha256};
+    let value = serde_json::json!({ "successor": successor, "exposures": exposures });
+    let mut canonical = String::new();
+    canonical_json(&value, &mut canonical);
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+/// `value` as compact JSON with every object's keys sorted (by their UTF-8 bytes).
+fn canonical_json(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, key) in keys.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(key.clone()).to_string());
+                out.push(':');
+                canonical_json(&map[key], out);
+            }
+            out.push('}');
+        }
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        scalar => out.push_str(&scalar.to_string()),
+    }
+}
+
+/// The quarantine role, a [`RoleDeleteRequest`]'s successor when none is named.
+pub const QUARANTINE_SUCCESSOR: &str = "chelabase_orphaned";
+
+fn quarantine_successor() -> String {
+    QUARANTINE_SUCCESSOR.to_string()
+}
+
+/// T10: what a role delete handed to its successor, over every database: `count` objects, and
+/// the `SECURITY DEFINER` routines among them (`regprocedure` text) for review.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reassigned {
+    pub count: u64,
+    pub definers: Vec<String>,
+    /// T10 fix: the exposures the delete kept because the Admin confirmed them (empty when
+    /// none, or for the quarantine role; absent on the wire then).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub confirmed: Vec<Exposure>,
+}
+
 /// A data API key that still uses a role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyRef {
@@ -525,7 +665,8 @@ pub struct KeyRef {
 /// The worker's answer. `code` says why when `ok` is false: `invalid_role_name`,
 /// `reserved_role_name`, `role_exists`, `role_cap_reached`, `branch_not_ready`, `not_found`,
 /// `role_in_use` (with `keys`), `role_privilege_mismatch`, `role_membership_not_allowed`,
-/// `role_attribute_not_allowed`, `not_applied`, `failed`. `error` is
+/// `role_attribute_not_allowed`, `invalid_successor`, `exposure_unconfirmed` (with `preview`),
+/// `not_applied`, `failed`. `error` is
 /// a message (never a password).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoleReply {
@@ -534,6 +675,14 @@ pub struct RoleReply {
     pub error: Option<String>,
     #[serde(default)]
     pub keys: Vec<KeyRef>,
+    /// T10: a done delete's [`Reassigned`]; absent in other replies and from workers that
+    /// predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reassigned: Option<Reassigned>,
+    /// T10 fix: a preview's answer, and the current exposures a delete refused with
+    /// `exposure_unconfirmed` answers with; absent otherwise (and from workers that predate it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<DeletePreview>,
 }
 
 /// Core request/reply: the live sessions of a role on a branch's compute (a [`RoleRequest`]
@@ -588,6 +737,48 @@ impl RoleSessionsReply {
             ..Self::not_running()
         }
     }
+}
+
+/// EOS-H1 (user ruling 2026-10-23: fail closed, via the worker): would a key create, or a
+/// role's membership change, let the data API reach a role with the members hub's "all rows"
+/// policy? An [`AllRowsCheckRequest`] in, an [`AllRowsCheckReply`] out. The worker reads, as
+/// `cloud_admin` on the branch's compute, the cluster's memberships and the "all rows" roles of
+/// every live database. A read only.
+pub const SUBJECT_ALL_ROWS_CHECK: &str = "chelabase.rpc.roles.all_rows_check";
+
+/// What [`SUBJECT_ALL_ROWS_CHECK`] checks on `branch_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllRowsCheckRequest {
+    pub branch_id: BranchId,
+    /// The roles the data API reaches rows through, sorted and deduplicated: a key create's
+    /// role; for a membership change, `anon`, `authenticated`, `authenticator` and the role of
+    /// every live (unrevoked) key of the branch.
+    pub starting: Vec<String>,
+    /// A membership change: only a (starting role, "all rows" role) pair it newly connects
+    /// counts. Absent (and never serialized) for a key create, where any reach counts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<MembershipChange>,
+}
+
+/// A role's memberships replaced, as the worker's role update applies it: `member_of` is the
+/// whole new list; the role's `pg_*` and Chelabase memberships stay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipChange {
+    pub role: String,
+    pub member_of: Vec<String>,
+}
+
+/// The worker's answer to [`SUBJECT_ALL_ROWS_CHECK`] (`status`: `clear`, `exposed`, `failed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AllRowsCheckReply {
+    /// Nothing is (newly) exposed.
+    Clear,
+    /// One of the shortest chains, `[starting role, …, "all rows" role]`.
+    Exposed { chain: Vec<String> },
+    /// The check couldn't be completed (the branch isn't ready, the compute can't be reached,
+    /// a read failed or ran past its deadline): the caller refuses, never allows.
+    Failed { message: String },
 }
 
 /// The worker's answer. `kind` says why when `ok` is false: `refused` (the caller's fault;
@@ -1686,9 +1877,181 @@ mod tests {
             code: Some("role_in_use".into()),
             error: Some("in use".into()),
             keys: vec![KeyRef { id: Uuid::nil(), name: "k".into() }],
+            reassigned: None,
+            preview: None,
         };
         let back: RoleReply = serde_json::from_slice(&serde_json::to_vec(&in_use).unwrap()).unwrap();
         assert_eq!(back, in_use);
+    }
+
+    // T10: a delete names its successor; one without (an older orchestrator) means the
+    // quarantine role, never the owner.
+    #[test]
+    fn a_delete_without_a_successor_means_the_quarantine_role() {
+        let branch = BranchId::new();
+        let old = serde_json::json!({ "branch_id": branch, "name": "app" });
+        let request: RoleDeleteRequest = serde_json::from_value(old).unwrap();
+        assert_eq!(request.successor, "chelabase_orphaned");
+        let named = RoleDeleteRequest { branch_id: branch, name: "app".into(), successor: "heir".into(), confirm: None };
+        let json = serde_json::to_value(&named).unwrap();
+        assert_eq!(json["successor"], "heir");
+        let back: RoleDeleteRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back, named);
+    }
+
+    // T10: a done delete carries what moved; other replies (and older workers) carry nothing.
+    #[test]
+    fn a_delete_reply_carries_what_was_reassigned() {
+        let done = RoleReply {
+            ok: true,
+            code: None,
+            error: None,
+            keys: vec![],
+            reassigned: Some(Reassigned { count: 3, definers: vec!["public.f(integer)".into()], confirmed: vec![] }),
+            preview: None,
+        };
+        let json = serde_json::to_value(&done).unwrap();
+        assert_eq!(json["reassigned"], serde_json::json!({ "count": 3, "definers": ["public.f(integer)"] }));
+        let back: RoleReply = serde_json::from_value(json).unwrap();
+        assert_eq!(back, done);
+        let plain = RoleReply { reassigned: None, ..done };
+        assert!(serde_json::to_value(&plain).unwrap().get("reassigned").is_none());
+        let old: RoleReply = serde_json::from_str(r#"{"ok":true,"code":null,"error":null}"#).unwrap();
+        assert_eq!(old.reassigned, None);
+    }
+
+    // --- T10 fix: preview, then confirm --------------------------------------------------
+
+    fn exposure(kind: ExposureKind, identity: &str, grantees: &[&str]) -> Exposure {
+        Exposure {
+            database: "app".into(),
+            kind,
+            identity: identity.into(),
+            grantees: grantees.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_preview_subject_is_its_own() {
+        assert_eq!(SUBJECT_ROLE_DELETE_PREVIEW, "chelabase.rpc.roles.delete_preview");
+    }
+
+    // The wire shapes: kinds in snake_case, `confirm` on a request and `preview` on a reply
+    // absent when unset (and an older peer's JSON without them parses).
+    #[test]
+    fn exposure_wire_shapes() {
+        let kinds = [
+            (ExposureKind::Function, "function"),
+            (ExposureKind::Procedure, "procedure"),
+            (ExposureKind::View, "view"),
+            (ExposureKind::MaterializedView, "materialized_view"),
+        ];
+        for (kind, name) in kinds {
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+            let back: ExposureKind = serde_json::from_value(serde_json::json!(name)).unwrap();
+            assert_eq!(back, kind);
+        }
+        let e = exposure(ExposureKind::View, "public.v", &["PUBLIC"]);
+        assert_eq!(
+            serde_json::to_value(&e).unwrap(),
+            serde_json::json!({ "database": "app", "kind": "view", "identity": "public.v", "grantees": ["PUBLIC"] })
+        );
+
+        let branch = BranchId::new();
+        let bare = RoleDeleteRequest { branch_id: branch, name: "app".into(), successor: "heir".into(), confirm: None };
+        assert!(serde_json::to_value(&bare).unwrap().get("confirm").is_none());
+        let confirmed = RoleDeleteRequest { confirm: Some("ab".repeat(32)), ..bare.clone() };
+        let json = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(json["confirm"], "ab".repeat(32));
+        assert_eq!(serde_json::from_value::<RoleDeleteRequest>(json).unwrap(), confirmed);
+
+        let plain = RoleReply { ok: true, code: None, error: None, keys: vec![], reassigned: None, preview: None };
+        assert!(serde_json::to_value(&plain).unwrap().get("preview").is_none());
+        let preview = DeletePreview {
+            successor: "heir".into(),
+            exposures: vec![e.clone()],
+            confirm: Some("cd".repeat(32)),
+        };
+        let refused = RoleReply {
+            ok: false,
+            code: Some("exposure_unconfirmed".into()),
+            error: Some("confirm".into()),
+            keys: vec![],
+            reassigned: None,
+            preview: Some(preview.clone()),
+        };
+        let json = serde_json::to_value(&refused).unwrap();
+        assert_eq!(json["preview"]["confirm"], "cd".repeat(32));
+        assert_eq!(json["preview"]["exposures"][0]["kind"], "view");
+        assert_eq!(serde_json::from_value::<RoleReply>(json).unwrap(), refused);
+
+        // A done delete lists what it kept on confirmation; none is absent, and an older
+        // worker's `reassigned` (no `confirmed`) parses.
+        let none = Reassigned { count: 1, definers: vec![], confirmed: vec![] };
+        assert_eq!(serde_json::to_value(&none).unwrap(), serde_json::json!({ "count": 1, "definers": [] }));
+        let kept = Reassigned { confirmed: vec![e], ..none.clone() };
+        let json = serde_json::to_value(&kept).unwrap();
+        assert_eq!(json["confirmed"][0]["identity"], "public.v");
+        assert_eq!(serde_json::from_value::<Reassigned>(json).unwrap(), kept);
+        let old: Reassigned = serde_json::from_str(r#"{"count":2,"definers":["public.f()"]}"#).unwrap();
+        assert!(old.confirmed.is_empty());
+    }
+
+    // The derived order the worker sorts by: database, kind, identity, grantees.
+    #[test]
+    fn exposures_sort_by_database_kind_identity() {
+        let mut list = [
+            Exposure { database: "b".into(), ..exposure(ExposureKind::Function, "public.a()", &["anon"]) },
+            exposure(ExposureKind::View, "public.a", &["anon"]),
+            exposure(ExposureKind::Function, "public.z()", &["anon"]),
+            exposure(ExposureKind::MaterializedView, "public.a", &["anon"]),
+            exposure(ExposureKind::Procedure, "public.a()", &["anon"]),
+        ];
+        list.sort();
+        let order: Vec<(&str, ExposureKind, &str)> =
+            list.iter().map(|e| (e.database.as_str(), e.kind, e.identity.as_str())).collect();
+        assert_eq!(
+            order,
+            [
+                ("app", ExposureKind::Function, "public.z()"),
+                ("app", ExposureKind::Procedure, "public.a()"),
+                ("app", ExposureKind::View, "public.a"),
+                ("app", ExposureKind::MaterializedView, "public.a"),
+                ("b", ExposureKind::Function, "public.a()"),
+            ]
+        );
+    }
+
+    // The token: hex SHA-256 of the canonical JSON (keys sorted at every level, no whitespace),
+    // pinned against hashes computed outside Rust (`sha256sum` of the literal texts below).
+    #[test]
+    fn the_confirm_token_is_the_canonical_json_hash() {
+        // {"exposures":[],"successor":"heir"}
+        assert_eq!(
+            exposure_token("heir", &[]),
+            "888703465941594e4bc108b738214543ab838cc0ab2dfede7e90ca5f44df21ae"
+        );
+        // {"exposures":[{"database":"app","grantees":["anon"],"identity":"public.planted()","kind":"function"},
+        //  {"database":"app","grantees":["PUBLIC","web"],"identity":"public.\"Odd \"\"v\"\"\"","kind":"materialized_view"}],
+        //  "successor":"heir"} (one line)
+        let list = [
+            exposure(ExposureKind::Function, "public.planted()", &["anon"]),
+            exposure(ExposureKind::MaterializedView, "public.\"Odd \"\"v\"\"\"", &["PUBLIC", "web"]),
+        ];
+        let token = exposure_token("heir", &list);
+        assert_eq!(token, "46384bb8aaf0639d087b2d521c15896ffffd02807c75efd9021867bc69ac5b55");
+        // Anything that changes the exposure changes the token: a grantee, the successor, the
+        // database, the kind.
+        let mut more = list.to_vec();
+        more[0].grantees.push("authenticated".into());
+        assert_ne!(exposure_token("heir", &more), token);
+        assert_ne!(exposure_token("heir2", &list), token);
+        let mut moved = list.to_vec();
+        moved[1].database = "other".into();
+        assert_ne!(exposure_token("heir", &moved), token);
+        let mut kind = list.to_vec();
+        kind[1].kind = ExposureKind::View;
+        assert_ne!(exposure_token("heir", &kind), token);
     }
 
     #[test]
@@ -1712,6 +2075,52 @@ mod tests {
         // A bare failure parses, with no sessions.
         let bare: RoleSessionsReply = serde_json::from_str(r#"{"ok":false,"code":"failed","error":"x"}"#).unwrap();
         assert!(!bare.compute_running && bare.sessions.is_empty());
+    }
+
+    // EOS-H1 (fail closed, via the worker): the all-rows check's subject and wire shapes. A
+    // key create's request carries no `change`; a reply is tagged by `status`, and one the
+    // orchestrator can't parse is a transport failure there (refused, never allowed).
+    #[test]
+    fn all_rows_check_wire_shapes() {
+        assert_eq!(SUBJECT_ALL_ROWS_CHECK, "chelabase.rpc.roles.all_rows_check");
+        let branch = BranchId::new();
+        let key = AllRowsCheckRequest { branch_id: branch, starting: vec!["k".into()], change: None };
+        let json = serde_json::to_value(&key).unwrap();
+        assert_eq!(json, serde_json::json!({ "branch_id": branch, "starting": ["k"] }));
+        let parsed: AllRowsCheckRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, key);
+        let change = AllRowsCheckRequest {
+            branch_id: branch,
+            starting: vec!["anon".into(), "authenticated".into(), "authenticator".into(), "k".into()],
+            change: Some(MembershipChange { role: "m".into(), member_of: vec![] }),
+        };
+        let json = serde_json::to_value(&change).unwrap();
+        assert_eq!(json["change"], serde_json::json!({ "role": "m", "member_of": [] }));
+        assert_eq!(serde_json::from_value::<AllRowsCheckRequest>(json).unwrap(), change);
+
+        let replies = [
+            (AllRowsCheckReply::Clear, serde_json::json!({ "status": "clear" })),
+            (
+                AllRowsCheckReply::Exposed { chain: vec!["k".into(), "m".into(), "r".into()] },
+                serde_json::json!({ "status": "exposed", "chain": ["k", "m", "r"] }),
+            ),
+            (
+                AllRowsCheckReply::Failed { message: "compute unreachable".into() },
+                serde_json::json!({ "status": "failed", "message": "compute unreachable" }),
+            ),
+        ];
+        for (reply, wire) in replies {
+            assert_eq!(serde_json::to_value(&reply).unwrap(), wire);
+            assert_eq!(serde_json::from_value::<AllRowsCheckReply>(wire).unwrap(), reply);
+        }
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({ "status": "allowed" }),
+            serde_json::json!({ "status": "exposed" }),
+            serde_json::json!({ "ok": true }),
+        ] {
+            assert!(serde_json::from_value::<AllRowsCheckReply>(bad.clone()).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@ use chelabase_metadata::{
     ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
 use chelabase_metadata::members::InviteDescription;
+use chelabase_metadata::personal_logins::LoginEndpoint;
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
 use chelabase_zitadel::client::Zitadel;
@@ -54,6 +55,8 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
+/// Members hub T8: personal-login rows by (tenant, Zitadel user id).
+type LoginRows = HashMap<(TenantId, String), Vec<LoginEndpoint>>;
 
 #[derive(Clone, Default)]
 struct FakeNeon {
@@ -83,6 +86,18 @@ struct FakeNeon {
     invites: Arc<Mutex<HashMap<String, InviteDescription>>>,
     /// RT1 T6: Zitadel org id -> the tenant bound to it.
     tenants: Arc<Mutex<HashMap<String, TenantId>>>,
+    /// Members hub T8: each (tenant, Zitadel user id)'s personal-login rows, which
+    /// `revoke_logins_for_zitadel_user` answers (every row of the member, revoked ones
+    /// included; an unknown user has none); each revocation asked for, in order; and while
+    /// `fail_revocation` is set, the revocation write fails (a database error).
+    login_rows: Arc<Mutex<LoginRows>>,
+    revocations: Arc<Mutex<Vec<(TenantId, String)>>>,
+    fail_revocation: Arc<Mutex<bool>>,
+    /// Final round A: each offboarded mark cleared (D7), a clear that fails while
+    /// `fail_clear` is set, and a tenant lookup that fails while `fail_tenant_lookup` is (T8-2).
+    clears: Arc<Mutex<Vec<(TenantId, String)>>>,
+    fail_clear: Arc<Mutex<bool>>,
+    fail_tenant_lookup: Arc<Mutex<bool>>,
 }
 
 /// The app-user rows the fake holds.
@@ -612,7 +627,38 @@ impl NeonMetadataPort for FakeNeon {
 
     async fn tenant_by_org(&self, zitadel_org_id: &str) -> Result<Option<TenantId>, MetadataError> {
         self.check()?;
+        if *self.fail_tenant_lookup.lock().unwrap() {
+            return Err(MetadataError::Config("the tenant lookup failed".into()));
+        }
         Ok(self.tenants.lock().unwrap().get(zitadel_org_id).copied())
+    }
+
+    async fn clear_offboarded(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<bool, MetadataError> {
+        self.check()?;
+        if *self.fail_clear.lock().unwrap() {
+            return Err(MetadataError::Config("the clear failed".into()));
+        }
+        self.clears.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
+        Ok(true)
+    }
+
+    async fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Vec<LoginEndpoint>, MetadataError> {
+        self.check()?;
+        if *self.fail_revocation.lock().unwrap() {
+            return Err(MetadataError::Config("the revocation write failed".into()));
+        }
+        self.revocations.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
+        Ok(self
+            .login_rows
+            .lock()
+            .unwrap()
+            .get(&(tenant, zitadel_user_id.to_string()))
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -954,11 +1000,13 @@ fn rules(mode: Mode, strength: bool) -> RoleSettings {
     .unwrap()
 }
 
-/// The proxy cache stand-in: records each `password_updated`; with `down`, it fails.
+/// The proxy cache stand-in: records each `password_updated` and wakes waiters; with `down`,
+/// it fails.
 #[derive(Clone, Default)]
 struct FakeCache {
     sent: Arc<Mutex<Vec<(String, String)>>>,
     down: Arc<Mutex<bool>>,
+    published: Arc<tokio::sync::Notify>,
 }
 
 impl CachePort for FakeCache {
@@ -972,9 +1020,31 @@ impl CachePort for FakeCache {
                 .lock()
                 .unwrap()
                 .push((endpoint_id.to_string(), role.to_string()));
+            self.published.notify_waiters();
             anyhow::ensure!(!*self.down.lock().unwrap(), "valkey is down");
             Ok(1)
         })
+    }
+}
+
+impl FakeCache {
+    /// Members hub T8 (S19): waits (up to 5 s, on the publish notifications, never a sleep)
+    /// until every (endpoint, role) of `want` was published; whether they all were.
+    async fn wait_for(&self, want: &[(String, String)]) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let notified = self.published.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let sent = self.sent.lock().unwrap().clone();
+            if want.iter().all(|w| sent.contains(w)) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                let sent = self.sent.lock().unwrap().clone();
+                return want.iter().all(|w| sent.contains(w));
+            }
+        }
     }
 }
 
@@ -5271,6 +5341,168 @@ async fn webhook_member_user_events_publish_an_access_event() {
     }
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert_eq!(a.rt_events.access.lock().unwrap().len(), kinds.len());
+}
+
+// ---- Members hub T8: the webhook revokes an offboarded member's personal logins (D4, P17) ----
+
+/// The webhook's app with tenant org `tenant-org` bound, its Zitadel user `284617` holding a
+/// personal login `zed` with rows on `ep-main` and `ep-child`; the cache, the resync port and
+/// the realtime events the app was given.
+struct Offboarding {
+    app: Internal,
+    neon: FakeNeon,
+    cache: FakeCache,
+    resync: FakeResync,
+    rt_events: FakeRtEvents,
+    tenant: TenantId,
+    main: BranchId,
+    child: BranchId,
+}
+
+impl Offboarding {
+    fn rows(&self) -> Vec<(String, String)> {
+        vec![("ep-main".into(), "zed".into()), ("ep-child".into(), "zed".into())]
+    }
+}
+
+async fn offboarding() -> Offboarding {
+    let w = app_world();
+    let tenant = TenantId::new();
+    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
+    let row = |branch: BranchId, endpoint: &str| LoginEndpoint {
+        branch_id: branch.as_uuid(),
+        endpoint_id: endpoint.into(),
+        role_name: "zed".into(),
+    };
+    w.neon
+        .login_rows
+        .lock()
+        .unwrap()
+        .insert((tenant, "284617".into()), vec![row(w.main, "ep-main"), row(w.child, "ep-child")]);
+    let (cache, resync, rt_events) = (FakeCache::default(), FakeResync::default(), FakeRtEvents::default());
+    let app = spawn_with_app(
+        w.neon.clone(),
+        w.locator.clone(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        cache.clone(),
+        "http://127.0.0.1:9",
+        AppSetup {
+            key: w.key.clone(),
+            resync: resync.clone(),
+            rt_events: rt_events.clone(),
+            ..AppSetup::default()
+        },
+    )
+    .await;
+    Offboarding { app, neon: w.neon.clone(), cache, resync, rt_events, tenant, main: w.main, child: w.child }
+}
+
+// D4: `user.deactivated`, `user.locked` and `user.removed` for a tenant org revoke the member's
+// logins (the metadata write), tell the proxy cache about every row, ask each branch to
+// reconcile its member roles, then publish today's realtime access event (W18). An unknown user
+// revokes nothing; another org isn't a tenant's.
+#[tokio::test]
+async fn a_deactivated_zitadel_user_loses_their_logins_and_the_cache_is_cleared() {
+    for kind in ["user.deactivated", "user.locked", "user.removed"] {
+        let o = offboarding().await;
+        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
+        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}");
+        assert_eq!(
+            o.neon.revocations.lock().unwrap().clone(),
+            vec![(o.tenant, "284617".to_string())],
+            "{kind}: the member's logins are revoked"
+        );
+        assert!(
+            o.cache.wait_for(&o.rows()).await,
+            "{kind}: the proxy cache is told about every row: {:?}",
+            o.cache.sent.lock().unwrap()
+        );
+        let asked = o.resync.members_asked.lock().unwrap().clone();
+        for branch in [o.main, o.child] {
+            assert!(asked.contains(&branch), "{kind}: {branch} reconciles its member roles: {asked:?}");
+        }
+        assert!(
+            eventually(|| o.rt_events.access.lock().unwrap().len() == 1).await,
+            "{kind}: the realtime access event still goes out"
+        );
+    }
+
+    let o = offboarding().await;
+    let app_user = uuid::Uuid::new_v4().to_string();
+    for (org, user) in [("tenant-org", "999"), ("no-such-org", "284617"), (ORG, app_user.as_str())] {
+        let body = user_event("user.deactivated", org, user, chrono::Utc::now());
+        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{org} {user}");
+    }
+    assert_eq!(
+        o.neon.revocations.lock().unwrap().clone(),
+        vec![(o.tenant, "999".to_string())],
+        "only the tenant org's event asks for a revocation"
+    );
+    assert!(o.cache.sent.lock().unwrap().is_empty(), "an unknown user has no rows to clear");
+}
+
+// P17: a revocation write that fails answers 500, so Zitadel delivers the event again, and
+// nothing after it ran (no cache message, no realtime event); the redelivery completes it.
+#[tokio::test]
+async fn a_failed_revocation_is_500_so_zitadel_retries() {
+    let o = offboarding().await;
+    *o.neon.fail_revocation.lock().unwrap() = true;
+    let body = user_event("user.deactivated", "tenant-org", "284617", chrono::Utc::now());
+    assert_eq!(o.app.event(&body, signed(&body)).await, 500);
+    assert!(o.cache.sent.lock().unwrap().is_empty());
+    assert!(o.resync.members_asked.lock().unwrap().is_empty());
+    assert!(o.rt_events.access.lock().unwrap().is_empty(), "the revocation comes before the realtime event");
+
+    *o.neon.fail_revocation.lock().unwrap() = false;
+    assert_eq!(o.app.event(&body, signed(&body)).await, 200, "the redelivery");
+    assert!(o.cache.wait_for(&o.rows()).await, "{:?}", o.cache.sent.lock().unwrap());
+    assert!(eventually(|| !o.rt_events.access.lock().unwrap().is_empty()).await);
+    assert_eq!(o.rt_events.access.lock().unwrap().len(), 1, "the failed delivery published nothing");
+}
+
+// ---- Members hub step 1, final fix round, area A ----
+
+// T8-2 (P17): a tenant lookup that fails on an offboarding event is a 500, so Zitadel delivers
+// it again; never a 200 that skipped the revocation.
+#[tokio::test]
+async fn a_failed_tenant_lookup_on_offboarding_is_500() {
+    for kind in ["user.deactivated", "user.locked", "user.removed"] {
+        let o = offboarding().await;
+        *o.neon.fail_tenant_lookup.lock().unwrap() = true;
+        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
+        assert_eq!(o.app.event(&body, signed(&body)).await, 500, "{kind}");
+        *o.neon.fail_tenant_lookup.lock().unwrap() = false;
+        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}: the redelivery");
+        assert_eq!(o.neon.revocations.lock().unwrap().clone(), vec![(o.tenant, "284617".to_string())], "{kind}");
+    }
+}
+
+// D7: `user.reactivated` and `user.unlocked` for a tenant org clear the member's offboarded
+// mark (its logins stay revoked: nothing is revoked or published for them); a failed clear is
+// a 500 so Zitadel retries; an app-users org's reactivation still syncs the app user.
+#[tokio::test]
+async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
+    for kind in ["user.reactivated", "user.unlocked"] {
+        let o = offboarding().await;
+        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
+        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}");
+        assert_eq!(
+            o.neon.clears.lock().unwrap().clone(),
+            vec![(o.tenant, "284617".to_string())],
+            "{kind}: the mark isn't cleared"
+        );
+        assert!(o.neon.revocations.lock().unwrap().is_empty(), "{kind}");
+
+        *o.neon.fail_clear.lock().unwrap() = true;
+        assert_eq!(o.app.event(&body, signed(&body)).await, 500, "{kind}: a failed clear");
+    }
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let body = user_event("user.reactivated", ORG, &user.to_string(), chrono::Utc::now());
+    assert_eq!(a.app.event(&body, signed(&body)).await, 200);
+    assert!(eventually(|| a.published().len() == 1).await, "{:?}", a.published());
 }
 
 // ---- Fork round 4, C4 (RT4-2, SP1, SP4, SP11, SP23) ----

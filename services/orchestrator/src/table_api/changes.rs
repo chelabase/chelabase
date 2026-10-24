@@ -40,6 +40,7 @@ use tracing::{error, info, warn};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
+use super::privilege_ops::{self, PrivilegeChecks, Prepared};
 use crate::access::Target;
 use crate::branches::{parse_body, unprocessable};
 use crate::console::unavailable;
@@ -87,6 +88,19 @@ fn refused(err: &DdlError) -> ApiError {
     ApiError::invalid_request(400, err.to_string()).with_extra("op_index", json!(err.op_index))
 }
 
+/// R6 / MH-30: an owner run is the route's Admin rule (Admin implies the owner, R7), so a
+/// caller below Admin is told `required: "admin"` rather than the SQL editor's `"owner"`.
+fn owner_run_needs_admin(mut err: ApiError, owner_run: bool) -> ApiError {
+    if owner_run && err.status == 403 && err.code == ErrorCode::Forbidden {
+        for (key, value) in &mut err.extra {
+            if key == "required" && value == "owner" {
+                *value = json!("admin");
+            }
+        }
+    }
+    err
+}
+
 /// The request's checks that need no compute (step 1): its `lock_timeout` in ms, or the error.
 fn validate(request: &SchemaChangeRequest) -> Result<u64, ApiError> {
     if request.operations.is_empty() {
@@ -106,9 +120,30 @@ fn validate(request: &SchemaChangeRequest) -> Result<u64, ApiError> {
             "`cascade.dependents_hash` must be 64 lowercase hex characters (a dry run's `dependents.hash`)",
         ));
     }
+    if let Some(e) = request.expect_acl.iter().find(|e| !is_hash(&e.acl_hash)) {
+        return Err(unprocessable(&format!(
+            "`expect_acl`: {:?} isn't 64 lowercase hex characters (a privileges read's `acl_hash`)",
+            e.acl_hash
+        )));
+    }
+    // What the compute decides is left open here: the server version (MAINTAIN), the
+    // functions (resolved in the transaction, P11) and the session role (the grantee check).
+    let resolved_functions = request
+        .operations
+        .iter()
+        .filter_map(|op| match op {
+            Operation::GrantFunction { function, .. } | Operation::RevokeFunction { function, .. } => {
+                Some((function.oid, "pg_catalog.now()".to_string()))
+            }
+            _ => None,
+        })
+        .collect();
     let ctx = RenderContext {
         tables: Vec::new(),
         cascade: request.cascade.is_some(),
+        resolved_functions,
+        server_version_num: i32::MAX,
+        ..Default::default()
     };
     let statements = ddl::render(&request.operations, &ctx).map_err(|e| refused(&e))?;
     for (op_index, op) in request.operations.iter().enumerate() {
@@ -166,6 +201,8 @@ pub const DEFAULT_DRY_RUN_MAX_BYTES: i64 = 268_435_456;
 pub(super) struct Notices {
     kept: Vec<String>,
     cascaded: Option<BTreeSet<String>>,
+    /// P29: Postgres warned that it granted or revoked less than asked (01006, 01007).
+    not_applied: bool,
 }
 
 impl Notices {
@@ -173,10 +210,16 @@ impl Notices {
         Notices {
             kept: Vec::new(),
             cascaded: Some(BTreeSet::new()),
+            not_applied: false,
         }
     }
 
     fn push(&mut self, notice: &DbError) {
+        // P29: matched by SQLSTATE (`privilege_not_revoked`, `privilege_not_granted`), never
+        // by text; a relation-level REVOKE sends one per column.
+        if matches!(notice.code().code(), "01006" | "01007") {
+            self.not_applied = true;
+        }
         match cascaded_objects(notice.message(), notice.detail()) {
             Some(objects) => {
                 if let Some(set) = &mut self.cascaded {
@@ -286,7 +329,7 @@ fn with_fields(err: ApiError, db: &DbError, op_index: Option<usize>, dry_run: bo
 }
 
 /// `dry_run: true` on a dry run's error (P10).
-fn on_dry(err: ApiError, dry_run: bool) -> ApiError {
+pub(super) fn on_dry(err: ApiError, dry_run: bool) -> ApiError {
     if dry_run {
         err.with_extra("dry_run", json!(true))
     } else {
@@ -296,7 +339,7 @@ fn on_dry(err: ApiError, dry_run: bool) -> ApiError {
 
 /// A failure of one of our own reads: a lock not granted in time is 409 `lock_timeout`, a
 /// timeout 504, a broken connection 503, anything else ours to fix (500, logged).
-fn read_failure(err: &tokio_postgres::Error, what: &str, dry_run: bool) -> ApiError {
+pub(super) fn read_failure(err: &tokio_postgres::Error, what: &str, dry_run: bool) -> ApiError {
     let out = match err.as_db_error() {
         None => failure(err, None, false),
         Some(db) if db.code().code() == "55P03" => ApiError::new(
@@ -512,6 +555,17 @@ struct Plan<'a> {
     confirmed: Option<&'a str>,
     set_role: Option<&'a str>,
     max_bytes: i64,
+    /// The database owner's name (the session role of an owner run).
+    owner: &'a str,
+    /// The request holds a privilege op: the members hub's checks apply (spec Part 4).
+    privileges: Option<PrivilegeChecks<'a>>,
+}
+
+impl Plan<'_> {
+    /// The role the statements run as: the acting role, or the database owner.
+    fn session_role(&self) -> &str {
+        self.set_role.unwrap_or(self.owner)
+    }
 }
 
 /// The result of one statement that ran.
@@ -602,12 +656,13 @@ fn not_run(s: &RenderedStatement, reason: SkipReason) -> StatementResult {
     }
 }
 
-/// Steps 4 and 6: the transaction, its statements, and the response.
+/// Steps 4 and 6: the transaction, its statements, and the response. A privilege request
+/// (`statements: None`) is rendered in the transaction, after its checks there.
 async fn run_in_transaction(
     conn: &mut Connected,
     plan: &Plan<'_>,
-    ctx: RenderContext,
-    statements: Vec<RenderedStatement>,
+    mut ctx: RenderContext,
+    statements: Option<Vec<RenderedStatement>>,
 ) -> Result<SchemaChangeResponse, ApiError> {
     let dry = plan.dry_run;
     let timeout = if dry {
@@ -631,7 +686,7 @@ async fn run_in_transaction(
             return Err(failure(&e, None, dry));
         }
     }
-    let out = transaction_body(conn, plan, &ctx, &statements).await;
+    let out = prepared_body(conn, plan, &mut ctx, statements).await;
     match out {
         Ok(response) if dry => {
             rollback(conn).await;
@@ -654,18 +709,48 @@ async fn run_in_transaction(
     }
 }
 
+/// A privilege request's checks and render (in the transaction), then the body.
+async fn prepared_body(
+    conn: &mut Connected,
+    plan: &Plan<'_>,
+    ctx: &mut RenderContext,
+    statements: Option<Vec<RenderedStatement>>,
+) -> Result<SchemaChangeResponse, ApiError> {
+    // T5-M2: the request's locks first, so the privilege checks below (the ACL hashes, the
+    // owners) read what the statements will run against.
+    for (sql, op_index) in locks(plan.ops) {
+        simple(conn, &sql)
+            .await
+            .map_err(|e| failure(&e, Some(op_index), plan.dry_run))?;
+    }
+    let (statements, prepared) = match (statements, &plan.privileges) {
+        (Some(statements), _) => (statements, None),
+        (None, checks) => {
+            let empty = BTreeSet::new();
+            let none = PrivilegeChecks {
+                expect_acl: &[],
+                key_roles: &empty,
+            };
+            let checks = checks.as_ref().unwrap_or(&none);
+            let owner_run = plan.set_role.is_none();
+            let prepared =
+                privilege_ops::prepare(conn, plan.ops, checks, owner_run, ctx, plan.dry_run)
+                    .await?;
+            let statements = ddl::render(plan.ops, ctx).map_err(|e| refused(&e))?;
+            (statements, Some(prepared))
+        }
+    };
+    transaction_body(conn, plan, ctx, &statements, prepared.as_ref()).await
+}
+
 async fn transaction_body(
     conn: &mut Connected,
     plan: &Plan<'_>,
     ctx: &RenderContext,
     statements: &[RenderedStatement],
+    prepared: Option<&Prepared>,
 ) -> Result<SchemaChangeResponse, ApiError> {
     let dry = plan.dry_run;
-    for (sql, op_index) in locks(plan.ops) {
-        simple(conn, &sql)
-            .await
-            .map_err(|e| failure(&e, Some(op_index), dry))?;
-    }
     // What a cascade of the request's drops would remove beyond their targets and their parts.
     let dependents = read_dependents(conn, plan.ops, 0, dry).await?;
     if let Some(now) = &dependents {
@@ -729,12 +814,33 @@ async fn transaction_body(
             // cascade to confirm.
             return Err(has_dependents(now, dry));
         }
+        // D6 / P26: a statement on an object another role owns runs as that role (an owner
+        // run only), `RESET ROLE` right after it.
+        let run_as = match &s.run_as {
+            Some(role) => {
+                Some(privilege_ops::enter(conn, role, plan.session_role(), s.op_index, dry).await?)
+            }
+            None => None,
+        };
         let mut notices = Notices::new();
         let (client, queue) = conn.client_and_notices();
         // The extended protocol: one statement, whatever the caller's expressions hold.
         collecting(client.execute(s.sql.as_str(), &[]), queue, &mut notices)
             .await
             .map_err(|e| failure(&e, Some(s.op_index), dry))?;
+        if let Some(run) = run_as {
+            privilege_ops::leave(conn, run, plan.session_role(), s.op_index, dry).await?;
+        }
+        if notices.not_applied {
+            return Err(privilege_ops::warned_not_applied(
+                conn,
+                plan.ops,
+                prepared,
+                s.op_index,
+                dry,
+            )
+            .await);
+        }
         if let (true, Some(exp), Some(now)) = (ctx.cascade, &expected, &dependents) {
             let expected = descriptions(&exp.objects);
             let others = parts_of_others(&targets, Some(s.op_index));
@@ -770,12 +876,21 @@ async fn transaction_body(
     let every_ran = results
         .iter()
         .all(|r| r.executed || r.skipped == Some(SkipReason::AlreadyDropped));
+    // MH-24: what the statements did, checked against what the request asked, whenever every
+    // statement ran or was skipped as already dropped (T5-I2); a dry run's ceiling skip left
+    // statements unrun, so there's nothing complete to check.
+    if let Some(prepared) = prepared
+        && every_ran
+    {
+        privilege_ops::verify(conn, plan.ops, prepared, dry).await?;
+    }
     Ok(SchemaChangeResponse {
         dry_run: dry,
         committed: false,
         statements: results,
         dependents,
         would_succeed: (dry && every_ran).then_some(true),
+        data_api_exposure: prepared.map(|p| p.exposure.clone()).unwrap_or_default(),
     })
 }
 
@@ -855,6 +970,7 @@ where
             statements: results,
             dependents,
             would_succeed: None,
+            data_api_exposure: Vec::new(),
         });
     }
     let mut results = Vec::with_capacity(statements.len());
@@ -902,6 +1018,7 @@ where
         statements: results,
         dependents: None,
         would_succeed: None,
+        data_api_exposure: Vec::new(),
     })
 }
 
@@ -1099,8 +1216,32 @@ where
             branch_id
         )
         .await
+        // T5-M4: whether this is an owner run is `Requested::from_name` with the database's
+        // real owner (`owner` in any case, or that owner's name), which only the access
+        // decision knows here; it answers `required: "owner"` only for a request it resolved
+        // so, which is every owner run.
+        .map_err(|err| owner_run_needs_admin(err, true))
     );
     let row = or_answer!(pick_pg_database(&state, &branch, request.database.as_deref()).await);
+    // Members hub: a privilege request's checks that need the metadata, before any compute.
+    let privileged = request.operations.iter().any(privilege_ops::is_privilege_op);
+    let key_roles = if privileged {
+        or_answer!(
+            privilege_ops::refuse_personal_logins(
+                &state,
+                record.database_id.as_uuid(),
+                &request.operations
+            )
+            .await
+        );
+        if privilege_ops::needs_key_roles(&request.operations) {
+            or_answer!(privilege_ops::key_roles(&state, branch.id).await)
+        } else {
+            BTreeSet::new()
+        }
+    } else {
+        BTreeSet::new()
+    };
     // 3. The session.
     let mut session = or_answer!(
         open_session(
@@ -1138,6 +1279,11 @@ where
         confirmed: request.cascade.as_ref().map(|c| c.dependents_hash.as_str()),
         set_role: set_role.as_deref(),
         max_bytes: state.table_api_dry_run_max_bytes,
+        owner: &owner,
+        privileges: privileged.then_some(PrivilegeChecks {
+            expect_acl: &request.expect_acl,
+            key_roles: &key_roles,
+        }),
     };
     let outcome = change(&state, &mut session, &plan, (&branch, &owner, &row.name)).await;
     // The hand-over (R5) ends this backend: the session goes first.
@@ -1162,6 +1308,19 @@ where
         status,
         "schema change"
     );
+    if privileged && committed {
+        privilege_ops::record_event(
+            &state,
+            &principal,
+            record.project_id.as_uuid(),
+            record.database_id.as_uuid(),
+            branch.id.as_uuid(),
+            &row.name,
+            set_role.as_deref(),
+            &request.operations,
+        )
+        .await;
+    }
     match outcome {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(err) => err.into_response(),
@@ -1211,15 +1370,30 @@ where
             dry,
         ));
     }
+    // MH-31: MAINTAIN by the compute's own version.
+    let server_version_num = simple_text(conn, "SHOW server_version_num")
+        .await
+        .map_err(|e| read_failure(&e, "reading the server version", dry))?
+        .and_then(|v| v.parse::<i32>().ok())
+        .unwrap_or(0);
     let ctx = RenderContext {
         tables,
         cascade: plan.confirmed.is_some(),
+        // S5: the grantee allow-list's owner is the role the statements run as.
+        session_role: plan.session_role().to_string(),
+        server_version_num,
+        ..Default::default()
     };
+    // A privilege request is rendered in the transaction, once its owners and functions are
+    // resolved there (S4, P11).
+    if plan.privileges.is_some() {
+        return run_in_transaction(&mut session.connected, plan, ctx, None).await;
+    }
     let statements = ddl::render(plan.ops, &ctx).map_err(|e| refused(&e))?;
     if statements.iter().any(|s| s.concurrently) {
         run_concurrently(state, session, plan, &ctx, statements, owner).await
     } else {
-        run_in_transaction(&mut session.connected, plan, ctx, statements).await
+        run_in_transaction(&mut session.connected, plan, ctx, Some(statements)).await
     }
 }
 
@@ -1259,6 +1433,54 @@ mod tests {
         assert!(validate(&r).is_ok());
         r.role = Some("pg_read_all_data".into());
         assert_eq!(validate(&r).unwrap_err().status, 422);
+    }
+
+    // MH-33: an `expect_acl` hash is checked for shape before any compute.
+    #[test]
+    fn expect_acl_hashes_are_64_lowercase_hex() {
+        let mut r: SchemaChangeRequest = serde_json::from_value(json!({
+            "operations": [comment()],
+            "expect_acl": [{ "object": { "relation": { "schema": "public", "name": "notes" } }, "acl_hash": "0".repeat(64) }],
+        }))
+        .unwrap();
+        assert!(validate(&r).is_ok());
+        r.expect_acl[0].acl_hash = "A".repeat(64);
+        assert_eq!(validate(&r).unwrap_err().status, 422);
+        r.expect_acl[0].acl_hash = String::new();
+        assert_eq!(validate(&r).unwrap_err().status, 422);
+    }
+
+    // MH-31 / P11: what only the compute decides isn't refused before it: MAINTAIN (the
+    // server's version) and a function op (resolved in the transaction); a grantee the
+    // allow-list refuses whatever the session is, is.
+    #[test]
+    fn validation_leaves_the_server_version_and_functions_to_the_compute() {
+        let r = request(json!([
+            { "grant": { "table": { "schema": "public", "name": "notes" }, "grant": { "privileges": ["maintain"], "grantee": { "role": "r" } } } },
+            { "grant_function": { "function": { "oid": 16384, "identity": "public.f(integer)" }, "grantee": { "role": "r" } } },
+            { "revoke_function": { "function": { "oid": 16385, "identity": "x" }, "grantee": "public" } },
+        ]));
+        assert!(validate(&r).is_ok());
+        for grantee in [json!({ "role": "authenticator" }), json!({ "role": "cb_m_x" }), json!("public")] {
+            let r = request(json!([
+                { "grant_schema": { "schema": "public", "grantee": grantee, "privileges": ["usage"] } },
+            ]));
+            let err = validate(&r).unwrap_err();
+            assert_eq!((err.status, err.body()["error"]["op_index"].clone()), (400, json!(0)), "{grantee}");
+        }
+    }
+
+    // R6 / MH-30: an owner run below Admin is told the route's level, `admin`; other refusals
+    // and a role run are left as they are.
+    #[test]
+    fn an_owner_run_below_admin_requires_admin() {
+        let owner = || ApiError::new(403, ErrorCode::Forbidden, "x").with_extra("required", json!("owner"));
+        assert_eq!(owner_run_needs_admin(owner(), true).body()["error"]["required"], "admin");
+        assert_eq!(owner_run_needs_admin(owner(), false).body()["error"]["required"], "owner");
+        let role = ApiError::new(403, ErrorCode::Forbidden, "x").with_extra("required", json!("role:sales"));
+        assert_eq!(owner_run_needs_admin(role, true).body()["error"]["required"], "role:sales");
+        let other = ApiError::not_found("x");
+        assert_eq!(owner_run_needs_admin(other, true).status, 404);
     }
 
     #[test]

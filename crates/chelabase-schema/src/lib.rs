@@ -21,6 +21,7 @@ pub mod fingerprint;
 pub mod identity;
 pub mod model;
 pub mod plan;
+pub mod privileges;
 pub mod review;
 pub mod sql;
 pub mod steps;

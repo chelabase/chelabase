@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   ApiError,
   listAccessEvents,
@@ -10,17 +10,15 @@ import { Button } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
 import { errorText } from "@/lib/errors";
 import { memberName } from "@/lib/members";
+import { parseMembersTab, type MembersTab } from "@/lib/members-search";
 import { AccessEventList } from "./access-event-list";
 import { InstanceTab } from "./instance-tab";
 import { ACCESS_EVENTS_KEY } from "./keys";
 import { PeopleTab } from "./people-tab";
+import { RolesTab } from "./roles/roles-tab";
 import { TenantName } from "./tenant-name";
 
-export type MembersTab = "people" | "activity" | "instance";
-
-export function parseMembersTab(v: unknown): MembersTab | undefined {
-  return v === "people" || v === "activity" || v === "instance" ? v : undefined;
-}
+export { parseMembersTab, type MembersTab };
 
 export interface MembersPageProps {
   tab: MembersTab;
@@ -30,6 +28,8 @@ export interface MembersPageProps {
 }
 
 const PAGE = 50;
+/** How long the page-level status stays up. */
+const STATUS_MS = 8000;
 
 /** `/app/members`: everyone in the tenant (People), the access log (Activity) and the instance's switch. */
 export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
@@ -39,9 +39,17 @@ export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
   const instanceAdmin = me.data?.instance_admin === true;
   const settings = useGetInstanceSettings({ query: { enabled: instanceAdmin } });
   const [status, setStatus] = useState<string | null>(null);
+  // What was just done is said for a few seconds, in a layer over the page: it never moves the tabs.
+  useEffect(() => {
+    if (status === null) return;
+    const t = setTimeout(() => setStatus(null), STATUS_MS);
+    return () => clearTimeout(t);
+  }, [status]);
 
   const tabs = [
     { id: "people" as const, label: "People" },
+    // Roles: anyone with a project grant (a tenant admin is Admin on every project).
+    ...(tenantAdmin || (me.data?.projects?.length ?? 0) > 0 ? [{ id: "roles" as const, label: "Roles" }] : []),
     ...(tenantAdmin ? [{ id: "activity" as const, label: "Activity" }] : []),
     // Hidden, not disabled, when the instance can't switch it (platform mode included).
     ...(instanceAdmin && settings.data?.open_signup_switchable ? [{ id: "instance" as const, label: "Instance" }] : []),
@@ -70,7 +78,7 @@ export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
         )}
       </div>
       {status && (
-        <p role="status" className="text-sm text-chalk">
+        <p role="status" className="fixed right-6 bottom-6 z-40 max-w-sm border border-line-strong bg-deep px-4 py-3 text-sm text-chalk shadow-lg">
           {status}
         </p>
       )}
@@ -111,6 +119,8 @@ export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
         >
           {current === "people" ? (
             <PeopleTab members={list} selfId={selfId} tenantAdmin={tenantAdmin} projects={projects} onStatus={setStatus} />
+          ) : current === "roles" ? (
+            <RolesTab />
           ) : current === "activity" ? (
             <AccessEventList
               queryKey={ACCESS_EVENTS_KEY}

@@ -335,6 +335,98 @@ pub struct TableGrant {
     pub with_grant_option: bool,
 }
 
+/// A schema privilege of the privilege ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SchemaPrivilege {
+    Usage,
+    Create,
+}
+
+/// A sequence privilege of the privilege ops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SequencePrivilege {
+    Usage,
+    Select,
+    Update,
+}
+
+/// The objects a default privilege applies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultObject {
+    Tables,
+    Sequences,
+    Functions,
+}
+
+/// A privilege of `alter_default_privileges` (which ones apply depends on the object).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegeName {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Truncate,
+    References,
+    Trigger,
+    Maintain,
+    Usage,
+    Execute,
+}
+
+/// A function or procedure: `oid` from the privileges read; `identity` its `regprocedure`
+/// text then (P11). Only the server's own resolution of `oid` reaches SQL.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct FunctionRef {
+    pub oid: u32,
+    pub identity: String,
+}
+
+/// An object whose ACL the privileges read hashes (P10, S3).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PrivilegeTarget {
+    Schema {
+        schema: String,
+    },
+    Relation {
+        schema: String,
+        name: String,
+    },
+    Sequence {
+        schema: String,
+        name: String,
+    },
+    Function {
+        oid: u32,
+    },
+    DefaultAcl {
+        for_role: String,
+        schema: String,
+        object: DefaultObject,
+    },
+}
+
+/// The `acl_hash` the privileges read gave `object` (P10): a different hash at apply time is
+/// 409 `privileges_changed_since_read`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct ExpectedAcl {
+    pub object: PrivilegeTarget,
+    pub acl_hash: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -510,6 +602,54 @@ pub enum Operation {
         schema: String,
         name: String,
     },
+    GrantSchema {
+        schema: String,
+        grantee: Grantee,
+        privileges: Vec<SchemaPrivilege>,
+    },
+    RevokeSchema {
+        schema: String,
+        grantee: Grantee,
+        privileges: Vec<SchemaPrivilege>,
+        #[serde(default)]
+        grant_option_only: bool,
+    },
+    GrantSequence {
+        sequence: TableRef,
+        grantee: Grantee,
+        privileges: Vec<SequencePrivilege>,
+    },
+    RevokeSequence {
+        sequence: TableRef,
+        grantee: Grantee,
+        privileges: Vec<SequencePrivilege>,
+        #[serde(default)]
+        grant_option_only: bool,
+    },
+    /// `EXECUTE`.
+    GrantFunction {
+        function: FunctionRef,
+        grantee: Grantee,
+    },
+    RevokeFunction {
+        function: FunctionRef,
+        grantee: Grantee,
+        #[serde(default)]
+        grant_option_only: bool,
+    },
+    AlterDefaultPrivileges {
+        for_role: String,
+        schema: String,
+        object: DefaultObject,
+        grant: bool,
+        grantee: Grantee,
+        privileges: Vec<PrivilegeName>,
+    },
+    SetAllRows {
+        table: TableRef,
+        role: String,
+        enabled: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -535,6 +675,8 @@ pub struct SchemaChangeRequest {
     pub cascade: Option<CascadeConfirm>,
     #[serde(default)]
     pub lock_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub expect_acl: Vec<ExpectedAcl>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +754,22 @@ pub struct SchemaChangeResponse {
     pub dependents: Option<Dependents>,
     #[serde(default)]
     pub would_succeed: Option<bool>,
+    /// P31: the request's grants (default privileges included) to `anon` or `authenticated`,
+    /// or to a role either of them inherits, in operation order; empty when none.
+    #[serde(default)]
+    pub data_api_exposure: Vec<DataApiExposure>,
+}
+
+/// One grant that exposes its privileges to the data API (P31): the operation, its grantee
+/// and one shortest membership chain from `anon` or `authenticated` to it (`[anon]` when the
+/// grantee is `anon` itself).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DataApiExposure {
+    pub op_index: usize,
+    pub grantee: String,
+    pub chain: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -778,6 +936,83 @@ mod tests {
         let r: Result<Operation, _> =
             serde_json::from_value(json!({ "drop_table": { "table": { "schema": "a", "name": "b", "x": 1 } } }));
         assert!(r.is_err());
+    }
+
+    /// T4: the privilege ops' and ACL targets' wire forms (Shared interfaces, pinned), and
+    /// MH-29 at the type level: no new op accepts a grant option.
+    #[test]
+    fn privilege_ops_and_targets_have_the_pinned_serde_forms() {
+        let op: Operation = serde_json::from_value(json!({ "grant_schema": {
+            "schema": "app", "grantee": { "role": "readers" }, "privileges": ["usage", "create"]
+        }}))
+        .unwrap();
+        assert_eq!(
+            op,
+            Operation::GrantSchema {
+                schema: "app".into(),
+                grantee: Grantee::Role("readers".into()),
+                privileges: vec![SchemaPrivilege::Usage, SchemaPrivilege::Create],
+            }
+        );
+        let op: Operation = serde_json::from_value(json!({ "revoke_sequence": {
+            "sequence": { "schema": "app", "name": "s" }, "grantee": "public", "privileges": ["usage", "select", "update"]
+        }}))
+        .unwrap();
+        let Operation::RevokeSequence { grant_option_only, .. } = op else { panic!("{op:?}") };
+        assert!(!grant_option_only, "grant_option_only defaults to false");
+        let op: Operation = serde_json::from_value(json!({ "grant_function": {
+            "function": { "oid": 16384, "identity": "app.f(integer)" }, "grantee": { "role": "r" }
+        }}))
+        .unwrap();
+        assert!(matches!(op, Operation::GrantFunction { function: FunctionRef { oid: 16384, .. }, .. }));
+        let op: Operation = serde_json::from_value(json!({ "alter_default_privileges": {
+            "for_role": "owner", "schema": "app", "object": "tables", "grant": true,
+            "grantee": { "role": "r" }, "privileges": ["select", "maintain"]
+        }}))
+        .unwrap();
+        assert!(matches!(op, Operation::AlterDefaultPrivileges { object: DefaultObject::Tables, .. }));
+        let op: Operation = serde_json::from_value(json!({ "set_all_rows": {
+            "table": { "schema": "app", "name": "t" }, "role": "r", "enabled": true
+        }}))
+        .unwrap();
+        assert!(matches!(op, Operation::SetAllRows { enabled: true, .. }));
+        for refused in [
+            json!({ "grant_schema": { "schema": "a", "grantee": "public", "privileges": ["usage"], "with_grant_option": true } }),
+            json!({ "grant_sequence": { "sequence": { "schema": "a", "name": "s" }, "grantee": "public", "privileges": ["usage"], "with_grant_option": true } }),
+            json!({ "grant_function": { "function": { "oid": 1, "identity": "f()" }, "grantee": "public", "with_grant_option": true } }),
+            json!({ "grant_function": { "function": { "schema": "a", "name": "f", "args": ["int"] }, "grantee": "public" } }),
+            json!({ "grant_schema": { "schema": "a", "grantee": "public", "privileges": ["select"] } }),
+        ] {
+            assert!(serde_json::from_value::<Operation>(refused.clone()).is_err(), "{refused}");
+        }
+
+        let targets = [
+            (json!({ "schema": { "schema": "app" } }), PrivilegeTarget::Schema { schema: "app".into() }),
+            (
+                json!({ "relation": { "schema": "public", "name": "t" } }),
+                PrivilegeTarget::Relation { schema: "public".into(), name: "t".into() },
+            ),
+            (
+                json!({ "sequence": { "schema": "public", "name": "s" } }),
+                PrivilegeTarget::Sequence { schema: "public".into(), name: "s".into() },
+            ),
+            (json!({ "function": { "oid": 16384 } }), PrivilegeTarget::Function { oid: 16384 }),
+            (
+                json!({ "default_acl": { "for_role": "owner", "schema": "app", "object": "functions" } }),
+                PrivilegeTarget::DefaultAcl { for_role: "owner".into(), schema: "app".into(), object: DefaultObject::Functions },
+            ),
+        ];
+        for (wire, target) in targets {
+            assert_eq!(serde_json::from_value::<PrivilegeTarget>(wire.clone()).unwrap(), target);
+            assert_eq!(serde_json::to_value(&target).unwrap(), wire);
+        }
+        let r: SchemaChangeRequest = serde_json::from_value(json!({ "operations": [] })).unwrap();
+        assert!(r.expect_acl.is_empty(), "expect_acl defaults to empty");
+        let r: SchemaChangeRequest = serde_json::from_value(json!({ "expect_acl": [
+            { "object": { "function": { "oid": 7 } }, "acl_hash": "ab" }
+        ]}))
+        .unwrap();
+        assert_eq!(r.expect_acl, [ExpectedAcl { object: PrivilegeTarget::Function { oid: 7 }, acl_hash: "ab".into() }]);
     }
 
     #[test]

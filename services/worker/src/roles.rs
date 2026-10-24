@@ -14,22 +14,28 @@ use chelabase_metadata::{
 };
 use chelabase_nats::{
     KeyRef, RESET_NOT_APPLIED, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED,
-    ROLE_UPDATE_NOT_APPLIED, RoleCreateRequest, RoleReply, RoleRequest, RoleUpdateRequest,
+    ROLE_UPDATE_NOT_APPLIED, Reassigned, RoleCreateRequest, RoleDeleteRequest, RoleReply, RoleRequest, RoleUpdateRequest,
     SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE,
+};
+use chelabase_nats::{
+    DeletePreview, Exposure, ExposureKind, SUBJECT_ROLE_DELETE_PREVIEW, exposure_token,
 };
 use chelabase_neon::ComputeBackend;
 use chelabase_neon::backend::admin_psql_command;
+use chelabase_schema::privileges::owner_settable_predicate;
 use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
-    RoleNameError, check_any_role_name, check_login_role_name, is_membership_reserved,
-    is_reserved_for, is_reserved_target, mark_personal_login_sql, quote_ident, quote_literal,
+    PERSONAL_LOGIN_MARKER, RESERVED_ROLE_NAMES, RoleNameError, check_any_role_name,
+    check_login_role_name, is_membership_reserved, is_reserved_for, is_reserved_target,
+    quote_ident, quote_literal,
 };
 use chrono::{DateTime, SubsecRound, Utc};
 use tokio::time::timeout;
 use tracing::{info, warn};
 
+use crate::member_roles::{QUARANTINE_ROLE, quarantine_role_sql};
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::resync::{
     ObservedRole, WantedRole, create_role_sql, parse_observed, password_sql, role_read_sql,
@@ -41,6 +47,9 @@ use crate::{OWNER_ROLE, Worker, credentials};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RoleOutcome {
     Ok,
+    /// T10: a delete done; what it handed to the successor, over every database (zero when
+    /// the role was already gone from SQL).
+    Deleted(Reassigned),
     /// The caller's fault: `(code, message)`.
     Refused(&'static str, String),
     /// Data API keys still use the role.
@@ -53,6 +62,11 @@ pub enum RoleOutcome {
     NotApplied,
     /// Something broke on our side; the message is for logs.
     Failed(String),
+    /// T10 fix: a delete's preview (`ok`, the reply's `preview`).
+    Preview(DeletePreview),
+    /// T10 fix: a delete to a named successor refused because its exposures weren't confirmed
+    /// with the current token: `exposure_unconfirmed`, the reply's `preview` the current state.
+    Unconfirmed(DeletePreview),
 }
 
 /// `outcome` as the RPC's reply.
@@ -62,6 +76,8 @@ pub fn role_reply(outcome: RoleOutcome) -> RoleReply {
         code: Some(code.to_string()),
         error: Some(error),
         keys,
+        reassigned: None,
+        preview: None,
     };
     match outcome {
         RoleOutcome::Ok => RoleReply {
@@ -69,6 +85,34 @@ pub fn role_reply(outcome: RoleOutcome) -> RoleReply {
             code: None,
             error: None,
             keys: Vec::new(),
+            reassigned: None,
+            preview: None,
+        },
+        RoleOutcome::Deleted(reassigned) => RoleReply {
+            ok: true,
+            code: None,
+            error: None,
+            keys: Vec::new(),
+            reassigned: Some(reassigned),
+            preview: None,
+        },
+        RoleOutcome::Preview(preview) => RoleReply {
+            ok: true,
+            code: None,
+            error: None,
+            keys: Vec::new(),
+            reassigned: None,
+            preview: Some(preview),
+        },
+        RoleOutcome::Unconfirmed(preview) => RoleReply {
+            preview: Some(preview),
+            ..refused(
+                "exposure_unconfirmed",
+                "the delete would let other roles run code or read views with the successor's \
+                 rights; review the exposures and confirm with the current token"
+                    .into(),
+                Vec::new(),
+            )
         },
         RoleOutcome::Refused(code, message) => refused(code, message, Vec::new()),
         RoleOutcome::InUse(keys) => refused(
@@ -536,6 +580,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// one fails and nothing else runs. Takes no endpoint lock and writes no metadata row (the
     /// Members step records it). Reserved names and any password that isn't a SCRAM verifier are
     /// refused before any SQL runs.
+    ///
+    /// T6-M4: tests only (the fork's live checks); the reconciler makes personal logins.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_personal_login(
         &self,
         endpoint: &str,
@@ -557,7 +604,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             "BEGIN;\nSET LOCAL search_path = pg_catalog, pg_temp;\nCREATE ROLE {} LOGIN PASSWORD {};\n{}\nCOMMIT;",
             quote_ident(name),
             quote_literal(scram_verifier),
-            mark_personal_login_sql(name),
+            chelabase_types::role_name::mark_personal_login_sql(name),
         );
         self.computes
             .admin_sql(endpoint, crate::resync::SYSTEM_DATABASE, &script)
@@ -984,18 +1031,171 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         RoleOutcome::Ok
     }
 
-    /// Deletes a role (spec Part 3): refused for the owner, a reserved name, or while a live
-    /// secret data key uses it; then under the endpoint's lock the role is dropped in SQL (its
-    /// objects reassigned to the owner in every database) and its row deleted.
-    pub async fn delete_role(&self, branch: BranchId, name: &str) -> RoleOutcome {
+    /// Deletes a role (spec Part 3, T10): refused for the owner, a reserved name, or while a
+    /// live secret data key uses it; `successor` (the role its objects go to) is refused
+    /// (`invalid_successor`) unless it is [`QUARANTINE_ROLE`] or a role the owner can SET to
+    /// that is neither owner-level, reserved nor a personal login ([`check_successor`], the
+    /// metadata, then [`successor_check_sql`]). Then under the endpoint's lock the role is
+    /// dropped in SQL (its databases handed to the owner, every other object to `successor`, in
+    /// every database, [`role_delete_script`]) and its row deleted. Answers what moved. For a
+    /// named successor, what it would expose must be confirmed first: this is
+    /// [`Worker::delete_role_with`] without a token.
+    pub async fn delete_role(&self, branch: BranchId, name: &str, successor: &str) -> RoleOutcome {
+        self.delete_role_with(branch, name, successor, None).await
+    }
+
+    /// The delete's refusals that need nothing read: the owner, a name Postgres can't hold, a
+    /// reserved name, then [`check_successor`].
+    fn check_delete(name: &str, successor: &str) -> Result<(), RoleOutcome> {
         if name == OWNER_ROLE {
-            return reserved(name);
+            return Err(reserved(name));
         }
-        if let Err(refusal) = check_any_name(name) {
+        check_any_name(name)?;
+        if is_reserved_for(name, OWNER_ROLE) {
+            return Err(reserved(name));
+        }
+        check_successor(name, successor)
+    }
+
+    /// The delete's refusals from the metadata: `name` must be a row other than the owner's
+    /// ([`RoleOutcome::NotFound`] otherwise), and `successor` neither a personal login nor the
+    /// owner's row (MH-18: they never receive objects, whatever SQL says).
+    async fn check_delete_rows(&self, branch: BranchId, ep: &str, name: &str, successor: &str) -> Result<(), RoleOutcome> {
+        match self.metadata.role_copies(ep).await {
+            Ok((rows, _))
+                if rows
+                    .iter()
+                    .any(|r| r.origin != RoleOrigin::Owner && r.name == name) =>
+            {
+                if rows.iter().any(|r| {
+                    r.name == successor
+                        && matches!(r.origin, RoleOrigin::Personal | RoleOrigin::Owner)
+                }) {
+                    return Err(invalid_successor(successor));
+                }
+                Ok(())
+            }
+            Ok(_) => Err(RoleOutcome::NotFound),
+            Err(e) => Err(failed(branch, "reading the roles", &e)),
+        }
+    }
+
+    /// A named successor checked in SQL ([`successor_check_sql`]); the quarantine role needs
+    /// none.
+    async fn check_successor_in_sql(
+        &self,
+        branch: BranchId,
+        ep: &str,
+        database: &str,
+        successor: &str,
+    ) -> Result<(), RoleOutcome> {
+        if successor == QUARANTINE_ROLE {
+            return Ok(());
+        }
+        match self
+            .computes
+            .admin_sql(ep, database, &successor_check_sql(successor))
+            .await
+        {
+            Ok(out) if out.trim() == "t" => Ok(()),
+            Ok(_) => Err(invalid_successor(successor)),
+            Err(e) => Err(failed(branch, "checking the successor", &e)),
+        }
+    }
+
+    /// The connectable databases `name`'s objects can live in, or `None` when the role is
+    /// already gone from SQL. Every database is one psql can be given (checked before anything
+    /// touches the role).
+    async fn role_databases(&self, ep: &str, database: &str, name: &str) -> anyhow::Result<Option<Vec<String>>> {
+        let exists = self
+            .computes
+            .admin_sql(ep, database, &exists_sql(name))
+            .await
+            .context("checking whether the role exists")?;
+        if exists.trim().is_empty() {
+            return Ok(None);
+        }
+        let databases = self
+            .computes
+            .admin_sql(ep, database, DATABASES_SQL)
+            .await
+            .context("listing the databases")?;
+        database_names(&databases).map(Some)
+    }
+
+    /// What deleting `name` to `successor` exposes in every one of `databases`
+    /// ([`exposure_sql`]), sorted.
+    async fn read_exposures(
+        &self,
+        ep: &str,
+        databases: &[String],
+        name: &str,
+        successor: &str,
+    ) -> anyhow::Result<Vec<Exposure>> {
+        let sql = exposure_sql(name, successor);
+        let mut exposures = Vec::new();
+        for db in databases {
+            let out = self
+                .computes
+                .admin_sql(ep, db, &sql)
+                .await
+                .with_context(|| format!("reading what the delete would expose in {db}"))?;
+            exposures.extend(parse_exposures(db, &out).with_context(|| format!("reading the exposures in {db}"))?);
+        }
+        exposures.sort();
+        Ok(exposures)
+    }
+
+    /// T10 fix (user ruling 2026-10-23: preview, then confirm): what deleting `name` to
+    /// `successor` would expose, over every connectable database ([`exposure_sql`],
+    /// [`parse_exposures`]), sorted; `confirm` is `chelabase_nats::exposure_token` of them, or
+    /// `None` when there are none or `successor` is [`QUARANTINE_ROLE`]. The delete's refusals
+    /// first (owner, reserved, [`check_successor`], not ready, not found, a personal login or
+    /// the owner's row as successor, then [`successor_check_sql`] for a named one). A read: no
+    /// lock, no NOLOGIN, nothing changed; a role already gone from SQL exposes nothing.
+    pub async fn preview_role_delete(&self, branch: BranchId, name: &str, successor: &str) -> RoleOutcome {
+        if let Err(refusal) = Self::check_delete(name, successor) {
             return refusal;
         }
-        if is_reserved_for(name, OWNER_ROLE) {
-            return reserved(name);
+        let (ep, database) = match self.role_target(branch).await {
+            Ok(target) => target,
+            Err(outcome) => return outcome,
+        };
+        if let Err(refusal) = self.check_delete_rows(branch, &ep, name, successor).await {
+            return refusal;
+        }
+        if let Err(refusal) = self.check_successor_in_sql(branch, &ep, &database, successor).await {
+            return refusal;
+        }
+        let databases = match self.role_databases(&ep, &database, name).await {
+            Ok(Some(databases)) => databases,
+            Ok(None) => return RoleOutcome::Preview(delete_preview(successor, Vec::new())),
+            Err(e) => return failed(branch, "previewing the delete", &format!("{e:#}")),
+        };
+        match self.read_exposures(&ep, &databases, name, successor).await {
+            Ok(exposures) => RoleOutcome::Preview(delete_preview(successor, exposures)),
+            Err(e) => failed(branch, "previewing the delete", &format!("{e:#}")),
+        }
+    }
+
+    /// T10 fix: [`Worker::delete_role`] with the preview's token. For a named successor (never
+    /// [`QUARANTINE_ROLE`], which reads no exposures), after the checks and before anything
+    /// changes (no NOLOGIN, no sessions ended), the exposures are read in every database; when
+    /// there are some and `confirm` isn't their current token, [`RoleOutcome::Unconfirmed`]
+    /// with the current preview. Otherwise each database runs [`role_delete_script_with`] with
+    /// that database's exposures, whose in-transaction guard raises [`EXPOSURES_CHANGED`] when
+    /// they changed meanwhile: the delete then answers [`RoleOutcome::Unconfirmed`] with a
+    /// fresh preview (the role stays, NOLOGIN, its row kept; databases done before stay done).
+    /// A done delete's [`Reassigned::confirmed`] lists what it kept.
+    pub async fn delete_role_with(
+        &self,
+        branch: BranchId,
+        name: &str,
+        successor: &str,
+        confirm: Option<&str>,
+    ) -> RoleOutcome {
+        if let Err(refusal) = Self::check_delete(name, successor) {
+            return refusal;
         }
         let (ep, database) = match self.role_target(branch).await {
             Ok(target) => target,
@@ -1005,13 +1205,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Ok(lock) => lock,
             Err(e) => return failed(branch, "locking the endpoint", &e),
         };
-        match self.metadata.role_copies(&ep).await {
-            Ok((rows, _))
-                if rows
-                    .iter()
-                    .any(|r| r.origin != RoleOrigin::Owner && r.name == name) => {}
-            Ok(_) => return RoleOutcome::NotFound,
-            Err(e) => return failed(branch, "reading the roles", &e),
+        if let Err(refusal) = self.check_delete_rows(branch, &ep, name, successor).await {
+            return refusal;
         }
         let keys: Vec<KeyRef> = match self.metadata.list_data_keys(branch).await {
             Ok(keys) => keys
@@ -1027,20 +1222,80 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if !keys.is_empty() {
             return RoleOutcome::InUse(keys);
         }
-
-        if let Err(e) = self.drop_role_sql(&ep, &database, name).await {
-            warn!(branch_id = %branch, endpoint_id = %ep, role = name, "dropping the role; the row stays: {e:#}");
-            return RoleOutcome::Failed(format!("dropping the role {name}: {e:#}"));
+        if let Err(refusal) = self.check_successor_in_sql(branch, &ep, &database, successor).await {
+            return refusal;
         }
+
+        let dropping = |e: anyhow::Error| {
+            warn!(branch_id = %branch, endpoint_id = %ep, role = name, "dropping the role; the row stays: {e:#}");
+            RoleOutcome::Failed(format!("dropping the role {name}: {e:#}"))
+        };
+        let reassigned = match self.role_databases(&ep, &database, name).await {
+            // Already gone from SQL: nothing moved, nothing exposed.
+            Ok(None) => Reassigned::default(),
+            Ok(Some(databases)) => {
+                // Read before anything changes; the quarantine role exposes nothing to confirm.
+                let exposures = if successor == QUARANTINE_ROLE {
+                    Vec::new()
+                } else {
+                    match self.read_exposures(&ep, &databases, name, successor).await {
+                        Ok(exposures) => exposures,
+                        Err(e) => return dropping(e),
+                    }
+                };
+                if !exposures.is_empty() && confirm != Some(exposure_token(successor, &exposures).as_str()) {
+                    info!(
+                        branch_id = %branch, endpoint_id = %ep, role = name, successor,
+                        exposures = exposures.len(), "role delete not confirmed; nothing changed"
+                    );
+                    return RoleOutcome::Unconfirmed(delete_preview(successor, exposures));
+                }
+                match self
+                    .drop_role_sql(&ep, &database, &databases, name, successor, &exposures)
+                    .await
+                {
+                    Ok(reassigned) => Reassigned {
+                        confirmed: exposures,
+                        ..reassigned
+                    },
+                    // The guard of a database's transaction: the exposures changed since they
+                    // were read. That transaction moved nothing; answer what they are now.
+                    Err(DropFailure { error: e, .. }) if exposures_changed(&e) => {
+                        warn!(branch_id = %branch, endpoint_id = %ep, role = name, "the exposures changed during the delete; the row stays: {e:#}");
+                        return match self.read_exposures(&ep, &databases, name, successor).await {
+                            Ok(fresh) => RoleOutcome::Unconfirmed(delete_preview(successor, fresh)),
+                            Err(e) => dropping(e),
+                        };
+                    }
+                    // T10-2: the successor guard of a database's transaction (a membership made
+                    // the successor unfit since the check). That transaction moved nothing; the
+                    // databases before it stay moved, and the answer names them.
+                    Err(DropFailure { error: e, moved_in }) if successor_unfit(&e) => {
+                        warn!(
+                            branch_id = %branch, endpoint_id = %ep, role = name, successor,
+                            moved_in = ?moved_in,
+                            "the successor became unfit during the delete; the row stays: {e:#}"
+                        );
+                        return unfit_successor(successor, &moved_in);
+                    }
+                    Err(DropFailure { error: e, .. }) => return dropping(e),
+                }
+            }
+            Err(e) => return dropping(e),
+        };
         match self.metadata.delete_role_copy(&ep, name).await {
             // `false`: the row went meanwhile (a forwarded DROP ROLE); the role is gone either way.
             Ok(_) => {}
             Err(e) => return failed(branch, "deleting the role's row", &e),
         }
         self.publish_twice(&ep, &[name.to_string()]).await;
-        info!(branch_id = %branch, endpoint_id = %ep, role = name, "login role deleted");
+        info!(
+            branch_id = %branch, endpoint_id = %ep, role = name, successor,
+            reassigned = reassigned.count, definers = reassigned.definers.len(),
+            confirmed = reassigned.confirmed.len(), "login role deleted"
+        );
         self.member_role_requests.request(branch);
-        RoleOutcome::Ok
+        RoleOutcome::Deleted(reassigned)
     }
 
     /// E29: renames a role through the control plane (a merge's phase 0 calls it for a
@@ -1123,6 +1378,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         {
             Ok(RenameCopyOutcome::Renamed { was_unreadable, .. }) => was_unreadable,
             Ok(RenameCopyOutcome::Taken) => return exists(to),
+            // A personal login is its record's (MH-11): not a role this API renames.
+            Ok(RenameCopyOutcome::Personal) => return RoleOutcome::NotFound,
             // The endpoint went meanwhile (the branch is being deleted or switched).
             Ok(RenameCopyOutcome::NotFound) => return RoleOutcome::NotReady,
             Err(e) => return failed(branch, "moving the role's row", &e),
@@ -1225,27 +1482,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(())
     }
 
-    /// The role gone from SQL: no new logins, its sessions ended, what it owns moved to the
-    /// owner (and its grants dropped) in every connectable database, then the role itself.
-    /// A role already missing is done. Every step is safe to run again.
-    async fn drop_role_sql(&self, ep: &str, database: &str, name: &str) -> anyhow::Result<()> {
-        let exists = self
-            .computes
-            .admin_sql(ep, database, &exists_sql(name))
-            .await
-            .context("checking whether the role exists")?;
-        if exists.trim().is_empty() {
-            return Ok(());
-        }
-        // Listed and checked first: a database psql can't be given must not leave the role
-        // locked out below.
-        let databases = self
-            .computes
-            .admin_sql(ep, database, DATABASES_SQL)
-            .await
-            .context("listing the databases")?;
-        let databases = database_names(&databases)?;
+    /// The role gone from SQL: no new logins, its sessions ended, what it owns moved to
+    /// `successor` (its databases to the owner; its grants dropped) in each of `databases`
+    /// ([`Worker::role_databases`], listed and checked first: a database psql can't be given
+    /// must not leave the role locked out), each guarding its own share of the confirmed
+    /// `exposures` ([`role_delete_script_with`]), then the role itself. Every step is safe to
+    /// run again. Answers what moved, summed over the databases.
+    async fn drop_role_sql(
+        &self,
+        ep: &str,
+        database: &str,
+        databases: &[String],
+        name: &str,
+        successor: &str,
+        exposures: &[Exposure],
+    ) -> Result<Reassigned, DropFailure> {
         let (ident, literal) = (quote_ident(name), quote_literal(name));
+        let mut moved_in: Vec<String> = Vec::new();
+        let failure = |moved_in: &[String], error: anyhow::Error| DropFailure {
+            moved_in: moved_in.to_vec(),
+            error,
+        };
         self.computes
             .admin_sql(
                 ep,
@@ -1256,22 +1513,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 ),
             )
             .await
-            .context("ending the role's sessions")?;
-        for db in &databases {
-            self.computes
-                .admin_sql(
-                    ep,
-                    db,
-                    &format!("REASSIGN OWNED BY {ident} TO {OWNER_ROLE}; DROP OWNED BY {ident};"),
-                )
+            .context("ending the role's sessions")
+            .map_err(|e| failure(&moved_in, e))?;
+        let mut reassigned = Reassigned::default();
+        for db in databases {
+            let here: Vec<Exposure> = exposures
+                .iter()
+                .filter(|e| e.database == *db)
+                .cloned()
+                .collect();
+            let out = self
+                .computes
+                .admin_sql(ep, db, &role_delete_script_with(name, successor, &here))
                 .await
-                .with_context(|| format!("moving the role's objects in {db}"))?;
+                .with_context(|| format!("moving the role's objects in {db}"))
+                .map_err(|e| failure(&moved_in, e))?;
+            // The script committed: this database's objects went to the successor.
+            moved_in.push(db.clone());
+            let moved = parse_reassigned(&out)
+                .with_context(|| format!("reading what moved in {db}"))
+                .map_err(|e| failure(&moved_in, e))?;
+            reassigned.count += moved.count;
+            reassigned.definers.extend(moved.definers);
         }
         self.computes
             .admin_sql(ep, database, &format!("DROP ROLE IF EXISTS {ident};"))
             .await
-            .context("dropping the role")?;
-        Ok(())
+            .context("dropping the role")
+            .map_err(|e| failure(&moved_in, e))?;
+        Ok(reassigned)
     }
 
     /// One role RPC: `payload` decoded for `subject`, handled within `deadline`, as the reply.
@@ -1330,27 +1600,42 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 }
                 Err(e) => return bad(&e),
             },
-            SUBJECT_ROLE_RESET | SUBJECT_ROLE_DELETE => {
+            SUBJECT_ROLE_RESET => {
                 let r = match serde_json::from_slice::<RoleRequest>(payload) {
                     Ok(r) => r,
                     Err(e) => return bad(&e),
                 };
-                let outcome = if subject == SUBJECT_ROLE_RESET {
-                    timeout(deadline, self.reset_role(r.branch_id, &r.name))
-                        .await
-                        .unwrap_or(RoleOutcome::NotApplied)
-                } else {
-                    timeout(deadline, self.delete_role(r.branch_id, &r.name))
-                        .await
-                        .unwrap_or_else(|_| {
-                            RoleOutcome::Failed("timed out; a retry is safe".into())
-                        })
+                let outcome = timeout(deadline, self.reset_role(r.branch_id, &r.name))
+                    .await
+                    .unwrap_or(RoleOutcome::NotApplied);
+                (r.branch_id, outcome)
+            }
+            SUBJECT_ROLE_DELETE => {
+                let r = match serde_json::from_slice::<RoleDeleteRequest>(payload) {
+                    Ok(r) => r,
+                    Err(e) => return bad(&e),
                 };
+                let outcome = timeout(
+                    deadline,
+                    self.delete_role_with(r.branch_id, &r.name, &r.successor, r.confirm.as_deref()),
+                )
+                .await
+                .unwrap_or_else(|_| RoleOutcome::Failed("timed out; a retry is safe".into()));
+                (r.branch_id, outcome)
+            }
+            SUBJECT_ROLE_DELETE_PREVIEW => {
+                let r = match serde_json::from_slice::<RoleDeleteRequest>(payload) {
+                    Ok(r) => r,
+                    Err(e) => return bad(&e),
+                };
+                let outcome = timeout(deadline, self.preview_role_delete(r.branch_id, &r.name, &r.successor))
+                    .await
+                    .unwrap_or_else(|_| RoleOutcome::Failed("timed out; a retry is safe".into()));
                 (r.branch_id, outcome)
             }
             other => return bad(&format!("unknown subject {other}")),
         };
-        if !matches!(outcome, RoleOutcome::Ok) {
+        if !matches!(outcome, RoleOutcome::Ok | RoleOutcome::Deleted(_) | RoleOutcome::Preview(_)) {
             info!(branch_id = %branch, subject, ?outcome, "role request not done");
         }
         let not_applied = matches!(outcome, RoleOutcome::NotApplied);
@@ -1394,6 +1679,397 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 }
 
+/// T10, per database, run as `cloud_admin` (a superuser: `REASSIGN OWNED` needs no membership
+/// in either role, and no CREATE on the objects' schemas for the successor): in one
+/// transaction (a `BEGIN;` line before the reassignment, a `COMMIT;` line last), with
+/// `standard_conforming_strings = on`, `search_path = pg_catalog, pg_temp`, `lock_timeout` 2s
+/// and `statement_timeout` 6s (T10-3, as the personal cleanup),
+/// 0. `LOCK TABLE pg_catalog.pg_auth_members IN SHARE MODE` (T10-1: no membership changes
+///    until the commit, so the guard below holds through the reassignment);
+/// 1. for [`crate::member_roles::QUARANTINE_ROLE`], the quarantine role made (or made
+///    powerless again) by [`crate::member_roles::quarantine_role_sql`], the same SQL T6-C1's
+///    personal cleanup runs; for a named successor, [`successor_check_sql`]'s rule again (a
+///    `DO` that raises when it no longer holds: a membership granted since the check);
+/// 2. the objects and routines `role` owns read (before the reassignment);
+/// 3. `REVOKE EXECUTE … FROM PUBLIC` on every routine `role` owns, the ones about to move (and
+///    only those: a named successor's own routines keep their ACLs); in the same transaction
+///    as the move, so equivalent to revoking right after it;
+/// 4. every database `role` owns handed to the owner (user ruling, 2026-10-23: owning a
+///    database runs no code, and the hub keeps managing it);
+/// 5. `REASSIGN OWNED BY role TO successor`;
+/// 6. `DROP OWNED BY role`.
+///
+/// Its output (psql `-At`) is one `count|<n>` line (the objects in this database `role` owned
+/// before the reassignment, `pg_shdepend` ownership rows) and one `definer|<hex>` line per
+/// `SECURITY DEFINER` routine that moved, its `regprocedure` text hex-encoded as UTF-8; read by
+/// [`parse_reassigned`]. Never `TO` the owner or `cloud_admin`. For a named successor it
+/// carries the exposure guard of [`role_delete_script_with`] expecting none.
+pub fn role_delete_script(role: &str, successor: &str) -> String {
+    role_delete_script_with(role, successor, &[])
+}
+
+/// T10 fix: the text an in-transaction exposure guard raises with when the exposures differ
+/// from the ones confirmed (or, with none confirmed, when some appeared).
+pub const EXPOSURES_CHANGED: &str = "chelabase: exposures changed";
+
+/// Whether `err` is a delete script's exposure guard firing ([`EXPOSURES_CHANGED`]).
+fn exposures_changed(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(EXPOSURES_CHANGED)
+}
+
+/// The text the delete script's successor guard raises with (after the successor's name).
+const SUCCESSOR_UNFIT: &str = "can no longer receive objects";
+
+/// Whether `err` is a delete script's successor guard firing ([`SUCCESSOR_UNFIT`]).
+fn successor_unfit(err: &anyhow::Error) -> bool {
+    format!("{err:#}").contains(SUCCESSOR_UNFIT)
+}
+
+/// A failed [`Worker::drop_role_sql`]: the databases whose objects already went to the
+/// successor (their transactions committed) and the error.
+struct DropFailure {
+    moved_in: Vec<String>,
+    error: anyhow::Error,
+}
+
+/// T10-2: `invalid_successor` for a successor that became unfit during the delete, naming the
+/// databases whose objects had already moved (`objects already moved in: …`), if any.
+fn unfit_successor(successor: &str, moved_in: &[String]) -> RoleOutcome {
+    let moved = if moved_in.is_empty() {
+        "nothing moved".to_string()
+    } else {
+        format!("objects already moved in: {}", moved_in.join(", "))
+    };
+    RoleOutcome::Refused(
+        "invalid_successor",
+        format!(
+            "{}. Its memberships changed during the delete; {moved}. The role is kept without \
+             LOGIN: delete it again with a valid successor to finish",
+            invalid_successor_message(successor)
+        ),
+    )
+}
+
+/// A delete's preview of `exposures` (sorted) for `successor`: the token only when there is
+/// something to confirm and the successor isn't [`QUARANTINE_ROLE`].
+fn delete_preview(successor: &str, exposures: Vec<Exposure>) -> DeletePreview {
+    let confirm = (!exposures.is_empty() && successor != QUARANTINE_ROLE)
+        .then(|| exposure_token(successor, &exposures));
+    DeletePreview {
+        successor: successor.to_string(),
+        exposures,
+        confirm,
+    }
+}
+
+/// T10 fix: [`role_delete_script`] with an in-transaction exposure guard. For a named
+/// successor, inside the transaction (after `BEGIN;`, before the reassignment) a `DO` reads
+/// this database's exposures of `role` (as [`exposure_sql`] defines them) and raises
+/// [`EXPOSURES_CHANGED`] unless they are exactly `expected` (kind, identity and every grantee;
+/// the database isn't compared, the script runs in one); [`QUARANTINE_ROLE`] gets no guard.
+/// `role_delete_script(r, s)` is `role_delete_script_with(r, s, &[])`. Never contains
+/// [`exposure_sql`]'s marker. What is expected is embedded as [`exposure_sql`]'s hex lines
+/// only, never as the names themselves.
+pub fn role_delete_script_with(role: &str, successor: &str, expected: &[Exposure]) -> String {
+    let r = quote_ident(role);
+    let s = quote_ident(successor);
+    let oid = format!(
+        "(SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = {})",
+        quote_literal(role)
+    );
+    // The quarantine role is made (or made powerless again) here; a named successor was checked
+    // before, and is checked again inside the transaction (a membership granted meanwhile
+    // fails the delete, nothing moved).
+    let first = if successor == QUARANTINE_ROLE {
+        quarantine_role_sql()
+    } else {
+        let guard = format!(
+            "BEGIN\n  IF NOT {} THEN\n    RAISE EXCEPTION 'the successor % can no longer receive objects', {};\n  END IF;\nEND",
+            successor_predicate(successor),
+            quote_literal(successor)
+        );
+        // T10 fix: what the move exposes is exactly what was confirmed (none by default).
+        let lines: std::collections::BTreeSet<String> = expected
+            .iter()
+            .flat_map(|e| {
+                e.grantees
+                    .iter()
+                    .map(move |g| exposure_line(e.kind, &e.identity, g))
+            })
+            .collect();
+        let exposure_guard = format!(
+            "DECLARE got text;\nBEGIN\n  SELECT pg_catalog.string_agg(q.line, ',' ORDER BY q.line COLLATE \"C\") INTO got\n    FROM ({rows}) q;\n  IF COALESCE(got, '') <> {expected} THEN\n    RAISE EXCEPTION {changed};\n  END IF;\nEND",
+            rows = exposure_rows_sql(role, successor),
+            expected = quote_literal(&lines.into_iter().collect::<Vec<_>>().join(",")),
+            changed = quote_literal(EXPOSURES_CHANGED),
+        );
+        format!(
+            "DO {};\nDO {};",
+            quote_literal(&guard),
+            quote_literal(&exposure_guard)
+        )
+    };
+    // PUBLIC's EXECUTE on the routines the role owns, revoked before they move (the same
+    // transaction: nothing is ever callable by PUBLIC as the successor). A superuser's REVOKE
+    // acts as the owner, whose grant the default ACL holds.
+    let revoke = format!(
+        "DECLARE f pg_catalog.regprocedure;\nBEGIN\n  FOR f IN SELECT p.oid::pg_catalog.regprocedure FROM pg_catalog.pg_proc p\n             WHERE p.proowner = {oid}\n  LOOP\n    EXECUTE pg_catalog.format({stmt}, f);\n  END LOOP;\nEND",
+        stmt = quote_literal("REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC")
+    );
+    // User ruling (2026-10-23): a database the role owns goes to the branch owner (owning a
+    // database runs no code); everything inside it goes to the successor.
+    let databases = format!(
+        "DECLARE d record;\nBEGIN\n  FOR d IN SELECT db.datname FROM pg_catalog.pg_database db WHERE db.datdba = {oid}\n  LOOP\n    EXECUTE pg_catalog.format({stmt}, d.datname, {owner});\n  END LOOP;\nEND",
+        stmt = quote_literal("ALTER DATABASE %I OWNER TO %I"),
+        owner = quote_literal(OWNER_ROLE)
+    );
+    // T10-3: the waits are bounded, as in the personal cleanup. T10-1: memberships are frozen
+    // for the rest of the transaction before the guard checks the successor, so one granted
+    // between that check and the reassignment waits for the delete instead of slipping through.
+    format!(
+        "SET standard_conforming_strings = on;\n\
+         SET search_path = pg_catalog, pg_temp;\n\
+         SET lock_timeout = '2s';\n\
+         SET statement_timeout = '6s';\n\
+         BEGIN;\n\
+         LOCK TABLE pg_catalog.pg_auth_members IN SHARE MODE;\n\
+         {first}\n\
+         SELECT 'count|' || pg_catalog.count(*) FROM pg_catalog.pg_shdepend d \
+         WHERE d.deptype = 'o' AND d.refclassid = 'pg_catalog.pg_authid'::pg_catalog.regclass \
+         AND d.refobjid = {oid} AND d.dbid = (SELECT db.oid FROM pg_catalog.pg_database db \
+         WHERE db.datname = pg_catalog.current_database());\n\
+         SELECT 'definer|' || pg_catalog.encode(pg_catalog.convert_to(\
+         p.oid::pg_catalog.regprocedure::pg_catalog.text, 'UTF8'), 'hex') \
+         FROM pg_catalog.pg_proc p WHERE p.proowner = {oid} AND p.prosecdef ORDER BY p.oid;\n\
+         DO {revoke};\n\
+         DO {databases};\n\
+         REASSIGN OWNED BY {r} TO {s};\n\
+         DROP OWNED BY {r};\n\
+         COMMIT;",
+        revoke = quote_literal(&revoke),
+        databases = quote_literal(&databases),
+    )
+}
+
+/// T10 fix, per database, run as `cloud_admin` with `search_path = pg_catalog, pg_temp`: the
+/// exposures `role` would hand to `successor` here. Marked `/* chelabase: exposure read */`.
+/// An exposure: a routine `role` owns with `prosecdef`, or a view / materialized view it owns
+/// without `security_invoker` true (any spelling Postgres accepts: `true`, `on`, `yes`, `1`;
+/// before Postgres 15 every view), whose ACL (the default when NULL) grants any privilege to a
+/// grantee other than `successor` and `role` itself (PUBLIC included for views; PUBLIC alone
+/// doesn't make a routine exposed). Output (psql `-At`): one line per (object, grantee),
+/// `exposure|<kind>|<hex identity>|<hex grantee>`, kind `function`, `procedure`, `view` or
+/// `materialized_view`, identity the `regprocedure` / `regclass` text, grantee the role name or
+/// `PUBLIC`, both hex-encoded as UTF-8. A column privilege on a view counts as one on the view
+/// (selecting the column runs the view as its owner).
+pub fn exposure_sql(role: &str, successor: &str) -> String {
+    format!(
+        "SET search_path = pg_catalog, pg_temp;\nSELECT /* chelabase: exposure read */ q.line FROM ({}) q ORDER BY q.line COLLATE \"C\";",
+        exposure_rows_sql(role, successor)
+    )
+}
+
+/// [`exposure_sql`]'s rows (one `line` column, distinct), without its marker: the delete
+/// script's guard reads the same rows.
+fn exposure_rows_sql(role: &str, successor: &str) -> String {
+    let (r, s) = (quote_literal(role), quote_literal(successor));
+    let me = format!("(SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname = {r})");
+    // Every spelling `parse_bool` takes as true (unique prefixes of true/yes, on, 1).
+    let truthy = ["t", "tr", "tru", "true", "y", "ye", "yes", "on", "1"]
+        .map(quote_literal)
+        .join(", ");
+    let kind_of_view = "CASE v.relkind WHEN 'm' THEN 'materialized_view' ELSE 'view' END";
+    let hex = |e: &str| format!("pg_catalog.encode(pg_catalog.convert_to({e}, 'UTF8'), 'hex')");
+    format!(
+        "WITH views AS (
+  SELECT c.oid, c.relkind, c.relacl, c.relowner FROM pg_catalog.pg_class c
+   WHERE c.relowner = {me} AND c.relkind IN ('v', 'm')
+     AND NOT (c.relkind = 'v' AND EXISTS (
+       SELECT 1 FROM pg_catalog.unnest(c.reloptions) AS opt(o)
+        WHERE pg_catalog.split_part(opt.o, '=', 1) = 'security_invoker'
+          AND pg_catalog.lower(pg_catalog.btrim(pg_catalog.substr(opt.o, pg_catalog.strpos(opt.o, '=') + 1)))
+              IN ({truthy})))),
+objects(kind, identity, acl, public_counts) AS (
+  SELECT CASE p.prokind WHEN 'p' THEN 'procedure' ELSE 'function' END,
+         p.oid::pg_catalog.regprocedure::pg_catalog.text,
+         COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner)), false
+    FROM pg_catalog.pg_proc p
+   WHERE p.proowner = {me} AND p.prosecdef
+  UNION ALL
+  SELECT {kind_of_view}, v.oid::pg_catalog.regclass::pg_catalog.text,
+         COALESCE(v.relacl, pg_catalog.acldefault('r', v.relowner)), true
+    FROM views v
+  UNION ALL
+  SELECT {kind_of_view}, v.oid::pg_catalog.regclass::pg_catalog.text, a.attacl, true
+    FROM views v JOIN pg_catalog.pg_attribute a ON a.attrelid = v.oid
+   WHERE a.attnum > 0 AND NOT a.attisdropped AND a.attacl IS NOT NULL)
+SELECT DISTINCT 'exposure|' || o.kind || '|' || {identity} || '|' || {grantee} AS line
+  FROM objects o, pg_catalog.aclexplode(o.acl) x
+ WHERE (x.grantee <> 0 OR o.public_counts)
+   AND x.grantee NOT IN (SELECT r.oid FROM pg_catalog.pg_roles r WHERE r.rolname IN ({r}, {s}))",
+        identity = hex("o.identity"),
+        grantee = hex(
+            "CASE WHEN x.grantee = 0 THEN 'PUBLIC' ELSE pg_catalog.pg_get_userbyid(x.grantee)::pg_catalog.text END"
+        ),
+    )
+}
+
+/// One line of [`exposure_sql`]'s output.
+fn exposure_line(kind: ExposureKind, identity: &str, grantee: &str) -> String {
+    format!(
+        "exposure|{}|{}|{}",
+        kind.as_str(),
+        hex::encode(identity),
+        hex::encode(grantee)
+    )
+}
+
+/// T10 fix: one database's [`exposure_sql`] output as exposures in `database`: lines grouped
+/// by (kind, identity), grantees sorted and deduplicated, the list sorted. Empty output is
+/// none; an unknown line, kind or bad hex is an error.
+pub fn parse_exposures(database: &str, out: &str) -> anyhow::Result<Vec<Exposure>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let text = |hex_text: &str| {
+        hex::decode(hex_text)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .with_context(|| format!("an unexpected name {hex_text:?} in the exposures"))
+    };
+    let mut found: BTreeMap<(ExposureKind, String), BTreeSet<String>> = BTreeMap::new();
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let fields: Vec<&str> = line.split('|').collect();
+        let ["exposure", kind, identity, grantee] = fields.as_slice() else {
+            anyhow::bail!("an unexpected line {line:?} in the exposures");
+        };
+        let kind = ExposureKind::from_wire(kind)
+            .with_context(|| format!("an unexpected kind {kind:?} in the exposures"))?;
+        found
+            .entry((kind, text(identity)?))
+            .or_default()
+            .insert(text(grantee)?);
+    }
+    let mut exposures: Vec<Exposure> = found
+        .into_iter()
+        .map(|((kind, identity), grantees)| Exposure {
+            database: database.to_string(),
+            kind,
+            identity,
+            grantees: grantees.into_iter().collect(),
+        })
+        .collect();
+    exposures.sort();
+    Ok(exposures)
+}
+
+/// [`successor_check_sql`]'s rule as one boolean expression (never NULL): `false` for a role
+/// that doesn't exist.
+fn successor_predicate(successor: &str) -> String {
+    let reserved: Vec<String> = RESERVED_ROLE_NAMES
+        .iter()
+        .map(|n| quote_literal(n))
+        .collect();
+    let settable = owner_settable_predicate("s.oid", "me.oid");
+    // Every membership upward counts (SET and ADMIN ones, and INHERIT ones too: before
+    // Postgres 16 every membership can SET, and an inherited owner-level role is owner-level
+    // enough). A role on the chain holding ADMIN on any role is refused too, as for a member
+    // role's leftovers.
+    format!(
+        "COALESCE((SELECT {settable}
+   AND NOT EXISTS (
+     WITH RECURSIVE chain(oid) AS (
+       SELECT s.oid
+       UNION SELECT a.roleid FROM pg_catalog.pg_auth_members a JOIN chain c ON a.member = c.oid)
+     SELECT 1 FROM chain c JOIN pg_catalog.pg_roles r ON r.oid = c.oid
+      WHERE r.rolsuper OR r.rolreplication OR r.rolcreaterole OR r.rolbypassrls OR r.rolcreatedb
+         OR pg_catalog.pg_has_role(r.oid, me.oid, 'MEMBER')
+         OR EXISTS (SELECT 1 FROM pg_catalog.pg_roles o
+                     WHERE o.rolname IN ('neon_superuser', 'cloud_admin')
+                       AND pg_catalog.pg_has_role(r.oid, o.oid, 'MEMBER'))
+         OR r.rolname ~* '^(pg_|cb_m_|chelabase_)' OR r.rolname = ANY (ARRAY[{reserved}])
+         OR EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members x WHERE x.member = r.oid AND x.admin_option)
+         OR EXISTS (SELECT 1 FROM pg_catalog.pg_db_role_setting rs
+                     WHERE rs.setdatabase = 0 AND rs.setrole = r.oid
+                       AND EXISTS (SELECT 1 FROM pg_catalog.unnest(rs.setconfig) AS sc
+                                    WHERE pg_catalog.starts_with(sc, '{PERSONAL_LOGIN_MARKER}='))))
+   FROM pg_catalog.pg_roles s, pg_catalog.pg_roles me
+  WHERE s.rolname = {name} AND me.rolname = {owner}), false)",
+        reserved = reserved.join(", "),
+        name = quote_literal(successor),
+        owner = quote_literal(OWNER_ROLE),
+    )
+}
+
+/// T10: one line, `t` when `successor` may receive a deleted role's objects, `f` otherwise
+/// (a role that doesn't exist included). Run as `cloud_admin` in the branch's main database,
+/// with `standard_conforming_strings = on` (T10-5: its literals mean what they say) and
+/// `search_path = pg_catalog, pg_temp`. Valid: the role exists; the owner can SET to it
+/// (`chelabase_schema::privileges::owner_settable_predicate`, P27a, with [`OWNER_ROLE`] as
+/// `me`); it isn't marked as a personal login (`chelabase.managed_role`); and neither it nor
+/// anything it reaches through SET or ADMIN memberships is owner-level (SUPERUSER, CREATEROLE,
+/// CREATEDB, REPLICATION, BYPASSRLS, a member of the owner, `neon_superuser` or `cloud_admin`)
+/// or reserved (`pg_*`, `cb_m_*`, `chelabase_*`, the platform's own names).
+pub fn successor_check_sql(successor: &str) -> String {
+    format!(
+        "SET standard_conforming_strings = on; SET search_path = pg_catalog, pg_temp; \
+         SELECT /* chelabase: successor check */ {};",
+        successor_predicate(successor)
+    )
+}
+
+/// T10: one database's [`role_delete_script`] output as a [`Reassigned`]. Empty output is
+/// nothing moved; an unknown line, a count that isn't a number or a definer that isn't hex
+/// UTF-8 is an error.
+pub fn parse_reassigned(out: &str) -> anyhow::Result<Reassigned> {
+    let mut reassigned = Reassigned::default();
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match line.split_once('|') {
+            Some(("count", n)) => {
+                let n: u64 = n
+                    .parse()
+                    .with_context(|| format!("an unexpected count {n:?}"))?;
+                reassigned.count += n;
+            }
+            Some(("definer", hex_name)) => {
+                let name = hex::decode(hex_name)
+                    .ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
+                    .with_context(|| format!("an unexpected routine {hex_name:?}"))?;
+                reassigned.definers.push(name);
+            }
+            _ => anyhow::bail!("an unexpected line {line:?} in the delete's output"),
+        }
+    }
+    Ok(reassigned)
+}
+
+/// T10: the successor rules checked before anything is read: a name Postgres can hold, not
+/// the deleted role, not the owner, not reserved (any case: `pg_*`, `cb_m_*`, `chelabase_*`,
+/// the platform's own names), except [`QUARANTINE_ROLE`] itself.
+pub(crate) fn check_successor(role: &str, successor: &str) -> Result<(), RoleOutcome> {
+    if successor == QUARANTINE_ROLE {
+        return Ok(());
+    }
+    if check_any_role_name(successor).is_err()
+        || successor == role
+        || successor == OWNER_ROLE
+        || is_membership_reserved(successor)
+    {
+        return Err(invalid_successor(successor));
+    }
+    Ok(())
+}
+
+fn invalid_successor(successor: &str) -> RoleOutcome {
+    RoleOutcome::Refused("invalid_successor", invalid_successor_message(successor))
+}
+
+fn invalid_successor_message(successor: &str) -> String {
+    format!(
+        "{successor:?} can't receive the role's objects: name a role the owner can SET to \
+         that isn't owner-level, reserved or a personal login, or {QUARANTINE_ROLE}"
+    )
+}
+
 fn exists(name: &str) -> RoleOutcome {
     RoleOutcome::Refused("role_exists", format!("a role named {name} already exists"))
 }
@@ -1404,6 +2080,103 @@ fn failed(branch: BranchId, what: &str, err: &dyn std::fmt::Display) -> RoleOutc
     RoleOutcome::Failed(format!("{what}: {err}"))
 }
 
+#[cfg(test)]
+#[path = "roles_successor_tests.rs"]
+mod successor_tests;
+
+#[cfg(test)]
+#[path = "roles_exposure_tests.rs"]
+mod exposure_tests;
+
+/// The coder's edges beyond the RED set (T10 fix).
+#[cfg(test)]
+mod exposure_edge_tests {
+    use super::*;
+    use crate::fakes::{ready_database, worker};
+
+    fn exposure(kind: ExposureKind, identity: &str, grantees: &[&str]) -> Exposure {
+        Exposure {
+            database: "app".into(),
+            kind,
+            identity: identity.into(),
+            grantees: grantees.iter().map(|g| g.to_string()).collect(),
+        }
+    }
+
+    // A column privilege on a view runs the view as its owner too; every spelling Postgres
+    // takes as true marks an invoker view (probed on PG16/PG17: `on`, `yes` excluded, `off`
+    // listed).
+    #[test]
+    fn the_read_counts_column_grants_and_every_true_spelling() {
+        let s = exposure_sql("app", "heir");
+        assert!(s.contains("attacl") && s.contains("attisdropped"), "{s}");
+        for spelling in ["'t'", "'true'", "'y'", "'yes'", "'on'", "'1'"] {
+            assert!(s.contains(spelling), "{spelling}: {s}");
+        }
+        assert!(!s.contains("'off'") && !s.contains("'o'"), "{s}");
+    }
+
+    // The guard compares sets: the same exposures in another order, or a grantee listed twice,
+    // make the same script.
+    #[test]
+    fn the_guard_ignores_order_and_duplicates() {
+        let a = exposure(ExposureKind::Function, "public.f()", &["anon", "web"]);
+        let b = exposure(ExposureKind::View, "public.v", &["PUBLIC"]);
+        let twice = exposure(ExposureKind::Function, "public.f()", &["web", "anon", "web"]);
+        let one = role_delete_script_with("app", "heir", &[a.clone(), b.clone()]);
+        assert_eq!(one, role_delete_script_with("app", "heir", &[b.clone(), a]));
+        assert_eq!(one, role_delete_script_with("app", "heir", &[twice, b]));
+    }
+
+    #[test]
+    fn only_the_guards_text_is_a_change_of_exposures() {
+        let guard = anyhow::anyhow!("ERROR:  {EXPOSURES_CHANGED}").context("moving the role's objects in app");
+        assert!(exposures_changed(&guard));
+        for other in ["ERROR:  the successor heir can no longer receive objects", "injected failure", ""] {
+            assert!(!exposures_changed(&anyhow::anyhow!("{other}")), "{other:?}");
+        }
+    }
+
+    // The guard fired and the exposures were gone by the re-read (the first read saw one, the
+    // second none): still unconfirmed, the move didn't happen, with nothing left to confirm, so
+    // a plain retry goes through.
+    #[tokio::test]
+    async fn a_guard_whose_exposures_went_meanwhile_answers_an_empty_preview() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let ep = main.endpoint_id.clone().unwrap();
+        assert_eq!(w.create_role(main.id, &RoleSpec::login("app", false)).await, RoleOutcome::Ok);
+        w.computes.answer(&exists_sql("app"), "1\n");
+        w.computes.answer("encode(convert_to(datname", &format!("{}\n", hex::encode("app")));
+        w.computes.answer(&successor_check_sql("heir"), "t\n");
+        let line = exposure_line(ExposureKind::Function, "public.f()", "anon");
+        w.computes.answer_once_at(&ep, "/* chelabase: exposure read */", &format!("{line}\n"));
+        let list = vec![exposure(ExposureKind::Function, "public.f()", &["anon"])];
+        let token = exposure_token("heir", &list);
+        *w.computes.fail_sql_containing.lock().unwrap() =
+            Some(("REASSIGN OWNED BY".into(), format!("ERROR:  {EXPOSURES_CHANGED}")));
+
+        let outcome = w.delete_role_with(main.id, "app", "heir", Some(&token)).await;
+
+        assert_eq!(
+            outcome,
+            RoleOutcome::Unconfirmed(DeletePreview { successor: "heir".into(), exposures: vec![], confirm: None })
+        );
+        assert!(w.metadata.state().endpoints[&ep].logins.contains_key("app"), "the row stays");
+    }
+
+    // A preview's request that isn't one answers `failed`.
+    #[tokio::test]
+    async fn the_preview_rpc_refuses_a_bad_request() {
+        let (w, _journal) = worker();
+        let reply = w
+            .role_rpc_reply(SUBJECT_ROLE_DELETE_PREVIEW, b"{}", Duration::from_secs(5))
+            .await;
+        assert_eq!(reply.code.as_deref(), Some("failed"), "{reply:?}");
+        assert_eq!(reply.preview, None);
+    }
+}
 #[cfg(test)]
 mod tests {
     use chelabase_metadata::RoleLevel;
@@ -1909,8 +2682,27 @@ mod tests {
     const DATABASES: &str = "SET search_path = pg_catalog, pg_temp; SELECT \
         encode(convert_to(datname, 'UTF8'), 'hex') FROM pg_database WHERE datallowconn AND NOT \
         datistemplate ORDER BY datname;";
-    const REASSIGN: &str = "REASSIGN OWNED BY \"app\" TO postgres; DROP OWNED BY \"app\";";
     const DROP: &str = "DROP ROLE IF EXISTS \"app\";";
+    /// T10: the quarantine role, the successor when none is named.
+    const Q: &str = crate::member_roles::QUARANTINE_ROLE;
+
+    /// T10: `app`'s per-database delete script, handing its objects to `successor`.
+    fn app_to(successor: &str) -> String {
+        role_delete_script("app", successor)
+    }
+
+    /// One `definer|<hex>` line of a delete script's output.
+    fn definer_line(identity: &str) -> String {
+        format!("definer|{}\n", hex::encode(identity))
+    }
+
+    fn deleted(count: u64, definers: &[&str]) -> RoleOutcome {
+        RoleOutcome::Deleted(Reassigned {
+            count,
+            definers: definers.iter().map(|d| d.to_string()).collect(),
+            confirmed: vec![],
+        })
+    }
 
     /// The databases as the listing prints them: one hex-encoded name per line.
     fn databases(names: &[&str]) -> String {
@@ -1957,6 +2749,8 @@ mod tests {
         }
     }
 
+    // T10: with the quarantine role as successor (the default), nothing is checked in SQL first;
+    // each database runs the delete script, and the outcome sums what moved.
     #[tokio::test]
     async fn delete_runs_in_order_across_every_database() {
         let (w, journal) = worker();
@@ -1964,9 +2758,11 @@ mod tests {
         w.computes.answer(EXISTS_APP, "1\n");
         w.computes
             .answer("FROM pg_database", &databases(&["app", "other"]));
+        w.computes.answer_in("app", "REASSIGN OWNED BY", &format!("count|2\n{}", definer_line("public.planted()")));
+        w.computes.answer_in("other", "REASSIGN OWNED BY", "count|1\n");
         let asked = w.member_role_requests.sent().len();
 
-        assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(3, &["public.planted()"]));
         assert_eq!(w.member_role_requests.sent().len(), asked + 1, "a member-role reconcile is asked for");
         assert_eq!(w.member_role_requests.sent().last(), Some(&branch));
 
@@ -1977,8 +2773,8 @@ mod tests {
                 on(&db, EXISTS_APP),
                 on(&db, DATABASES),
                 on(&db, TERMINATE),
-                on("app", REASSIGN),
-                on("other", REASSIGN),
+                on("app", &app_to(Q)),
+                on("other", &app_to(Q)),
                 on(&db, DROP),
             ]
         );
@@ -2010,11 +2806,11 @@ mod tests {
         w.computes
             .answer("FROM pg_database", &databases(&["app", "my-app"]));
 
-        assert_eq!(w.delete_role(branch, name).await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, name, Q).await, deleted(0, &[]));
 
         let ident = "\"My \"\"Role\"\"\"";
         let on = |d: &str, s: String| (d.to_string(), s);
-        let reassign = format!("REASSIGN OWNED BY {ident} TO postgres; DROP OWNED BY {ident};");
+        let reassign = role_delete_script(name, Q);
         assert_eq!(
             sql_on(&w)[2..],
             [
@@ -2051,7 +2847,7 @@ mod tests {
         let (branch, ep, _db) = with_app(&w, &journal).await;
         w.metadata.state().role_row_vanishes = true;
 
-        assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
         assert!(!w.metadata.state().endpoints[&ep].logins.contains_key("app"));
     }
 
@@ -2069,13 +2865,13 @@ mod tests {
             ("CB_M_X", "reserved_role_name"),
             ("", "invalid_role_name"),
         ] {
-            let outcome = w.delete_role(branch, name).await;
+            let outcome = w.delete_role(branch, name, Q).await;
             assert!(refused(code)(&outcome), "{name:?}: {outcome:?}");
         }
         assert!(position(&journal, "metadata.lock_endpoint").is_none());
-        assert_eq!(w.delete_role(branch, "ghost").await, RoleOutcome::NotFound);
+        assert_eq!(w.delete_role(branch, "ghost", Q).await, RoleOutcome::NotFound);
         assert_eq!(
-            w.delete_role(BranchId::new(), "app").await,
+            w.delete_role(BranchId::new(), "app", Q).await,
             RoleOutcome::NotReady
         );
         assert!(sql(&w).is_empty(), "{:?}", sql(&w));
@@ -2097,7 +2893,7 @@ mod tests {
         }
 
         assert_eq!(
-            w.delete_role(branch, "app").await,
+            w.delete_role(branch, "app", Q).await,
             RoleOutcome::InUse(vec![KeyRef {
                 id: live.id,
                 name: "backend".into()
@@ -2107,7 +2903,7 @@ mod tests {
         assert!(login(&w, &ep, "app").is_some());
 
         w.metadata.state().revoked_keys.insert(live.id);
-        assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
         assert!(login(&w, &ep, "app").is_none());
     }
 
@@ -2120,7 +2916,7 @@ mod tests {
         *w.computes.fail_sql_containing.lock().unwrap() =
             Some(("REASSIGN".into(), "objects depend on it".into()));
 
-        let outcome = w.delete_role(branch, "app").await;
+        let outcome = w.delete_role(branch, "app", Q).await;
 
         assert!(matches!(outcome, RoleOutcome::Failed(_)), "{outcome:?}");
         assert!(login(&w, &ep, "app").is_some());
@@ -2128,7 +2924,7 @@ mod tests {
         assert!(!sql(&w).iter().any(|s| s == DROP));
 
         *w.computes.fail_sql_containing.lock().unwrap() = None;
-        assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
         assert!(login(&w, &ep, "app").is_none());
     }
 
@@ -2141,7 +2937,7 @@ mod tests {
         w.computes
             .answer("FROM pg_database", &databases(&["app", long.as_str()]));
 
-        let outcome = w.delete_role(branch, "app").await;
+        let outcome = w.delete_role(branch, "app", Q).await;
 
         assert!(
             matches!(outcome, RoleOutcome::Failed(ref m) if m.contains(&long)),
@@ -2156,11 +2952,300 @@ mod tests {
         let (w, journal) = worker();
         let (branch, ep, _db) = with_app(&w, &journal).await;
 
-        assert_eq!(w.delete_role(branch, "app").await, RoleOutcome::Ok);
+        assert_eq!(w.delete_role(branch, "app", Q).await, deleted(0, &[]));
 
         assert_eq!(sql(&w), [EXISTS_APP]);
         assert!(login(&w, &ep, "app").is_none());
         assert!(position(&journal, &format!("cache.password_updated {ep} app")).is_some());
+    }
+
+    // --- T10: delete with a successor ----------------------------------------------------
+
+    /// The named successor `heir`'s check, as the fake answers it (`t` valid).
+    fn heir_valid(w: &FakeWorker, answer: &str) {
+        w.computes.answer(&successor_check_sql("heir"), answer);
+    }
+
+    // A named successor is checked in SQL before anything touches the role, and gets the
+    // objects in every database; the outcome sums the counts and lists every definer.
+    #[tokio::test]
+    async fn delete_to_a_named_successor_checks_it_first() {
+        let (w, journal) = worker();
+        let (branch, ep, db) = with_app(&w, &journal).await;
+        w.computes.answer(EXISTS_APP, "1\n");
+        w.computes.answer("FROM pg_database", &databases(&["app", "other"]));
+        w.computes.answer_in(
+            "app",
+            "REASSIGN OWNED BY",
+            &format!("count|2\n{}{}", definer_line("public.planted()"), definer_line("\"Odd\n\".\"f|g\"(integer)")),
+        );
+        w.computes.answer_in("other", "REASSIGN OWNED BY", &format!("count|1\n{}", definer_line("public.planted()")));
+        heir_valid(&w, "t\n");
+
+        assert_eq!(
+            w.delete_role(branch, "app", "heir").await,
+            deleted(3, &["public.planted()", "\"Odd\n\".\"f|g\"(integer)", "public.planted()"])
+        );
+
+        let ran = sql_on(&w);
+        let at = |needle: &str| {
+            ran.iter()
+                .position(|(_, s)| s == needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from {ran:?}"))
+        };
+        assert!(at(&successor_check_sql("heir")) < at(TERMINATE), "{ran:?}");
+        let scripts: Vec<&(String, String)> = ran.iter().filter(|(_, s)| *s == app_to("heir")).collect();
+        assert_eq!(
+            scripts,
+            [&("app".to_string(), app_to("heir")), &("other".to_string(), app_to("heir"))],
+            "{ran:?}"
+        );
+        assert_eq!(ran.last(), Some(&(db.clone(), DROP.to_string())));
+        assert!(!ran.iter().any(|(_, s)| s.contains("TO postgres") || s.contains("TO \"postgres\"")), "{ran:?}");
+        assert!(login(&w, &ep, "app").is_none());
+    }
+
+    // A successor SQL refuses (the owner can't SET to it, owner-level or marked in SQL, or gone):
+    // `invalid_successor`, and the role is untouched, its row kept.
+    #[tokio::test]
+    async fn an_invalid_successor_by_sql_leaves_the_role_untouched() {
+        for answer in ["f\n", ""] {
+            let (w, journal) = worker();
+            let (branch, ep, _db) = with_app(&w, &journal).await;
+            w.computes.answer(EXISTS_APP, "1\n");
+            w.computes.answer("FROM pg_database", &databases(&["app"]));
+            heir_valid(&w, answer);
+
+            let outcome = w.delete_role(branch, "app", "heir").await;
+
+            assert!(refused("invalid_successor")(&outcome), "{answer:?}: {outcome:?}");
+            let ran = sql(&w);
+            assert!(ran.contains(&successor_check_sql("heir")), "{answer:?}: {ran:?}");
+            assert!(
+                !ran.iter().any(|s| s.contains("NOLOGIN") || s.contains("REASSIGN") || s.contains("DROP ROLE")),
+                "{answer:?}: {ran:?}"
+            );
+            assert!(login(&w, &ep, "app").is_some(), "{answer:?}");
+            assert!(position(&journal, "metadata.delete_role_copy").is_none(), "{answer:?}");
+        }
+    }
+
+    // Red-team "privilege ops" (MH-28) for a successor: the role itself, the owner, reserved
+    // names in any case (the quarantine role's own name is the one exception), member roles and
+    // names Postgres can't hold are refused before any lock or SQL.
+    #[tokio::test]
+    async fn static_successor_refusals_run_nothing() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = with_app(&w, &journal).await;
+        let long = "s".repeat(64);
+        for successor in [
+            "app",
+            OWNER_ROLE,
+            "owner",
+            "cloud_admin",
+            "neon_superuser",
+            "authenticator",
+            "anon",
+            "authenticated",
+            "public",
+            "pg_read_all_data",
+            "PG_x",
+            "chelabase_admin",
+            "CHELABASE_ORPHANED",
+            "chelabase_orphaned2",
+            "cb_m_x",
+            "",
+            "a\0b",
+            long.as_str(),
+        ] {
+            let outcome = w.delete_role(branch, "app", successor).await;
+            assert!(refused("invalid_successor")(&outcome), "{successor:?}: {outcome:?}");
+        }
+        assert!(position(&journal, "metadata.lock_endpoint").is_none(), "{:?}", entries(&journal));
+        assert!(sql(&w).is_empty(), "{:?}", sql(&w));
+        assert!(login(&w, &ep, "app").is_some());
+    }
+
+    // MH-18: a personal login never receives objects, whatever SQL says.
+    #[tokio::test]
+    async fn a_personal_login_cant_succeed() {
+        let (w, journal) = worker();
+        let (branch, ep, _db) = with_app(&w, &journal).await;
+        {
+            let mut state = w.metadata.state();
+            let endpoint = state.endpoints.get_mut(&ep).unwrap();
+            endpoint.set_verifier("alice", Some(PERSONAL_VERIFIER));
+            endpoint.logins.insert(
+                "alice".into(),
+                FakeLogin {
+                    origin: RoleOrigin::Personal,
+                    password_enc: None,
+                    pending: false,
+                    login: true,
+                    level: RoleLevel::Plain,
+                    api_owner_level: false,
+                    attributes: chelabase_metadata::RoleAttributes::default(),
+                    attributes_pending: false,
+                    attributes_change_id: None,
+                },
+            );
+        }
+        w.computes.answer(EXISTS_APP, "1\n");
+        w.computes.answer("FROM pg_database", &databases(&["app"]));
+        w.computes.answer(&successor_check_sql("alice"), "t\n");
+
+        let outcome = w.delete_role(branch, "app", "alice").await;
+
+        assert!(refused("invalid_successor")(&outcome), "{outcome:?}");
+        assert!(!sql(&w).iter().any(|s| s.contains("REASSIGN") || s.contains("NOLOGIN")), "{:?}", sql(&w));
+        assert!(login(&w, &ep, "app").is_some());
+    }
+
+    // The script hands objects to the successor, never the owner or `cloud_admin`, then drops
+    // what's left; the owner's name never appears as a target.
+    #[test]
+    fn the_script_reassigns_to_the_successor_never_the_owner() {
+        for successor in ["heir", Q] {
+            let s = app_to(successor);
+            let target = format!("REASSIGN OWNED BY \"app\" TO \"{successor}\"");
+            let in_do = format!("REASSIGN OWNED BY \"app\" TO \"{successor}\"").replace('\'', "''");
+            assert!(s.contains(&target) || s.contains(&in_do), "{successor}: {s}");
+            assert!(s.contains("DROP OWNED BY \"app\""), "{successor}: {s}");
+            for owner in ["TO postgres", "TO \"postgres\"", "TO cloud_admin", "TO \"cloud_admin\""] {
+                assert!(!s.contains(owner), "{successor}: {owner} in {s}");
+            }
+            assert!(s.contains("SET standard_conforming_strings = on"), "{successor}: {s}");
+            assert!(s.contains("SET search_path = pg_catalog, pg_temp"), "{successor}: {s}");
+        }
+    }
+
+    // T6-C1's quarantine making is shared: the quarantine path embeds the same SQL as the
+    // personal cleanup, before the reassignment; a named successor is never created.
+    #[test]
+    fn the_quarantine_path_reuses_c1s_quarantine_sql() {
+        let make = crate::member_roles::quarantine_role_sql();
+        assert!(make.contains("CREATE ROLE chelabase_orphaned NOLOGIN"), "{make}");
+        assert!(make.contains("NOSUPERUSER") && make.contains("pg_terminate_backend"), "{make}");
+        assert!(crate::member_roles::personal_cleanup_script("x").contains(&make));
+        let s = app_to(Q);
+        let made = s.find(&make).unwrap_or_else(|| panic!("the quarantine SQL is missing: {s}"));
+        assert!(made < s.find("REASSIGN OWNED BY").unwrap(), "{s}");
+        assert!(!app_to("heir").contains("CREATE ROLE"), "{}", app_to("heir"));
+    }
+
+    // MH-18 amended for every successor: PUBLIC loses EXECUTE on what moved; the routines are
+    // read before the reassignment, and the whole script is one transaction, so a failure
+    // halfway never leaves a moved routine callable by PUBLIC (a retry couldn't find it).
+    #[test]
+    fn the_script_revokes_public_execute_and_is_one_transaction() {
+        for successor in ["heir", Q] {
+            let s = app_to(successor);
+            let lines: Vec<&str> = s.lines().map(str::trim).collect();
+            let begin = lines.iter().position(|l| *l == "BEGIN;");
+            let last = lines.iter().rev().find(|l| !l.is_empty()).copied();
+            let reassign = s.find("REASSIGN OWNED BY").unwrap_or(usize::MAX);
+            assert!(begin.is_some(), "{successor}: no BEGIN; line: {s}");
+            let begin_at = s.find("\nBEGIN;\n").or_else(|| s.starts_with("BEGIN;\n").then_some(0)).unwrap_or(usize::MAX);
+            assert!(begin_at < reassign, "{successor}: {s}");
+            assert_eq!(last, Some("COMMIT;"), "{successor}: {s}");
+            let read = s.find("pg_proc").unwrap_or(usize::MAX);
+            assert!(read < reassign, "{successor}: the routines are read before they move: {s}");
+            let revoke = s.find("REVOKE EXECUTE ON ROUTINE").unwrap_or(usize::MAX);
+            assert!(revoke != usize::MAX && s.contains("FROM PUBLIC"), "{successor}: {s}");
+            let drop = s.find("DROP OWNED BY").unwrap_or(0);
+            assert!(reassign < drop && revoke < drop, "{successor}: {s}");
+            assert!(s.contains("prosecdef") && s.contains("count|") && s.contains("definer|"), "{successor}: {s}");
+        }
+    }
+
+    // Hostile names stay one identifier (or one literal inside a DO body).
+    #[test]
+    fn hostile_names_stay_one_identifier() {
+        let s = role_delete_script("a\"b'c", "d\"e'f");
+        let plain = "REASSIGN OWNED BY \"a\"\"b'c\" TO \"d\"\"e'f\"";
+        let in_do = plain.replace('\'', "''");
+        assert!(s.contains(plain) || s.contains(&in_do), "{s}");
+        let drop = "DROP OWNED BY \"a\"\"b'c\"";
+        assert!(s.contains(drop) || s.contains(&drop.replace('\'', "''")), "{s}");
+    }
+
+    // The successor check: P27a's predicate with the owner as `me`, the personal-login marker,
+    // owner-level and reserved roles along the chain; the name quoted as a literal.
+    #[test]
+    fn the_successor_check_covers_every_rule() {
+        let s = successor_check_sql("It's");
+        assert!(s.contains("'It''s'"), "{s}");
+        assert!(!s.contains("'It's'"), "{s}");
+        assert!(s.contains("SET search_path = pg_catalog, pg_temp"), "{s}");
+        assert!(s.contains(&format!("'{OWNER_ROLE}'")), "the owner is `me`: {s}");
+        for needle in [
+            "pg_has_role",
+            "'SET'",
+            "admin_option",
+            "server_version_num",
+            chelabase_types::role_name::PERSONAL_LOGIN_MARKER,
+            "rolsuper",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolreplication",
+            "rolbypassrls",
+            "neon_superuser",
+            "cloud_admin",
+            "chelabase_",
+            "cb_m_",
+            "pg_",
+            "WITH RECURSIVE",
+        ] {
+            assert!(s.contains(needle), "{needle} missing: {s}");
+        }
+    }
+
+    #[test]
+    fn delete_output_parses() {
+        assert_eq!(parse_reassigned("").unwrap(), Reassigned::default());
+        let out = format!(
+            "count|2\n{}{}",
+            definer_line("public.f(integer)"),
+            definer_line("\"x\ny\".\"f|g\"()")
+        );
+        assert_eq!(
+            parse_reassigned(&out).unwrap(),
+            Reassigned { count: 2, definers: vec!["public.f(integer)".into(), "\"x\ny\".\"f|g\"()".into()], confirmed: vec![] }
+        );
+        for bad in ["count|x\n", "definer|zz\n", "definer|ff\n", "hello\n", "count|-1\n"] {
+            assert!(parse_reassigned(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    // The RPC: a request without a successor (an older orchestrator) goes to the quarantine
+    // role; the reply carries what moved; a bad successor is `invalid_successor`.
+    #[tokio::test]
+    async fn the_delete_rpc_carries_the_successor_and_answers_reassigned() {
+        let (w, journal) = worker();
+        let (branch, _ep, _db) = with_app(&w, &journal).await;
+        w.computes.answer(EXISTS_APP, "1\n");
+        w.computes.answer("FROM pg_database", &databases(&["app"]));
+        w.computes.answer_in("app", "REASSIGN OWNED BY", &format!("count|1\n{}", definer_line("public.planted()")));
+        let deadline = Duration::from_secs(5);
+
+        let itself = serde_json::to_vec(&RoleDeleteRequest {
+            branch_id: branch,
+            name: "app".into(),
+            successor: "app".into(),
+            confirm: None,
+        })
+        .unwrap();
+        let reply = w.role_rpc_reply(SUBJECT_ROLE_DELETE, &itself, deadline).await;
+        assert_eq!(reply.code.as_deref(), Some("invalid_successor"), "{reply:?}");
+
+        let old = serde_json::to_vec(&serde_json::json!({ "branch_id": branch, "name": "app" })).unwrap();
+        let reply = w.role_rpc_reply(SUBJECT_ROLE_DELETE, &old, deadline).await;
+        assert!(reply.ok, "{reply:?}");
+        assert_eq!(
+            reply.reassigned,
+            Some(Reassigned { count: 1, definers: vec!["public.planted()".into()], confirmed: vec![] })
+        );
+        assert!(sql(&w).contains(&app_to(Q)), "{:?}", sql(&w));
     }
 
     // --- RPCs ----------------------------------------------------------------------------
@@ -3401,15 +4486,17 @@ mod tests {
         );
         w.computes.answer("FROM pg_database", &databases(&["app", "other"]));
 
-        assert_eq!(w.delete_role(branch, "alice").await, RoleOutcome::Ok);
+        // T10: the quarantine role receives what it owned (MH-18 amended), never the owner.
+        assert_eq!(w.delete_role(branch, "alice", Q).await, deleted(0, &[]));
 
         let ran = sql_on(&w);
         let at = |needle: &str, d: &str| {
             ran.iter()
-                .position(|(database, s)| s.contains(needle) && database == d)
+                .position(|(database, s)| s == needle && database == d)
                 .unwrap_or_else(|| panic!("{needle:?} in {d} missing from {ran:?}"))
         };
-        let reassign = "REASSIGN OWNED BY \"alice\" TO postgres; DROP OWNED BY \"alice\";";
+        let reassign = role_delete_script("alice", Q);
+        let reassign = reassign.as_str();
         let order = [at(reassign, "app"), at(reassign, "other"), at("DROP ROLE IF EXISTS \"alice\";", &db)];
         assert!(order.is_sorted(), "{ran:?}");
         assert!(login(&w, &ep, "alice").is_none(), "the row goes");

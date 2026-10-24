@@ -9,6 +9,7 @@ import {
 } from "@chelabase/management-client";
 import { MultiCombobox, type ComboOption } from "@/components/ui/combobox";
 import { errorText } from "@/lib/errors";
+import { cn } from "@/lib/utils";
 import { whereText } from "@/lib/refusal-extra";
 import { actAsReserved, refusal as ruleRefusal, refusalText } from "@/lib/role-rules";
 
@@ -21,6 +22,8 @@ export interface RoleSource {
 export interface RoleChoice extends ComboOption {
   /** Every role this one can `SET ROLE` into (R21), in order. */
   chain: string[];
+  /** The databases that have it, when not all of them do. */
+  onlyOn?: string[];
 }
 
 /** Every role `name` can `SET ROLE` into (memberships with the SET option, any depth), without `name` itself. */
@@ -61,9 +64,10 @@ export function roleChoices(sources: readonly RoleSource[], platformRole: Platfo
   for (const { database, roles } of sources) {
     const byName = new Map(roles.map((r) => [r.name, r]));
     for (const r of roles) {
-      // Never the owner (Admin includes it) or a reserved name (no grant may hold one).
-      if (r.origin === "owner" || actAsReserved(r.name)) continue;
-      const chain = closure(r.name, byName);
+      // Never the owner (Admin includes it), a reserved name (no grant may hold one) or a personal
+      // login (it belongs to its member, MH-11).
+      if (r.origin === "owner" || r.origin === "personal" || actAsReserved(r.name)) continue;
+      const chain = closure(r.name, byName).filter((c) => byName.get(c)?.origin !== "personal");
       const entry = merged.get(r.name) ?? { chain: new Set<string>(), on: [], reason: null };
       chain.forEach((c) => entry.chain.add(c));
       entry.on.push(database);
@@ -80,6 +84,7 @@ export function roleChoices(sources: readonly RoleSource[], platformRole: Platfo
     return {
       value,
       chain,
+      onlyOn: e.on.length < sources.length ? e.on : undefined,
       detail: notes.length > 0 ? notes.join(" · ") : undefined,
       disabledReason: platformRole !== "admin" && e.reason ? `Admin only: ${e.reason}` : undefined,
     };
@@ -103,10 +108,12 @@ export interface RolePickerProps {
   disabled?: boolean;
   /** Told whether Admin-only roles are chosen below Admin: the form's Save waits until they're gone. */
   onBlockedChange?: (blocked: boolean) => void;
+  /** Extra classes for the "Postgres roles" label. */
+  labelClassName?: string;
 }
 
 /** Postgres roles for a grant (shared by the invite and approve dialogs and the Access tab). */
-export function RolePicker({ databases, platformRole, value, onChange, refused, refusal, disabled, onBlockedChange }: RolePickerProps) {
+export function RolePicker({ databases, platformRole, value, onChange, refused, refusal, disabled, onBlockedChange, labelClassName }: RolePickerProps) {
   const ready = databases.filter((d) => d.status === "ready");
   const branches = useQueries({ queries: ready.map((d) => getListBranchesQueryOptions(d.database_id)) });
   const mains = ready.map((d, i) => ({ db: d, main: branches[i].data?.find((b) => b.parent_branch_id === null) ?? null }));
@@ -143,7 +150,7 @@ export function RolePicker({ databases, platformRole, value, onChange, refused, 
   if (platformRole === "admin") {
     return (
       <div role="group" aria-label="Postgres roles" className="space-y-1">
-        <p className="text-sm font-medium">Postgres roles</p>
+        <p className={cn("text-sm font-medium", labelClassName)}>Postgres roles</p>
         <p className="text-sm">All roles</p>
         <p className="text-xs text-chalk-dim">An Admin holds every role of the project, the owner included. Narrow it on a database to keep fewer roles there.</p>
       </div>
@@ -154,6 +161,7 @@ export function RolePicker({ databases, platformRole, value, onChange, refused, 
     <div className="space-y-1">
       <MultiCombobox
         label="Postgres roles"
+        labelClassName={labelClassName}
         mono
         options={choices}
         value={value}

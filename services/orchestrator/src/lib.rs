@@ -17,13 +17,13 @@ use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, BranchJob, CheckDataRoleReply, MergeJob, CheckDataRoleRequest, DataApiDatabaseRequest, DatabaseSettingsJob, DeleteDatabaseJob,
     JetStreamContext, JobEnvelope,
     ProjectDeleteJob, ProvisionDatabaseJob, ResetPasswordReply, ResetPasswordRequest, RESET_NOT_APPLIED,
-    RoleCreateRequest, RoleReply, RoleRequest, RoleSessionsReply, RoleUpdateRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
+    RoleCreateRequest, RoleDeleteRequest, RoleReply, RoleRequest, RoleSessionsReply, RoleUpdateRequest, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP, SUBJECT_RESET_PASSWORD,
-    SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_SESSIONS, SUBJECT_ROLE_UPDATE,
+    SUBJECT_APP_USERS_CHECK, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_DELETE_PREVIEW, SUBJECT_ROLE_RESET, SUBJECT_ROLE_SESSIONS, SUBJECT_ROLE_UPDATE,
 };
 use chelabase_secrets::{open_credential, open_role_password, Purpose, SecretKey};
 use chelabase_types::api_error::{ApiError, ErrorCode};
-use chelabase_metadata::members::{Admission, GrantRow, GrantRows, MemberRecord, MemberStatus, OverrideRow};
+use chelabase_metadata::members::{Admission, GrantRow, MemberRecord, MemberStatus, OverrideRow};
 use chelabase_types::mode_policy::ModePolicy;
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
 use chelabase_types::api_error::ErrorEnvelope;
@@ -49,10 +49,12 @@ pub mod internal;
 pub mod members;
 mod merges;
 mod openapi;
+mod personal_logins;
 pub mod projects;
 mod protection;
 mod roles;
 pub mod sql_editor;
+mod privileges;
 mod table_api;
 pub use table_api::{DEFAULT_DRY_RUN_MAX_BYTES as DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES, dry_run_max_bytes as table_api_dry_run_max_bytes};
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, REALTIME_OWNER_CONNECTIONS, RestReply};
@@ -112,7 +114,7 @@ impl ProxyAddress {
 }
 
 /// The proxy's host name for an endpoint.
-fn proxy_host(endpoint_id: &str, domain: &str) -> String {
+pub(crate) fn proxy_host(endpoint_id: &str, domain: &str) -> String {
     format!("{endpoint_id}.{domain}")
 }
 
@@ -606,13 +608,14 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         admission: Admission,
     ) -> impl Future<Output = Result<MemberRecord, MetadataError>> + Send;
 
-    /// Every stored grant level for one (member, project, Chelabase database).
-    fn grant_rows(
+    /// Every source of the member's access on a project and their override on a Chelabase
+    /// database (MH-2): [`chelabase_types::access::GrantSources::effective`] is the only way to a grant.
+    fn grant_sources(
         &self,
         member: Uuid,
         project: Uuid,
         database: Option<Uuid>,
-    ) -> impl Future<Output = Result<GrantRows, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<chelabase_types::access::GrantSources, MetadataError>> + Send;
 
     /// The member's project grants on live projects, by project id.
     fn member_projects(
@@ -625,6 +628,36 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         &self,
         member: Uuid,
     ) -> impl Future<Output = Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError>> + Send;
+
+    /// T2-4 (MH-2): every live project of `tenant` where the member has an access source, with
+    /// its sources at the project level, by project id: what `/v1/me`, the project list and
+    /// realtime's projects read (never the own grants alone). The metadata answers it in one
+    /// query; this default asks [`Self::grant_sources`] per project of the tenant and per
+    /// project of the member's own grants.
+    fn member_grant_sources(
+        &self,
+        tenant: TenantId,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<(Uuid, chelabase_types::access::GrantSources)>, MetadataError>> + Send
+    {
+        async move {
+            let mut projects: std::collections::BTreeSet<Uuid> = self
+                .member_projects(member)
+                .await?
+                .into_iter()
+                .map(|(project, _)| project)
+                .collect();
+            projects.extend(self.list_projects(tenant).await?.into_iter().map(|p| p.id.as_uuid()));
+            let mut out = Vec::new();
+            for id in projects {
+                let sources = self.grant_sources(member, id, None).await?;
+                if sources.effective().is_some() {
+                    out.push((id, sources));
+                }
+            }
+            Ok(out)
+        }
+    }
 }
 
 // Each method below must delegate to `MetadataClient`'s inherent method of the
@@ -1117,13 +1150,13 @@ impl MetadataPort for MetadataClient {
         MetadataClient::ensure_member(self, tenant, zitadel_user_id, email, name, admission).await
     }
 
-    async fn grant_rows(
+    async fn grant_sources(
         &self,
         member: Uuid,
         project: Uuid,
         database: Option<Uuid>,
-    ) -> Result<GrantRows, MetadataError> {
-        MetadataClient::grant_rows(self, member, project, database).await
+    ) -> Result<chelabase_types::access::GrantSources, MetadataError> {
+        MetadataClient::grant_sources(self, member, project, database).await
     }
 
     async fn member_projects(&self, member: Uuid) -> Result<Vec<(Uuid, GrantRow)>, MetadataError> {
@@ -1132,6 +1165,13 @@ impl MetadataPort for MetadataClient {
 
     async fn member_overrides(&self, member: Uuid) -> Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError> {
         MetadataClient::member_overrides(self, member).await
+    }
+    async fn member_grant_sources(
+        &self,
+        tenant: TenantId,
+        member: Uuid,
+    ) -> Result<Vec<(Uuid, chelabase_types::access::GrantSources)>, MetadataError> {
+        MetadataClient::member_grant_sources(self, tenant, member).await
     }
 }
 
@@ -1257,7 +1297,14 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
     /// Deletes a login role.
     fn delete_role(
         &self,
-        request: RoleRequest,
+        request: RoleDeleteRequest,
+    ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
+
+    /// T10 fix: what deleting a role to `request.successor` would expose (a read; the reply's
+    /// `preview`), over `SUBJECT_ROLE_DELETE_PREVIEW`. `request.confirm` is ignored.
+    fn preview_role_delete(
+        &self,
+        request: RoleDeleteRequest,
     ) -> impl Future<Output = Result<RoleReply, ResetError>> + Send;
 
     /// Reads a role's live sessions on the branch's compute (E29a); never starts the compute.
@@ -1265,6 +1312,14 @@ pub trait JobPort: members::MemberRolesQueue + Send + Sync + 'static {
         &self,
         request: RoleRequest,
     ) -> impl Future<Output = Result<RoleSessionsReply, ResetError>> + Send;
+
+    /// EOS-H1: asks the worker whether a key create or a role's membership change would let
+    /// the data API reach a role with the members hub's "all rows" policy
+    /// (`chelabase_nats::SUBJECT_ALL_ROWS_CHECK`). The caller refuses on any failure.
+    fn check_all_rows(
+        &self,
+        request: chelabase_nats::AllRowsCheckRequest,
+    ) -> impl Future<Output = Result<chelabase_nats::AllRowsCheckReply, ResetError>> + Send;
 
     fn publish_project_delete(
         &self,
@@ -1518,8 +1573,12 @@ impl JobPort for NatsPorts {
         role_rpc(&self.client, SUBJECT_ROLE_UPDATE, &request).await
     }
 
-    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+    async fn delete_role(&self, request: RoleDeleteRequest) -> Result<RoleReply, ResetError> {
         role_rpc(&self.client, SUBJECT_ROLE_DELETE, &request).await
+    }
+
+    async fn preview_role_delete(&self, request: RoleDeleteRequest) -> Result<RoleReply, ResetError> {
+        role_rpc(&self.client, SUBJECT_ROLE_DELETE_PREVIEW, &request).await
     }
 
     async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
@@ -1538,6 +1597,13 @@ impl JobPort for NatsPorts {
                 _ => ResetError::Transport(e.to_string()),
             })?;
         serde_json::from_slice(&reply.payload).map_err(|e| ResetError::Transport(e.to_string()))
+    }
+
+    async fn check_all_rows(
+        &self,
+        request: chelabase_nats::AllRowsCheckRequest,
+    ) -> Result<chelabase_nats::AllRowsCheckReply, ResetError> {
+        member_roles_rpc(&self.client, chelabase_nats::SUBJECT_ALL_ROWS_CHECK, &request).await
     }
 
     async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
@@ -1614,6 +1680,10 @@ pub struct AppState<M, J> {
     pub realtime: internal::realtime::RealtimeAuth,
     /// Publishes realtime's platform and access events after metadata writes (P10).
     pub rt_events: Arc<dyn internal::realtime::RtEvents>,
+    /// The proxies' role-secret cache (members hub P4): every write that revokes, resets or
+    /// deletes a personal login tells it, now and again 1 s later. The same `Arc` as the
+    /// internal state's `cache`.
+    pub proxy_cache: Arc<dyn internal::CachePort>,
 }
 
 /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: 10 when unset or blank, otherwise 1 to 100.
@@ -1761,8 +1831,16 @@ async fn resolve_member<M: MetadataPort, J>(
         .map_err(failed)?;
     let existing = match existing {
         None if !auto_create => return Ok(None),
-        // A removed or pending member is returned as is: neither refreshes its claims.
-        Some(m) if matches!(m.status, MemberStatus::Removed | MemberStatus::Pending) => return Ok(Some(m)),
+        // A removed, pending or suspended member is returned as is: none refreshes its claims,
+        // and a sign-in never reactivates a suspended one (S6).
+        Some(m)
+            if matches!(
+                m.status,
+                MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended
+            ) =>
+        {
+            return Ok(Some(m));
+        }
         other => other,
     };
     let mut email = caller
@@ -2172,13 +2250,15 @@ struct MeMember {
 }
 
 /// Where a member is: `invited` (not signed in yet), `pending` (signed up, waiting for an
-/// admin to approve), `active`, or `removed`.
+/// admin to approve), `active`, `suspended` (grants kept, no access until a tenant admin
+/// reinstates them), or `removed`.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MemberStatusView {
     Invited,
     Pending,
     Active,
+    Suspended,
     Removed,
 }
 
@@ -2189,6 +2269,7 @@ impl From<MemberStatus> for MemberStatusView {
             MemberStatus::Pending => Self::Pending,
             MemberStatus::Active => Self::Active,
             MemberStatus::Removed => Self::Removed,
+            MemberStatus::Suspended => Self::Suspended,
         }
     }
 }
@@ -2353,11 +2434,13 @@ where
         .merge(console::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())
+        .merge(privileges::routes())
         .merge(roles::routes())
         .merge(projects::routes())
         .merge(app_users::routes())
         .merge(app_user_admin::routes())
         .merge(members::routes())
+        .merge(personal_logins::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -2409,7 +2492,7 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    use chelabase_types::access::{effective, PlatformRole, RoleSet};
+    use chelabase_types::access::{GrantSources, PlatformRole, RoleSet};
     let failed = |what: &str, err: MetadataError| {
         error!("{what}: {err}");
         ApiError::internal()
@@ -2419,7 +2502,8 @@ where
         Some(tenant) => resolve_member(state, tenant, &caller).await?,
         None => None,
     };
-    let active = member.as_ref().filter(|m| m.status == MemberStatus::Active);
+    // D7: an offboarded member is told who they are, with nothing to use.
+    let active = member.as_ref().filter(|m| m.in_good_standing());
     let tenant_admin = active.is_some_and(|m| m.tenant_admin);
     let instance_admin = state.policy.instance_admin(tenant_admin, in_operator_org(state, &caller.org_id));
 
@@ -2438,44 +2522,48 @@ where
                 databases: Vec::new(),
             })
             .collect(),
-        (Some(_), Some(m)) => {
+        (Some(tenant), Some(m)) => {
+            // T2-4: every source (`GrantSources`), not the own grants alone.
             let grants = state
                 .metadata
-                .member_projects(m.id)
+                .member_grant_sources(tenant, m.id)
                 .await
-                .map_err(|e| failed("member projects", e))?;
+                .map_err(|e| failed("member grant sources", e))?;
             let overrides = state
                 .metadata
                 .member_overrides(m.id)
                 .await
                 .map_err(|e| failed("member overrides", e))?;
+            // S20: `plus` is always empty in step 1 (no team grants; an override intersects to
+            // `Only`), so every role stays `"all"`.
             let roles_of = |roles: RoleSet| match roles {
-                RoleSet::All => MeRoles::All(AllRoles::All),
+                RoleSet::All { .. } => MeRoles::All(AllRoles::All),
                 RoleSet::Only(set) => MeRoles::Only(set.iter().map(|r| r.as_str().to_string()).collect()),
             };
+            // MH-2: every grant goes through `GrantSources::effective`.
             grants
                 .into_iter()
-                .map(|(project, row)| {
-                    let base = access::grant_of(&row);
-                    let grant = effective(&base, None);
+                .filter_map(|(project, sources)| {
+                    let grant = sources.effective()?;
                     let databases = overrides
                         .iter()
                         .filter(|(p, _, _)| *p == project)
-                        .map(|(_, database, o)| {
-                            let narrowed = effective(&base, Some(&access::narrowing_of(o)));
-                            MeDatabase {
+                        .filter_map(|(_, database, o)| {
+                            let narrowed: GrantSources = sources.narrowed(Some(o.to_narrowing()));
+                            let narrowed = narrowed.effective()?;
+                            Some(MeDatabase {
                                 database_id: DatabaseId(*database),
                                 platform_role: narrowed.platform_role,
                                 roles: roles_of(narrowed.roles),
-                            }
+                            })
                         })
                         .collect();
-                    MeProject {
+                    Some(MeProject {
                         project_id: ProjectId(project),
                         platform_role: grant.platform_role,
                         roles: roles_of(grant.roles),
                         databases,
-                    }
+                    })
                 })
                 .collect()
         }
@@ -2753,7 +2841,7 @@ pub(crate) struct ConnectionDetails {
 }
 
 /// Percent-encodes everything but RFC 3986's unreserved characters.
-fn uri_component(s: &str) -> String {
+pub(crate) fn uri_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {

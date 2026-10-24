@@ -1,16 +1,14 @@
 //! C3 edge tests (fork round 4, personal logins) beyond the RED set.
 
 use chelabase_metadata::{RoleAttributes, RoleCopy, RoleLevel, RoleOrigin};
-use chelabase_types::role_name::mark_personal_login_sql;
 use chrono::{DateTime, Utc};
 
 use crate::OWNER_ROLE;
 use crate::c2_tests::ready_named;
 use crate::fakes::worker;
-use crate::resync::{Observed, plan_resync};
+use crate::resync::{Observed, ObservedRole, plan_resync};
 
-/// F2: a whole verifier (RFC 7677's "pencil"): the recreate and `create_personal_login` take
-/// no other.
+/// F2: a whole verifier (RFC 7677's "pencil"): `create_personal_login` takes no other.
 const VERIFIER: &str = crate::f2_tests::PENCIL;
 
 fn personal(name: &str, member_of: &[&str]) -> RoleCopy {
@@ -42,53 +40,27 @@ fn sql_of(w: &crate::fakes::FakeWorker) -> Vec<String> {
         .collect()
 }
 
-// Invariant: whatever the catalog shows, a personal row is never removed and never recorded
-// as another origin, and only a missing one is made again (with the marker).
+// T6 (spec Part 6 "Convergence", S1; replaces the RT4-4 invariant deliberately): whatever the
+// catalog shows (the role lost, present and marked, present unmarked), a personal row is
+// never made again, repaired, removed or recorded by the resync, for any name; the member-role
+// reconciler alone converges personal logins.
 #[test]
-fn a_personal_row_is_never_removed_or_downgraded() {
-    for name in ["alice", "Al\"ice", "a b"] {
-        let copies = [personal(name, &[])];
-        let (repairs, write) = plan_resync(OWNER_ROLE, &copies, &Observed::default());
-        assert!(write.removals.is_empty(), "{name}: {write:?}");
-        assert_eq!(repairs.len(), 1, "{name}");
-        let script = repairs[0].statements.join("\n");
-        assert!(script.starts_with("BEGIN;\nCREATE ROLE "), "{script}");
-        assert!(script.ends_with("COMMIT;"), "{script}");
-        assert!(script.contains(&mark_personal_login_sql(name)), "{script}");
-        assert!(
-            write
-                .upserts
-                .iter()
-                .all(|u| u.origin == RoleOrigin::Personal),
-            "{write:?}"
-        );
+fn a_personal_row_is_never_recreated_removed_or_recorded() {
+    for name in ["alice", "Al\"ice", "a b", "cb_m_0123", "chelabase_realtime", "CHELABASE_x"] {
+        let mut marked = ObservedRole::plain(name);
+        marked.password = Some(VERIFIER.into());
+        marked.owner_admin = false;
+        marked.marked = true;
+        let mut unmarked = marked.clone();
+        unmarked.marked = false;
+        for (what, roles) in [("lost", vec![]), ("marked", vec![marked]), ("unmarked", vec![unmarked])] {
+            let observed = Observed { roles, databases: Vec::new() };
+            let (repairs, write) = plan_resync(OWNER_ROLE, &[personal(name, &["readers"])], &observed);
+            assert!(repairs.iter().all(|g| g.role != name), "{name} {what}: {repairs:?}");
+            assert!(write.upserts.iter().all(|u| u.name != name), "{name} {what}: {write:?}");
+            assert!(write.removals.iter().all(|r| r != name), "{name} {what}: {write:?}");
+        }
     }
-}
-
-// Names the platform keeps for itself are never made by a resync, whatever a row says.
-#[test]
-fn a_personal_row_with_a_reserved_prefix_is_not_recreated() {
-    for name in ["cb_m_0123", "chelabase_realtime", "CHELABASE_x"] {
-        let (repairs, write) =
-            plan_resync(OWNER_ROLE, &[personal(name, &[])], &Observed::default());
-        assert!(
-            repairs.is_empty() && write.upserts.is_empty() && write.removals.is_empty(),
-            "{name}"
-        );
-    }
-}
-
-// Memberships in groups that no longer exist are dropped from the script, not failed on.
-#[test]
-fn the_recreate_script_keeps_only_groups_that_exist() {
-    let (repairs, write) = plan_resync(
-        OWNER_ROLE,
-        &[personal("alice", &["gone"])],
-        &Observed::default(),
-    );
-    let script = repairs[0].statements.join("\n");
-    assert!(!script.contains("gone"), "{script}");
-    assert!(write.upserts[0].attributes.member_of.is_empty());
 }
 
 #[tokio::test]

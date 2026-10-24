@@ -54,10 +54,16 @@ ns AS (
     AND n.nspname NOT LIKE 'pg\_temp\_%'
     AND NOT EXISTS (SELECT FROM ext e WHERE e.classid = 'pg_namespace'::regclass AND e.objid = n.oid)
 ),
--- Roles that never appear as an ACL grantee: Chelabase's own and the hidden member login roles.
--- (Not all of `reserved`: grants to anon / authenticated stay.)
+-- Roles that never appear as an ACL grantee: Chelabase's own, the hidden member login roles and
+-- marked roles (personal logins, MH-13: a `chelabase.managed_role=` setting with
+-- `setdatabase = 0`, whatever the name). (Not all of `reserved`: grants to anon /
+-- authenticated stay.)
 hidden AS (
   SELECT r.oid FROM pg_roles r
   WHERE lower(r.rolname) LIKE 'chelabase\_%'
      OR lower(r.rolname) LIKE 'cb\_m\_%'
+     OR EXISTS (SELECT FROM pg_db_role_setting s
+                WHERE s.setrole = r.oid AND s.setdatabase = 0
+                  AND EXISTS (SELECT FROM unnest(s.setconfig) AS c
+                              WHERE starts_with(c, 'chelabase.managed_role=')))
 ),

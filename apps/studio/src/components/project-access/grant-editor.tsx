@@ -1,25 +1,23 @@
 import { useState, type RefObject } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import {
-  deleteProjectGrant,
-  getListProjectGrantsQueryKey,
-  putProjectGrant,
-  type PlatformRole,
-  type Project,
-  type ProjectGrant,
-} from "@chelabase/management-client";
+import { deleteProjectGrant, getListProjectGrantsQueryKey, type Member, type Project, type ProjectGrant } from "@chelabase/management-client";
+import { GrantCard } from "@/components/members/hub";
 import { refreshAccess } from "@/components/members/keys";
-import { PlatformRoleField } from "@/components/members/platform-role-field";
-import { RolePicker } from "@/components/members/role-picker";
+import type { RoleSource } from "@/components/members/role-picker";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
-import { failureOf, FailureText, type Failure } from "./failure";
+import { failureOf, type Failure } from "./failure";
 import { DatabaseNarrowing } from "./database-narrowing";
 
 export interface GrantEditorProps {
   project: Project;
   grant: ProjectGrant;
+  /** The person; a former member is gone from the list, so only the grant's id is known. */
+  member: Member | undefined;
   name: string;
+  roleSources: readonly RoleSource[];
+  /** The databases' roles are still being read: the card waits for them. */
+  rolesLoading: boolean;
   chains: ReadonlyMap<string, string[]>;
   /** Closes the editor; `done` names what happened, `gone` says the row no longer exists. */
   onClose: (done?: string, gone?: boolean) => void;
@@ -31,45 +29,18 @@ export interface GrantEditorProps {
 /** The editor's element id, which the row's expand control points at. */
 export const editorId = (memberId: string) => `access-editor-${memberId}`;
 
-const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x) => b.includes(x));
-
-/** An expanded row: the grant (platform role, roles, save, take away) and the per-database narrowing. */
-export function GrantEditor({ project, grant, name, chains, onClose, onStatus, returnFocus }: GrantEditorProps) {
+/** An expanded row: the shared grant card (platform role, roles, save), take away, and the per-database narrowing. */
+export function GrantEditor({ project, grant, member, name, roleSources, rolesLoading, chains, onClose, onStatus, returnFocus }: GrantEditorProps) {
   const queryClient = useQueryClient();
-  const [platformRole, setPlatformRole] = useState<PlatformRole>(grant.platform_role);
-  // R17: an Admin grant holds every role (`"all"`); a grant moved below Admin starts with none.
-  const granted = grant.pg_roles === "all" ? [] : grant.pg_roles;
-  const [pgRoles, setPgRoles] = useState<string[]>(granted);
-  const [blocked, setBlocked] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<Failure | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmError, setConfirmError] = useState<string | null>(null);
+  const [refused, setRefused] = useState<Failure | null>(null);
 
-  const admin = platformRole === "admin";
-  const changed = platformRole !== grant.platform_role || (!admin && !sameSet(pgRoles, granted));
-  // The role picker isn't shown for Admin, so nothing it held back counts.
-  const held = blocked && !admin;
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: getListProjectGrantsQueryKey(project.id) });
     refreshAccess(queryClient);
   };
-
-  async function save() {
-    if (busy || !changed || held) return;
-    setBusy(true);
-    setFailure(null);
-    try {
-      await putProjectGrant(project.id, grant.member_id, { platform_role: platformRole, pg_roles: admin ? [] : pgRoles });
-      refresh();
-      onClose(`Saved ${name}'s access.`);
-    } catch (err) {
-      setFailure(failureOf(err, project));
-      refresh();
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function takeAway() {
     setBusy(true);
@@ -89,47 +60,37 @@ export function GrantEditor({ project, grant, name, chains, onClose, onStatus, r
 
   return (
     <div id={editorId(grant.member_id)} role="group" aria-label={`Access for ${name}`} className="space-y-4 border-l-2 border-line-strong py-3 pl-4">
-      <form
-        aria-label={`Project access for ${name}`}
-        onSubmit={(e) => {
-          e.preventDefault();
-          void save();
-        }}
-        className="space-y-4"
-      >
-        <fieldset disabled={busy} className="m-0 min-w-0 space-y-4 border-0 p-0">
-          <PlatformRoleField value={platformRole} onChange={setPlatformRole} />
-          <RolePicker
-            databases={project.databases}
-            platformRole={platformRole}
-            value={pgRoles}
-            onChange={setPgRoles}
-            refused={failure?.role ? new Set([failure.role]) : undefined}
-            onBlockedChange={setBlocked}
-          />
-        </fieldset>
-        {failure && <FailureText failure={failure} />}
-        <div className="flex flex-wrap items-center gap-2">
-          <Button type="submit" disabled={busy || !changed || held}>
-            {busy ? "Saving…" : "Save"}
-          </Button>
-          <Button type="button" variant="ghost" disabled={busy} onClick={() => onClose()}>
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            variant="destructive"
-            className="ml-auto"
-            disabled={busy}
-            onClick={() => {
-              setConfirmError(null);
-              setConfirming(true);
-            }}
-          >
-            Take access away
-          </Button>
-        </div>
-      </form>
+      {rolesLoading ? (
+        <p className="text-sm text-chalk-dim">Loading roles…</p>
+      ) : (
+        <GrantCard
+          projectId={project.id}
+          // GrantCard reads only the member's id.
+          member={member ?? ({ id: grant.member_id } as Member)}
+          grant={grant}
+          roleSources={roleSources}
+          databases={project.databases}
+          onFailure={setRefused}
+          onSaved={() => onClose(`Saved ${name}'s access.`)}
+        />
+      )}
+      <div className="flex flex-wrap items-center gap-2">
+        <Button type="button" variant="ghost" disabled={busy} onClick={() => onClose()}>
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          variant="destructive"
+          className="ml-auto"
+          disabled={busy}
+          onClick={() => {
+            setConfirmError(null);
+            setConfirming(true);
+          }}
+        >
+          Take access away
+        </Button>
+      </div>
       <div className="border-t border-line pt-3">
         <h4 className="text-sm font-medium">Per database</h4>
         <p className="text-xs text-chalk-dim">Narrowing only takes access away on one database; it never adds any.</p>
@@ -144,8 +105,7 @@ export function GrantEditor({ project, grant, name, chains, onClose, onStatus, r
               grant={{ platformRole: grant.platform_role, pgRoles: grant.pg_roles }}
               override={grant.overrides.find((o) => o.database_id === d.database_id)}
               chains={chains}
-              // Only a narrowing can be "what's left of the grant": with none, the grant itself is refused.
-              flagged={failure?.databaseId === d.database_id && grant.overrides.some((o) => o.database_id === d.database_id)}
+              flagged={refused?.databaseId === d.database_id && grant.overrides.some((o) => o.database_id === d.database_id)}
               onStatus={onStatus}
             />
           ))}

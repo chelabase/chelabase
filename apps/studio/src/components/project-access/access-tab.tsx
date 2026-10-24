@@ -17,6 +17,7 @@ import {
 import { AccessEventList } from "@/components/members/access-event-list";
 import { InviteLinkDialog, type OneTimeLink } from "@/components/members/invite-link-panel";
 import { ACCESS_EVENTS_KEY } from "@/components/members/keys";
+import type { RoleSource } from "@/components/members/role-picker";
 import { Button } from "@/components/ui/button";
 import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
@@ -64,7 +65,7 @@ function AdminAccess({ project }: { project: Project }) {
   const me = useGetMe();
   const grants = useListProjectGrants(project.id);
   const members = useListMembers();
-  const { sources } = useRoleSources(project.databases);
+  const { sources, loading: rolesLoading } = useRoleSources(project.databases);
   const chains = useMemo(() => chainsOf(sources), [sources]);
   const narrow = useMediaQuery(NARROW);
 
@@ -138,9 +139,14 @@ function AdminAccess({ project }: { project: Project }) {
               Each person gets a platform role on this project and the Postgres roles they may act as.
             </p>
           </div>
-          <Button ref={addButton} onClick={() => setAdding(true)}>
-            Add people
-          </Button>
+          <div className="flex flex-wrap items-center gap-3">
+            <Link to="/app/members" search={{ project: project.id }} className="text-sm text-chalk underline underline-offset-4">
+              Manage in Members
+            </Link>
+            <Button ref={addButton} onClick={() => setAdding(true)}>
+              Add people
+            </Button>
+          </div>
         </div>
         {status && (
           <p role="status" className="text-sm text-chalk">
@@ -162,7 +168,7 @@ function AdminAccess({ project }: { project: Project }) {
           )
         ) : (
           <>
-            <div className="overflow-x-auto">
+            <div className="relative max-w-full min-w-0 overflow-x-auto">
               <table aria-label="People with access" className="w-full text-left text-sm">
                 <thead className="border-b border-line text-chalk-dim">
                   <tr>
@@ -192,7 +198,7 @@ function AdminAccess({ project }: { project: Project }) {
                   {tenantAdmins.map((m) => (
                     <tr key={m.id} className="border-b border-line align-top">
                       <td className="space-y-1 py-2 pr-3">
-                        <Person member={m} label="Tenant admin" />
+                        <Person member={m} label="Tenant admin" projectId={project.id} />
                         {narrow && <p>Admin</p>}
                         {narrow && <p className="text-chalk-dim">Every role, including the database owner</p>}
                       </td>
@@ -217,6 +223,8 @@ function AdminAccess({ project }: { project: Project }) {
                         member={member}
                         name={name}
                         chains={chains}
+                        roleSources={sources}
+                        rolesLoading={rolesLoading}
                         open={open}
                         narrow={narrow}
                         onToggle={() => {
@@ -302,12 +310,19 @@ function nameOf({ grant, member }: { grant: ProjectGrant; member: Member | undef
   return member ? memberName(member) : `Former member ${grant.member_id.slice(0, 8)}`;
 }
 
-function Person({ member, label }: { member: Member | undefined; label?: string }) {
+function Person({ member, label, projectId }: { member: Member | undefined; label?: string; projectId: string }) {
   if (!member) return <span className="text-chalk-dim">A former member</span>;
   return (
     <div className="min-w-0">
       <div className="flex flex-wrap items-center gap-x-2">
-        <span className="font-medium">{memberName(member)}</span>
+        <Link
+          to="/app/members/$memberId"
+          params={{ memberId: member.id }}
+          search={{ project: projectId }}
+          className="font-medium underline decoration-line-strong underline-offset-4 hover:decoration-chalk"
+        >
+          {memberName(member)}
+        </Link>
         {label && <span className="text-xs text-chalk-dim">{label}</span>}
         {member.status === "invited" && (
           <span className="text-xs text-chalk-dim" title="Counts once they accept" tabIndex={0}>
@@ -327,7 +342,8 @@ function RoleChips({ roles, chains }: { roles: MeRoles; chains: ReadonlyMap<stri
   return (
     <ul className="flex flex-wrap gap-1">
       {roles.map((r) => {
-        const chain = chains.get(r) ?? [];
+        // A role granted by name is listed as its own chip: the chain only adds what is not already shown (BP-5).
+        const chain = (chains.get(r) ?? []).filter((c) => !roles.includes(c));
         return (
           <li key={r} className="inline-flex items-center gap-1 border border-line-strong px-1.5 leading-6">
             <span className="font-mono text-[13px]">{r}</span>
@@ -361,6 +377,8 @@ function GrantRow({
   member,
   name,
   chains,
+  roleSources,
+  rolesLoading,
   open,
   narrow,
   onToggle,
@@ -374,6 +392,8 @@ function GrantRow({
   member: Member | undefined;
   name: string;
   chains: ReadonlyMap<string, string[]>;
+  roleSources: readonly RoleSource[];
+  rolesLoading: boolean;
   open: boolean;
   narrow: boolean;
   onToggle: () => void;
@@ -388,7 +408,7 @@ function GrantRow({
         {narrow ? (
           // Below 40rem: one cell, stacked, so the table never scrolls sideways.
           <td className="space-y-2 py-2 pr-3">
-            <Person member={member} />
+            <Person member={member} projectId={project.id} />
             <div>
               <div>{ROLE_LABEL[grant.platform_role]}</div>
               {grant.platform_role === "admin" && <div className="text-xs text-chalk-dim">includes the database owner</div>}
@@ -399,7 +419,7 @@ function GrantRow({
         ) : (
           <>
             <td className="py-2 pr-3">
-              <Person member={member} />
+              <Person member={member} projectId={project.id} />
             </td>
             <td className="py-2 pr-3">
               <div>{ROLE_LABEL[grant.platform_role]}</div>
@@ -430,7 +450,7 @@ function GrantRow({
       {open && (
         <tr className="border-b border-line">
           <td colSpan={narrow ? 2 : 5} className="pb-3">
-            <GrantEditor project={project} grant={grant} name={name} chains={chains} onClose={onClose} onStatus={onStatus} returnFocus={returnFocus} />
+            <GrantEditor project={project} grant={grant} member={member} name={name} roleSources={roleSources} rolesLoading={rolesLoading} chains={chains} onClose={onClose} onStatus={onStatus} returnFocus={returnFocus} />
           </td>
         </tr>
       )}

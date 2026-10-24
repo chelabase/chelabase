@@ -14,7 +14,9 @@ use chelabase_metadata::{
 };
 use chelabase_metadata::{ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleWriteOutcome};
 use chelabase_metadata::{MergeEvent, MergeRecord, MergeStatus, MergeStatusPatch};
-use chelabase_metadata::members::{GrantRows, MemberBranchRole, MemberRecord};
+use chelabase_metadata::members::{MemberBranchRole, MemberRecord};
+use chelabase_metadata::personal_logins::PersonalLoginRecord;
+use chelabase_types::access::GrantSources;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
 use chelabase_neon::spec::Placement;
@@ -427,12 +429,12 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         tenant: TenantId,
     ) -> impl Future<Output = Result<Vec<MemberRecord>, MetadataError>> + Send;
-    /// Every member's stored grant levels on (project, database), in one query.
-    fn database_grant_rows(
+    /// Every member's access sources on (project, database), in one query (MH-2).
+    fn database_grant_sources(
         &self,
         project: Uuid,
         database: Uuid,
-    ) -> impl Future<Output = Result<Vec<(Uuid, GrantRows)>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<Vec<(Uuid, GrantSources)>, MetadataError>> + Send;
     /// The branches the member-role sweep visits.
     fn member_role_branches(&self) -> impl Future<Output = Result<Vec<Uuid>, MetadataError>> + Send;
     /// Forgets a branch's member-role rows (a reset or restore replaced its catalog).
@@ -463,6 +465,60 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         member: Uuid,
         branch: Uuid,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// T6: every personal-login record of `database` (any status), with `qualifies` read in
+    /// the same query.
+    fn personal_login_records(
+        &self,
+        database: Uuid,
+    ) -> impl Future<Output = Result<Vec<PersonalLoginRecord>, MetadataError>> + Send;
+    /// T6: a personal `neon_roles` row for the record on `endpoint_id` (the record's own
+    /// verifier; `scram_verifier` is ignored, T3-I1).
+    fn upsert_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// T6: deletes the row only when its origin is `personal`.
+    fn delete_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        role_name: &str,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// T7: `(tenant, member, zitadel_user_id)` of every member holding a login that isn't
+    /// revoked (one row per member), for the identity sweep.
+    fn members_with_live_logins(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(TenantId, Uuid, String)>, MetadataError>> + Send;
+    /// T7: the webhook's and the sweep's write: the tenant member with this Zitadel user, every
+    /// live login revoked (`identity_offboarded`). Returns the member's personal-row endpoints
+    /// (revoked ones included); an unknown user: empty.
+    fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError>> + Send;
+    /// D7: `(tenant, member, zitadel_user_id)` of every member marked offboarded, for the
+    /// identity sweep (which clears the mark once Zitadel shows the user active).
+    fn offboarded_members(
+        &self,
+    ) -> impl Future<Output = Result<Vec<(TenantId, Uuid, String)>, MetadataError>> + Send;
+    /// D7: clears the offboarded mark of the tenant member with this Zitadel user; `true` when
+    /// one was cleared.
+    fn clear_offboarded(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// EOS-1: the member role's row, written only while its stored `password_enc` is still
+    /// `read` (`None`: no row); `false`, nothing written, otherwise.
+    fn upsert_member_branch_role_if(
+        &self,
+        row: &MemberBranchRole,
+        read: Option<&str>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     /// Ends an enable: `Ok` makes the row `on`, `Err(text)` makes it `error`. Only a row still
     /// `enabling` moves; false otherwise.
     fn finish_enable_data_api(
@@ -1126,12 +1182,12 @@ impl WorkerMetadata for MetadataClient {
         MetadataClient::list_members(self, tenant).await
     }
 
-    async fn database_grant_rows(
+    async fn database_grant_sources(
         &self,
         project: Uuid,
         database: Uuid,
-    ) -> Result<Vec<(Uuid, GrantRows)>, MetadataError> {
-        MetadataClient::database_grant_rows(self, project, database).await
+    ) -> Result<Vec<(Uuid, GrantSources)>, MetadataError> {
+        MetadataClient::database_grant_sources(self, project, database).await
     }
 
     async fn member_role_branches(&self) -> Result<Vec<Uuid>, MetadataError> {
@@ -1163,6 +1219,57 @@ impl WorkerMetadata for MetadataClient {
 
     async fn delete_member_branch_role(&self, member: Uuid, branch: Uuid) -> Result<(), MetadataError> {
         MetadataClient::delete_member_branch_role(self, member, branch).await
+    }
+
+    async fn personal_login_records(
+        &self,
+        database: Uuid,
+    ) -> Result<Vec<PersonalLoginRecord>, MetadataError> {
+        MetadataClient::personal_login_records(self, database).await
+    }
+
+    async fn members_with_live_logins(&self) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
+        MetadataClient::members_with_live_logins(self).await
+    }
+
+    async fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        MetadataClient::revoke_logins_for_zitadel_user(self, tenant, zitadel_user_id).await
+    }
+
+    async fn offboarded_members(&self) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
+        MetadataClient::offboarded_members(self).await
+    }
+
+    async fn clear_offboarded(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<bool, MetadataError> {
+        MetadataClient::clear_offboarded(self, tenant, zitadel_user_id).await
+    }
+
+    async fn upsert_member_branch_role_if(
+        &self,
+        row: &MemberBranchRole,
+        read: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::upsert_member_branch_role_if(self, row, read).await
+    }
+
+    async fn upsert_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::upsert_personal_role_row(self, endpoint_id, member, database, role_name, scram_verifier)
+            .await
+    }
+
+    async fn delete_personal_role_row(&self, endpoint_id: &str, role_name: &str) -> Result<(), MetadataError> {
+        MetadataClient::delete_personal_role_row(self, endpoint_id, role_name).await
     }
 
     async fn served_databases(

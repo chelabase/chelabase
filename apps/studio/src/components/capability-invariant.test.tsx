@@ -135,7 +135,7 @@ const info: ProjectInfo = { id: "p1", slug: "default", name: "Default", status: 
 const settings = { history_window: 604800, max_branches: 5, max_rows: 1000, statement_timeout_ms: 8000, max_connections: 5 };
 const member = (id: string, extra: Partial<Member> = {}): Member => ({
   id, email: `${id}@example.test`, display_name: id, status: "active", tenant_admin: false, has_access: true, invite: null,
-  accepted_at: null, created_at: "2026-10-01T00:00:00Z", ...extra,
+  accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z", access: { level: "none", projects: [] }, ...extra,
 });
 const consoleSchema = {
   default_schema: "public", version: "v",
@@ -237,10 +237,10 @@ const CONTROLS: Control[] = [
     ready: () => screen.findAllByText(/app users/i), query: button("Delete project"),
   },
   { name: "New project", operationId: "createProject", ui: () => <Dashboard />, ready: () => screen.findByRole("heading", { name: "demo" }), query: button("New project") },
-  { name: "Create role", operationId: "createRole", ui: () => <BranchRoles databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Create role") },
-  { name: "Delete role", operationId: "deleteRole", ui: () => <BranchRoles databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Delete reporting") },
-  { name: "Reset role password", operationId: "resetRolePassword", ui: () => <BranchRoles databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Reset password for reporting") },
-  { name: "Reveal a role", operationId: "getBranchConnection", ui: () => <BranchRoles databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Reveal reporting") },
+  { name: "Create role", operationId: "createRole", ui: () => <BranchRoles projectId="p1" databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Create role") },
+  { name: "Delete role", operationId: "deleteRole", ui: () => <BranchRoles projectId="p1" databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Delete reporting") },
+  { name: "Reset role password", operationId: "resetRolePassword", ui: () => <BranchRoles projectId="p1" databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Reset password for reporting") },
+  { name: "Reveal a role", operationId: "getBranchConnection", ui: () => <BranchRoles projectId="p1" databaseId="d1" branchId="m" />, ready: rolesReady, query: button("Reveal reporting") },
   {
     name: "Save database settings", operationId: "updateDatabase",
     ui: () => <DatabaseSettings databaseId="d1" settings={settings as never} />,

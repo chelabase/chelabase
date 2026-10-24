@@ -20,7 +20,7 @@ const me: Me = {
 function member(id: string, extra: Partial<Member>): Member {
   return {
     id, email: `${id}@example.test`, display_name: id, status: "active", tenant_admin: false, has_access: true,
-    invite: null, accepted_at: null, created_at: "2026-10-01T00:00:00Z", ...extra,
+    invite: null, accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z", access: { level: "none", projects: [] }, ...extra,
   };
 }
 

@@ -49,6 +49,9 @@ struct Fx {
     database: String,
     owner_password: String,
     storcon_url: String,
+    /// An admin NeonJWT for the storage controller (it runs without `--dev`), signed with the
+    /// stack's compute-JWT key pair as `branch_live`'s `admin_storcon` does.
+    storcon_token: String,
 }
 
 /// Provisions a database, runs `body` on it, then deletes it, pass or fail (`KEEP=1` keeps it).
@@ -96,6 +99,11 @@ where
         id,
         owner_password,
         storcon_url: config.storcon_url.clone(),
+        storcon_token: chelabase_neon::jwt::storage_token_from_dir(
+            &config.compute_jwt_dir,
+            &chelabase_neon::jwt::StorageScope::Admin,
+        )
+        .expect("the compute-JWT key pair"),
     });
 
     // A panic inside the task is caught here, so the cleanup below always runs.
@@ -2526,6 +2534,7 @@ impl Fx {
                 "{}/v1/tenant/config",
                 self.storcon_url.trim_end_matches('/')
             ))
+            .bearer_auth(&self.storcon_token)
             .json(&json!({
                 "tenant_id": tenant.as_str(),
                 "gc_horizon": 1_048_576,

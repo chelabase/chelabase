@@ -298,6 +298,11 @@ role-e2e:
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
 
+# Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
+# revocation on grant loss (compute suspended), suspend, revoke-now, Zitadel offboarding, expiry
+personal-logins-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/personal-logins-e2e.sh
+
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:
     infra/neon/tests/run.sh

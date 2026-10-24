@@ -376,6 +376,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let copies = rows
             .into_iter()
             .filter(|r| r.origin != RoleOrigin::Owner && r.name != OWNER_ROLE)
+            // S1: a personal row belongs to its record (the metadata's CHECK and FK refuse a
+            // copy); the child's personal rows come from its member-role reconcile.
+            .filter(|r| r.origin != RoleOrigin::Personal)
             .map(|r| {
                 let mut copy = ChildCopy {
                     name: r.name,
@@ -1575,6 +1578,40 @@ mod tests {
                 .any(|(ep, _, s)| *ep == dev_ep && s.contains("PASSWORD 'SCRAM")),
             "{sql:?}"
         );
+    }
+
+    // T6 (S1): a child branch's copies leave out personal rows (the metadata's CHECK and FK
+    // would refuse them, failing the branch); the child's personal rows come from its
+    // member-role reconcile, which a new branch asks for.
+    #[tokio::test]
+    async fn a_child_branch_copies_no_personal_row() {
+        let (w, journal) = worker();
+        let s = with_login_roles(&w, &journal).await;
+        {
+            let mut state = w.metadata.state();
+            let endpoint = state.endpoints.get_mut(&s.main_ep).unwrap();
+            endpoint
+                .logins
+                .insert("alice".into(), crate::fakes::FakeLogin::new(RoleOrigin::Personal, None, false));
+            endpoint.set_verifier("alice", Some(&chelabase_neon::scram::verifier("pw")));
+        }
+
+        w.handle_branch_create(s.dev, None).await.unwrap();
+
+        let dev = w.metadata.branch(s.dev);
+        assert_eq!(dev.status, BranchStatus::Ready, "{:?}", dev.error);
+        let dev_ep = dev.endpoint_id.unwrap();
+        let copies: Vec<String> = entries(&journal)
+            .into_iter()
+            .filter(|e| e.starts_with(&format!("metadata.endpoint_copy {dev_ep} ")))
+            .collect();
+        assert!(copies.iter().any(|e| e.contains(" app ")), "{copies:?}");
+        assert!(
+            !copies.iter().any(|e| e.contains(" alice ") || e.ends_with(" personal")),
+            "{copies:?}"
+        );
+        assert!(row(&w, &dev_ep, "alice").is_none(), "no personal row on the child");
+        assert!(w.member_role_requests.sent().contains(&s.dev), "the child asks for its reconcile");
     }
 
     fn protect(w: &FakeWorker, branch: BranchId) {

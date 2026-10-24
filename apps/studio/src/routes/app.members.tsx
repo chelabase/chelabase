@@ -1,13 +1,11 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { MembersPage, parseMembersTab, type MembersTab } from "@/components/members/members-page";
+import { MembersPage } from "@/components/members/members-page";
 import { useAppSession } from "@/lib/app-session";
+import { validateMembersSearch } from "@/lib/members-search";
 
 export const Route = createFileRoute("/app/members")({
-  validateSearch: (search: Record<string, unknown>): { tab?: MembersTab } => {
-    const tab = parseMembersTab(search.tab);
-    return tab && tab !== "people" ? { tab } : {};
-  },
+  validateSearch: validateMembersSearch,
   component: MembersRoute,
 });
 

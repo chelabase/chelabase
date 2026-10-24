@@ -70,7 +70,7 @@ describe("grid: the other editors and repeated presses", () => {
     expect(onSave).toHaveBeenCalledWith('["r2"]', expect.objectContaining({ name: "tags" }), { null: false, text: '["c"]' });
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "tags" })).toBeNull());
     expect(activeCells()).toEqual([]);
-    expect(nulls(onPresence)).toBe(before + 1);
+    await waitFor(() => expect(nulls(onPresence)).toBe(before + 1));
   });
 
   it("an_unchanged_codemirror_json_editor_closes_on_an_outside_press_without_a_save", async () => {
@@ -100,7 +100,7 @@ describe("grid: the other editors and repeated presses", () => {
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "n" })).toBeNull());
     expect(onSave).toHaveBeenCalledTimes(1);
     expect(activeCells()).toEqual([]);
-    expect(nulls(onPresence)).toBe(before + 1);
+    await waitFor(() => expect(nulls(onPresence)).toBe(before + 1));
   });
 
   it("a_failed_save_is_not_retried_by_a_second_press_with_the_same_value_but_is_with_a_new_one", async () => {
@@ -122,7 +122,7 @@ describe("grid: the other editors and repeated presses", () => {
     expect(onSave).toHaveBeenCalledTimes(2);
     expect(onSave).toHaveBeenLastCalledWith('["r2"]', expect.objectContaining({ name: "n" }), { null: false, text: "201" });
     expect(activeCells()).toEqual([]);
-    expect(nulls(onPresence)).toBe(before + 1);
+    await waitFor(() => expect(nulls(onPresence)).toBe(before + 1));
   });
 
   it("the_own_colour_changing_while_editing_restyles_the_cell_and_keeps_the_editor", async () => {

@@ -86,6 +86,13 @@ describe("ProjectPage", () => {
     expect(screen.getByRole("button", { name: "Create database" })).toBeInTheDocument();
   });
 
+  it("fs3_databases_table_scrolls_inside_a_relative_frame", async () => {
+    setup({});
+    const frame = (await screen.findByRole("table")).closest<HTMLElement>(".overflow-x-auto");
+    expect(frame).not.toBeNull();
+    expect(frame!.className).toMatch(/(^|\s)relative(\s|$)/);
+  });
+
   it("create_form_shows_before_me_loads", async () => {
     // /v1/me never answers: the form needs no tenant, so it is there anyway.
     setup({ "GET /v1/me": () => new Promise<Response>(() => {}) });

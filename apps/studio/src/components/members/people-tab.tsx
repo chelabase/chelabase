@@ -1,6 +1,8 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Select } from "@/components/ui/select";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { MoreHorizontal, ShieldCheck } from "lucide-react";
+import { Link, useNavigate, useRouter, useSearch } from "@tanstack/react-router";
+import { MoreHorizontal, Plus, Search } from "lucide-react";
 import {
   ApiError,
   removeMember,
@@ -15,11 +17,15 @@ import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Menu, MenuItem, MenuNote } from "@/components/ui/menu";
 import { errorText } from "@/lib/errors";
-import { memberName, memberStatus, utc, type StatusText } from "@/lib/members";
+import { initials, memberName, memberStatus, ROLE_LABEL, utc, type StatusText } from "@/lib/members";
+import type { HubSearch } from "@/lib/members-search";
 import { useMediaQuery } from "@/lib/use-media-query";
+import { groupRoster, LevelBadge, Tag, useViewPreference, ViewToggle, type Group, type GroupKey, type RosterView } from "./hub";
+import { breakableEmail } from "./breakable-email";
 import { InviteDialog } from "./invite-dialog";
 import { InviteLinkDialog, type OneTimeLink } from "./invite-link-panel";
 import { refreshAccess } from "./keys";
+import { dateText } from "./member-page/logins";
 import { Requests } from "./requests";
 
 export interface PeopleTabProps {
@@ -32,27 +38,111 @@ export interface PeopleTabProps {
   onStatus: (message: string | null) => void;
 }
 
-type Confirm =
+export type Confirm =
   | { kind: "make-admin"; member: Member }
   | { kind: "step-down"; member: Member }
   | { kind: "remove"; member: Member }
   | { kind: "revoke"; member: Member };
 
-const LAST_ADMIN = (name: string) => `${name} is the last tenant admin. Make someone else a tenant admin first.`;
+export const LAST_ADMIN = (name: string) => `${name} is the last tenant admin. Make someone else a tenant admin first.`;
 
 /** Below 40rem the roster stacks: one block per person instead of a table. */
 const NARROW = "(max-width: 40rem)";
 
-/** The roster: who is here, their status as words, and (for tenant admins) one menu per row. */
-export function PeopleTab({ members, selfId, tenantAdmin, projects, onStatus: setStatus }: PeopleTabProps) {
+/** The roster's place in the URL: the project filter, the view and the name filter (`/app/members?project=&view=&q=`). */
+interface Nav {
+  project: string | undefined;
+  view: RosterView | undefined;
+  q: string;
+  setProject: (project: string | undefined) => void;
+  setView: (view: RosterView) => void;
+  setQ: (q: string) => void;
+  /** A link to the member's page that carries the filter, the view and the name filter back. */
+  memberLink: (m: Member, className: string, children: ReactNode) => ReactNode;
+}
+
+/**
+ * The People tab. Inside the router its filter, view and name filter live in the URL (so the member
+ * page's back link restores them); without one (a bare render) they are plain state.
+ */
+export function PeopleTab(props: PeopleTabProps) {
+  const router = useRouter({ warn: false });
+  return router ? <RoutedPeopleTab {...props} /> : <LocalPeopleTab {...props} />;
+}
+
+function RoutedPeopleTab(props: PeopleTabProps) {
+  const search = useSearch({ strict: false }) as HubSearch;
+  const navigate = useNavigate({ from: "/app/members" });
+  const set = (patch: Partial<HubSearch>) =>
+    void navigate({ search: (prev: Record<string, unknown>) => ({ ...prev, ...patch }), replace: true });
+  const nav: Nav = {
+    project: search.project,
+    view: search.view,
+    q: search.q ?? "",
+    setProject: (project) => set({ project }),
+    setView: (view) => set({ view }),
+    setQ: (q) => set({ q: q === "" ? undefined : q }),
+    memberLink: (m, className, children) => (
+      <Link
+        to="/app/members/$memberId"
+        params={{ memberId: m.id }}
+        search={{ ...(search.project && { project: search.project }), ...(search.view && { view: search.view }), ...(search.q && { q: search.q }) }}
+        className={className}
+      >
+        {children}
+      </Link>
+    ),
+  };
+  return <PeopleRoster {...props} nav={nav} />;
+}
+
+function LocalPeopleTab(props: PeopleTabProps) {
+  const [project, setProject] = useState<string | undefined>();
+  const [view, setView] = useState<RosterView | undefined>();
+  const [q, setQ] = useState("");
+  const nav: Nav = {
+    project,
+    view,
+    q,
+    setProject,
+    setView,
+    setQ,
+    // A bare render has no router for `Link` to read; the plain anchor is the same address.
+    memberLink: (m, className, children) => (
+      <a href={`/app/members/${encodeURIComponent(m.id)}`} className={className}>
+        {children}
+      </a>
+    ),
+  };
+  return <PeopleRoster {...props} nav={nav} />;
+}
+
+/** The meaning shown at the right of a group heading (MH-35). */
+const GROUP_HINT: Partial<Record<GroupKey, string>> = {
+  tenant_admins: "Admin on every project",
+  other: "Access only on projects you can't see",
+  none: "Signed in, no project yet",
+  invited: "Access counts once they accept",
+  suspended: "Can't sign in; access kept for reinstating",
+};
+
+/** A tenant admin is one whatever the level says. */
+const levelOf = (m: Member) => (m.tenant_admin ? "tenant_admin" : m.access.level);
+
+/** The roster: who is here, grouped by what they can do, their status as words, and (for tenant admins) one menu per row. */
+function PeopleRoster({ members, selfId, tenantAdmin, projects, onStatus: setStatus, nav }: PeopleTabProps & { nav: Nav }) {
   const queryClient = useQueryClient();
+  const [storedView, storeView] = useViewPreference("roster");
+  const view = nav.view ?? storedView;
+  const project = projects.find((p) => p.id === nav.project);
   const filterId = useId();
+  const projectId = useId();
   const narrow = useMediaQuery(NARROW);
   const inviteButton = useRef<HTMLButtonElement>(null);
   /** Each row's menu trigger, so a dialog opened from a row hands focus back to it. */
   const triggers = useRef(new Map<string, HTMLElement>());
   const returnTo = useRef<HTMLElement | null>(null);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(nav.q);
   const [inviting, setInviting] = useState(false);
   const [confirm, setConfirm] = useState<Confirm | null>(null);
   const [confirmError, setConfirmError] = useState<string | null>(null);
@@ -79,8 +169,17 @@ export function PeopleTab({ members, selfId, tenantAdmin, projects, onStatus: se
   const shown = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return people;
-    return people.filter((m) => memberName(m).toLowerCase().includes(q) || (m.email ?? "").includes(q));
+    return people.filter((m) => memberName(m).toLowerCase().includes(q) || (m.email ?? "").toLowerCase().includes(q));
   }, [people, query]);
+  const groups = useMemo(() => groupRoster(shown, { projectId: project?.id, projectName: project?.name }), [shown, project]);
+  // "{m} on {project}": the people who hold a role there (Invited and Suspended don't count).
+  const onProject = useMemo(
+    () =>
+      project
+        ? groupRoster(people, { projectId: project.id }).filter((g) => g.key === "admins" || g.key === "developers" || g.key === "viewers").reduce((n, g) => n + g.members.length, 0)
+        : 0,
+    [people, project],
+  );
 
   const refresh = () => refreshAccess(queryClient);
   const fromRow = (m: Member) => {
@@ -254,31 +353,106 @@ export function PeopleTab({ members, selfId, tenantAdmin, projects, onStatus: se
     );
   }
 
-  function person(m: Member) {
-    const name = memberName(m);
+  /** An invited person has no level yet: the tag would only promise it. */
+  const tagLevel = (m: Member) => (m.status === "invited" ? "none" : levelOf(m));
+  const countText = (m: Member) => {
+    const n = m.access.projects.length;
+    return n === 0 ? "No projects" : `${n} ${n === 1 ? "project" : "projects"}`;
+  };
+  /** The member's role on the filtered project (a tenant admin is Admin everywhere). */
+  const roleOnProject = (m: Member) => {
+    const tenantAdminHere = m.tenant_admin || m.access.level === "tenant_admin";
+    const role = tenantAdminHere ? "admin" : m.access.projects.find((p) => p.project_id === project?.id)?.platform_role;
+    if (!role) return <span className="text-chalk-dim">—</span>;
     return (
-      <>
-        <div className="flex flex-wrap items-center gap-x-2 text-chalk">
-          <span className="truncate">
-            {m.display_name || name}
-            {m.id === selfId && <span className="text-chalk-dim"> (you)</span>}
-          </span>
-          {m.tenant_admin && (
-            <span className="inline-flex items-center gap-1 text-xs text-chalk">
-              <ShieldCheck aria-hidden="true" size={16} strokeWidth={1.5} />
-              Tenant admin
-            </span>
-          )}
+      <span className="inline-flex flex-wrap items-center gap-1">
+        <Tag chalk={role !== "viewer"}>{ROLE_LABEL[role]}</Tag>
+        {tenantAdminHere && <LevelBadge level="tenant_admin" />}
+      </span>
+    );
+  };
+
+  const nameLine = (m: Member) => (
+    <>
+      {m.display_name || memberName(m)}
+      {m.id === selfId && <span className="text-chalk-dim"> (you)</span>}
+    </>
+  );
+
+  const rowErrorOf = (m: Member) =>
+    rowError?.id === m.id && (
+      <p role="alert" className="mt-1 text-coral">
+        {rowError.message}
+      </p>
+    );
+
+  /** The list's first cell: the name (a link to the member's page), the email under it. */
+  function person(m: Member) {
+    return (
+      <div className="flex items-start gap-3">
+        <span
+          aria-hidden="true"
+          className={`flex size-8 shrink-0 items-center justify-center border text-xs text-chalk-dim ${m.status === "invited" ? "border-dashed border-line-strong" : "border-line-strong"}`}
+        >
+          {initials(memberName(m))}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-chalk">
+            {nav.memberLink(m, "underline-offset-4 outline-none hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sand", nameLine(m))}
+          </div>
+          <div className="[overflow-wrap:anywhere] text-chalk-dim">{m.email ? breakableEmail(m.email) : "Email unknown"}</div>
+          {rowErrorOf(m)}
         </div>
-        <div className="truncate text-chalk-dim">{m.email ?? "Email unknown"}</div>
-        {rowError?.id === m.id && (
-          <p role="alert" className="mt-1 text-coral">
-            {rowError.message}
-          </p>
-        )}
-      </>
+      </div>
     );
   }
+
+  function card(m: Member) {
+    const s = memberStatus(m);
+    return (
+      <li key={m.id} className="relative border border-line hover:bg-chalk/[0.06]">
+        {nav.memberLink(
+          m,
+          "block p-3 pr-12 text-sm outline-none focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand",
+          <>
+            <span className="flex items-center gap-3">
+              <span
+                aria-hidden="true"
+                className={`flex size-8 shrink-0 items-center justify-center border text-xs text-chalk-dim ${m.status === "invited" ? "border-dashed border-line-strong" : "border-line-strong"}`}
+              >
+                {initials(memberName(m))}
+              </span>
+              <span className="min-w-0">
+                <span className="block truncate font-semibold text-chalk">{nameLine(m)}</span>
+                <span className="block [overflow-wrap:anywhere] text-chalk-dim">{m.email ? breakableEmail(m.email) : "Email unknown"}</span>
+              </span>
+            </span>
+            <span className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-chalk-dim">
+              <LevelBadge level={tagLevel(m)} />
+              <span>{countText(m)}</span>
+              {s.text !== "Active" && <Status s={s} />}
+            </span>
+          </>,
+        )}
+        {tenantAdmin && <div className="absolute top-1 right-1">{actions(m)}</div>}
+        {rowErrorOf(m) && <div className="px-3 pb-3 text-sm">{rowErrorOf(m)}</div>}
+      </li>
+    );
+  }
+
+  function heading(g: Group) {
+    const hint = project ? undefined : GROUP_HINT[g.key];
+    return (
+      <div className="flex items-baseline gap-3 border-b border-line pb-1">
+        <h3 className="text-base font-semibold">
+          {g.title} <span className="font-normal text-chalk-dim tabular-nums">{g.members.length}</span>
+        </h3>
+        {hint && <span className="ml-auto text-xs text-chalk-dim">{hint}</span>}
+      </div>
+    );
+  }
+
+  const columns = tenantAdmin ? 6 : 5;
 
   return (
     <div className="space-y-6">
@@ -288,29 +462,65 @@ export function PeopleTab({ members, selfId, tenantAdmin, projects, onStatus: se
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-chalk-dim tabular-nums">
-          {people.length} {people.length === 1 ? "person" : "people"}
+          {project
+            ? `${people.length} ${people.length === 1 ? "person" : "people"} · ${onProject} on ${project.name}`
+            : `${people.length} ${people.length === 1 ? "person" : "people"}`}
         </p>
         <div className="flex flex-wrap items-center gap-3">
           <label htmlFor={filterId} className="sr-only">
             Filter by name or email
           </label>
-          <input
-            id={filterId}
-            type="search"
-            value={query}
-            placeholder="Filter by name or email"
-            onChange={(e) => setQuery(e.target.value)}
-            className="h-8 w-56 border border-input bg-ink px-2 text-sm text-chalk outline-none placeholder:text-chalk-dim focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-sand"
+          <div className="relative">
+            <Search aria-hidden="true" size={14} strokeWidth={1.5} className="pointer-events-none absolute top-1/2 left-2 -translate-y-1/2 text-chalk-dim" />
+            <input
+              id={filterId}
+              type="search"
+              value={query}
+              placeholder="Filter by name or email"
+              onChange={(e) => {
+                setQuery(e.target.value);
+                nav.setQ(e.target.value);
+              }}
+              className="h-8 w-56 border border-input bg-ink pr-2 pl-7 text-sm text-chalk outline-none placeholder:text-chalk-dim focus-visible:outline-2 focus-visible:-outline-offset-1 focus-visible:outline-sand"
+            />
+          </div>
+          <label htmlFor={projectId} className="sr-only">
+            Project
+          </label>
+          <Select
+            id={projectId}
+            value={project?.id ?? ""}
+            onChange={(e) => nav.setProject(e.target.value === "" ? undefined : e.target.value)}
+            wrapperClassName="w-44"
+          >
+            <option value="">All projects</option>
+            {projects.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </Select>
+          <ViewToggle
+            value={view}
+            onChange={(next) => {
+              storeView(next);
+              nav.setView(next);
+            }}
           />
-          {tenantAdmin ? (
+          {tenantAdmin && (
             <Button ref={inviteButton} onClick={() => setInviting(true)}>
+              <Plus aria-hidden="true" size={14} strokeWidth={1.5} />
               Invite people
             </Button>
-          ) : (
-            <p className="text-sm text-chalk-dim">Tenant admins invite and remove people.</p>
           )}
         </div>
       </div>
+      {!tenantAdmin && (
+        <div className="space-y-1 text-sm text-chalk-dim">
+          <p>Tenant admins invite and remove people.</p>
+          <p>Levels count only the projects you can see.</p>
+        </div>
+      )}
 
       {unfinished && (
         <div role="alert" className="flex flex-wrap items-center gap-3 border border-coral/60 p-3 text-sm text-coral">
@@ -324,52 +534,88 @@ export function PeopleTab({ members, selfId, tenantAdmin, projects, onStatus: se
       {shown.length === 0 ? (
         <p className="text-sm text-chalk-dim">
           No one matches “{query.trim()}”.{" "}
-          <button type="button" className="text-chalk underline underline-offset-4" onClick={() => setQuery("")}>
+          <button
+            type="button"
+            className="text-chalk underline underline-offset-4"
+            onClick={() => {
+              setQuery("");
+              nav.setQ("");
+            }}
+          >
             Clear filter
           </button>
         </p>
+      ) : view === "cards" ? (
+        <div className="space-y-6">
+          {groups.map((g) => (
+            <section key={g.key} className="space-y-3">
+              {heading(g)}
+              <ul className="grid gap-3 sm:grid-cols-2 md:grid-cols-3">{g.members.map(card)}</ul>
+            </section>
+          ))}
+        </div>
       ) : narrow ? (
-        <ul aria-label="People" className="border-y border-line text-sm">
-          {shown.map((m) => {
-            const s = memberStatus(m);
-            return (
-              <li key={m.id} className="flex items-start gap-3 border-b border-line py-2 last:border-b-0">
-                <div className="min-w-0 flex-1">
-                  {person(m)}
-                  <Status s={s} />
-                </div>
-                {tenantAdmin && actions(m)}
-              </li>
-            );
-          })}
-        </ul>
+        <div aria-label="People" role="group" className="space-y-6 text-sm">
+          {groups.map((g) => (
+            <section key={g.key} className="space-y-1">
+              {heading(g)}
+              <ul className="border-b border-line">
+                {g.members.map((m) => (
+                  <li key={m.id} className="flex items-start gap-3 border-b border-line py-2 last:border-b-0">
+                    <div className="min-w-0 flex-1">
+                      {person(m)}
+                      <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
+                        {project ? roleOnProject(m) : <LevelBadge level={tagLevel(m)} />}
+                        <Status s={memberStatus(m)} />
+                      </div>
+                    </div>
+                    {tenantAdmin && actions(m)}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+        </div>
       ) : (
         <table aria-label="People" className="w-full table-fixed text-left text-sm">
           <thead className="border-b border-line text-chalk-dim">
             <tr>
               <th scope="col" className="py-2 font-medium">Person</th>
-              <th scope="col" className="w-56 py-2 font-medium">Status</th>
-              <th scope="col" className="w-32 py-2 font-medium">Joined</th>
-              {tenantAdmin && <th scope="col" className="w-28 py-2"><span className="sr-only">Actions</span></th>}
+              <th scope="col" className={project ? "w-44 py-2 font-medium" : "w-32 py-2 font-medium"}>{project ? `On ${project.name}` : "Level"}</th>
+              <th scope="col" className="w-20 py-2 font-medium">Projects</th>
+              <th scope="col" className="w-44 py-2 font-medium">Status</th>
+              <th scope="col" className="w-28 py-2 font-medium">Joined</th>
+              {tenantAdmin && <th scope="col" className="w-14 py-2"><span className="sr-only">Actions</span></th>}
             </tr>
           </thead>
-          <tbody>
-            {shown.map((m) => {
-              const joined = m.status === "invited" ? null : (m.accepted_at ?? m.created_at);
-              return (
-                <tr key={m.id} className="border-b border-line align-top last:border-0">
-                  <td className="py-2 pr-3">{person(m)}</td>
-                  <td className="py-2 pr-3">
-                    <Status s={memberStatus(m)} />
-                  </td>
-                  <td className="py-2 tabular-nums text-chalk-dim">
-                    {joined ? <time dateTime={joined} title={utc(joined)}>{new Date(joined).toISOString().slice(0, 10)}</time> : "—"}
-                  </td>
-                  {tenantAdmin && <td className="py-1 text-right">{actions(m)}</td>}
-                </tr>
-              );
-            })}
-          </tbody>
+          {groups.map((g) => (
+            <tbody key={g.key}>
+              <tr>
+                <td colSpan={columns} className="pt-6 pb-1">
+                  {heading(g)}
+                </td>
+              </tr>
+              {g.members.map((m) => {
+                const joined = m.status === "invited" ? null : (m.accepted_at ?? m.created_at);
+                return (
+                  <tr key={m.id} className="border-b border-line align-top last:border-0">
+                    <td className="py-2 pr-3">{person(m)}</td>
+                    <td className="py-2 pr-3">
+                      {project ? roleOnProject(m) : (tagLevel(m) === "none" ? <span className="text-chalk-dim">—</span> : <LevelBadge level={tagLevel(m)} />)}
+                    </td>
+                    <td className="py-2 pr-3 tabular-nums text-chalk-dim">{m.access.projects.length}</td>
+                    <td className="py-2 pr-3">
+                      <Status s={memberStatus(m)} />
+                    </td>
+                    <td className="py-2 tabular-nums text-chalk-dim">
+                      {joined ? <time dateTime={joined} title={utc(joined)}>{dateText(joined)}</time> : "—"}
+                    </td>
+                    {tenantAdmin && <td className="py-1 text-right">{actions(m)}</td>}
+                  </tr>
+                );
+              })}
+            </tbody>
+          ))}
         </table>
       )}
 
@@ -439,7 +685,7 @@ function Status({ s }: { s: StatusText }) {
   );
 }
 
-function copyFor(c: Confirm): { title: string; body: string; confirm: string; tone: "primary" | "destructive" } {
+export function copyFor(c: Confirm): { title: string; body: string; confirm: string; tone: "primary" | "destructive" } {
   const name = memberName(c.member);
   switch (c.kind) {
     case "make-admin":

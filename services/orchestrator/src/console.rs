@@ -416,6 +416,38 @@ macro_rules! or_answer {
     };
 }
 
+/// T2-1 (D1): whether the caller may write as `role` (`None`: the owner): a named role held at
+/// Developer or above, or reached (R21) through the chain of one held there; the owner at the
+/// caller's own level.
+async fn may_write<M, J>(
+    state: &AppState<M, J>,
+    authorized: &crate::access::Authorized,
+    role: Option<&str>,
+    branch: Uuid,
+) -> Result<bool, ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let Some(grant) = authorized.grant.as_ref() else {
+        return Ok(false);
+    };
+    if grant.platform_role < PlatformRole::Developer {
+        return Ok(false);
+    }
+    let Some(name) = role else {
+        return Ok(true);
+    };
+    if let Some(level) = grant.level_of(name) {
+        return Ok(level >= PlatformRole::Developer);
+    }
+    let Some(record) = authorized.record.as_ref() else {
+        return Ok(false);
+    };
+    let graph = authorized.role_graph(state, record, branch).await?;
+    Ok(graph.is_some_and(|g| g.chain_grants(&grant.roles_at_least(PlatformRole::Developer), name)))
+}
+
 /// Every step of the console route.
 async fn console<M, J>(
     state: &AppState<M, J>,
@@ -460,11 +492,9 @@ where
     };
     let authorized = or_answer!(authorize(state, principal, ep::CONSOLE_QUERY.policy.access, target).await);
     // A Viewer only reads: a write (or a batch holding one) is refused before it reaches rest.
+    // T2-1 (D1): the role's own level counts, not the member's top level.
     if write_kind(&parsed.op).is_some()
-        && authorized
-            .grant
-            .as_ref()
-            .is_none_or(|g| g.platform_role < PlatformRole::Developer)
+        && !or_answer!(may_write(state, &authorized, request.role.as_deref(), branch_id).await)
     {
         return deny_to_api(Deny::Forbidden { required: PlatformRole::Developer.as_str().to_string() })
             .into_response();

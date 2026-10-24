@@ -8,9 +8,15 @@ import type { ColumnChange } from './columnChange.ts';
 import type { ColumnSpec } from './columnSpec.ts';
 import type { ConstraintSpec } from './constraintSpec.ts';
 import type { CreateTable } from './createTable.ts';
+import type { DefaultObject } from './defaultObject.ts';
 import type { EnumPosition } from './enumPosition.ts';
+import type { FunctionRef } from './functionRef.ts';
+import type { Grantee } from './grantee.ts';
 import type { IndexSpec } from './indexSpec.ts';
 import type { PolicySpec } from './policySpec.ts';
+import type { PrivilegeName } from './privilegeName.ts';
+import type { SchemaPrivilege } from './schemaPrivilege.ts';
+import type { SequencePrivilege } from './sequencePrivilege.ts';
 import type { TableGrant } from './tableGrant.ts';
 import type { TableRef } from './tableRef.ts';
 
@@ -171,5 +177,58 @@ export type Operation = {
   drop_enum: {
   name: string;
   schema: string;
+};
+} | {
+  grant_schema: {
+  grantee: Grantee;
+  privileges: SchemaPrivilege[];
+  schema: string;
+};
+} | {
+  revoke_schema: {
+  grant_option_only?: boolean;
+  grantee: Grantee;
+  privileges: SchemaPrivilege[];
+  schema: string;
+};
+} | {
+  grant_sequence: {
+  grantee: Grantee;
+  privileges: SequencePrivilege[];
+  sequence: TableRef;
+};
+} | {
+  revoke_sequence: {
+  grant_option_only?: boolean;
+  grantee: Grantee;
+  privileges: SequencePrivilege[];
+  sequence: TableRef;
+};
+} | {
+  /** `EXECUTE`. */
+  grant_function: {
+  function: FunctionRef;
+  grantee: Grantee;
+};
+} | {
+  revoke_function: {
+  function: FunctionRef;
+  grant_option_only?: boolean;
+  grantee: Grantee;
+};
+} | {
+  alter_default_privileges: {
+  for_role: string;
+  grant: boolean;
+  grantee: Grantee;
+  object: DefaultObject;
+  privileges: PrivilegeName[];
+  schema: string;
+};
+} | {
+  set_all_rows: {
+  enabled: boolean;
+  role: string;
+  table: TableRef;
 };
 };

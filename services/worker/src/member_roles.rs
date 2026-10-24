@@ -52,22 +52,27 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chelabase_metadata::members::{GrantRow, MemberBranchRole, MemberStatus, OverrideRow};
+use chelabase_metadata::members::MemberBranchRole;
+#[cfg(test)]
+use chelabase_metadata::members::MemberStatus;
+#[cfg(test)]
+use chelabase_metadata::members::GrantRow;
 use chelabase_metadata::{BranchKind, BranchStatus};
 use chelabase_nats::{
     MemberRoleApplied, MemberRoleHandOverRequest, MemberRolesReconcileRequest, MemberRolesReply,
 };
-use chelabase_types::role_name::member_hand_over_sql;
+use chelabase_types::role_name::{mark_personal_login_sql, member_hand_over_sql};
 use chelabase_neon::ComputeBackend;
 use chelabase_schema::sql::{ident, literal};
 use chelabase_secrets::{open_member_role_password, seal_member_role_password};
 use chelabase_types::BranchId;
 use chelabase_types::access::{
-    Grant, Narrowing, PgRole, PlatformRole, RoleSet, act_as_reserved, data_api_role, effective,
-    tenant_admin_grant,
+    Grant, GrantSources, PgRole, PlatformRole, RoleSet, act_as_reserved, data_api_role,
+    tenant_admin_effective,
 };
-use chelabase_types::role_name::MEMBER_ROLE_PREFIX;
+use chelabase_types::role_name::{MEMBER_ROLE_PREFIX, PERSONAL_LOGIN_MARKER};
 use chelabase_types::table_api::SCHEMA_LOCKED_ROLE;
+use chrono::{DateTime, Utc};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -130,6 +135,16 @@ pub struct DesiredMemberRole {
     /// It holds the DDL guard's marker role ([`SCHEMA_LOCKED_ROLE`], TE-A P7): the branch is
     /// protected and the member isn't an Admin on the project.
     pub locked: bool,
+    /// A member role, or a member's personal login (T6).
+    pub kind: RoleKind,
+}
+
+/// What a desired role is (T6): a member role (`cb_m_*`), or a member's personal login, whose
+/// `VALID UNTIL` is its record's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoleKind {
+    Member,
+    Personal { valid_until: DateTime<Utc> },
 }
 
 /// One `pg_auth_members` row of a member role.
@@ -156,6 +171,8 @@ pub struct ActualMemberRole {
     /// `pg_authid.rolpassword`.
     pub verifier: Option<String>,
     pub memberships: Vec<ActualMembership>,
+    /// `rolvaliduntil` (`None`: no expiry); read for marked roles (T6).
+    pub valid_until: Option<DateTime<Utc>>,
 }
 
 /// One change to a branch's member roles, in [`plan_member_roles`]'s order: revokes; creates,
@@ -200,6 +217,26 @@ pub enum MemberRoleStep {
     Unlock {
         role: String,
     },
+    /// T6: a personal login made, in one transaction as `cloud_admin`: `CREATE ROLE … LOGIN
+    /// NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION VALID UNTIL '<ts>' PASSWORD
+    /// '<verifier>'`, the personal-login marker, and (`lock`) the DDL guard's marker.
+    CreatePersonal {
+        role: String,
+        verifier: String,
+        valid_until: DateTime<Utc>,
+        lock: bool,
+    },
+    /// T6: a personal login's `VALID UNTIL` set back to its record's.
+    SetValidUntil {
+        role: String,
+        valid_until: DateTime<Utc>,
+    },
+    /// T6-M6: a personal login's per-database settings reset, database by database (never a
+    /// role-wide `RESET ALL`: the marker is a role-wide setting).
+    ResetDatabaseSettings {
+        role: String,
+        databases: Vec<String>,
+    },
 }
 
 impl MemberRoleStep {
@@ -213,7 +250,10 @@ impl MemberRoleStep {
             | Self::Grant { role, .. }
             | Self::Drop { role }
             | Self::Lock { role }
-            | Self::Unlock { role } => role,
+            | Self::Unlock { role }
+            | Self::CreatePersonal { role, .. }
+            | Self::SetValidUntil { role, .. }
+            | Self::ResetDatabaseSettings { role, .. } => role,
         }
     }
 }
@@ -251,15 +291,57 @@ pub fn plan_member_roles(
         // Fail closed (T7 review): the marker comes straight after the role exists (first, for
         // an existing role), so a later step that fails can't leave grants without it.
         let lock = (d.locked && !marked).then(|| MemberRoleStep::Lock { role: role.clone() });
-        match have {
-            None => {
+        match (have, &d.kind) {
+            // T6 (MH-16): a personal login is made, marked and (`locked`) locked in one
+            // transaction, before any membership.
+            (None, RoleKind::Personal { valid_until }) => {
+                creates.push(MemberRoleStep::CreatePersonal {
+                    role: role.clone(),
+                    verifier: d.verifier.clone(),
+                    valid_until: *valid_until,
+                    lock: d.locked,
+                });
+            }
+            // T6 (D2, MH-14, MH-17): an existing personal login is locked first; then its
+            // attributes and `VALID UNTIL` are set back, and its password is set back to the
+            // record's (its sessions end) wherever the catalog differs (a copy, a restore, a
+            // protected child, a reset).
+            (Some(a), RoleKind::Personal { valid_until }) => {
+                creates.extend(lock);
+                let micros = |t: &DateTime<Utc>| t.timestamp_micros();
+                let expiry_differs =
+                    a.valid_until.as_ref().map(micros) != Some(micros(valid_until));
+                if !a.attributes_ok || expiry_differs {
+                    creates.push(MemberRoleStep::SetValidUntil {
+                        role: role.clone(),
+                        valid_until: *valid_until,
+                    });
+                }
+                let verifier_differs = a.verifier.as_deref() != Some(d.verifier.as_str());
+                if d.rotate || !a.attributes_ok || verifier_differs {
+                    creates.push(MemberRoleStep::SetPassword {
+                        role: role.clone(),
+                        verifier: d.verifier.clone(),
+                    });
+                }
+                let mut databases: Vec<String> = a.settings.iter().flatten().cloned().collect();
+                databases.sort();
+                databases.dedup();
+                if !databases.is_empty() {
+                    creates.push(MemberRoleStep::ResetDatabaseSettings {
+                        role: role.clone(),
+                        databases,
+                    });
+                }
+            }
+            (None, RoleKind::Member) => {
                 creates.push(MemberRoleStep::Create {
                     role: role.clone(),
                     verifier: d.verifier.clone(),
                 });
                 creates.extend(lock);
             }
-            Some(a) => {
+            (Some(a), RoleKind::Member) => {
                 creates.extend(lock);
                 if d.rotate {
                     creates.push(MemberRoleStep::SetPassword {
@@ -392,7 +474,45 @@ pub fn render_step(step: &MemberRoleStep) -> String {
             ident(SCHEMA_LOCKED_ROLE),
             ident(role)
         ),
+        MemberRoleStep::CreatePersonal {
+            role,
+            verifier,
+            valid_until,
+            lock,
+        } => {
+            let mut sql = format!(
+                "BEGIN;\nCREATE ROLE {} {MEMBER_ROLE_ATTRIBUTES} VALID UNTIL {} PASSWORD {};\n{}",
+                ident(role),
+                valid_until_literal(valid_until),
+                literal(verifier),
+                mark_personal_login_sql(role)
+            );
+            if *lock {
+                sql.push('\n');
+                sql.push_str(&render_step(&MemberRoleStep::Lock { role: role.clone() }));
+            }
+            sql.push_str("\nCOMMIT;");
+            sql
+        }
+        // The attributes too: a marked role's own attributes are only ever changed by a
+        // superuser, and this puts them back with the expiry (never `RESET ALL`: the marker is
+        // a setting).
+        MemberRoleStep::SetValidUntil { role, valid_until } => format!(
+            "ALTER ROLE {r} NOSUPERUSER {MEMBER_ROLE_ATTRIBUTES};\nALTER ROLE {r} VALID UNTIL {};",
+            valid_until_literal(valid_until),
+            r = ident(role)
+        ),
+        MemberRoleStep::ResetDatabaseSettings { role, databases } => databases
+            .iter()
+            .map(|db| format!("ALTER ROLE {} IN DATABASE {} RESET ALL;", ident(role), ident(db)))
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
+}
+
+/// A `VALID UNTIL` literal, to the microsecond Postgres keeps (RFC 3339, UTC).
+fn valid_until_literal(at: &DateTime<Utc>) -> String {
+    literal(&at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true))
 }
 
 /// Ends every session of `role`, waiting up to 5 s for each (M2).
@@ -417,6 +537,94 @@ pub fn cleanup_script(role: &str, reassign_to: Option<&str>) -> String {
     format!(
         "{CLEANUP_MARK}\n{}",
         chelabase_types::role_name::member_cleanup_sql(role, reassign_to)
+    )
+}
+
+/// The powerless role a personal login's objects are quarantined to (spec Part 6, MH-18
+/// amended): `NOLOGIN`, no other attributes, no memberships either way, never granted anything.
+/// Reserved by its `chelabase_` prefix. The same name a role delete's request defaults to.
+pub const QUARANTINE_ROLE: &str = chelabase_nats::QUARANTINE_SUCCESSOR;
+
+/// T10: the quarantine role's making, shared by [`personal_cleanup_script`] and a role delete
+/// to [`QUARANTINE_ROLE`] (`crate::roles::role_delete_script`): made when missing (race-safe),
+/// made powerless again when something changed it (attributes reset, memberships either way
+/// revoked, its sessions ended). One top-level statement (a `DO`), the text both scripts embed.
+pub fn quarantine_role_sql() -> String {
+    let q = ident(QUARANTINE_ROLE);
+    let name = literal(QUARANTINE_ROLE);
+    // Made when missing; then kept powerless even if someone with CREATEROLE changed it: the
+    // attributes reset, every membership in it or of it removed, any session as it ended. The
+    // attributes are read from `pg_authid` (the scripts run as `cloud_admin`): `pg_roles` masks
+    // every password as `********`.
+    let make = format!(
+        "DECLARE g record;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles r WHERE r.rolname = {name}) THEN
+    BEGIN
+      CREATE ROLE {q} NOLOGIN;
+    EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL;
+    END;
+  END IF;
+  IF EXISTS (SELECT 1 FROM pg_catalog.pg_authid r WHERE r.rolname = {name}
+              AND (r.rolcanlogin OR r.rolsuper OR r.rolcreatedb OR r.rolcreaterole
+                   OR r.rolreplication OR r.rolbypassrls OR r.rolpassword IS NOT NULL)) THEN
+    ALTER ROLE {q} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
+      PASSWORD NULL;
+  END IF;
+  FOR g IN SELECT a.rolname AS granted, b.rolname AS member, c.rolname AS grantor
+             FROM pg_catalog.pg_auth_members m
+             JOIN pg_catalog.pg_roles a ON a.oid = m.roleid
+             JOIN pg_catalog.pg_roles b ON b.oid = m.member
+             LEFT JOIN pg_catalog.pg_roles c ON c.oid = m.grantor
+            WHERE a.rolname = {name} OR b.rolname = {name}
+  LOOP
+    IF g.grantor IS NULL THEN
+      EXECUTE pg_catalog.format({plain_revoke}, g.granted, g.member);
+    ELSE
+      EXECUTE pg_catalog.format({revoke_by}, g.granted, g.member, g.grantor);
+    END IF;
+  END LOOP;
+  PERFORM pg_catalog.pg_terminate_backend(s.pid) FROM pg_catalog.pg_stat_activity s
+    WHERE s.usename = {name};
+END",
+        plain_revoke = literal("REVOKE %I FROM %I CASCADE"),
+        revoke_by = literal("REVOKE %I FROM %I GRANTED BY %I CASCADE"),
+    );
+    format!("DO {};", literal(&make))
+}
+
+/// T6 (spec Part 6 "No privileges of its own", MH-18 as amended, K6 H5), per (personal login,
+/// database): the canonical procedure with a powerless successor. [`QUARANTINE_ROLE`] is made
+/// when missing (race-safe: a concurrent `CREATE ROLE` raises `duplicate_object` or
+/// `unique_violation`, both caught) and made powerless again when something changed it
+/// (attributes reset, memberships either way revoked, its sessions ended); what the login owns is
+/// reassigned to it, never to the owner or `cloud_admin` (a planted `SECURITY DEFINER` function
+/// or view would run with their rights); `EXECUTE` on every routine it holds is revoked from
+/// `PUBLIC`; then `DROP OWNED` removes every privilege, default privilege and policy naming the
+/// login. A personal login holds no privileges of its own; it acts only through `SET ROLE`.
+/// Run before its memberships are applied and before its `DROP ROLE`.
+pub fn personal_cleanup_script(role: &str) -> String {
+    let q = ident(QUARANTINE_ROLE);
+    let name = literal(QUARANTINE_ROLE);
+    let revoke = format!(
+        "DECLARE f pg_catalog.regprocedure;
+BEGIN
+  FOR f IN SELECT p.oid::pg_catalog.regprocedure FROM pg_catalog.pg_proc p
+             JOIN pg_catalog.pg_roles r ON r.oid = p.proowner WHERE r.rolname = {name}
+  LOOP
+    EXECUTE pg_catalog.format({stmt}, f);
+  END LOOP;
+END",
+        stmt = literal("REVOKE EXECUTE ON ROUTINE %s FROM PUBLIC")
+    );
+    format!(
+        "{CLEANUP_MARK}\nSET standard_conforming_strings = on;\n\
+         SET search_path = pg_catalog, pg_temp;\nSET lock_timeout = '2s';\n\
+         SET statement_timeout = '6s';\n{make}\nREASSIGN OWNED BY {r} TO {q};\nDO {revoke};\n\
+         DROP OWNED BY {r};",
+        make = quarantine_role_sql(),
+        revoke = literal(&revoke),
+        r = ident(role),
     )
 }
 
@@ -467,8 +675,21 @@ pub fn drop_role_sql(role: &str) -> String {
 /// closed or `neon.born_closed`-marked databases (`c` lines). The comment is the fakes' needle. Role grants made
 /// by a superuser are recorded as made by the bootstrap superuser (OID 10): those are the
 /// reconciler's own.
+///
+/// T6: the roles carrying the personal-login marker (`k` lines), with their `VALID UNTIL`
+/// (`u` lines: microseconds since the epoch, `-` for none) and, as a member role's, their
+/// memberships (`m`), password (`p`) and leftovers (`l`), and their per-database settings (`s`,
+/// T6-M6; never the role-wide entry, which holds the marker).
 pub fn member_catalog_sql() -> String {
     let h = |x: &str| format!("encode(convert_to({x}, 'UTF8'), 'hex')");
+    // T6: the round-4 predicate (`role_name::is_marked_sql`): the role carries the
+    // personal-login marker, a `setdatabase = 0` setting starting `chelabase.managed_role=`.
+    let is_marked = |oid: &str| {
+        format!(
+            "EXISTS (SELECT 1 FROM pg_db_role_setting ps, unnest(ps.setconfig) pc \
+WHERE ps.setrole = {oid} AND ps.setdatabase = 0 AND starts_with(pc, '{PERSONAL_LOGIN_MARKER}='))"
+        )
+    };
     let owner_level: Vec<String> = std::iter::once(OWNER_ROLE)
         .chain(OWNER_LEVEL_ROLES)
         .map(literal)
@@ -489,7 +710,7 @@ SELECT 'm ' || {mname} || ' ' || {gname} || ' ' || \
 CASE WHEN a.grantor = 10 THEN '-' ELSE {grname} END || ' ' || \
 CASE WHEN a.set_option AND NOT a.inherit_option AND NOT a.admin_option THEN 't' ELSE 'f' END \
 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid \
-JOIN pg_roles gr ON gr.oid = a.grantor WHERE starts_with(m.rolname::text, 'cb_m_') \
+JOIN pg_roles gr ON gr.oid = a.grantor WHERE starts_with(m.rolname::text, 'cb_m_') OR {m_marked} \
 UNION ALL \
 SELECT 'e ' || {mname} || ' ' || {gname} \
 FROM pg_auth_members a JOIN pg_roles m ON m.oid = a.member JOIN pg_roles g ON g.oid = a.roleid \
@@ -501,16 +722,23 @@ UNION ALL \
 SELECT 's ' || {rname} || ' ' || CASE WHEN s.setdatabase = 0 THEN '-' ELSE coalesce({dname}, '-') END \
 FROM pg_db_role_setting s JOIN pg_roles r ON r.oid = s.setrole \
 LEFT JOIN pg_database d ON d.oid = s.setdatabase WHERE starts_with(r.rolname::text, 'cb_m_') \
+OR (s.setdatabase <> 0 AND {r_marked}) \
 UNION ALL \
 SELECT 'p ' || {aname} || ' ' || coalesce({apass}, '-') FROM pg_authid a \
-WHERE starts_with(a.rolname::text, 'cb_m_') \
+WHERE starts_with(a.rolname::text, 'cb_m_') OR {a_marked} \
+UNION ALL \
+SELECT 'k ' || {rname} FROM pg_roles r WHERE {r_marked} \
+UNION ALL \
+SELECT 'u ' || {aname} || ' ' || CASE WHEN a.rolvaliduntil IS NULL OR NOT isfinite(a.rolvaliduntil) \
+THEN '-' ELSE (extract(epoch FROM a.rolvaliduntil) * 1000000)::bigint::text END \
+FROM pg_authid a WHERE {a_marked} \
 UNION ALL \
 SELECT 'd ' || {dname} || ' ' || {downer} FROM pg_database d \
 WHERE d.datallowconn AND NOT d.datistemplate \
 UNION ALL \
 SELECT DISTINCT 'l ' || {rname} || ' ' || CASE WHEN s.dbid = 0 THEN '-' ELSE coalesce({dname}, '-') END \
 FROM pg_shdepend s JOIN pg_roles r ON r.oid = s.refobjid LEFT JOIN pg_database d ON d.oid = s.dbid \
-WHERE s.refclassid = 'pg_authid'::regclass AND starts_with(r.rolname::text, 'cb_m_') \
+WHERE s.refclassid = 'pg_authid'::regclass AND (starts_with(r.rolname::text, 'cb_m_') OR {r_marked}) \
 UNION ALL \
 SELECT 'S ' || {rname} FROM pg_roles r WHERE r.rolsuper \
 UNION ALL \
@@ -541,6 +769,9 @@ AND lower(split_part(c, '=', 2)) IN ('on', 'true', 'yes', '1', 't', 'tr', 'tru',
         apass = h("a.rolpassword"),
         downer = h("pg_get_userbyid(d.datdba)"),
         owner_level = owner_level.join(", "),
+        m_marked = is_marked("m.oid"),
+        a_marked = is_marked("a.oid"),
+        r_marked = is_marked("r.oid"),
     )
 }
 
@@ -583,6 +814,12 @@ pub struct MemberCatalog {
     /// non-superuser can connect to them (and `CREATE DATABASE … TEMPLATE` copies them), so a
     /// protected branch guards them too (RT3-5).
     pub open_templates: Vec<String>,
+    /// T6: every role carrying the personal-login marker (the round-4 predicate), by name.
+    pub marked: BTreeSet<String>,
+    /// T6: the marked roles with their attributes flag, password, `VALID UNTIL` and
+    /// memberships, by name; their `settings` are the per-database ones only (the role-wide
+    /// entry holds the marker).
+    pub personal: BTreeMap<String, ActualMemberRole>,
 }
 
 /// One `c` line of the catalog.
@@ -696,6 +933,8 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
     let mut memberships: Vec<(String, ActualMembership)> = Vec::new();
     let mut settings: Vec<(String, Option<String>)> = Vec::new();
     let mut passwords: Vec<(String, Option<String>)> = Vec::new();
+    let mut attributes: BTreeMap<String, bool> = BTreeMap::new();
+    let mut expiries: Vec<(String, Option<DateTime<Utc>>)> = Vec::new();
     let field = |f: Option<&str>| {
         f.map(unhex)
             .unwrap_or_else(|| Err("a missing field".into()))
@@ -715,6 +954,7 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
                 if flag(fields.next())? {
                     catalog.login.insert(name.clone());
                 }
+                attributes.insert(name.clone(), attributes_ok);
                 if name.starts_with(MEMBER_ROLE_PREFIX) {
                     catalog.member_roles.insert(
                         name.clone(),
@@ -724,6 +964,7 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
                             settings: Vec::new(),
                             verifier: None,
                             memberships: Vec::new(),
+                            valid_until: None,
                         },
                     );
                 }
@@ -760,6 +1001,26 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
             Some("p") => {
                 let role = field(fields.next())?;
                 passwords.push((role, optional(fields.next())?));
+            }
+            Some("k") => {
+                catalog.marked.insert(field(fields.next())?);
+            }
+            Some("u") => {
+                let role = field(fields.next())?;
+                let until = match fields.next() {
+                    Some("-") => None,
+                    Some(micros) => Some(
+                        micros
+                            .parse::<i64>()
+                            .ok()
+                            .and_then(DateTime::from_timestamp_micros)
+                            .ok_or_else(|| {
+                                format!("an unexpected VALID UNTIL {micros:?} in the member-role catalog")
+                            })?,
+                    ),
+                    None => return Err("a member-role catalog line is missing a field".into()),
+                };
+                expiries.push((role, until));
             }
             Some("d") => {
                 let name = field(fields.next())?;
@@ -805,20 +1066,60 @@ pub fn parse_member_catalog(out: &str) -> Result<MemberCatalog, String> {
             ));
         }
     }
+    // T6: a marked role the read lists (never a member role's name) is a personal login.
+    for name in &catalog.marked {
+        if name.starts_with(MEMBER_ROLE_PREFIX) {
+            continue;
+        }
+        if let Some(attributes_ok) = attributes.get(name) {
+            catalog.personal.insert(
+                name.clone(),
+                ActualMemberRole {
+                    role_name: name.clone(),
+                    attributes_ok: *attributes_ok,
+                    settings: Vec::new(),
+                    verifier: None,
+                    memberships: Vec::new(),
+                    valid_until: None,
+                },
+            );
+        }
+    }
     for (member, membership) in memberships {
         if let Some(role) = catalog.member_roles.get_mut(&member) {
+            role.memberships.push(membership);
+        } else if let Some(role) = catalog.personal.get_mut(&member) {
             role.memberships.push(membership);
         }
     }
     for (member, database) in settings {
         if let Some(role) = catalog.member_roles.get_mut(&member) {
             role.settings.push(database);
+        } else if let Some(role) = catalog.personal.get_mut(&member) {
+            // T6-M6: a marked login's per-database settings; its role-wide entry holds the
+            // marker (the read lists none, and none is kept here).
+            if database.is_some() {
+                role.settings.push(database);
+            }
         }
     }
     for (member, verifier) in passwords {
         if let Some(role) = catalog.member_roles.get_mut(&member) {
             role.verifier = verifier;
+        } else if let Some(role) = catalog.personal.get_mut(&member) {
+            role.verifier = verifier;
         }
+    }
+    for (name, until) in expiries {
+        if let Some(role) = catalog.personal.get_mut(&name) {
+            role.valid_until = until;
+        }
+    }
+    for role in catalog.personal.values_mut() {
+        role.memberships
+            .sort_by(|a, b| (&a.role, &a.grantor).cmp(&(&b.role, &b.grantor)));
+        role.settings.sort();
+        role.settings.dedup();
     }
     for role in catalog.member_roles.values_mut() {
         role.memberships
@@ -932,14 +1233,14 @@ pub enum Skipped {
 /// The roles a member role gets for `grant` on a branch: the owner and reserved names never,
 /// then [`safe_roles`]. An Admin's `All` (a project Admin's, R17, or a tenant admin's) starts
 /// from every role on the branch except the data API's `anon` and `authenticated`, which a
-/// member gets only when its grant names them (R18). Each named role left out is returned
+/// member gets only when a source names them (R18, `plus`). Each named role left out is returned
 /// with why.
 pub fn granted_roles(
     grant: &Grant,
     catalog: &MemberCatalog,
 ) -> (BTreeSet<String>, Vec<(String, Skipped)>) {
     let named: BTreeSet<String> = match &grant.roles {
-        RoleSet::All => catalog.roles.iter().filter(|r| !data_api_role(r)).cloned().collect(),
+        RoleSet::All { plus } => catalog.roles.iter().filter(|r| !data_api_role(r) || plus.contains(*r)).cloned().collect(),
         RoleSet::Only(set) => set
             .iter()
             .filter_map(|r| match r {
@@ -951,7 +1252,7 @@ pub fn granted_roles(
     let candidate: BTreeSet<String> = named.iter().filter(|r| grantable(r)).cloned().collect();
     let roles = safe_roles(&candidate, catalog);
     let skipped = match &grant.roles {
-        RoleSet::All => Vec::new(),
+        RoleSet::All { .. } => Vec::new(),
         RoleSet::Only(_) => candidate
             .iter()
             .filter(|r| !roles.contains(*r))
@@ -968,19 +1269,11 @@ pub fn granted_roles(
     (roles, skipped)
 }
 
-/// R17: an Admin grant is every role on the project.
-fn grant_of(row: &GrantRow) -> Grant {
-    row.to_grant()
-}
-
-fn narrowing_of(row: &OverrideRow) -> Narrowing {
-    Narrowing {
-        platform_role: row.platform_role,
-        roles: row
-            .pg_roles
-            .as_ref()
-            .map(|roles| roles.iter().map(|r| PgRole::parse(r)).collect()),
-    }
+/// A tenant admin's grant shape (every role, R17/R18), for [`granted_roles`] in tests.
+#[cfg(test)]
+fn tenant_admin_grant() -> Grant {
+    let e = tenant_admin_effective();
+    Grant { platform_role: e.platform_role, roles: e.roles }
 }
 
 /// Where member-role reconciles are asked for (`chelabase.member_roles.reconcile`). The
@@ -1193,9 +1486,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Ok(members) => members,
             Err(e) => return failed(format!("reading the members: {e}")),
         };
-        let grants: HashMap<Uuid, chelabase_metadata::members::GrantRows> = match self
+        let grants: HashMap<Uuid, GrantSources> = match self
             .metadata
-            .database_grant_rows(
+            .database_grant_sources(
                 database.project_id.as_uuid(),
                 database.database_id.as_uuid(),
             )
@@ -1266,24 +1559,23 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
         // Desired, with passwords.
         let mut wanted: Vec<Wanted> = Vec::new();
+        // D7: an offboarded member holds no member role either (dropped like a suspended
+        // one's; made again, with a fresh password, once the mark is cleared).
         for m in members
             .iter()
-            .filter(|m| m.status == MemberStatus::Active)
+            .filter(|m| m.in_good_standing())
             .filter(|m| member.is_none_or(|id| id == m.id))
         {
-            let grant = if m.tenant_admin {
-                Some(tenant_admin_grant())
+            // MH-2: union then narrowing; no source (an override alone) is no access.
+            let effective = if m.tenant_admin {
+                Some(tenant_admin_effective())
             } else {
-                grants.get(&m.id).and_then(|levels| {
-                    levels.project.as_ref().map(|project| {
-                        effective(
-                            &grant_of(project),
-                            levels.database.as_ref().map(narrowing_of).as_ref(),
-                        )
-                    })
-                })
+                grants.get(&m.id).and_then(GrantSources::effective)
             };
-            let Some(grant) = grant else { continue };
+            let Some(effective) = effective else { continue };
+            // The member role holds every effective role, Viewer-level ones included: it serves
+            // Viewer act-as routes too, and `authorize` checks each role's own level (D1).
+            let grant = Grant { platform_role: effective.platform_role, roles: effective.roles };
             // P7: on a protected branch, everyone but an Admin (tenant admins are) is marked.
             let locked = record.protected && grant.platform_role != PlatformRole::Admin;
             let (roles, skipped) = granted_roles(&grant, &catalog);
@@ -1354,26 +1646,68 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     verifier,
                     rotate,
                     locked,
+                    kind: RoleKind::Member,
                 },
                 sealed,
                 write_row,
             });
         }
 
+        // T6 (spec Part 6 "Convergence", MH-10, MH-17, S9): the personal logins. Desired: the
+        // database's records whose member qualifies, unrevoked and unexpired. Actual: the
+        // catalog's marked roles. A run for one member (S9) sees only that member's records and
+        // the marked roles they name, so it never drops an orphan (it can't be attributed).
+        let mut failures: Vec<String> = Vec::new();
+        let personal = match self
+            .personal_logins_wanted(
+                branch, &ep, &record, &database, member, &catalog, &members, &grants,
+            )
+            .await
+        {
+            Ok(personal) => personal,
+            Err(e) => return failed(e),
+        };
+        failures.extend(personal.failures.iter().cloned());
+
         let only = member.map(member_role_name);
         let actual: Vec<ActualMemberRole> = catalog
             .member_roles
             .values()
             .filter(|a| only.as_ref().is_none_or(|name| &a.role_name == name))
+            .chain(personal.actual.iter())
             .cloned()
             .collect();
-        let desired: Vec<DesiredMemberRole> = wanted.iter().map(|w| w.desired.clone()).collect();
+        let desired: Vec<DesiredMemberRole> = wanted
+            .iter()
+            .map(|w| w.desired.clone())
+            .chain(personal.desired.iter().cloned())
+            .collect();
         let steps = plan_member_roles(&desired, &actual);
+        let is_personal = |role: &str| {
+            personal.actual.iter().any(|a| a.role_name == role)
+                || personal.desired.iter().any(|d| d.role_name == role)
+        };
+        // S16, MH-9: a personal row whose login isn't wanted goes before any role step, so the
+        // proxy stops routing it at once (the cache is told below).
+        let mut published: Vec<String> = Vec::new();
+        for name in &personal.stale_rows {
+            match self.metadata.delete_personal_role_row(&ep, name).await {
+                Ok(()) => published.push(name.clone()),
+                Err(e) => failures.push(format!("removing the personal row of {name}: {e}")),
+            }
+        }
+        // T6-M3: another origin's row under a wanted login's name goes too, so the login's own
+        // row (written below) can take the name.
+        for name in &personal.legacy_rows {
+            match self.metadata.delete_role_copy(&ep, name).await {
+                Ok(_) => published.push(name.clone()),
+                Err(e) => failures.push(format!("removing the legacy row of {name}: {e}")),
+            }
+        }
 
         // Apply (I1): each role's revocations first, as their own script; then its creates,
         // passwords and grants; then the drops. psql stops at a script's first error, so a
         // role's failure stops only that script.
-        let mut failures: Vec<String> = Vec::new();
         let mut failed_roles: BTreeSet<String> = BTreeSet::new();
         // P6: on a protected branch the DDL guard goes into every database before the role
         // steps: checked on every run, installed wherever the check doesn't answer that the
@@ -1480,10 +1814,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         let mut revokes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         let mut changes: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        // A personal login's create runs as its own script: nothing else touches the name
+        // unless the create (marker and lock included) committed.
+        let mut personal_creates: BTreeMap<&str, String> = BTreeMap::new();
         let mut drops: Vec<&str> = Vec::new();
         for step in &steps {
             match step {
                 MemberRoleStep::Drop { role } => drops.push(role),
+                MemberRoleStep::CreatePersonal { .. } => {
+                    personal_creates.insert(step.role(), render_step(step));
+                }
                 MemberRoleStep::Revoke { .. } | MemberRoleStep::Unlock { .. } => revokes
                     .entry(step.role())
                     .or_default()
@@ -1504,6 +1844,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(e) => return failed(format!("reading the last acted roles: {e}")),
         };
         let target = |role: &str| reassign_target(&catalog, role, acted.get(role).map(String::as_str));
+        // MH-18 (amended): a personal login's leftovers are quarantined to `chelabase_orphaned`;
+        // a member role's go per R31.
+        let cleanup = |role: &str| {
+            if is_personal(role) {
+                personal_cleanup_script(role)
+            } else {
+                cleanup_script(role, target(role).as_deref())
+            }
+        };
         // R31, I-A, I-B: every member role that stays, on every reconcile, but only where
         // `pg_shdepend` shows it still owns or holds something (a converged sweep runs nothing),
         // and before the revokes (its memberships still let it become the target): leftovers to
@@ -1513,7 +1862,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 continue;
             }
             if let Err(e) = self
-                .clean_up_leftovers(&ep, &catalog, role, target(role).as_deref())
+                .clean_up_leftovers(&ep, &catalog, role, &cleanup(role))
                 .await
             {
                 warn!(branch_id = %branch, role, "member roles: cleaning up failed: {e:#}");
@@ -1532,7 +1881,24 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 failed_roles.insert(role.to_string());
             }
         }
-        for (role, statements) in &changes {
+        let changed: BTreeSet<&str> = personal_creates
+            .keys()
+            .chain(changes.keys())
+            .copied()
+            .collect();
+        for role in changed {
+            if let Some(create) = personal_creates.get(role) {
+                let script = format!("SET search_path = pg_catalog, pg_temp;\n{create}");
+                if let Err(e) = self.computes.admin_sql(&ep, SYSTEM_DATABASE, &script).await {
+                    warn!(branch_id = %branch, role, "personal login: creating failed (the record is kept): {e:#}");
+                    failures.push(format!("creating {role}: {e:#}"));
+                    failed_roles.insert(role.to_string());
+                    continue;
+                }
+            }
+            let Some(statements) = changes.get(role) else {
+                continue;
+            };
             let script = format!(
                 "SET search_path = pg_catalog, pg_temp;\n{}",
                 statements.join("\n")
@@ -1545,7 +1911,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         for role in &drops {
             if let Err(e) = self
-                .drop_member_role(&ep, &catalog, role, target(role).as_deref())
+                .drop_member_role(&ep, &catalog, role, &cleanup(role))
                 .await
             {
                 warn!(branch_id = %branch, role, "member roles: dropping failed: {e:#}");
@@ -1566,8 +1932,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 password_enc: w.sealed.clone(),
                 applied_roles: w.desired.roles.iter().cloned().collect(),
             };
-            if let Err(e) = self.metadata.upsert_member_branch_role(&row).await {
-                failures.push(format!("storing {}: {e}", w.desired.role_name));
+            // EOS-1: a compare-and-set on the password this run read. A rotation mark (`''`,
+            // revoke-now or a suspension) written since is kept, so the next run (the one the
+            // mark's writer asks for) still gives the role a fresh password.
+            let read = rows.get(&w.desired.member_id).map(|r| r.password_enc.as_str());
+            match self.metadata.upsert_member_branch_role_if(&row, read).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    info!(branch_id = %branch, role = w.desired.role_name, "member roles: the row changed since it was read (a rotation mark); kept for the next run");
+                }
+                Err(e) => failures.push(format!("storing {}: {e}", w.desired.role_name)),
             }
         }
         for row in rows.values() {
@@ -1585,6 +1959,35 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 failures.push(format!("removing the row of {}: {e}", row.role_name));
             }
         }
+        // T6: each applied personal login's row on this endpoint (the record's own verifier,
+        // T3-I1), where it's missing or carries another verifier; S16: the proxy cache is told
+        // of every personal row written or removed, now and again later.
+        for d in personal
+            .desired
+            .iter()
+            .filter(|d| !failed_roles.contains(&d.role_name))
+        {
+            if personal.rows.get(&d.role_name) == Some(&Some(d.verifier.clone())) {
+                continue;
+            }
+            match self
+                .metadata
+                .upsert_personal_role_row(
+                    &ep,
+                    d.member_id,
+                    database.database_id.as_uuid(),
+                    &d.role_name,
+                    &d.verifier,
+                )
+                .await
+            {
+                Ok(()) => published.push(d.role_name.clone()),
+                Err(e) => {
+                    failures.push(format!("storing the personal row of {}: {e}", d.role_name))
+                }
+            }
+        }
+        self.publish_twice(&ep, &published).await;
 
         if !failures.is_empty() {
             return failed(format!("member roles: {}", failures.join("; ")));
@@ -1655,15 +2058,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
     }
 
-    /// A member role gone: locked out and its sessions ended, then in each database its
-    /// leftovers to `reassign_to` and the rest dropped ([`cleanup_script`], R31), then the role.
-    /// Each part is safe to run again.
+    /// A member role or personal login gone: locked out and its sessions ended, then `cleanup`
+    /// in each database with leftovers ([`cleanup_script`], R31, or
+    /// [`personal_cleanup_script`]), then the role. Each part is safe to run again.
     async fn drop_member_role(
         &self,
         ep: &str,
         catalog: &MemberCatalog,
         role: &str,
-        reassign_to: Option<&str>,
+        cleanup: &str,
     ) -> anyhow::Result<()> {
         let lock_out = format!(
             "SET search_path = pg_catalog, pg_temp;\n{}",
@@ -1674,7 +2077,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         self.computes
             .admin_sql(ep, SYSTEM_DATABASE, &lock_out)
             .await?;
-        self.clean_up_leftovers(ep, catalog, role, reassign_to).await?;
+        self.clean_up_leftovers(ep, catalog, role, cleanup).await?;
         self.computes
             .admin_sql(
                 ep,
@@ -1688,15 +2091,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         Ok(())
     }
 
-    /// [`cleanup_script`] for `role` in each database where `pg_shdepend` shows it still owns
-    /// or holds something (I-A), shared objects from the system database; nothing at all for
-    /// a role with no leftovers.
+    /// `cleanup` ([`cleanup_script`], or [`personal_cleanup_script`] for a personal login) for
+    /// `role` in each database where `pg_shdepend` shows it still owns or holds something
+    /// (I-A), shared objects from the system database; nothing at all for a role with no
+    /// leftovers.
     async fn clean_up_leftovers(
         &self,
         ep: &str,
         catalog: &MemberCatalog,
         role: &str,
-        reassign_to: Option<&str>,
+        cleanup: &str,
     ) -> anyhow::Result<()> {
         let Some(found) = catalog.leftovers.get(role) else {
             return Ok(());
@@ -1707,7 +2111,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         }
         for db in databases {
             self.computes
-                .admin_sql(ep, db, &cleanup_script(role, reassign_to))
+                .admin_sql(ep, db, cleanup)
                 .await
                 .map_err(|e| anyhow::anyhow!("in {db}: {e:#}"))?;
         }
@@ -1894,3 +2298,6 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod quarantine_tests;

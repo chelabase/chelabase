@@ -15,4 +15,8 @@ before?: number;
  * @minimum 0
  */
 limit?: number;
+/**
+ * Only events whose target or actor is this member
+ */
+member_id?: string;
 };

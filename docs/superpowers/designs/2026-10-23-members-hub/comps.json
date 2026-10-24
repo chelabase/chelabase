@@ -1,0 +1,82 @@
+[
+  {
+    "file": "01-roster-cards.html",
+    "title": "Members roster",
+    "note": "Tenant admin's People tab in cards: Requests above, then the MH-35 groups by highest level, each with a count and a one-line meaning. Status (Invited, Suspended) decides the group before level. Square cards, initials in a hairline square, level as a tag; the only sand fill is Invite people."
+  },
+  {
+    "file": "02-roster-list-developer.html",
+    "title": "Members roster list",
+    "note": "A Developer's view in list: read-only (no Invite, no row menus, no Requests, no Activity tab). Levels and project counts cover only projects Lena can see (R1), so Aiden, who works only on Ops console, sits under Other projects (MH-35). Below 40rem the rows stack."
+  },
+  {
+    "file": "03-roster-project-filter.html",
+    "title": "Members by project",
+    "note": "The project filter regroups everyone by their role on Billing app: Admins (tenant admins marked, they're Admin everywhere), Developers, Viewers, then No access on Billing app. Invited and Suspended stay status groups. The Level column becomes the role on that project."
+  },
+  {
+    "file": "04-member-admin-view.html",
+    "title": "Member page",
+    "note": "A tenant admin on Sofia's page. Header actions by power (Suspend and Revoke Postgres access now are tenant-admin only, Remove from tenant in the overflow). One card per project with the segmented platform role and the filterable role checklist: checked first, 'also gives' chains, the escaped bidi name refunds\\u202Ereview, the Admin-only group with reasons, and step 2's locked 'via team' row (lock + link, never sent in the PUT). The warehouse card shows unsaved edits (sand pending edge, its own Save). Logins: Admins see Delete only; expiring soon is a coral-outlined square."
+  },
+  {
+    "file": "05-member-self.html",
+    "title": "Your member page",
+    "note": "Sofia's own page: project access is read-only (no Save, roles listed but disabled, no Admin-only group), personal logins are hers to manage. Her billing-prod login expires in 9 days, so the row offers Renew and a prompt names the date and what renewing does (new password, 90 more days)."
+  },
+  {
+    "file": "06-member-suspended.html",
+    "title": "Suspended member",
+    "note": "A suspended member: the status is coral, a coral-bordered box says when, by whom and what stopped, and Reinstate is the page's one sand action. Grants stay visible and editable ('effective once reinstated'); revoked logins stay listed with their reason until deleted (P6)."
+  },
+  {
+    "file": "07-roles-tab.html",
+    "title": "Roles tab",
+    "note": "The Roles tab for an Admin: project → database → branch → Postgres database pickers (search params), the protected-branch note, role cards with NOLOGIN/LOGIN, owner-level in coral, member counts (Admins only, MH-34; a Developer sees the same cards without counts and without the logins list), a privilege summary, and the escaped name. Personal logins are never role cards: they get their own Admin-only list (P24) linking to each member."
+  },
+  {
+    "file": "08-role-page.html",
+    "title": "Role privileges",
+    "note": "A project Admin on billing_editor: one schema block per schema with Schema, Tables and views (objects × 8 privileges, 'all' per row and column), the column drill-in open on customers, All rows with its caveat line, Sequences, Functions, Future objects. Staged cells carry the sand pending edge; the right panel collects them (one panel, one sand: Review changes). payments and close_period are owned by ledger_svc, which the owner can't SET to: greyed with a lock and 'change in SQL as ledger_svc'. Grantors show where they matter (neon_superuser, P30); grant option is shown and only revocable (MH-29)."
+  },
+  {
+    "file": "09-role-review.html",
+    "title": "Review privilege changes",
+    "note": "Review changes: the dry-run SQL, the exposure flag (authenticated inherits reports_reader), and the dry run's 422 exposes_data_api on All rows with the server's chain. Apply stays disabled until the refused change is removed."
+  },
+  {
+    "file": "10-role-conflict.html",
+    "title": "Privileges not applied",
+    "note": "After Apply, the server's verify-after check (MH-24) found SELECT still held through another grantor: 409 privileges_not_applied, named object, privilege and grantor, everything rolled back. The staleness 409 (privileges_changed_since_read) is a different message: reload, keep the staged changes."
+  },
+  {
+    "file": "11-create-role.html",
+    "title": "Create role",
+    "note": "Create role: name with the API's rule, NOLOGIN by default (spelled as 'Group role'), Advanced open: member of (with the data-API chain noted), inherit, bypass RLS tagged owner-level, connection limit, valid until. Owner-level creation stays in the branch Roles panel. After creating, Studio opens the new role's page."
+  },
+  {
+    "file": "12-login-reveal.html",
+    "title": "Personal login password",
+    "note": "The shown-once reveal after New login (or Reset / Renew): password and main-branch connection string, each with Copy; P23's note on branches; the roles the login can SET ROLE into. 'You won't see this password again' is plain chalk weight, not a warning colour. Done is the only way out (no click-outside dismissal); the secret lives in the dialog's state only."
+  },
+  {
+    "file": "13-invite-compose.html",
+    "title": "Invite people",
+    "note": "Several emails per invite: pasted addresses become chips, an invalid one is coral-outlined with its reason and is never sent (the button counts only valid ones). Delivery and access are shared by the batch; access rows are today's grant rows."
+  },
+  {
+    "file": "14-invite-results.html",
+    "title": "Invite results",
+    "note": "After sending: one result per email (R8: sent in sequence), seafoam square for done, solid coral for failed with the server's reason in words. The title counts. Failed addresses can go back into the form; the successful ones aren't sent twice."
+  },
+  {
+    "file": "15-suspend-dialog.html",
+    "title": "Suspend member",
+    "note": "Suspend's confirm: what stops now, what's kept, how to undo it, and the permanent alternative. Destructive button, no sand."
+  },
+  {
+    "file": "16-revoke-now-dialog.html",
+    "title": "Revoke Postgres access",
+    "note": "Revoke Postgres access now: names the logins that stop, says sessions end (P16: cb_m_* passwords rotate, so Studio's own sessions reconnect), and what's untouched."
+  }
+]

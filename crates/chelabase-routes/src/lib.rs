@@ -564,6 +564,15 @@ pub mod orchestrator {
         Access::Project(Admin),
     );
 
+    /// What deleting a role to a successor would expose (T10 fix, preview then confirm): a
+    /// read, Admin as the delete.
+    pub const PREVIEW_ROLE_DELETE: Endpoint = key_endpoint(
+        "orchestrator.preview_role_delete",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/roles/{role}/delete-preview",
+        Access::Project(Admin),
+    );
+
     /// The tenant's projects (filtered to the caller's grants; tenant admins see all).
     pub const LIST_PROJECTS: Endpoint =
         key_endpoint("orchestrator.list_projects", Method::Get, "/v1/projects", Access::TenantMember);
@@ -816,6 +825,72 @@ pub mod orchestrator {
     pub const UPDATE_TENANT: Endpoint =
         key_endpoint("orchestrator.update_tenant", Method::Patch, "/v1/tenant", Access::TenantAdmin);
 
+    /// A member's personal Postgres logins (members hub): filtered by the caller in the
+    /// handler (MH-22): their own, a tenant admin's all, a project Admin's on their projects.
+    pub const LIST_MEMBER_PERSONAL_LOGINS: Endpoint = key_endpoint(
+        "orchestrator.list_member_personal_logins",
+        Method::Get,
+        "/v1/members/{member_id}/personal-logins",
+        Access::TenantMember,
+    );
+
+    /// Every personal login of a Chelabase database, any status (P24).
+    pub const LIST_DATABASE_PERSONAL_LOGINS: Endpoint = key_endpoint(
+        "orchestrator.list_database_personal_logins",
+        Method::Get,
+        "/v1/databases/{id}/personal-logins",
+        Access::Project(Admin),
+    );
+
+    /// Creates the caller's own personal login on the database (Developer and above there).
+    pub const PUT_PERSONAL_LOGIN: Endpoint = key_endpoint(
+        "orchestrator.put_personal_login",
+        Method::Put,
+        "/v1/databases/{id}/personal-login",
+        Access::Project(Developer),
+    );
+
+    /// A new password for the caller's own personal login (also renews it).
+    pub const RESET_PERSONAL_LOGIN: Endpoint = key_endpoint(
+        "orchestrator.reset_personal_login",
+        Method::Post,
+        "/v1/databases/{id}/personal-login/reset-password",
+        Access::Project(Developer),
+    );
+
+    /// Deletes a member's personal login: the member, a tenant admin or the project's Admin
+    /// (checked in the handler).
+    pub const DELETE_PERSONAL_LOGIN: Endpoint = key_endpoint(
+        "orchestrator.delete_personal_login",
+        Method::Delete,
+        "/v1/databases/{id}/personal-logins/{member_id}",
+        Access::TenantMember,
+    );
+
+    /// Suspends a member (D5): refused everywhere, logins revoked, Zitadel user locked.
+    pub const SUSPEND_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.suspend_member",
+        Method::Post,
+        "/v1/members/{member_id}/suspend",
+        Access::TenantAdmin,
+    );
+
+    /// Reinstates a suspended member (its logins stay revoked).
+    pub const REINSTATE_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.reinstate_member",
+        Method::Post,
+        "/v1/members/{member_id}/reinstate",
+        Access::TenantAdmin,
+    );
+
+    /// "Revoke Postgres access now" (P16 b): logins revoked, member-role passwords rotated.
+    pub const REVOKE_MEMBER_POSTGRES_ACCESS: Endpoint = key_endpoint(
+        "orchestrator.revoke_member_postgres_access",
+        Method::Post,
+        "/v1/members/{member_id}/revoke-postgres-access",
+        Access::TenantAdmin,
+    );
+
     /// The database's tables, views and other relations (kind, size, whether the table API edits
     /// them).
     pub const LIST_OBJECTS: Endpoint = key_endpoint(
@@ -847,6 +922,15 @@ pub mod orchestrator {
         Method::Post,
         "/v1/databases/{id}/branches/{branch_id}/schema-changes",
         Access::ActAsBranch { unprotected: Developer, protected: Admin },
+    );
+
+    /// One role's privileges in one Postgres database of a branch (members hub, MH-32:
+    /// project-level, like the object list).
+    pub const GET_PRIVILEGES: Endpoint = key_endpoint(
+        "orchestrator.get_privileges",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/privileges",
+        Access::Project(Viewer),
     );
 
     /// A row of all defaults (`INSERT … DEFAULT VALUES`) in one table.
@@ -1106,6 +1190,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::DELETE_ROLE,
     orchestrator::UPDATE_ROLE,
     orchestrator::LIST_ROLE_SESSIONS,
+    orchestrator::PREVIEW_ROLE_DELETE,
     orchestrator::LIST_PROJECTS,
     orchestrator::CREATE_PROJECT,
     orchestrator::GET_PROJECT,
@@ -1143,10 +1228,19 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::UPDATE_INSTANCE_SETTINGS,
     orchestrator::GET_INVITE_DELIVERY,
     orchestrator::UPDATE_TENANT,
+    orchestrator::LIST_MEMBER_PERSONAL_LOGINS,
+    orchestrator::LIST_DATABASE_PERSONAL_LOGINS,
+    orchestrator::PUT_PERSONAL_LOGIN,
+    orchestrator::RESET_PERSONAL_LOGIN,
+    orchestrator::DELETE_PERSONAL_LOGIN,
+    orchestrator::SUSPEND_MEMBER,
+    orchestrator::REINSTATE_MEMBER,
+    orchestrator::REVOKE_MEMBER_POSTGRES_ACCESS,
     orchestrator::LIST_OBJECTS,
     orchestrator::GET_TABLE,
     orchestrator::LIST_TYPES,
     orchestrator::APPLY_SCHEMA_CHANGES,
+    orchestrator::GET_PRIVILEGES,
     orchestrator::INSERT_DEFAULT_ROW,
     orchestrator::GET_CELL,
     rest::QUERY,
@@ -1465,6 +1559,11 @@ mod tests {
             found("GET", &format!("{roles}/app/sessions")),
             "orchestrator.list_role_sessions"
         );
+        // T10 fix: a delete's preview (what it would expose to the successor).
+        assert_eq!(
+            found("GET", &format!("{roles}/app/delete-preview")),
+            "orchestrator.preview_role_delete"
+        );
         for name in [
             "list_roles",
             "create_role",
@@ -1472,6 +1571,7 @@ mod tests {
             "delete_role",
             "update_role",
             "list_role_sessions",
+            "preview_role_delete",
         ] {
             let ep = ENDPOINTS
                 .iter()
@@ -1767,6 +1867,8 @@ mod tests {
             ("orchestrator.get_table", Access::Project(Viewer)),
             ("orchestrator.list_types", Access::Project(Viewer)),
             ("orchestrator.apply_schema_changes", Access::ActAsBranch { unprotected: Developer, protected: Admin }),
+            // Members hub T5: the privileges read is project-level (MH-32).
+            ("orchestrator.get_privileges", Access::Project(Viewer)),
             ("orchestrator.insert_default_row", Access::ActAs(Developer)),
             ("orchestrator.get_cell", Access::ActAs(Viewer)),
             // Saved queries (edit, delete: the author or Admin, refined in the handler).
@@ -1787,6 +1889,8 @@ mod tests {
             ("orchestrator.delete_role", Access::Project(Admin)),
             ("orchestrator.reset_role_password", Access::Project(Admin)),
             ("orchestrator.list_role_sessions", Access::Project(Admin)),
+            // T10 fix: the delete's preview, as the delete.
+            ("orchestrator.preview_role_delete", Access::Project(Admin)),
             // Data keys (Admin for a key not bound to an allowed role, refined in the handler).
             ("orchestrator.list_keys", Access::Project(Viewer)),
             ("orchestrator.data_api_schema", Access::Project(Viewer)),
@@ -1871,6 +1975,17 @@ mod tests {
             ("orchestrator.update_instance_settings", Access::Instance),
             ("orchestrator.get_invite_delivery", Access::TenantMember),
             ("orchestrator.update_tenant", Access::TenantAdmin),
+            // Members hub T8: personal logins (the member list is filtered in the handler,
+            // MH-22; delete is the member, a tenant admin or the project's Admin, refined in the
+            // handler), the database's list (P24), suspension and revoke-now (D5).
+            ("orchestrator.list_member_personal_logins", Access::TenantMember),
+            ("orchestrator.list_database_personal_logins", Access::Project(Admin)),
+            ("orchestrator.put_personal_login", Access::Project(Developer)),
+            ("orchestrator.reset_personal_login", Access::Project(Developer)),
+            ("orchestrator.delete_personal_login", Access::TenantMember),
+            ("orchestrator.suspend_member", Access::TenantAdmin),
+            ("orchestrator.reinstate_member", Access::TenantAdmin),
+            ("orchestrator.revoke_member_postgres_access", Access::TenantAdmin),
             // Data API.
             ("rest.query", Access::DataKey),
             ("rest.schema", Access::DataKey),
@@ -1922,6 +2037,42 @@ mod tests {
             .iter()
             .find(|e| e.method == method && e.path == path)
             .unwrap_or_else(|| panic!("{} {path} is not in ENDPOINTS", method.as_str()))
+    }
+
+    /// Members hub T8: the personal-login, suspension and revoke-now endpoints, as pinned (the
+    /// plan's "Orchestrator routes"), on the orchestrator's management API.
+    #[test]
+    fn members_hub_t8_endpoints_are_declared() {
+        use PlatformRole::{Admin, Developer};
+        let pinned: [(Method, &str, &str, Access); 8] = [
+            (Method::Get, "/v1/members/{member_id}/personal-logins", "orchestrator.list_member_personal_logins", Access::TenantMember),
+            (Method::Get, "/v1/databases/{id}/personal-logins", "orchestrator.list_database_personal_logins", Access::Project(Admin)),
+            (Method::Put, "/v1/databases/{id}/personal-login", "orchestrator.put_personal_login", Access::Project(Developer)),
+            (Method::Post, "/v1/databases/{id}/personal-login/reset-password", "orchestrator.reset_personal_login", Access::Project(Developer)),
+            (Method::Delete, "/v1/databases/{id}/personal-logins/{member_id}", "orchestrator.delete_personal_login", Access::TenantMember),
+            (Method::Post, "/v1/members/{member_id}/suspend", "orchestrator.suspend_member", Access::TenantAdmin),
+            (Method::Post, "/v1/members/{member_id}/reinstate", "orchestrator.reinstate_member", Access::TenantAdmin),
+            (Method::Post, "/v1/members/{member_id}/revoke-postgres-access", "orchestrator.revoke_member_postgres_access", Access::TenantAdmin),
+        ];
+        for (method, path, name, access) in pinned {
+            let ep = declared(method, path);
+            assert_eq!(ep.name, name, "{path}");
+            assert_eq!(ep.service, Service::Orchestrator, "{path}");
+            assert_eq!(ep.scope, Scope::Api, "{path}");
+            assert_eq!(ep.policy.auth, Auth::Management, "{path}");
+            assert_eq!(ep.policy.access, access, "{path}");
+        }
+        let id = "6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
+        for (method, path, name) in [
+            ("PUT", format!("/v1/databases/{id}/personal-login"), "orchestrator.put_personal_login"),
+            ("DELETE", format!("/v1/databases/{id}/personal-logins/{id}"), "orchestrator.delete_personal_login"),
+            ("POST", format!("/v1/members/{id}/revoke-postgres-access"), "orchestrator.revoke_member_postgres_access"),
+        ] {
+            match match_endpoint(Scope::Api, method, &path) {
+                Match::Found(ep) => assert_eq!(ep.name, name, "{method} {path}"),
+                other => panic!("{method} {path}: {other:?}"),
+            }
+        }
     }
 
     #[test]

@@ -607,12 +607,12 @@ impl MetadataPort for Doc {
     ) -> Result<MemberRecord, MetadataError> {
         match *self {}
     }
-    async fn grant_rows(
+    async fn grant_sources(
         &self,
         member: Uuid,
         project: Uuid,
         database: Option<Uuid>,
-    ) -> Result<GrantRows, MetadataError> {
+    ) -> Result<chelabase_types::access::GrantSources, MetadataError> {
         match *self {}
     }
     async fn member_projects(&self, member: Uuid) -> Result<Vec<(Uuid, GrantRow)>, MetadataError> {
@@ -706,10 +706,19 @@ impl JobPort for Doc {
     async fn update_role(&self, request: RoleUpdateRequest) -> Result<RoleReply, ResetError> {
         match *self {}
     }
-    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+    async fn delete_role(&self, request: chelabase_nats::RoleDeleteRequest) -> Result<RoleReply, ResetError> {
+        match *self {}
+    }
+    async fn preview_role_delete(&self, request: chelabase_nats::RoleDeleteRequest) -> Result<RoleReply, ResetError> {
         match *self {}
     }
     async fn role_sessions(&self, request: RoleRequest) -> Result<RoleSessionsReply, ResetError> {
+        match *self {}
+    }
+    async fn check_all_rows(
+        &self,
+        request: chelabase_nats::AllRowsCheckRequest,
+    ) -> Result<chelabase_nats::AllRowsCheckReply, ResetError> {
         match *self {}
     }
     async fn publish_project_delete(&self, job: &JobEnvelope<ProjectDeleteJob>) -> Result<(), BoxError> {
@@ -787,9 +796,70 @@ impl members::MembersPort for Doc {
         &self,
         tenant: TenantId,
         project: Option<Uuid>,
+        member: Option<Uuid>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<chelabase_metadata::members::AccessEvent>, MetadataError> {
+        match *self {}
+    }
+    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<(Uuid, Uuid, chelabase_types::access::PlatformRole)>, MetadataError> {
+        match *self {}
+    }
+    async fn record_access_event(&self, e: &chelabase_metadata::personal_logins::AccessEventInput<'_>) -> Result<(), MetadataError> {
+        match *self {}
+    }
+    async fn is_personal_login_name(&self, database: Uuid, name: &str) -> Result<bool, MetadataError> {
+        match *self {}
+    }
+    async fn personal_login_names(&self, project: Uuid) -> Result<std::collections::BTreeSet<String>, MetadataError> {
+        match *self {}
+    }
+    async fn create_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chelabase_metadata::personal_logins::PersonalLogin, chelabase_metadata::personal_logins::LoginWriteError> {
+        match *self {}
+    }
+    async fn reset_personal_login(
+        &self,
+        member: Uuid,
+        database: Uuid,
+        scram_verifier: &str,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (chelabase_metadata::personal_logins::PersonalLogin, Vec<chelabase_metadata::personal_logins::LoginEndpoint>),
+        chelabase_metadata::personal_logins::LoginWriteError,
+    > {
+        match *self {}
+    }
+    async fn delete_personal_login(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        database: Uuid,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, chelabase_metadata::personal_logins::LoginWriteError> {
+        match *self {}
+    }
+    async fn member_personal_logins(&self, member: Uuid) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLogin>, MetadataError> {
+        match *self {}
+    }
+    async fn database_personal_logins(&self, database: Uuid) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLogin>, MetadataError> {
+        match *self {}
+    }
+    async fn member_login_endpoints(&self, member: Uuid) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        match *self {}
+    }
+    async fn suspend_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
+        match *self {}
+    }
+    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<(), DocWriteError> {
+        match *self {}
+    }
+    async fn revoke_postgres_access(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
         match *self {}
     }
     async fn set_tenant_admin(&self, actor: Option<Uuid>, member: Uuid, admin: bool) -> Result<(), DocWriteError> {
@@ -993,6 +1063,8 @@ mod tests {
                 "DELETE /v1/databases/{id}/branches/{branch_id}/roles/{role}",
                 "deleteRole",
             ),
+            // Members hub T8 (S14).
+            ("DELETE /v1/databases/{id}/personal-logins/{member_id}", "deletePersonalLogin"),
             ("DELETE /v1/databases/{id}/sql-queries/{query_id}", "deleteSavedQuery"),
             ("DELETE /v1/invites/{invite_id}", "revokeInvite"),
             ("DELETE /v1/members/{member_id}", "removeMember"),
@@ -1033,10 +1105,18 @@ mod tests {
                 "listKeys",
             ),
             ("GET /v1/databases/{id}/branches/{branch_id}/objects", "listObjects"),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/pg-databases/{name}/privileges",
+                "getPrivileges",
+            ),
             ("GET /v1/databases/{id}/branches/{branch_id}/review", "getBranchReview"),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/roles",
                 "listRoles",
+            ),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/delete-preview",
+                "previewRoleDelete",
             ),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/roles/{role}/sessions",
@@ -1052,12 +1132,14 @@ mod tests {
             ("GET /v1/databases/{id}/merges", "listMerges"),
             ("GET /v1/databases/{id}/merges/{merge_id}", "getMerge"),
             ("GET /v1/databases/{id}/merges/{merge_id}/plan.sql", "exportMergePlan"),
+            ("GET /v1/databases/{id}/personal-logins", "listDatabasePersonalLogins"),
             ("GET /v1/databases/{id}/sql-queries", "listSavedQueries"),
             ("GET /v1/databases/{id}/sql-queries/{query_id}", "getSavedQuery"),
             ("GET /v1/instance/settings", "getInstanceSettings"),
             ("GET /v1/invites/delivery", "getInviteDelivery"),
             ("GET /v1/me", "getMe"),
             ("GET /v1/members", "listMembers"),
+            ("GET /v1/members/{member_id}/personal-logins", "listMemberPersonalLogins"),
             ("GET /v1/projects", "listProjects"),
             ("GET /v1/projects/{id}", "getProject"),
             ("GET /v1/projects/{id}/access-events", "listProjectAccessEvents"),
@@ -1156,6 +1238,10 @@ mod tests {
             ("POST /v1/databases/{id}/merges/{merge_id}/rehearse", "rehearseMerge"),
             ("POST /v1/databases/{id}/merges/{merge_id}/retry", "retryMerge"),
             (
+                "POST /v1/databases/{id}/personal-login/reset-password",
+                "resetPersonalLoginPassword",
+            ),
+            (
                 "POST /v1/databases/{id}/reset-password",
                 "resetDatabasePassword",
             ),
@@ -1164,6 +1250,9 @@ mod tests {
             ("POST /v1/invites/{invite_id}/resend", "resendInvite"),
             ("POST /v1/members/{member_id}/approve", "approveMember"),
             ("POST /v1/members/{member_id}/decline", "declineMember"),
+            ("POST /v1/members/{member_id}/reinstate", "reinstateMember"),
+            ("POST /v1/members/{member_id}/revoke-postgres-access", "revokeMemberPostgresAccess"),
+            ("POST /v1/members/{member_id}/suspend", "suspendMember"),
             ("POST /v1/projects", "createProject"),
             ("POST /v1/projects/{id}/invites", "createProjectInvite"),
             ("POST /v1/projects/{id}/users", "createAppUser"),
@@ -1173,6 +1262,7 @@ mod tests {
                 "PUT /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
                 "putGuardExemption",
             ),
+            ("PUT /v1/databases/{id}/personal-login", "createPersonalLogin"),
             ("PUT /v1/projects/{id}/app-users", "putAppUsers"),
             ("PUT /v1/projects/{id}/grants/{member_id}", "putProjectGrant"),
             (
@@ -1276,6 +1366,54 @@ mod tests {
         assert!(field.contains("`pg_*` and Chelabase's own groups stay"), "{field}");
     }
 
+    // T10 fix (preview, then confirm): the delete takes `confirm` and documents the 409; the
+    // preview takes `successor`, answers `RoleDeletePreview`, and refuses as the delete does.
+    #[test]
+    fn role_delete_documents_preview_and_confirm() {
+        let doc = document();
+        let params = |id: &str| -> Vec<String> {
+            operation(&doc, id)["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{id} has no parameters"))
+                .iter()
+                .map(|p| p["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let delete = params("deleteRole");
+        assert!(delete.contains(&"successor".to_string()) && delete.contains(&"confirm".to_string()), "{delete:?}");
+        let conflict = operation(&doc, "deleteRole")["responses"]["409"]["description"].as_str().unwrap();
+        for needle in ["`exposure_unconfirmed`", "`exposures`", "`confirm`"] {
+            assert!(conflict.contains(needle), "deleteRole 409 lacks {needle}: {conflict}");
+        }
+
+        let preview = params("previewRoleDelete");
+        assert!(preview.contains(&"successor".to_string()), "{preview:?}");
+        assert!(!preview.contains(&"confirm".to_string()), "{preview:?}");
+        let op = operation(&doc, "previewRoleDelete");
+        assert_eq!(op["tags"], serde_json::json!(["roles"]));
+        assert_eq!(
+            op["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/RoleDeletePreview"
+        );
+        for status in ["403", "404", "409", "422", "503"] {
+            assert!(op["responses"].get(status).is_some(), "previewRoleDelete documents {status}");
+        }
+        let unprocessable = op["responses"]["422"]["description"].as_str().unwrap();
+        assert!(unprocessable.contains("`invalid_successor`"), "{unprocessable}");
+        let schema = &doc["components"]["schemas"]["RoleDeletePreview"];
+        let mut fields: Vec<&str> = schema["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["confirm", "exposures", "successor"], "{schema}");
+        let exposure = &doc["components"]["schemas"]["RoleExposure"];
+        let mut fields: Vec<&str> = exposure["properties"].as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["database", "grantees", "identity", "kind"], "{exposure}");
+        assert_eq!(
+            doc["components"]["schemas"]["RoleExposureKind"]["enum"],
+            serde_json::json!(["function", "procedure", "view", "materialized_view"])
+        );
+    }
+
     /// Schema names become the TypeScript type names of the public client: clear and unique.
     #[test]
     fn schema_names_are_api_facing() {
@@ -1289,9 +1427,12 @@ mod tests {
         let expected = [
             "AccessEvent",
             "AccessEventPage",
+            "AccessLevel",
+            "AccessVia",
             "AcknowledgeReviewRequest",
             "AfterMerge",
             "AllRoles",
+            "AllRows",
             "AppUser",
             "AppUserPage",
             "AppUserSession",
@@ -1316,6 +1457,7 @@ mod tests {
             "Column",
             "ColumnChange",
             "ColumnDesc",
+            "ColumnPrivileges",
             "ColumnSpec",
             "CommentChange",
             "ConnectionDetails",
@@ -1337,6 +1479,7 @@ mod tests {
             "CreateSavedQueryRequest",
             "CreateTable",
             "CreatedDataKey",
+            "DataApiExposure",
             "DataApiSchema",
             "DataApiState",
             "DataKey",
@@ -1348,9 +1491,12 @@ mod tests {
             "DatabaseStatus",
             "DatabaseSummary",
             "DefaultChange",
+            "DefaultObject",
+            "DefaultPrivileges",
             "DefaultRow",
             "DefaultRowRequest",
             "DeleteProjectRequest",
+            "DeletedRole",
             "Delivery",
             "DeliveryReason",
             "Dependent",
@@ -1361,11 +1507,13 @@ mod tests {
             "ErrorCode",
             "ErrorEnvelope",
             "ExclusionElement",
+            "ExpectedAcl",
             "FinishRequest",
             "FixAction",
             "FkAction",
             "ForeignKeyTarget",
             "FunctionDesc",
+            "FunctionRef",
             "Grant",
             "GrantOverride",
             "Grantee",
@@ -1391,6 +1539,8 @@ mod tests {
             "MeRoles",
             "MeUser",
             "Member",
+            "MemberAccess",
+            "MemberProjectAccess",
             "MemberStatusView",
             "Merge",
             "MergeDetail",
@@ -1402,12 +1552,19 @@ mod tests {
             "NullsOrder",
             "ObjectKind",
             "ObjectList",
+            "ObjectPrivileges",
             "ObjectSummary",
+            "Offered",
             "OnDelete",
             "Operation",
             "OperationAccepted",
             "OperatorRef",
             "PasswordState",
+            "PersonalLoginList",
+            "PersonalLoginRevokeReason",
+            "PersonalLoginSecret",
+            "PersonalLoginStatus",
+            "PersonalLoginView",
             "PlatformRole",
             "PointInTime",
             "Policy",
@@ -1415,6 +1572,10 @@ mod tests {
             "PolicyCommandSpec",
             "PolicySpec",
             "Privilege",
+            "PrivilegeName",
+            "PrivilegeObjectKind",
+            "PrivilegeTarget",
+            "PrivilegesPage",
             "Project",
             "ProjectGrant",
             "ProjectId",
@@ -1423,6 +1584,8 @@ mod tests {
             "PutAppUsersRequest",
             "PutGrantOverrideRequest",
             "PutGrantRequest",
+            "PutPersonalLoginRequest",
+            "ReassignedObjects",
             "RecomputeRequest",
             "RehearseRequest",
             "Relation",
@@ -1439,7 +1602,12 @@ mod tests {
             "ReviewItemKind",
             "ReviewReason",
             "ReviewReasonKind",
+            "RevokeResult",
             "RlsSpec",
+            // T10 fix: a role delete's preview.
+            "RoleDeletePreview",
+            "RoleExposure",
+            "RoleExposureKind",
             "RoleInUseKey",
             "RoleLevel",
             "RoleOrigin",
@@ -1452,7 +1620,10 @@ mod tests {
             "SchemaChangeRequest",
             "SchemaChangeResponse",
             "SchemaEntry",
+            "SchemaPrivilege",
+            "SchemaPrivileges",
             "SequenceParams",
+            "SequencePrivilege",
             "SkipReason",
             "StatementResult",
             "Table",

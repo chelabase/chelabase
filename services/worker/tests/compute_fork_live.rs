@@ -727,48 +727,97 @@ async fn a_personal_login_is_guarded() {
     .await;
 }
 
-/// RT4-4: a personal login the compute lost (dropped behind the platform's back as
-/// `cloud_admin`) is made again by one resync, marked in the same script, so the owner's
-/// `ALTER ROLE` on it is refused again.
+/// RT4-4, changed deliberately by members hub T6 (spec Part 6 "Convergence"): a personal login
+/// the compute lost (dropped behind the platform's back as `cloud_admin`) is never made again
+/// by the resync; the member-role reconcile makes it again from its record, marked in its
+/// create transaction, so the owner's `ALTER ROLE` on it is refused again.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "needs the workbench stack on the round-4 images"]
+#[ignore = "needs the workbench stack on the members hub images (end-of-step pass)"]
 async fn a_recreated_personal_login_is_marked_again() {
     with_db(|db| async move {
         let password = "personal-live-pw";
         let verifier = chelabase_neon::scram::verifier(password);
         let branch = BranchId::from(db.id);
-        db.worker.create_personal_login(&db.ep, "bob", &verifier).await.expect("create_personal_login");
-        // The Members step records the row; until it does, the first resync records the role as
-        // an SQL one and the test flips its origin, as the Members step will have made it.
-        db.worker.resync(branch).await.expect("first resync");
-        let flipped = sqlx::query("UPDATE neon_roles SET origin = 'personal' WHERE endpoint_id = $1 AND name = 'bob'")
-            .bind(&db.ep)
+        // A Developer of the demo project with a login on this database (the record first, as
+        // the API writes it). Undone at the end, pass or fail: the demo project is shared.
+        let member = db
+            .metadata
+            .ensure_member(
+                DEMO_TENANT_ID.into(),
+                &format!("z-c3-{}", uuid::Uuid::new_v4()),
+                "c3@personal.live",
+                "c3",
+                chelabase_metadata::members::Admission::Active,
+            )
+            .await
+            .expect("a member");
+        sqlx::query(
+            "INSERT INTO project_grants (member_id, project_id, platform_role) VALUES ($1, $2, 'developer')",
+        )
+        .bind(member.id)
+        .bind(DEMO_PROJECT_ID)
+        .execute(db.metadata.pool())
+        .await
+        .expect("grant Developer");
+        let checks = {
+            let db = db.clone();
+            tokio::spawn(async move {
+                db.metadata
+                    .create_personal_login(
+                        member.id,
+                        db.id.as_uuid(),
+                        "bob",
+                        &verifier,
+                        chrono::Utc::now() + chrono::Duration::days(90),
+                    )
+                    .await
+                    .expect("the record");
+                let reconcile = || async {
+                    match db.worker.reconcile_member_roles(branch, None).await {
+                        chelabase_nats::MemberRolesReply::Done { .. } => {}
+                        chelabase_nats::MemberRolesReply::Failed { message } => panic!("reconcile: {message}"),
+                    }
+                };
+                reconcile().await;
+                assert!(is_marked(&db, &db.ep, "bob").await);
+
+                db.sql("postgres", "DROP OWNED BY bob; DROP ROLE bob;").await;
+                let count = || db.sql("postgres", "SELECT count(*) FROM pg_roles WHERE rolname = 'bob';");
+                assert_eq!(count().await.trim(), "0");
+
+                db.worker.resync(branch).await.expect("resync");
+                assert_eq!(count().await.trim(), "0", "the resync never makes a personal login");
+
+                reconcile().await;
+                assert_eq!(count().await.trim(), "1", "the reconcile makes it again from its record");
+                assert!(is_marked(&db, &db.ep, "bob").await, "marked again");
+                let err = as_owner(&db, &db.ep, "ALTER ROLE bob PASSWORD 'owner-set';").await.unwrap_err();
+                assert!(err.contains("managed by Chelabase"), "{err}");
+                // Its password is the record's verifier: the login works, and is not a spec role.
+                let conninfo = db.conninfo("bob", password, false).await;
+                assert_eq!(db.psql(&conninfo, "SELECT current_user;").await.unwrap().trim(), "bob");
+                let origin: String = sqlx::query_scalar("SELECT origin FROM neon_roles WHERE endpoint_id = $1 AND name = 'bob'")
+                    .bind(&db.ep)
+                    .fetch_one(db.metadata.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(origin, "personal", "its row is the record's");
+                let spec_roles = db.metadata.neon_roles(&db.ep).await.unwrap();
+                assert!(spec_roles.iter().all(|r| r.name != "bob"), "never a compute-spec role: {spec_roles:?}");
+            })
+            .await
+        };
+        let _ = sqlx::query("DELETE FROM project_grants WHERE member_id = $1")
+            .bind(member.id)
             .execute(db.metadata.pool())
-            .await
-            .unwrap();
-        assert_eq!(flipped.rows_affected(), 1, "the resync recorded the role");
-        assert!(is_marked(&db, &db.ep, "bob").await);
-
-        db.sql("postgres", "DROP OWNED BY bob; DROP ROLE bob;").await;
-        assert_eq!(db.sql("postgres", "SELECT count(*) FROM pg_roles WHERE rolname = 'bob';").await.trim(), "0");
-
-        db.worker.resync(branch).await.expect("the resync that recreates it");
-
-        assert_eq!(db.sql("postgres", "SELECT count(*) FROM pg_roles WHERE rolname = 'bob';").await.trim(), "1");
-        assert!(is_marked(&db, &db.ep, "bob").await, "marked again");
-        let err = as_owner(&db, &db.ep, "ALTER ROLE bob PASSWORD 'owner-set';").await.unwrap_err();
-        assert!(err.contains("managed by Chelabase"), "{err}");
-        // Its password is the stored verifier: the login works, and is not a spec role.
-        let conninfo = db.conninfo("bob", password, false).await;
-        assert_eq!(db.psql(&conninfo, "SELECT current_user;").await.unwrap().trim(), "bob");
-        let origin: String = sqlx::query_scalar("SELECT origin FROM neon_roles WHERE endpoint_id = $1 AND name = 'bob'")
-            .bind(&db.ep)
-            .fetch_one(db.metadata.pool())
-            .await
-            .unwrap();
-        assert_eq!(origin, "personal", "the resync keeps the origin");
-        let spec_roles = db.metadata.neon_roles(&db.ep).await.unwrap();
-        assert!(spec_roles.iter().all(|r| r.name != "bob"), "never a compute-spec role: {spec_roles:?}");
+            .await;
+        let _ = sqlx::query("UPDATE members SET status = 'removed', tenant_admin = false WHERE id = $1")
+            .bind(member.id)
+            .execute(db.metadata.pool())
+            .await;
+        if let Err(panic) = checks {
+            std::panic::resume_unwind(panic.into_panic());
+        }
     })
     .await;
 }

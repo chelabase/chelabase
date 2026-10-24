@@ -11,6 +11,7 @@ use chelabase_secrets::SecretKey;
 use chelabase_types::BranchId;
 use chelabase_types::role_settings::RoleSettings;
 
+pub mod all_rows;
 pub mod app_users;
 pub mod app_users_sql;
 pub mod branch_create;
@@ -36,10 +37,14 @@ mod f4_coder_tests;
 mod f4_tests;
 #[cfg(test)]
 mod fakes;
+#[cfg(test)]
+mod final_a_tests;
+pub mod identity_sweep;
 pub mod member_roles;
 pub mod schema_guard;
 pub mod merge;
 pub mod names;
+pub mod personal_logins;
 pub mod point;
 pub mod project_delete;
 pub mod ports;
@@ -118,6 +123,10 @@ pub struct Worker<M, S, C, N, P> {
     pub app_users_reconcile_every: Duration,
     /// How often the member-role sweep runs (`CHELABASE_MEMBER_ROLES_SWEEP_SECS`).
     pub member_roles_sweep_every: Duration,
+    /// How often the identity sweep runs (`CHELABASE_IDENTITY_SWEEP_SECS`).
+    pub identity_sweep_every: Duration,
+    /// EOS-4: the identity sweep said once that it can't run without a Zitadel client.
+    pub identity_sweep_warned: std::sync::atomic::AtomicBool,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,

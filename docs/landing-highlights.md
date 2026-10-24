@@ -7,6 +7,44 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
+## Members hub, step 1: one place for people, roles and privileges (2026-10-24, in progress: paused for the merge decision)
+
+Branch `members-hub`; spec `docs/superpowers/specs/2026-10-23-members-hub-design.md`; plan `docs/superpowers/plans/2026-10-23-members-hub-step-1.md`. No fork change (it builds on fork round 4's personal-login marker).
+
+### One place for access
+- **Problem:** Studio's Members page could only make someone a tenant admin or remove them. Grants lived in each project's Access tab, Postgres roles in each branch's panel, and there was nowhere to define NOLOGIN roles and what they may touch.
+- **What we built:**
+  - A members hub. The roster is grouped by each person's highest visible level, with a project filter and card or list views.
+  - A page per member: grants per project with database narrowing, invite actions, and Suspend / Reinstate / "Revoke Postgres access now".
+  - A Roles tab: create roles, a staged privilege editor (tables and columns, schemas, sequences, functions, default privileges, "all rows" for RLS), and role delete with a chosen successor.
+  - Multi-email invites that report each address's outcome.
+- **Evidence:** Studio suite 2472/2472; three Impeccable finish reviews against the user-approved comps; a browser pass as a tenant admin and as a Developer.
+
+### Personal Postgres logins that die the instant access does
+- **Problem:** to use `psql` or a GUI client, people shared the app's password or the owner's.
+- **What we built:**
+  - **One login per person per database**, present on every branch where they have Developer access or more. It holds no privileges of its own and acts only through its groups, and it can start in a chosen group (`options=-c role=…`).
+  - **Revocation reaches the proxy in the same transaction** as any loss of access, before any compute work: grant or override changes, removal, suspension, revoke-now, the IdP webhook, a 10-minute IdP sweep, and a 90-day expiry. An offboarded member is refused everywhere at once.
+  - **Objects a removed login owned go to a powerless quarantine role, never to the owner**, so a planted SECURITY DEFINER can't escalate. Role deletes ask for a successor and preview any exposure before confirming.
+- **Evidence:**
+  - `personal_logins_live` 7/7 and `personal-logins-e2e` 10 checks, covering a proxy refusal while the compute is suspended and the role option;
+  - `members_live` 65/65, with deterministic race tests of a worker write against a reset or revoke;
+  - `member_roles_live` 30/30, `roles_live` 47/47;
+  - a 48-case exhaustive model of login convergence.
+
+### Privileges that are checked, not assumed
+- **Problem:** Postgres answers a GRANT or REVOKE the caller can't perform with a warning, not an error. So an editor can report success while the privilege is unchanged.
+- **What we built:**
+  - Every privilege apply re-reads the ACLs in the same transaction and rolls back with a named mismatch if anything differs.
+  - Edits on objects owned by group roles run as their owner through a transient SET that leaves the owner's memberships exactly as they were.
+  - "All rows" is refused for any role the data API reaches. That check runs in the worker and fails closed.
+- **Evidence:** `privileges_live` 10/10, `catalog_live` 15/15, the orchestrator `api` live privilege tests, and T1's PG 17.11 feasibility probe.
+
+### Also fixed on the way
+- Four `merge_live` tests broken on `main` since 2026-10-16: they sent no storage-controller token.
+- Two timing flakes in the test harness: a paused clock racing loopback on WSL2, and SIGPIPE in lint scripts.
+- Advisories RUSTSEC-2026-0384 (`tokio`) and RUSTSEC-2026-0385 (`ctutils`).
+
 ## Carried gaps: provisioning through a pageserver restart, no leaked computes (2026-10-22, shipped: merged into `main` `06758d3f`)
 
 Branch `carried-gaps`; plan `docs/superpowers/plans/2026-10-22-carried-gaps.md`. No fork change.

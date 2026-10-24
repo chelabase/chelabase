@@ -5,6 +5,9 @@
 //! The transaction's `lock_timeout` is 2 s: the compute's curl gives up after 3 s and retries,
 //! so the receiver answers "try again" first. Dropping a [`DdlTx`] without [`DdlTx::commit`]
 //! rolls everything back.
+//!
+//! No writer here changes a personal row (origin `personal`, S1): it belongs to its personal
+//! login's record, and the marked role it mirrors is the reconciler's.
 
 use chelabase_types::BranchId;
 use sqlx::{Postgres, Transaction};
@@ -195,7 +198,7 @@ impl DdlTx {
              ON CONFLICT (endpoint_id, name) DO UPDATE
                  SET scram_verifier = EXCLUDED.scram_verifier, password_enc = NULL,
                      no_password = false, password_unreadable = false, forwarded_at = now()
-                 WHERE neon_roles.origin <> 'owner'",
+                 WHERE neon_roles.origin NOT IN ('owner', 'personal')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -211,7 +214,7 @@ impl DdlTx {
     pub async fn set_login(&mut self, name: &str, login: bool) -> Result<bool, MetadataError> {
         let updated = sqlx::query(
             "UPDATE neon_roles SET login = $3, forwarded_at = now()
-             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -252,7 +255,7 @@ impl DdlTx {
     pub async fn mark_password_unreadable(&mut self, name: &str) -> Result<(), MetadataError> {
         let marked = sqlx::query(
             "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
-             WHERE endpoint_id = $1 AND name = $2",
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -287,7 +290,8 @@ impl DdlTx {
 
     pub async fn remove_copy(&mut self, name: &str) -> Result<bool, MetadataError> {
         let deleted = sqlx::query(
-            "DELETE FROM neon_roles WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+            "DELETE FROM neon_roles
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
         )
         .bind(&self.endpoint_id)
         .bind(name)
@@ -317,7 +321,7 @@ impl DdlTx {
             "UPDATE neon_roles SET name = $3, password_enc = $4,
                  password_unreadable = CASE WHEN $4 IS NULL THEN password_unreadable ELSE false END,
                  forwarded_at = now()
-             WHERE endpoint_id = $1 AND name = $2",
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
         )
         .bind(&self.endpoint_id)
         .bind(old)

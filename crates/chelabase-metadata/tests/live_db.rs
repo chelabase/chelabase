@@ -24,6 +24,7 @@ use chelabase_metadata::{
 use chelabase_metadata::{
     ApiRoleChange, NewApiRole, RenameCopyOutcome, RoleAttributes, RoleWriteOutcome, SecretChange,
 };
+use chelabase_metadata::members::Admission;
 use chelabase_types::data_key::{self, DataKeyKind};
 use chelabase_types::{BranchId, DatabaseId, ProjectId, TenantId};
 
@@ -2994,88 +2995,383 @@ async fn neon_roles_lists_only_the_owner() {
     assert_eq!(unknown, (vec![], 0));
 }
 
-// F2 round 2: a resync's removals never delete a personal row (only the platform removes a
-// personal login); an `sql` row listed with it is deleted.
+// ---- Members hub step 1 (T3): personal rows belong to their records ------------------------
+//
+// A personal `neon_roles` row exists only with its `personal_logins` record (FK, CHECKs), and
+// only the personal-login functions write one (S1). These tests need members, so each runs on
+// its own scratch database (the shared demo tenant never keeps them).
+
+/// A personal login's stored verifier in these tests.
+const PERSONAL_VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdA==$personal";
+
+/// Scratch databases (`cl_<8 hex unix seconds><4 hex>`) older than this are dropped by any run.
+const SCRATCH_STALE_SECS: u64 = 3600;
+
+/// A scratch database with every migration applied.
+struct ScratchDb {
+    meta: sqlx::PgPool,
+    name: String,
+    client: MetadataClient,
+}
+
+impl ScratchDb {
+    async fn new() -> ScratchDb {
+        let base = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+        });
+        let meta = raw_pool().await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let stale: Vec<String> =
+            sqlx::query_scalar("SELECT datname FROM pg_catalog.pg_database WHERE datname ~ '^cl_[0-9a-f]{12}$'")
+                .fetch_all(&meta)
+                .await
+                .unwrap();
+        for old in stale {
+            if u64::from_str_radix(&old[3..11], 16).unwrap_or(u64::MAX) < now.saturating_sub(SCRATCH_STALE_SECS) {
+                let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE IF EXISTS {old} WITH (FORCE)")))
+                    .execute(&meta)
+                    .await;
+            }
+        }
+        let name = format!("cl_{:08x}{}", now as u32, &hex32()[..4]);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}"))).execute(&meta).await.unwrap();
+        let (head, tail) = base.rsplit_once('/').expect("a database in the URL");
+        let query = tail.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+        let client = MetadataClient::connect(&MetadataConfig { database_url: format!("{head}/{name}{query}") })
+            .await
+            .unwrap();
+        client.migrate().await.unwrap();
+        ScratchDb { meta, name, client }
+    }
+
+    async fn finish(self) {
+        self.client.pool().close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.name)))
+            .execute(&self.meta)
+            .await
+            .unwrap();
+    }
+
+    /// A tenant whose first member (`alice`, the claiming tenant admin) is returned, with one
+    /// project and a ready database whose main has an endpoint: `(tenant, alice, database, endpoint)`.
+    async fn ready(&self) -> (TenantId, uuid::Uuid, DatabaseId, String) {
+        let c = &self.client;
+        let t = TenantId(uuid::Uuid::new_v4());
+        sqlx::query("INSERT INTO tenants (id, slug) VALUES ($1, $2)")
+            .bind(t.as_uuid())
+            .bind(format!("t-{t}"))
+            .execute(c.pool())
+            .await
+            .unwrap();
+        let alice = c
+            .ensure_member(t, "alice", "alice@x.com", "Alice", Admission::Active)
+            .await
+            .unwrap();
+        assert!(alice.tenant_admin);
+        let p = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO projects (id, tenant_id, slug, name) VALUES ($1, $2, $3, $3)")
+            .bind(p)
+            .bind(t.as_uuid())
+            .bind(format!("p-{p}"))
+            .execute(c.pool())
+            .await
+            .unwrap();
+        let db = DatabaseId::new();
+        c.insert_database_pending(db, t, ProjectId(p), &format!("d-{db}")).await.unwrap();
+        let ep = link_endpoint(c, db).await;
+        assert!(make_ready(c, db, "v1:owner").await);
+        (t, alice.id, db, ep)
+    }
+
+    /// [`Self::ready`] plus alice's personal login `alice` on the database, with its proxy row
+    /// on main's endpoint.
+    async fn with_login(&self) -> (TenantId, uuid::Uuid, DatabaseId, String) {
+        let (t, alice, db, ep) = self.ready().await;
+        let until = chrono::Utc::now() + chrono::Duration::days(90);
+        self.client
+            .create_personal_login(alice, db.as_uuid(), "alice", PERSONAL_VERIFIER, until)
+            .await
+            .unwrap();
+        self.client
+            .upsert_personal_role_row(&ep, alice, db.as_uuid(), "alice", PERSONAL_VERIFIER)
+            .await
+            .unwrap();
+        (t, alice, db, ep)
+    }
+}
+
+/// Everything a writer could change on a row: origin, verifier, login, sealed password, the
+/// unreadable and no-password marks, and the record it belongs to.
+type RowState = (String, Option<String>, bool, Option<String>, bool, bool, Option<uuid::Uuid>, Option<uuid::Uuid>);
+
+async fn row_state(client: &MetadataClient, ep: &str, name: &str) -> Option<RowState> {
+    sqlx::query_as(
+        "SELECT origin, scram_verifier, login, password_enc, password_unreadable, no_password,
+                member_id, personal_database_id
+         FROM neon_roles WHERE endpoint_id = $1 AND name = $2",
+    )
+    .bind(ep)
+    .bind(name)
+    .fetch_optional(client.pool())
+    .await
+    .unwrap()
+}
+
+/// The constraint a statement violated, or `None` when it succeeded.
+fn refused_by(result: Result<sqlx::postgres::PgQueryResult, sqlx::Error>) -> Option<String> {
+    match result {
+        Ok(_) => None,
+        Err(sqlx::Error::Database(e)) => Some(e.constraint().unwrap_or("<none>").to_string()),
+        Err(other) => panic!("not a database error: {other}"),
+    }
+}
+
+// MH-9 / spec Part 6: the proxy's read answers no verifier for a personal row whose record is
+// revoked or past `valid_until` (a join in the same statement), and the verifier again once
+// the record is valid; other rows are unaffected.
+#[tokio::test]
+#[ignore]
+async fn the_proxy_gets_no_secret_for_a_revoked_or_expired_login() {
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, alice, _db, ep) = x.with_login().await;
+    seed_copy(c, &ep, "plain", "sql", Some(SQL_VERIFIER), None).await;
+    let live = Some(Some(PERSONAL_VERIFIER.to_string()));
+    assert_eq!(c.routable_role_secret(&ep, "alice").await.unwrap(), live);
+    let set_until = |interval: &'static str| {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE personal_logins SET valid_until = now() + interval '{interval}' WHERE member_id = $1"
+        )))
+        .bind(alice)
+        .execute(c.pool())
+    };
+    set_until("-1 second").await.unwrap();
+    assert_eq!(c.routable_role_secret(&ep, "alice").await.unwrap(), Some(None), "expired");
+    assert_eq!(c.routable_role_secret(&ep, "plain").await.unwrap(), Some(Some(SQL_VERIFIER.to_string())));
+    set_until("1 day").await.unwrap();
+    assert_eq!(c.routable_role_secret(&ep, "alice").await.unwrap(), live, "valid again");
+    c.revoke_postgres_access(alice, alice).await.unwrap();
+    assert_eq!(c.routable_role_secret(&ep, "alice").await.unwrap(), Some(None), "revoked");
+    x.finish().await;
+}
+
+// MH-15 / MH-11: a personal row needs its member and record (CHECK and FK), never holds a
+// sealed password, and only a personal row may name a member.
+#[tokio::test]
+#[ignore]
+async fn a_personal_row_needs_its_record() {
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, alice, db, ep) = x.ready().await;
+    let insert = |name: &'static str, origin: &'static str, member: Option<uuid::Uuid>, sealed: Option<&'static str>| {
+        sqlx::query(
+            "INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin, password_enc, member_id, personal_database_id)
+             VALUES ($1, $2, 'x', $3, $4, $5, $6)",
+        )
+        .bind(ep.clone())
+        .bind(name)
+        .bind(origin)
+        .bind(sealed)
+        .bind(member)
+        .bind(member.map(|_| db.as_uuid()))
+        .execute(c.pool())
+    };
+    let orphan = refused_by(
+        sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'orphan', 'x', 'personal')")
+            .bind(&ep)
+            .execute(c.pool())
+            .await,
+    );
+    assert_eq!(orphan.as_deref(), Some("neon_roles_personal_member"), "a personal row without its member");
+    assert_eq!(refused_by(insert("named", "sql", Some(alice), None).await).as_deref(), Some("neon_roles_personal_member"));
+    assert_eq!(
+        refused_by(insert("alice", "personal", Some(alice), None).await).as_deref(),
+        Some("neon_roles_personal_login"),
+        "no record yet"
+    );
+    let until = chrono::Utc::now() + chrono::Duration::days(90);
+    c.create_personal_login(alice, db.as_uuid(), "alice", PERSONAL_VERIFIER, until).await.unwrap();
+    assert_eq!(
+        refused_by(insert("alice", "personal", Some(alice), Some("v1:sealed")).await).as_deref(),
+        Some("neon_roles_personal_unsealed")
+    );
+    assert_eq!(refused_by(insert("alice", "personal", Some(alice), None).await), None, "with its record");
+    // Only the record's own name.
+    assert_eq!(
+        refused_by(insert("other", "personal", Some(alice), None).await).as_deref(),
+        Some("neon_roles_personal_login")
+    );
+    c.delete_personal_login(alice, alice, db.as_uuid()).await.unwrap();
+    assert_eq!(row_state(c, &ep, "alice").await, None, "the row goes with its record");
+    x.finish().await;
+}
+
+// S1: no generic writer touches a personal row: the resync's upserts (no flip to `sql`, no
+// verifier written back, MH-9/MH-10) and removals, an upsert of a new `personal` row (skipped),
+// the API's by-name writers and the DDL receiver's. The resync's other rows are still written.
+#[tokio::test]
+#[ignore]
+async fn no_generic_writer_touches_a_personal_row() {
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, _alice, db, ep) = x.with_login().await;
+    let branch = main_of(db);
+    let before = row_state(c, &ep, "alice").await.expect("alice's row");
+    assert_eq!((before.0.as_str(), before.1.as_deref()), ("personal", Some(PERSONAL_VERIFIER)));
+
+    // The resync: an upsert of the name as `sql` with the catalog's verifier, a new `sql` row,
+    // and a new `personal` row.
+    let (_, read) = c.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![
+            upsert("alice", RoleOrigin::Sql, "SCRAM-SHA-256$catalog"),
+            upsert("carol", RoleOrigin::Sql, SQL_VERIFIER),
+            upsert("dave", RoleOrigin::Personal, SQL_VERIFIER),
+        ],
+        removals: vec![],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    let applied = c.apply_resync(&ep, branch, read, &write).await.unwrap();
+    assert!(matches!(applied, ResyncApplied::Applied { .. }), "{applied:?}");
+    assert_eq!(row_state(c, &ep, "alice").await.as_ref(), Some(&before), "the resync's upsert");
+    assert_eq!(row_state(c, &ep, "carol").await.map(|r| r.0), Some("sql".to_string()), "other rows are written");
+    assert_eq!(row_state(c, &ep, "dave").await, None, "a personal upsert is skipped");
+    let (_, read) = c.role_copies(&ep).await.unwrap();
+    let write = ResyncWrite {
+        upserts: vec![],
+        removals: vec!["alice".into(), "carol".into()],
+        databases: vec![observed("db", "postgres", false)],
+    };
+    c.apply_resync(&ep, branch, read, &write).await.unwrap();
+    assert_eq!(row_state(c, &ep, "alice").await.as_ref(), Some(&before), "the resync's removal");
+    assert_eq!(row_state(c, &ep, "carol").await, None);
+
+    // The API's by-name writers.
+    c.store_role_secret(&ep, "alice", "SCRAM-SHA-256$api", "v1:api", 100).await.unwrap();
+    c.replace_role_secret(&ep, "alice", "SCRAM-SHA-256$api", "v1:api").await.unwrap();
+    c.delete_role_copy(&ep, "alice").await.unwrap();
+    c.rename_role_copy(&ep, branch, "alice", "alice2", None, None).await.unwrap();
+    c.mark_password_unreadable(&ep, "alice").await.unwrap();
+    assert_eq!(row_state(c, &ep, "alice").await.as_ref(), Some(&before), "the API's writers");
+    assert_eq!(row_state(c, &ep, "alice2").await, None);
+
+    // The DDL receiver's.
+    let mut tx = c.begin_ddl(&ep).await.unwrap().expect("the endpoint");
+    tx.upsert_sql_copy("alice", "SCRAM-SHA-256$ddl").await.unwrap();
+    tx.set_login("alice", false).await.unwrap();
+    tx.mark_password_unreadable("alice").await.unwrap();
+    tx.upsert_no_password("alice").await.unwrap();
+    tx.remove_copy("alice").await.unwrap();
+    tx.rename_copy("alice", "zed", None).await.unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(row_state(c, &ep, "alice").await.as_ref(), Some(&before), "the DDL receiver's writers");
+    assert_eq!(row_state(c, &ep, "zed").await, None);
+    x.finish().await;
+}
+
+// S1: a branch copy leaves personal rows out (the child's come from its reconcile); its other
+// copies are written.
+#[tokio::test]
+#[ignore]
+async fn a_branch_copy_skips_personal_rows() {
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, _alice, db, _ep) = x.ready().await;
+    let child = new_branch(db, "dev", main_of(db));
+    assert_eq!(c.create_branch(&child).await.unwrap(), CreateBranchOutcome::Created);
+    let plain = RoleAttributes::default();
+    let copies = [
+        NewRoleCopy { name: "alice", origin: RoleOrigin::Personal, verifier: Some(PERSONAL_VERIFIER), password_enc: None, login: true, level: RoleLevel::Plain, api_owner_level: false, pending: false, attributes: &plain },
+        NewRoleCopy { name: "app", origin: RoleOrigin::Sql, verifier: Some(SQL_VERIFIER), password_enc: None, login: true, level: RoleLevel::Plain, api_owner_level: false, pending: false, attributes: &plain },
+    ];
+    let ep = ep_id();
+    let (tenant, timeline) = (hex32(), hex32());
+    let mut new = new_endpoint(&ep, &tenant, &timeline);
+    new.role_copies = &copies;
+    let created = c.create_endpoint_for_branch(child.id, &timeline, &new, false).await;
+    let names: Vec<String> = c.role_copies(&ep).await.unwrap().0.into_iter().map(|r| r.name).collect();
+    assert!(matches!(created, Ok(true)), "{created:?}");
+    assert_eq!(names, vec!["postgres".to_string(), "app".to_string()], "no personal copy");
+    x.finish().await;
+}
+
+// F2 round 2, changed deliberately by T3: a resync's removals never delete a personal row (an
+// `sql` row listed with it is deleted); personal rows are the reconciler's and go with their
+// record.
 #[tokio::test]
 #[ignore]
 async fn a_resync_never_removes_a_personal_row() {
-    let _sealed = sealed_lock().await;
-    let client = client().await;
-    let (id, ep) = ready_database(&client).await;
-    seed_copy(&client, &ep, "alice", "personal", Some(SQL_VERIFIER), None).await;
-    seed_copy(&client, &ep, "bob", "sql", Some(SQL_VERIFIER), None).await;
-    let (_, read) = client.role_copies(&ep).await.unwrap();
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, alice, db, ep) = x.with_login().await;
+    seed_copy(c, &ep, "bob", "sql", Some(SQL_VERIFIER), None).await;
+    let (_, read) = c.role_copies(&ep).await.unwrap();
     let write = ResyncWrite {
         upserts: vec![],
         removals: vec!["alice".into(), "bob".into()],
         databases: vec![observed("app", "postgres", false)],
     };
-    client.apply_resync(&ep, main_of(id), read, &write).await.unwrap();
-    let (after, _) = client.role_copies(&ep).await.unwrap();
-    cleanup(&client, id).await;
-    let origin_of = |n: &str| after.iter().find(|c| c.name == n).map(|c| c.origin);
+    c.apply_resync(&ep, main_of(db), read, &write).await.unwrap();
+    let (after, _) = c.role_copies(&ep).await.unwrap();
+    let origin_of = |n: &str| after.iter().find(|r| r.name == n).map(|r| r.origin);
     assert_eq!(origin_of("alice"), Some(RoleOrigin::Personal));
     assert_eq!(origin_of("bob"), None);
+    c.delete_personal_login(alice, alice, db.as_uuid()).await.unwrap();
+    assert_eq!(row_state(c, &ep, "alice").await, None, "gone with its record");
+    x.finish().await;
 }
 
-// c3 (P10, SP13): the migration lets a row be `personal`; the origin round-trips through
-// `list_roles` and `role_copies`; the spec's roles (`neon_roles`, `neon_roles_versioned`) never
-// carry a personal row, so a personal login can't reach a compute spec (RT4-4).
+// c3 (P10, SP13), changed deliberately by T3 (S1): the origin round-trips through `list_roles`
+// and `role_copies`; the spec's roles (`neon_roles`, `neon_roles_versioned`) never carry a
+// personal row (RT4-4); the resync no longer turns a personal row into `sql` (MH-10) nor stores
+// a new personal row (only the reconciler's write does).
 #[tokio::test]
 #[ignore]
 async fn a_personal_origin_round_trips_and_never_reaches_the_spec() {
-    let _sealed = sealed_lock().await;
-    let client = client().await;
-    let (id, ep) = ready_database(&client).await;
-    seed_copy(&client, &ep, "alice", "personal", Some(SQL_VERIFIER), None).await;
-    seed_copy(&client, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
-    let listed = client.list_roles(&ep).await.unwrap();
-    let (copies, _) = client.role_copies(&ep).await.unwrap();
-    let spec_roles = client.neon_roles(&ep).await.unwrap();
-    let (versioned, _) = client.neon_roles_versioned(&ep).await.unwrap();
-    let secret = client.neon_role_secret(&ep, "alice").await.unwrap();
-    // F2: a resync that records a personal row as SQL (the catalog shows the role without the
-    // marker) makes it `sql`; no other origin changes (`resync_upsert_keeps_the_origin…`).
-    let (_, read) = client.role_copies(&ep).await.unwrap();
-    let branch = main_of(id);
+    let x = ScratchDb::new().await;
+    let c = &x.client;
+    let (_t, _alice, db, ep) = x.with_login().await;
+    seed_copy(c, &ep, "from_sql", "sql", Some(SQL_VERIFIER), None).await;
+    let listed = c.list_roles(&ep).await.unwrap();
+    let (copies, _) = c.role_copies(&ep).await.unwrap();
+    let spec_roles = c.neon_roles(&ep).await.unwrap();
+    let (versioned, _) = c.neon_roles_versioned(&ep).await.unwrap();
+    let secret = c.neon_role_secret(&ep, "alice").await.unwrap();
+    let branch = main_of(db);
+    let (_, read) = c.role_copies(&ep).await.unwrap();
     let write = ResyncWrite {
         upserts: vec![upsert("alice", RoleOrigin::Sql, SQL_VERIFIER)],
         removals: vec![],
         databases: vec![observed("app", "postgres", false)],
     };
-    client.apply_resync(&ep, branch, read, &write).await.unwrap();
-    let (after, _) = client.role_copies(&ep).await.unwrap();
-    // A resync write of a new personal row stores it as one.
-    let (_, read) = client.role_copies(&ep).await.unwrap();
+    c.apply_resync(&ep, branch, read, &write).await.unwrap();
+    let (after, _) = c.role_copies(&ep).await.unwrap();
+    let (_, read) = c.role_copies(&ep).await.unwrap();
     let write = ResyncWrite {
         upserts: vec![upsert("bob", RoleOrigin::Personal, SQL_VERIFIER)],
         removals: vec![],
         databases: vec![observed("app", "postgres", false)],
     };
-    client.apply_resync(&ep, branch, read, &write).await.unwrap();
-    let (with_bob, _) = client.role_copies(&ep).await.unwrap();
-    // The CHECK still refuses anything else.
+    c.apply_resync(&ep, branch, read, &write).await.unwrap();
+    let (with_bob, _) = c.role_copies(&ep).await.unwrap();
     let bogus = sqlx::query("INSERT INTO neon_roles (endpoint_id, name, scram_verifier, origin) VALUES ($1, 'x', 'x', 'member')")
         .bind(&ep)
-        .execute(client.pool())
-        .await
-        .unwrap_err();
-    let constraint = match bogus {
-        sqlx::Error::Database(e) => e.constraint().unwrap_or("<none>").to_string(),
-        other => panic!("not a database error: {other}"),
-    };
-    cleanup(&client, id).await;
+        .execute(c.pool())
+        .await;
     let origin_of = |rows: &[chelabase_metadata::RoleRow], n: &str| rows.iter().find(|r| r.name == n).map(|r| r.origin);
     assert_eq!(origin_of(&listed, "alice"), Some(RoleOrigin::Personal));
     assert_eq!(origin_of(&listed, "from_sql"), Some(RoleOrigin::Sql));
-    assert_eq!(copies.iter().find(|c| c.name == "alice").unwrap().origin, RoleOrigin::Personal);
+    assert_eq!(copies.iter().find(|r| r.name == "alice").unwrap().origin, RoleOrigin::Personal);
     let owner = chelabase_metadata::NeonRole { name: "postgres".into(), scram_verifier: "SCRAM-SHA-256$v1".into() };
     assert_eq!(spec_roles, vec![owner.clone()], "a personal row is never a spec role");
     assert_eq!(versioned, vec![owner]);
-    assert_eq!(secret, Some(Some(SQL_VERIFIER.to_string())), "the proxy still authenticates it");
-    assert_eq!(after.iter().find(|c| c.name == "alice").unwrap().origin, RoleOrigin::Sql, "an unmarked personal row becomes sql");
-    assert_eq!(with_bob.iter().find(|c| c.name == "bob").unwrap().origin, RoleOrigin::Personal);
-    assert_eq!(constraint, "neon_roles_origin");
+    assert_eq!(secret, Some(Some(PERSONAL_VERIFIER.to_string())), "the proxy authenticates a live login");
+    let alice_after = after.iter().find(|r| r.name == "alice").unwrap();
+    assert_eq!(alice_after.origin, RoleOrigin::Personal, "never flipped to sql");
+    assert_eq!(alice_after.scram_verifier.as_deref(), Some(PERSONAL_VERIFIER), "no catalog verifier written back");
+    assert!(!with_bob.iter().any(|r| r.name == "bob"), "the resync never stores a personal row");
+    assert_eq!(refused_by(bogus).as_deref(), Some("neon_roles_origin"));
+    x.finish().await;
 }
 
 #[tokio::test]

@@ -4,11 +4,17 @@
  * Chelabase Management API
  * OpenAPI spec version: 1
  */
+import type { DataApiExposure } from './dataApiExposure.ts';
 import type { Dependents } from './dependents.ts';
 import type { StatementResult } from './statementResult.ts';
 
 export interface SchemaChangeResponse {
   committed: boolean;
+  /**
+     * P31: the request's grants (default privileges included) to `anon` or `authenticated`,
+     * or to a role either of them inherits, in operation order; empty when none.
+     */
+  data_api_exposure?: DataApiExposure[];
   dependents?: Dependents | null;
   dry_run: boolean;
   statements?: StatementResult[];

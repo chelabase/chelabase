@@ -1297,24 +1297,32 @@ async fn create_tenant_retries_a_request_timeout() {
     assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
 }
 
-/// I2/P6: a tenant create that times out every time stops at the budget (plus at most one
-/// request timeout; with H1's cap, about the budget) and reports a timeout, not success.
+/// I2/P6: a tenant create that times out every time stops (it doesn't hang on the 5 s answer)
+/// and reports the request timeout, not success, never before the budget is spent. Real
+/// sockets on a real clock, so only what no scheduling delay can change is asserted here: how
+/// many attempts fit in the budget and by how much it is overrun depend on the machine's load
+/// (a full run once starved the first attempt past the whole budget). The loop's timing
+/// (attempts > 1, each with the request timeout, overrun ≤ one attempt) is pinned under a
+/// paused clock, without I/O, by `storcon::tests::retries_of_a_slow_failure_stop_at_the_budget`.
 #[tokio::test]
 async fn create_tenant_timeouts_stop_at_the_budget() {
-    let (base, count) = repeating(201, "{}", Duration::from_secs(5)).await;
+    let (base, _count) = repeating(201, "{}", Duration::from_secs(5)).await;
+    let budget = Duration::from_millis(400);
     let started = Instant::now();
     let err = quick(
         StorconClient::new(&base, 1).with_timeout(Duration::from_millis(50)),
-        Duration::from_millis(400),
+        budget,
     )
     .create_tenant(&id(1))
     .await
     .unwrap_err();
     let elapsed = started.elapsed();
     assert!(matches!(err, StorconError::Other(_)), "{err:?}");
-    assert!(requests(&count) > 1, "{}", requests(&count));
-    assert!(elapsed >= Duration::from_millis(350), "{elapsed:?}");
-    assert!(elapsed < Duration::from_millis(400 + 50 + 250), "{elapsed:?}");
+    assert!(err.is_request_timeout(), "{err:?}");
+    // Never given up before the budget: the loop reads the same monotonic clock, started
+    // after `started`.
+    assert!(elapsed >= budget, "{elapsed:?}");
+    // The 5 s answer is a success: waiting for it would have returned Ok above.
 }
 
 /// I2/P6: only create_tenant retries a request timeout. A timeline create that times out is

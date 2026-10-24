@@ -984,6 +984,135 @@ async fn objects_and_types_list_what_the_editor_needs() {
     s.finish().await;
 }
 
+/// Members hub T4 (MH-13): a marked role (a personal login: `chelabase.managed_role` set with
+/// `setdatabase = 0`) is never read, as a role, a grantee (table, column, sequence, schema,
+/// default privileges) or a member, whatever its name.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_marked_role_never_appears_as_role_or_grantee() {
+    let s = Scratch::new().await;
+    let alice = s.role("alice");
+    let group = s.role("group");
+    s.sql(&format!(
+        "CREATE ROLE \"{alice}\" LOGIN NOINHERIT;
+         ALTER ROLE \"{alice}\" SET chelabase.managed_role = 'personal';
+         CREATE ROLE \"{group}\" NOLOGIN;
+         GRANT \"{group}\" TO \"{alice}\";
+         CREATE TABLE public.marked_probe (id int, note text);
+         CREATE SEQUENCE public.marked_seq;
+         GRANT SELECT ON public.marked_probe TO \"{alice}\";
+         GRANT SELECT (note) ON public.marked_probe TO \"{alice}\";
+         GRANT USAGE ON SEQUENCE public.marked_seq TO \"{alice}\";
+         GRANT USAGE ON SCHEMA public TO \"{alice}\";
+         ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO \"{alice}\";
+         ALTER DEFAULT PRIVILEGES GRANT SELECT ON TABLES TO \"{alice}\";"
+    ))
+    .await;
+    let m = s.model().await;
+    s.finish().await;
+    let names: Vec<&str> = m.roles.iter().map(|r| r.name.as_str()).collect();
+    assert!(!names.contains(&alice.as_str()), "the marked role is listed: {names:?}");
+    assert!(names.contains(&group.as_str()), "{names:?}");
+    let dump = format!("{m:?}");
+    assert!(!dump.contains(alice.as_str()), "{alice} leaked: {dump}");
+}
+
+/// Members hub T4 (MH-13): a merge never pairs, creates or grants to a marked role. Roles are
+/// cluster-wide, so the marked role is on both sides; its grants only on the source.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_merge_never_names_a_marked_role() {
+    use chelabase_schema::analysis::{analyze, merge};
+    use chelabase_schema::plan::{PlanOptions, plan};
+
+    let a = Scratch::new().await;
+    let alice = a.role("alice");
+    let group = a.role("group");
+    a.sql(&format!(
+        "CREATE ROLE \"{alice}\" LOGIN NOINHERIT;
+         ALTER ROLE \"{alice}\" SET chelabase.managed_role = 'personal';
+         CREATE ROLE \"{group}\" NOLOGIN;
+         GRANT \"{group}\" TO \"{alice}\";
+         CREATE TABLE public.marked_probe (id int, note text);
+         GRANT SELECT ON public.marked_probe TO \"{alice}\";
+         GRANT SELECT ON public.marked_probe TO \"{group}\";
+         GRANT UPDATE (note) ON public.marked_probe TO \"{alice}\";"
+    ))
+    .await;
+    let source = a.model().await;
+    let b = Scratch::new().await;
+    let target = b.model().await;
+    b.finish().await;
+    a.finish().await;
+
+    let map = IdentityMap::default();
+    let analysis = analyze(&target, &target, &source, &map, Direction::IntoParent);
+    let merged = merge(&analysis, &[], &target, &target, &source, &map, Direction::IntoParent).expect("the merged model");
+    let opts = PlanOptions { lock_timeout_ms: 5000, merge_id: uuid::Uuid::nil() };
+    let p = plan(&target, &merged, &analysis, &[], &opts).expect("the plan");
+    assert!(p.steps.iter().any(|s| s.sql.contains("marked_probe")), "the plan creates the table");
+    assert!(p.steps.iter().any(|s| s.sql.contains(group.as_str())), "the group's grant moves");
+    for step in &p.steps {
+        assert!(!step.sql.contains(alice.as_str()), "a step names the marked role: {}", step.sql);
+    }
+}
+
+/// Final round, T4-7: a policy's roles get the same exclusion as ACL grantees. A marked role
+/// (a personal login, whatever its name), a `cb_m_*` member role and a `chelabase_…` role are
+/// left out of a policy's `roles`, the policy's other roles kept; a policy whose every role is
+/// hidden isn't listed at all (an empty list would read as `TO PUBLIC`). PUBLIC itself stays.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn policy_roles_leave_out_hidden_roles() {
+    let s = Scratch::new().await;
+    let alice = s.role("alice");
+    let group = s.role("group");
+    let member = format!("cb_m_pol_{}", s.name);
+    s.sql(&format!(
+        "CREATE ROLE \"{alice}\" LOGIN NOINHERIT;
+         ALTER ROLE \"{alice}\" SET chelabase.managed_role = 'personal';
+         CREATE ROLE \"{group}\" NOLOGIN;
+         CREATE ROLE \"{member}\" LOGIN NOINHERIT;
+         CREATE TABLE public.pol_probe (id int);
+         ALTER TABLE public.pol_probe ENABLE ROW LEVEL SECURITY;
+         CREATE POLICY mixed ON public.pol_probe TO \"{alice}\", \"{group}\", \"{member}\" USING (true);
+         CREATE POLICY only_hidden ON public.pol_probe TO \"{alice}\", \"{member}\" USING (true);
+         CREATE POLICY only_alice ON public.pol_probe TO \"{alice}\" USING (true);
+         CREATE POLICY everyone ON public.pol_probe TO PUBLIC USING (true);"
+    ))
+    .await;
+    let m = s.model().await;
+    s.finish().await;
+    let meta = connect(&url()).await;
+    let _ = meta
+        .batch_execute(&format!("DROP ROLE IF EXISTS \"{member}\""))
+        .await;
+    let t = m
+        .tables
+        .iter()
+        .find(|t| t.name == "pol_probe")
+        .expect("the table");
+    let roles = |name: &str| -> Option<Vec<String>> {
+        t.policies.iter().find(|p| p.name == name).map(|p| {
+            p.roles
+                .iter()
+                .map(|r| match r {
+                    RoleRef::Public => "PUBLIC".to_string(),
+                    RoleRef::Role { name, .. } => name.clone(),
+                })
+                .collect()
+        })
+    };
+    assert_eq!(roles("mixed"), Some(vec![group.clone()]), "{:?}", t.policies);
+    assert_eq!(roles("only_hidden"), None, "{:?}", t.policies);
+    assert_eq!(roles("only_alice"), None, "{:?}", t.policies);
+    assert_eq!(roles("everyone"), Some(vec!["PUBLIC".to_string()]));
+    let dump = format!("{m:?}");
+    for hidden in [&alice, &member] {
+        assert!(!dump.contains(hidden.as_str()), "{hidden} leaked: {dump}");
+    }
+}
+
 // T4 review, minor 1: a shell type (`CREATE TYPE x;`, not yet defined) can't be a column's
 // type, so the catalog never lists it.
 #[tokio::test]

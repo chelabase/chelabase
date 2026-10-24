@@ -3,6 +3,7 @@
 //! ask it over request/reply and translate its answer. Passwords are never in a response here;
 //! they are revealed only by `GET …/connection?role=`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use axum::{
@@ -12,13 +13,15 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, Utc};
+use chelabase_metadata::members::AccessAction;
+use chelabase_metadata::personal_logins::AccessEventInput;
 use chelabase_metadata::{
     BranchKind, BranchRecord, BranchStatus, DataKeyRecord, DatabaseRecord, PasswordState, RoleLevel,
     RoleOrigin, RoleRow,
 };
 use chelabase_nats::{
-    ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED, ROLE_UPDATE_NOT_APPLIED, RoleCreateRequest, RoleReply,
-    RoleRequest, RoleSessionsReply, RoleUpdateRequest,
+    QUARANTINE_SUCCESSOR, ROLE_CREATE_NOT_APPLIED, ROLE_DELETE_NOT_APPLIED, ROLE_UPDATE_NOT_APPLIED,
+    RoleCreateRequest, RoleDeleteRequest, RoleReply, RoleRequest, RoleSessionsReply, RoleUpdateRequest,
 };
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::data_key::DataKeyKind;
@@ -27,13 +30,15 @@ use chelabase_types::role_name::{
 };
 use chelabase_types::{ApiJson, ApiPath, BranchId};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info};
+use serde_json::{Value, json};
+use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use crate::access::{authorize_database, Target};
+use crate::access::{authorize_database, is_personal_login, Target};
 use crate::branches::load_branch;
+use crate::privileges::check_all_rows;
 use chelabase_routes::orchestrator as ep;
 use chelabase_types::access::Access;
 use crate::{
@@ -56,6 +61,7 @@ where
         .routes(routes!(reset_role_password))
         .routes(routes!(delete_role, update_role))
         .routes(routes!(list_role_sessions))
+        .routes(routes!(preview_role_delete))
 }
 
 /// A role of a branch, without secrets. The owner comes first.
@@ -332,6 +338,19 @@ where
     Ok((record, branch, endpoint))
 }
 
+/// MH-11: a personal login is absent from every generic role route (it is managed through its
+/// own routes only): 404 like a role that isn't there, before the worker is asked.
+async fn not_personal<M, J>(state: &AppState<M, J>, record: &DatabaseRecord, role: &str) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if is_personal_login(state, record, role).await? {
+        return Err(ApiError::not_found("role not found"));
+    }
+    Ok(())
+}
+
 /// The worker's refusal or failure as the API's error; `not_applied` is the operation's own
 /// `not_applied` message.
 fn reply_error(reply: &RoleReply, what: &str, not_applied: &'static str) -> ApiError {
@@ -362,6 +381,18 @@ fn reply_error(reply: &RoleReply, what: &str, not_applied: &'static str) -> ApiE
             ),
         ),
         "not_found" => ApiError::not_found("role not found"),
+        "invalid_successor" => invalid_successor(),
+        // T10 fix: the exposures as they are now, and the token that confirms them.
+        "exposure_unconfirmed" => {
+            let preview = reply.preview.clone().unwrap_or_default();
+            ApiError::new(
+                409,
+                ErrorCode::ExposureUnconfirmed,
+                "the delete would let other roles run routines or read views with the successor's rights; review `exposures` and delete again with `confirm`",
+            )
+            .with_extra("exposures", serde_json::to_value(&preview.exposures).unwrap_or_default())
+            .with_extra("confirm", preview.confirm.map_or(Value::Null, Value::String))
+        }
         // The worker's message names the target (the caller's own input).
         "role_membership_not_allowed" => membership_error(reply.error.as_deref().unwrap_or(
             "a membership names a role that doesn't exist, isn't the owner's to grant, or is reserved",
@@ -384,6 +415,66 @@ fn reply_error(reply: &RoleReply, what: &str, not_applied: &'static str) -> ApiE
             error!("{what} failed: {code}: {:?}", reply.error);
             ApiError::internal()
         }
+    }
+}
+
+/// Whether a role call gets an event (P25, R-T9a): `Some(true)` when the worker did it,
+/// `Some(false)` when it stored the change for a retry (`not_applied`) or didn't answer in time
+/// (T9-m1: the change may have been made), `None` for a refusal or a transport failure (no
+/// event).
+fn event_applied(result: &Result<RoleReply, ResetError>) -> Option<bool> {
+    match result {
+        Ok(reply) if reply.ok => Some(true),
+        Ok(reply) if reply.code.as_deref() == Some("not_applied") => Some(false),
+        Err(ResetError::Timeout) => Some(false),
+        _ => None,
+    }
+}
+
+/// T9-m3: what a deleted role was, for its event: `login` and the attributes the API sets.
+fn role_was(row: &chelabase_metadata::RoleRow) -> Value {
+    let a = &row.attributes;
+    json!({
+        "login": row.login,
+        "attributes": {
+            "owner_level": row.level == chelabase_metadata::RoleLevel::OwnerLevel,
+            "inherit": a.inherit,
+            "connection_limit": a.connection_limit,
+            "valid_until": a.valid_until,
+            "bypass_rls": a.bypass_rls,
+            "member_of": a.member_of,
+        },
+    })
+}
+
+/// Writes the role event of a change, `after` plus `applied`, with the project, database and
+/// branch (MH-37). Never a password. A failed write is logged: the change is made, so the
+/// request still answers as it did.
+async fn log_role_event<M, J>(
+    state: &AppState<M, J>,
+    principal: &AuthPrincipal,
+    record: &DatabaseRecord,
+    branch: BranchId,
+    action: AccessAction,
+    mut after: Value,
+    applied: bool,
+) where
+    M: MetadataPort,
+{
+    after["applied"] = Value::Bool(applied);
+    let event = AccessEventInput {
+        tenant: principal.tenant_id,
+        actor: principal.member.as_ref().map(|m| m.id),
+        action,
+        target: None,
+        project: Some(record.project_id.as_uuid()),
+        database: Some(record.database_id.as_uuid()),
+        branch: Some(branch.as_uuid()),
+        before: None,
+        after: Some(&after),
+    };
+    if let Err(err) = state.metadata.record_access_event(&event).await {
+        warn!(branch_id = %branch, "role event not recorded: {err}");
     }
 }
 
@@ -455,7 +546,14 @@ where
         Ok(exemptions) => exemptions,
         Err(err) => return err.into_response(),
     };
-    Json(rows.into_iter().map(|row| BranchRole::new(row, &keys, &exemptions)).collect::<Vec<_>>()).into_response()
+    // MH-11: personal logins aren't listed (their rows are `personal`).
+    Json(
+        rows.into_iter()
+            .filter(|row| row.origin != RoleOrigin::Personal)
+            .map(|row| BranchRole::new(row, &keys, &exemptions))
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
 #[utoipa::path(
@@ -497,6 +595,15 @@ where
     if let Err(err) = check_login_role_name(&request.name) {
         return name_error(err).into_response();
     }
+    // S11, D3: a personal login's name is taken on every branch of the database, also where
+    // its role isn't made yet.
+    match is_personal_login(&state, &record, &request.name).await {
+        Ok(false) => {}
+        Ok(true) => {
+            return ApiError::new(409, ErrorCode::RoleExists, "a role with that name already exists").into_response();
+        }
+        Err(err) => return err.into_response(),
+    }
     if let Err(err) = check_settings(
         &request.name,
         owner_name(&record),
@@ -517,6 +624,21 @@ where
             ..RoleCreateRequest::login(branch.id, &request.name, request.owner_level)
         })
         .await;
+    if let Some(applied) = event_applied(&reply) {
+        let created = json!({
+            "role": request.name,
+            "login": request.login,
+            "attributes": {
+                "owner_level": request.owner_level,
+                "inherit": request.inherit,
+                "connection_limit": request.connection_limit,
+                "valid_until": request.valid_until,
+                "bypass_rls": request.bypass_rls,
+                "member_of": request.member_of,
+            },
+        });
+        log_role_event(&state, &principal, &record, branch.id, AccessAction::RoleCreated, created, applied).await;
+    }
     if let Err(err) = rpc_result(reply, "create role", ROLE_CREATE_NOT_APPLIED) {
         return err.into_response();
     }
@@ -597,6 +719,9 @@ where
     if let Err(err) = check_any_name(&role) {
         return err.into_response();
     }
+    if let Err(err) = not_personal(&state, &record, &role).await {
+        return err.into_response();
+    }
     let reply = state
         .js
         .reset_role(RoleRequest { branch_id: branch.id, name: role.clone() })
@@ -614,20 +739,21 @@ where
     operation_id = "deleteRole",
     tag = "roles",
     summary = "Delete a login role",
-    description = "Deletes a login role. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted.",
+    description = "Deletes a role. Its objects in every database go to `successor` (never the owner): a role the owner can `SET ROLE` to that isn't owner-level, reserved or a personal login, or `chelabase_orphaned` (the default), a powerless role. Databases it owns go to the owner. PUBLIC loses EXECUTE on every routine that moved, and the answer lists the `SECURITY DEFINER` ones for review. Refused while a data API key uses it (`role_in_use`, with the keys in `keys`). The owner can't be deleted. A named successor that would let other roles run the role's `SECURITY DEFINER` routines or read its views without `security_invoker` with the successor's rights needs `confirm`, the current token of the delete's preview (`GET …/roles/{role}/delete-preview`); the grants are kept. `chelabase_orphaned` never needs one.",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
         ("role" = String, Path, description = "Role name"),
+        DeleteRoleQuery,
     ),
     responses(
-        (status = 204, description = "The role was deleted"),
+        (status = 200, description = "The role was deleted; what went to the successor", body = DeletedRole),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the role doesn't exist", body = ErrorEnvelope),
-        (status = 409, description = "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
-        (status = 422, description = "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte", body = ErrorEnvelope),
+        (status = 409, description = "`role_in_use`: data API keys still use the role, listed in `keys` as `{id, name}`; `exposure_unconfirmed`: the move to the named successor exposes routines or views to other roles and `confirm` isn't the current token, with the current list in `exposures` (as the preview's) and its token in `confirm`; nothing changed, unless the exposures changed while the delete ran, in which case databases already done stay done and the role is left without LOGIN; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
+        (status = 422, description = "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `invalid_successor`: the successor is the role itself, the owner, reserved, a personal login, owner-level, a role the owner can't SET to, or doesn't exist; `invalid_request`: the query string is malformed (a parameter given twice, say)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: the worker failed to delete the role", body = ErrorEnvelope),
         (status = 503, description = "`not_applied`: the change is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the worker or database didn't answer in time", body = ErrorEnvelope),
@@ -637,12 +763,13 @@ async fn delete_role<M, J>(
     State(state): State<Arc<AppState<M, J>>>,
     principal: AuthPrincipal,
     ApiPath((id, branch_id, role)): ApiPath<(Uuid, Uuid, String)>,
+    query: Result<axum::extract::Query<DeleteRoleQuery>, axum::extract::rejection::QueryRejection>,
 ) -> Response
 where
     M: MetadataPort,
     J: JobPort,
 {
-    let (record, branch, _) = match load_target(&state, &principal, ep::DELETE_ROLE.policy.access, id, branch_id).await {
+    let (record, branch, endpoint) = match load_target(&state, &principal, ep::DELETE_ROLE.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
@@ -652,15 +779,311 @@ where
     if let Err(err) = check_any_name(&role) {
         return err.into_response();
     }
+    if let Err(err) = not_personal(&state, &record, &role).await {
+        return err.into_response();
+    }
+    let Ok(axum::extract::Query(DeleteRoleQuery { successor, confirm })) = query else {
+        return ApiError::new(422, ErrorCode::InvalidRequest, "the query string is malformed").into_response();
+    };
+    let successor = successor.unwrap_or_else(|| QUARANTINE_SUCCESSOR.to_string());
+    if let Err(err) = check_successor(&state, &endpoint, owner_name(&record), &role, &successor).await {
+        return err.into_response();
+    }
+    // T9-m3: the event says what was deleted, as it was before the delete. A failed read only
+    // leaves those fields out.
+    let was = match state.metadata.list_roles(&endpoint).await {
+        Ok(rows) => rows.iter().find(|r| r.name == role).map(role_was),
+        Err(err) => {
+            warn!(branch_id = %branch.id, %role, "delete role: the role's row isn't readable for its event: {err}");
+            None
+        }
+    };
     let reply = state
         .js
-        .delete_role(RoleRequest { branch_id: branch.id, name: role.clone() })
+        .delete_role(RoleDeleteRequest {
+            branch_id: branch.id,
+            name: role.clone(),
+            successor: successor.clone(),
+            confirm,
+        })
         .await;
+    if let Some(applied) = event_applied(&reply) {
+        let confirmed = match &reply {
+            Ok(reply) => reply.reassigned.as_ref().map_or(0, |r| r.confirmed.len()),
+            Err(_) => 0,
+        };
+        let mut deleted = json!({ "role": role, "successor": successor, "exposures_confirmed": confirmed });
+        if let Some(Value::Object(was)) = &was {
+            for (key, value) in was {
+                deleted[key] = value.clone();
+            }
+        }
+        log_role_event(&state, &principal, &record, branch.id, AccessAction::RoleDeleted, deleted, applied).await;
+    }
+    let reassigned = match &reply {
+        Ok(reply) => reply.reassigned.clone(),
+        Err(_) => None,
+    };
     if let Err(err) = rpc_result(reply, "delete role", ROLE_DELETE_NOT_APPLIED) {
         return err.into_response();
     }
-    info!(request_id = %principal.request_id, branch_id = %branch.id, %role, "login role deleted");
-    StatusCode::NO_CONTENT.into_response()
+    // T10-4: a done delete always says what it reassigned. A worker older than the successor
+    // ignores it, hands the objects to the owner and answers without `reassigned`: never a
+    // 200 claiming they went to the successor.
+    let Some(reassigned) = reassigned else {
+        error!(
+            request_id = %principal.request_id, branch_id = %branch.id, %role, %successor,
+            "role delete: the worker answered without what it reassigned (a worker older than the successor); the objects may have gone to the owner"
+        );
+        return ApiError::internal().into_response();
+    };
+    info!(
+        request_id = %principal.request_id, branch_id = %branch.id, %role, %successor,
+        reassigned = reassigned.count, definers = reassigned.definers.len(), "login role deleted"
+    );
+    let body = DeletedRole {
+        successor,
+        reassigned: ReassignedObjects { count: reassigned.count, definers: reassigned.definers },
+    };
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// `?successor=&confirm=` on a role delete.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct DeleteRoleQuery {
+    /// The role the deleted role's objects go to: a role the owner can `SET ROLE` to that isn't
+    /// owner-level, reserved or a personal login, or `chelabase_orphaned` (the default), a
+    /// powerless role. Its databases go to the owner.
+    successor: Option<String>,
+    /// The `confirm` token of the delete's preview (`GET …/roles/{role}/delete-preview`), when
+    /// the move to a named successor exposes routines or views to other roles. Not needed for
+    /// `chelabase_orphaned`, nor when nothing is exposed.
+    confirm: Option<String>,
+}
+
+/// `?successor=` on a role delete's preview.
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub(crate) struct PreviewRoleDeleteQuery {
+    /// The successor the delete would name, with the delete's rules; `chelabase_orphaned` (the
+    /// default) when omitted.
+    successor: Option<String>,
+}
+
+/// What deleting a role to `successor` would expose: routines and views that would run with
+/// the successor's rights for other roles.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct RoleDeletePreview {
+    /// The successor previewed.
+    successor: String,
+    /// Sorted by database, kind, identity. Empty when nothing is exposed.
+    exposures: Vec<RoleExposure>,
+    /// The token to pass as the delete's `confirm`; `null` when there is nothing to confirm
+    /// (no exposures, or `chelabase_orphaned`, which never needs one). It changes whenever the
+    /// exposures do.
+    confirm: Option<String>,
+}
+
+/// An object the deleted role owns that would run with the successor's rights for others: a
+/// `SECURITY DEFINER` routine granted to roles other than the successor (PUBLIC's EXECUTE is
+/// revoked on every routine that moves), or a view without `security_invoker` (or a
+/// materialized view) granted to anyone but the successor, PUBLIC included.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct RoleExposure {
+    /// The database it lives in.
+    database: String,
+    kind: RoleExposureKind,
+    /// `schema.name(argument types)` for a routine, `schema.name` for a view, quoted as SQL
+    /// quotes it.
+    identity: String,
+    /// The roles granted a privilege on it (`PUBLIC` for everyone), sorted.
+    grantees: Vec<String>,
+}
+
+/// The kind of an exposed object.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoleExposureKind {
+    Function,
+    Procedure,
+    View,
+    MaterializedView,
+}
+
+impl From<chelabase_nats::ExposureKind> for RoleExposureKind {
+    fn from(kind: chelabase_nats::ExposureKind) -> Self {
+        use chelabase_nats::ExposureKind as K;
+        match kind {
+            K::Function => Self::Function,
+            K::Procedure => Self::Procedure,
+            K::View => Self::View,
+            K::MaterializedView => Self::MaterializedView,
+        }
+    }
+}
+
+impl From<chelabase_nats::DeletePreview> for RoleDeletePreview {
+    fn from(p: chelabase_nats::DeletePreview) -> Self {
+        Self {
+            successor: p.successor,
+            exposures: p
+                .exposures
+                .into_iter()
+                .map(|e| RoleExposure {
+                    database: e.database,
+                    kind: e.kind.into(),
+                    identity: e.identity,
+                    grantees: e.grantees,
+                })
+                .collect(),
+            confirm: p.confirm,
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/databases/{id}/branches/{branch_id}/roles/{role}/delete-preview",
+    operation_id = "previewRoleDelete",
+    tag = "roles",
+    summary = "Preview a role delete",
+    description = "What deleting the role to `successor` would expose: its `SECURITY DEFINER` routines granted to roles other than the successor, and its views without `security_invoker` (and materialized views) granted to anyone but the successor, PUBLIC included. After the delete they run with the successor's rights for those roles. Review them, then pass `confirm` to the delete; a delete to a named successor that exposes something is refused without the current token (`exposure_unconfirmed`). `chelabase_orphaned` (the default) never needs one: its preview lists what it finds with `confirm: null`. Changes nothing. The delete's rules for the role and the successor apply.",
+    params(
+        ("id" = Uuid, Path, description = "Database id"),
+        ("branch_id" = Uuid, Path, description = "Branch id"),
+        ("role" = String, Path, description = "Role name"),
+        PreviewRoleDeleteQuery,
+    ),
+    responses(
+        (status = 200, description = "What the delete would expose, and the token that confirms it", body = RoleDeletePreview),
+        (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: the caller isn't an Admin of the project", body = ErrorEnvelope),
+        (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the role doesn't exist", body = ErrorEnvelope),
+        (status = 409, description = "`branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
+        (status = 422, description = "`reserved_role_name`: the owner can't be deleted; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `invalid_successor`: the successor is the role itself, the owner, reserved, a personal login, owner-level, a role the owner can't SET to, or doesn't exist; `invalid_request`: the query string is malformed", body = ErrorEnvelope),
+        (status = 500, description = "`internal`: the worker failed to read the exposures", body = ErrorEnvelope),
+        (status = 503, description = "`worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
+        (status = 504, description = "`timeout`: the worker or database didn't answer in time", body = ErrorEnvelope),
+    ),
+)]
+async fn preview_role_delete<M, J>(
+    State(state): State<Arc<AppState<M, J>>>,
+    principal: AuthPrincipal,
+    ApiPath((id, branch_id, role)): ApiPath<(Uuid, Uuid, String)>,
+    query: Result<axum::extract::Query<PreviewRoleDeleteQuery>, axum::extract::rejection::QueryRejection>,
+) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let (record, branch, endpoint) =
+        match load_target(&state, &principal, ep::PREVIEW_ROLE_DELETE.policy.access, id, branch_id).await {
+            Ok(target) => target,
+            Err(err) => return err.into_response(),
+        };
+    if role == owner_name(&record) {
+        return name_error(RoleNameError::Reserved).into_response();
+    }
+    if let Err(err) = check_any_name(&role) {
+        return err.into_response();
+    }
+    if let Err(err) = not_personal(&state, &record, &role).await {
+        return err.into_response();
+    }
+    let Ok(axum::extract::Query(PreviewRoleDeleteQuery { successor })) = query else {
+        return ApiError::new(422, ErrorCode::InvalidRequest, "the query string is malformed").into_response();
+    };
+    let successor = successor.unwrap_or_else(|| QUARANTINE_SUCCESSOR.to_string());
+    if let Err(err) = check_successor(&state, &endpoint, owner_name(&record), &role, &successor).await {
+        return err.into_response();
+    }
+    let reply = state
+        .js
+        .preview_role_delete(RoleDeleteRequest {
+            branch_id: branch.id,
+            name: role.clone(),
+            successor: successor.clone(),
+            confirm: None,
+        })
+        .await;
+    let preview = match &reply {
+        Ok(reply) if reply.ok => reply.preview.clone(),
+        _ => None,
+    };
+    if let Err(err) = rpc_result(reply, "preview role delete", RESET_NOT_APPLIED) {
+        return err.into_response();
+    }
+    // An ok answer without a preview lists nothing. Safe either way: the preview only informs,
+    // the worker checks the exposures again on the delete itself.
+    let preview = preview.unwrap_or_else(|| chelabase_nats::DeletePreview {
+        successor: successor.clone(),
+        ..Default::default()
+    });
+    (StatusCode::OK, Json(RoleDeletePreview::from(preview))).into_response()
+}
+
+/// A done role delete.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DeletedRole {
+    /// The role that received the objects.
+    successor: String,
+    reassigned: ReassignedObjects,
+}
+
+/// What a role delete handed to its successor, over every database.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ReassignedObjects {
+    /// The objects the role owned (tables, functions, types, schemas, …).
+    count: u64,
+    /// The `SECURITY DEFINER` routines among them, as `schema.name(argument types)`: review
+    /// them, they now run as the successor. PUBLIC's EXECUTE on every routine that moved was
+    /// revoked.
+    definers: Vec<String>,
+}
+
+fn invalid_successor() -> ApiError {
+    ApiError::new(
+        422,
+        ErrorCode::InvalidSuccessor,
+        "the successor can't receive the role's objects: name a role the owner can SET to that isn't owner-level, reserved or a personal login, or chelabase_orphaned",
+    )
+}
+
+/// T10's refusals the API can make itself (defence in depth; the worker checks the rest in
+/// SQL): a name Postgres can hold, not the role itself, not the owner, not reserved (except
+/// `chelabase_orphaned`), and not recorded as a personal login, the owner or owner-level.
+async fn check_successor<M, J>(
+    state: &AppState<M, J>,
+    endpoint: &str,
+    owner: &str,
+    role: &str,
+    successor: &str,
+) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    if successor == QUARANTINE_SUCCESSOR {
+        return Ok(());
+    }
+    if check_any_role_name(successor).is_err()
+        || successor == role
+        || successor == owner
+        || is_membership_reserved(successor)
+    {
+        return Err(invalid_successor());
+    }
+    let rows = state.metadata.list_roles(endpoint).await.map_err(|err| {
+        error!("list roles for a delete's successor: {err}");
+        ApiError::internal()
+    })?;
+    let refused = rows.iter().any(|r| {
+        r.name == successor
+            && (matches!(r.origin, RoleOrigin::Personal | RoleOrigin::Owner) || r.level == RoleLevel::OwnerLevel)
+    });
+    if refused { Err(invalid_successor()) } else { Ok(()) }
 }
 
 #[utoipa::path(
@@ -683,9 +1106,9 @@ where
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's), the branch or the role doesn't exist, or the role was made in SQL by a role other than the owner (the owner doesn't administer it)", body = ErrorEnvelope),
         (status = 409, description = "`role_cap_reached`: turning LOGIN on would give the branch more login roles than its maximum; `branch_not_ready`: the branch isn't ready; `backup_branch`: a restore backup has no compute; `credentials_unavailable`: the branch has no endpoint", body = ErrorEnvelope),
-        (status = 422, description = "`reserved_role_name`: the owner, a reserved role or any `chelabase_` role; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set)", body = ErrorEnvelope),
+        (status = 422, description = "`reserved_role_name`: the owner, a reserved role or any `chelabase_` role; `invalid_role_name`: the name is empty, over 63 bytes or has a NUL byte; `role_membership_not_allowed`: a membership in a reserved role, the owner, the role itself, a role that doesn't exist or isn't the owner's to grant, or a role that is itself a member (at any depth) of a reserved role; `role_attribute_not_allowed`: a connection limit under -1; `invalid_request`: an unknown field (an attribute that can't be set); `exposes_data_api`: the new memberships would let a data API key's role, `anon`, `authenticated` or `authenticator` reach a role with the members hub's \"all rows\" policy on the branch (every row through the data API); `chain` lists the roles from that role to it, and nothing changed", body = ErrorEnvelope),
         (status = 500, description = "`internal`: the worker failed to change the role", body = ErrorEnvelope),
-        (status = 503, description = "`not_applied`: the change is stored but not applied yet and will be retried; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
+        (status = 503, description = "`not_applied`: the change is stored but not applied yet and will be retried; `unavailable`: a `member_of` change's data API exposure check (\"all rows\" roles, read on the branch's compute) couldn't be completed, nothing changed, retry; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope),
         (status = 504, description = "`timeout`: the worker or database didn't answer in time", body = ErrorEnvelope),
     ),
 )]
@@ -710,8 +1133,36 @@ where
     if role == owner || is_reserved_target(&role, owner) {
         return name_error(RoleNameError::Reserved).into_response();
     }
+    if let Err(err) = not_personal(&state, &record, &role).await {
+        return err.into_response();
+    }
     if let Err(err) = check_settings(&role, owner, request.connection_limit, request.member_of.as_deref()) {
         return err.into_response();
+    }
+    if let Some(member_of) = &request.member_of
+        && let Err(err) = refuse_all_rows_exposure(&state, &branch, &role, member_of).await
+    {
+        return err.into_response();
+    }
+    // Only what the request changes: fields it leaves out are dropped from `attributes` below.
+    let mut changed = json!({
+        "role": role,
+        "login": request.login,
+        "attributes": {
+            "owner_level": request.owner_level,
+            "inherit": request.inherit,
+            "connection_limit": request.connection_limit,
+            "valid_until": request.valid_until.map(|v| v.map_or(json!("cleared"), |d| json!(d))),
+            "bypass_rls": request.bypass_rls,
+            "member_of": request.member_of,
+        },
+    });
+    if let Some(attributes) = changed["attributes"].as_object_mut() {
+        attributes.retain(|_, v| !v.is_null());
+    }
+    // T9-m2: no `login` the request doesn't change.
+    if let Some(fields) = changed.as_object_mut() {
+        fields.retain(|key, v| key != "login" || !v.is_null());
     }
     let reply = state
         .js
@@ -726,6 +1177,9 @@ where
             ..RoleUpdateRequest::new(branch.id, &role)
         })
         .await;
+    if let Some(applied) = event_applied(&reply) {
+        log_role_event(&state, &principal, &record, branch.id, AccessAction::RoleUpdated, changed, applied).await;
+    }
     if let Err(err) = rpc_result(reply, "update role", ROLE_UPDATE_NOT_APPLIED) {
         return err.into_response();
     }
@@ -744,6 +1198,36 @@ where
             ApiError::internal().into_response()
         }
     }
+}
+
+/// EOS-H1: a membership change of `role` (its other memberships replaced by `member_of`, as the
+/// worker applies it: `pg_*` and Chelabase's own groups stay) that would let a live data API
+/// key's role, `anon`, `authenticated` or `authenticator` newly reach a role with the hub's
+/// "all rows" policy on the branch is 422 `exposes_data_api` with the chain; the worker checks
+/// it (as `cloud_admin`, every live database) before the update is sent, and a check that
+/// can't complete refuses with 503 (user ruling 2026-10-23: fail closed). Exposure that was
+/// already there isn't this change's.
+async fn refuse_all_rows_exposure<M, J>(
+    state: &AppState<M, J>,
+    branch: &BranchRecord,
+    role: &str,
+    member_of: &[String],
+) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let keys = state.metadata.list_data_keys(branch.id).await.map_err(|err| {
+        error!(branch_id = %branch.id, "all-rows check: list data keys: {err}");
+        ApiError::internal()
+    })?;
+    let starting: BTreeSet<String> = ["anon", "authenticated", "authenticator"]
+        .into_iter()
+        .map(String::from)
+        .chain(keys.into_iter().filter(|k| k.revoked_at.is_none()).map(|k| k.role))
+        .collect();
+    let change = chelabase_nats::MembershipChange { role: role.to_string(), member_of: member_of.to_vec() };
+    check_all_rows(state, branch.id, starting, Some(change), &format!("changing {role:?}'s memberships")).await
 }
 
 /// The live sessions of a role on the branch's compute (E29a).
@@ -837,11 +1321,14 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    let (_, branch, _) = match load_target(&state, &principal, ep::LIST_ROLE_SESSIONS.policy.access, id, branch_id).await {
+    let (record, branch, _) = match load_target(&state, &principal, ep::LIST_ROLE_SESSIONS.policy.access, id, branch_id).await {
         Ok(target) => target,
         Err(err) => return err.into_response(),
     };
     if let Err(err) = check_any_name(&role) {
+        return err.into_response();
+    }
+    if let Err(err) = not_personal(&state, &record, &role).await {
         return err.into_response();
     }
     let reply = state.js.role_sessions(RoleRequest { branch_id: branch.id, name: role }).await;

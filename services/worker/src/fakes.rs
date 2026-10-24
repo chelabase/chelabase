@@ -232,6 +232,9 @@ pub struct FakeState {
     /// Runs once, just before the next `set_merge_status`: a write landing while a job ran (a
     /// cancel, say).
     pub before_merge_write: Option<StateHook>,
+    /// Final round A (EOS-1): runs once, just before the next member-role row write (either
+    /// upsert): a revoke-now landing between a reconcile's read of the rows and its write.
+    pub before_upsert_member_branch_role: Option<StateHook>,
     /// `merges.handed_back_at` (T14 M10).
     pub handed_back: HashMap<uuid::Uuid, DateTime<Utc>>,
     /// Members of every tenant, their project grants by `(member, project)`, their overrides by
@@ -239,9 +242,18 @@ pub struct FakeState {
     pub members: Vec<chelabase_metadata::members::MemberRecord>,
     pub grants: HashMap<(uuid::Uuid, uuid::Uuid), chelabase_metadata::members::GrantRow>,
     pub overrides: HashMap<(uuid::Uuid, uuid::Uuid), chelabase_metadata::members::OverrideRow>,
+    /// Team grants by `(member, project)` (members hub step 2's source; the step 1 metadata
+    /// never fills it, the fake does to test the union, T2).
+    pub team_grants: HashMap<(uuid::Uuid, uuid::Uuid), Vec<chelabase_types::access::Grant>>,
     pub member_roles: Vec<chelabase_metadata::members::MemberBranchRole>,
     /// R31: the last acted role by (member, branch).
     pub acted_roles: HashMap<(uuid::Uuid, uuid::Uuid), String>,
+    /// T6: every personal-login record (any database), as `personal_login_records` reads them
+    /// (`qualifies` is whatever the test sets).
+    pub personal_logins: Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>,
+    /// T7: each member's personal-row endpoints, as `revoke_logins_for_zitadel_user` returns
+    /// them (revoked logins' rows included, as the real read does).
+    pub login_endpoints: HashMap<uuid::Uuid, Vec<chelabase_metadata::personal_logins::LoginEndpoint>>,
     /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
     /// new branch and a restore's backup copy their source's.
     pub guard_exemptions: HashMap<BranchId, Vec<String>>,
@@ -885,6 +897,13 @@ impl WorkerMetadata for FakeMetadata {
         parent_protected_seen: bool,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("create_endpoint_for_branch")?;
+        // T6 (S1): which copies the worker handed over, by name and origin.
+        for copy in ep.role_copies {
+            record(
+                &self.journal,
+                format!("metadata.endpoint_copy {} {} {}", ep.id, copy.name, copy.origin.as_str()),
+            );
+        }
         // C8: the parent's flag is checked inside the insert; a change refuses it.
         let parent_id = state.branches.get(&id).and_then(|b| b.parent_branch_id);
         let flip = state.protection_flips > 0;
@@ -1589,6 +1608,16 @@ impl WorkerMetadata for FakeMetadata {
             if owner.as_deref() == Some(up.name.as_str()) {
                 continue;
             }
+            // As `apply_resync` (S1, MH-10): personal rows are their records' alone. An upsert
+            // of origin `personal` is skipped, and one of a name whose row is personal leaves it.
+            if up.origin == RoleOrigin::Personal
+                || ep
+                    .logins
+                    .get(&up.name)
+                    .is_some_and(|l| l.origin == RoleOrigin::Personal)
+            {
+                continue;
+            }
             let before = ep.logins.get(&up.name).cloned();
             let before_verifier = ep.verifier(&up.name);
             let mut row = before.clone().unwrap_or(FakeLogin {
@@ -1612,11 +1641,6 @@ impl WorkerMetadata for FakeMetadata {
             row.pending = up.pending;
             row.attributes = up.attributes.clone();
             row.attributes_pending = false;
-            // As `apply_resync`: a personal login the catalog no longer marks becomes `sql`; no
-            // other origin changes.
-            if row.origin == RoleOrigin::Personal && up.origin == RoleOrigin::Sql {
-                row.origin = RoleOrigin::Sql;
-            }
             if row.origin == RoleOrigin::Api
                 && let Some(owner_level) = up.api_owner_level
             {
@@ -2215,15 +2239,17 @@ impl WorkerMetadata for FakeMetadata {
             .collect())
     }
 
-    async fn database_grant_rows(
+    async fn database_grant_sources(
         &self,
         project: uuid::Uuid,
         database: uuid::Uuid,
-    ) -> Result<Vec<(uuid::Uuid, chelabase_metadata::members::GrantRows)>, MetadataError> {
-        let state = self.read("database_grant_rows")?;
+    ) -> Result<Vec<(uuid::Uuid, chelabase_types::access::GrantSources)>, MetadataError> {
+        use chelabase_types::access::{GrantSources, Narrowing, PgRole};
+        let state = self.read("database_grant_sources")?;
         let mut ids: Vec<uuid::Uuid> = state
             .grants
             .keys()
+            .chain(state.team_grants.keys())
             .filter(|(_, p)| *p == project)
             .map(|(m, _)| *m)
             .chain(state.overrides.keys().filter(|(_, d)| *d == database).map(|(m, _)| *m))
@@ -2233,13 +2259,13 @@ impl WorkerMetadata for FakeMetadata {
         Ok(ids
             .into_iter()
             .map(|m| {
-                (
-                    m,
-                    chelabase_metadata::members::GrantRows {
-                        project: state.grants.get(&(m, project)).cloned(),
-                        database: state.overrides.get(&(m, database)).cloned(),
-                    },
-                )
+                let own = state.grants.get(&(m, project)).map(|g| g.to_grant());
+                let teams = state.team_grants.get(&(m, project)).cloned().unwrap_or_default();
+                let narrowing = state.overrides.get(&(m, database)).map(|o| Narrowing {
+                    platform_role: o.platform_role,
+                    roles: o.pg_roles.as_ref().map(|roles| roles.iter().map(|r| PgRole::parse(r)).collect()),
+                });
+                (m, GrantSources::new(own, teams, narrowing))
             })
             .collect())
     }
@@ -2294,11 +2320,75 @@ impl WorkerMetadata for FakeMetadata {
         row: &chelabase_metadata::members::MemberBranchRole,
     ) -> Result<(), MetadataError> {
         let mut state = self.write("upsert_member_branch_role")?;
+        if let Some(hook) = state.before_upsert_member_branch_role.take() {
+            hook(&mut state);
+        }
         state
             .member_roles
             .retain(|r| (r.member_id, r.branch_id) != (row.member_id, row.branch_id));
         state.member_roles.push(row.clone());
         Ok(())
+    }
+
+    /// As the metadata's (EOS-1): written only while the stored `password_enc` is still
+    /// `read` (`None`: no row).
+    async fn upsert_member_branch_role_if(
+        &self,
+        row: &chelabase_metadata::members::MemberBranchRole,
+        read: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("upsert_member_branch_role_if")?;
+        if let Some(hook) = state.before_upsert_member_branch_role.take() {
+            hook(&mut state);
+        }
+        let stored = state
+            .member_roles
+            .iter()
+            .find(|r| (r.member_id, r.branch_id) == (row.member_id, row.branch_id))
+            .map(|r| r.password_enc.clone());
+        if stored.as_deref() != read {
+            return Ok(false);
+        }
+        state
+            .member_roles
+            .retain(|r| (r.member_id, r.branch_id) != (row.member_id, row.branch_id));
+        state.member_roles.push(row.clone());
+        Ok(true)
+    }
+
+    /// As the metadata's (D7): the marked members, by tenant then member.
+    async fn offboarded_members(
+        &self,
+    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
+        record(&self.journal, "metadata.offboarded_members".to_string());
+        let state = self.read("offboarded_members")?;
+        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
+            .members
+            .iter()
+            .filter(|m| m.offboarded)
+            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
+            .collect();
+        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
+        Ok(rows)
+    }
+
+    /// As the metadata's (D7): the tenant's member with this Zitadel user loses its mark; true
+    /// when it had one.
+    async fn clear_offboarded(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<bool, MetadataError> {
+        let mut state = self.write("clear_offboarded")?;
+        let Some(m) = state
+            .members
+            .iter_mut()
+            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id && m.offboarded)
+        else {
+            return Ok(false);
+        };
+        m.offboarded = false;
+        Ok(true)
     }
 
     async fn member_acted_roles(
@@ -2325,6 +2415,131 @@ impl WorkerMetadata for FakeMetadata {
         state
             .member_roles
             .retain(|r| (r.member_id, r.branch_id) != (member, branch));
+        Ok(())
+    }
+
+    async fn personal_login_records(
+        &self,
+        database: uuid::Uuid,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>, MetadataError> {
+        let state = self.read("personal_login_records")?;
+        let mut records: Vec<_> = state
+            .personal_logins
+            .iter()
+            .filter(|r| r.database_id == database)
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| a.role_name.cmp(&b.role_name));
+        Ok(records)
+    }
+
+    /// As the metadata's (T3-I1): the row carries the record's own verifier (none once
+    /// revoked), never `scram_verifier`; no record, nothing written; a row of another origin
+    /// under the name is left alone.
+    async fn upsert_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        member: uuid::Uuid,
+        database: uuid::Uuid,
+        role_name: &str,
+        _scram_verifier: &str,
+    ) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.upsert_personal_role_row {endpoint_id} {role_name}"),
+        );
+        let mut state = self.read("upsert_personal_role_row")?;
+        let state = &mut *state;
+        let Some(login) = state
+            .personal_logins
+            .iter()
+            .find(|r| r.member_id == member && r.database_id == database && r.role_name == role_name)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(ep) = state.endpoints.get_mut(endpoint_id) else {
+            return Err(MetadataError::Database(sqlx::Error::RowNotFound));
+        };
+        if ep
+            .logins
+            .get(role_name)
+            .is_some_and(|l| l.origin != RoleOrigin::Personal)
+        {
+            return Ok(());
+        }
+        let verifier = if login.revoked { None } else { login.scram_verifier };
+        ep.logins
+            .insert(role_name.to_string(), FakeLogin::new(RoleOrigin::Personal, None, false));
+        ep.set_verifier(role_name, verifier.as_deref());
+        Ok(())
+    }
+
+    /// As the metadata's: one row per member holding a login that isn't revoked, by tenant
+    /// then member.
+    async fn members_with_live_logins(
+        &self,
+    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
+        record(&self.journal, "metadata.members_with_live_logins".to_string());
+        let state = self.read("members_with_live_logins")?;
+        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
+            .members
+            .iter()
+            .filter(|m| state.personal_logins.iter().any(|l| l.member_id == m.id && !l.revoked))
+            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
+            .collect();
+        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
+        Ok(rows)
+    }
+
+    /// As the metadata's: the tenant's member with this Zitadel user has every login revoked
+    /// (`revoked`, no verifier) and the member's endpoints come back; an unknown user: empty.
+    async fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        // `write` journals the call once (the tests count one entry per revocation).
+        let mut state = self.write("revoke_logins_for_zitadel_user")?;
+        let state = &mut *state;
+        let Some(member) = state
+            .members
+            .iter()
+            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id)
+            .map(|m| m.id)
+        else {
+            return Ok(Vec::new());
+        };
+        for login in state.personal_logins.iter_mut().filter(|l| l.member_id == member) {
+            login.revoked = true;
+            login.scram_verifier = None;
+        }
+        // D7: the member is marked offboarded too.
+        if let Some(m) = state.members.iter_mut().find(|m| m.id == member) {
+            m.offboarded = true;
+        }
+        Ok(state.login_endpoints.get(&member).cloned().unwrap_or_default())
+    }
+
+    async fn delete_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        role_name: &str,
+    ) -> Result<(), MetadataError> {
+        record(
+            &self.journal,
+            format!("metadata.delete_personal_role_row {endpoint_id} {role_name}"),
+        );
+        let mut state = self.read("delete_personal_role_row")?;
+        if let Some(ep) = state.endpoints.get_mut(endpoint_id)
+            && ep
+                .logins
+                .get(role_name)
+                .is_some_and(|l| l.origin == RoleOrigin::Personal)
+        {
+            ep.logins.remove(role_name);
+            ep.set_verifier(role_name, None);
+        }
         Ok(())
     }
 
@@ -3892,6 +4107,8 @@ pub fn worker() -> (FakeWorker, Journal) {
         zitadel: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),
+        identity_sweep_every: Duration::from_secs(600),
+        identity_sweep_warned: Default::default(),
         remove_orphans: true,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,

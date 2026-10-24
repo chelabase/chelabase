@@ -109,4 +109,12 @@ export const ErrorCode = {
   has_dependents: 'has_dependents',
   review_changed: 'review_changed',
   compute_tls_failed: 'compute_tls_failed',
+  privileges_not_applied: 'privileges_not_applied',
+  privileges_changed_since_read: 'privileges_changed_since_read',
+  exposes_data_api: 'exposes_data_api',
+  personal_login_exists: 'personal_login_exists',
+  member_suspended: 'member_suspended',
+  member_offboarded: 'member_offboarded',
+  invalid_successor: 'invalid_successor',
+  exposure_unconfirmed: 'exposure_unconfirmed',
 } as const;

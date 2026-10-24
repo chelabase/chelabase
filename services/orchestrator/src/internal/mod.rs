@@ -32,6 +32,7 @@ use chelabase_types::BranchId;
 use uuid::Uuid;
 use chelabase_neon::{ComputeLocator, ComputeSigner, StorconClient};
 pub use ddl::{BoxFuture, CachePort, DdlPort, ResyncPort};
+pub(crate) use ddl::publish_login_rows;
 pub use hooks::AttachEvents;
 use chelabase_types::role_settings::RoleSettings;
 use std::future::Future;
@@ -197,6 +198,25 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         zitadel_org_id: &str,
     ) -> impl Future<Output = Result<Option<chelabase_types::TenantId>, MetadataError>> + Send;
+
+    /// Members hub D4: the tenant member with this Zitadel user loses every live personal
+    /// login (`identity_offboarded`); returns every personal row of theirs (revoked ones
+    /// included); an unknown user has none.
+    fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> impl Future<
+        Output = Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError>,
+    > + Send;
+
+    /// D7: the tenant member with this Zitadel user is no longer marked offboarded (its user
+    /// was reactivated or unlocked); `true` when a mark was cleared. Logins stay revoked.
+    fn clear_offboarded(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
 /// A tenant's sign-up state.
@@ -366,6 +386,20 @@ impl NeonMetadataPort for MetadataClient {
         zitadel_org_id: &str,
     ) -> Result<Option<chelabase_types::TenantId>, MetadataError> {
         MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await
+    }
+    async fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        MetadataClient::revoke_logins_for_zitadel_user(self, tenant, zitadel_user_id).await
+    }
+    async fn clear_offboarded(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::clear_offboarded(self, tenant, zitadel_user_id).await
     }
 }
 

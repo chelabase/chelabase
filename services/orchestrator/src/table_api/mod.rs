@@ -8,10 +8,12 @@ use utoipa_axum::router::OpenApiRouter;
 use crate::{AppState, JobPort, MetadataPort};
 
 mod changes;
+mod privilege_ops;
 mod read;
 mod rows;
 
 pub use changes::{DEFAULT_DRY_RUN_MAX_BYTES, dry_run_max_bytes};
+pub(crate) use read::{READ_TIMEOUT_SQL, read_failure};
 
 pub(crate) fn routes<M: MetadataPort, J: JobPort>() -> OpenApiRouter<Arc<AppState<M, J>>> {
     read::routes::<M, J>()

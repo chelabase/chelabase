@@ -12,7 +12,8 @@ const me = (tenant_admin: boolean): Me => ({
 });
 const m = (id: string, status: Member["status"]): Member => ({
   id, email: `${id}@x.test`, display_name: id, status, tenant_admin: false, has_access: false, invite: null,
-  accepted_at: null, created_at: "2026-10-01T00:00:00Z",
+  accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z",
+  access: { level: "none", projects: [] },
 });
 
 function Probe() {

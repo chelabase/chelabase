@@ -13,7 +13,7 @@ use chelabase_routes::orchestrator as ep;
 use chelabase_schema::SchemaError;
 use chelabase_schema::catalog;
 use chelabase_schema::model::Relation;
-use chelabase_types::access::{Access, Grant, PlatformRole, RoleSet};
+use chelabase_types::access::{Access, Effective, PlatformRole, RoleSet};
 use chelabase_types::role_name::member_role_name;
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::table_api::{ObjectList, TypeCatalog};
@@ -32,7 +32,7 @@ use crate::sql_editor::{load_authorized, pick_pg_database, reconcile_member_role
 use crate::{roles, AppState, AuthPrincipal, JobPort, MetadataPort};
 
 /// The longest one catalog read may run.
-const READ_TIMEOUT_SQL: &str = "SET statement_timeout = 15000";
+pub(crate) const READ_TIMEOUT_SQL: &str = "SET statement_timeout = 15000";
 
 pub(super) fn routes<M, J>() -> OpenApiRouter<Arc<AppState<M, J>>>
 where
@@ -64,7 +64,7 @@ type ReadQuery = Result<axum::extract::Query<TableReadQuery>, axum::extract::rej
 
 /// A read's failure in the management API's shape: a fixed message per code, never Postgres's
 /// text (that goes to the log with the request id).
-fn read_failure(f: QueryFailure) -> ApiError {
+pub(crate) fn read_failure(f: QueryFailure) -> ApiError {
     warn!(
         status = f.status.as_u16(),
         code = f.code,
@@ -210,13 +210,13 @@ async fn read_once(
 }
 
 /// The Postgres role a read's CONNECT check is made as (R10, R12): what Postgres decides when
-/// the caller logs in. A non-Admin member whose grant isn't `RoleSet::All` connects as their
-/// own login (`cb_m_<id>`, created NOINHERIT, so only PUBLIC's CONNECT or one granted to the
-/// login itself counts). Admin, `RoleSet::All` and a caller with no grant (an instance-level
-/// principal the policy already admitted) are the owner.
-fn connect_subject(grant: Option<&Grant>, member: Option<Uuid>, owner: &str) -> String {
+/// the caller logs in. A non-Admin member (an effective `RoleSet::All` is always Admin)
+/// connects as their own login (`cb_m_<id>`, created NOINHERIT, so only PUBLIC's CONNECT or
+/// one granted to the login itself counts). Admin and a caller with no grant (an
+/// instance-level principal the policy already admitted) are the owner.
+fn connect_subject(grant: Option<&Effective>, member: Option<Uuid>, owner: &str) -> String {
     match (grant, member) {
-        (Some(g), Some(member)) if g.platform_role != PlatformRole::Admin && g.roles != RoleSet::All => {
+        (Some(g), Some(member)) if g.platform_role != PlatformRole::Admin && !matches!(g.roles, RoleSet::All { .. }) => {
             member_role_name(member)
         }
         _ => owner.to_owned(),
@@ -407,7 +407,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chelabase_types::access::PgRole;
+    use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole};
 
     fn failure(status: StatusCode, code: &'static str, sqlstate: Option<&str>) -> QueryFailure {
         let mut f = QueryFailure::new(status, code, "Postgres said: secret detail");
@@ -417,23 +417,28 @@ mod tests {
         f
     }
 
-    fn grant(roles: RoleSet) -> Grant {
-        Grant { platform_role: chelabase_types::access::PlatformRole::Viewer, roles }
+    fn grant(platform_role: PlatformRole, roles: RoleSet, db: Option<Narrowing>) -> Effective {
+        GrantSources::new(Some(Grant { platform_role, roles }), Vec::new(), db).effective().unwrap()
     }
 
     // R10, R12: which role a read's CONNECT check is made as.
     #[test]
     fn connect_subject_follows_the_effective_grant() {
         let m = Uuid::from_u128(7);
-        let only = grant(RoleSet::Only([PgRole::Named("a".into())].into()));
+        let a = || RoleSet::Only([PgRole::Named("a".into())].into());
+        let only = grant(PlatformRole::Viewer, a(), None);
         assert_eq!(connect_subject(None, None, "own"), "own");
         assert_eq!(connect_subject(None, Some(m), "own"), "own");
-        assert_eq!(connect_subject(Some(&grant(RoleSet::All)), Some(m), "own"), "own");
-        let mut admin = only.clone();
-        admin.platform_role = PlatformRole::Admin;
+        assert_eq!(connect_subject(Some(&grant(PlatformRole::Admin, RoleSet::all(), None)), Some(m), "own"), "own");
+        let listed = Narrowing { platform_role: None, roles: Some([PgRole::Named("a".into())].into()) };
+        let admin = grant(PlatformRole::Admin, RoleSet::all(), Some(listed));
+        assert!(matches!(admin.roles, RoleSet::Only(_)));
         assert_eq!(connect_subject(Some(&admin), Some(m), "own"), "own");
         assert_eq!(connect_subject(Some(&only), Some(m), "own"), member_role_name(m));
-        assert_eq!(connect_subject(Some(&grant(RoleSet::Only(Default::default()))), Some(m), "own"), member_role_name(m));
+        // An Admin narrowed below Admin connects as their own login.
+        let narrowed = Narrowing { platform_role: Some(PlatformRole::Developer), roles: None };
+        assert_eq!(connect_subject(Some(&grant(PlatformRole::Admin, RoleSet::all(), Some(narrowed))), Some(m), "own"), member_role_name(m));
+        assert_eq!(connect_subject(Some(&grant(PlatformRole::Viewer, RoleSet::Only(Default::default()), None)), Some(m), "own"), member_role_name(m));
     }
 
     #[test]

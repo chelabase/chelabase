@@ -21,22 +21,35 @@ export interface PlatformRoleFieldProps {
   label?: string;
   /** Roles shown but not choosable (the caller explains why). */
   locked?: readonly PlatformRole[];
+  /** A first "No access" segment; choosing it calls `onSelect`, and while `selected` it shows chosen and the role's hint gives way. */
+  noAccess?: { selected: boolean; onSelect: () => void };
+  /** `false` leaves the role's meaning to the caller (the invite row puts it on its own line). */
+  hint?: boolean;
+  /** Extra classes for the visible label. */
+  labelClassName?: string;
 }
 
 /** Viewer / Developer / Admin as a segmented control, with the chosen role's meaning under it. */
-export function PlatformRoleField({ value, onChange, max = "admin", disabled, label = "Platform role", locked = [] }: PlatformRoleFieldProps) {
+export function PlatformRoleField({ value, onChange, max = "admin", disabled, label = "Platform role", locked = [], noAccess, hint = true, labelClassName }: PlatformRoleFieldProps) {
   const offered = ORDER.slice(0, ORDER.indexOf(max) + 1);
+  const none = noAccess?.selected === true;
   return (
     <div className="space-y-1">
-      <RadioGroup
+      <RadioGroup<string>
         label={label}
+        labelClassName={labelClassName}
         layout="segmented"
-        options={offered.map((r) => ({ value: r, label: ROLE_LABEL[r], disabled: locked.includes(r) }))}
-        value={value}
-        onValueChange={onChange}
+        cols={noAccess ? 4 : 3}
+        tone="tab"
+        options={[
+          ...(noAccess ? [{ value: "none", label: "No access", disabled }] : []),
+          ...offered.map((r) => ({ value: r as string, label: ROLE_LABEL[r], disabled: disabled || locked.includes(r) })),
+        ]}
+        value={none ? "none" : value}
+        onValueChange={(next) => (next === "none" ? noAccess?.onSelect() : onChange(next as PlatformRole))}
         disabled={disabled}
       />
-      <p className="max-w-[65ch] text-xs text-chalk-dim">{ROLE_HINT[value]}</p>
+      {hint && <p className="max-w-[65ch] text-xs text-chalk-dim">{none ? "Removes the member's access to this project." : ROLE_HINT[value]}</p>}
     </div>
   );
 }

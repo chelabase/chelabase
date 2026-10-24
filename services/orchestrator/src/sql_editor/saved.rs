@@ -89,7 +89,7 @@ fn internal(err: impl std::fmt::Display) -> ApiError {
 /// saved before members has no author (Admin only).
 fn editor(
     principal: &AuthPrincipal,
-    grant: Option<&chelabase_types::access::Grant>,
+    grant: Option<&chelabase_types::access::Effective>,
 ) -> Result<SavedQueryEditor, ApiError> {
     if grant.is_some_and(|g| g.platform_role == PlatformRole::Admin) {
         return Ok(SavedQueryEditor::Admin);

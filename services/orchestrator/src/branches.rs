@@ -619,6 +619,15 @@ where
         Ok(record) => record,
         Err(resp) => return resp.into_response(),
     };
+    // MH-11, MH-15: a personal login is absent from the reveal, like a role that isn't there
+    // (its password is answered once, by its own routes, and never stored).
+    if let Some(name) = role.as_deref() {
+        match crate::access::is_personal_login(&state, &record, name).await {
+            Ok(false) => {}
+            Ok(true) => return ApiError::not_found("role not found").into_response(),
+            Err(err) => return err.into_response(),
+        }
+    }
     let branch = match load_branch(&state, &record, branch_id).await {
         Ok(branch) => branch,
         Err(resp) => return resp.into_response(),

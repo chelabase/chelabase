@@ -762,6 +762,8 @@ pub mod fake {
         pub fail_upload: Mutex<Option<String>>,
         /// `(database, needle)` set by [`FakeBackend::fail_in`].
         fail_in_needles: Mutex<Vec<(String, String)>>,
+        /// `(database, needle, message)` set by [`FakeBackend::fail_in_with`].
+        fail_in_messages: Mutex<Vec<(String, String, String)>>,
     }
 
     fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -821,6 +823,16 @@ pub mod fake {
         /// (other databases are unaffected).
         pub fn fail_in(&self, database: &str, needle: &str) {
             lock(&self.fail_in_needles).push((database.to_string(), needle.to_string()));
+        }
+
+        /// From now on, SQL run in `database` containing `needle` fails with `message` (like
+        /// psql's error output), other databases unaffected; tried before [`Self::fail_in`].
+        pub fn fail_in_with(&self, database: &str, needle: &str, message: &str) {
+            lock(&self.fail_in_messages).push((
+                database.to_string(),
+                needle.to_string(),
+                message.to_string(),
+            ));
         }
 
         /// The file `path` of `endpoint_id`'s container reads as `contents`.
@@ -995,6 +1007,13 @@ pub mod fake {
             }
             if lock(&self.fail_needles).iter().any(|n| sql.contains(n)) {
                 bail!("injected failure");
+            }
+            if let Some((_, _, message)) = lock(&self.fail_in_messages)
+                .iter()
+                .find(|(db, n, _)| db == database && sql.contains(n.as_str()))
+                .cloned()
+            {
+                bail!(message);
             }
             if lock(&self.fail_in_needles)
                 .iter()

@@ -73,6 +73,12 @@ async fn main() -> anyhow::Result<()> {
 
     // The storage controller runs without --dev: an admin-scoped NeonJWT from the compute-JWT key.
     let storcon_admin = signer.storage_token(&chelabase_neon::jwt::StorageScope::Admin)?;
+    // The proxies' role-secret cache, as the `control` ACL user (CHELABASE_VALKEY_USER /
+    // CHELABASE_VALKEY_PASSWORD_FILE): one client for both listeners (members hub P4).
+    let proxy_cache: Arc<dyn orchestrator::internal::CachePort> =
+        Arc::new(ProxyCache::from_lookup(&internal_config.valkey_url, |name| {
+            std::env::var(name).ok()
+        })?);
     let internal_state = Arc::new(InternalState {
         metadata: metadata.clone(),
         locator: DockerLocator::connect(&internal_config.compute_network, &internal_config.stack)?,
@@ -91,10 +97,7 @@ async fn main() -> anyhow::Result<()> {
         rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
-        // As the `control` ACL user (CHELABASE_VALKEY_USER / CHELABASE_VALKEY_PASSWORD_FILE).
-        cache: Arc::new(ProxyCache::from_lookup(&internal_config.valkey_url, |name| {
-            std::env::var(name).ok()
-        })?),
+        cache: proxy_cache.clone(),
         resync: Arc::new(nats.clone()),
         control_plane_uri: internal_config.control_plane_uri.clone(),
         rest: rest.clone(),
@@ -127,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
             verifier: chelabase_auth::JwtVerifier::from_env()?,
         },
         rt_events,
+        proxy_cache,
         js: NatsPorts { js, client: nats },
         identity,
         secrets,

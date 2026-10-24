@@ -1,5 +1,7 @@
 import { useState } from "react";
+import { useGetMe } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { errorText } from "@/lib/errors";
 import { BranchRoles } from "./branch-roles";
 
 export interface OwnerPasswordNoticeProps {
@@ -25,7 +27,23 @@ export function OwnerPasswordNotice({ databaseId, branchId, onRetry }: OwnerPass
           Retry
         </Button>
       </div>
-      {showRoles && <BranchRoles databaseId={databaseId} branchId={branchId} />}
+      {showRoles && <RolesOfProject databaseId={databaseId} branchId={branchId} />}
     </div>
   );
+}
+
+/** The branch Roles panel needs its project (for the Members links): found from the caller's own projects. */
+function RolesOfProject({ databaseId, branchId }: { databaseId: string; branchId: string }) {
+  const me = useGetMe();
+  const project = me.data?.tenant?.projects.find((p) => p.databases.some((d) => d.database_id === databaseId));
+  if (!project) {
+    return me.isError ? (
+      <p role="alert" className="text-destructive">
+        Couldn&apos;t load the roles: {errorText(me.error)}
+      </p>
+    ) : (
+      <p className="text-muted-foreground">Loading roles…</p>
+    );
+  }
+  return <BranchRoles projectId={project.id} databaseId={databaseId} branchId={branchId} />;
 }

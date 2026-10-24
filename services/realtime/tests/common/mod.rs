@@ -100,8 +100,11 @@ type Rule = Arc<dyn Fn(&Value) -> (u16, Value) + Send + Sync>;
 struct OrchState {
     authorize: Mutex<Rule>,
     projects: Mutex<Rule>,
+    /// Final round A (T8-1): `/internal/realtime/member`, asked before a Studio ticket.
+    member: Mutex<Rule>,
     authorize_calls: Mutex<Vec<Value>>,
     projects_calls: Mutex<Vec<Value>>,
+    member_calls: Mutex<Vec<Value>>,
     /// Each `/authorize` answers after this long (a slow orchestrator).
     authorize_delay: Mutex<Duration>,
 }
@@ -124,11 +127,14 @@ impl FakeOrchestrator {
                 },
             );
         let default_projects: Rule = Arc::new(|_: &Value| projects_of(&[(PROJECT, &[DB])]));
+        let default_member: Rule = Arc::new(|_: &Value| (200, json!({"allowed": true})));
         let state = Arc::new(OrchState {
             authorize: Mutex::new(default_authorize),
             projects: Mutex::new(default_projects),
+            member: Mutex::new(default_member),
             authorize_calls: Mutex::new(vec![]),
             projects_calls: Mutex::new(vec![]),
+            member_calls: Mutex::new(vec![]),
             authorize_delay: Mutex::new(Duration::ZERO),
         });
         let route = |which: &'static str, state: Arc<OrchState>| {
@@ -149,6 +155,9 @@ impl FakeOrchestrator {
                             tokio::time::sleep(delay).await;
                         }
                         state.authorize.lock().unwrap().clone()
+                    } else if which == "member" {
+                        state.member_calls.lock().unwrap().push(body.clone());
+                        state.member.lock().unwrap().clone()
                     } else {
                         state.projects_calls.lock().unwrap().push(body.clone());
                         state.projects.lock().unwrap().clone()
@@ -166,6 +175,10 @@ impl FakeOrchestrator {
             .route(
                 "/internal/realtime/projects",
                 post(route("projects", state.clone())),
+            )
+            .route(
+                "/internal/realtime/member",
+                post(route("member", state.clone())),
             );
         let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -184,6 +197,13 @@ impl FakeOrchestrator {
     }
     pub fn on_projects(&self, f: impl Fn(&Value) -> (u16, Value) + Send + Sync + 'static) {
         *self.state.projects.lock().unwrap() = Arc::new(f);
+    }
+    /// Final round A (T8-1): how `/internal/realtime/member` answers from now on.
+    pub fn on_member(&self, f: impl Fn(&Value) -> (u16, Value) + Send + Sync + 'static) {
+        *self.state.member.lock().unwrap() = Arc::new(f);
+    }
+    pub fn member_calls(&self) -> Vec<Value> {
+        self.state.member_calls.lock().unwrap().clone()
     }
     pub fn authorize_calls(&self) -> Vec<Value> {
         self.state.authorize_calls.lock().unwrap().clone()

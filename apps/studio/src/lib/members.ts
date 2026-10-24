@@ -50,6 +50,7 @@ export function memberStatus(m: Member, now: Date = new Date()): StatusText {
     if (new Date(expires).getTime() <= now.getTime()) return { text: "Invite expired", tone: "hazard", title: utc(expires) };
     return { text: `Invited · expires ${relativeTime(expires, now)}`, tone: "plain", title: utc(expires) };
   }
+  if (m.status === "suspended") return { text: "Suspended", tone: "hazard" };
   if (!m.has_access && !m.tenant_admin) return { text: "No access yet", tone: "dim" };
   return { text: "Active", tone: "plain" };
 }
@@ -89,6 +90,19 @@ const rolesOf = (v: unknown): string[] => {
   const r = field(v, "pg_roles");
   return Array.isArray(r) ? r.filter((x): x is string => typeof x === "string") : [];
 };
+
+/** A login's or role's name from an event's `after` (else `before`), as " name" (or empty). */
+const named = (e: AccessEvent, keys: string[], prefix: string): string => {
+  for (const side of [e.after, e.before]) {
+    for (const k of keys) {
+      const v = field(side, k);
+      if (typeof v === "string" && v !== "") return `${prefix} ${v}`;
+    }
+  }
+  return "";
+};
+const loginName = (e: AccessEvent) => named(e, ["login", "role", "name"], "");
+const roleName = (e: AccessEvent, prefix = "") => named(e, ["role", "name"], prefix);
 
 /** One access event as a sentence (the Activity list and the project's access log). */
 export function eventSentence(e: AccessEvent, ctx: SentenceContext): string {
@@ -158,6 +172,26 @@ export function eventSentence(e: AccessEvent, ctx: SentenceContext): string {
     }
     case "member_declined":
       return `${actor} declined ${target}'s sign-up`;
+    case "member_suspended":
+      return `${actor} suspended ${target}`;
+    case "member_reinstated":
+      return `${actor} reinstated ${target}`;
+    case "personal_logins_revoked":
+      return `${actor} revoked all of ${target}'s personal Postgres logins`;
+    case "personal_login_created":
+      return `${actor} created a personal Postgres login${loginName(e)} for ${target}${e.database_id ? ` on ${database}` : ""}`;
+    case "personal_login_reset":
+      return `${actor} reset the password of ${target}'s personal Postgres login${loginName(e)}`;
+    case "personal_login_deleted":
+      return `${actor} deleted ${target}'s personal Postgres login${loginName(e)}`;
+    case "role_created":
+      return `${actor} created the Postgres role${roleName(e)}${e.database_id ? ` on ${database}` : ""}`;
+    case "role_updated":
+      return `${actor} changed the Postgres role${roleName(e)}${e.database_id ? ` on ${database}` : ""}`;
+    case "role_deleted":
+      return `${actor} deleted the Postgres role${roleName(e)}${e.database_id ? ` on ${database}` : ""}`;
+    case "privileges_changed":
+      return `${actor} changed privileges${roleName(e, " of")}${e.database_id ? ` on ${database}` : ""}`;
     default:
       return `${actor} changed access (${e.action})`;
   }
@@ -169,7 +203,7 @@ export interface EventField {
   value: string;
 }
 
-const STATUS_WORDS: Record<string, string> = { active: "Active", invited: "Invited", pending: "Waiting for approval", removed: "Removed" };
+const STATUS_WORDS: Record<string, string> = { active: "Active", invited: "Invited", pending: "Waiting for approval", removed: "Removed", suspended: "Suspended" };
 
 /**
  * An event's `before` or `after` as labelled, readable fields (projects and databases by name,
@@ -202,4 +236,11 @@ export function eventFields(value: unknown, ctx: SentenceContext, action?: strin
     } else out.push({ label: key, value: typeof v === "string" ? v : JSON.stringify(v) });
   }
   return out;
+}
+
+/** The first letter of the first and the last word, upper-cased; whole code points, so a surrogate pair is never split. */
+export function initials(name: string): string {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const letters = words.length > 1 ? [words[0], words[words.length - 1]] : words;
+  return letters.map((w) => Array.from(w)[0] ?? "").join("").toUpperCase();
 }

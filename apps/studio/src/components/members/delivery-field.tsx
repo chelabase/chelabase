@@ -28,7 +28,7 @@ export function DeliveryField({ info, value, onChange, error, disabled }: Delive
   ];
   return (
     <div className="space-y-1.5">
-      <RadioGroup label="How they get the invite" options={options} value={value} onValueChange={onChange} disabled={disabled} />
+      <RadioGroup inline label="How they get the invite" options={options} value={value} onValueChange={onChange} disabled={disabled} />
       {!info.email_available && (
         <p className="max-w-[65ch] text-xs text-chalk-dim">{NO_EMAIL[info.reason ?? "no_email_provider"] ?? NO_EMAIL.no_email_provider}</p>
       )}

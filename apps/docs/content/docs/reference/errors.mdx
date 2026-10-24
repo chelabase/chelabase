@@ -45,6 +45,9 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 403 | `forbidden` | The caller's grant is too low, or the Postgres role asked for isn't in their effective set. `error.required` names what is needed: a tenant, project or branch level (`tenant admin`, `developer`, `admin`), `instance admin`, `owner`, or `role:<name>`. A project the caller has no grant on answers 404 `not_found` instead. |
 | 403 | `no_access_yet` | The caller is a member with no grants anywhere. A tenant admin must grant them a project. |
 | 403 | `pending_approval` | The caller signed up and waits for a tenant admin to approve them. |
+| 403 | `member_suspended` | A tenant admin suspended the caller's membership. Every route refuses them except `GET /v1/me`; a tenant admin can reinstate them. |
+| 403 | `member_offboarded` | The caller's Zitadel user was deactivated, locked or removed. Every route refuses them except `GET /v1/me`, until Zitadel shows the user active again (reactivated or unlocked). |
+| 409 | `personal_login_exists` | The caller already has a live personal login on this database. Reset its password, or delete it and create a new one to change the name. |
 | 403 | `not_available_in_platform_mode` | The feature (or self-sign-up) isn't designed for platform mode yet. |
 | 403 | `sign_up_closed` | Open sign-up is off and the tenant already has members. |
 | 409 | `last_tenant_admin` | The change would leave the tenant without an active tenant admin (demoting or removing the last one). |
@@ -104,6 +107,9 @@ Two more refusals use general codes. A grant or override below Admin that lists 
 | 409 | `conflict` | Existing rows break a unique, foreign-key or exclusion constraint (23505, 23503, 23P01), or a deadlock or serialization failure (40P01, 40001; safe to retry). |
 | 400 | `constraint_violation` | Rows break NOT NULL or a check, or a value is out of range or can't be read as its type (23502, 23514, class 22). Not the app users' 422 `constraint_violation`, which is another endpoint's. |
 | 400 | `schema_change_failed` | Postgres refused a table API statement (any SQLSTATE not mapped to another code); the error carries `sqlstate`, `message`, `detail`, `hint` and `position`. |
+| 409 | `privileges_not_applied` | A privilege change ran, but the privileges read back afterwards differ from the requested end state (for example a grant Postgres skipped because the role running it couldn't give it). Nothing of the change was kept. |
+| 409 | `privileges_changed_since_read` | An object's privileges, or a function's signature, changed since the privileges read the request was built from. Read them again and retry. |
+| 422 | `exposes_data_api` | "All rows" was refused because the data API can reach the table through that role; `error.chain` shows how. |
 
 ### Schema merges
 
@@ -135,6 +141,8 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 422 | `reserved_role_name` | The name is reserved, or the role is the owner, which can't be deleted. |
 | 422 | `role_attribute_not_allowed` | An attribute the roles API doesn't take: a connection limit under -1. Other attributes outside the allowed set (LOGIN, owner-level, INHERIT, CONNECTION LIMIT, VALID UNTIL, BYPASSRLS, memberships) are refused as `invalid_request` unknown fields. |
 | 422 | `role_membership_not_allowed` | A membership in a role Chelabase keeps for itself (the owner, `authenticator`, `anon`, `authenticated`, `neon_superuser`, `cloud_admin`, `chelabase_…`, `pg_…`), in the role itself, in a role that doesn't exist or the owner can't administer, or in a group that is itself a member of one of those, at any depth. |
+| 422 | `invalid_successor` | A role delete's `successor` can't receive the role's objects: it's the role itself, the owner, a reserved role (`pg_…`, `cb_m_…`, `chelabase_…` other than `chelabase_orphaned`, the platform's own), a personal login, owner-level (directly or through a membership), a role the owner can't `SET ROLE` to, or one that doesn't exist. Omit `successor` to hand them to `chelabase_orphaned`. |
+| 409 | `exposure_unconfirmed` | A role delete to a named `successor` would leave `SECURITY DEFINER` routines or views without `security_invoker`, granted to other roles, running with the successor's rights, and `confirm` isn't the current token. `error.exposures` lists them as `{database, kind, identity, grantees}` and `error.confirm` carries the current token (also answered by `GET …/roles/{role}/delete-preview`): review them, then delete again with `?confirm=<token>`. `chelabase_orphaned` never needs one. |
 | 403 | `role_refused` | The worker refused the role (on the SQL editor and console routes). |
 | 422 | `role_refused` | The worker refused the role when a key is created (it doesn't exist, or it's owner-level: superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION` or a `neon_superuser` member; the message says which). `BYPASSRLS` alone is allowed. |
 | 500 | `role_privilege_mismatch` | The role's privileges in the database don't match what Chelabase recorded. |

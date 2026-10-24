@@ -15,7 +15,10 @@ export interface AccessEvent {
      * `member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,
      * `member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,
      * `invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,
-     * `open_signup_set`, `tenant_renamed`, `member_approved` or `member_declined`.
+     * `open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,
+     * `member_suspended`, `member_reinstated`, `personal_logins_revoked`,
+     * `personal_login_created`, `personal_login_reset`, `personal_login_deleted`,
+     * `role_created`, `role_updated` or `role_deleted`.
      */
   action: string;
   /**
@@ -34,6 +37,11 @@ export interface AccessEvent {
   at: string;
   /** @nullable */
   before: AccessEventBefore;
+  /**
+     * The branch of a per-branch change (a role's); `null` for the others.
+     * @nullable
+     */
+  branch_id: string | null;
   /** @nullable */
   database_id: string | null;
   id: number;

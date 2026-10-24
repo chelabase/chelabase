@@ -580,6 +580,28 @@ impl Zitadel {
         Ok(())
     }
 
+    /// Locks the user (`POST /v2/users/{id}/lock`): no sign-in until unlocked (a suspended
+    /// member, D5). Already locked (Zitadel's precondition refusal, 400 or 412) or already gone
+    /// (404) is fine, so a retry completes; any other refusal is an error.
+    pub async fn lock_user(&self, user_id: &str) -> Result<(), ZError> {
+        self.call_settled(&format!("/v2/users/{user_id}/lock")).await
+    }
+
+    /// Unlocks the user (`POST /v2/users/{id}/unlock`); not locked or gone is fine, as for
+    /// [`Self::lock_user`].
+    pub async fn unlock_user(&self, user_id: &str) -> Result<(), ZError> {
+        self.call_settled(&format!("/v2/users/{user_id}/unlock")).await
+    }
+
+    /// A state change `POST` whose precondition refusal (400, 412: already in that state) or
+    /// 404 (the user is gone) means there is nothing left to do.
+    async fn call_settled(&self, path: &str) -> Result<(), ZError> {
+        match self.call(Method::POST, path, Some(json!({}))).await {
+            Ok(_) | Err(ZError::Rejected { status: 400 | 404 | 412, .. }) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `verified` marks the new address verified; otherwise a code is sent, with
     /// `url_template` when given.
     pub async fn set_email(

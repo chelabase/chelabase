@@ -10,7 +10,7 @@ use chelabase_nats::{
     SUBJECT_APP_USERS_CHECK, SUBJECT_CHECK_DATA_ROLE, SUBJECT_DATA_API_DISABLE,
     SUBJECT_DATA_API_ENABLE, SUBJECT_DATA_API_REBOOTSTRAP,
     SUBJECT_RESET_PASSWORD, SUBJECT_RESYNC_BRANCH, SUBJECT_ROLE_CREATE, SUBJECT_ROLE_DELETE,
-    SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
+    SUBJECT_ROLE_DELETE_PREVIEW, SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
     run_app_users_consumer, run_app_users_sync_consumer, run_branch_consumer,
     run_delete_consumer, run_merge_consumer, run_project_delete_consumer,
     run_provision_consumer, run_settings_consumer,
@@ -29,6 +29,8 @@ use worker::member_roles::{
 };
 use worker::resync::{PendingResyncs, TOUCHED_RESYNC_DELAY};
 use worker::review::{REVIEW_DEADLINE, review_reply};
+use worker::all_rows::{ALL_ROWS_CHECK_DEADLINE, all_rows_check_reply};
+use chelabase_nats::{AllRowsCheckReply, SUBJECT_ALL_ROWS_CHECK};
 
 const RECONCILE_EVERY: Duration = Duration::from_secs(30);
 /// Hard cap on one reset, below the orchestrator's NATS request timeout (`RESET_TIMEOUT`,
@@ -100,7 +102,13 @@ async fn main() -> anyhow::Result<()> {
     for subject in [SUBJECT_DATA_API_DISABLE, SUBJECT_DATA_API_REBOOTSTRAP] {
         tokio::spawn(serve_data_api_rpc(worker.clone(), nats.clone(), subject));
     }
-    for subject in [SUBJECT_ROLE_CREATE, SUBJECT_ROLE_RESET, SUBJECT_ROLE_DELETE, SUBJECT_ROLE_UPDATE] {
+    for subject in [
+        SUBJECT_ROLE_CREATE,
+        SUBJECT_ROLE_RESET,
+        SUBJECT_ROLE_DELETE,
+        SUBJECT_ROLE_DELETE_PREVIEW,
+        SUBJECT_ROLE_UPDATE,
+    ] {
         tokio::spawn(serve_role_rpc(worker.clone(), nats.clone(), subject));
     }
     tokio::spawn(serve_role_sessions(worker.clone(), nats.clone()));
@@ -108,8 +116,10 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_member_roles_reconcile(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_hand_over(worker.clone(), nats.clone()));
     tokio::spawn(serve_review(worker.clone(), nats.clone()));
+    tokio::spawn(serve_all_rows_check(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
     tokio::spawn(member_roles_sweep_loop(worker.clone()));
+    tokio::spawn(identity_sweep_loop(worker.clone()));
     tokio::spawn(cert_sweep_loop(worker.clone()));
     tokio::spawn(worker::token_refresh::storage_token_refresh_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
@@ -679,6 +689,36 @@ async fn serve_review(worker: Arc<RealWorker>, client: async_nats::Client) {
     }
 }
 
+/// EOS-H1: serves the all-rows check (request/reply with an [`AllRowsCheckReply`]); a reply
+/// that can't be sent leaves the orchestrator to time out and refuse.
+async fn serve_all_rows_check(worker: Arc<RealWorker>, client: async_nats::Client) {
+    let mut requests = match client
+        .queue_subscribe(SUBJECT_ALL_ROWS_CHECK, RESET_QUEUE_GROUP.to_string())
+        .await
+    {
+        Ok(sub) => sub,
+        Err(err) => {
+            warn!("all-rows check subscribe failed: {err}");
+            return;
+        }
+    };
+    info!(subject = SUBJECT_ALL_ROWS_CHECK, "serving all-rows checks");
+    while let Some(message) = requests.next().await {
+        let worker = worker.clone();
+        let client = client.clone();
+        tokio::spawn(async move {
+            let reply: AllRowsCheckReply =
+                all_rows_check_reply(worker, &message.payload, ALL_ROWS_CHECK_DEADLINE).await;
+            if let Some(reply_to) = message.reply {
+                let body = serde_json::to_vec(&reply).unwrap_or_default();
+                if let Err(err) = client.publish(reply_to, body.into()).await {
+                    warn!("all-rows check reply failed: {err}");
+                }
+            }
+        });
+    }
+}
+
 /// RT3-7: at start and then daily, every running compute's server certificate and the
 /// orchestrator's and realtime's client pairs are renewed when due.
 async fn cert_sweep_loop(worker: Arc<RealWorker>) {
@@ -706,6 +746,22 @@ async fn member_roles_sweep_loop(worker: Arc<RealWorker>) {
         let (done, failed) = worker.sweep_member_roles_once().await;
         if failed > 0 {
             warn!(done, failed, "member-role sweep: some branches failed; the next sweep retries");
+        }
+    }
+}
+
+/// T7: every `CHELABASE_IDENTITY_SWEEP_SECS`, the Zitadel state of each member holding a live
+/// personal login is read and a deactivated, locked or deleted user's logins are revoked: the
+/// backstop for a missed Actions webhook.
+async fn identity_sweep_loop(worker: Arc<RealWorker>) {
+    let every = worker.identity_sweep_every;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        let (checked, revoked) = worker.sweep_identities_once().await;
+        if revoked > 0 {
+            info!(checked, revoked, "identity sweep: offboarded members' logins revoked");
         }
     }
 }

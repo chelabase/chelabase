@@ -70,6 +70,9 @@ pub struct WorkerConfig {
     /// `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (default 300, 30 to 86,400): how often every branch's
     /// member roles are reconciled, the backstop for lost or failed reconcile publishes.
     pub member_roles_sweep_every: Duration,
+    /// `CHELABASE_IDENTITY_SWEEP_SECS` (default 600, 1 to 86,400): how often personal-login
+    /// owners' Zitadel state is checked.
+    pub identity_sweep_every: Duration,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes this stack's compute
     /// containers no endpoint row records. Listing is scoped to the stack, so this is an
     /// opt-out for debugging, not a guard against other stacks.
@@ -164,6 +167,10 @@ impl WorkerConfig {
                 "CHELABASE_MEMBER_ROLES_SWEEP_SECS",
                 non_blank(&get, "CHELABASE_MEMBER_ROLES_SWEEP_SECS"),
             )?,
+            identity_sweep_every: identity_sweep_every(non_blank(
+                &get,
+                "CHELABASE_IDENTITY_SWEEP_SECS",
+            ))?,
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
             compute_control_network: or_default(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
@@ -269,6 +276,18 @@ fn reconcile_every(name: &str, value: Option<String>) -> anyhow::Result<Duration
     match value.parse::<u64>() {
         Ok(secs) if (30..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
         _ => Err(anyhow!("{name}={value:?}: expected whole seconds from 30 to 86400")),
+    }
+}
+
+/// `CHELABASE_IDENTITY_SWEEP_SECS`: whole seconds from 1 to 86,400; 600 when unset.
+fn identity_sweep_every(value: Option<String>) -> anyhow::Result<Duration> {
+    const NAME: &str = "CHELABASE_IDENTITY_SWEEP_SECS";
+    let Some(value) = value else {
+        return Ok(Duration::from_secs(600));
+    };
+    match value.parse::<u64>() {
+        Ok(secs) if (1..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
+        _ => Err(anyhow!("{NAME}={value:?}: expected whole seconds from 1 to 86400")),
     }
 }
 
@@ -388,6 +407,20 @@ pub fn build(
     publisher: Arc<dyn RtPublisher>,
     attach: AttachSource,
 ) -> anyhow::Result<RealWorker> {
+    build_with(config, metadata, key, publisher, attach, DockerBackend::connect)
+}
+
+/// [`build`] with the Docker backend's constructor given. The real one needs the engine's
+/// socket file to exist (so `build` fails while Docker is restarting); tests that don't
+/// exercise Docker pass a backend over an unreachable engine instead.
+pub fn build_with(
+    config: &WorkerConfig,
+    metadata: MetadataClient,
+    key: SecretKey,
+    publisher: Arc<dyn RtPublisher>,
+    attach: AttachSource,
+    connect: impl FnOnce(ComputeSettings) -> anyhow::Result<DockerBackend>,
+) -> anyhow::Result<RealWorker> {
     // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
     let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {
@@ -446,7 +479,7 @@ pub fn build(
             attach,
         },
         computes: StoppingBackend::new(
-            DockerBackend::connect(ComputeSettings {
+            connect(ComputeSettings {
                 image: config.compute_image.clone(),
                 network: config.compute_network.clone(),
                 control_plane_uri: config.control_plane_uri.clone(),
@@ -474,6 +507,8 @@ pub fn build(
         zitadel: zitadel_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,
+        identity_sweep_every: config.identity_sweep_every,
+        identity_sweep_warned: Default::default(),
         remove_orphans: config.remove_orphans,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
@@ -745,6 +780,25 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, " ")])).unwrap();
         assert_eq!(c.member_roles_sweep_every, Duration::from_secs(300));
         for bad in ["29", "86401", "x"] {
+            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, bad)]))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(VAR), "{bad}: {err}");
+        }
+    }
+
+    /// T7: the identity sweep runs every 10 minutes by default; whole seconds from 1 to 86,400,
+    /// a bad value fails startup naming the variable, a blank one is unset.
+    #[test]
+    fn the_interval_is_bounded() {
+        const VAR: &str = "CHELABASE_IDENTITY_SWEEP_SECS";
+        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert_eq!(c.identity_sweep_every, Duration::from_secs(600));
+        for (value, secs) in [("1", 1), ("45", 45), ("86400", 86_400), (" ", 600)] {
+            let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, value)])).unwrap();
+            assert_eq!(c.identity_sweep_every, Duration::from_secs(secs), "{value:?}");
+        }
+        for bad in ["0", "86401", "-1", "x", "1.5", "600s"] {
             let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, bad)]))
                 .unwrap_err()
                 .to_string();

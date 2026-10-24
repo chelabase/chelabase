@@ -367,8 +367,12 @@ describe("BranchActions", () => {
 
 describe("BranchActions roles", () => {
   it("toggles the Roles panel on a ready branch", async () => {
-    setup(main, [main], { "GET /v1/databases/db/branches/m/roles": () => jsonResponse([]) });
-    await userEvent.click(btn("Roles"));
+    // The panel links into the Members hub, so it needs a router.
+    renderWithRouter(
+      <BranchActions projectId="p1" databaseId="db" databaseName="web1" branch={main} branches={[main]} historyWindow={7 * 86400} />,
+      { fetch: fakeFetch({ "GET /v1/databases/db/branches/m/roles": () => jsonResponse([]) }) },
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Roles" }));
     expect(await screen.findByRole("heading", { name: "Roles" })).toBeInTheDocument();
     await userEvent.click(btn("Roles"));
     expect(screen.queryByRole("heading", { name: "Roles" })).toBeNull();

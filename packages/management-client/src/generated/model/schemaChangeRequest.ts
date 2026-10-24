@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { CascadeConfirm } from './cascadeConfirm.ts';
+import type { ExpectedAcl } from './expectedAcl.ts';
 import type { Operation } from './operation.ts';
 
 export interface SchemaChangeRequest {
@@ -12,6 +13,7 @@ export interface SchemaChangeRequest {
   /** @nullable */
   database?: string | null;
   dry_run?: boolean;
+  expect_acl?: ExpectedAcl[];
   /**
      * @minimum 0
      * @nullable

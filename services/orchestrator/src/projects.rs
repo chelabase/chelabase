@@ -196,10 +196,15 @@ where
         let Some(member) = principal.member.as_ref() else {
             return ApiError::internal().into_response();
         };
-        let granted = match state.metadata.member_projects(member.id).await {
+        // T2-4: every access source, not the own grants alone.
+        let granted = match state
+            .metadata
+            .member_grant_sources(principal.tenant_id, member.id)
+            .await
+        {
             Ok(granted) => granted,
             Err(err) => {
-                error!("list member projects: {err}");
+                error!("list member grant sources: {err}");
                 return ApiError::internal().into_response();
             }
         };

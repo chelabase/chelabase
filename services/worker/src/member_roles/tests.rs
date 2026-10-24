@@ -24,6 +24,7 @@ fn desired(role_name: &str, roles: &[&str], rotate: bool) -> DesiredMemberRole {
         verifier: format!("SCRAM-{role_name}"),
         rotate,
         locked: false,
+        kind: RoleKind::Member,
     }
 }
 
@@ -34,6 +35,7 @@ fn actual(role_name: &str, memberships: Vec<ActualMembership>) -> ActualMemberRo
         settings: Vec::new(),
         verifier: Some(format!("SCRAM-{role_name}")),
         memberships,
+        valid_until: None,
     }
 }
 
@@ -75,6 +77,7 @@ fn plan_member_roles_creates_grants_revokes_drops() {
             attributes_ok: false,
             settings: vec![None, Some("app".into())],
             verifier: Some("SCRAM-old".into()),
+            valid_until: None,
             // Ours but with the wrong options: granted again (which fixes them).
             memberships: vec![ActualMembership {
                 role: "billing".into(),
@@ -619,6 +622,10 @@ proptest! {
                 MemberRoleStep::Unlock { role } => {
                     state.get_mut(role).unwrap().retain(|m| !(m.role == "chelabase_schema_locked" && m.grantor.is_none()));
                 }
+                // T6: personal steps are never planned for member roles.
+                MemberRoleStep::CreatePersonal { .. } | MemberRoleStep::SetValidUntil { .. } | MemberRoleStep::ResetDatabaseSettings { .. } => {
+                    prop_assert!(false, "a personal step for a member role: {step:?}");
+                }
             }
         }
         // The included granted roles, computed apart from `safe_roles`.
@@ -884,6 +891,7 @@ fn the_catalog_answer_parses() {
                     shaped: false
                 },
             ],
+            valid_until: None,
         }
     );
     assert!(catalog.leftovers.is_empty());
@@ -937,7 +945,7 @@ fn add_member(w: &FakeWorker, db: chelabase_types::DatabaseId, roles: &[&str]) -
         display_name: "m".into(),
         tenant_admin: false,
         status: MemberStatus::Active,
-        accepted_at: None,
+        accepted_at: None, offboarded: false, suspended_at: None, suspended_by: None,
     });
     state.grants.insert(
         (member, record.project_id.as_uuid()),
@@ -1578,6 +1586,7 @@ proptest! {
                 .filter(|(i, _)| catalog.roles.contains(&names[*i]))
                 .map(|(i, shaped)| ActualMembership { role: names[*i].clone(), grantor: None, shaped: *shaped })
                 .collect(),
+            valid_until: None,
         });
         let recorded = recorded.map(|i| names[i].clone());
         let could: BTreeSet<String> = closure(
@@ -1837,7 +1846,7 @@ fn the_marker_is_never_a_usable_role() {
     .unwrap();
     let marker_set = set(&["chelabase_schema_locked", "billing"]);
     assert_eq!(safe_roles(&marker_set, &catalog), set(&["billing"]));
-    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All };
+    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() };
     assert!(!granted_roles(&all, &catalog).0.contains("chelabase_schema_locked"));
     // A grant naming it skips it as unsafe-or-reserved, never grants it.
     let named = Grant {
@@ -2009,6 +2018,10 @@ proptest! {
                     state.remove(role);
                 }
                 MemberRoleStep::SetPassword { .. } | MemberRoleStep::Reshape { .. } => {}
+                // T6: personal steps are never planned for member roles.
+                MemberRoleStep::CreatePersonal { .. } | MemberRoleStep::SetValidUntil { .. } | MemberRoleStep::ResetDatabaseSettings { .. } => {
+                    prop_assert!(false, "a personal step for a member role: {step:?}");
+                }
             }
         }
         prop_assert_eq!(state.keys().cloned().collect::<BTreeSet<_>>(), want.iter().map(|d| d.role_name.clone()).collect::<BTreeSet<_>>());
@@ -2295,7 +2308,7 @@ async fn template1_is_touched_only_when_another_database_changed() {
 #[test]
 fn every_role_leaves_out_the_data_api_roles_unless_named() {
     let catalog = MemberCatalog { roles: set(&["anon", "authenticated", "billing", "sales"]), ..Default::default() };
-    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All };
+    let all = Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() };
     assert_eq!(granted_roles(&all, &catalog).0, set(&["billing", "sales"]));
     let named = Grant {
         platform_role: PlatformRole::Developer,
@@ -2365,4 +2378,1136 @@ fn opening_resets_the_marker_with_quoted_names() {
     let reset = sql.find("ALTER DATABASE \"we\"\"ird\" RESET neon.born_closed;").expect(&sql);
     assert!(open < reset, "{sql}");
     assert_eq!(reset_born_closed_sql("db"), "ALTER DATABASE \"db\" RESET neon.born_closed;");
+}
+
+// Members hub T2 (MH-2): the reconcile reads `database_grant_sources` and grants the member
+// role every role of `Effective::roles` (Viewer-level ones included: the member role serves
+// Viewer act-as routes too; only personal logins filter by level, T6). A member with an
+// override and no source gets nothing, never a default.
+#[tokio::test]
+async fn reconcile_reads_grant_sources() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let db = w.metadata.state().databases.keys().copied().next().expect("a database");
+    let record = w.metadata.database(db);
+    let project = record.project_id.as_uuid();
+    // A team grant names `sales` at Viewer (step 2's source; the fake fills it).
+    w.metadata.state().team_grants.insert(
+        (member, project),
+        vec![Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: RoleSet::Only([PgRole::Named("sales".into())].into_iter().collect()),
+        }],
+    );
+    // Another member holds only an override on the database: no source.
+    let lonely = Uuid::new_v4();
+    {
+        let mut state = w.metadata.state();
+        state.members.push(MemberRecord {
+            id: lonely,
+            tenant_id: record.tenant_id,
+            zitadel_user_id: format!("z-{lonely}"),
+            email: None,
+            display_name: "o".into(),
+            tenant_admin: false,
+            status: MemberStatus::Active,
+            accepted_at: None, offboarded: false, suspended_at: None, suspended_by: None,
+        });
+        state.overrides.insert(
+            (lonely, db.as_uuid()),
+            chelabase_metadata::members::OverrideRow {
+                platform_role: Some(PlatformRole::Admin),
+                pg_roles: Some(vec!["billing".into()]),
+            },
+        );
+    }
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "sales", "anon"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(
+        reply,
+        MemberRolesReply::Done {
+            roles: vec![MemberRoleApplied {
+                member_id: member,
+                role_name: member_role_name(member),
+                applied_roles: vec!["billing".into(), "sales".into()],
+            }]
+        }
+    );
+    let sql = texts(&w);
+    assert_eq!(sql.len(), 1, "{sql:?}");
+    assert!(!sql[0].contains(&member_role_name(lonely)), "an override alone is no access: {}", sql[0]);
+}
+
+// --- T6: personal logins (spec Part 6 "Convergence", "Memberships", "No privileges of its
+// own"; D2; MH-10, MH-16, MH-17, MH-18, MH-23; seam S1, S9, S16) ------------------------------
+//
+// The catalog answer pins how [`member_catalog_sql`] reports marked roles (the round-4
+// predicate, `chelabase.managed_role=` at `setdatabase = 0`): the role's `r` line as any role,
+// a `k <name>` line (marked), its `p` line (password), a `u <name> <valid until>` line
+// (microseconds since the epoch, `-` for none) and an `m` line per membership, as a member
+// role's. A marked role is read into `MemberCatalog::marked` and `MemberCatalog::personal`.
+
+use chelabase_metadata::personal_logins::PersonalLoginRecord;
+use chelabase_types::role_name::mark_personal_login_sql;
+use crate::fakes::{entries, position};
+
+/// A fixed `VALID UNTIL` far ahead.
+fn far() -> DateTime<Utc> {
+    chrono::TimeZone::with_ymd_and_hms(&Utc, 2099, 1, 2, 3, 4, 5).unwrap()
+}
+
+fn days(n: i64) -> chrono::Duration {
+    chrono::Duration::days(n)
+}
+
+/// A whole SCRAM verifier for `password`.
+fn scram(password: &str) -> String {
+    chelabase_neon::scram::verifier(password)
+}
+
+/// SQL with identifier quotes removed, so assertions read the same whether a plain name is
+/// quoted or not.
+fn plain(sql: &str) -> String {
+    sql.replace('"', "")
+}
+
+fn personal_desired(role: &str, roles: &[&str], verifier: &str, locked: bool) -> DesiredMemberRole {
+    DesiredMemberRole {
+        member_id: Uuid::nil(),
+        role_name: role.into(),
+        roles: set(roles),
+        verifier: verifier.into(),
+        rotate: false,
+        locked,
+        kind: RoleKind::Personal { valid_until: far() },
+    }
+}
+
+fn personal_actual(
+    role: &str,
+    memberships: Vec<ActualMembership>,
+    verifier: &str,
+    valid_until: Option<DateTime<Utc>>,
+) -> ActualMemberRole {
+    ActualMemberRole {
+        role_name: role.into(),
+        attributes_ok: true,
+        settings: Vec::new(),
+        verifier: Some(verifier.into()),
+        memberships,
+        valid_until,
+    }
+}
+
+/// The catalog lines of a marked role (see the section's comment).
+fn marked_lines(
+    name: &str,
+    verifier: &str,
+    valid_until: Option<DateTime<Utc>>,
+    memberships: &[&str],
+) -> String {
+    let until = valid_until.map_or("-".to_string(), |t| t.timestamp_micros().to_string());
+    let mut out = format!(
+        "r {n} t f f t\nk {n}\np {n} {v}\nu {n} {until}\n",
+        n = h(name),
+        v = h(verifier)
+    );
+    for m in memberships {
+        out.push_str(&format!("m {} {} - t\n", h(name), h(m)));
+    }
+    out
+}
+
+/// A personal-login record of `member` on `db`.
+#[allow(clippy::too_many_arguments)]
+fn login_record(
+    w: &FakeWorker,
+    db: chelabase_types::DatabaseId,
+    member: Uuid,
+    name: &str,
+    verifier: Option<&str>,
+    valid_until: DateTime<Utc>,
+    revoked: bool,
+    qualifies: bool,
+) {
+    w.metadata.state().personal_logins.push(PersonalLoginRecord {
+        member_id: member,
+        database_id: db.as_uuid(),
+        role_name: name.into(),
+        scram_verifier: verifier.map(str::to_string),
+        valid_until,
+        revoked,
+        qualifies,
+    });
+}
+
+/// A live, qualifying record valid until [`far`].
+fn live_record(w: &FakeWorker, db: chelabase_types::DatabaseId, member: Uuid, name: &str, verifier: &str) {
+    login_record(w, db, member, name, Some(verifier), far(), false, true);
+}
+
+/// A personal row for `name` on `ep`, as the worker's upsert leaves it.
+fn personal_row(w: &FakeWorker, ep: &str, name: &str, verifier: Option<&str>) {
+    let mut state = w.metadata.state();
+    let endpoint = state.endpoints.get_mut(ep).unwrap();
+    endpoint.logins.insert(
+        name.into(),
+        crate::fakes::FakeLogin::new(chelabase_metadata::RoleOrigin::Personal, None, false),
+    );
+    endpoint.set_verifier(name, verifier);
+}
+
+/// The database of `branch`.
+fn db_of(w: &FakeWorker, branch: BranchId) -> chelabase_types::DatabaseId {
+    w.metadata.branch(branch).database_id
+}
+
+/// Every changing script (cleanups included), without identifier quotes, with its database.
+fn plain_scripts(w: &FakeWorker) -> Vec<(String, String)> {
+    changing_scripts(w)
+        .into_iter()
+        .map(|(db, s)| (db, plain(&s)))
+        .collect()
+}
+
+/// Whether some script drops `role`.
+fn dropped(w: &FakeWorker, role: &str) -> bool {
+    plain_scripts(w).iter().any(|(_, s)| {
+        s.contains(&format!("DROP ROLE IF EXISTS {role};")) || s.contains(&format!("DROP ROLE {role};"))
+    })
+}
+
+/// Whether some script creates `role`.
+fn created(w: &FakeWorker, role: &str) -> bool {
+    plain_scripts(w)
+        .iter()
+        .any(|(_, s)| s.contains(&format!("CREATE ROLE {role} ")))
+}
+
+/// The index of the first script (of [`plain_scripts`]) containing `needle`.
+fn script_at(scripts: &[(String, String)], needle: &str) -> usize {
+    scripts
+        .iter()
+        .position(|(_, s)| s.contains(needle))
+        .unwrap_or_else(|| panic!("no script contains {needle:?}: {scripts:#?}"))
+}
+
+/// The roles granted to `role` by every script (`GRANT x TO role …` lines), the DDL guard's
+/// marker left out.
+fn granted_to(w: &FakeWorker, role: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (_, s) in plain_scripts(w) {
+        for line in s.lines() {
+            let Some(rest) = line.trim().strip_prefix("GRANT ") else { continue };
+            let Some((granted, tail)) = rest.split_once(" TO ") else { continue };
+            let grantee = tail.split([' ', ';']).next().unwrap_or("");
+            if grantee == role && granted != SCHEMA_LOCKED_ROLE {
+                out.insert(granted.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// A tenant admin of `db`'s tenant, with no grant.
+fn add_tenant_admin(w: &FakeWorker, db: chelabase_types::DatabaseId) -> Uuid {
+    let record = w.metadata.database(db);
+    let member = Uuid::new_v4();
+    w.metadata.state().members.push(MemberRecord {
+        id: member,
+        tenant_id: record.tenant_id,
+        zitadel_user_id: format!("z-{member}"),
+        email: None,
+        display_name: "admin".into(),
+        tenant_admin: true,
+        status: MemberStatus::Active,
+        accepted_at: None, offboarded: false, suspended_at: None, suspended_by: None,
+    });
+    member
+}
+
+/// The `VALID UNTIL '<ts>'` instant of `sql` (RFC 3339).
+fn valid_until_in(sql: &str) -> DateTime<Utc> {
+    let at = sql.find("VALID UNTIL '").unwrap_or_else(|| panic!("no VALID UNTIL: {sql}"));
+    let rest = &sql[at + "VALID UNTIL '".len()..];
+    let literal = &rest[..rest.find('\'').expect(sql)];
+    DateTime::parse_from_rfc3339(literal)
+        .unwrap_or_else(|e| panic!("VALID UNTIL {literal:?} isn't RFC 3339: {e}"))
+        .with_timezone(&Utc)
+}
+
+#[test]
+fn the_catalog_reads_marked_roles() {
+    let sql = member_catalog_sql();
+    assert!(sql.contains("chelabase.managed_role="), "the round-4 predicate: {sql}");
+    let out = format!(
+        "{}{}{}",
+        cat(&["!postgres", "billing"]),
+        marked_lines("alice", "SCRAM-a", Some(far()), &["billing"]),
+        leftovers(&[("alice", Some("app"))])
+    );
+    let catalog = parse_member_catalog(&out).unwrap();
+    assert_eq!(catalog.marked, set(&["alice"]));
+    assert!(catalog.login.contains("alice") && catalog.roles.contains("alice"));
+    assert!(!catalog.member_roles.contains_key("alice"), "a personal login isn't a member role");
+    assert_eq!(
+        catalog.personal["alice"],
+        personal_actual("alice", vec![ours("billing")], "SCRAM-a", Some(far()))
+    );
+    assert_eq!(catalog.leftovers["alice"], BTreeSet::from([Some("app".to_string())]));
+    let none = parse_member_catalog(&marked_lines("bob", "SCRAM-b", None, &[])).unwrap();
+    assert_eq!(none.personal["bob"].valid_until, None);
+    assert!(parse_member_catalog(&format!("u {} soon\n", h("bob"))).is_err());
+}
+
+/// Spec Part 6 "Create order" (MH-16): a new personal login is one transaction as
+/// `cloud_admin`: the role (the personal-login attributes, `VALID UNTIL`, the record's
+/// verifier), the marker, then on a protected branch for a non-Admin the DDL guard's marker,
+/// before any membership. An existing unlocked one is locked first.
+#[test]
+fn plan_creates_marks_and_locks_in_one_transaction() {
+    use MemberRoleStep::*;
+    let steps = plan_member_roles(&[personal_desired("alice", &["billing"], "SCRAM-alice", true)], &[]);
+    assert_eq!(
+        steps,
+        vec![
+            CreatePersonal {
+                role: "alice".into(),
+                verifier: "SCRAM-alice".into(),
+                valid_until: far(),
+                lock: true,
+            },
+            Grant { role: "alice".into(), granted: "billing".into() },
+        ]
+    );
+    let raw = render_step(&steps[0]);
+    let sql = plain(&raw);
+    let begin = sql.find("BEGIN;").expect(&sql);
+    let create = sql
+        .find("CREATE ROLE alice LOGIN NOINHERIT NOCREATEDB NOCREATEROLE NOBYPASSRLS NOREPLICATION VALID UNTIL '")
+        .expect(&sql);
+    assert_eq!(valid_until_in(&sql), far());
+    assert!(sql.contains("PASSWORD 'SCRAM-alice'"), "{sql}");
+    let mark = raw.find(&mark_personal_login_sql("alice")).expect(&raw);
+    let mark = plain(&raw[..mark]).len();
+    let lock = sql.find("GRANT chelabase_schema_locked TO alice").expect(&sql);
+    let commit = sql.rfind("COMMIT;").expect(&sql);
+    assert!(begin < create && create < mark && mark < lock && lock < commit, "{sql}");
+    assert!(sql.trim_end().ends_with("COMMIT;"), "{sql}");
+    assert!(!sql.contains("GRANT billing"), "memberships are their own step: {sql}");
+    // Unlocked: no guard marker.
+    let unlocked = render_step(&CreatePersonal {
+        role: "alice".into(),
+        verifier: "SCRAM-alice".into(),
+        valid_until: far(),
+        lock: false,
+    });
+    assert!(!unlocked.contains(SCHEMA_LOCKED_ROLE), "{unlocked}");
+    assert!(unlocked.contains(&mark_personal_login_sql("alice")), "{unlocked}");
+    // Never the member role's `Create`.
+    assert!(!steps.iter().any(|s| matches!(s, Create { .. })));
+    // An existing login on a branch that became protected: the lock before any grant.
+    let have = personal_actual("alice", vec![], "SCRAM-alice", Some(far()));
+    let steps = plan_member_roles(&[personal_desired("alice", &["billing"], "SCRAM-alice", true)], &[have]);
+    assert_eq!(
+        steps,
+        vec![
+            Lock { role: "alice".into() },
+            Grant { role: "alice".into(), granted: "billing".into() },
+        ]
+    );
+}
+
+/// D2: the record's `VALID UNTIL` is set back wherever the catalog differs (a copy, a restore,
+/// an expiry set by hand); a converged login plans nothing.
+#[test]
+fn valid_until_drift_is_repaired() {
+    use MemberRoleStep::*;
+    let wanted = personal_desired("alice", &["billing"], "SCRAM-alice", false);
+    for drifted in [Some(far() - days(1)), None] {
+        let have = personal_actual("alice", vec![ours("billing")], "SCRAM-alice", drifted);
+        let steps = plan_member_roles(std::slice::from_ref(&wanted), &[have]);
+        assert_eq!(steps, vec![SetValidUntil { role: "alice".into(), valid_until: far() }], "{drifted:?}");
+        let sql = plain(&render_step(&steps[0]));
+        assert!(sql.contains("ALTER ROLE alice VALID UNTIL '"), "{sql}");
+        assert_eq!(valid_until_in(&sql), far());
+    }
+    let converged = personal_actual("alice", vec![ours("billing")], "SCRAM-alice", Some(far()));
+    assert_eq!(plan_member_roles(&[wanted], &[converged]), vec![]);
+}
+
+/// MH-23: a personal login never holds the owner, an owner-level role, a member role or the
+/// guard's marker as a membership, whatever its desired set says; and a tenant admin's login
+/// gets every safe role (`tenant_admin_effective()`, S16), the data API's roles, owner-level,
+/// LOGIN (other personal logins included) and reserved roles left out.
+#[tokio::test]
+async fn plan_never_grants_the_owner_or_an_owner_level_role() {
+    let (w, _journal) = worker();
+    let id = ready_database(&w).await;
+    let main = w.metadata.main(id);
+    let ep = main.endpoint_id.clone().unwrap();
+    let admin = add_tenant_admin(&w, id);
+    live_record(&w, id, admin, "alice", &scram("pw"));
+    w.computes.sql.lock().unwrap().clear();
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}",
+            cat(&["!postgres", "!app", "billing", "sales", "anon", "authenticated", "@deploy"]),
+            marked_lines("bob", &scram("bob"), Some(far()), &[])
+        ),
+    );
+    w.reconcile_member_roles(main.id, None).await;
+    assert!(created(&w, "alice"), "{:#?}", plain_scripts(&w));
+    assert_eq!(granted_to(&w, "alice"), set(&["billing", "sales"]));
+
+    // The plan itself drops the owner and reserved names from any desired set.
+    let wanted = personal_desired(
+        "alice",
+        &[OWNER_ROLE, "billing", "cb_m_x", SCHEMA_LOCKED_ROLE, "pg_monitor"],
+        "SCRAM-alice",
+        false,
+    );
+    let grants: Vec<String> = plan_member_roles(&[wanted], &[])
+        .into_iter()
+        .filter_map(|s| match s {
+            MemberRoleStep::Grant { granted, .. } => Some(granted),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grants, ["billing"]);
+}
+
+/// D1, spec Part 6 "Memberships": a personal login holds only the roles held at Developer or
+/// above (`Effective::roles_at_least(Developer)`), safe ones only, `INHERIT FALSE, SET TRUE`
+/// (R10); the member role keeps its Viewer-level roles.
+#[tokio::test]
+async fn plan_grants_only_developer_level_safe_roles() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing", "deploy"]).await;
+    let id = db_of(&w, branch);
+    let project = w.metadata.database(id).project_id.as_uuid();
+    w.metadata.state().team_grants.insert(
+        (member, project),
+        vec![Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: RoleSet::Only([PgRole::Named("reports".into())].into_iter().collect()),
+        }],
+    );
+    live_record(&w, id, member, "alice", &scram("pw"));
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "reports", "@deploy"]));
+    w.reconcile_member_roles(branch, None).await;
+    assert_eq!(granted_to(&w, "alice"), set(&["billing"]), "{:#?}", plain_scripts(&w));
+    assert!(
+        plain_scripts(&w)
+            .iter()
+            .any(|(_, s)| s.contains("GRANT billing TO alice WITH INHERIT FALSE, SET TRUE, ADMIN FALSE;")),
+        "R10: {:#?}",
+        plain_scripts(&w)
+    );
+    assert_eq!(
+        granted_to(&w, &member_role_name(member)),
+        set(&["billing", "reports"]),
+        "the member role keeps Viewer-level roles"
+    );
+}
+
+/// MH-14, D2: a copy, restore or protected child carries another verifier; the record's is
+/// set back, and the login's sessions end.
+#[tokio::test]
+async fn plan_sets_the_record_verifier_back_after_a_copy() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let record = scram("the record's password");
+    live_record(&w, id, member, "alice", &record);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}",
+            cat(&["!postgres", "billing"]),
+            marked_lines("alice", &scram("a parent's password"), Some(far()), &["billing"])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let at = script_at(&scripts, &format!("ALTER ROLE alice PASSWORD '{record}';"));
+    assert!(scripts[at].1.contains(&terminate_sql("alice")), "{}", scripts[at].1);
+    assert!(!created(&w, "alice") && !dropped(&w, "alice"), "{scripts:#?}");
+}
+
+/// MH-17: a rotation, a revoked membership and a drop of a personal login each end its
+/// sessions.
+#[tokio::test]
+async fn a_rotation_or_drop_ends_sessions() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let record = scram("new");
+    live_record(&w, id, member, "alice", &record);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}{}",
+            cat(&["!postgres", "billing", "hr"]),
+            marked_lines("alice", &scram("old"), Some(far()), &["billing", "hr"]),
+            marked_lines("bob", &scram("bob"), Some(far()), &[])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let rotate = script_at(&scripts, &format!("ALTER ROLE alice PASSWORD '{record}';"));
+    assert!(scripts[rotate].1.contains(&terminate_sql("alice")), "{}", scripts[rotate].1);
+    let revoke = script_at(&scripts, "REVOKE hr FROM alice");
+    assert!(scripts[revoke].1.contains(&terminate_sql("alice")), "{}", scripts[revoke].1);
+    let lock_out = script_at(&scripts, "ALTER ROLE bob NOLOGIN;");
+    assert!(scripts[lock_out].1.contains(&terminate_sql("bob")), "{}", scripts[lock_out].1);
+    assert!(dropped(&w, "bob"), "{scripts:#?}");
+}
+
+/// MH-10, K6 H5, MH-18 (amended, T6-C1): a marked role without a record is dropped as
+/// `cloud_admin`: locked out with its sessions ended, then what it owns goes to the powerless
+/// quarantine role `chelabase_orphaned` (never the owner) and `DROP OWNED` takes the rest, then
+/// the role.
+#[tokio::test]
+async fn plan_drops_an_orphaned_marked_role_after_cleanup() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}{}",
+            cat(&["!postgres", "billing"]),
+            marked_lines("bob", &scram("bob"), Some(far()), &["billing"]),
+            leftovers(&[("bob", Some("app"))])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let lock_out = script_at(&scripts, "ALTER ROLE bob NOLOGIN;");
+    assert!(scripts[lock_out].1.contains(&terminate_sql("bob")));
+    let cleanup = script_at(&scripts, "DROP OWNED BY bob");
+    assert_eq!(scripts[cleanup].0, "app", "{scripts:#?}");
+    assert!(
+        scripts[cleanup].1.contains(&format!("REASSIGN OWNED BY bob TO {ORPHANED_ROLE};")),
+        "MH-18 (amended): what it owns goes to the quarantine role: {}",
+        scripts[cleanup].1
+    );
+    assert!(
+        !scripts[cleanup].1.contains(&format!("REASSIGN OWNED BY bob TO {OWNER_ROLE}")),
+        "never to the owner: {}",
+        scripts[cleanup].1
+    );
+    let gone = scripts
+        .iter()
+        .position(|(_, s)| s.contains("DROP ROLE IF EXISTS bob;") || s.contains("DROP ROLE bob;"))
+        .expect("bob is dropped");
+    assert!(lock_out < cleanup && cleanup < gone, "{scripts:#?}");
+}
+
+/// MH-17: a record whose member no longer qualifies (whatever its revocation says) is not
+/// desired: the login is dropped, its row deleted, and the proxy cache told now and later.
+#[tokio::test]
+async fn plan_drops_a_login_whose_member_no_longer_qualifies() {
+    let (w, journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    login_record(&w, id, member, "alice", Some(&verifier), far(), false, false);
+    personal_row(&w, &ep, "alice", Some(&verifier));
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{}{}", cat(&["!postgres", "billing"]), marked_lines("alice", &verifier, Some(far()), &["billing"])),
+    );
+    journal.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    assert!(dropped(&w, "alice"), "{:#?}", plain_scripts(&w));
+    assert!(!w.metadata.state().endpoints[&ep].logins.contains_key("alice"));
+    let log = entries(&journal);
+    let deleted = position(&journal, &format!("metadata.delete_personal_role_row {ep} alice")).unwrap_or_else(|| panic!("{log:#?}"));
+    let now = log
+        .iter()
+        .position(|e| e == &format!("cache.password_updated {ep} alice"))
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    let later = log
+        .iter()
+        .position(|e| e.starts_with(&format!("cache.password_updated_later {ep} ")) && e.contains("alice"))
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    assert!(deleted < now && deleted < later, "{log:#?}");
+}
+
+/// D4's backstop: an expired record is not desired; the login is dropped.
+#[tokio::test]
+async fn plan_drops_an_expired_login() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    let past = Utc::now() - days(1);
+    login_record(&w, id, member, "alice", Some(&verifier), past, false, true);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{}{}", cat(&["!postgres", "billing"]), marked_lines("alice", &verifier, Some(past), &["billing"])),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    assert!(dropped(&w, "alice"), "{:#?}", plain_scripts(&w));
+    assert!(!created(&w, "alice"));
+}
+
+/// MH-10 orphan, a restore: the branch went back to before the member deleted `alice` and made
+/// `alice2`; the restored `alice` is dropped, `alice2` made.
+#[tokio::test]
+async fn orphan_from_a_restore() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    live_record(&w, id, member, "alice2", &scram("new"));
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{}{}", cat(&["!postgres", "billing"]), marked_lines("alice", &scram("old"), Some(far()), &["billing"])),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    assert!(dropped(&w, "alice"), "{:#?}", plain_scripts(&w));
+    assert!(created(&w, "alice2"), "{:#?}", plain_scripts(&w));
+    assert!(!created(&w, "alice"));
+}
+
+/// MH-10 orphan, a reset to the parent: the parent still has Bob's old `dave` (deleted since),
+/// and Carol's login now holds the name. The role is Carol's: her verifier set back (Bob's
+/// sessions end), Bob's memberships revoked, hers granted; never dropped or adopted as Bob's.
+#[tokio::test]
+async fn orphan_from_a_reset_to_parent() {
+    let (w, _journal) = worker();
+    let (branch, ep, carol) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let carols = scram("carol");
+    live_record(&w, id, carol, "dave", &carols);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}",
+            cat(&["!postgres", "billing", "hr"]),
+            marked_lines("dave", &scram("bob's old"), Some(far()), &["hr"])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let rotate = script_at(&scripts, &format!("ALTER ROLE dave PASSWORD '{carols}';"));
+    assert!(scripts[rotate].1.contains(&terminate_sql("dave")));
+    script_at(&scripts, "REVOKE hr FROM dave");
+    assert_eq!(granted_to(&w, "dave"), set(&["billing"]));
+    assert!(!dropped(&w, "dave") && !created(&w, "dave"), "{scripts:#?}");
+}
+
+/// MH-10/MH-15 orphan, a lost create answer: the record is written first, so a login whose
+/// answer was lost is a live record with its marked role and no row yet. It is kept (never
+/// dropped or made again) and its row written, with the cache told (S16).
+#[tokio::test]
+async fn orphan_from_a_lost_create_answer() {
+    let (w, journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    live_record(&w, id, member, "alice", &verifier);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{}{}", cat(&["!postgres", "billing"]), marked_lines("alice", &verifier, Some(far()), &["billing"])),
+    );
+    journal.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    assert!(
+        position(&journal, &format!("metadata.upsert_personal_role_row {ep} alice")).is_some(),
+        "{:#?}",
+        entries(&journal)
+    );
+    assert!(!dropped(&w, "alice") && !created(&w, "alice"), "{:#?}", plain_scripts(&w));
+    let state = w.metadata.state();
+    let row = &state.endpoints[&ep].logins["alice"];
+    assert_eq!(row.origin, chelabase_metadata::RoleOrigin::Personal);
+    assert_eq!(state.endpoints[&ep].verifier("alice"), Some(verifier));
+}
+
+/// MH-10 orphan, a deleted record: its rows went with it (FK cascade); the role is dropped and
+/// no row written for it.
+#[tokio::test]
+async fn orphan_from_a_deleted_record() {
+    let (w, journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{}{}", cat(&["!postgres", "billing"]), marked_lines("alice", &scram("pw"), Some(far()), &["billing"])),
+    );
+    journal.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    assert!(dropped(&w, "alice"), "{:#?}", plain_scripts(&w));
+    assert!(position(&journal, "metadata.upsert_personal_role_row").is_none(), "{:#?}", entries(&journal));
+    assert!(!plain_scripts(&w).iter().any(|(_, s)| s.contains("GRANT billing TO alice")));
+}
+
+/// Spec "Create order": an unmarked role holding the record's name is a customer's and never
+/// adopted: the create fails (Postgres refuses the name), nothing else touches the role, no row
+/// is written, and the record stays.
+#[tokio::test]
+async fn an_unmarked_role_with_the_records_name_is_never_adopted() {
+    let (w, journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    live_record(&w, id, member, "alice", &scram("pw"));
+    w.computes.fail_when("CREATE ROLE alice ");
+    w.computes.fail_when("CREATE ROLE \"alice\"");
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "@alice"]));
+    journal.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    for (_, s) in plain_scripts(&w) {
+        for needle in ["ALTER ROLE alice", "TO alice", "FROM alice", "DROP ROLE IF EXISTS alice", "DROP ROLE alice", "DROP OWNED BY alice"] {
+            assert!(!s.contains(needle), "{needle}: {s}");
+        }
+    }
+    assert!(position(&journal, "metadata.upsert_personal_role_row").is_none(), "{:#?}", entries(&journal));
+    assert_eq!(w.metadata.state().personal_logins.len(), 1);
+}
+
+/// MH-18 (amended, T6-C1): a kept login that owns or holds something (`pg_shdepend`) is
+/// cleaned up (what it owns to `chelabase_orphaned`, never the owner, then `DROP OWNED`) before
+/// its memberships are applied.
+#[tokio::test]
+async fn a_kept_login_loses_direct_privileges_before_memberships() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    live_record(&w, id, member, "alice", &verifier);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}{}",
+            cat(&["!postgres", "billing"]),
+            marked_lines("alice", &verifier, Some(far()), &[]),
+            leftovers(&[("alice", Some("app"))])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let cleanup = script_at(&scripts, "DROP OWNED BY alice");
+    assert_eq!(scripts[cleanup].0, "app");
+    assert!(scripts[cleanup].1.contains(&format!("REASSIGN OWNED BY alice TO {ORPHANED_ROLE};")), "{}", scripts[cleanup].1);
+    assert!(!scripts[cleanup].1.contains(&format!("REASSIGN OWNED BY alice TO {OWNER_ROLE}")), "{}", scripts[cleanup].1);
+    let grant = script_at(&scripts, "GRANT billing TO alice");
+    assert!(cleanup < grant, "{scripts:#?}");
+    assert!(!dropped(&w, "alice"));
+}
+
+/// MH-16 through the reconcile: on a protected branch a Developer's new login is created
+/// with the guard's marker in the create transaction, before its memberships; a tenant admin's
+/// isn't (with `guard_logins` on the guard itself covers every login).
+#[tokio::test]
+async fn a_protected_branch_creates_a_developers_login_locked_and_an_admins_unlocked() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
+    let admin = add_tenant_admin(&w, id);
+    live_record(&w, id, member, "alice", &scram("a"));
+    live_record(&w, id, admin, "root_ann", &scram("b"));
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let create = script_at(&scripts, "CREATE ROLE alice ");
+    let script = &scripts[create].1;
+    let lock = script.find("GRANT chelabase_schema_locked TO alice").expect(script);
+    assert!(script.find("CREATE ROLE alice ").unwrap() < lock, "{script}");
+    let grant = script_at(&scripts, "GRANT billing TO alice");
+    assert!(create < grant || (create == grant && lock < script.find("GRANT billing TO alice").unwrap()), "{scripts:#?}");
+    let admins = script_at(&scripts, "CREATE ROLE root_ann ");
+    assert!(!scripts[admins].1.contains(SCHEMA_LOCKED_ROLE), "{}", scripts[admins].1);
+}
+
+/// S16: every personal row the worker writes clears the proxy cache now and again later.
+#[tokio::test]
+async fn personal_row_writes_clear_the_proxy_cache_twice() {
+    let (w, journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    live_record(&w, id, member, "alice", &verifier);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    journal.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    let log = entries(&journal);
+    let upsert = position(&journal, &format!("metadata.upsert_personal_role_row {ep} alice")).unwrap_or_else(|| panic!("{log:#?}"));
+    let now = log
+        .iter()
+        .position(|e| e == &format!("cache.password_updated {ep} alice"))
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    let later = log
+        .iter()
+        .position(|e| e.starts_with(&format!("cache.password_updated_later {ep} ")) && e.contains("alice"))
+        .unwrap_or_else(|| panic!("{log:#?}"));
+    assert!(upsert < now && upsert < later, "{log:#?}");
+    assert_eq!(w.metadata.state().endpoints[&ep].verifier("alice"), Some(verifier));
+}
+
+/// S9: a run for one member plans that member's personal logins (create) and leaves every
+/// other login alone, and never drops an orphan (it can't be attributed); the unfiltered run
+/// does.
+#[tokio::test]
+async fn a_member_filtered_run_creates_that_members_login_and_drops_no_orphan() {
+    let (w, _journal) = worker();
+    let (branch, ep, m) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let n = add_member(&w, id, &["billing"]);
+    live_record(&w, id, m, "alice", &scram("a"));
+    live_record(&w, id, n, "bob", &scram("b"));
+    // Nina's record no longer qualifies; her login is still there.
+    login_record(&w, id, n, "nina", Some(&scram("c")), far(), false, false);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{}{}{}",
+            cat(&["!postgres", "billing"]),
+            marked_lines("zed", &scram("z"), Some(far()), &[]),
+            marked_lines("nina", &scram("c"), Some(far()), &["billing"])
+        ),
+    );
+    w.reconcile_member_roles(branch, Some(m)).await;
+    assert!(created(&w, "alice"), "{:#?}", plain_scripts(&w));
+    for other in ["bob", "zed", "nina"] {
+        assert!(
+            !plain_scripts(&w).iter().any(|(_, s)| s.contains(&format!(" {other}"))),
+            "{other} is left alone: {:#?}",
+            plain_scripts(&w)
+        );
+    }
+    w.computes.sql.lock().unwrap().clear();
+    w.reconcile_member_roles(branch, None).await;
+    assert!(dropped(&w, "zed") && dropped(&w, "nina"), "{:#?}", plain_scripts(&w));
+    assert!(created(&w, "bob"), "{:#?}", plain_scripts(&w));
+}
+
+/// The convergence rule (spec Part 6, MH-10, MH-17, S9), exhaustively over one login: after a
+/// run, the login is made exactly when its record is live (qualifies, unrevoked, unexpired)
+/// and it's missing, and dropped exactly when it's present and not wanted, for an unfiltered
+/// run or one for its own member when it has a record; a run for another member, or for its
+/// member without a record (an orphan), touches nothing.
+#[tokio::test]
+async fn convergence_follows_the_desired_set_exhaustively() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Filter {
+        None,
+        Own,
+        Other,
+    }
+    let mut cases = Vec::new();
+    for has_record in [false, true] {
+        let flags: Vec<(bool, bool, bool)> = if has_record {
+            let mut v = Vec::new();
+            for q in [false, true] {
+                for r in [false, true] {
+                    for e in [false, true] {
+                        v.push((q, r, e));
+                    }
+                }
+            }
+            v
+        } else {
+            vec![(false, false, false)]
+        };
+        for (qualifies, revoked, expired) in flags {
+            for in_catalog in [false, true] {
+                for filter in [Filter::None, Filter::Own, Filter::Other] {
+                    cases.push((has_record, qualifies, revoked, expired, in_catalog, filter));
+                }
+            }
+        }
+    }
+    for (has_record, qualifies, revoked, expired, in_catalog, filter) in cases {
+        let case = format!("record {has_record}, qualifies {qualifies}, revoked {revoked}, expired {expired}, in catalog {in_catalog}, run {filter:?}");
+        let (w, _journal) = worker();
+        let (branch, ep, m) = setup(&w, &["billing"]).await;
+        let id = db_of(&w, branch);
+        let other = add_member(&w, id, &["billing"]);
+        let verifier = scram("pw");
+        let until = if expired { Utc::now() - days(1) } else { far() };
+        if has_record {
+            let kept = (!revoked).then_some(verifier.as_str());
+            login_record(&w, id, m, "alice", kept, until, revoked, qualifies);
+        }
+        let mut answer = cat(&["!postgres", "billing"]);
+        if in_catalog {
+            answer.push_str(&marked_lines("alice", &verifier, Some(until), &["billing"]));
+        }
+        w.computes.answer_at(&ep, "chelabase: member roles", &answer);
+        let run_for = match filter {
+            Filter::None => None,
+            Filter::Own => Some(m),
+            Filter::Other => Some(other),
+        };
+        w.reconcile_member_roles(branch, run_for).await;
+        let wanted = has_record && qualifies && !revoked && !expired;
+        let touched = filter == Filter::None || (filter == Filter::Own && has_record);
+        assert_eq!(created(&w, "alice"), touched && wanted && !in_catalog, "create: {case}: {:#?}", plain_scripts(&w));
+        assert_eq!(dropped(&w, "alice"), touched && !wanted && in_catalog, "drop: {case}: {:#?}", plain_scripts(&w));
+    }
+}
+
+// --- T6 fix round, C1 (spec Part 6 "No privileges of its own", MH-18 as amended by the user
+// 2026-10-23): a personal login's objects are quarantined, never handed to the owner. The
+// canonical procedure with a powerless successor: the fixed, reserved NOLOGIN role
+// `chelabase_orphaned` (no members, no privileges) is made when missing, in the same script and
+// before the reassign; `REASSIGN OWNED BY <login> TO chelabase_orphaned`, then `DROP OWNED BY
+// <login>`, in every database with leftovers; EXECUTE is revoked from PUBLIC on the functions
+// moved to it. Both for a kept login's cleanup and for a login's drop.
+
+/// The quarantine role (spec Part 6, MH-18 amended).
+const ORPHANED_ROLE: &str = "chelabase_orphaned";
+
+/// The statement that makes the quarantine role, from `CREATE ROLE` to its end (`;` or the
+/// closing quote of a dynamic `EXECUTE '…'`), quotes removed.
+fn orphaned_create(script: &str) -> Option<String> {
+    let script = plain(script);
+    let at = script.find(&format!("CREATE ROLE {ORPHANED_ROLE}"))?;
+    let rest = &script[at..];
+    let end = rest.find([';', '\'']).unwrap_or(rest.len());
+    Some(rest[..end].to_string())
+}
+
+/// Checks one personal cleanup script (spec Part 6, MH-18 amended) for `role`.
+fn assert_quarantines(script: &str, role: &str) {
+    let p = plain(script);
+    assert!(script.starts_with(CLEANUP_MARK), "still a cleanup (R31's filters read the mark): {script}");
+    // The quarantine role is made when missing, before the reassign, in this script.
+    let create = orphaned_create(script)
+        .unwrap_or_else(|| panic!("the script makes {ORPHANED_ROLE} when missing: {script}"));
+    let words: Vec<&str> = create.split_whitespace().collect();
+    assert!(words.contains(&"NOLOGIN"), "NOLOGIN: {create}");
+    for forbidden in [
+        "LOGIN", "SUPERUSER", "CREATEDB", "CREATEROLE", "REPLICATION", "BYPASSRLS", "INHERIT",
+        "PASSWORD", "IN", "ADMIN", "USER", "SYSID",
+    ] {
+        assert!(!words.contains(&forbidden), "no {forbidden}: no members, no privileges: {create}");
+    }
+    assert_eq!(
+        words.iter().filter(|w| **w == "ROLE").count(),
+        1,
+        "no `ROLE …` member clause: {create}"
+    );
+    assert!(
+        p.contains(&format!("'{ORPHANED_ROLE}'")) || p.contains("duplicate_object"),
+        "made only when missing (an existence check, or `duplicate_object` caught): {script}"
+    );
+    let created_at = p.find(&format!("CREATE ROLE {ORPHANED_ROLE}")).unwrap();
+    // Every reassign targets the quarantine role, never the owner or anyone else.
+    let reassign = format!("REASSIGN OWNED BY {role} TO {ORPHANED_ROLE};");
+    let reassigned_at = p
+        .find(&reassign)
+        .unwrap_or_else(|| panic!("{reassign:?} in {script}"));
+    assert_eq!(p.matches("REASSIGN OWNED BY").count(), 1, "one reassign: {script}");
+    assert!(!p.contains(&format!("TO {OWNER_ROLE};")), "never to the owner: {script}");
+    assert!(!p.contains("TO cloud_admin"), "never to a superuser: {script}");
+    let dropped_at = p
+        .find(&format!("DROP OWNED BY {role};"))
+        .unwrap_or_else(|| panic!("DROP OWNED follows: {script}"));
+    assert!(created_at < reassigned_at && reassigned_at < dropped_at, "create, reassign, drop owned: {script}");
+    // EXECUTE is revoked from PUBLIC on the functions the quarantine role holds.
+    assert!(
+        p.lines().any(|l| l.contains("REVOKE") && l.contains("EXECUTE") && l.contains("FROM PUBLIC")),
+        "EXECUTE revoked from PUBLIC on the quarantined functions: {script}"
+    );
+    assert!(
+        p.contains("pg_proc") || p.contains("ALL FUNCTIONS") || p.contains("ALL ROUTINES"),
+        "the revoke reaches the functions themselves: {script}"
+    );
+    // Nothing grants the quarantine role to anyone or anything to it.
+    assert!(!p.contains(&format!("GRANT {ORPHANED_ROLE}")), "never a member: {script}");
+    for line in p.lines().filter(|l| l.contains("GRANT ") && !l.contains("REVOKE")) {
+        assert!(!line.contains(&format!("TO {ORPHANED_ROLE}")), "never granted anything: {line}");
+    }
+}
+
+/// MH-18 (amended), C1: the rendered script, for a plain name and one that needs quoting.
+#[test]
+fn personal_cleanup_quarantines_to_a_powerless_role() {
+    assert_quarantines(&personal_cleanup_script("alice"), "alice");
+    let odd = personal_cleanup_script("Al\"ice x");
+    assert!(
+        odd.contains("REASSIGN OWNED BY \"Al\"\"ice x\" TO "),
+        "the login is quoted: {odd}"
+    );
+    assert!(odd.contains("DROP OWNED BY \"Al\"\"ice x\";"), "{odd}");
+    assert!(
+        orphaned_create(&odd).is_some() && plain(&odd).contains(&format!("TO {ORPHANED_ROLE};")),
+        "{odd}"
+    );
+    // The timeouts R31's cleanup runs under are kept.
+    assert!(odd.contains("SET lock_timeout") && odd.contains("SET statement_timeout"), "{odd}");
+}
+
+/// MH-18 (amended): a kept login's cleanup runs in every database where it owns or holds
+/// something, shared objects from the system database, each one the whole quarantine script.
+#[tokio::test]
+async fn a_kept_logins_cleanup_quarantines_in_every_database() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let id = db_of(&w, branch);
+    let verifier = scram("pw");
+    live_record(&w, id, member, "alice", &verifier);
+    let answer = Cat {
+        roles: &["!postgres", "billing"],
+        memberships: &[],
+        edges: &[],
+        passwords: &[],
+        databases: &[("app", "postgres"), ("other", "postgres"), ("postgres", "cloud_admin")],
+    }
+    .answer();
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{answer}{}{}",
+            marked_lines("alice", &verifier, Some(far()), &["billing"]),
+            leftovers(&[("alice", Some("app")), ("alice", Some("other")), ("alice", None)])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let cleanups: Vec<(String, String)> = changing_scripts(&w)
+        .into_iter()
+        .filter(|(_, s)| plain(s).contains("DROP OWNED BY alice"))
+        .collect();
+    for (db, s) in &cleanups {
+        assert_quarantines(s, "alice");
+        assert!(!db.is_empty(), "{s}");
+    }
+    let dbs: BTreeSet<&str> = cleanups.iter().map(|(db, _)| db.as_str()).collect();
+    assert_eq!(dbs, BTreeSet::from(["app", "other", "postgres"]), "{cleanups:#?}");
+    assert!(!dropped(&w, "alice"));
+}
+
+/// MH-18 (amended), MH-10: a dropped login's objects are quarantined in every database with
+/// leftovers, before its `DROP ROLE`.
+#[tokio::test]
+async fn a_dropped_login_is_quarantined_in_every_database_before_the_drop() {
+    let (w, _journal) = worker();
+    let (branch, ep, _member) = setup(&w, &["billing"]).await;
+    let answer = Cat {
+        roles: &["!postgres", "billing"],
+        memberships: &[],
+        edges: &[],
+        passwords: &[],
+        databases: &[("app", "postgres"), ("other", "postgres")],
+    }
+    .answer();
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!(
+            "{answer}{}{}",
+            marked_lines("bob", &scram("bob"), Some(far()), &["billing"]),
+            leftovers(&[("bob", Some("app")), ("bob", Some("other"))])
+        ),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    let scripts = plain_scripts(&w);
+    let cleanups: Vec<usize> = scripts
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, s))| s.contains("DROP OWNED BY bob"))
+        .map(|(i, _)| i)
+        .collect();
+    let dbs: BTreeSet<&str> = cleanups.iter().map(|i| scripts[*i].0.as_str()).collect();
+    assert_eq!(dbs, BTreeSet::from(["app", "other"]), "{scripts:#?}");
+    for i in &cleanups {
+        assert_quarantines(&scripts[*i].1, "bob");
+    }
+    let gone = scripts
+        .iter()
+        .position(|(_, s)| s.contains("DROP ROLE IF EXISTS bob;") || s.contains("DROP ROLE bob;"))
+        .expect("bob is dropped");
+    assert!(cleanups.iter().all(|i| *i < gone), "{scripts:#?}");
+}
+
+/// MH-18 (amended): `chelabase_orphaned` is reserved: never a role a member role or personal
+/// login is granted (a grant naming it, the role in the catalog), never act-as, and a
+/// membership in it found in the catalog is revoked.
+#[tokio::test]
+async fn the_quarantine_role_is_never_granted() {
+    assert!(!grantable(ORPHANED_ROLE));
+    assert!(!grantable("Chelabase_Orphaned"));
+    assert!(chelabase_types::access::act_as_reserved(ORPHANED_ROLE));
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing", ORPHANED_ROLE]).await;
+    let id = db_of(&w, branch);
+    let role = member_role_name(member);
+    let verifier = row(&w, branch, member, "pw", &["billing"]);
+    let login = scram("pl");
+    live_record(&w, id, member, "alice", &login);
+    let answer = Cat {
+        roles: &["!postgres", "billing", ORPHANED_ROLE, &role],
+        memberships: &[(&role, "billing"), (&role, ORPHANED_ROLE)],
+        edges: &[],
+        passwords: &[(&role, &verifier)],
+        databases: &[("app", "postgres")],
+    }
+    .answer();
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &format!("{answer}{}", marked_lines("alice", &login, Some(far()), &[ORPHANED_ROLE])),
+    );
+    w.reconcile_member_roles(branch, None).await;
+    assert!(!granted_to(&w, &role).contains(ORPHANED_ROLE), "{:#?}", plain_scripts(&w));
+    assert!(!granted_to(&w, "alice").contains(ORPHANED_ROLE), "{:#?}", plain_scripts(&w));
+    let scripts = plain_scripts(&w);
+    script_at(&scripts, &format!("REVOKE {ORPHANED_ROLE} FROM {role}"));
+    script_at(&scripts, &format!("REVOKE {ORPHANED_ROLE} FROM alice"));
+}
+
+/// M5, plan P16 (b), S2: "Revoke Postgres access now" empties the member's
+/// `member_branch_roles.password_enc`; the next reconcile rotates the `cb_m_*` password and
+/// ends its sessions, and the row carries the fresh sealed password.
+#[tokio::test]
+async fn an_emptied_member_role_password_is_rotated_with_sessions_ended() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let role = member_role_name(member);
+    let old = row(&w, branch, member, "the old password", &["billing"]);
+    w.metadata.state().member_roles[0].password_enc = String::new();
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &Cat {
+            roles: &["!postgres", "billing", &role],
+            memberships: &[(&role, "billing")],
+            edges: &[],
+            passwords: &[(&role, &old)],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    );
+    assert!(done(&w.reconcile_member_roles(branch, None).await));
+    let sql = texts(&w);
+    let rotate = sql
+        .iter()
+        .find(|s| s.contains(&format!("ALTER ROLE {role} PASSWORD 'SCRAM-SHA-256$")))
+        .unwrap_or_else(|| panic!("the password is rotated: {sql:#?}"));
+    assert!(rotate.contains(&terminate_sql(&role)), "its sessions end: {rotate}");
+    let stored = w.metadata.state().member_roles[0].clone();
+    assert!(!stored.password_enc.is_empty(), "the row is sealed again");
+    let password =
+        open_member_role_password(&w.key, branch.as_uuid(), &role, &stored.password_enc).unwrap();
+    assert_ne!(password, "the old password");
+    let verifier = rotate.split('\'').nth(1).unwrap();
+    assert!(chelabase_neon::scram::verifies(verifier, &password));
 }

@@ -20,7 +20,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{AssertSqlSafe, Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::{DatabaseStatus, MetadataClient, MetadataError, NewEndpoint};
+use crate::{DatabaseStatus, MetadataClient, MetadataError, NewEndpoint, RoleOrigin};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -998,7 +998,9 @@ impl MetadataClient {
         .bind(ep.owner_verifier)
         .execute(&mut *tx)
         .await?;
-        for copy in ep.role_copies {
+        // S1: a personal row is never copied; a child's comes from its reconcile, for a login
+        // whose member qualifies there.
+        for copy in ep.role_copies.iter().filter(|c| c.origin != RoleOrigin::Personal) {
             sqlx::query(
                 "INSERT INTO neon_roles
                      (endpoint_id, name, scram_verifier, origin, password_enc, login, level,

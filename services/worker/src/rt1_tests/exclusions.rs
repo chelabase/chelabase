@@ -57,7 +57,8 @@ async fn the_login_role_api_refuses_the_realtime_role() {
     for outcome in [
         w.create_role(branch, &RoleSpec::login(REALTIME_ROLE, false))
             .await,
-        w.delete_role(branch, REALTIME_ROLE).await,
+        w.delete_role(branch, REALTIME_ROLE, crate::member_roles::QUARANTINE_ROLE)
+            .await,
     ] {
         assert!(
             matches!(outcome, RoleOutcome::Refused("reserved_role_name", _)),
@@ -78,7 +79,7 @@ fn member_roles_never_grant_the_realtime_role() {
     };
     let all = Grant {
         platform_role: PlatformRole::Admin,
-        roles: RoleSet::All,
+        roles: RoleSet::all(),
     };
     assert_eq!(
         granted_roles(&all, &catalog).0,

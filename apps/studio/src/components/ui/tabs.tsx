@@ -23,12 +23,12 @@ export interface TabsProps<T extends string> {
 export function Tabs<T extends string>({ label, items, value, onValueChange, children }: TabsProps<T>) {
   return (
     <TabsPrimitive.Root value={value} onValueChange={(next) => onValueChange(next as T)} className="space-y-6">
-      <TabsPrimitive.List aria-label={label} className="flex gap-1 border-b border-line">
+      <TabsPrimitive.List aria-label={label} className="flex gap-1 overflow-x-auto border-b border-line">
         {items.map((item) => (
           <TabsPrimitive.Tab
             key={item.id}
             value={item.id}
-            className="-mb-px border-b-2 border-transparent px-3 py-2 text-sm font-medium text-chalk-dim outline-none hover:text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand data-[active]:border-sand data-[active]:text-chalk"
+            className="-mb-px shrink-0 border-b-2 whitespace-nowrap border-transparent px-3 py-2 text-sm font-medium text-chalk-dim outline-none hover:text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand data-[active]:border-sand data-[active]:text-chalk"
           >
             {item.label}
           </TabsPrimitive.Tab>

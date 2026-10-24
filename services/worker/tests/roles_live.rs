@@ -33,6 +33,7 @@ use chelabase_types::{BranchId, DatabaseId};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use worker::config::RealWorker;
+use worker::member_roles::QUARANTINE_ROLE;
 use worker::roles::{RoleOutcome, RolePatch, RoleSpec};
 
 mod common;
@@ -361,6 +362,19 @@ impl Fx {
             .collect();
         rows.sort();
         rows
+    }
+}
+
+/// T10: a delete of a role that owned nothing.
+fn deleted_nothing() -> RoleOutcome {
+    RoleOutcome::Deleted(chelabase_nats::Reassigned::default())
+}
+
+/// T10: a done delete's [`chelabase_nats::Reassigned`]; panics on any other outcome.
+fn reassigned(outcome: RoleOutcome) -> chelabase_nats::Reassigned {
+    match outcome {
+        RoleOutcome::Deleted(r) => r,
+        other => panic!("the delete wasn't done: {other:?}"),
     }
 }
 
@@ -904,7 +918,7 @@ async fn quoted_names_work() {
             body["uri"]
         );
 
-        assert_eq!(fx.worker.delete_role(fx.main, name).await, RoleOutcome::Ok);
+        assert_eq!(fx.worker.delete_role(fx.main, name, QUARANTINE_ROLE).await, deleted_nothing());
         assert_eq!(fx.role_count(&fx.ep, name).await, "0");
         assert_eq!(fx.copies(&fx.ep).await, []);
         assert_refused(&fx.ep, &fx.database, name, &fresh).await;
@@ -2048,9 +2062,10 @@ async fn reset_of_an_sql_role_makes_it_revealable() {
     .await;
 }
 
+// T10: the default successor is the quarantine role (was: the owner).
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-async fn delete_refuses_login_and_hands_objects_to_the_owner() {
+async fn delete_refuses_login_and_quarantines_objects() {
     live(|fx| async move {
         fx.create(fx.main, "app", false).await;
         let pw = fx.password(fx.main, "app").await;
@@ -2088,8 +2103,10 @@ async fn delete_refuses_login_and_hands_objects_to_the_owner() {
         assert!(seen, "app's session never showed in pg_stat_activity");
 
         let started = Instant::now();
-        assert_eq!(fx.worker.delete_role(fx.main, "app").await, RoleOutcome::Ok);
+        let moved = reassigned(fx.worker.delete_role(fx.main, "app", QUARANTINE_ROLE).await);
         println!("delete took {:?}", started.elapsed());
+        assert_eq!(moved.count, 2, "app_t in each database: {moved:?}");
+        assert!(moved.definers.is_empty(), "{moved:?}");
 
         let ended = tokio::time::timeout(Duration::from_secs(10), session.wait())
             .await
@@ -2106,7 +2123,7 @@ async fn delete_refuses_login_and_hands_objects_to_the_owner() {
                     "SELECT tableowner FROM pg_tables WHERE tablename = 'app_t';",
                 )
                 .await;
-            assert_eq!(owner.trim(), "postgres", "app_t's owner in {db}");
+            assert_eq!(owner.trim(), QUARANTINE_ROLE, "app_t's owner in {db}");
         }
         assert_eq!(fx.copies(&fx.ep).await, []);
         assert_logs_in(&fx.ep, &fx.database, "postgres", &fx.owner_password).await;
@@ -2115,7 +2132,7 @@ async fn delete_refuses_login_and_hands_objects_to_the_owner() {
 }
 
 // I1: a database name that isn't a plain identifier (here one with a hyphen) doesn't block
-// the delete: psql reaches it, and the role's table in it moves to the owner.
+// the delete: psql reaches it, and the role's table in it moves to the quarantine role (T10).
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn delete_reaches_a_hyphenated_database() {
@@ -2129,7 +2146,8 @@ async fn delete_reaches_a_hyphenated_database() {
         )
         .await;
 
-        assert_eq!(fx.worker.delete_role(fx.main, "app").await, RoleOutcome::Ok);
+        let moved = reassigned(fx.worker.delete_role(fx.main, "app", QUARANTINE_ROLE).await);
+        assert_eq!(moved.count, 1, "{moved:?}");
 
         let owner = fx
             .sql_in(
@@ -2138,7 +2156,7 @@ async fn delete_reaches_a_hyphenated_database() {
                 "SELECT tableowner FROM pg_tables WHERE tablename = 'app_t';",
             )
             .await;
-        assert_eq!(owner.trim(), "postgres", "app_t's owner in my-app");
+        assert_eq!(owner.trim(), QUARANTINE_ROLE, "app_t's owner in my-app");
         assert_eq!(fx.role_count(&fx.ep, "app").await, "0");
     })
     .await;
@@ -2208,13 +2226,14 @@ async fn delete_owner_level_role_that_granted_memberships() {
         assert_eq!(fx.value(&fx.ep, &grantor("app")).await, "admin");
 
         let started = Instant::now();
-        let outcome = fx.worker.delete_role(fx.main, "admin").await;
+        let outcome = fx.worker.delete_role(fx.main, "admin", QUARANTINE_ROLE).await;
         println!("delete took {:?}", started.elapsed());
-        assert_eq!(outcome, RoleOutcome::Ok);
+        assert!(matches!(outcome, RoleOutcome::Deleted(_)), "{outcome:?}");
 
         assert_eq!(fx.role_count(&fx.ep, "admin").await, "0");
         // The group itself stays (roles have no owner to reassign); admin's database goes to
-        // the owner.
+        // the branch owner (T10 ruling: a database owned by the deleted role goes to the branch
+        // owner `postgres`; objects inside go to the successor).
         assert_eq!(fx.role_count(&fx.ep, "app_group").await, "1");
         assert_eq!(
             fx.value(
@@ -2232,6 +2251,298 @@ async fn delete_owner_level_role_that_granted_memberships() {
         );
         assert_logs_in(&fx.ep, &fx.database, "app", &app_pw).await;
         fx.assert_plain(&fx.ep, "app").await;
+    })
+    .await;
+}
+
+/// T10: whether PUBLIC holds EXECUTE on `public.<name>()` (`t`/`f`), its ACL read as Postgres
+/// applies it (a NULL ACL is the default, which grants PUBLIC EXECUTE).
+fn public_execute(name: &str) -> String {
+    format!(
+        "SELECT EXISTS (SELECT 1 FROM pg_proc p, \
+         aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a \
+         WHERE p.oid = 'public.{name}()'::regprocedure AND a.grantee = 0 \
+         AND a.privilege_type = 'EXECUTE');"
+    )
+}
+
+/// T10: a group role `planters` (made through the API, so the owner administers it) that owns
+/// a planted `SECURITY DEFINER` function, a plain function and a table, as a Developer acting
+/// as the group would leave them; and `heir`, a NOLOGIN role made through the API with a
+/// function of its own that PUBLIC may call.
+async fn planted(fx: &Fx) {
+    for name in ["planters", "heir"] {
+        let spec = RoleSpec { login: false, ..RoleSpec::login(name, false) };
+        assert_eq!(fx.worker.create_role(fx.main, &spec).await, RoleOutcome::Ok, "{name}");
+    }
+    fx.sql(
+        "GRANT CREATE ON SCHEMA public TO planters, heir;\n\
+         SET ROLE planters;\n\
+         CREATE FUNCTION public.planted() RETURNS text LANGUAGE sql SECURITY DEFINER \
+           AS $$SELECT current_user::text$$;\n\
+         CREATE FUNCTION public.plain_fn() RETURNS int LANGUAGE sql AS $$SELECT 1$$;\n\
+         CREATE TABLE public.planted_t (n int);\n\
+         RESET ROLE;\n\
+         SET ROLE heir;\n\
+         CREATE FUNCTION public.heirs_own() RETURNS int LANGUAGE sql AS $$SELECT 2$$;\n\
+         RESET ROLE;",
+    )
+    .await;
+    assert_eq!(fx.value_in_db(&public_execute("planted")).await, "t", "the default ACL");
+}
+
+impl Fx {
+    /// The first non-empty line of a one-value query in the main database.
+    async fn value_in_db(&self, sql: &str) -> String {
+        self.sql(sql)
+            .await
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or("")
+            .to_string()
+    }
+}
+
+// T10 (the C1 escalation in the generic delete): a SECURITY DEFINER function a group role
+// owns goes to the successor the Admin chose, never the owner; PUBLIC loses EXECUTE on what
+// moved (the successor's own functions keep theirs); the answer lists the definer for review.
+// Successors the owner can't SET to, owner-level ones (directly or through a membership) and
+// the owner itself are refused first, with nothing moved.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn delete_hands_a_planted_definer_to_the_chosen_successor() {
+    live(|fx| async move {
+        planted(&fx).await;
+        fx.create(fx.main, "boss", true).await;
+        // `stranger`: made by cloud_admin, so the owner can't SET to it. `climber`: the owner
+        // can SET to it, but it reaches the owner-level `boss`.
+        fx.sql(
+            "CREATE ROLE stranger NOLOGIN;\n\
+             CREATE ROLE climber NOLOGIN;\n\
+             GRANT climber TO postgres;\n\
+             GRANT boss TO climber;",
+        )
+        .await;
+        for successor in ["boss", "stranger", "climber", "postgres", "planters", "nobody_here"] {
+            let outcome = fx.worker.delete_role(fx.main, "planters", successor).await;
+            assert!(
+                matches!(outcome, RoleOutcome::Refused("invalid_successor", _)),
+                "{successor}: {outcome:?}"
+            );
+            assert_eq!(fx.role_count(&fx.ep, "planters").await, "1", "{successor}");
+            assert_eq!(
+                fx.value_in_db("SELECT proowner::regrole::text FROM pg_proc WHERE proname = 'planted';").await,
+                "planters",
+                "{successor}"
+            );
+        }
+
+        let moved = reassigned(fx.worker.delete_role(fx.main, "planters", "heir").await);
+
+        assert_eq!(moved.definers, ["public.planted()"], "{moved:?}");
+        assert_eq!(moved.count, 3, "two functions and a table: {moved:?}");
+        assert_eq!(fx.role_count(&fx.ep, "planters").await, "0");
+        assert_eq!(
+            fx.value_in_db(
+                "SELECT string_agg(proname || '=' || proowner::regrole::text, ',' ORDER BY proname) \
+                 FROM pg_proc WHERE proname IN ('planted', 'plain_fn', 'heirs_own');"
+            )
+            .await,
+            "heirs_own=heir,plain_fn=heir,planted=heir"
+        );
+        assert_eq!(
+            fx.value_in_db("SELECT tableowner FROM pg_tables WHERE tablename = 'planted_t';").await,
+            "heir"
+        );
+        assert_eq!(fx.value_in_db(&public_execute("planted")).await, "f", "planted");
+        assert_eq!(fx.value_in_db(&public_execute("plain_fn")).await, "f", "plain_fn");
+        assert_eq!(fx.value_in_db(&public_execute("heirs_own")).await, "t", "heir's own keeps PUBLIC");
+        // Nothing went to the owner.
+        assert_eq!(
+            fx.value_in_db(
+                "SELECT count(*) FROM pg_proc WHERE proname IN ('planted', 'plain_fn') \
+                 AND proowner = 'postgres'::regrole;"
+            )
+            .await,
+            "0"
+        );
+    })
+    .await;
+}
+
+// T10: with no successor named, the quarantine role (C1's) receives the planted function: made
+// NOLOGIN with no members, PUBLIC's EXECUTE revoked, the definer listed.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn delete_quarantines_a_planted_definer_by_default() {
+    live(|fx| async move {
+        planted(&fx).await;
+
+        let moved = reassigned(fx.worker.delete_role(fx.main, "planters", QUARANTINE_ROLE).await);
+
+        assert_eq!(moved.definers, ["public.planted()"], "{moved:?}");
+        assert_eq!(
+            fx.value_in_db("SELECT proowner::regrole::text FROM pg_proc WHERE proname = 'planted';").await,
+            QUARANTINE_ROLE
+        );
+        assert_eq!(fx.value_in_db(&public_execute("planted")).await, "f");
+        assert_eq!(fx.value_in_db(&public_execute("plain_fn")).await, "f");
+        assert_eq!(
+            fx.value(
+                &fx.ep,
+                &format!(
+                    "SELECT rolcanlogin::text || ',' || rolsuper::text || ',' || \
+                     (SELECT count(*) FROM pg_auth_members m WHERE m.roleid = r.oid OR m.member = r.oid) \
+                     FROM pg_roles r WHERE rolname = {};",
+                    literal(QUARANTINE_ROLE)
+                )
+            )
+            .await,
+            "false,false,0"
+        );
+        assert_eq!(fx.role_count(&fx.ep, "planters").await, "0");
+    })
+    .await;
+}
+
+/// T10 fix: [`planted`], then what `planters` exposes: its definer `planted()` granted to
+/// `anon`, and a view without `security_invoker` over its table granted to PUBLIC. Not
+/// exposures, also made: a plain function and the table granted to `anon`, and (Postgres 15+)
+/// an invoker view (`security_invoker = on`, a spelling other than `true`) granted to `anon`.
+/// Answers the exposures as the preview lists them.
+async fn exposed(fx: &Fx) -> Vec<chelabase_nats::Exposure> {
+    use chelabase_nats::{Exposure, ExposureKind};
+    planted(fx).await;
+    let version: u32 = fx
+        .value_in_db("SHOW server_version_num;")
+        .await
+        .parse()
+        .expect("server_version_num");
+    let invoker = if version >= 150000 {
+        "CREATE VIEW public.invoker_v WITH (security_invoker = on) AS SELECT n FROM public.planted_t;\n\
+         GRANT SELECT ON public.invoker_v TO anon;\n"
+    } else {
+        ""
+    };
+    fx.sql(&format!(
+        "SET ROLE planters;\n\
+         GRANT EXECUTE ON FUNCTION public.planted() TO anon;\n\
+         GRANT EXECUTE ON FUNCTION public.plain_fn() TO anon;\n\
+         GRANT SELECT ON public.planted_t TO anon;\n\
+         CREATE VIEW public.planted_v AS SELECT n FROM public.planted_t;\n\
+         GRANT SELECT ON public.planted_v TO PUBLIC;\n\
+         {invoker}\
+         RESET ROLE;"
+    ))
+    .await;
+    vec![
+        Exposure {
+            database: fx.database.clone(),
+            kind: ExposureKind::Function,
+            identity: "public.planted()".into(),
+            grantees: vec!["anon".into()],
+        },
+        Exposure {
+            database: fx.database.clone(),
+            kind: ExposureKind::View,
+            identity: "public.planted_v".into(),
+            grantees: vec!["PUBLIC".into()],
+        },
+    ]
+}
+
+/// T10 fix: a preview's [`chelabase_nats::DeletePreview`]; panics on any other outcome.
+fn previewed(outcome: RoleOutcome) -> chelabase_nats::DeletePreview {
+    match outcome {
+        RoleOutcome::Preview(p) => p,
+        other => panic!("not a preview: {other:?}"),
+    }
+}
+
+// T10 fix (user ruling 2026-10-23: preview, then confirm): a definer function granted to anon
+// and a non-invoker view granted to PUBLIC would run with the named successor's rights. The
+// preview lists them with a token and changes nothing; a delete without the token, or with a
+// wrong one, is refused with the current preview and moves nothing; with the token it's done,
+// lists what it kept, and keeps the grants (PUBLIC's EXECUTE on the routines is still revoked).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn delete_to_a_named_successor_needs_the_previews_token() {
+    live(|fx| async move {
+        let list = exposed(&fx).await;
+        let owner_of_planted = "SELECT proowner::regrole::text FROM pg_proc WHERE proname = 'planted';";
+
+        let preview = previewed(fx.worker.preview_role_delete(fx.main, "planters", "heir").await);
+
+        let token = chelabase_nats::exposure_token("heir", &list);
+        assert_eq!(
+            preview,
+            chelabase_nats::DeletePreview {
+                successor: "heir".into(),
+                exposures: list.clone(),
+                confirm: Some(token.clone()),
+            }
+        );
+        assert_eq!(fx.value_in_db(owner_of_planted).await, "planters", "a preview changes nothing");
+
+        for confirm in [None, Some("0".repeat(64)), Some(chelabase_nats::exposure_token("heir", &list[..1]))] {
+            let outcome = fx.worker.delete_role_with(fx.main, "planters", "heir", confirm.as_deref()).await;
+            assert_eq!(outcome, RoleOutcome::Unconfirmed(preview.clone()), "{confirm:?}");
+            assert_eq!(fx.role_count(&fx.ep, "planters").await, "1", "{confirm:?}");
+            assert_eq!(fx.value_in_db(owner_of_planted).await, "planters", "{confirm:?}");
+        }
+
+        let moved = reassigned(fx.worker.delete_role_with(fx.main, "planters", "heir", Some(&token)).await);
+
+        assert_eq!(moved.confirmed, list, "{moved:?}");
+        assert_eq!(moved.definers, ["public.planted()"], "{moved:?}");
+        assert_eq!(fx.role_count(&fx.ep, "planters").await, "0");
+        assert_eq!(fx.value_in_db(owner_of_planted).await, "heir");
+        assert_eq!(
+            fx.value_in_db("SELECT relowner::regrole::text FROM pg_class WHERE oid = 'public.planted_v'::regclass;").await,
+            "heir"
+        );
+        // The grants stay, now with the successor's rights behind them.
+        assert_eq!(
+            fx.value_in_db("SELECT has_function_privilege('anon', 'public.planted()', 'EXECUTE');").await,
+            "t"
+        );
+        assert_eq!(fx.value_in_db(&public_execute("planted")).await, "f", "PUBLIC's EXECUTE is still revoked");
+        assert_eq!(
+            fx.value_in_db(
+                "SELECT EXISTS (SELECT 1 FROM pg_class c, aclexplode(c.relacl) a \
+                 WHERE c.oid = 'public.planted_v'::regclass AND a.grantee = 0 AND a.privilege_type = 'SELECT');"
+            )
+            .await,
+            "t"
+        );
+        assert_eq!(fx.value_in_db("SELECT public.planted();").await, "heir");
+    })
+    .await;
+}
+
+// T10 fix: the quarantine role never needs a token: its preview lists the same exposures with
+// none, and the delete without one is done, keeping nothing on confirmation.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn delete_to_the_quarantine_role_needs_no_token() {
+    live(|fx| async move {
+        let list = exposed(&fx).await;
+
+        let preview = previewed(fx.worker.preview_role_delete(fx.main, "planters", QUARANTINE_ROLE).await);
+
+        assert_eq!(preview.successor, QUARANTINE_ROLE);
+        assert_eq!(preview.exposures, list);
+        assert_eq!(preview.confirm, None);
+
+        let moved = reassigned(fx.worker.delete_role(fx.main, "planters", QUARANTINE_ROLE).await);
+
+        assert!(moved.confirmed.is_empty(), "{moved:?}");
+        assert_eq!(fx.role_count(&fx.ep, "planters").await, "0");
+        assert_eq!(
+            fx.value_in_db("SELECT proowner::regrole::text FROM pg_proc WHERE proname = 'planted';").await,
+            QUARANTINE_ROLE
+        );
     })
     .await;
 }
@@ -2688,6 +2999,80 @@ async fn role_sessions_lists_the_live_connections() {
         assert_eq!(body["count"], 0, "{body}");
 
         child.kill().await.ok();
+    })
+    .await;
+}
+
+/// final B2 (EOS-H1, fail closed, via the worker): the all-rows check on a real compute. The
+/// hub's "all rows" policy (permissive, FOR ALL, one role, `USING (true) WITH CHECK (true)`,
+/// commented `chelabase:all_rows`) on a table of a second database is found; a key role that
+/// reaches its role (through a role whose name needs quoting) is exposed with the chain, a
+/// membership change counts only what it adds, and a policy without the marker isn't the hub's.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn all_rows_check_reads_every_database_on_a_real_compute() {
+    use chelabase_nats::{AllRowsCheckReply, AllRowsCheckRequest, MembershipChange};
+    live(|fx| async move {
+        let odd = "aro mid|\"q\"";
+        fx.sql_in(
+            &fx.ep,
+            "postgres",
+            &format!(
+                "CREATE ROLE aro_r NOLOGIN; CREATE ROLE aro_k NOLOGIN; CREATE ROLE aro_n NOLOGIN; \
+                 CREATE ROLE {} NOLOGIN; GRANT aro_r TO {}; GRANT {} TO aro_k;",
+                ident(odd),
+                ident(odd),
+                ident(odd)
+            ),
+        )
+        .await;
+        fx.sql_in(&fx.ep, "postgres", "CREATE DATABASE aro_other").await;
+        fx.sql_in(
+            &fx.ep,
+            "aro_other",
+            "CREATE TABLE public.notes (id int); \
+             ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY everything ON public.notes AS PERMISSIVE FOR ALL TO aro_r USING (true) WITH CHECK (true); \
+             COMMENT ON POLICY everything ON public.notes IS 'chelabase:all_rows'; \
+             CREATE POLICY lookalike ON public.notes AS PERMISSIVE FOR ALL TO aro_n USING (true) WITH CHECK (true);",
+        )
+        .await;
+        let ask = |starting: &[&str], change: Option<MembershipChange>| AllRowsCheckRequest {
+            branch_id: fx.main,
+            starting: starting.iter().map(|r| r.to_string()).collect(),
+            change,
+        };
+        let chain = |roles: &[&str]| AllRowsCheckReply::Exposed {
+            chain: roles.iter().map(|r| r.to_string()).collect(),
+        };
+
+        assert_eq!(
+            fx.worker.all_rows_check(ask(&["aro_k"], None)).await,
+            chain(&["aro_k", odd, "aro_r"])
+        );
+        assert_eq!(
+            fx.worker.all_rows_check(ask(&["aro_n"], None)).await,
+            AllRowsCheckReply::Clear,
+            "a policy without the marker isn't the hub's"
+        );
+        let join = MembershipChange { role: "aro_n".into(), member_of: vec!["aro_r".into()] };
+        assert_eq!(
+            fx.worker.all_rows_check(ask(&["anon", "aro_n"], Some(join))).await,
+            chain(&["aro_n", "aro_r"])
+        );
+        let again = MembershipChange { role: odd.into(), member_of: vec!["aro_r".into()] };
+        assert_eq!(
+            fx.worker.all_rows_check(ask(&["anon", "aro_k"], Some(again))).await,
+            AllRowsCheckReply::Clear,
+            "already exposed before the change"
+        );
+        fx.sql_in(&fx.ep, "postgres", "DROP DATABASE aro_other").await;
+        fx.sql_in(
+            &fx.ep,
+            "postgres",
+            &format!("DROP ROLE aro_k; DROP ROLE {}; DROP ROLE aro_n; DROP ROLE aro_r;", ident(odd)),
+        )
+        .await;
     })
     .await;
 }

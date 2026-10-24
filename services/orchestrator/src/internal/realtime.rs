@@ -10,6 +10,8 @@
 //!   the body's shape.
 //! - `POST /internal/realtime/projects {token}`: the projects (and their live databases) the
 //!   member may see, for realtime's project channels.
+//! - `POST /internal/realtime/member {sub, org_id}` (T8-1, D7): may this person get a Studio
+//!   ticket now? `{allowed}` (with `reason: "forbidden"` when not).
 //! - `POST /internal/realtime/visible {…}`: the owner's privilege probe and key conversion
 //!   (R19, W2, W4, P7, S12) on the console's owner pool, by relation OID with the keys bound.
 //!   With `convert: true` (T8, owner deletes) it only prints `keys` in the owner session's form
@@ -29,7 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router, middleware};
 use chelabase_auth::{AuthError, JwtVerifier, VerifiedClaims};
-use chelabase_metadata::members::MemberStatus;
+
 use chelabase_metadata::{BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseRecord};
 use chelabase_nats::rt::{AccessEvent, ProjectEvent};
 use chelabase_query::realtime as checks;
@@ -128,6 +130,8 @@ pub(crate) fn project_changed(events: &SharedRtEvents, project: ProjectId, event
 pub const AUTHORIZE_PATH: &str = "/internal/realtime/authorize";
 pub const PROJECTS_PATH: &str = "/internal/realtime/projects";
 pub const VISIBLE_PATH: &str = "/internal/realtime/visible";
+/// T8-1, D7: may this person get a Studio ticket now?
+pub const MEMBER_PATH: &str = "/internal/realtime/member";
 
 /// `/visible`'s body limit: [`checks::MAX_KEYS`] keys and as many to convert, each of long
 /// texts (a composite text key near the btree limit is about 2.7 kB), past axum's 2 MB default.
@@ -144,6 +148,7 @@ where
     Router::new()
         .route(AUTHORIZE_PATH, post(authorize_route::<M, J>))
         .route(PROJECTS_PATH, post(projects_route::<M, J>))
+        .route(MEMBER_PATH, post(member_route::<M, J>))
         .route(
             VISIBLE_PATH,
             post(visible_route::<M, J>).layer(DefaultBodyLimit::max(VISIBLE_BODY_LIMIT)),
@@ -277,7 +282,7 @@ where
     // R10: only an active member watches anything. Anyone else (no row, invited, pending,
     // removed) is refused before the target is looked at, so the answer never tells an
     // existing target from a missing one.
-    if !principal.member.as_ref().is_some_and(|m| m.status == MemberStatus::Active) {
+    if !principal.member.as_ref().is_some_and(|m| m.in_good_standing()) {
         return Err(Refusal::Forbidden);
     }
     let target = Target::Role {
@@ -394,7 +399,8 @@ where
     };
     // Only an active member sees projects (a pending, invited or removed one, or a person with
     // no row, is refused like a non-member).
-    let Some(member) = principal.member.as_ref().filter(|m| m.status == MemberStatus::Active) else {
+    // D7: an offboarded one too.
+    let Some(member) = principal.member.as_ref().filter(|m| m.in_good_standing()) else {
         return Refusal::Forbidden.response();
     };
     let unavailable = |what: &str, err: &dyn std::fmt::Display| {
@@ -406,9 +412,14 @@ where
         Err(err) => return unavailable("list projects", &err),
     };
     if !member.tenant_admin {
-        let granted = match state.metadata.member_projects(member.id).await {
+        // T2-4: every access source, not the own grants alone.
+        let granted = match state
+            .metadata
+            .member_grant_sources(principal.tenant_id, member.id)
+            .await
+        {
             Ok(g) => g,
-            Err(err) => return unavailable("member projects", &err),
+            Err(err) => return unavailable("member grant sources", &err),
         };
         projects.retain(|p| granted.iter().any(|(id, _)| *id == p.id.as_uuid()));
     }
@@ -424,6 +435,50 @@ where
         }));
     }
     Json(json!({ "tenant_id": principal.tenant_id.as_uuid(), "projects": out })).into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MemberBody {
+    sub: String,
+    org_id: String,
+}
+
+/// T8-1, D7: realtime asks before it issues a Studio ticket, with the gateway's identity
+/// (`sub`, `org_id`). `{allowed: true}` only for a member of the org's tenant in good standing
+/// (active, not offboarded); a suspended, offboarded, pending, invited or removed member, a
+/// person with no row, or an org no tenant is bound to is `{allowed: false, reason:
+/// "forbidden"}`. The member is read, never made. A metadata failure is 503.
+async fn member_route<M, J>(State(state): State<Arc<AppState<M, J>>>, bytes: Bytes) -> Response
+where
+    M: MetadataPort,
+    J: JobPort,
+{
+    let request: MemberBody = match body(&bytes) {
+        Ok(b) => b,
+        Err(bad) => return bad.into_response(),
+    };
+    let refused = || {
+        Json(json!({ "allowed": false, "reason": Refusal::Forbidden.reason() })).into_response()
+    };
+    let tenant = match state.metadata.get_tenant_by_zitadel_org_id(&request.org_id).await {
+        Ok(Some(tenant)) => tenant,
+        Ok(None) => return refused(),
+        Err(err) => {
+            warn!("realtime member check: the tenant lookup failed: {err}");
+            return Refusal::Unavailable.response();
+        }
+    };
+    match state.metadata.member_by_zitadel(tenant, &request.sub).await {
+        Ok(Some(member)) if member.in_good_standing() => {
+            Json(json!({ "allowed": true })).into_response()
+        }
+        Ok(_) => refused(),
+        Err(err) => {
+            warn!("realtime member check: reading the member failed: {err}");
+            Refusal::Unavailable.response()
+        }
+    }
 }
 
 #[derive(Deserialize)]

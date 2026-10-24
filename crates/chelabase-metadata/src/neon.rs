@@ -483,6 +483,9 @@ pub enum RenameCopyOutcome {
     Renamed { row: bool, was_unreadable: bool },
     /// The new name has a row, or live secret keys of a role dropped earlier: nothing moved.
     Taken,
+    /// T3-M1: `old` is a personal login's row, which belongs to its record (S1): refused,
+    /// nothing moved, keys included.
+    Personal,
     /// No such endpoint: nothing moved.
     NotFound,
 }
@@ -725,7 +728,8 @@ impl MetadataClient {
     }
 
     /// `None` for an unknown endpoint; `Some(None)` for a known endpoint without that role, or
-    /// whose row has no SCRAM verifier (an MD5 role). Routable or not: anything serving the
+    /// whose row has no SCRAM verifier (an MD5 role, or a personal login whose record is revoked
+    /// or expired, MH-9). Routable or not: anything serving the
     /// proxy uses [`MetadataClient::routable_role_secret`] (P4).
     pub async fn neon_role_secret(
         &self,
@@ -750,9 +754,18 @@ impl MetadataClient {
         role: &str,
         routable_only: bool,
     ) -> Result<Option<Option<String>>, MetadataError> {
+        // MH-9, I1: a personal row answers its record's verifier, never its own (a worker write
+        // racing a reset can leave a row stale or empty), and only while the record is live (not
+        // revoked, not past `valid_until`), judged in this same statement.
         let row: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT r.scram_verifier FROM neon_endpoints e
+            "SELECT CASE WHEN r.origin = 'personal' THEN l.scram_verifier
+                         ELSE r.scram_verifier END
+             FROM neon_endpoints e
              LEFT JOIN neon_roles r ON r.endpoint_id = e.id AND r.name = $2
+             LEFT JOIN personal_logins l
+               ON r.origin = 'personal' AND l.member_id = r.member_id
+              AND l.database_id = r.personal_database_id AND l.role_name = r.name
+              AND l.revoked_at IS NULL AND l.valid_until > now()
              WHERE e.id = $1 AND (e.routable OR NOT $3)",
         )
         .bind(endpoint_id)
@@ -1451,7 +1464,10 @@ impl MetadataClient {
         .fetch_optional(&mut *tx)
         .await?;
         let counted = match &current {
-            Some((origin, _)) if origin == "owner" => return Ok(RoleWriteOutcome::NotFound),
+            // S1: a personal row is its record's, never the API's.
+            Some((origin, _)) if origin == "owner" || origin == "personal" => {
+                return Ok(RoleWriteOutcome::NotFound);
+            }
             Some((_, verifier)) => verifier.is_some(),
             None => false,
         };
@@ -1465,7 +1481,7 @@ impl MetadataClient {
              ON CONFLICT (endpoint_id, name) DO UPDATE SET
                  scram_verifier = EXCLUDED.scram_verifier, password_enc = EXCLUDED.password_enc,
                  login = true, pending = true, password_unreadable = false, no_password = false
-             WHERE r.origin <> 'owner'",
+             WHERE r.origin NOT IN ('owner', 'personal')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1499,7 +1515,7 @@ impl MetadataClient {
         let updated = sqlx::query(
             "UPDATE neon_roles SET scram_verifier = $3, password_enc = $4, pending = true,
                  password_unreadable = false, no_password = false
-             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1542,7 +1558,7 @@ impl MetadataClient {
             sqlx::query(
                 "UPDATE neon_roles SET attributes_pending = false
                  WHERE endpoint_id = $1 AND name = $2 AND attributes_pending
-                   AND attributes_change_id = $3",
+                   AND attributes_change_id = $3 AND origin <> 'personal'",
             )
             .bind(endpoint_id)
             .bind(name)
@@ -1556,7 +1572,7 @@ impl MetadataClient {
         }
         let cleared = sqlx::query(
             "UPDATE neon_roles SET pending = false
-             WHERE endpoint_id = $1 AND name = $2 AND pending",
+             WHERE endpoint_id = $1 AND name = $2 AND pending AND origin <> 'personal'",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1585,7 +1601,8 @@ impl MetadataClient {
             return Ok(false);
         }
         let deleted = sqlx::query(
-            "DELETE FROM neon_roles WHERE endpoint_id = $1 AND name = $2 AND origin <> 'owner'",
+            "DELETE FROM neon_roles
+             WHERE endpoint_id = $1 AND name = $2 AND origin NOT IN ('owner', 'personal')",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1647,6 +1664,19 @@ impl MetadataClient {
         .await?;
         if taken {
             return Ok(RenameCopyOutcome::Taken);
+        }
+        // S1: a personal row is its record's (its name is the record's, by FK): nothing moves,
+        // keys included.
+        let personal: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM neon_roles
+                            WHERE endpoint_id = $1 AND name = $2 AND origin = 'personal')",
+        )
+        .bind(endpoint_id)
+        .bind(old)
+        .fetch_one(&mut *tx)
+        .await?;
+        if personal {
+            return Ok(RenameCopyOutcome::Personal);
         }
         let was_unreadable: Option<bool> = sqlx::query_scalar(
             "SELECT password_unreadable FROM neon_roles
@@ -1718,7 +1748,7 @@ impl MetadataClient {
         }
         sqlx::query(
             "UPDATE neon_roles SET password_enc = NULL, password_unreadable = true
-             WHERE endpoint_id = $1 AND name = $2",
+             WHERE endpoint_id = $1 AND name = $2 AND origin <> 'personal'",
         )
         .bind(endpoint_id)
         .bind(name)
@@ -1736,7 +1766,8 @@ impl MetadataClient {
     /// `connection_limit`, `valid_until`, `bypass_rls`, `member_of`) still update. Every
     /// upserted row's `attributes_pending` is cleared, and an `api` row takes the upsert's
     /// `api_owner_level` when it carries one (E32: the catalog's). The owner's row is never
-    /// touched. It sets the branch's `branch_databases` to exactly
+    /// touched, nor is a personal row (S1): an upsert of origin `personal` is skipped, and an
+    /// upsert or removal of a personal row's name leaves it. It sets the branch's `branch_databases` to exactly
     /// `write.databases`. A database's origin is
     /// `system` when observed as system, `main` for the recorded main database's name
     /// (`neon_databases`), `sql` otherwise. `roles_version += 1` when anything changed (the
@@ -1759,7 +1790,10 @@ impl MetadataClient {
             return Ok(ResyncApplied::VersionMoved);
         }
         let mut changed = Vec::new();
-        for up in &write.upserts {
+        // S1 / MH-10: personal rows are their records' alone. A personal upsert is skipped,
+        // and an upsert of a name whose row is personal leaves it as it is (no flip to `sql`,
+        // no catalog verifier written back, MH-9).
+        for up in write.upserts.iter().filter(|u| u.origin != RoleOrigin::Personal) {
             let (mode, sealed) = match &up.password_enc {
                 SealedChange::Keep => (0_i32, None),
                 SealedChange::Clear => (1, None),
@@ -1795,17 +1829,14 @@ impl MetadataClient {
                      member_no_set = EXCLUDED.member_no_set,
                      member_admin = EXCLUDED.member_admin,
                      attributes_pending = false,
-                     origin = CASE WHEN r.origin = 'personal' AND EXCLUDED.origin = 'sql'
-                                   THEN 'sql' ELSE r.origin END,
                      api_owner_level = CASE WHEN r.origin = 'api' AND $15::bool IS NOT NULL
                                             THEN $15 ELSE r.api_owner_level END,
                      password_unreadable = CASE WHEN NOT {held}
                                                   AND (r.scram_verifier IS DISTINCT FROM EXCLUDED.scram_verifier
                                                        OR $7::int <> 0)
                                                 THEN false ELSE r.password_unreadable END
-                 WHERE r.origin <> 'owner'
+                 WHERE r.origin NOT IN ('owner', 'personal')
                    AND (r.level IS DISTINCT FROM EXCLUDED.level
-                        OR (r.origin = 'personal' AND EXCLUDED.origin = 'sql')
                         OR r.pending IS DISTINCT FROM EXCLUDED.pending
                         OR r.attributes_pending
                         OR (r.origin = 'api' AND $15::bool IS NOT NULL

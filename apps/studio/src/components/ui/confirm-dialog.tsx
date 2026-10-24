@@ -28,7 +28,7 @@ export function ConfirmDialog({ open, onOpenChange, title, body, confirm, tone =
         <AlertDialog.Backdrop className={backdrop} />
         <AlertDialog.Popup finalFocus={finalFocus} className={cn(popupFrame, popupSurface, "w-[28rem] space-y-4")}>
           <AlertDialog.Title className="text-lg font-semibold text-balance">{title}</AlertDialog.Title>
-          <AlertDialog.Description className="text-sm text-chalk">{body}</AlertDialog.Description>
+          <AlertDialog.Description render={<div />} className="space-y-2 text-sm text-chalk">{body}</AlertDialog.Description>
           {error && (
             <p role="alert" className="text-sm text-coral">
               {error}

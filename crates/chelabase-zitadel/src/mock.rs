@@ -138,6 +138,8 @@ impl MockZitadel {
             .route("/v2/users/{id}/authentication_methods", get(authentication_methods))
             .route("/v2/users/{id}/deactivate", post(deactivate))
             .route("/v2/users/{id}/reactivate", post(reactivate))
+            .route("/v2/users/{id}/lock", post(lock))
+            .route("/v2/users/{id}/unlock", post(unlock))
             .route("/v2/users/{id}/email", post(set_email))
             .route("/v2/users/{id}/email/verify", post(verify_email))
             .route("/v2/users/{id}/email/resend", post(resend))
@@ -610,6 +612,32 @@ async fn deactivate(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
 
 async fn reactivate(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
     set_active(s, headers, id, false).await
+}
+
+/// `POST /v2/users/{id}/lock` and `/unlock`: as `set_active`, a precondition refusal (400) when
+/// the user is already in that state, 404 for an unknown user.
+async fn set_locked(s: S, headers: HeaderMap, id: String, locked: bool) -> Reply {
+    let mut inner = s.lock().unwrap();
+    if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    match inner.users.iter_mut().find(|u| u.id == id) {
+        Some(u) if locked && u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyLocked"),
+        Some(u) if !locked && !u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.NotLocked"),
+        Some(u) => {
+            u.locked = locked;
+            ok(json!({}))
+        }
+        None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
+    }
+}
+
+async fn lock(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
+    set_locked(s, headers, id, true).await
+}
+
+async fn unlock(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
+    set_locked(s, headers, id, false).await
 }
 
 async fn set_email(

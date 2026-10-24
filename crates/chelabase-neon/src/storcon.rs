@@ -891,4 +891,64 @@ mod tests {
         }
         assert!(jitter(Duration::MAX) <= Duration::from_nanos(u64::MAX));
     }
+
+    /// I2/P6/H1 under a paused clock (no I/O, so no wall-clock flakiness): a retried error that
+    /// takes a whole request timeout each time (a tenant create timing out against the
+    /// `storcon_mock` test's server) stops at the budget, overrunning it by at most one
+    /// attempt, after more than one attempt, each with the request timeout (below what is left
+    /// of the budget), and the error says how many attempts it took.
+    #[tokio::test(start_paused = true)]
+    async fn retries_of_a_slow_failure_stop_at_the_budget() {
+        let request_timeout = Duration::from_millis(50);
+        let budget = Duration::from_millis(400);
+        let client = StorconClient::new("http://unused.invalid", 1).with_schedule_retry(
+            Duration::from_millis(1),
+            Duration::from_millis(5),
+            budget,
+        );
+        let tenant = NeonId::new();
+        let started = Instant::now();
+        let attempts = std::sync::Mutex::new(Vec::new());
+        let err = client
+            .retry_transient::<(), _>(
+                "create tenant",
+                &tenant,
+                |_| true,
+                budget,
+                request_timeout,
+                |timeout| {
+                    attempts.lock().unwrap().push((started.elapsed(), timeout));
+                    async move {
+                        tokio::time::sleep(timeout).await;
+                        Err(StorconError::Other(
+                            ServerError {
+                                status: StatusCode::GATEWAY_TIMEOUT,
+                                message: "timed out".into(),
+                            }
+                            .into(),
+                        ))
+                    }
+                },
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        let attempts = attempts.into_inner().unwrap();
+        assert!(attempts.len() > 1, "{attempts:?}");
+        assert!(
+            attempts.iter().all(|(_, t)| *t == request_timeout),
+            "{attempts:?}"
+        );
+        assert!(
+            attempts.iter().all(|(at, _)| *at <= budget),
+            "no attempt starts past the budget: {attempts:?}"
+        );
+        assert!(elapsed >= budget, "{elapsed:?}");
+        assert!(elapsed <= budget + request_timeout, "{elapsed:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains(&format!("(after {} attempts", attempts.len())),
+            "{text}"
+        );
+    }
 }

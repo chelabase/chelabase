@@ -39,7 +39,7 @@ const memberMe: Me = {
 function member(id: string, extra: Partial<Member>): Member {
   return {
     id, email: `${id}@example.test`, display_name: id, status: "active", tenant_admin: false, has_access: true,
-    invite: null, accepted_at: null, created_at: "2026-10-01T00:00:00Z", ...extra,
+    invite: null, accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z", access: { level: "none", projects: [] }, ...extra,
   };
 }
 
@@ -100,13 +100,13 @@ describe("MembersPage", () => {
     });
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-    await userEvent.type(within(dialog).getByLabelText("Email"), "not-an-email");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "not-an-email");
     await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
     expect(within(dialog).getByText("Enter an email address.")).toBeInTheDocument();
     expect(call(f, "POST", "/v1/invites")).toBeUndefined();
 
-    await userEvent.clear(within(dialog).getByLabelText("Email"));
-    await userEvent.type(within(dialog).getByLabelText("Email"), "  New@Example.test ");
+    await userEvent.clear(within(dialog).getByLabelText("Emails"));
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "  New@Example.test ");
     await userEvent.click(within(dialog).getByRole("button", { name: "Add a project" }));
     // The only project is used now: no second row can be added.
     expect(within(dialog).getByRole("button", { name: "Add a project" })).toBeDisabled();
@@ -164,7 +164,7 @@ describe("MembersPage", () => {
     expect(await within(dialog).findByText(/Email isn't set up on this instance/)).toBeInTheDocument();
     // Without email, only the link is offered.
     expect(within(dialog).queryByRole("radio", { name: /^Email/ })).toBeNull();
-    await userEvent.type(within(dialog).getByLabelText("Email"), "new@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "new@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
     const panel = await screen.findByRole("dialog", { name: "Invite link for new@example.test" });
     expect(within(panel).getByDisplayValue(url)).toBeInTheDocument();
@@ -210,7 +210,7 @@ describe("MembersPage", () => {
     setup();
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-    await userEvent.type(within(dialog).getByLabelText("Email"), "kept@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "kept@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Add a project" }));
     // The project has no ready database: the popup shows only the "No roles" status.
     await userEvent.click(within(dialog).getByLabelText("Postgres roles"));
@@ -218,7 +218,7 @@ describe("MembersPage", () => {
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(screen.queryByText(/No roles to grant yet/)).toBeNull());
     expect(screen.getByRole("dialog", { name: "Invite people" })).toBeInTheDocument();
-    expect(within(screen.getByRole("dialog", { name: "Invite people" })).getByLabelText("Email")).toHaveValue("kept@example.test");
+    expect(within(screen.getByRole("dialog", { name: "Invite people" })).getByLabelText("Emails")).toHaveValue("kept@example.test");
   });
 
   it("invite_link_refused_says_send_by_email", async () => {
@@ -231,7 +231,7 @@ describe("MembersPage", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
     await userEvent.click(await within(dialog).findByRole("radio", { name: /One-time link/ }));
-    await userEvent.type(within(dialog).getByLabelText("Email"), "old@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "old@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
     expect(await within(dialog).findByText(/old@example.test already has a way to sign in/)).toBeInTheDocument();
     expect(within(dialog).getByRole("radio", { name: /^Email/ })).toBeChecked();
@@ -485,7 +485,7 @@ describe("MembersPage", () => {
     });
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-    await userEvent.type(within(dialog).getByLabelText("Email"), "new@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "new@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Add a project" }));
     await userEvent.click(within(dialog).getByRole("button", { name: "Add a project" }));
     await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
@@ -532,12 +532,12 @@ describe("MembersPage", () => {
     });
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-    await userEvent.type(within(dialog).getByLabelText("Email"), "new@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "new@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Add a project" }));
     const blog = await within(dialog).findByRole("group", { name: "Blog" });
     await userEvent.click(within(blog).getByLabelText("Postgres roles"));
     await userEvent.click(await screen.findByRole("option", { name: /reports/ }));
-    await userEvent.click(within(dialog).getByLabelText("Email"));
+    await userEvent.click(within(dialog).getByLabelText("Emails"));
     await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
     const inline = await within(blog).findByTestId("refused-role-detail");
     expect(inline).toHaveTextContent("reports → svc");
@@ -557,7 +557,7 @@ describe("MembersPage", () => {
     setup({ routes: { "POST /v1/invites": ok({ error: { code: "conflict", message: "something else entirely" } }, 409) } });
     await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
     const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-    await userEvent.type(within(dialog).getByLabelText("Email"), "x@example.test");
+    await userEvent.type(within(dialog).getByLabelText("Emails"), "x@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
     expect(await within(dialog).findByRole("alert")).toHaveTextContent("something else entirely");
   });
@@ -572,7 +572,7 @@ describe("MembersPage", () => {
       const r = setup({ routes: { "POST /v1/invites": ok({ error }, 409) } });
       await userEvent.click(await screen.findByRole("button", { name: "Invite people" }));
       const dialog = await screen.findByRole("dialog", { name: "Invite people" });
-      await userEvent.type(within(dialog).getByLabelText("Email"), "x@example.test");
+      await userEvent.type(within(dialog).getByLabelText("Emails"), "x@example.test");
       await userEvent.click(within(dialog).getByRole("button", { name: "Send invite" }));
       expect(await within(dialog).findByText(text)).toBeInTheDocument();
       r.unmount();

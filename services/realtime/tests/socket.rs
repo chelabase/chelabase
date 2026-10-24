@@ -65,10 +65,16 @@ async fn valkey_down_means_503_for_tickets() {
 async fn tickets_are_rate_limited_per_member() {
     // W35: 10 per member per second (a burst of 25 spans at most two seconds).
     let h = Harness::start().await;
-    let mut statuses = vec![];
-    for _ in 0..25 {
-        statuses.push(h.post_ticket(h.rt(), Some(&h.identity("ana", ORG))).await.0);
-    }
+    // At once: each ticket also asks the orchestrator (T8-1), so a sequential burst can spread
+    // over more seconds than the window under load.
+    let identity = h.identity("ana", ORG);
+    let statuses: Vec<u16> = futures_util::future::join_all(
+        (0..25).map(|_| h.post_ticket(h.rt(), Some(&identity))),
+    )
+    .await
+    .into_iter()
+    .map(|r| r.0)
+    .collect();
     assert!(statuses.contains(&429), "{statuses:?}");
     assert!(
         statuses.iter().filter(|s| **s == 201).count() <= 20,

@@ -8,8 +8,8 @@ export interface ModalProps {
   title: string;
   /** One line under the title (the dialog's accessible description). */
   description?: ReactNode;
-  /** `wide` fits forms with rows of fields (the invite dialog). */
-  size?: "default" | "wide";
+  /** `wide` fits forms with rows of fields (the invite dialog); `medium` (38rem) holds a secret shown once. */
+  size?: "default" | "medium" | "wide";
   /** Where focus goes on open (default: the first focusable) and on close (default: the trigger). */
   initialFocus?: RefObject<HTMLElement | null>;
   /** A function decides at close time; `false` leaves focus alone (another dialog takes it). */
@@ -36,7 +36,7 @@ export function Modal({ open, onOpenChange, title, description, size = "default"
         <DialogPrimitive.Popup
           initialFocus={initialFocus}
           finalFocus={finalFocus}
-          className={cn(popupFrame, popupSurface, "space-y-4", size === "wide" ? "w-[44rem]" : "w-[28rem]")}
+          className={cn(popupFrame, popupSurface, "space-y-4", size === "wide" ? "w-[44rem]" : size === "medium" ? "w-[38rem]" : "w-[28rem]")}
         >
           <div className="space-y-1">
             <DialogPrimitive.Title className="text-lg font-semibold text-balance">{title}</DialogPrimitive.Title>

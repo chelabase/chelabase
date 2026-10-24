@@ -1,7 +1,6 @@
-//! Personal logins (F2, part 2; C3's latent findings): a lost personal login is made again only
-//! under a name a personal login may take (`is_reserved_target`, not just the reserved
-//! prefixes) and only with a whole SCRAM verifier, and `create_personal_login` takes only a
-//! whole verifier. These need no new name; the marker's adoption rule is
+//! Personal logins (F2, part 2; C3's latent findings; members hub T6): the resync never makes
+//! a lost personal login again (the member-role reconciler converges them from their
+//! records), and `create_personal_login` takes only a whole verifier. The marker rule is
 //! `personal_marker.rs`.
 
 use chelabase_metadata::{RoleAttributes, RoleCopy, RoleLevel, RoleOrigin};
@@ -68,51 +67,30 @@ fn the_name_table_agrees_with_is_reserved_target() {
     }
 }
 
-// Invariant (the catalog lost the role): a recreate script runs exactly when the row is a
-// personal login, its name is one a personal login may take, and its verifier is a whole SCRAM
-// verifier; nothing else makes, records or removes it. Exhaustive over the name kinds and the
-// verifier kinds.
+// Invariant (the catalog lost the role; T6 changes it deliberately, spec Part 6
+// "Convergence"): the resync never makes a lost personal login again, records or removes its
+// row, whatever its name or verifier: the member-role reconciler makes it from its record.
+// Exhaustive over the name kinds and the verifier kinds.
 #[test]
-fn a_lost_personal_login_is_made_again_only_under_an_allowed_name_with_a_whole_verifier() {
-    for (name, refused) in NAMES {
-        for (verifier, whole) in [
-            (Some(PENCIL), true),
-            (Some(PREFIX_ONLY), false),
-            (Some("md5000102030405060708090a0b0c0d0e0f"), false),
-            (None, false),
+fn a_lost_personal_login_is_never_made_again_by_the_resync() {
+    for (name, _refused) in NAMES {
+        for verifier in [
+            Some(PENCIL),
+            Some(PREFIX_ONLY),
+            Some("md5000102030405060708090a0b0c0d0e0f"),
+            None,
         ] {
             let (repairs, write) = plan_resync(
                 OWNER_ROLE,
                 &[personal(name, verifier)],
                 &Observed::default(),
             );
-            let made = !refused && whole;
             let case = format!("{name:?} verifier {verifier:?}");
-            assert_eq!(
-                repairs.iter().any(|g| g.role == *name),
-                made,
-                "{case}: {repairs:?}"
+            assert!(repairs.is_empty(), "{case}: {repairs:?}");
+            assert!(
+                write.upserts.iter().all(|u| u.name != *name),
+                "{case}: {write:?}"
             );
-            if made {
-                let script = repairs
-                    .iter()
-                    .find(|g| g.role == *name)
-                    .unwrap()
-                    .statements
-                    .join("\n");
-                assert!(
-                    script.contains("chelabase.managed_role"),
-                    "{case}: {script}"
-                );
-                let u = write.upserts.iter().find(|u| u.name == *name).expect(&case);
-                assert_eq!(u.origin, RoleOrigin::Personal, "{case}");
-            } else {
-                assert!(repairs.is_empty(), "{case}: {repairs:?}");
-                assert!(
-                    write.upserts.iter().all(|u| u.name != *name),
-                    "{case}: {write:?}"
-                );
-            }
             assert!(
                 write.removals.is_empty(),
                 "{case}: a personal row is never removed: {write:?}"

@@ -20,10 +20,17 @@ pub use dependents::{
     parse_target_parts, target_parts_sql,
 };
 pub use notices::cascaded_objects;
+pub use render::privilege_op_schema;
+pub(crate) use render::{
+    privilege_keyword, privilege_name_keyword, schema_privilege, sequence_privilege,
+};
 
+use std::collections::BTreeMap;
+
+use chelabase_types::access::act_as_reserved;
 use chelabase_types::table_api::{
     ColumnSpec, ConstraintKindSpec, ConstraintSpec, DefaultChange, IndexKey, LockLevel, Operation,
-    PolicySpec, SkipReason, TableRef,
+    PolicySpec, PrivilegeTarget, SkipReason, TableRef,
 };
 
 use crate::model::Table;
@@ -43,6 +50,15 @@ pub struct RenderContext {
     pub tables: Vec<ContextTable>,
     /// Drops end `CASCADE` instead of `RESTRICT` (the request confirmed its dependents).
     pub cascade: bool,
+    /// The `regprocedure` text per function OID, resolved by the orchestrator in the apply
+    /// transaction (P11); a function op whose OID is missing is refused.
+    pub resolved_functions: BTreeMap<u32, String>,
+    /// Object owners, filled in the transaction for an owner run (empty for a role run).
+    pub owners: BTreeMap<PrivilegeTarget, String>,
+    /// The database owner for an owner run, the acting role for a role run.
+    pub session_role: String,
+    /// `server_version_num`: `MAINTAIN` is refused below 170000.
+    pub server_version_num: i32,
 }
 
 impl RenderContext {
@@ -67,6 +83,8 @@ pub struct RenderedStatement {
     pub concurrently: bool,
     /// The table the statement touches (`None` for enums).
     pub table: Option<TableRef>,
+    /// The role the statement runs as (`SET LOCAL ROLE`), in an owner run only (S4).
+    pub run_as: Option<String>,
 }
 
 /// An operation the renderer refuses, with its index in the request.
@@ -106,6 +124,101 @@ pub enum DdlErrorKind {
         "the drop's target was changed by operation {by} of the same request; drop it in a separate request"
     )]
     ChangedEarlier { by: usize },
+    /// A grantee the privilege ops refuse (MH-28).
+    #[error("grantee not allowed: {0:?}")]
+    GranteeNotAllowed(String),
+    /// A `FOR ROLE` the default-privilege op refuses (MH-28).
+    #[error("FOR ROLE not allowed: {0:?}")]
+    ForRoleNotAllowed(String),
+    /// A privilege the server doesn't have (`MAINTAIN` below Postgres 17).
+    #[error("privilege not supported by this server: {0}")]
+    PrivilegeNotSupported(&'static str),
+    /// A function op whose OID the orchestrator didn't resolve (P11).
+    #[error("function {0} isn't resolved")]
+    UnresolvedFunction(u32),
+    /// T4-5: a privilege op on a schema the hub never shows ([`hidden_schema`]).
+    #[error("privileges in schema {0:?} can't be changed: it's a system schema")]
+    HiddenSchema(String),
+}
+
+/// T4-5: the schemas the hub never shows and whose privileges its ops never change: Postgres's
+/// own (`pg_…`: `pg_catalog`, `pg_toast`, `pg_temp_<n>`, …; Postgres reserves the prefix),
+/// `information_schema`, and Chelabase's (`chelabase…`). Extension schemas need the catalog
+/// (the orchestrator checks them).
+pub fn hidden_schema(schema: &str) -> bool {
+    schema.starts_with("pg_") || schema == "information_schema" || schema.starts_with("chelabase")
+}
+
+/// The privilege ops' grantee allow-list (MH-28, S5): never `owner` (the database owner in an
+/// owner run, the session role otherwise), an [`act_as_reserved`] name (`pg_…`, `cb_m_…`,
+/// `chelabase_…`, `postgres`, `owner`, `authenticator`, `public`, …; `anon` and
+/// `authenticated` are allowed), or a `current_user`-like keyword. `PUBLIC` as a grantee is
+/// [`Grantee::Public`](chelabase_types::table_api::Grantee::Public), allowed only in revokes by
+/// the renderer. Personal logins are refused by the orchestrator (they need the metadata).
+pub fn privilege_grantee<'a>(name: &'a str, owner: &str) -> Result<&'a str, DdlErrorKind> {
+    const KEYWORDS: [&str; 3] = ["current_user", "session_user", "current_role"];
+    if name == owner
+        || act_as_reserved(name)
+        || name.eq_ignore_ascii_case("authenticator")
+        || KEYWORDS.iter().any(|k| name.eq_ignore_ascii_case(k))
+    {
+        return Err(DdlErrorKind::GranteeNotAllowed(name.to_string()));
+    }
+    Ok(name)
+}
+
+/// The object whose ACL (and owner) a privilege op changes: the table of `Grant`, `Revoke` and
+/// `SetAllRows` (a policy needs the table's owner too), the schema, sequence or routine of the
+/// new ops, the default ACL of `AlterDefaultPrivileges`. `None` for every other op.
+pub fn privilege_target(op: &Operation) -> Option<PrivilegeTarget> {
+    let relation = |t: &TableRef| PrivilegeTarget::Relation {
+        schema: t.schema.clone(),
+        name: t.name.clone(),
+    };
+    match op {
+        Operation::Grant { table, .. }
+        | Operation::Revoke { table, .. }
+        | Operation::SetAllRows { table, .. } => Some(relation(table)),
+        Operation::GrantSchema { schema, .. } | Operation::RevokeSchema { schema, .. } => {
+            Some(PrivilegeTarget::Schema {
+                schema: schema.clone(),
+            })
+        }
+        Operation::GrantSequence { sequence, .. } | Operation::RevokeSequence { sequence, .. } => {
+            Some(PrivilegeTarget::Sequence {
+                schema: sequence.schema.clone(),
+                name: sequence.name.clone(),
+            })
+        }
+        Operation::GrantFunction { function, .. } | Operation::RevokeFunction { function, .. } => {
+            Some(PrivilegeTarget::Function { oid: function.oid })
+        }
+        Operation::AlterDefaultPrivileges {
+            for_role,
+            schema,
+            object,
+            ..
+        } => Some(PrivilegeTarget::DefaultAcl {
+            for_role: for_role.clone(),
+            schema: schema.clone(),
+            object: *object,
+        }),
+        _ => None,
+    }
+}
+
+/// S4: the role `op`'s statements run as. Only in an owner run (`owners` filled): the object's
+/// owner when it isn't the session role; for `AlterDefaultPrivileges`, `for_role` (P28: `FOR
+/// ROLE` then names the current role, which needs only SET). A role run never sets it.
+fn run_as(op: &Operation, ctx: &RenderContext) -> Option<String> {
+    if ctx.owners.is_empty() {
+        return None;
+    }
+    let owner = match op {
+        Operation::AlterDefaultPrivileges { for_role, .. } => for_role.clone(),
+        _ => ctx.owners.get(&privilege_target(op)?)?.clone(),
+    };
+    (owner != ctx.session_role).then_some(owner)
 }
 
 /// An identity whose catalog knowledge an operation may change.
@@ -218,6 +331,7 @@ pub fn render(ops: &[Operation], ctx: &RenderContext) -> Result<Vec<RenderedStat
     }
     let mut out = Vec::new();
     let mut changed = Changed::default();
+    let mut all_rows = render::AllRowsOverlay::default();
     for (op_index, op) in ops.iter().enumerate() {
         if let Some(bad) = expressions(op).into_iter().find(|e| !single_expression(e)) {
             return Err(DdlError {
@@ -236,9 +350,10 @@ pub fn render(ops: &[Operation], ctx: &RenderContext) -> Result<Vec<RenderedStat
                 kind: DdlErrorKind::ChangedEarlier { by },
             });
         }
-        let stmts = render::operation(op, ctx, changed_by.is_none())
+        let stmts = render::operation_in(op, ctx, changed_by.is_none(), &mut all_rows)
             .map_err(|kind| DdlError { op_index, kind })?;
         changed.record(op, op_index);
+        let run_as = run_as(op, ctx);
         out.extend(stmts.into_iter().map(|s| RenderedStatement {
             sql: s.sql,
             op_index,
@@ -246,6 +361,7 @@ pub fn render(ops: &[Operation], ctx: &RenderContext) -> Result<Vec<RenderedStat
             lock: s.lock,
             concurrently: s.concurrently,
             table: s.table,
+            run_as: run_as.clone(),
         }));
     }
     Ok(out)
@@ -370,7 +486,17 @@ fn existing_table(op: &Operation) -> Option<&TableRef> {
         | Operation::RenameEnumValue { .. }
         | Operation::RenameEnum { .. }
         | Operation::DropEnum { .. } => None,
+        // Schemas, sequences, routines and default ACLs aren't tables.
+        Operation::GrantSchema { .. }
+        | Operation::RevokeSchema { .. }
+        | Operation::GrantSequence { .. }
+        | Operation::RevokeSequence { .. }
+        | Operation::GrantFunction { .. }
+        | Operation::RevokeFunction { .. }
+        | Operation::AlterDefaultPrivileges { .. } => None,
         Operation::CreateIndex(spec) => Some(&spec.table),
+        // The table's policies name the hub's policy (on) or find it (off).
+        Operation::SetAllRows { table, .. } => Some(table),
         Operation::RenameTable { table, .. }
         | Operation::SetTableSchema { table, .. }
         | Operation::DropTable { table }

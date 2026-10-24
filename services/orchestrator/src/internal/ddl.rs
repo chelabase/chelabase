@@ -799,7 +799,7 @@ pub async fn receive<M: NeonMetadataPort, L: ComputeLocator>(
             tokio::spawn(async move { publish_pg_database_events(&*state, branch, events).await });
         }
     }
-    publish(state.cache.clone(), id, changed);
+    publish_password_updated(state.cache.clone(), id, changed);
     StatusCode::OK.into_response()
 }
 
@@ -1200,8 +1200,10 @@ async fn reseal_password<T: DdlPort>(
 
 /// `password_updated` for each changed role, at once and again about 1 s later (R22): the
 /// receiver answers before the user's commit is visible. Failures are logged (R12); the
-/// answer doesn't wait (a slow Valkey must not outlast the compute's 3 s curl timeout).
-fn publish(cache: Arc<dyn CachePort>, endpoint: String, roles: Vec<String>) {
+/// answer doesn't wait (a slow Valkey must not outlast the compute's 3 s curl timeout). The
+/// personal-login writes use it too (members hub P4): every row of a login whose secret went
+/// or changed.
+pub(crate) fn publish_password_updated(cache: Arc<dyn CachePort>, endpoint: String, roles: Vec<String>) {
     if roles.is_empty() {
         return;
     }
@@ -1221,6 +1223,20 @@ fn publish(cache: Arc<dyn CachePort>, endpoint: String, roles: Vec<String>) {
             }
         }
     });
+}
+
+/// [`publish_password_updated`] for personal-login rows (members hub P4), grouped by endpoint.
+pub(crate) fn publish_login_rows(
+    cache: &Arc<dyn CachePort>,
+    rows: Vec<chelabase_metadata::personal_logins::LoginEndpoint>,
+) {
+    let mut by_endpoint: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    for row in rows {
+        by_endpoint.entry(row.endpoint_id).or_default().push(row.role_name);
+    }
+    for (endpoint, roles) in by_endpoint {
+        publish_password_updated(cache.clone(), endpoint, roles);
+    }
 }
 
 #[cfg(test)]

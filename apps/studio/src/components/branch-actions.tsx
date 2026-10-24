@@ -33,12 +33,12 @@ import {
 import { errorText } from "@/lib/errors";
 import { useProjectCaps } from "@/lib/capabilities";
 import { mergeErrorText } from "@/lib/merges";
-import { BranchReview, reviewChangedText } from "./branch-review";
 import { BranchRoles } from "./branch-roles";
+import { BranchReview, reviewChangedText } from "./branch-review";
 import { DatabaseActions } from "./database-actions";
 import { MERGE_ROUTE, MergeLink } from "./merges/merge-link";
 
-type Panel = "none" | "protect" | "protection" | "reset-to-parent" | "restore" | "delete" | "roles";
+type Panel = "none" | "protect" | "protection" | "reset-to-parent" | "restore" | "delete";
 
 export interface BranchActionsProps {
   /** The project the database belongs to (for links to its merges). */
@@ -59,6 +59,8 @@ export interface BranchActionsProps {
   openMerges?: MergeSummary[];
   /** Open the connection details on load, for this role (null: the owner). */
   openConnection?: { role: string | null };
+  /** The Roles panel's switch when the caller renders it (the tree gives it its own full-width row); without it, the panel opens below the actions. */
+  roles?: { open: boolean; onToggle: () => void };
 }
 
 /** A failed action's text, and the merge it names (linked) when it names one. */
@@ -76,7 +78,11 @@ export function BranchActions({
   historyWindow,
   openMerges = [],
   openConnection,
+  roles,
 }: BranchActionsProps) {
+  const [localRoles, setLocalRoles] = useState(false);
+  const rolesOpen = roles ? roles.open : localRoles;
+  const toggleRoles = roles ? roles.onToggle : () => setLocalRoles((v) => !v);
   const queryClient = useQueryClient();
   // Each one refreshes the branch list and the database (returned, so `busy` waits for it).
   const invalidate = { mutation: { onSuccess: (_: unknown, { id }: { id: string }) => invalidateBranches(queryClient, id) } };
@@ -138,6 +144,7 @@ export function BranchActions({
   const bounds = restoreBounds(new Date(), historyWindow, branch.history_start);
 
   function open(next: Panel) {
+    if (rolesOpen) toggleRoles();
     setError(null);
     setNotice(null);
     setPoint("");
@@ -357,7 +364,11 @@ export function BranchActions({
           disabled={reasons.connect !== null || busy}
           title={reasons.connect ?? undefined}
           aria-describedby={reasonId("connect")}
-          onClick={() => open("roles")}
+          aria-expanded={rolesOpen}
+          onClick={() => {
+            setPanel("none");
+            toggleRoles();
+          }}
         >
           Roles
         </Button>
@@ -374,7 +385,7 @@ export function BranchActions({
         )}
       </DatabaseActions>
 
-      {panel === "roles" && reasons.connect === null && <BranchRoles databaseId={databaseId} branchId={branch.id} />}
+      {!roles && rolesOpen && reasons.connect === null && <BranchRoles projectId={projectId} databaseId={databaseId} branchId={branch.id} />}
 
       {reviewChanged && (
         <p>

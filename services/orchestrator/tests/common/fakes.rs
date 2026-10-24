@@ -12,7 +12,7 @@ use chelabase_metadata::{
 };
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, AppUsersJob, AppUsersSyncJob, ProjectDeleteJob, BranchJob, MergeJob, CheckDataRoleReply, DatabaseSettingsJob, DeleteDatabaseJob, JobEnvelope, PointInTime,
-    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleReply, RoleRequest, RoleSession, RoleSessionsReply, RoleUpdateRequest, RESET_NOT_APPLIED,
+    ProvisionDatabaseJob, ResetPasswordReply, RoleCreateRequest, RoleDeleteRequest, RoleReply, RoleRequest, RoleSession, RoleSessionsReply, RoleUpdateRequest, RESET_NOT_APPLIED,
 };
 use chelabase_routes::{Service, ENDPOINTS};
 use chelabase_types::mode::Mode;
@@ -31,9 +31,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use reqwest::Method;
 use serde_json::{json, Value};
-use chelabase_metadata::members::{GrantRow, GrantRows, MemberBranchRole, MemberRecord, MemberStatus, Observed, OverrideRow};
+use chelabase_metadata::members::{GrantRow, MemberBranchRole, MemberRecord, MemberStatus, Observed, OverrideRow};
 use chelabase_nats::{MemberRoleApplied, MemberRoleHandOverRequest, MemberRolesReconcileRequest, MemberRolesReply};
-use chelabase_types::access::PlatformRole;
+use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole, PlatformRole};
 
 /// The test identity's subject: the default caller, an active tenant admin of every tenant
 /// `bind_org` binds (so tests written before members keep their meaning).
@@ -103,6 +103,10 @@ struct FakeMetadata {
     members: Arc<Mutex<Vec<MemberRecord>>>,
     grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), GrantRow>>>,
     overrides: Arc<Mutex<HashMap<OverrideKey, OverrideRow>>>,
+    /// Team grants by (member, project) (members hub step 2's source; step 1's metadata never
+    /// fills it, the fake does to test the per-role levels, T2).
+    #[allow(clippy::type_complexity)]
+    team_grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), Vec<Grant>>>>,
     /// Reads of a member row (`member_by_zitadel` and `ensure_member` each read it once).
     member_reads: Arc<AtomicUsize>,
     /// Reads of a branch's roles (`list_roles`).
@@ -129,6 +133,29 @@ struct FakeMetadata {
     member_branch_roles: Arc<Mutex<Vec<(uuid::Uuid, BranchId)>>>,
     /// PB: each branch's guard exemptions, sorted (missing: none).
     guard_exemptions: Arc<Mutex<HashMap<BranchId, Vec<String>>>>,
+    /// Members hub T5: personal-login role names, as (database id, role name), any status
+    /// (`MembersPort::is_personal_login_name` answers from it).
+    personal_login_names: Arc<Mutex<HashSet<(uuid::Uuid, String)>>>,
+    /// Members hub T8: personal-login records and their proxy rows (what `personal_logins` and
+    /// the `neon_roles` rows of origin `personal` hold). The T8 `MembersPort` methods answer
+    /// from it as the real ones would (T3's docs): a revoked record keeps its rows (with no
+    /// verifier) until the worker drops the role, and `member_login_endpoints` lists every row
+    /// of the member whatever its record's status.
+    personal_logins: Arc<Mutex<Vec<FakeLogin>>>,
+    /// Final round A (T9-I1): `member_project_roles` fails with a database error while set.
+    fail_member_project_roles: Arc<Mutex<bool>>,
+}
+
+/// Members hub T8: one personal-login record as the fake keeps it.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct FakeLogin {
+    /// The record as the API lists it.
+    login: chelabase_metadata::personal_logins::PersonalLogin,
+    /// The record's SCRAM verifier; `None` once revoked (MH-9).
+    verifier: Option<String>,
+    /// Its personal `neon_roles` rows, one per branch endpoint the worker made the role on.
+    endpoints: Vec<chelabase_metadata::personal_logins::LoginEndpoint>,
 }
 
 /// An `invites` row.
@@ -241,6 +268,7 @@ impl FakeMetadata {
             tenant_admin,
             status,
             accepted_at: (status == MemberStatus::Active).then(chrono::Utc::now),
+            offboarded: false, suspended_at: None, suspended_by: None,
         });
         id
     }
@@ -257,6 +285,12 @@ impl FakeMetadata {
             (member, project.as_uuid()),
             GrantRow { platform_role: role, pg_roles: pg_roles.iter().map(|r| r.to_string()).collect() },
         );
+    }
+
+    /// A team grant reaching `member` on `project` (T2: the union's other source).
+    #[allow(dead_code)]
+    fn team_grant(&self, member: uuid::Uuid, project: ProjectId, grant: Grant) {
+        self.team_grants.lock().unwrap().entry((member, project.as_uuid())).or_default().push(grant);
     }
 
     /// A narrowing override for `member` on a Chelabase database.
@@ -435,6 +469,88 @@ impl FakeMetadata {
 
     fn fail_next_insert(&self) {
         *self.fail_insert.lock().unwrap() = true;
+    }
+
+    /// Members hub T8: a live personal login of `member` on `database` named `name`, as the
+    /// worker would have converged it: valid for 90 days, a verifier, and a personal role row
+    /// (origin `personal`, no sealed password) on every branch of the database that has an
+    /// endpoint. Its name joins `personal_login_names`.
+    #[allow(dead_code)]
+    fn seed_personal_login(&self, member: uuid::Uuid, database: DatabaseId, name: &str) -> FakeLogin {
+        use chelabase_metadata::personal_logins::{LoginEndpoint, LoginStatus, PersonalLogin};
+        let record = self.database(database);
+        let mut endpoints: Vec<LoginEndpoint> = self
+            .branches
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.database_id == database && b.status != BranchStatus::Deleted)
+            .filter_map(|b| {
+                b.endpoint_id.clone().map(|endpoint_id| LoginEndpoint {
+                    branch_id: b.id.as_uuid(),
+                    endpoint_id,
+                    role_name: name.to_string(),
+                })
+            })
+            .collect();
+        endpoints.sort();
+        for e in &endpoints {
+            self.add_role_row(
+                &e.endpoint_id,
+                RoleRow {
+                    name: name.into(),
+                    origin: RoleOrigin::Personal,
+                    level: RoleLevel::Plain,
+                    login: true,
+                    password: PasswordState::SetInSql,
+                    created_at: chrono::Utc::now(),
+                    pending: false,
+                    attributes: RoleAttributes::default(),
+                },
+            );
+        }
+        let now = chrono::Utc::now();
+        let login = FakeLogin {
+            login: PersonalLogin {
+                member_id: member,
+                database_id: database.as_uuid(),
+                project_id: record.project_id.as_uuid(),
+                database_name: record.name.clone(),
+                role_name: name.into(),
+                valid_until: now + chrono::Duration::days(90),
+                created_at: now,
+                revoked_at: None,
+                revoked_reason: None,
+                status: LoginStatus::Active,
+            },
+            verifier: Some(format!("SCRAM-SHA-256$4096:c2VlZA==$seeded-{name}:c2VydmVy")),
+            endpoints,
+        };
+        self.personal_login_names.lock().unwrap().insert((database.as_uuid(), name.to_string()));
+        self.personal_logins.lock().unwrap().push(login.clone());
+        login
+    }
+
+    /// Members hub T8: `member`'s record on `database`, if any.
+    #[allow(dead_code)]
+    fn personal_login(&self, member: uuid::Uuid, database: DatabaseId) -> Option<FakeLogin> {
+        self.personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.login.member_id == member && l.login.database_id == database.as_uuid())
+            .cloned()
+    }
+
+    /// Members hub T8: changes `member`'s record on `database` (to revoke or expire it).
+    #[allow(dead_code)]
+    fn edit_personal_login(&self, member: uuid::Uuid, database: DatabaseId, change: impl FnOnce(&mut FakeLogin)) {
+        let mut logins = self.personal_logins.lock().unwrap();
+        let l = logins
+            .iter_mut()
+            .find(|l| l.login.member_id == member && l.login.database_id == database.as_uuid())
+            .expect("personal login");
+        change(l);
     }
 
     /// Databases without a main branch yet get the default one.
@@ -1715,7 +1831,8 @@ impl MetadataPort for FakeMetadata {
         let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
         let mut members = self.members.lock().unwrap();
         if let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id) {
-            if !matches!(m.status, MemberStatus::Removed | MemberStatus::Pending) {
+            // S6: a suspended member is returned as is, like a removed or pending one.
+            if !matches!(m.status, MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended) {
                 if m.status == MemberStatus::Invited {
                     // I1: only while an open invite exists; otherwise the member stays invited.
                     let now = chrono::Utc::now();
@@ -1756,6 +1873,7 @@ impl MetadataPort for FakeMetadata {
             tenant_admin: !has_admin,
             status,
             accepted_at: Some(chrono::Utc::now()),
+            offboarded: false, suspended_at: None, suspended_by: None,
         };
         self.stamp_created(record.id);
         members.push(record.clone());
@@ -1769,16 +1887,21 @@ impl MetadataPort for FakeMetadata {
         Ok(record)
     }
 
-    async fn grant_rows(
+    async fn grant_sources(
         &self,
         member: uuid::Uuid,
         project: uuid::Uuid,
         database: Option<uuid::Uuid>,
-    ) -> Result<GrantRows, MetadataError> {
-        Ok(GrantRows {
-            project: self.grants.lock().unwrap().get(&(member, project)).cloned(),
-            database: database.and_then(|d| self.overrides.lock().unwrap().get(&(member, d)).cloned()),
-        })
+    ) -> Result<GrantSources, MetadataError> {
+        let own = self.grants.lock().unwrap().get(&(member, project)).map(GrantRow::to_grant);
+        let teams = self.team_grants.lock().unwrap().get(&(member, project)).cloned().unwrap_or_default();
+        let narrowing = database
+            .and_then(|d| self.overrides.lock().unwrap().get(&(member, d)).cloned())
+            .map(|o| Narrowing {
+                platform_role: o.platform_role,
+                roles: o.pg_roles.map(|roles| roles.iter().map(|r| PgRole::parse(r)).collect()),
+            });
+        Ok(GrantSources::new(own, teams, narrowing))
     }
 
     async fn member_overrides(
@@ -1902,6 +2025,10 @@ struct FakeJobs {
     /// Every create request as sent, and every update request.
     role_creates: Arc<Mutex<Vec<RoleCreateRequest>>>,
     role_updates: Arc<Mutex<Vec<RoleUpdateRequest>>>,
+    /// Every delete request as sent (T10: with its successor).
+    role_deletes: Arc<Mutex<Vec<RoleDeleteRequest>>>,
+    /// T10 fix: every delete-preview request as sent (answered like the other role RPCs).
+    role_delete_previews: Arc<Mutex<Vec<RoleDeleteRequest>>>,
     /// What the worker answers to the role RPCs; `ok` when unset.
     role_reply: Arc<Mutex<Option<Result<RoleReply, ResetError>>>>,
     /// (branch, role) of each role-sessions read.
@@ -1928,6 +2055,9 @@ struct FakeJobs {
     /// What a reconcile applies: these rows replace the store's rows of the same (member,
     /// branch) when the request's branch (and member, when given) matches.
     member_rows_on_reconcile: Arc<Mutex<Option<MemberRowsOnReconcile>>>,
+    /// Members hub T8: runs on each reconcile request before the answer (what the worker
+    /// writes meanwhile, such as a personal login's row on the branch).
+    member_reconcile_hook: Arc<Mutex<Option<ReconcileHook>>>,
     /// Each hand-over after an act-as run (answered `Done`).
     member_hand_overs: Arc<Mutex<Vec<MemberRoleHandOverRequest>>>,
     /// T7: branches asked to reconcile their member roles, in order.
@@ -1935,10 +2065,16 @@ struct FakeJobs {
     /// PB: each review request, and what every one answers (unset: `Failed`, no compute).
     review_requests: Arc<Mutex<Vec<chelabase_nats::ReviewRequest>>>,
     review_reply: Arc<Mutex<Option<Result<chelabase_nats::ReviewReply, ResetError>>>>,
+    /// EOS-H1: each all-rows check request, and what every one answers (unset: `Clear`).
+    all_rows_checks: Arc<Mutex<Vec<chelabase_nats::AllRowsCheckRequest>>>,
+    all_rows_reply: Arc<Mutex<Option<Result<chelabase_nats::AllRowsCheckReply, ResetError>>>>,
 }
 
 /// A metadata store of member-role rows and the rows a reconcile writes into it.
 type MemberRowsOnReconcile = (Arc<Mutex<Vec<MemberBranchRole>>>, Vec<MemberBranchRole>);
+
+/// What the fake worker does on a reconcile request (members hub T8).
+type ReconcileHook = Arc<dyn Fn(&MemberRolesReconcileRequest) + Send + Sync>;
 
 impl FakeJobs {
     fn reset_answers(&self, answer: FakeReset) {
@@ -2020,6 +2156,10 @@ impl JobPort for FakeJobs {
         request: MemberRolesReconcileRequest,
     ) -> Result<MemberRolesReply, ResetError> {
         self.member_reconciles.lock().unwrap().push(request.clone());
+        let hook = self.member_reconcile_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(&request);
+        }
         if let Some(answer) = self.member_reconcile_reply.lock().unwrap().clone() {
             return answer;
         }
@@ -2129,8 +2269,22 @@ impl JobPort for FakeJobs {
         self.role_answer()
     }
 
-    async fn delete_role(&self, request: RoleRequest) -> Result<RoleReply, ResetError> {
+    async fn delete_role(&self, request: RoleDeleteRequest) -> Result<RoleReply, ResetError> {
         self.role_calls.lock().unwrap().push(format!("delete:{}", request.name));
+        self.role_deletes.lock().unwrap().push(request);
+        // A done delete answers what it reassigned (T10-4: a reply without it is an older
+        // worker's, an error); a reply a test set is answered as set.
+        match self.role_answer() {
+            Ok(reply) if reply.ok && reply.reassigned.is_none() && self.role_reply.lock().unwrap().is_none() => {
+                Ok(RoleReply { reassigned: Some(chelabase_nats::Reassigned::default()), ..reply })
+            }
+            other => other,
+        }
+    }
+
+    async fn preview_role_delete(&self, request: RoleDeleteRequest) -> Result<RoleReply, ResetError> {
+        self.role_calls.lock().unwrap().push(format!("preview_delete:{}", request.name));
+        self.role_delete_previews.lock().unwrap().push(request);
         self.role_answer()
     }
 
@@ -2140,6 +2294,18 @@ impl JobPort for FakeJobs {
             Some(answer) => answer,
             None => Ok(RoleSessionsReply::running(Vec::new())),
         }
+    }
+
+    async fn check_all_rows(
+        &self,
+        request: chelabase_nats::AllRowsCheckRequest,
+    ) -> Result<chelabase_nats::AllRowsCheckReply, ResetError> {
+        self.all_rows_checks.lock().unwrap().push(request);
+        self.all_rows_reply
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(Ok(chelabase_nats::AllRowsCheckReply::Clear))
     }
 
     async fn publish_project_delete(
@@ -2194,7 +2360,7 @@ impl FakeJobs {
     fn role_answer(&self) -> Result<RoleReply, ResetError> {
         match self.role_reply.lock().unwrap().clone() {
             Some(answer) => answer,
-            None => Ok(RoleReply { ok: true, code: None, error: None, keys: vec![] }),
+            None => Ok(RoleReply { ok: true, code: None, error: None, keys: vec![], reassigned: None, preview: None }),
         }
     }
 }
@@ -2294,6 +2460,61 @@ impl orchestrator::internal::realtime::RtEvents for FakeRtEvents {
     }
 }
 
+/// Members hub T8 (P4): the proxies' role-secret cache as the app's `proxy_cache`. Records each
+/// `password_updated` (endpoint, role) and wakes waiters; with `down`, each one fails after
+/// being recorded (Valkey down).
+#[derive(Clone, Default)]
+struct FakeCache {
+    sent: Arc<Mutex<Vec<(String, String)>>>,
+    down: Arc<Mutex<bool>>,
+    published: Arc<tokio::sync::Notify>,
+}
+
+impl orchestrator::internal::CachePort for FakeCache {
+    fn password_updated<'a>(
+        &'a self,
+        endpoint_id: &'a str,
+        role: &'a str,
+    ) -> orchestrator::internal::BoxFuture<'a, anyhow::Result<u64>> {
+        Box::pin(async move {
+            self.sent.lock().unwrap().push((endpoint_id.to_string(), role.to_string()));
+            self.published.notify_waiters();
+            anyhow::ensure!(!*self.down.lock().unwrap(), "valkey is down");
+            Ok(1)
+        })
+    }
+}
+
+#[allow(dead_code)]
+impl FakeCache {
+    fn sent(&self) -> Vec<(String, String)> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    fn clear(&self) {
+        self.sent.lock().unwrap().clear();
+    }
+
+    /// Waits (up to 5 s, on the publish notifications, never a sleep) until every (endpoint,
+    /// role) of `want` was published at least once; whether they all were.
+    async fn wait_for(&self, want: &[(String, String)]) -> bool {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let notified = self.published.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let sent = self.sent();
+            if want.iter().all(|w| sent.contains(w)) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                let sent = self.sent();
+                return want.iter().all(|w| sent.contains(w));
+            }
+        }
+    }
+}
+
 /// A verifier for apps that don't test realtime: its JWKS URL is the discard port.
 fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
     chelabase_auth::ZitadelAuthConfig {
@@ -2316,6 +2537,9 @@ struct TestApp {
     /// RT1 T6: what the orchestrator published for realtime.
     #[allow(dead_code)]
     rt_events: FakeRtEvents,
+    /// Members hub T8 (P4): the app's `proxy_cache`.
+    #[allow(dead_code)]
+    cache: FakeCache,
 }
 
 impl TestApp {
@@ -2495,6 +2719,9 @@ async fn spawn_app_core(
     oidc: chelabase_auth::ZitadelAuthConfig,
 ) -> TestApp {
     let rt_events = FakeRtEvents::default();
+    // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in
+    // `main.rs`).
+    let cache = FakeCache::default();
     let (private_pem, public_pem) = generate_keypair_pem();
     let key = SecretKey::generate();
     let locator = FakeLocator::default();
@@ -2526,6 +2753,7 @@ async fn spawn_app_core(
             verifier: chelabase_auth::JwtVerifier::new(oidc),
         },
         rt_events: Arc::new(rt_events.clone()),
+        proxy_cache: Arc::new(cache.clone()),
     });
     let probe: Router = Router::new()
         .route(INSTANCE_PROBE, axum::routing::get(instance_probe))
@@ -2545,6 +2773,7 @@ async fn spawn_app_core(
         locator,
         state,
         rt_events,
+        cache,
     }
 }
 
@@ -2796,6 +3025,7 @@ impl FakeMetadata {
             actor_email: None,
             target_email: None,
             project_name: None,
+            branch_id: None,
         });
     }
 
@@ -2903,6 +3133,99 @@ impl FakeMetadata {
             .get(&DatabaseId(database))
             .filter(|d| d.tenant_id == tenant && !matches!(d.status, DatabaseStatus::Deleting | DatabaseStatus::Deleted))
             .map(|d| d.project_id.as_uuid())
+    }
+}
+
+/// Members hub T8: the personal-login side of the fake, as T3's metadata functions behave.
+impl FakeMetadata {
+    /// `chelabase_member_level`: an active member's level on a database of its tenant that
+    /// isn't deleted (a tenant admin's is admin; an override narrows the grant).
+    fn login_level(&self, member: uuid::Uuid, database: uuid::Uuid) -> Option<PlatformRole> {
+        let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned()?;
+        if m.status != MemberStatus::Active {
+            return None;
+        }
+        let db = self.databases.lock().unwrap().get(&DatabaseId(database)).cloned()?;
+        if db.status == DatabaseStatus::Deleted || db.tenant_id != m.tenant_id {
+            return None;
+        }
+        if m.tenant_admin {
+            return Some(PlatformRole::Admin);
+        }
+        let granted = self.grants.lock().unwrap().get(&(member, db.project_id.as_uuid()))?.platform_role;
+        let narrowed = self.overrides.lock().unwrap().get(&(member, database)).and_then(|o| o.platform_role);
+        Some(narrowed.map_or(granted, |o| o.min(granted)))
+    }
+
+    /// The record as the API lists it, its status judged now.
+    fn login_view(l: &FakeLogin) -> chelabase_metadata::personal_logins::PersonalLogin {
+        use chelabase_metadata::personal_logins::LoginStatus;
+        let mut login = l.login.clone();
+        login.status = if login.revoked_at.is_some() {
+            LoginStatus::Revoked
+        } else if login.valid_until <= chrono::Utc::now() {
+            LoginStatus::Expired
+        } else {
+            LoginStatus::Active
+        };
+        login
+    }
+
+    /// Removes a record's proxy rows from the role store (the FK's cascade).
+    fn drop_login_rows(&self, l: &FakeLogin) {
+        let mut roles = self.roles.lock().unwrap();
+        for e in &l.endpoints {
+            if let Some(rows) = roles.get_mut(&e.endpoint_id) {
+                rows.retain(|r| !(r.name == e.role_name && r.origin == RoleOrigin::Personal));
+            }
+        }
+    }
+
+    /// Every live login of `member` revoked with `reason`; returns how many.
+    fn revoke_member_logins(&self, member: uuid::Uuid, reason: chelabase_metadata::personal_logins::RevokeReason) -> usize {
+        use chelabase_metadata::personal_logins::LoginStatus;
+        let mut n = 0;
+        for l in self.personal_logins.lock().unwrap().iter_mut().filter(|l| l.login.member_id == member && l.login.revoked_at.is_none()) {
+            l.login.revoked_at = Some(chrono::Utc::now());
+            l.login.revoked_reason = Some(reason);
+            l.login.status = LoginStatus::Revoked;
+            l.verifier = None;
+            n += 1;
+        }
+        n
+    }
+
+    /// S2: the member's `cb_m_*` rows marked for rotation (`password_enc = ''`).
+    fn mark_member_roles_for_rotation(&self, member: uuid::Uuid) -> Vec<uuid::Uuid> {
+        let mut branches = Vec::new();
+        for r in self.member_roles.lock().unwrap().iter_mut().filter(|r| r.member_id == member) {
+            r.password_enc.clear();
+            branches.push(r.branch_id);
+        }
+        branches
+    }
+
+    /// The projects a member reaches, as the metadata's `touched_projects`: its grants, the
+    /// projects of its overrides, of the branches holding its member roles and of its logins.
+    fn login_touched_projects(&self, member: uuid::Uuid) -> Vec<uuid::Uuid> {
+        let mut out: Vec<uuid::Uuid> = self.grants.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, p)| *p).collect();
+        let mut databases: Vec<uuid::Uuid> = self.overrides.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, d)| *d).collect();
+        databases.extend(self.personal_logins.lock().unwrap().iter().filter(|l| l.login.member_id == member).map(|l| l.login.database_id));
+        let mut branches: Vec<BranchId> = self.member_branch_roles.lock().unwrap().iter().filter(|(m, _)| *m == member).map(|(_, b)| *b).collect();
+        branches.extend(self.member_roles.lock().unwrap().iter().filter(|r| r.member_id == member).map(|r| BranchId(r.branch_id)));
+        for b in branches {
+            if let Some(b) = self.branches.lock().unwrap().get(&b) {
+                databases.push(b.database_id.as_uuid());
+            }
+        }
+        for d in databases {
+            if let Some(db) = self.databases.lock().unwrap().get(&DatabaseId(d)) {
+                out.push(db.project_id.as_uuid());
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
     }
 }
 
@@ -3034,6 +3357,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         &self,
         tenant: TenantId,
         project: Option<uuid::Uuid>,
+        member: Option<uuid::Uuid>,
         before_id: Option<i64>,
         limit: u32,
     ) -> Result<Vec<chelabase_metadata::members::AccessEvent>, MetadataError> {
@@ -3043,11 +3367,326 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             .unwrap()
             .iter()
             .rev()
-            .filter(|e| e.tenant_id == tenant && project.is_none_or(|p| event_names_project(e, p)) && before_id.is_none_or(|b| e.id < b))
+            .filter(|e| {
+                e.tenant_id == tenant
+                    && project.is_none_or(|p| event_names_project(e, p))
+                    && member.is_none_or(|m| e.target_member_id == Some(m) || e.actor_member_id == Some(m))
+                    && before_id.is_none_or(|b| e.id < b)
+            })
             .take(limit as usize)
             .cloned()
             .map(|e| self.named(e))
             .collect())
+    }
+
+    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<(uuid::Uuid, uuid::Uuid, PlatformRole)>, MetadataError> {
+        if *self.fail_member_project_roles.lock().unwrap() {
+            return Err(MetadataError::Config("member project roles unreadable".into()));
+        }
+        let members = self.members.lock().unwrap();
+        let live: HashSet<uuid::Uuid> =
+            self.projects.lock().unwrap().iter().filter(|p| p.status != ProjectStatus::Deleted).map(|p| p.id.as_uuid()).collect();
+        let mut out: Vec<_> = self
+            .grants
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|((m, p), _)| live.contains(p) && members.iter().any(|x| x.id == *m && x.tenant_id == tenant && x.status != MemberStatus::Removed))
+            .map(|((m, p), g)| (*m, *p, g.platform_role))
+            .collect();
+        out.sort_by_key(|(m, p, _)| (*m, *p));
+        Ok(out)
+    }
+
+    async fn is_personal_login_name(&self, database: uuid::Uuid, name: &str) -> Result<bool, MetadataError> {
+        Ok(self.personal_login_names.lock().unwrap().contains(&(database, name.to_string())))
+    }
+
+    async fn personal_login_names(&self, project: uuid::Uuid) -> Result<std::collections::BTreeSet<String>, MetadataError> {
+        let databases: HashSet<uuid::Uuid> = self
+            .databases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|d| d.project_id.as_uuid() == project)
+            .map(|d| d.database_id.as_uuid())
+            .collect();
+        Ok(self
+            .personal_login_names
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| databases.contains(d))
+            .map(|(_, n)| n.clone())
+            .collect())
+    }
+
+    async fn create_personal_login(
+        &self,
+        member: uuid::Uuid,
+        database: uuid::Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<chelabase_metadata::personal_logins::PersonalLogin, chelabase_metadata::personal_logins::LoginWriteError> {
+        use chelabase_metadata::personal_logins::{LoginStatus, LoginWriteError, PersonalLogin};
+        let Some(level) = self.login_level(member, database).filter(|l| *l >= PlatformRole::Developer) else {
+            return Err(LoginWriteError::NotQualified);
+        };
+        let own = self.personal_logins.lock().unwrap().iter().find(|l| l.login.member_id == member && l.login.database_id == database).cloned();
+        if own.as_ref().is_some_and(|l| Self::login_view(l).status == LoginStatus::Active) {
+            return Err(LoginWriteError::Exists);
+        }
+        // D3: another login of the database (any status), or any role on a live branch of it,
+        // except the replaced record's own rows (S10).
+        let other_login = self
+            .personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.login.database_id == database && l.login.member_id != member && l.login.role_name == role_name);
+        let endpoints: Vec<String> = self
+            .branches
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|b| b.database_id.as_uuid() == database && b.status != BranchStatus::Deleted)
+            .filter_map(|b| b.endpoint_id.clone())
+            .collect();
+        let own_rows: HashSet<String> = own.iter().flat_map(|l| l.endpoints.iter().map(|e| e.endpoint_id.clone())).collect();
+        let role_taken = {
+            let roles = self.roles.lock().unwrap();
+            endpoints.iter().any(|ep| {
+                roles.get(ep).is_some_and(|rows| {
+                    rows.iter().any(|r| r.name == role_name && !(r.origin == RoleOrigin::Personal && own_rows.contains(ep)))
+                })
+            })
+        };
+        if other_login || role_taken {
+            return Err(LoginWriteError::NameTaken);
+        }
+        let record = self.databases.lock().unwrap().get(&DatabaseId(database)).cloned().ok_or(LoginWriteError::NotQualified)?;
+        if let Some(old) = &own {
+            self.drop_login_rows(old);
+            self.personal_logins.lock().unwrap().retain(|l| !(l.login.member_id == member && l.login.database_id == database));
+            self.personal_login_names.lock().unwrap().remove(&(database, old.login.role_name.clone()));
+        }
+        let login = PersonalLogin {
+            member_id: member,
+            database_id: database,
+            project_id: record.project_id.as_uuid(),
+            database_name: record.name.clone(),
+            role_name: role_name.into(),
+            valid_until,
+            created_at: chrono::Utc::now(),
+            revoked_at: None,
+            revoked_reason: None,
+            status: LoginStatus::Active,
+        };
+        self.personal_logins.lock().unwrap().push(FakeLogin {
+            login: login.clone(),
+            verifier: Some(scram_verifier.into()),
+            endpoints: Vec::new(),
+        });
+        self.personal_login_names.lock().unwrap().insert((database, role_name.to_string()));
+        let tenant = record.tenant_id;
+        self.log(
+            Change::new(tenant, Some(member), "personal_login_created", Some(member))
+                .scope(Some(login.project_id), Some(database))
+                .after(json!({ "role_name": role_name, "valid_until": valid_until, "level": level.as_str() })),
+        );
+        Ok(login)
+    }
+
+    async fn reset_personal_login(
+        &self,
+        member: uuid::Uuid,
+        database: uuid::Uuid,
+        scram_verifier: &str,
+        valid_until: chrono::DateTime<chrono::Utc>,
+    ) -> Result<
+        (chelabase_metadata::personal_logins::PersonalLogin, Vec<chelabase_metadata::personal_logins::LoginEndpoint>),
+        chelabase_metadata::personal_logins::LoginWriteError,
+    > {
+        use chelabase_metadata::personal_logins::{LoginStatus, LoginWriteError};
+        let live = self
+            .personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.login.member_id == member && l.login.database_id == database && l.login.revoked_at.is_none());
+        if !live {
+            return Err(LoginWriteError::NotFound);
+        }
+        if !self.login_level(member, database).is_some_and(|l| l >= PlatformRole::Developer) {
+            return Err(LoginWriteError::NotQualified);
+        }
+        let l = {
+            let mut logins = self.personal_logins.lock().unwrap();
+            let l = logins.iter_mut().find(|l| l.login.member_id == member && l.login.database_id == database).unwrap();
+            l.verifier = Some(scram_verifier.into());
+            l.login.valid_until = valid_until;
+            l.login.status = LoginStatus::Active;
+            l.clone()
+        };
+        let tenant = self.databases.lock().unwrap().get(&DatabaseId(database)).map(|d| d.tenant_id).unwrap();
+        self.log(
+            Change::new(tenant, Some(member), "personal_login_reset", Some(member))
+                .scope(Some(l.login.project_id), Some(database))
+                .after(json!({ "role_name": l.login.role_name, "valid_until": valid_until })),
+        );
+        Ok((Self::login_view(&l), l.endpoints.clone()))
+    }
+
+    async fn delete_personal_login(
+        &self,
+        actor: uuid::Uuid,
+        member: uuid::Uuid,
+        database: uuid::Uuid,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, chelabase_metadata::personal_logins::LoginWriteError> {
+        use chelabase_metadata::personal_logins::LoginWriteError;
+        let l = self
+            .personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|l| l.login.member_id == member && l.login.database_id == database)
+            .cloned()
+            .ok_or(LoginWriteError::NotFound)?;
+        self.drop_login_rows(&l);
+        self.personal_logins.lock().unwrap().retain(|x| !(x.login.member_id == member && x.login.database_id == database));
+        self.personal_login_names.lock().unwrap().remove(&(database, l.login.role_name.clone()));
+        let tenant = self.databases.lock().unwrap().get(&DatabaseId(database)).map(|d| d.tenant_id).unwrap();
+        self.log(
+            Change::new(tenant, Some(actor), "personal_login_deleted", Some(member))
+                .scope(Some(l.login.project_id), Some(database))
+                .before(json!({ "role_name": l.login.role_name })),
+        );
+        Ok(l.endpoints)
+    }
+
+    async fn member_personal_logins(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLogin>, MetadataError> {
+        let mut out: Vec<_> = self.personal_logins.lock().unwrap().iter().filter(|l| l.login.member_id == member).map(Self::login_view).collect();
+        out.sort_by(|a, b| (&a.database_name, a.database_id).cmp(&(&b.database_name, b.database_id)));
+        Ok(out)
+    }
+
+    async fn database_personal_logins(&self, database: uuid::Uuid) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLogin>, MetadataError> {
+        let mut out: Vec<_> = self.personal_logins.lock().unwrap().iter().filter(|l| l.login.database_id == database).map(Self::login_view).collect();
+        out.sort_by(|a, b| a.role_name.cmp(&b.role_name));
+        Ok(out)
+    }
+
+    async fn member_login_endpoints(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        let mut out: Vec<_> = self
+            .personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.login.member_id == member)
+            .flat_map(|l| l.endpoints.clone())
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    async fn suspend_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<Vec<uuid::Uuid>> {
+        use chelabase_metadata::members::AccessWriteError;
+        use chelabase_metadata::personal_logins::RevokeReason;
+        let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::NotFound)?;
+        match m.status {
+            MemberStatus::Active => {}
+            MemberStatus::Suspended => return Ok(self.login_touched_projects(member)),
+            _ => return Err(AccessWriteError::Conflict("only an active member can be suspended".into())),
+        }
+        if actor == member {
+            return Err(AccessWriteError::Conflict("you can't suspend yourself".into()));
+        }
+        if m.tenant_admin && self.other_active_admins(m.tenant_id, member) == 0 {
+            return Err(AccessWriteError::LastTenantAdmin);
+        }
+        {
+            let mut members = self.members.lock().unwrap();
+            let x = members.iter_mut().find(|x| x.id == member).unwrap();
+            x.status = MemberStatus::Suspended;
+            x.suspended_at = Some(chrono::Utc::now());
+            x.suspended_by = Some(actor);
+        }
+        let rotated = self.mark_member_roles_for_rotation(member);
+        self.log(
+            Change::new(m.tenant_id, Some(actor), "member_suspended", Some(member))
+                .before(json!({ "status": "active" }))
+                .after(json!({ "status": "suspended", "rotated_branches": rotated })),
+        );
+        let n = self.revoke_member_logins(member, RevokeReason::Suspended);
+        if n > 0 {
+            self.log(Change::new(m.tenant_id, Some(actor), "personal_logins_revoked", Some(member)).after(json!({ "count": n, "reason": "suspended" })));
+        }
+        Ok(self.login_touched_projects(member))
+    }
+
+    async fn reinstate_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<()> {
+        use chelabase_metadata::members::AccessWriteError;
+        let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::NotFound)?;
+        match m.status {
+            MemberStatus::Suspended => {}
+            MemberStatus::Active => return Ok(()),
+            _ => return Err(AccessWriteError::Conflict("only a suspended member can be reinstated".into())),
+        }
+        {
+            let mut members = self.members.lock().unwrap();
+            let x = members.iter_mut().find(|x| x.id == member).unwrap();
+            x.status = MemberStatus::Active;
+            x.suspended_at = None;
+            x.suspended_by = None;
+        }
+        self.log(
+            Change::new(m.tenant_id, Some(actor), "member_reinstated", Some(member))
+                .before(json!({ "status": "suspended" }))
+                .after(json!({ "status": "active" })),
+        );
+        Ok(())
+    }
+
+    async fn revoke_postgres_access(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<Vec<uuid::Uuid>> {
+        use chelabase_metadata::members::AccessWriteError;
+        use chelabase_metadata::personal_logins::RevokeReason;
+        let m = self.live_member(member).ok_or(AccessWriteError::NotFound)?;
+        // Final round A (T8-6): a write landing just before this one (`race_once`), as a login
+        // made between the handler's reads and the revocation.
+        let race = self.race_before_write.lock().unwrap().pop_front();
+        if let Some(write) = race {
+            write(self);
+        }
+        let n = self.revoke_member_logins(member, RevokeReason::RevokedNow);
+        let rotated = self.mark_member_roles_for_rotation(member);
+        self.log(
+            Change::new(m.tenant_id, Some(actor), "personal_logins_revoked", Some(member))
+                .after(json!({ "count": n, "reason": "revoked_now", "rotated_branches": rotated })),
+        );
+        Ok(self.login_touched_projects(member))
+    }
+
+    async fn record_access_event(&self, e: &chelabase_metadata::personal_logins::AccessEventInput<'_>) -> Result<(), MetadataError> {
+        let mut events = self.events.lock().unwrap();
+        let id = events.len() as i64 + 1;
+        events.push(chelabase_metadata::members::AccessEvent {
+            id,
+            tenant_id: e.tenant,
+            actor_member_id: e.actor,
+            action: e.action.as_str().into(),
+            target_member_id: e.target,
+            project_id: e.project,
+            database_id: e.database,
+            before: e.before.cloned(),
+            after: e.after.cloned(),
+            at: chrono::Utc::now(),
+            actor_email: None,
+            target_email: None,
+            project_name: None,
+            branch_id: e.branch,
+        });
+        Ok(())
     }
 
     async fn set_tenant_admin(&self, actor: Option<uuid::Uuid>, member: uuid::Uuid, admin: bool) -> FakeWrite<()> {
@@ -3236,6 +3875,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             tenant_admin: false,
             status: MemberStatus::Invited,
             accepted_at: None,
+            offboarded: false, suspended_at: None, suspended_by: None,
         };
         {
             let mut members = self.members.lock().unwrap();
@@ -3287,6 +3927,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             tenant_admin: false,
             status: MemberStatus::Active,
             accepted_at: Some(chrono::Utc::now()),
+            offboarded: false, suspended_at: None, suspended_by: None,
         };
         {
             let mut members = self.members.lock().unwrap();

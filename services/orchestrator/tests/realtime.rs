@@ -1776,3 +1776,61 @@ async fn visible_convert_mode_prints_keys_and_refuses_keys_outside_p6() {
 
     scratch.drop().await;
 }
+
+// --- Members hub step 1, final fix round, area A ----------------------------------------------
+
+const MEMBER: &str = "/internal/realtime/member";
+
+// T2-4: realtime's project list reads every grant source: a member reached only through a
+// (fake) team grant sees the project.
+#[tokio::test]
+async fn realtime_projects_read_every_grant_source() {
+    let t = rt().await;
+    let tam = t.metadata.add_member(t.tenant, "tam", MemberStatus::Active, false);
+    t.metadata.team_grant(
+        tam,
+        t.project,
+        Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: chelabase_types::access::RoleSet::Only(Default::default()),
+        },
+    );
+    let (status, body) = t
+        .post(PROJECTS, Some(REALTIME_TOKEN), json!({ "token": t.token("tam") }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        projects_of(&body),
+        vec![(t.project.as_uuid().to_string(), vec![t.db.as_uuid().to_string()])]
+    );
+}
+
+// D7, T8-1: realtime asks before it issues a Studio ticket. `/internal/realtime/member` (its
+// bearer only; `{sub, org_id}` from the gateway's identity) answers `{allowed: true}` for an
+// active member and `{allowed: false, reason: "forbidden"}` for a suspended or offboarded one,
+// a non-member, or another org; the project list refuses an offboarded member like a
+// suspended one.
+#[tokio::test]
+async fn realtime_refuses_suspended_and_offboarded_members() {
+    let t = rt().await;
+    t.metadata.add_granted(t.tenant, "sus", t.project, PlatformRole::Developer, &[]);
+    t.metadata.set_member(t.tenant, "sus", |m| m.status = MemberStatus::Suspended);
+    t.metadata.add_granted(t.tenant, "off", t.project, PlatformRole::Developer, &[]);
+    t.metadata.set_member(t.tenant, "off", |m| m.offboarded = true);
+    let ask = |sub: &str, org: &str| json!({ "sub": sub, "org_id": org });
+
+    let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask("dev1", "org-1")).await;
+    assert_eq!((status, body["allowed"].clone()), (200, json!(true)), "{body}");
+    for (sub, org) in [("sus", "org-1"), ("off", "org-1"), ("stranger", "org-1"), ("dev1", "org-2")] {
+        let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask(sub, org)).await;
+        assert_eq!(status, 200, "{sub} {org}: {body}");
+        assert_refused(&body, "forbidden");
+    }
+    let (status, _) = t.post(MEMBER, None, ask("dev1", "org-1")).await;
+    assert_eq!(status, 401, "realtime's bearer only");
+
+    let (status, _) = t
+        .post(PROJECTS, Some(REALTIME_TOKEN), json!({ "token": t.token("off") }))
+        .await;
+    assert_eq!(status, 403, "an offboarded member's projects");
+}

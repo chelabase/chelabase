@@ -165,6 +165,8 @@ pub(crate) fn rt_worker() -> Rt {
         zitadel: w.zitadel,
         app_users_reconcile_every: w.app_users_reconcile_every,
         member_roles_sweep_every: w.member_roles_sweep_every,
+        identity_sweep_every: w.identity_sweep_every,
+        identity_sweep_warned: Default::default(),
         remove_orphans: w.remove_orphans,
         merge_tx_timeout: w.merge_tx_timeout,
         merge_online_step_timeout: w.merge_online_step_timeout,

@@ -8,11 +8,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_neon::DockerBackend;
 use chelabase_neon::compute_tls::ComputeCa;
 use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE, generate_keypair};
 use chelabase_secrets::SecretKey;
 
-use crate::config::{RealWorker, WorkerConfig, build};
+use crate::config::{RealWorker, WorkerConfig, build_with};
 use crate::rt_events::NoopPublisher;
 
 const VAR: &str = "CHELABASE_REALTIME_PG_PASSWORD_FILE";
@@ -78,12 +79,18 @@ fn lazy_metadata() -> MetadataClient {
 }
 
 fn built(config: &WorkerConfig) -> anyhow::Result<RealWorker> {
-    build(
+    // `build` itself needs the Docker socket file to exist, which fails whenever the engine is
+    // restarting; these tests are about the config, so the backend sits over an unreachable one.
+    build_with(
         config,
         lazy_metadata(),
         SecretKey::generate(),
         Arc::new(NoopPublisher),
         crate::ports::AttachSource::Disabled,
+        |settings| {
+            let docker = bollard::Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)?;
+            Ok(DockerBackend::with_docker(settings, docker))
+        },
     )
 }
 

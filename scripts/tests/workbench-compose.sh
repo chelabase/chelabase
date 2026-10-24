@@ -2,6 +2,9 @@
 # Offline check of the workbench Compose shape (W2 spec section 2): one stack's rendered config,
 # from a fixture stack.env (stack feat-x, gateway 8137, proxy 4537).
 set -euo pipefail
+# `producer | grep -q` under pipefail races: grep -q exits at its first match, the producer can
+# get SIGPIPE/EPIPE and fail the pipeline. gq is grep -q that reads all its input (same status).
+gq() { grep "$@" >/dev/null; }
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 fixture="$root/scripts/tests/fixtures/workbench-stack.env"
 fail() {
@@ -28,16 +31,16 @@ $published"
 ! grep -q 'host-gateway' <<<"$config" || fail "no extra_hosts host-gateway"
 
 for name in studio api auth mail docs landing; do
-  q '.services.gateway.networks.default.aliases[]?' | grep -qx "$name.feat-x.chelabase.localhost" ||
+  q '.services.gateway.networks.default.aliases[]?' | gq -x "$name.feat-x.chelabase.localhost" ||
     fail "the gateway answers $name.feat-x.chelabase.localhost inside the network"
 done
 [[ "$(q '.services.gateway.environment.CHELABASE_GATEWAY_LISTEN // empty')" == "" ||
   "$(q '.services.gateway.environment.CHELABASE_GATEWAY_LISTEN')" == "0.0.0.0:8137" ]] ||
   fail "the gateway listens on its published port inside"
 
-q '.services["storage-controller"].command[]' | grep -qx -- '--control-plane-url=http://orchestrator:8083/storcon' ||
+q '.services["storage-controller"].command[]' | gq -x -- '--control-plane-url=http://orchestrator:8083/storcon' ||
   fail "storcon's hook calls the orchestrator by service name"
-q '.services.proxy.command[]' | grep -qx -- '--auth-endpoint=http://orchestrator:8083/proxy/api/v1' ||
+q '.services.proxy.command[]' | gq -x -- '--auth-endpoint=http://orchestrator:8083/proxy/api/v1' ||
   fail "the proxy's auth endpoint is the orchestrator by service name"
 
 for s in orchestrator worker gateway auth rest studio docs landing runner; do
@@ -63,9 +66,9 @@ done
   fail "studio mounts the checkout read-write (Vite's cache)"
 
 for s in orchestrator worker runner; do
-  q ".services[\"$s\"].volumes[] | select(.target == \"/var/run/docker.sock\") | .source" | grep -qx /var/run/docker.sock ||
+  q ".services[\"$s\"].volumes[] | select(.target == \"/var/run/docker.sock\") | .source" | gq -x /var/run/docker.sock ||
     fail "$s gets the Docker socket"
-  q ".services[\"$s\"].group_add[]?" | grep -qx 973 || fail "$s joins the docker group"
+  q ".services[\"$s\"].group_add[]?" | gq -x 973 || fail "$s joins the docker group"
 done
 for s in gateway auth rest studio zitadel mailpit metadata-db; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/var/run/docker.sock\") | .source")" ]] ||
@@ -99,10 +102,10 @@ for s in orchestrator worker gateway auth rest; do
 done
 
 for s in orchestrator worker gateway auth rest runner; do
-  q ".services[\"$s\"].env_file[]? | if type == \"object\" then .path else . end" | grep -qx /m/.chelabase/stacks/feat-x/env/stack.env ||
+  q ".services[\"$s\"].env_file[]? | if type == \"object\" then .path else . end" | gq -x /m/.chelabase/stacks/feat-x/env/stack.env ||
     fail "$s reads the stack env"
 done
-q '.services.runner.volumes[] | select(.target == "/usr/local/bin/cargo-nextest") | .source' | grep -qx /usr/local/bin/cargo-nextest ||
+q '.services.runner.volumes[] | select(.target == "/usr/local/bin/cargo-nextest") | .source' | gq -x /usr/local/bin/cargo-nextest ||
   fail "the runner gets the host's cargo-nextest"
 # W2 live: a live test's own input (docker_backend_live's endpoint id) reaches the runner from
 # the caller's env, as it reached `cargo test` on the host.
@@ -212,8 +215,8 @@ grep -q 'auth.conf' "$nats_conf" || fail "nats.conf includes the rendered users 
   fail "nats mounts the checkout's nats.conf read-only"
 [[ "$(q '.services.nats.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x/nats/auth.conf") | .read_only // false')" == true ]] ||
   fail "nats mounts the stack's rendered auth.conf read-only"
-q '.services.nats.command[]' | grep -Eqx -- '-c|--config|--config=.*|-c=.*' || fail "nats starts from its config file"
-q '.services.nats.command[]' | grep -qx -- '--jetstream' || fail "nats keeps JetStream"
+q '.services.nats.command[]' | gq -Ex -- '-c|--config|--config=.*|-c=.*' || fail "nats starts from its config file"
+q '.services.nats.command[]' | gq -x -- '--jetstream' || fail "nats keeps JetStream"
 valkey_cmd="$(q '.services.valkey.command // [] | if type == "array" then join(" ") else . end')"
 acl_target="$(q '.services.valkey.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x/valkey/users.acl") | .target')"
 [[ -n "$acl_target" && "$(q '.services.valkey.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x/valkey/users.acl") | .read_only // false')" == true ]] ||
@@ -237,7 +240,7 @@ grep -q -- '--redis-plain-password-file=/run/valkey-proxy.password' <<<"$proxy_f
 grep -q -- '--control-plane-token-file=/run/proxy-api.token' <<<"$proxy_entry" && ! grep -q 'NEON_PROXY_TO_CONTROLPLANE_TOKEN' <<<"$proxy_entry" ||
   fail "the proxy's control-plane token comes from /run/proxy-api.token"
 ! grep -q -- '--redis-plain' <<<"$(q '.services.proxy.command[]')" || fail "no unauthenticated --redis-plain left in the proxy's command"
-q '.services.proxy.command[]' | grep -qx -- '--redis-auth-type=plain' || fail "the proxy keeps --redis-auth-type=plain"
+q '.services.proxy.command[]' | gq -x -- '--redis-auth-type=plain' || fail "the proxy keeps --redis-auth-type=plain"
 storcon_entry="$(q '.services["storage-controller"].entrypoint // [] | join(" ")')"
 storcon_flags="$(q '.services["storage-controller"] | [(.entrypoint // [])[], (.command // [])[]] | join(" ")')"
 # Fork round 4 (F6): the storage controller reads its hook token from its mount itself
@@ -315,7 +318,7 @@ done
   fail "realtime must not get the Docker socket"
 [[ -z "$(q '.services.realtime.ports // [] | .[]?')" ]] || fail "realtime publishes no port (the gateway is the way in)"
 for f in /m/.chelabase/stacks/feat-x/env/stack.env /m/.chelabase/stacks/feat-x/zitadel/demo.env; do
-  q '.services.realtime.env_file[]? | if type == "object" then .path else . end' | grep -qx "$f" ||
+  q '.services.realtime.env_file[]? | if type == "object" then .path else . end' | gq -x "$f" ||
     fail "realtime reads $f (demo.env: the OIDC audiences, as the gateway)"
 done
 grep -q '8088/health' <<<"$(q '.services.realtime.healthcheck.test // [] | join(" ")')" ||
@@ -348,7 +351,7 @@ eff_env() { # eff_env <service> <key>
   local v
   v="$(env_of "$1" "$2")"
   if [[ -z "$v" ]] && q ".services[\"$1\"].env_file[]? | if type == \"object\" then .path else . end" |
-    grep -qx /m/.chelabase/stacks/feat-x/env/stack.env; then
+    gq -x /m/.chelabase/stacks/feat-x/env/stack.env; then
     v="$(sed -n "s/^$2=//p" "$fixture")"
   fi
   printf '%s' "$v"

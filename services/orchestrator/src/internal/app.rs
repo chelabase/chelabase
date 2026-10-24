@@ -554,6 +554,17 @@ where
     if matches!(kind, UserEventKind::Gone | UserEventKind::Deactivated) {
         match state.metadata.tenant_by_org(&event.resource_owner).await {
             Ok(Some(tenant)) => {
+                // D4, P17: the member's personal logins are revoked first; a failed write is
+                // 500, so Zitadel delivers the event again (nothing after it has run).
+                let rows = match state
+                    .metadata
+                    .revoke_logins_for_zitadel_user(tenant, &event.aggregate_id)
+                    .await
+                {
+                    Ok(rows) => rows,
+                    Err(e) => return internal("revoking an offboarded member's personal logins", e),
+                };
+                offboarded_logins_changed(&state, rows).await;
                 let event = chelabase_nats::rt::AccessEvent {
                     tenant_id: tenant.as_uuid(),
                     member_sub: Some(event.aggregate_id.clone()),
@@ -562,8 +573,32 @@ where
                 return StatusCode::OK.into_response();
             }
             Ok(None) => {}
-            // Best effort: the member's next re-authorization (60 s) catches it.
-            Err(e) => warn!("Zitadel event: the org's tenant isn't readable: {e:#}"),
+            // T8-2, P17: a 200 here would skip the revocation for good; Zitadel delivers a
+            // failed event again.
+            Err(e) => return internal("Zitadel event: the org's tenant lookup", e),
+        }
+    }
+    // D7: a tenant member's user reactivated or unlocked loses its offboarded mark (its logins
+    // stay revoked; it makes new ones). A failed clear is 500, so Zitadel delivers it again.
+    if kind == UserEventKind::Reactivated {
+        match state.metadata.tenant_by_org(&event.resource_owner).await {
+            Ok(Some(tenant)) => {
+                if let Err(e) = state
+                    .metadata
+                    .clear_offboarded(tenant, &event.aggregate_id)
+                    .await
+                {
+                    return internal("clearing a reactivated member's offboarded mark", e);
+                }
+                let event = chelabase_nats::rt::AccessEvent {
+                    tenant_id: tenant.as_uuid(),
+                    member_sub: Some(event.aggregate_id.clone()),
+                };
+                super::realtime::spawn_access(state.rt_events.clone(), event);
+                return StatusCode::OK.into_response();
+            }
+            Ok(None) => {}
+            Err(e) => return internal("Zitadel event: the org's tenant lookup", e),
         }
     }
     let auth = match state
@@ -612,6 +647,24 @@ where
         });
     }
     StatusCode::OK.into_response()
+}
+
+/// After an offboarding revocation (D4): the proxies forget every personal row of the member
+/// (`rows` holds revoked ones from earlier deliveries too, so a redelivery still clears them),
+/// and each branch holding one reconciles its member roles, which drops the logins. Failures
+/// are logged: the verifier is already gone from the metadata, and the worker's sweep
+/// reconciles every branch anyway.
+async fn offboarded_logins_changed<M, L>(
+    state: &InternalState<M, L>,
+    rows: Vec<chelabase_metadata::personal_logins::LoginEndpoint>,
+) {
+    let branches: std::collections::BTreeSet<Uuid> = rows.iter().map(|r| r.branch_id).collect();
+    super::ddl::publish_login_rows(&state.cache, rows);
+    for branch in branches {
+        if let Err(e) = state.resync.reconcile_member_roles(BranchId(branch)).await {
+            warn!(branch_id = %branch, "Zitadel event: member-role reconcile not asked for: {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]

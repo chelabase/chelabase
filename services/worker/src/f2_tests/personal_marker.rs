@@ -1,10 +1,9 @@
-//! The personal-login marker in the resync (F2, part 2; C3's latent finding at
-//! `resync.rs:886-890`): a role the catalog has is recorded as `Personal` only when its row is
-//! a personal login's, its name is one a personal login may take, and the catalog shows the
-//! marker (SP22's predicate, read by the catalog read's `m` lines). An unmarked role is
-//! recorded as `Sql` (an owner-made `alice` on a point-in-time child is never adopted as
-//! alice's personal login with the owner's verifier). Second finding in the personal-login
-//! area, so the rule is tested exhaustively.
+//! The personal-login marker in the resync (F2, part 2; members hub T6 changes the rule
+//! deliberately, spec Part 6 "Convergence", MH-9, MH-10, S1): the resync reads the marker
+//! (SP22's predicate, the catalog read's `m` lines) only to leave marked roles alone. It never
+//! records, recreates or repairs a marked role or a personal row, whatever the catalog shows;
+//! the member-role reconciler converges personal logins from their records. Tested
+//! exhaustively.
 
 use chelabase_metadata::{ResyncWrite, RoleOrigin};
 use chelabase_types::role_name::PERSONAL_LOGIN_MARKER;
@@ -145,18 +144,15 @@ fn marker_scripts<'a>(repairs: &'a [RepairGroup], name: &str) -> Vec<&'a RepairG
         .collect()
 }
 
-// Invariant, exhaustive over {no row, personal (whole verifier, prefix-only, none), sql, api}
-// × {absent, unmarked, marked} × every name kind, with an unrelated present role beside it:
-// - the role is recorded as `Personal` exactly when its row is a personal login's, its name is
-//   allowed, and the catalog shows it marked, or lost it and the row can make it again (a
-//   whole verifier);
-// - a marker script runs exactly for a lost personal login that can be made again;
-// - a personal row that exists unmarked (or under a refused name) is recorded as `Sql`, with
-//   no repair: never adopted, never re-marked, never touched;
-// - a personal row is never removed;
-// - the unrelated role is recorded as `Sql`, whatever is marked.
+// Invariant (T6), exhaustive over {no row, personal (whole verifier, prefix-only, none), sql,
+// api} × {absent, unmarked, marked} × every name kind, with an unrelated marked role beside
+// it:
+// - a personal row is never recorded (no upsert), removed, recreated or repaired;
+// - a marked role is never recorded or repaired, whatever its row;
+// - no marker script ever runs;
+// - the unrelated marked role is never recorded.
 #[test]
-fn personal_origin_needs_a_personal_row_an_allowed_name_and_the_marker_exhaustively() {
+fn the_resync_never_touches_a_personal_row_or_a_marked_role_exhaustively() {
     let rows = [
         Row::None,
         Row::Personal,
@@ -165,7 +161,7 @@ fn personal_origin_needs_a_personal_row_an_allowed_name_and_the_marker_exhaustiv
         Row::Sql,
         Row::Api,
     ];
-    for (name, refused) in NAMES {
+    for (name, _refused) in NAMES {
         for r in rows {
             // Round 2: the role also exists without a SCRAM password (the branch that skips a
             // reserved name with no password).
@@ -206,41 +202,28 @@ fn personal_origin_needs_a_personal_row_an_allowed_name_and_the_marker_exhaustiv
                     r,
                     Row::Personal | Row::PersonalPrefixOnly | Row::PersonalNoVerifier
                 );
-                let can_make = r == Row::Personal;
-                let adopted = personal_row
-                    && !refused
-                    && (seen == Seen::Marked || (seen == Seen::Absent && can_make));
                 let origin = upsert_origin(&write, name);
-                assert_eq!(
-                    origin == Some(RoleOrigin::Personal),
-                    adopted,
-                    "{case}: recorded as {origin:?}: {write:?}"
+                assert!(
+                    marker_scripts(&repairs, name).is_empty(),
+                    "{case}: no marker script: {repairs:?}"
                 );
-                let remade = personal_row && !refused && seen == Seen::Absent && can_make;
-                assert_eq!(
-                    marker_scripts(&repairs, name).len(),
-                    usize::from(remade),
-                    "{case}: {repairs:?}"
-                );
-                if personal_row && seen != Seen::Absent {
-                    if !adopted {
-                        assert_eq!(origin, Some(RoleOrigin::Sql), "{case}: {write:?}");
-                    }
+                if personal_row || seen == Seen::Marked {
+                    assert_eq!(origin, None, "{case}: never recorded: {write:?}");
                     assert!(
                         repairs.iter().all(|g| g.role != *name),
-                        "{case}: an existing personal login gets no repair: {repairs:?}"
+                        "{case}: never made or repaired: {repairs:?}"
                     );
                 }
                 if personal_row {
                     assert!(
                         !write.removals.contains(&name.to_string()),
-                        "{case}: {write:?}"
+                        "{case}: never removed: {write:?}"
                     );
                 }
                 assert_eq!(
                     upsert_origin(&write, "bystander"),
-                    Some(RoleOrigin::Sql),
-                    "{case}: a marked role with no personal row is not adopted"
+                    None,
+                    "{case}: a marked role with no row is never recorded"
                 );
             }
         }
@@ -269,7 +252,7 @@ fn the_owner_is_never_adopted_as_a_personal_login() {
 }
 
 /// The whole path through the fakes: the catalog read shows `alice`, with an `m` line or
-/// without; her row is a personal login's. The origin the resync records.
+/// without; her row is a personal login's. The origin her row has after the resync.
 async fn origin_after_resync(marked: bool) -> RoleOrigin {
     let (w, journal) = worker();
     let id = crate::fakes::ready_database(&w).await;
@@ -326,9 +309,12 @@ async fn origin_after_resync(marked: bool) -> RoleOrigin {
     origin
 }
 
+// T6 (deliberate change, S1): an unmarked role under a personal row's name is the owner's, and
+// the row stays its record's: the resync neither adopts the role nor flips the row to `sql`
+// (the metadata's CHECK would refuse the flip and fail the whole resync).
 #[tokio::test(start_paused = true)]
-async fn the_resync_records_an_unmarked_personal_row_as_sql() {
-    assert_eq!(origin_after_resync(false).await, RoleOrigin::Sql);
+async fn the_resync_leaves_an_unmarked_personal_row_personal() {
+    assert_eq!(origin_after_resync(false).await, RoleOrigin::Personal);
 }
 
 #[tokio::test(start_paused = true)]

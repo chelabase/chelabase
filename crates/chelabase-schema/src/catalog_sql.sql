@@ -8,6 +8,8 @@ reserved AS (
      OR r.rolname LIKE 'pg\_%'
      OR lower(r.rolname) LIKE 'chelabase\_%'
      OR lower(r.rolname) LIKE 'cb\_m\_%'
+     -- Marked roles (personal logins, MH-13): never a role, member or grantee of the model.
+     OR r.oid IN (SELECT oid FROM hidden)
 ),
 schemas_j AS (
   SELECT n.nspname AS k, jsonb_build_object(

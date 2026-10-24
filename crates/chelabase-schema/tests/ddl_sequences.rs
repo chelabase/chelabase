@@ -51,6 +51,7 @@ fn ctx() -> RenderContext {
     RenderContext {
         tables: vec![ContextTable { table: table("public", "a"), total_bytes: 0 }, ContextTable { table: table("app", "b"), total_bytes: 0 }],
         cascade: false,
+        ..Default::default()
     }
 }
 

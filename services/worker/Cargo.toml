@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "worker"
 path = "src/main.rs"
 
+[features]
+# Test-only entry points for the integration tests (`Worker::create_personal_login`, T6-M4).
+test-support = []
+
 [dependencies]
 chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true, features = ["metadata"] }
@@ -39,7 +43,9 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+worker = { path = ".", features = ["test-support"] }
 chelabase-auth = { workspace = true }
+bollard = { workspace = true }
 tempfile = { workspace = true }
 sqlx = { workspace = true }
 base64 = { workspace = true }

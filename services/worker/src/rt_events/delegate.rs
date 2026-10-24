@@ -1,7 +1,8 @@
 //! [`super::PublishingMetadata`]'s [`WorkerMetadata`]: every call goes to the wrapped port
 //! unchanged; the status writes then publish (the table in [`super`]'s docs).
 
-use chelabase_metadata::members::{GrantRows, MemberBranchRole, MemberRecord};
+use chelabase_metadata::members::{MemberBranchRole, MemberRecord};
+use chelabase_types::access::GrantSources;
 use chelabase_metadata::{
     ApiRoleChange, AppSession, BranchAuthSync, BranchConnectionRow, BranchDatabase,
     BranchDeleteOutcome, BranchKind, BranchRecord, BranchStatus, ClaimOutcome, DataKeyRecord,
@@ -623,12 +624,12 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.list_members(tenant).await
     }
 
-    async fn database_grant_rows(
+    async fn database_grant_sources(
         &self,
         project: Uuid,
         database: Uuid,
-    ) -> Result<Vec<(Uuid, GrantRows)>, MetadataError> {
-        self.inner.database_grant_rows(project, database).await
+    ) -> Result<Vec<(Uuid, GrantSources)>, MetadataError> {
+        self.inner.database_grant_sources(project, database).await
     }
 
     async fn member_role_branches(&self) -> Result<Vec<Uuid>, MetadataError> {
@@ -664,6 +665,62 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         branch: Uuid,
     ) -> Result<(), MetadataError> {
         self.inner.delete_member_branch_role(member, branch).await
+    }
+
+    async fn personal_login_records(
+        &self,
+        database: Uuid,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>, MetadataError> {
+        self.inner.personal_login_records(database).await
+    }
+
+    async fn upsert_personal_role_row(
+        &self,
+        endpoint_id: &str,
+        member: Uuid,
+        database: Uuid,
+        role_name: &str,
+        scram_verifier: &str,
+    ) -> Result<(), MetadataError> {
+        self.inner
+            .upsert_personal_role_row(endpoint_id, member, database, role_name, scram_verifier)
+            .await
+    }
+
+    async fn members_with_live_logins(&self) -> Result<Vec<(chelabase_types::TenantId, Uuid, String)>, MetadataError> {
+        self.inner.members_with_live_logins().await
+    }
+
+    async fn revoke_logins_for_zitadel_user(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        self.inner.revoke_logins_for_zitadel_user(tenant, zitadel_user_id).await
+    }
+
+    async fn offboarded_members(&self) -> Result<Vec<(chelabase_types::TenantId, Uuid, String)>, MetadataError> {
+        self.inner.offboarded_members().await
+    }
+
+    async fn clear_offboarded(
+        &self,
+        tenant: chelabase_types::TenantId,
+        zitadel_user_id: &str,
+    ) -> Result<bool, MetadataError> {
+        self.inner.clear_offboarded(tenant, zitadel_user_id).await
+    }
+
+    async fn upsert_member_branch_role_if(
+        &self,
+        row: &chelabase_metadata::members::MemberBranchRole,
+        read: Option<&str>,
+    ) -> Result<bool, MetadataError> {
+        self.inner.upsert_member_branch_role_if(row, read).await
+    }
+
+    async fn delete_personal_role_row(&self, endpoint_id: &str, role_name: &str) -> Result<(), MetadataError> {
+        self.inner.delete_personal_role_row(endpoint_id, role_name).await
     }
 
     async fn finish_enable_data_api(

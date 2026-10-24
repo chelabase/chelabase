@@ -23,7 +23,7 @@ const adminMe = meFor({ id: "ana", role: "admin", roles: "all" });
 
 const member = (id: string, extra: Partial<Member> = {}): Member => ({
   id, email: `${id}@example.test`, display_name: id[0].toUpperCase() + id.slice(1), status: "active", tenant_admin: false, has_access: true,
-  invite: null, accepted_at: null, created_at: "2026-10-01T00:00:00Z", ...extra,
+  invite: null, accepted_at: null, suspended_at: null, suspended_by: null, created_at: "2026-10-01T00:00:00Z", access: { level: "none", projects: [] }, ...extra,
 });
 const people: Member[] = [
   member("ana"),
@@ -109,10 +109,10 @@ describe("AccessTab", () => {
     expect(within(eveRow).queryByText("o")).toBeNull();
     expect(within(eveRow).queryByText(/owner chip/i)).toBeNull();
 
-    // The editor shows every role instead of a role picker; narrowing stays per database.
+    // The editor (the shared grant card) says "All roles" instead of a role list; narrowing stays per database.
     const editor = await openEditor("Eve");
-    const roles = within(editor).getByRole("group", { name: "Postgres roles" });
-    expect(within(roles).getByText("All roles")).toBeInTheDocument();
+    expect(within(editor).getByText("All roles")).toBeInTheDocument();
+    expect(within(editor).queryByRole("checkbox", { name: "billing_admin" })).toBeNull();
     expect(within(editor).queryByRole("combobox", { name: "Postgres roles" })).toBeNull();
   });
 
@@ -254,7 +254,7 @@ describe("AccessTab", () => {
   it("activity_lists_events", async () => {
     const event: AccessEvent = {
       id: 7, at: new Date().toISOString(), action: "grant_put", actor_member_id: "ana", actor_email: "ana@example.test",
-      target_member_id: "bo", target_email: "bo@example.test", project_id: "p1", project_name: "Shop", database_id: null,
+      target_member_id: "bo", target_email: "bo@example.test", project_id: "p1", project_name: "Shop", database_id: null, branch_id: null,
       before: null, after: { platform_role: "developer", pg_roles: [] },
     } as AccessEvent;
     setup({ routes: { "GET /v1/projects/p1/access-events": ok({ events: [event], next_before: null }) } });
@@ -295,11 +295,10 @@ describe("AccessTab", () => {
       },
     });
     const editor = await openEditor("Bo");
-    await userEvent.click(within(editor).getByLabelText("Postgres roles"));
-    await userEvent.click(await screen.findByRole("option", { name: /^reporting/ }));
-    await userEvent.keyboard("{Escape}");
+    await userEvent.click(await within(editor).findByRole("checkbox", { name: "reporting" }));
     await userEvent.click(within(editor).getByRole("button", { name: "Save" }));
-    // On Bo's row, in Studio's words (never the server's sentence), with the chain and database.
+    // On Bo's card, in Studio's words (never the server's sentence), with the chain and database
+    // (the shared card is given the project's databases).
     const alert = await within(editor).findByText("Only Admin can hold billing_admin on orders: it reaches app_login, a LOGIN role.");
     expect(alert).toBeInTheDocument();
     expect(within(editor).queryByText(/can't be held below Admin/)).toBeNull();
@@ -320,7 +319,7 @@ describe("AccessTab", () => {
       },
     });
     const editor = await openEditor("Gus");
-    await userEvent.click(within(editor).getByRole("button", { name: "Remove billing_admin" }));
+    await userEvent.click(await within(editor).findByRole("checkbox", { name: "billing_admin" }));
     await userEvent.click(within(editor).getByRole("button", { name: "Save" }));
     expect(await within(editor).findByText("Only Admin can hold reporting on orders: it's a LOGIN role.")).toBeInTheDocument();
     expect(within(editor).queryByText(/why the grant was refused/)).toBeNull();
@@ -346,19 +345,20 @@ describe("AccessTab", () => {
     expect(within(within(editor).getByRole("group", { name: "orders" })).queryByText("That narrows nothing.")).toBeNull();
   });
 
-  it("role_picker_merges_databases", async () => {
+  it("role_checklist_merges_databases", async () => {
     setup();
     const editor = await openEditor("Bo");
-    await userEvent.click(within(editor).getByLabelText("Postgres roles"));
-    // `reporting` is on both databases: one option, no "only on" note.
-    const reporting = await screen.findAllByRole("option", { name: /^reporting/ });
+    // `reporting` is on both databases: one checkbox, no "only on" note.
+    const reporting = await within(editor).findAllByRole("checkbox", { name: "reporting" });
     expect(reporting).toHaveLength(1);
-    expect(reporting[0]).not.toHaveTextContent("only on");
+    expect(reporting[0].closest("li")).not.toHaveTextContent("only on");
     // `audit` exists only on events, `billing` only on orders.
-    expect(await screen.findByRole("option", { name: /^audit/ })).toHaveTextContent("only on events");
-    expect(screen.getByRole("option", { name: /^billing_admin/ })).toHaveTextContent("only on orders");
-    // The LOGIN role is Admin-only below Admin.
-    expect(screen.getByRole("option", { name: /^app_login/ })).toHaveTextContent("Admin only: LOGIN role");
+    expect((await within(editor).findByRole("checkbox", { name: "audit" })).closest("li")).toHaveTextContent("only on events");
+    expect(within(editor).getByRole("checkbox", { name: "billing_admin" }).closest("li")).toHaveTextContent("only on orders");
+    // The LOGIN role is Admin-only below Admin: disabled with its reason.
+    const login = within(editor).getByRole("checkbox", { name: "app_login" });
+    expect(login).toBeDisabled();
+    expect(login.closest("li")).toHaveTextContent("Admin only: LOGIN role");
   });
 
   it("take_access_away_confirms", async () => {
@@ -378,9 +378,9 @@ describe("AccessTab", () => {
       routes: { "PUT /v1/projects/p1/grants/bo": ok({ member_id: "bo", platform_role: "viewer", pg_roles: ["billing_admin"], overrides: [] }) },
     });
     const editor = await openEditor("Bo");
-    const save = within(editor).getByRole("button", { name: "Save" });
-    expect(save).toBeDisabled();
+    expect(within(editor).queryByRole("button", { name: "Save" })).toBeNull();
     await userEvent.click(within(editor).getByRole("radio", { name: "Viewer" }));
+    const save = within(editor).getByRole("button", { name: "Save" });
     expect(save).toBeEnabled();
     await userEvent.click(save);
     await waitFor(() => expect(call(f, "PUT", "/v1/projects/p1/grants/bo")).toBeDefined());
@@ -617,5 +617,81 @@ describe("AccessTab", () => {
     expect(await screen.findByText("You don't have access to Shop.")).toBeInTheDocument();
     const paths = f.calls.map((r) => new URL(r.url).pathname);
     expect(paths.filter((p) => /branches|roles|grants/.test(p))).toEqual([]);
+  });
+
+  describe("on the hub's shared components (S4, H10)", () => {
+    const linkTo = (a: HTMLElement) => new URL(a.getAttribute("href") ?? "", "http://x");
+
+    it("access_tab_uses_the_shared_grant_card_and_links_to_members", async () => {
+      const { f } = setup({
+        routes: {
+          "PUT /v1/projects/p1/grants/bo": ok({ member_id: "bo", platform_role: "developer", pg_roles: ["billing_admin", "reporting"], overrides: [] }),
+        },
+      });
+      // "Manage in Members" and each person link into the hub, for this project.
+      const manage = await screen.findByRole("link", { name: "Manage in Members" });
+      expect(linkTo(manage).pathname).toBe("/app/members");
+      expect(linkTo(manage).searchParams.get("project")).toBe("p1");
+      expect([null, "people"]).toContain(linkTo(manage).searchParams.get("tab"));
+      const boRow = (await screen.findByText("bo@example.test")).closest("tr")!;
+      const bo = within(boRow).getByRole("link", { name: "Bo" });
+      expect(linkTo(bo).pathname).toBe("/app/members/bo");
+      expect(linkTo(bo).searchParams.get("project")).toBe("p1");
+      const tiaRow = (await screen.findByText("tia@example.test")).closest("tr")!;
+      expect(linkTo(within(tiaRow).getByRole("link", { name: "Tia" })).pathname).toBe("/app/members/tia");
+
+      // The editor is the shared card: a role checklist (no combobox), the owner and personal logins never offered.
+      const editor = await openEditor("Bo");
+      expect(within(editor).queryByRole("combobox", { name: "Postgres roles" })).toBeNull();
+      expect(within(editor).getByRole("checkbox", { name: "billing_admin" })).toBeChecked();
+      expect(within(editor).getByRole("checkbox", { name: "reporting" })).not.toBeChecked();
+      expect(within(editor).queryByRole("checkbox", { name: "o" })).toBeNull();
+      // A clean card has no Save (the narrowing forms have their own, named differently).
+      expect(within(editor).queryByRole("button", { name: "Save" })).toBeNull();
+
+      // Save sends the person's own grant only: a platform role and the checked roles.
+      await userEvent.click(within(editor).getByRole("checkbox", { name: "reporting" }));
+      // One Save for the card once it is dirty.
+      expect(within(editor).getAllByRole("button", { name: "Save" })).toHaveLength(1);
+      const save = within(editor).getByRole("button", { name: "Save" });
+      expect(save).toBeEnabled();
+      await userEvent.click(save);
+      await waitFor(() => expect(call(f, "PUT", "/v1/projects/p1/grants/bo")).toBeDefined());
+      const body = await call(f, "PUT", "/v1/projects/p1/grants/bo")!.clone().json();
+      expect(Object.keys(body).sort()).toEqual(["pg_roles", "platform_role"]);
+      expect(body.platform_role).toBe("developer");
+      expect([...body.pg_roles].sort()).toEqual(["billing_admin", "reporting"]);
+      expect(await screen.findByRole("status")).toHaveTextContent("Saved Bo's access.");
+      expect(screen.queryByRole("group", { name: "Access for Bo" })).toBeNull();
+      // Nothing else was written: one PUT, no override, no other member.
+      expect(f.calls.filter((r) => r.method === "PUT")).toHaveLength(1);
+    });
+
+    it("a_former_member_has_no_link_and_a_personal_login_is_never_a_choice", async () => {
+      const ghost: ProjectGrant = { member_id: "ghost", platform_role: "viewer", pg_roles: [], overrides: [] };
+      setup({
+        routes: {
+          "GET /v1/projects/p1/grants": ok([...grants, ghost]),
+          "GET /v1/databases/d1/branches/m1/roles": ok([...ordersRoles, role("bo_personal", { origin: "personal", login: true })]),
+        },
+      });
+      const ghostRow = (await screen.findByText("A former member")).closest("tr")!;
+      expect(within(ghostRow).queryByRole("link")).toBeNull();
+      const editor = await openEditor("Bo");
+      await within(editor).findByRole("checkbox", { name: "reporting" });
+      expect(within(editor).queryByRole("checkbox", { name: "bo_personal" })).toBeNull();
+    });
+
+    it("the_shared_card_still_blocks_admin_only_roles_below_admin", async () => {
+      // Gus is a Developer; app_login is Admin-only (LOGIN): it can't be ticked, so Save stays off.
+      const { f } = setup();
+      const editor = await openEditor("Gus");
+      const login = await within(editor).findByRole("checkbox", { name: "app_login" });
+      expect(login).toBeDisabled();
+      await userEvent.click(login);
+      expect(login).not.toBeChecked();
+      expect(within(editor).queryByRole("button", { name: "Save" })).toBeNull();
+      expect(call(f, "PUT", "/v1/projects/p1/grants/gus")).toBeUndefined();
+    });
   });
 });

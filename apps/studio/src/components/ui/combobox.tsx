@@ -29,6 +29,8 @@ export interface MultiComboboxProps {
   notes?: readonly string[];
   /** Mono labels: the values are code (role names). */
   mono?: boolean;
+  /** Extra classes for the visible label (e.g. `sm:sr-only` when the layout names the field another way). */
+  labelClassName?: string;
   /**
    * Where the popup opens (default below). A field above a dialog's buttons opens it above, so
    * the open list never covers them (it flips when there's no room).
@@ -44,7 +46,7 @@ const optionRow =
  * (deep water, strong hairline, square). Arrow keys move, Enter toggles, Backspace in an empty
  * field removes the last chip, Escape closes. Disabled options stay listed with their reason.
  */
-export function MultiCombobox({ label, options, value, onValueChange, chipDetail, invalid, placeholder, disabled, status, notes, mono, side = "bottom" }: MultiComboboxProps) {
+export function MultiCombobox({ label, options, value, onValueChange, chipDetail, invalid, placeholder, disabled, status, notes, mono, labelClassName, side = "bottom" }: MultiComboboxProps) {
   const id = useId();
   const byValue = new Map(options.map((o) => [o.value, o]));
   // Enabled options first, then the ones that can't be chosen (with their reasons).
@@ -58,8 +60,14 @@ export function MultiCombobox({ label, options, value, onValueChange, chipDetail
       onValueChange={(next) => onValueChange(next as string[])}
       disabled={disabled}
     >
-      <div className="space-y-1">
-        <label htmlFor={id} className="text-sm font-medium">
+      {/* Enter picks the highlighted option; with none highlighted it must not submit the form around the field (BP-2). */}
+      <div
+        className="space-y-1"
+        onKeyDown={(e) => {
+          if (e.key === "Enter" && (e.target as HTMLElement).getAttribute("role") === "combobox") e.preventDefault();
+        }}
+      >
+        <label htmlFor={id} className={cn("text-sm font-medium", labelClassName)}>
           {label}
         </label>
         <Combobox.InputGroup className="flex min-h-8 w-full cursor-text flex-wrap items-center gap-1 border border-input bg-ink px-1.5 py-1 focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-sand">

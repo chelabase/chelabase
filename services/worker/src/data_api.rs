@@ -453,7 +453,8 @@ fn system_roles() -> String {
         .join(", ")
 }
 
-/// One row for an existing role: `superuser`, `neon_superuser` (a member, at any depth),
+/// One row for an existing role: `superuser`, `personal_login` (it carries the personal-login
+/// marker, the round-4 predicate; MH-12), `neon_superuser` (a member, at any depth),
 /// `owner_level` (CREATEROLE, CREATEDB or REPLICATION: with the two before, E33's owner-level
 /// definition, as rest's `OWNER_LEVEL_SQL`), `system` (a member of a superuser role or of
 /// [`system_roles`]) or `ok <oid> <t|f>` (the flag: BYPASSRLS, which a key's role may have).
@@ -462,6 +463,9 @@ fn system_roles() -> String {
 fn role_check_sql(role: &str) -> String {
     format!(
         "SET search_path = pg_catalog, pg_temp; SELECT CASE WHEN r.rolsuper THEN 'superuser' \
+         WHEN EXISTS (SELECT FROM pg_db_role_setting s WHERE s.setrole = r.oid \
+         AND s.setdatabase = 0 AND EXISTS (SELECT FROM unnest(s.setconfig) AS c \
+         WHERE starts_with(c, '{marker}='))) THEN 'personal_login' \
          WHEN EXISTS (SELECT FROM pg_roles s WHERE s.rolname = 'neon_superuser' \
          AND pg_has_role(r.oid, s.oid, 'MEMBER')) THEN 'neon_superuser' \
          WHEN r.rolcreaterole OR r.rolcreatedb OR r.rolreplication \
@@ -471,7 +475,8 @@ fn role_check_sql(role: &str) -> String {
          ELSE 'ok ' || r.oid::text || CASE WHEN r.rolbypassrls THEN ' t' ELSE ' f' END END \
          FROM pg_roles r WHERE r.rolname = {};",
         system_roles(),
-        quote_literal(role)
+        quote_literal(role),
+        marker = chelabase_types::role_name::PERSONAL_LOGIN_MARKER,
     )
 }
 
@@ -1092,6 +1097,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return match answer {
                 "" => refused("does not exist"),
                 "superuser" => refused("is a superuser"),
+                // MH-12: a personal login never backs a key.
+                "personal_login" => refused("is a personal login"),
                 "neon_superuser" => refused(&format!(
                     "is a member of neon_superuser ({OWNER_LEVEL_HINT})"
                 )),
@@ -2150,6 +2157,33 @@ COMMIT;
             answer_check(&w, unknown);
             assert!(matches!(w.check_data_role(main, "reader").await, RoleCheck::Failed(_)), "{unknown:?}");
         }
+    }
+
+    // T6 (MH-12, spec Part 6 "Hidden elsewhere"): the worker's key-role check refuses a role
+    // carrying the personal-login marker (the round-4 predicate, read by the check query
+    // itself), answering `personal_login`, and grants nothing to `authenticator`.
+    #[tokio::test]
+    async fn a_key_cannot_use_a_marked_role() {
+        let sql = role_check_sql("alice");
+        assert!(
+            sql.contains("chelabase.managed_role=") && sql.contains("pg_db_role_setting"),
+            "the check reads the marker: {sql}"
+        );
+        assert!(sql.contains("'personal_login'"), "{sql}");
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = BranchId::from(id);
+        w.computes.sql.lock().unwrap().clear();
+        answer_check(&w, "personal_login\n");
+        assert_eq!(
+            w.check_data_role(main, "alice").await,
+            refused("the role alice is a personal login")
+        );
+        assert!(grants(&w).is_empty(), "{:?}", grants(&w));
+        let reply = w
+            .check_data_role_reply(&chelabase_nats::CheckDataRoleRequest { branch_id: main, role: "alice".into() })
+            .await;
+        assert_eq!(reply.kind.as_deref(), Some("refused"));
     }
 
     // E33: a role with BYPASSRLS may back a secret key: the check passes, grants it to

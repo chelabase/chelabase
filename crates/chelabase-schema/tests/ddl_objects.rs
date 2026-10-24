@@ -10,7 +10,8 @@ fn notes() -> TableRef {
     t("public", "notes")
 }
 fn sqls(ops: &[Operation]) -> Vec<String> {
-    render(ops, &RenderContext::default()).unwrap().into_iter().map(|s| s.sql).collect()
+    // T4: MAINTAIN needs Postgres 17 (`server_version_num`), which the default context lacks.
+    render(ops, &RenderContext { server_version_num: 170_000, ..Default::default() }).unwrap().into_iter().map(|s| s.sql).collect()
 }
 fn index(name: Option<&str>, keys: Vec<IndexKey>) -> IndexSpec {
     IndexSpec { table: notes(), name: name.map(Into::into), method: None, unique: false, nulls_not_distinct: false, keys, include: vec![], predicate: None, concurrently: false }
@@ -114,18 +115,20 @@ fn grant_operations_one_statement_per_privilege_and_column() {
     };
     assert_eq!(
         sqls(&[
-            Operation::Grant { table: notes(), grant: g(&[], vec![Privilege::Select], Grantee::Public, false) },
-            Operation::Grant { table: notes(), grant: g(&["body", "Tags"], vec![Privilege::Update, Privilege::Insert], Grantee::Role("Editors".into()), true) },
+            // S5: PUBLIC is refused as a grantee (MH-28); a plain role here.
+            Operation::Grant { table: notes(), grant: g(&[], vec![Privilege::Select], Grantee::Role("readers".into()), false) },
+            // S21 (user): the table grant refuses `with_grant_option: true`; revoke keeps it.
+            Operation::Grant { table: notes(), grant: g(&["body", "Tags"], vec![Privilege::Update, Privilege::Insert], Grantee::Role("Editors".into()), false) },
             Operation::Grant { table: notes(), grant: g(&[], vec![Privilege::Maintain, Privilege::Truncate, Privilege::References, Privilege::Trigger, Privilege::Delete], Grantee::Role("ops".into()), false) },
             Operation::Revoke { table: notes(), grant: g(&[], vec![Privilege::Select], Grantee::Role("anon".into()), false) },
             Operation::Revoke { table: notes(), grant: g(&["body"], vec![Privilege::Update], Grantee::Role("Editors".into()), true) },
         ]),
         [
-            "GRANT SELECT ON public.notes TO PUBLIC",
-            "GRANT UPDATE (body) ON public.notes TO \"Editors\" WITH GRANT OPTION",
-            "GRANT UPDATE (\"Tags\") ON public.notes TO \"Editors\" WITH GRANT OPTION",
-            "GRANT INSERT (body) ON public.notes TO \"Editors\" WITH GRANT OPTION",
-            "GRANT INSERT (\"Tags\") ON public.notes TO \"Editors\" WITH GRANT OPTION",
+            "GRANT SELECT ON public.notes TO readers",
+            "GRANT UPDATE (body) ON public.notes TO \"Editors\"",
+            "GRANT UPDATE (\"Tags\") ON public.notes TO \"Editors\"",
+            "GRANT INSERT (body) ON public.notes TO \"Editors\"",
+            "GRANT INSERT (\"Tags\") ON public.notes TO \"Editors\"",
             "GRANT MAINTAIN ON public.notes TO ops",
             "GRANT TRUNCATE ON public.notes TO ops",
             "GRANT REFERENCES ON public.notes TO ops",
@@ -174,7 +177,8 @@ fn locks_of_the_remaining_operations() {
     // `LockLevel::None` and `Option::None` both appear: no glob import.
     use LockLevel::{AccessExclusive, Share, ShareUpdateExclusive};
     let lock = |op: Operation| render(&[op], &RenderContext::default()).unwrap()[0].lock;
-    let g = TableGrant { columns: vec![], privileges: vec![Privilege::Select], grantee: Grantee::Public, with_grant_option: false };
+    // S5: PUBLIC is refused as a grantee (MH-28); a plain role here.
+    let g = TableGrant { columns: vec![], privileges: vec![Privilege::Select], grantee: Grantee::Role("readers".into()), with_grant_option: false };
     assert_eq!(lock(Operation::CreateIndex(index(None, vec![key("a")]))), Share);
     assert_eq!(lock(Operation::DropIndex { schema: "public".into(), name: "i".into(), concurrently: false }), AccessExclusive);
     assert_eq!(lock(Operation::RenameIndex { schema: "public".into(), name: "i".into(), to: "j".into() }), ShareUpdateExclusive);
@@ -205,6 +209,7 @@ fn ctx(total_bytes: i64) -> RenderContext {
             total_bytes,
         }],
         cascade: false,
+        ..Default::default()
     }
 }
 
@@ -329,6 +334,9 @@ proptest! {
 
     #[test]
     fn rename_and_policy_names_survive(table in name(), column in name(), to in name(), role in name()) {
+        // S5: the table grant's grantee allow-list (MH-28) refuses `pg_…`, `cb_m_…`,
+        // `chelabase_…` and the reserved names, which this alphabet can spell.
+        prop_assume!(!chelabase_types::access::act_as_reserved(&role) && !role.eq_ignore_ascii_case("authenticator"));
         let out = render(&[
             Operation::RenameColumn { table: t("public", &table), column: column.clone(), to: to.clone() },
             Operation::CreatePolicy { table: t("public", &table), policy: PolicySpec { name: to.clone(), command: PolicyCommandSpec::All, permissive: true, roles: vec![role.clone()], using: Some("true".into()), with_check: None } },

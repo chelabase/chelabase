@@ -31,7 +31,8 @@ openapi = ["dep:utoipa", "chelabase-types/openapi"]
 # Live catalog tests' scratch database names.
 getrandom = { workspace = true }
 tokio = { workspace = true }
-# Live catalog tests' own admin sessions.
-tokio-postgres = { workspace = true }
+# Live catalog tests' own admin sessions; the privileges read's jsonb parameter and result
+# (the feature is already built for chelabase-query).
+tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
 # The renderer's hostile-name property tests.
 proptest = { workspace = true }

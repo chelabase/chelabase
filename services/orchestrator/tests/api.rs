@@ -2782,17 +2782,20 @@ fn role_row(name: &str, origin: RoleOrigin, level: RoleLevel, password: Password
 }
 
 fn role_reply(code: &str) -> RoleReply {
-    RoleReply { ok: false, code: Some(code.into()), error: Some("worker said so".into()), keys: vec![] }
+    RoleReply { ok: false, code: Some(code.into()), error: Some("worker said so".into()), keys: vec![], reassigned: None, preview: None }
 }
 
 // c3 (SP13): a personal login is listed with the new `personal` origin, between the others.
 #[tokio::test]
-async fn list_roles_shows_a_personal_login_with_its_origin() {
+async fn list_roles_hides_personal_logins() {
+    // Members hub T8 (MH-11), a deliberate change: this test used to assert that a personal
+    // login is listed with origin `personal`. Every generic role route now treats one as absent.
     let t = branching().await;
     let dev = t.ready("dev");
     let ep = t.with_owner_row(dev);
     t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
     t.metadata.add_role_row(&ep, role_row("alice", RoleOrigin::Personal, RoleLevel::Plain, PasswordState::SetInSql));
+    t.metadata.personal_login_names.lock().unwrap().insert((t.db.as_uuid(), "alice".to_string()));
     let resp = t.send(Method::GET, &t.roles(dev), None).await;
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -2803,7 +2806,7 @@ async fn list_roles_shows_a_personal_login_with_its_origin() {
             .find(|r| r["name"] == name)
             .map(|r| r["origin"].clone())
     };
-    assert_eq!(origin_of("alice"), Some(json!("personal")));
+    assert_eq!(origin_of("alice"), None, "a personal login is not listed: {body}");
     assert_eq!(origin_of("app"), Some(json!("api")));
     assert_eq!(origin_of("postgres"), Some(json!("owner")));
 }
@@ -3336,7 +3339,7 @@ async fn reset_and_delete_accept_sql_names() {
     let resp = t.send(Method::POST, &format!("{}/My%20Role/reset-password", t.roles(dev)), None).await;
     assert_eq!(resp.status(), 204);
     let resp = t.send(Method::DELETE, &format!("{}/Bad-Name", t.roles(dev)), None).await;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200, "T10: a delete answers what it reassigned");
     assert_eq!(
         *t.jobs.role_calls.lock().unwrap(),
         vec!["reset:My Role".to_string(), "delete:Bad-Name".to_string()]
@@ -3361,19 +3364,20 @@ async fn role_path_is_decoded_once() {
     let resp = t.send(Method::POST, &format!("{}/{segment}/reset-password", t.roles(dev)), None).await;
     assert_eq!(resp.status(), 204);
     let resp = t.send(Method::DELETE, &format!("{}/{segment}", t.roles(dev)), None).await;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200, "T10: a delete answers what it reassigned");
     assert_eq!(
         *t.jobs.role_calls.lock().unwrap(),
         vec!["reset:a/b%61?#".to_string(), "delete:a/b%61?#".to_string()]
     );
 }
 
+// T10: a delete answers 200 with what it reassigned (was 204).
 #[tokio::test]
-async fn delete_role_204() {
+async fn delete_role_200() {
     let t = branching().await;
     let dev = t.ready("dev");
     let resp = t.send(Method::DELETE, &format!("{}/app", t.roles(dev)), None).await;
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 200);
     assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["delete:app".to_string()]);
 }
 
@@ -6931,6 +6935,56 @@ async fn admins_run_as_the_data_api_roles_only_when_granted_by_name() {
     assert_ne!(resp.status(), 403, "a grant naming anon may run as it");
 }
 
+// Members hub T2 (D1, MH-1): act-as checks the route's minimum against the requested role's
+// own level, read through `grant_sources`. `mixed` is a Developer through their own grant
+// (`sales`); `billing` comes only from a Viewer team grant, so it stays a Viewer-level role.
+#[tokio::test]
+async fn act_as_uses_the_roles_level_not_the_members() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    let mixed = t.grant_member("mixed", PlatformRole::Developer, &["sales"]);
+    let project = t.metadata.database(t.db).project_id;
+    t.metadata.team_grant(
+        mixed,
+        project,
+        Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: chelabase_types::access::RoleSet::Only([PgRole::Named("billing".into())].into_iter().collect()),
+        },
+    );
+    // The member's login holds both (the reconciler grants every effective role).
+    t.put_member_role(t.member_role_row(mixed, main, &["billing", "sales"]));
+    // Developer routes (SQL run, SQL schema) as `billing`: refused on billing's own level.
+    let err = error_of(t.run_as("mixed", main, Some("billing")).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("role:billing")));
+    let err = error_of(t.schema_as("mixed", main, "?role=billing").await, 403).await;
+    assert_eq!(err["error"]["required"], "role:billing");
+    // As `sales` (held at Developer) the access check passes (what follows needs a compute
+    // the fakes don't have; only the access refusal matters here).
+    let not_refused = |what: &'static str| {
+        move |resp: reqwest::Response| async move {
+            if resp.status() == 403 {
+                let err: Value = resp.json().await.unwrap();
+                assert_ne!(code_of(&err), "forbidden", "{what}: {err}");
+            }
+        }
+    };
+    not_refused("run as sales")(t.run_as("mixed", main, Some("sales")).await).await;
+    // A Viewer route (the console's schema) as `billing` passes the access check.
+    let resp = t.send_as("mixed", Method::GET, &format!("{}/console/schema?role=billing", t.branch(main)), None).await;
+    not_refused("console schema as billing")(resp).await;
+    // None of the refusals asked for a reconcile.
+    assert!(t.reconciles().is_empty(), "{:?}", t.reconciles());
+}
+
+// Members hub T2 (P14): a suspended caller's refusal is 403 `member_suspended`.
+#[test]
+fn a_suspended_refusal_is_403_member_suspended() {
+    let e = orchestrator::access::deny_to_api(chelabase_types::access::Deny::Suspended);
+    assert_eq!((e.status, e.code), (403, chelabase_types::api_error::ErrorCode::MemberSuspended));
+    assert_eq!(e.body()["error"]["code"], "member_suspended");
+}
+
 // I2 (T9 review): an effective Admin acts as any role of the branch. When the member role can't
 // hold it (a chain through a reserved role, R23; or one the reconciler left out, e.g. an ADMIN
 // chain 6a can't see), the owner's connection and `SET ROLE` serve it instead.
@@ -9357,6 +9411,35 @@ async fn pending_member_is_403_pending_approval() {
     assert_eq!(me["member"], json!({ "id": pat, "status": "pending", "tenant_admin": false }));
     assert_eq!(me["projects"], json!([]));
     assert_eq!(t.w.metadata.member(t.w.tenant, "pat").unwrap().status, MemberStatus::Pending);
+    assert!(t.actions().is_empty());
+}
+
+// P14 (members hub T3): a suspended member is 403 `member_suspended` on every route except
+// GET /v1/me, which says `suspended` and lists no project; signing in keeps them suspended
+// (S6), grants and all.
+#[tokio::test]
+async fn a_suspended_caller_gets_member_suspended_and_me_says_so() {
+    let t = mw(Mode::SelfHosted).await;
+    let sam = t.w.metadata.add_member(t.w.tenant, "sam", MemberStatus::Suspended, false);
+    t.w.metadata.grant(sam, t.w.project, PlatformRole::Admin, &[]);
+    let project = t.w.project;
+    let db = t.w.db;
+    for (method, path, body) in [
+        (Method::GET, "/v1/members".to_string(), None),
+        (Method::GET, "/v1/projects".to_string(), None),
+        (Method::GET, format!("/v1/databases/{db}"), None),
+        (Method::GET, format!("/v1/projects/{project}"), None),
+        (Method::PATCH, "/v1/tenant".to_string(), Some(json!({ "display_name": "x" }))),
+        (Method::POST, "/v1/invites".to_string(), Some(json!({ "email": "a@x.com" }))),
+        (Method::GET, "/v1/access-events".to_string(), None),
+    ] {
+        let err = error_of(t.send("sam", method.clone(), &path, body).await, 403).await;
+        assert_eq!(code_of(&err), "member_suspended", "{method} {path}");
+    }
+    let me = body_of(t.send("sam", Method::GET, "/v1/me", None).await).await;
+    assert_eq!(me["member"], json!({ "id": sam, "status": "suspended", "tenant_admin": false }));
+    assert_eq!(me["projects"], json!([]));
+    assert_eq!(t.w.metadata.member(t.w.tenant, "sam").unwrap().status, MemberStatus::Suspended);
     assert!(t.actions().is_empty());
 }
 
@@ -12606,6 +12689,952 @@ async fn dropping_an_enum_with_its_columns_table_or_column() {
     scratch.drop().await;
 }
 
+// --- Members hub T5: the privileges read and privilege ops -------------------------------
+//
+// The live tests run on scratch databases of the stack's metadata Postgres (PG 17, P22), with
+// the fakes' metadata: the owner run is the scratch owner `t6_owner_<hex>`, a plain LOGIN role
+// (not a superuser), so roles owning objects reach it only through the memberships each test
+// grants. Cluster-wide roles of a run are `<owner>_<name>` and are dropped with it; `anon`,
+// `authenticated` and `neon_superuser` are made once if missing and kept (as `catalog_live`
+// and `app_users_live` do), only memberships of the run's own roles being added to them.
+
+impl Branching {
+    /// `GET …/pg-databases/{pg_database}/privileges{query}` as the default caller (a tenant admin).
+    async fn privileges(&self, branch: BranchId, pg_database: &str, query: &str) -> reqwest::Response {
+        self.send(Method::GET, &self.privileges_path(branch, pg_database, query), None).await
+    }
+
+    async fn privileges_as(&self, sub: &str, branch: BranchId, pg_database: &str, query: &str) -> reqwest::Response {
+        self.send_as(sub, Method::GET, &self.privileges_path(branch, pg_database, query), None).await
+    }
+
+    fn privileges_path(&self, branch: BranchId, pg_database: &str, query: &str) -> String {
+        format!("{}/pg-databases/{pg_database}/privileges{query}", self.branch(branch))
+    }
+
+    /// The `privileges_changed` events, oldest first.
+    fn privilege_events(&self) -> Vec<chelabase_metadata::members::AccessEvent> {
+        self.metadata.events.lock().unwrap().iter().filter(|e| e.action == "privileges_changed").cloned().collect()
+    }
+
+    /// Registers `names` as roles of the main branch in the fakes (for routes that look a role
+    /// up in the metadata).
+    fn known_roles(&self, names: &[&String]) {
+        let ep = self.metadata.branch(self.main()).endpoint_id.unwrap();
+        for n in names {
+            self.metadata.add_group_role(&ep, n, &[]);
+        }
+    }
+}
+
+impl ScratchCompute {
+    /// `<owner>_<name>`: a cluster-wide role name of this run.
+    fn named(&self, name: &str) -> String {
+        format!("{}_{name}", self.owner)
+    }
+
+    /// NOLOGIN roles of this run (cluster-wide), by their full names.
+    async fn make_roles<const N: usize>(&self, names: [&str; N]) -> [String; N] {
+        let full = names.map(|n| self.named(n));
+        for r in &full {
+            self.exec_cluster(&format!("CREATE ROLE {r} NOLOGIN")).await;
+        }
+        full
+    }
+
+    /// Runs `sql` as the cluster's admin on the metadata database (roles and memberships).
+    async fn exec_cluster(&self, sql: &str) {
+        use sqlx::Executor;
+        self.admin.execute(sqlx::AssertSqlSafe(sql.to_owned())).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+    }
+
+    /// One text value of `sql` (NULL as ""), in the scratch database as the cluster's admin.
+    async fn text(&self, sql: &str) -> String {
+        let opts: sqlx::postgres::PgConnectOptions = (*self.admin.connect_options()).clone();
+        let pool = sqlx::PgPool::connect_with(opts.database(&self.database)).await.unwrap();
+        let v: Option<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned())).fetch_one(&pool).await.unwrap_or_else(|e| panic!("{sql}: {e}"));
+        pool.close().await;
+        v.unwrap_or_default()
+    }
+
+    /// `grantor:PRIVILEGE` entries of `grantee` on relation `relation` (`schema.name`), sorted.
+    async fn acl(&self, relation: &str, grantee: &str) -> String {
+        self.text(&format!(
+            "SELECT string_agg(e, ',' ORDER BY e) FROM (SELECT a.grantor::regrole::text || ':' || a.privilege_type AS e \
+             FROM pg_class c, aclexplode(c.relacl) a WHERE c.oid = '{relation}'::regclass AND a.grantee = '{grantee}'::regrole) x"
+        ))
+        .await
+    }
+
+    /// The same for schema `schema`'s ACL (only `grantee`'s own entries: PUBLIC's default
+    /// `USAGE` on `public` (PG15+) never shows up here, unlike `has_schema_privilege`).
+    async fn schema_acl(&self, schema: &str, grantee: &str) -> String {
+        self.text(&format!(
+            "SELECT string_agg(e, ',' ORDER BY e) FROM (SELECT a.grantor::regrole::text || ':' || a.privilege_type AS e \
+             FROM pg_namespace n, aclexplode(n.nspacl) a WHERE n.nspname = '{schema}' AND a.grantee = '{grantee}'::regrole) x"
+        ))
+        .await
+    }
+
+    /// The same for one column's ACL.
+    async fn column_acl(&self, relation: &str, column: &str, grantee: &str) -> String {
+        self.text(&format!(
+            "SELECT string_agg(e, ',' ORDER BY e) FROM (SELECT a.grantor::regrole::text || ':' || a.privilege_type AS e \
+             FROM pg_attribute att, aclexplode(att.attacl) a WHERE att.attrelid = '{relation}'::regclass \
+             AND att.attname = '{column}' AND a.grantee = '{grantee}'::regrole) x"
+        ))
+        .await
+    }
+
+    /// `grantor:PRIVILEGE` of `grantee` in `for_role`'s default privileges for tables in `public`.
+    async fn default_acl(&self, for_role: &str, grantee: &str) -> String {
+        self.text(&format!(
+            "SELECT string_agg(e, ',' ORDER BY e) FROM (SELECT a.grantor::regrole::text || ':' || a.privilege_type AS e \
+             FROM pg_default_acl d, aclexplode(d.defaclacl) a WHERE d.defaclrole = '{for_role}'::regrole \
+             AND d.defaclnamespace = 'public'::regnamespace AND d.defaclobjtype = 'r' AND a.grantee = '{grantee}'::regrole) x"
+        ))
+        .await
+    }
+
+    /// Every `pg_auth_members` row of `member` (role/grantor/admin/inherit/set), sorted (P26: an
+    /// owner run leaves them exactly as they were).
+    async fn memberships(&self, member: &str) -> String {
+        self.text(&format!(
+            "SELECT string_agg(e, ',' ORDER BY e) FROM (SELECT m.roleid::regrole::text || '/' || m.grantor::regrole::text \
+             || '/' || m.admin_option || '/' || m.inherit_option || '/' || m.set_option AS e \
+             FROM pg_auth_members m WHERE m.member = '{member}'::regrole) x"
+        ))
+        .await
+    }
+
+    /// Drops the database, then `roles` (best effort, in order), then the owner.
+    async fn drop_with(self, roles: &[String]) {
+        use sqlx::Executor;
+        self.admin
+            .execute(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.database)))
+            .await
+            .unwrap();
+        for r in roles {
+            let _ = self.admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE IF EXISTS {r}"))).await;
+        }
+        self.admin.execute(sqlx::AssertSqlSafe(format!("DROP ROLE {}", self.owner))).await.unwrap();
+    }
+}
+
+/// Makes the cluster-wide `role` (NOLOGIN) unless it exists; it is kept.
+fn shared_role_sql(role: &str) -> String {
+    format!("DO $$ BEGIN CREATE ROLE {role} NOLOGIN; EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$")
+}
+
+/// The body of a response with `status`, its text in the failure message.
+async fn answer(resp: reqwest::Response, status: u16) -> Value {
+    let got = resp.status().as_u16();
+    let text = resp.text().await.unwrap();
+    assert_eq!(got, status, "{text}");
+    serde_json::from_str(&text).unwrap_or(Value::Null)
+}
+
+fn public_table(name: &str) -> Value {
+    json!({ "schema": "public", "name": name })
+}
+
+fn grant_op(table: &str, privileges: &[&str], grantee: &str) -> Value {
+    json!({ "grant": { "table": public_table(table), "grant": { "privileges": privileges, "grantee": { "role": grantee } } } })
+}
+
+fn revoke_op(table: &str, privileges: &[&str], grantee: &str) -> Value {
+    json!({ "revoke": { "table": public_table(table), "grant": { "privileges": privileges, "grantee": { "role": grantee } } } })
+}
+
+fn schema_usage_op(grantee: &str) -> Value {
+    json!({ "grant_schema": { "schema": "public", "grantee": { "role": grantee }, "privileges": ["usage"] } })
+}
+
+fn all_rows_op(table: &str, role: &str, enabled: bool) -> Value {
+    json!({ "set_all_rows": { "table": public_table(table), "role": role, "enabled": enabled } })
+}
+
+fn default_select_op(for_role: &str, grant: bool, grantee: &str) -> Value {
+    json!({ "alter_default_privileges": { "for_role": for_role, "schema": "public", "object": "tables",
+        "grant": grant, "grantee": { "role": grantee }, "privileges": ["select"] } })
+}
+
+fn relation_target(name: &str) -> Value {
+    json!({ "relation": { "schema": "public", "name": name } })
+}
+
+/// A listed object of a read page, by name.
+fn listed<'a>(page: &'a Value, name: &str) -> &'a Value {
+    page["objects"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no objects in {page}"))
+        .iter()
+        .find(|o| o["name"] == name)
+        .unwrap_or_else(|| panic!("{name} isn't listed in {page}"))
+}
+
+/// `(grantor, PRIVILEGE)` of a `grants` list.
+fn grant_pairs(grants: &Value) -> std::collections::BTreeSet<(String, String)> {
+    grants
+        .as_array()
+        .unwrap_or_else(|| panic!("no grants in {grants}"))
+        .iter()
+        .map(|g| (g["grantor"]["name"].as_str().unwrap().to_string(), g["privilege"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+fn pair_set(v: &[(&str, &str)]) -> std::collections::BTreeSet<(String, String)> {
+    v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+}
+
+/// A query value with `/`, `%`, `&`, `+` and space escaped.
+fn query_escaped(s: &str) -> String {
+    s.replace('%', "%25").replace('/', "%2F").replace('&', "%26").replace('+', "%2B").replace(' ', "%20")
+}
+
+/// A Developer `dev-a` acting as `group` (a role this run made) through a member role, as the
+/// reconciler would have made it (password `pw`, `INHERIT FALSE, SET TRUE`). Returns the member
+/// id and the member role's name (to drop with the run).
+async fn developer_acting_as(t: &Branching, scratch: &ScratchCompute, group: &str) -> (uuid::Uuid, String) {
+    let main = t.main();
+    t.known_roles(&[&group.to_string()]);
+    let a = t.grant_member("dev-a", PlatformRole::Developer, &[group]);
+    let row = t.member_role_row(a, main, &[group]);
+    let member_role = row.role_name.clone();
+    scratch
+        .exec_cluster(&format!("CREATE ROLE {member_role} LOGIN NOINHERIT PASSWORD 'pw'; GRANT {group} TO {member_role} WITH INHERIT FALSE, SET TRUE"))
+        .await;
+    t.put_member_role(row);
+    (a, member_role)
+}
+
+// The read checks what needs no compute first: `role` is required, `limit` is 1 to 500, and a
+// malformed `after` in object mode is 400/422, not a SQL error (T4-6).
+#[tokio::test]
+async fn privileges_read_validates_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    for query in [
+        "",
+        "?role=",
+        "?role=editor&limit=0",
+        "?role=editor&limit=501",
+        "?role=editor&limit=x",
+        "?role=editor&schema=public&after=garbage",
+        "?role=editor&schema=public&after=0%2Fx%2Fnotes",
+        "?role=editor&schema=public&after=x%2F1%2Fnotes",
+    ] {
+        let resp = t.privileges(main, "web1", query).await;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap();
+        assert!(status == 400 || status == 422, "{query}: {status} {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(code_of(&body), "invalid_request", "{query}");
+    }
+    assert_eq!(t.compute_lookups(), 0);
+    // The bounds and a well-formed `after` get as far as the compute (none in the fake).
+    for query in ["?role=editor&limit=500", "?role=editor&limit=1", "?role=editor&schema=public&after=0%2F16384%2Fnotes", "?role=editor&after=public"] {
+        let resp = t.privileges(main, "web1", query).await;
+        assert_eq!(code_of(&answer(resp, 503).await), "unavailable", "{query}");
+    }
+}
+
+// MH-31: the Postgres database resolves only through `branch_databases`, never a template or
+// the system `postgres`.
+#[tokio::test]
+async fn privileges_read_refuses_a_pg_database_outside_branch_databases() {
+    let t = sql_app().await;
+    let main = t.main();
+    let resp = t.privileges(main, "web1", "?role=editor").await;
+    assert_eq!(code_of(&answer(resp, 503).await), "unavailable", "web1 is the branch's database");
+    for name in ["postgres", "template1", "template0", "nope"] {
+        let resp = t.privileges(main, name, "?role=editor").await;
+        assert_eq!(code_of(&answer(resp, 404).await), "not_found", "{name}");
+    }
+    assert_eq!(t.compute_lookups(), 1, "only web1 reached the compute");
+}
+
+// R6 / MH-30 / MH-32: the read is Viewer level; owner-run privilege edits are Admin only; a
+// Developer acting as a role passes the route's access (Postgres then decides).
+#[tokio::test]
+async fn privilege_powers_follow_the_routes() {
+    let (t, dev) = act_as_app().await;
+    let main = t.main();
+    t.grant_member("vic", PlatformRole::Viewer, &[]);
+    let resp = t.privileges_as("vic", main, "web1", "?role=billing").await;
+    assert_eq!(code_of(&answer(resp, 503).await), "unavailable", "a Viewer reads");
+    let path = format!("{}/schema-changes", t.branch(main));
+    let op = json!({ "operations": [schema_usage_op("billing")] });
+    let err = answer(t.send_as("vic", Method::POST, &path, Some(op.clone())).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden", "{err}");
+    let err = answer(t.send_as("dev", Method::POST, &path, Some(op)).await, 403).await;
+    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "an owner run is Admin only");
+    t.put_member_role(t.member_role_row(dev, main, &["billing_admin", "sales"]));
+    let as_role = json!({ "role": "sales", "operations": [schema_usage_op("billing")] });
+    let resp = t.send_as("dev", Method::POST, &path, Some(as_role)).await;
+    assert_eq!(resp.status(), 503, "a Developer acting as a role gets past access");
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn privileges_read_lists_grants_with_grantors_and_hashes() {
+    let (scratch, t) = changes_app("prd-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, mid, x1, x5] = scratch.make_roles(["reader", "mid", "x1", "x5"]).await;
+    t.known_roles(&[&reader, &mid]);
+    scratch.exec_cluster(&format!("GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE")).await;
+    scratch
+        .exec_in(&format!(
+            "GRANT USAGE ON SCHEMA public TO {reader};
+             GRANT SELECT ON public.notes TO {mid} WITH GRANT OPTION;
+             GRANT INSERT ON public.notes TO {reader};
+             SET ROLE {mid}; GRANT SELECT ON public.notes TO {reader}; RESET ROLE;
+             CREATE TABLE public.t_x1 (id int); ALTER TABLE public.t_x1 OWNER TO {x1};
+             CREATE TABLE public.t_x5 (id int); ALTER TABLE public.t_x5 OWNER TO {x5};"
+        ))
+        .await;
+    let db = scratch.database.clone();
+    let page = answer(t.privileges(main, &db, &format!("?role={reader}&schema=public")).await, 200).await;
+    assert_eq!(page["role"], reader.as_str());
+    assert!(page["server_version_num"].as_i64().unwrap() >= 170000, "{page}");
+    assert!(page["offered"]["table"].as_array().unwrap().contains(&json!("maintain")), "{page}");
+    let notes = listed(&page, "notes");
+    assert_eq!((notes["kind"].as_str(), notes["owner"].as_str(), notes["owner_settable"].as_bool()), (Some("table"), Some(o.as_str()), Some(true)));
+    assert_eq!(grant_pairs(&notes["grants"]), pair_set(&[(o.as_str(), "INSERT"), (mid.as_str(), "SELECT")]), "every grantor (MH-24)");
+    let hash = notes["acl_hash"].as_str().unwrap();
+    assert!(hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()), "{hash}");
+    // D6 / P27: a role the owner can SET to is settable; one it can't reach isn't.
+    assert_eq!(listed(&page, "t_x1")["owner_settable"], true);
+    assert_eq!(listed(&page, "t_x5")["owner_settable"], false);
+    assert!(page["next_after"].is_null(), "{page}");
+    // Schema mode: the schema list and default ACLs, no objects.
+    let top = answer(t.privileges(main, &db, &format!("?role={reader}")).await, 200).await;
+    let public = top["schemas"].as_array().unwrap().iter().find(|s| s["name"] == "public").unwrap_or_else(|| panic!("{top}"));
+    assert!(grant_pairs(&public["grants"]).iter().any(|(_, p)| p == "USAGE"), "{public}");
+    assert_eq!(top["objects"], json!([]));
+    // PUBLIC is read as `public` (exact, lower case, T4-1).
+    let pubpage = answer(t.privileges(main, &db, "?role=public&schema=public").await, 200).await;
+    assert_eq!(pubpage["role"], "public");
+    // A role that isn't on the branch.
+    let err = answer(t.privileges(main, &db, &format!("?role={}", scratch.named("nobody"))).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, mid, x1, x5]).await;
+}
+
+// MH-32: the object mode is paged (`limit`, `next_after`) and every object comes exactly once.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn privileges_read_pages_per_schema() {
+    let (scratch, t) = changes_app("pg-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    t.known_roles(&[&reader]);
+    let mut sql = format!("CREATE SCHEMA app AUTHORIZATION {o};");
+    for i in 0..5 {
+        sql.push_str(&format!("CREATE TABLE app.p{i} (id int); ALTER TABLE app.p{i} OWNER TO {o};"));
+    }
+    scratch.exec_in(&sql).await;
+    let db = scratch.database.clone();
+    let mut names = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let query = match &after {
+            None => format!("?role={reader}&schema=app&limit=2"),
+            Some(a) => format!("?role={reader}&schema=app&limit=2&after={}", query_escaped(a)),
+        };
+        let page = answer(t.privileges(main, &db, &query).await, 200).await;
+        let objects = page["objects"].as_array().unwrap();
+        assert!(objects.len() <= 2, "{page}");
+        names.extend(objects.iter().map(|o| o["name"].as_str().unwrap().to_string()));
+        after = page["next_after"].as_str().map(str::to_string);
+        if after.is_none() {
+            break;
+        }
+    }
+    assert!(after.is_none(), "paging ends");
+    assert_eq!(names, ["p0", "p1", "p2", "p3", "p4"]);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// D6 with T1's P26: each statement on an object another role owns runs as that owner. Every
+// way the owner reaches it: SET already (case 1), an owner-granted row without SET (case 2),
+// ADMIN only (case 3), ADMIN through an INHERIT membership (T1 item 6's extra). The grantor
+// is the object's owner, the owner's memberships are exactly as before, and the statement
+// after a run-as one runs as the owner again (RESET ROLE). `public` (owned by
+// `pg_database_owner`) works too.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn owner_run_grants_on_a_table_owned_by_a_settable_role() {
+    let (scratch, t) = changes_app("run-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x1, x2, x3, x4, mid] = scratch.make_roles(["reader", "x1", "x2", "x3", "x4", "mid"]).await;
+    scratch
+        .exec_cluster(&format!(
+            "GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE;
+             GRANT {x2} TO {o} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+             GRANT {x2} TO {o} WITH ADMIN FALSE, INHERIT TRUE, SET FALSE GRANTED BY {o};
+             GRANT {x3} TO {o} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+             GRANT {mid} TO {o} WITH ADMIN FALSE, INHERIT TRUE, SET FALSE;
+             GRANT {x4} TO {mid} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
+        ))
+        .await;
+    let mut sql = String::new();
+    for (table, owner) in [("t1", &x1), ("t2", &x2), ("t3", &x3), ("t4", &x4)] {
+        sql.push_str(&format!("CREATE TABLE public.{table} (id int); ALTER TABLE public.{table} OWNER TO {owner};"));
+    }
+    scratch.exec_in(&sql).await;
+    let before = scratch.memberships(&o).await;
+    let ops = json!([
+        grant_op("t1", &["select"], &reader),
+        grant_op("t2", &["select"], &reader),
+        grant_op("t3", &["select"], &reader),
+        grant_op("t4", &["select"], &reader),
+        grant_op("notes", &["select"], &reader),
+        schema_usage_op(&reader),
+    ]);
+    let real = answer(t.changes(main, json!({ "operations": ops })).await, 200).await;
+    assert_eq!(real["committed"], true, "{real}");
+    for (table, owner) in [("t1", &x1), ("t2", &x2), ("t3", &x3), ("t4", &x4)] {
+        assert_eq!(scratch.acl(&format!("public.{table}"), &reader).await, format!("{owner}:SELECT"), "{table}: granted as its owner");
+    }
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{o}:SELECT"), "RESET ROLE: the owner's own table as the owner");
+    let public_acl = scratch.schema_acl("public", &reader).await;
+    assert!(public_acl.split(',').any(|e| e.ends_with(":USAGE")), "the reader's own USAGE entry, not PUBLIC's default: {public_acl:?}");
+    assert_eq!(scratch.memberships(&o).await, before, "P26: the owner's memberships are unchanged");
+    // A statement failing after a run-as one rolls back the whole request, transient grant
+    // included.
+    let ops = json!([
+        revoke_op("t3", &["select"], &reader),
+        { "grant": { "table": public_table("notes"), "grant": { "columns": ["nope"], "privileges": ["select"], "grantee": { "role": reader } } } },
+    ]);
+    let err = answer(t.changes(main, json!({ "operations": ops })).await, 400).await;
+    assert_eq!((code_of(&err), err["error"]["sqlstate"].as_str(), err["error"]["op_index"].as_u64()), ("schema_change_failed", Some("42703"), Some(1)), "{err}");
+    assert_eq!(scratch.acl("public.t3", &reader).await, format!("{x3}:SELECT"), "rolled back");
+    assert_eq!(scratch.memberships(&o).await, before);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[x2.clone(), x1, x3, x4, mid, reader]).await;
+}
+
+// D6: an object whose owner the run-as sequence can't reach is 422 `invalid_request` with
+// `extra.owner`, in a dry run too, and nothing runs. That includes an owner the database
+// owner holds ADMIN on only through a non-INHERIT membership (Postgres finds no grantor there:
+// `no possible grantors`, never a 500).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn owner_run_refuses_an_object_whose_owner_is_unreachable() {
+    let (scratch, t) = changes_app("unr-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x5, adm, x6] = scratch.make_roles(["reader", "x5", "adm", "x6"]).await;
+    scratch
+        .exec_cluster(&format!(
+            "GRANT {adm} TO {o} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+             GRANT {x6} TO {adm} WITH ADMIN TRUE, INHERIT TRUE, SET TRUE;"
+        ))
+        .await;
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.t5 (id int); ALTER TABLE public.t5 OWNER TO {x5};
+             CREATE TABLE public.t6 (id int); ALTER TABLE public.t6 OWNER TO {x6};"
+        ))
+        .await;
+    let before = scratch.memberships(&o).await;
+    for (table, owner) in [("t5", &x5), ("t6", &x6)] {
+        for dry_run in [true, false] {
+            let body = json!({ "dry_run": dry_run, "operations": [grant_op(table, &["select"], &reader)] });
+            let err = answer(t.changes(main, body).await, 422).await;
+            assert_eq!((code_of(&err), err["error"]["owner"].as_str()), ("invalid_request", Some(owner.as_str())), "{table} dry_run={dry_run}: {err}");
+        }
+        assert_eq!(scratch.acl(&format!("public.{table}"), &reader).await, "", "{table}");
+    }
+    assert_eq!(scratch.memberships(&o).await, before);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[x6, adm, x5, reader]).await;
+}
+
+// P30 (user): on an object `cloud_admin` made, the owner's grants are recorded with grantor
+// `neon_superuser` (which holds every privilege with grant option there, and which the owner
+// inherits). The editor revokes them as the owner, without run-as, although the object's
+// owner isn't settable, and the verify-after sees them gone. (Guard: the base already does
+// this; T5's owner check must not refuse it.)
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_neon_superuser_grant_is_revoked_as_the_owner() {
+    let (scratch, t) = changes_app("nsu-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x5] = scratch.make_roles(["reader", "x5"]).await;
+    scratch.exec_cluster(&shared_role_sql("neon_superuser")).await;
+    scratch.exec_cluster(&format!("GRANT neon_superuser TO {o} WITH INHERIT TRUE, SET FALSE")).await;
+    scratch
+        .exec_in(&format!(
+            "CREATE TABLE public.ca (id int); ALTER TABLE public.ca OWNER TO {x5};
+             GRANT ALL ON public.ca TO neon_superuser WITH GRANT OPTION;
+             SET ROLE {o}; GRANT SELECT ON public.ca TO {reader}; RESET ROLE;"
+        ))
+        .await;
+    assert_eq!(scratch.acl("public.ca", &reader).await, "neon_superuser:SELECT", "the setup");
+    let real = answer(t.changes(main, json!({ "operations": [revoke_op("ca", &["select"], &reader)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert_eq!(scratch.acl("public.ca", &reader).await, "");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[x5, reader]).await;
+}
+
+// MH-24: a revoke another grantor's entry survives (the table's own and a column's) is 409
+// `privileges_not_applied`, naming object, privilege, grantee, grantor and column; the whole
+// request rolls back (the owner's own INSERT stays); a dry run answers the same.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_revoke_another_grantor_still_holds_is_privileges_not_applied() {
+    let (scratch, t) = changes_app("pna-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, mid] = scratch.make_roles(["reader", "mid"]).await;
+    scratch
+        .exec_in(&format!(
+            "GRANT SELECT ON public.notes TO {mid} WITH GRANT OPTION;
+             GRANT INSERT ON public.notes TO {reader};
+             SET ROLE {mid}; GRANT SELECT ON public.notes TO {reader}; GRANT SELECT (body) ON public.notes TO {reader}; RESET ROLE;"
+        ))
+        .await;
+    for dry_run in [true, false] {
+        let body = json!({ "dry_run": dry_run, "operations": [revoke_op("notes", &["select", "insert"], &reader)] });
+        let err = answer(t.changes(main, body).await, 409).await;
+        assert_eq!(code_of(&err), "privileges_not_applied", "{err}");
+        let mismatches = err["error"]["mismatches"].as_array().unwrap_or_else(|| panic!("{err}"));
+        for column in [Value::Null, json!("body")] {
+            let want = json!({ "object": relation_target("notes"), "privilege": "SELECT", "grantee": reader,
+                "still_granted_by": mid, "column": column, "wanted": false });
+            assert!(mismatches.contains(&want), "{want} in {err}");
+        }
+        assert!(mismatches.iter().all(|m| m["privilege"] == "SELECT"), "INSERT was revoked: {err}");
+    }
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{o}:INSERT,{mid}:SELECT"), "rolled back");
+    assert_eq!(scratch.column_acl("public.notes", "body", &reader).await, format!("{mid}:SELECT"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, mid]).await;
+}
+
+// P29: Postgres's `no privileges could be revoked` / `were granted` WARNINGs (01006, 01007)
+// fail the request per statement, before any re-read: here a role holding SELECT without a
+// grant option revokes from a role that holds nothing (the re-read alone would pass), then
+// grants (nothing lands).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_no_privileges_warning_is_privileges_not_applied() {
+    let (scratch, t) = changes_app("warn-pass").await;
+    let main = t.main();
+    let [grp, g] = scratch.make_roles(["grp", "g"]).await;
+    let (_, member_role) = developer_acting_as(&t, &scratch, &grp).await;
+    scratch.exec_in(&format!("GRANT SELECT ON public.notes TO {grp}")).await;
+    let path = format!("{}/schema-changes", t.branch(main));
+    for op in [revoke_op("notes", &["select"], &g), grant_op("notes", &["select"], &g)] {
+        let body = json!({ "role": grp, "operations": [op.clone()] });
+        let err = answer(t.send_as("dev-a", Method::POST, &path, Some(body)).await, 409).await;
+        assert_eq!(code_of(&err), "privileges_not_applied", "{op}: {err}");
+    }
+    assert_eq!(scratch.acl("public.notes", &g).await, "");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[member_role, grp, g]).await;
+}
+
+// MH-33 / P10: `expect_acl` carries the read's hash; a change since is 409
+// `privileges_changed_since_read` naming the object (a dry run too), and nothing changes; with
+// the fresh hash it applies; an `expect_acl` entry for an object the request doesn't touch is
+// ignored.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_stale_acl_hash_is_privileges_changed_since_read() {
+    let (scratch, t) = changes_app("stale-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    t.known_roles(&[&reader]);
+    let db = scratch.database.clone();
+    let q = format!("?role={reader}&schema=public");
+    let page = answer(t.privileges(main, &db, &q).await, 200).await;
+    let old = listed(&page, "notes")["acl_hash"].as_str().unwrap().to_string();
+    scratch.exec_in(&format!("GRANT INSERT ON public.notes TO {reader}")).await;
+    for dry_run in [true, false] {
+        let body = json!({ "dry_run": dry_run, "operations": [grant_op("notes", &["select"], &reader)],
+            "expect_acl": [{ "object": relation_target("notes"), "acl_hash": old }] });
+        let err = answer(t.changes(main, body).await, 409).await;
+        assert_eq!(code_of(&err), "privileges_changed_since_read", "{err}");
+        assert_eq!(err["error"]["objects"], json!([relation_target("notes")]), "{err}");
+    }
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{o}:INSERT"), "nothing changed");
+    let page = answer(t.privileges(main, &db, &q).await, 200).await;
+    let fresh = listed(&page, "notes")["acl_hash"].as_str().unwrap().to_string();
+    assert_ne!(fresh, old);
+    let body = json!({ "operations": [grant_op("notes", &["select"], &reader)],
+        "expect_acl": [
+            { "object": relation_target("notes"), "acl_hash": fresh },
+            { "object": { "schema": { "schema": "public" } }, "acl_hash": "0".repeat(64) },
+        ] });
+    let real = answer(t.changes(main, body).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{o}:INSERT,{o}:SELECT"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// S3: the hash covers the whole ACL, so another grantee's grant since the read is caught too.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_stale_hash_from_another_grantees_change_is_detected() {
+    let (scratch, t) = changes_app("other-pass").await;
+    let main = t.main();
+    let [reader, other] = scratch.make_roles(["reader", "other"]).await;
+    t.known_roles(&[&reader]);
+    let db = scratch.database.clone();
+    let page = answer(t.privileges(main, &db, &format!("?role={reader}&schema=public")).await, 200).await;
+    let old = listed(&page, "notes")["acl_hash"].as_str().unwrap().to_string();
+    scratch.exec_in(&format!("GRANT SELECT ON public.notes TO {other}")).await;
+    let body = json!({ "operations": [grant_op("notes", &["select"], &reader)],
+        "expect_acl": [{ "object": relation_target("notes"), "acl_hash": old }] });
+    let err = answer(t.changes(main, body).await, 409).await;
+    assert_eq!(code_of(&err), "privileges_changed_since_read", "{err}");
+    assert_eq!(scratch.acl("public.notes", &reader).await, "");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, other]).await;
+}
+
+// MH-27 / P11: a function is named by the read's OID and identity; only the server's own
+// `regprocedure` text runs. A changed identity (a rename, or client text that isn't the
+// read's) is 409 `privileges_changed_since_read`; a dropped function is 404 with `op_index`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_changed_function_identity_is_privileges_changed_since_read() {
+    let (scratch, t) = changes_app("fn-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    t.known_roles(&[&reader]);
+    scratch
+        .exec_in(&format!(
+            "CREATE FUNCTION public.f(integer) RETURNS integer LANGUAGE sql AS 'SELECT 1';
+             ALTER FUNCTION public.f(integer) OWNER TO {o};
+             REVOKE EXECUTE ON FUNCTION public.f(integer) FROM PUBLIC;"
+        ))
+        .await;
+    let db = scratch.database.clone();
+    let page = answer(t.privileges(main, &db, &format!("?role={reader}&schema=public")).await, 200).await;
+    let f = listed(&page, "f");
+    assert_eq!(f["kind"], "function");
+    let (oid, identity) = (f["oid"].as_u64().unwrap(), f["identity"].as_str().unwrap().to_string());
+    let grant = |identity: &str| json!({ "operations": [{ "grant_function": { "function": { "oid": oid, "identity": identity }, "grantee": { "role": reader } } }] });
+    let real = answer(t.changes(main, grant(&identity)).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert!(scratch.yes(&format!("SELECT has_function_privilege('{reader}', {oid}::oid, 'EXECUTE')")).await);
+    // Client text that isn't the function's identity never reaches SQL.
+    let hostile = format!("{identity} TO PUBLIC; GRANT ALL ON ALL TABLES IN SCHEMA public TO {reader}; --");
+    let err = answer(t.changes(main, grant(&hostile)).await, 409).await;
+    assert_eq!(code_of(&err), "privileges_changed_since_read", "{err}");
+    assert_eq!(scratch.acl("public.notes", &reader).await, "");
+    scratch.exec_in("ALTER FUNCTION public.f(integer) RENAME TO g").await;
+    let err = answer(t.changes(main, grant(&identity)).await, 409).await;
+    assert_eq!(code_of(&err), "privileges_changed_since_read", "{err}");
+    scratch.exec_in("DROP FUNCTION public.g(integer)").await;
+    let err = answer(t.changes(main, grant(&identity)).await, 404).await;
+    assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("not_found", Some(0)), "{err}");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// MH-26: "all rows" is refused (422 `exposes_data_api`, the chain from the data API side) for a
+// role `anon` is or inherits, and for one a live secret key's role inherits; in a dry run too;
+// no policy is made. A role nothing exposes gets its policy.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn all_rows_for_a_role_anon_inherits_is_exposes_data_api() {
+    let (scratch, t) = changes_app("expo-pass").await;
+    let main = t.main();
+    let [rr, kr, k, safe] = scratch.make_roles(["rr", "kr", "k", "safe"]).await;
+    scratch.exec_cluster(&shared_role_sql("anon")).await;
+    scratch.exec_cluster(&format!("GRANT {rr} TO anon; GRANT {kr} TO {k}")).await;
+    t.seed_secret_key(main, "ci", &k);
+    scratch.exec_in("ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY").await;
+    for (role, chain) in [(rr.as_str(), json!(["anon", rr])), (kr.as_str(), json!([k, kr])), ("anon", json!(["anon"]))] {
+        for dry_run in [true, false] {
+            let body = json!({ "dry_run": dry_run, "operations": [all_rows_op("notes", role, true)] });
+            let err = answer(t.changes(main, body).await, 422).await;
+            assert_eq!(code_of(&err), "exposes_data_api", "{role}: {err}");
+            assert_eq!(err["error"]["chain"], chain, "{role}: {err}");
+        }
+    }
+    assert!(scratch.yes("SELECT NOT EXISTS (SELECT FROM pg_policy WHERE polrelid = 'public.notes'::regclass)").await);
+    let real = answer(t.changes(main, json!({ "operations": [all_rows_op("notes", &safe, true)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[rr, kr, k, safe]).await;
+}
+
+// MH-26: the hub's policy is found by shape and marker, never by name: turning it on beside a
+// user's policy named `<role>_all_rows` (another shape) and a same-shape policy without the
+// marker makes a policy of its own, under another name; turning it off drops only that one.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn all_rows_toggle_off_drops_only_the_marked_policy() {
+    let (scratch, t) = changes_app("tog-pass").await;
+    let main = t.main();
+    let [rs] = scratch.make_roles(["rs"]).await;
+    t.known_roles(&[&rs]);
+    scratch
+        .exec_in(&format!(
+            "ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY;
+             CREATE POLICY {rs}_all_rows ON public.notes FOR SELECT TO {rs} USING (id > 0);
+             CREATE POLICY mine ON public.notes AS PERMISSIVE FOR ALL TO {rs} USING (true) WITH CHECK (true);"
+        ))
+        .await;
+    let marked = "SELECT polname::text FROM pg_policy WHERE polrelid = 'public.notes'::regclass \
+                  AND obj_description(oid, 'pg_policy') = 'chelabase:all_rows'";
+    let real = answer(t.changes(main, json!({ "operations": [all_rows_op("notes", &rs, true)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    let name = scratch.text(marked).await;
+    assert!(!name.is_empty() && name != format!("{rs}_all_rows") && name != "mine", "{name}");
+    let page = answer(t.privileges(main, &scratch.database, &format!("?role={rs}&schema=public")).await, 200).await;
+    assert_eq!(listed(&page, "notes")["all_rows"]["policy"], name.as_str());
+    let real = answer(t.changes(main, json!({ "operations": [all_rows_op("notes", &rs, false)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert!(
+        scratch.yes(&format!("SELECT count(*) = 0 FROM ({marked}) m")).await,
+        "the hub's policy is gone"
+    );
+    let left = scratch
+        .text("SELECT string_agg(polname::text, ',' ORDER BY polname) FROM pg_policy WHERE polrelid = 'public.notes'::regclass")
+        .await;
+    assert_eq!(left, format!("mine,{rs}_all_rows"), "the user's policies stay");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[rs]).await;
+}
+
+// MH-18 / MH-28 / S5: a personal login is refused as a grantee (400 `invalid_request` with
+// `op_index`), and so is the database owner in an owner run (the allow-list's owner is the
+// session role); nothing runs.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_personal_login_is_refused_as_grantee() {
+    let (scratch, t) = changes_app("pl-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [pl, reader] = scratch.make_roles(["pl", "reader"]).await;
+    t.metadata.personal_login_names.lock().unwrap().insert((t.db.as_uuid(), pl.clone()));
+    for (ops, op_index) in [
+        (json!([grant_op("notes", &["select"], &pl)]), 0),
+        (json!([schema_usage_op(&reader), schema_usage_op(&pl)]), 1),
+        (json!([grant_op("notes", &["select"], &o)]), 0),
+    ] {
+        let err = answer(t.changes(main, json!({ "operations": ops.clone() })).await, 400).await;
+        assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("invalid_request", Some(op_index)), "{ops}: {err}");
+    }
+    assert_eq!(scratch.acl("public.notes", &pl).await, "");
+    assert!(
+        scratch.yes(&format!("SELECT position('{reader}=' in coalesce(nspacl::text, '')) = 0 AND position('{pl}=' in coalesce(nspacl::text, '')) = 0 FROM pg_namespace WHERE nspname = 'public'")).await,
+        "nothing ran"
+    );
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[pl, reader]).await;
+}
+
+// P28 / S4: `ALTER DEFAULT PRIVILEGES FOR ROLE X` runs as X (SET is enough; through the
+// transient grant when the owner holds only ADMIN), alone in its request (its `DefaultAcl`
+// target is in `owners`); the owner's memberships are unchanged; revoking it works the same.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn default_privileges_for_another_role_apply_as_that_role() {
+    let (scratch, t) = changes_app("adp-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x1, x3] = scratch.make_roles(["reader", "x1", "x3"]).await;
+    scratch
+        .exec_cluster(&format!(
+            "GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE;
+             GRANT {x3} TO {o} WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;"
+        ))
+        .await;
+    let before = scratch.memberships(&o).await;
+    for x in [&x1, &x3] {
+        let real = answer(t.changes(main, json!({ "operations": [default_select_op(x, true, &reader)] })).await, 200).await;
+        assert_eq!(real["committed"], true);
+        assert_eq!(scratch.default_acl(x, &reader).await, format!("{x}:SELECT"), "{x}");
+    }
+    assert_eq!(scratch.memberships(&o).await, before);
+    let real = answer(t.changes(main, json!({ "operations": [default_select_op(&x1, false, &reader)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert_eq!(scratch.default_acl(&x1, &reader).await, "");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, x1, x3]).await;
+}
+
+// MH-31 / R5: the dry run runs the same statements (run-as included) and changes nothing (the
+// read's hashes are the same after it); the real run's SQL is the dry run's.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_dry_run_returns_the_same_sql_and_changes_nothing() {
+    let (scratch, t) = changes_app("dry-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x1] = scratch.make_roles(["reader", "x1"]).await;
+    t.known_roles(&[&reader]);
+    scratch.exec_cluster(&format!("GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE")).await;
+    scratch.exec_in(&format!("CREATE TABLE public.t1 (id int); ALTER TABLE public.t1 OWNER TO {x1};")).await;
+    let db = scratch.database.clone();
+    let hashes = |page: &Value| {
+        ["notes", "t1"].map(|n| listed(page, n)["acl_hash"].as_str().unwrap().to_string())
+    };
+    let q = format!("?role={reader}&schema=public");
+    let before = hashes(&answer(t.privileges(main, &db, &q).await, 200).await);
+    let ops = json!([grant_op("t1", &["select"], &reader), grant_op("notes", &["select"], &reader), schema_usage_op(&reader)]);
+    let dry = answer(t.changes(main, json!({ "dry_run": true, "operations": ops.clone() })).await, 200).await;
+    assert_eq!((dry["dry_run"].as_bool(), dry["committed"].as_bool(), dry["would_succeed"].as_bool()), (Some(true), Some(false), Some(true)), "{dry}");
+    assert!(dry["statements"].as_array().unwrap().iter().all(|s| s["executed"] == true), "{dry}");
+    assert_eq!(hashes(&answer(t.privileges(main, &db, &q).await, 200).await), before, "the dry run changed nothing");
+    assert_eq!(scratch.acl("public.t1", &reader).await, "");
+    let real = answer(t.changes(main, json!({ "operations": ops })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    let sql = |v: &Value| v["statements"].as_array().unwrap().iter().map(|s| s["sql"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+    assert_eq!(sql(&dry), sql(&real));
+    assert_eq!(scratch.acl("public.t1", &reader).await, format!("{x1}:SELECT"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, x1]).await;
+}
+
+// P31 (user): the dry run's answer flags every grant (default privileges included) to `anon`
+// or `authenticated`, or to a role either of them inherits, with the chain from the data API
+// side: `data_api_exposure: [{ op_index, grantee, chain }]`, in op order. Other grants and
+// revokes aren't flagged.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_dry_run_flags_grants_that_expose_to_the_data_api() {
+    let (scratch, t) = changes_app("flag-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [rr, pr] = scratch.make_roles(["rr", "pr"]).await;
+    scratch.exec_cluster(&shared_role_sql("anon")).await;
+    scratch.exec_cluster(&shared_role_sql("authenticated")).await;
+    scratch.exec_cluster(&format!("GRANT {rr} TO authenticated")).await;
+    let ops = json!([
+        grant_op("notes", &["select"], "anon"),
+        grant_op("notes", &["select"], &rr),
+        grant_op("notes", &["select"], &pr),
+        default_select_op(&o, true, "authenticated"),
+        revoke_op("notes", &["select"], "anon"),
+    ]);
+    let dry = answer(t.changes(main, json!({ "dry_run": true, "operations": ops })).await, 200).await;
+    assert_eq!(
+        dry["data_api_exposure"],
+        json!([
+            { "op_index": 0, "grantee": "anon", "chain": ["anon"] },
+            { "op_index": 1, "grantee": rr, "chain": ["authenticated", rr] },
+            { "op_index": 3, "grantee": "authenticated", "chain": ["authenticated"] },
+        ]),
+        "{dry}"
+    );
+    let plain = answer(t.changes(main, json!({ "dry_run": true, "operations": [grant_op("notes", &["select"], &pr)] })).await, 200).await;
+    assert_eq!(plain["data_api_exposure"], json!([]), "{plain}");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[rr, pr]).await;
+}
+
+// MH-31: MAINTAIN is offered and granted on Postgres 17 (the render's `server_version_num` is
+// the compute's, not 0).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn maintain_is_granted_on_postgres_17() {
+    let (scratch, t) = changes_app("mnt-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    let real = answer(t.changes(main, json!({ "operations": [grant_op("notes", &["maintain"], &reader)] })).await, 200).await;
+    assert_eq!(real["committed"], true);
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{o}:MAINTAIN"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// MH-30 / P13: every committed privilege apply writes one `privileges_changed` (database,
+// branch, project; `after: {pg_database, acted_as, ops: [{op, object}]}`), never SQL text, in
+// events or logs; a dry run, a refused request and a request without privilege ops write none.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn every_privilege_apply_writes_privileges_changed_without_sql() {
+    let logs = Logs::default();
+    let _guard = logs.capture();
+    let (scratch, t) = changes_app("evt-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    let ops = json!([schema_usage_op(&reader), grant_op("notes", &["select"], &reader)]);
+    answer(t.changes(main, json!({ "dry_run": true, "operations": ops.clone() })).await, 200).await;
+    assert!(t.privilege_events().is_empty(), "a dry run writes none");
+    answer(t.changes(main, json!({ "operations": ops })).await, 200).await;
+    let events = t.privilege_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let e = &events[0];
+    let record = t.metadata.database(t.db);
+    assert_eq!(e.database_id, Some(t.db.as_uuid()));
+    assert_eq!(e.branch_id, Some(main.as_uuid()));
+    assert_eq!(e.project_id, Some(record.project_id.as_uuid()));
+    assert!(e.actor_member_id.is_some(), "{e:?}");
+    let after = e.after.clone().unwrap();
+    assert_eq!(after["pg_database"], scratch.database.as_str(), "{after}");
+    assert_eq!(
+        after["ops"],
+        json!([
+            { "op": "grant_schema", "object": { "schema": { "schema": "public" } } },
+            { "op": "grant", "object": relation_target("notes") },
+        ]),
+        "{after}"
+    );
+    let text = after.to_string();
+    for sql in ["GRANT", "REVOKE", "USAGE ON", " ON SCHEMA", " TO "] {
+        assert!(!text.contains(sql), "SQL in the event: {text}");
+    }
+    // A refused request (the owner as grantee) and one without privilege ops write none.
+    answer(t.changes(main, json!({ "operations": [grant_op("notes", &["select"], &o)] })).await, 400).await;
+    answer(t.changes(main, json!({ "operations": [comment_op("notes")] })).await, 200).await;
+    assert_eq!(t.privilege_events().len(), 1);
+    let logged = logs.text();
+    assert!(!logged.contains("GRANT SELECT") && !logged.contains("GRANT USAGE"), "SQL in the logs:\n{logged}");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// MH-30: a Developer's privilege op acting as a role does what Postgres lets that role do and
+// is logged too (actor, `acted_as`); the same Developer's owner run is refused before anything.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_developer_run_as_a_role_is_logged_too() {
+    let (scratch, t) = changes_app("devlog-pass").await;
+    let main = t.main();
+    let [grp, g] = scratch.make_roles(["grp", "g"]).await;
+    let (a, member_role) = developer_acting_as(&t, &scratch, &grp).await;
+    scratch.exec_in(&format!("CREATE TABLE public.gt (id int); ALTER TABLE public.gt OWNER TO {grp};")).await;
+    let path = format!("{}/schema-changes", t.branch(main));
+    let body = json!({ "role": grp, "operations": [grant_op("gt", &["select"], &g)] });
+    let real = answer(t.send_as("dev-a", Method::POST, &path, Some(body)).await, 200).await;
+    assert_eq!(real["committed"], true);
+    let events = t.privilege_events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].actor_member_id, Some(a));
+    let after = events[0].after.clone().unwrap();
+    assert_eq!((after["acted_as"].as_str(), after["pg_database"].as_str()), (Some(grp.as_str()), Some(scratch.database.as_str())), "{after}");
+    assert_eq!(scratch.acl("public.gt", &g).await, format!("{grp}:SELECT"));
+    let owner_run = json!({ "operations": [grant_op("gt", &["insert"], &g)] });
+    let err = answer(t.send_as("dev-a", Method::POST, &path, Some(owner_run)).await, 403).await;
+    assert_eq!(err["error"]["required"], "admin");
+    assert_eq!(t.privilege_events().len(), 1);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[member_role, grp, g]).await;
+}
+
 // --- Table API: rows (TE-A, T8) -----------------------------------------------------------
 
 impl Branching {
@@ -13078,4 +14107,1803 @@ async fn fixes_go_to_the_worker_with_the_hash() {
     }
     t.review_answers(chelabase_nats::ReviewReply::Failed { message: "compute unreachable".into() });
     assert_eq!(code_of(&error_of(t.send(Method::POST, &path, Some(order)).await, 503).await), "unavailable");
+}
+
+// ---- Members hub T9: the roster's `access`, the log's member filter and branch, role events
+
+/// The roster as `sub` sees it: the raw body and the member objects by id.
+async fn roster_as(t: &Mw, sub: &str) -> (String, std::collections::HashMap<uuid::Uuid, Value>) {
+    let resp = t.send(sub, Method::GET, "/v1/members", None).await;
+    assert_eq!(resp.status(), 200);
+    let text = resp.text().await.unwrap();
+    let list: Vec<Value> = serde_json::from_str(&text).unwrap();
+    let by_id = list.into_iter().map(|m| (m["id"].as_str().unwrap().parse().unwrap(), m)).collect();
+    (text, by_id)
+}
+
+/// `access` of a roster member: `(level, [(project, platform_role)])`, projects sorted.
+fn access_of(m: &Value) -> (String, Vec<(String, String)>) {
+    let access = &m["access"];
+    assert!(access.is_object(), "access must be an object, never null or missing: {m}");
+    let mut keys: Vec<&str> = access.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["level", "projects"], "{m}");
+    let mut projects: Vec<(String, String)> = access["projects"]
+        .as_array()
+        .unwrap_or_else(|| panic!("projects must be an array: {m}"))
+        .iter()
+        .map(|p| {
+            let mut pk: Vec<&str> = p.as_object().unwrap().keys().map(String::as_str).collect();
+            pk.sort();
+            assert_eq!(pk, ["platform_role", "project_id", "via"], "{p}");
+            assert_eq!(p["via"], "own", "step 1 is always own: {p}");
+            (p["project_id"].as_str().unwrap().to_string(), p["platform_role"].as_str().unwrap().to_string())
+        })
+        .collect();
+    projects.sort();
+    (access["level"].as_str().unwrap_or_else(|| panic!("level: {m}")).to_string(), projects)
+}
+
+/// `access_of` sorts the projects (ids are random), so expectations are sorted the same way.
+fn sorted_pairs(mut v: Vec<(String, String)>) -> Vec<(String, String)> {
+    v.sort();
+    v
+}
+
+fn pair(project: impl std::fmt::Display, role: &str) -> (String, String) {
+    (project.to_string(), role.to_string())
+}
+
+// R1: `level` and `projects` cover the projects the caller can see, so a non-admin never
+// learns of grants on projects they can't see; a Developer never sees `pg_roles` or overrides
+// (MH-35); the grants endpoint stays Admin-only (MH-34).
+#[tokio::test]
+async fn roster_level_is_over_the_callers_visible_projects() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let p1 = t.w.project;
+    let p2 = md.create_project(t.w.tenant, "Second").await.unwrap().id;
+    let p3 = md.create_project(t.w.tenant, "Hidden").await.unwrap().id;
+    let dev = md.add_granted(t.w.tenant, "dev", p1, PlatformRole::Developer, &[]);
+    let ann = md.add_granted(t.w.tenant, "ann", p1, PlatformRole::Viewer, &["secretrole"]);
+    md.grant(ann, p3, PlatformRole::Admin, &["secretrole"]);
+    md.narrow(ann, t.w.db, OverrideRow { platform_role: None, pg_roles: Some(vec!["secretoverride".into()]) });
+    let cy = md.add_granted(t.w.tenant, "cy", p1, PlatformRole::Developer, &[]);
+    md.grant(cy, p2, PlatformRole::Viewer, &[]);
+    // Admin only on a project the caller can't see, and Viewer on a visible one.
+    let bo = md.add_granted(t.w.tenant, "bo", p2, PlatformRole::Admin, &[]);
+    md.grant(bo, p1, PlatformRole::Viewer, &[]);
+
+    let (text, roster) = roster_as(&t, "dev").await;
+    // First failure of the task: `access` is missing.
+    assert_eq!(access_of(&roster[&ann]), ("viewer".into(), vec![pair(p1, "viewer")]), "ann's admin on P3 is hidden");
+    assert_eq!(access_of(&roster[&cy]), ("developer".into(), vec![pair(p1, "developer")]));
+    assert_eq!(access_of(&roster[&bo]), ("viewer".into(), vec![pair(p1, "viewer")]), "bo's admin on P2 is hidden");
+    assert_eq!(access_of(&roster[&dev]), ("developer".into(), vec![pair(p1, "developer")]));
+    for hidden in [p2.to_string(), p3.to_string(), "secretrole".into(), "secretoverride".to_string()] {
+        assert!(!text.contains(&hidden), "a Developer's roster leaked {hidden}: {text}");
+    }
+    // The grants endpoint is not widened for the roster (MH-34).
+    let err = error_of(t.send("dev", Method::GET, &format!("/v1/projects/{p1}/grants"), None).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden");
+
+    // A Viewer sees the same projects: its own grant is the visible set.
+    let vic = md.add_granted(t.w.tenant, "vic", p2, PlatformRole::Viewer, &[]);
+    let (text, roster) = roster_as(&t, "vic").await;
+    assert_eq!(access_of(&roster[&bo]), ("admin".into(), vec![pair(p2, "admin")]), "bo is Admin on vic's one project");
+    assert_eq!(access_of(&roster[&cy]), ("viewer".into(), vec![pair(p2, "viewer")]));
+    assert_eq!(access_of(&roster[&vic]).0, "viewer");
+    assert!(!text.contains(&p3.to_string()) && !text.contains(&p1.to_string()), "{text}");
+
+    // The tenant admin sees everything.
+    let (_, roster) = roster_as(&t, DEFAULT_SUB).await;
+    assert_eq!(
+        access_of(&roster[&ann]),
+        ("admin".into(), sorted_pairs(vec![pair(p1, "viewer"), pair(p3, "admin")])),
+        "level is the highest over all projects"
+    );
+    assert_eq!(access_of(&roster[&cy]), ("developer".into(), sorted_pairs(vec![pair(p1, "developer"), pair(p2, "viewer")])));
+}
+
+// MH-35: `other` is access only on projects the caller can't see; `none` is no grant anywhere
+// (an override alone is no grant).
+#[tokio::test]
+async fn a_member_only_on_hidden_projects_is_other_and_one_without_grants_is_none() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let p1 = t.w.project;
+    let p2 = md.create_project(t.w.tenant, "Second").await.unwrap().id;
+    let dev = md.add_granted(t.w.tenant, "dev", p1, PlatformRole::Viewer, &[]);
+    let hid = md.add_granted(t.w.tenant, "hid", p2, PlatformRole::Admin, &["secretrole"]);
+    let nobody = md.add_member(t.w.tenant, "nobody", MemberStatus::Active, false);
+    let only_override = md.add_member(t.w.tenant, "ovr", MemberStatus::Active, false);
+    md.narrow(only_override, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+
+    let (text, roster) = roster_as(&t, "dev").await;
+    assert_eq!(access_of(&roster[&hid]), ("other".into(), vec![]), "{text}");
+    assert_eq!(access_of(&roster[&nobody]), ("none".into(), vec![]));
+    assert_eq!(access_of(&roster[&only_override]), ("none".into(), vec![]));
+    assert_eq!(roster[&hid]["has_access"], true, "has_access is kept as it is");
+    assert_eq!(roster[&nobody]["has_access"], false);
+    assert!(!text.contains(&p2.to_string()) && !text.contains("secretrole"), "{text}");
+
+    // A tenant admin sees the same member's real level.
+    let (_, roster) = roster_as(&t, DEFAULT_SUB).await;
+    assert_eq!(access_of(&roster[&hid]), ("admin".into(), vec![pair(p2, "admin")]));
+    assert_eq!(access_of(&roster[&nobody]), ("none".into(), vec![]));
+    assert_eq!(access_of(&roster[&dev]).0, "viewer");
+}
+
+// A tenant admin member's level is `tenant_admin` whatever their grants, and they hold every
+// project (as Admin) in what the caller can see.
+#[tokio::test]
+async fn a_tenant_admin_sees_every_project() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let p1 = t.w.project;
+    let p2 = md.create_project(t.w.tenant, "Second").await.unwrap().id;
+    let lead = md.add_member(t.w.tenant, "lead", MemberStatus::Active, true);
+    let lead2 = md.add_member(t.w.tenant, "lead2", MemberStatus::Active, true);
+    md.grant(lead2, p1, PlatformRole::Viewer, &[]);
+    let dev = md.add_granted(t.w.tenant, "dev", p1, PlatformRole::Developer, &[]);
+
+    let (_, roster) = roster_as(&t, DEFAULT_SUB).await;
+    let everything = vec![pair(p1, "admin"), pair(p2, "admin")];
+    let mut everything = everything;
+    everything.sort();
+    assert_eq!(access_of(&roster[&lead]), ("tenant_admin".into(), everything.clone()));
+    assert_eq!(access_of(&roster[&lead2]), ("tenant_admin".into(), everything), "a viewer grant doesn't lower it");
+
+    // The Developer sees the tenant admins' level, over the one project it can see.
+    let (text, roster) = roster_as(&t, "dev").await;
+    assert_eq!(access_of(&roster[&lead]), ("tenant_admin".into(), vec![pair(p1, "admin")]));
+    assert_eq!(access_of(&roster[&lead2]), ("tenant_admin".into(), vec![pair(p1, "admin")]));
+    assert_eq!(access_of(&roster[&dev]).0, "developer");
+    assert!(!text.contains(&p2.to_string()), "{text}");
+}
+
+// MemberStatusView::Suspended is listed, and `access` is present whatever the status (Studio
+// groups by status first, S17); removed members are not listed.
+#[tokio::test]
+async fn roster_lists_suspended_members() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let p1 = t.w.project;
+    let sus = md.add_member(t.w.tenant, "sus", MemberStatus::Suspended, false);
+    md.grant(sus, p1, PlatformRole::Developer, &[]);
+    let inv = md.add_member(t.w.tenant, "inv", MemberStatus::Invited, false);
+    md.grant(inv, p1, PlatformRole::Viewer, &[]);
+    let pend = md.add_member(t.w.tenant, "pend", MemberStatus::Pending, false);
+    let gone = md.add_member(t.w.tenant, "gone", MemberStatus::Removed, false);
+
+    for caller in [DEFAULT_SUB, "sus-viewer"] {
+        if caller != DEFAULT_SUB {
+            md.add_granted(t.w.tenant, caller, p1, PlatformRole::Viewer, &[]);
+        }
+        let (text, roster) = roster_as(&t, caller).await;
+        assert_eq!(roster[&sus]["status"], "suspended", "{text}");
+        assert_eq!(roster[&sus]["has_access"], true);
+        assert_eq!(access_of(&roster[&sus]), ("developer".into(), vec![pair(p1, "developer")]));
+        assert_eq!(roster[&inv]["status"], "invited");
+        assert_eq!(access_of(&roster[&inv]), ("viewer".into(), vec![pair(p1, "viewer")]));
+        assert_eq!(access_of(&roster[&pend]), ("none".into(), vec![]));
+        assert!(!roster.contains_key(&gone), "a removed member is not listed");
+        for m in roster.values() {
+            access_of(m);
+        }
+    }
+}
+
+/// Seeds one event (the real writes log one per change).
+#[allow(clippy::too_many_arguments)]
+fn seed_event(
+    t: &Mw,
+    actor: Option<uuid::Uuid>,
+    action: &str,
+    target: Option<uuid::Uuid>,
+    project: Option<ProjectId>,
+    branch: Option<BranchId>,
+) -> i64 {
+    let mut events = t.w.metadata.events.lock().unwrap();
+    let id = events.len() as i64 + 1;
+    events.push(chelabase_metadata::members::AccessEvent {
+        id,
+        tenant_id: t.w.tenant,
+        actor_member_id: actor,
+        action: action.into(),
+        target_member_id: target,
+        project_id: project.as_ref().map(ProjectId::as_uuid),
+        database_id: None,
+        before: None,
+        after: None,
+        at: chrono::Utc::now(),
+        actor_email: None,
+        target_email: None,
+        project_name: None,
+        branch_id: branch.as_ref().map(BranchId::as_uuid),
+    });
+    id
+}
+
+fn event_ids(page: &Value) -> Vec<i64> {
+    page["events"].as_array().unwrap_or_else(|| panic!("no events in {page}")).iter().map(|e| e["id"].as_i64().unwrap()).collect()
+}
+
+// Part 3: `?member_id=` matches the target or the actor, on both log routes; MH-36: the tenant
+// log stays tenant-admin, a project's log is for its Admins.
+#[tokio::test]
+async fn events_filter_by_member_as_target_or_actor() {
+    let t = mw(Mode::SelfHosted).await;
+    let md = &t.w.metadata;
+    let p1 = t.w.project;
+    let p2 = md.create_project(t.w.tenant, "Second").await.unwrap().id;
+    let admin = md.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
+    let a = md.add_member(t.w.tenant, "a", MemberStatus::Active, false);
+    let b = md.add_member(t.w.tenant, "b", MemberStatus::Active, false);
+    let e1 = seed_event(&t, Some(admin), "grant_put", Some(a), Some(p1), None);
+    let e2 = seed_event(&t, Some(a), "invite_created", Some(b), Some(p1), None);
+    let e3 = seed_event(&t, Some(admin), "grant_put", Some(b), Some(p2), None);
+    let e4 = seed_event(&t, None, "open_signup_set", None, None, None);
+    let e5 = seed_event(&t, Some(a), "grant_deleted", Some(a), Some(p2), None);
+
+    let get = |q: String| {
+        let t = &t;
+        async move { body_of(t.send(DEFAULT_SUB, Method::GET, &q, None).await).await }
+    };
+    // First failure: the parameter is ignored and every event comes back.
+    assert_eq!(event_ids(&get(format!("/v1/access-events?member_id={a}")).await), vec![e5, e2, e1]);
+    assert_eq!(event_ids(&get(format!("/v1/access-events?member_id={b}")).await), vec![e3, e2]);
+    assert_eq!(event_ids(&get(format!("/v1/access-events?member_id={admin}")).await), vec![e3, e1]);
+    assert_eq!(event_ids(&get("/v1/access-events".into()).await), vec![e5, e4, e3, e2, e1]);
+    // Someone with no events (or another tenant's id) is an empty page, not an error.
+    let page = get(format!("/v1/access-events?member_id={}", uuid::Uuid::new_v4())).await;
+    assert_eq!((event_ids(&page), page["next_before"].clone()), (vec![], Value::Null));
+    // It composes with the paging.
+    let first = get(format!("/v1/access-events?member_id={a}&limit=2")).await;
+    assert_eq!(event_ids(&first), vec![e5, e2]);
+    assert_eq!(first["next_before"], e2);
+    let next = get(format!("/v1/access-events?member_id={a}&limit=2&before={e2}")).await;
+    assert_eq!(event_ids(&next), vec![e1]);
+    // Not a UUID: 400, not ignored.
+    let err = error_of(t.send(DEFAULT_SUB, Method::GET, "/v1/access-events?member_id=nope", None).await, 400).await;
+    assert_eq!(code_of(&err), "invalid_request");
+
+    // The project's log filters the same way, within the project.
+    assert_eq!(event_ids(&get(format!("/v1/projects/{p1}/access-events?member_id={a}")).await), vec![e2, e1]);
+    assert_eq!(event_ids(&get(format!("/v1/projects/{p2}/access-events?member_id={a}")).await), vec![e5]);
+    assert_eq!(event_ids(&get(format!("/v1/projects/{p2}/access-events?member_id={b}")).await), vec![e3]);
+
+    // MH-36: a project Admin reads its project's log (and filters it), not the tenant's; a
+    // Developer reads neither.
+    md.add_granted(t.w.tenant, "padmin", p1, PlatformRole::Admin, &[]);
+    md.add_granted(t.w.tenant, "pdev", p1, PlatformRole::Developer, &[]);
+    let path = format!("/v1/projects/{p1}/access-events?member_id={a}");
+    assert_eq!(event_ids(&body_of(t.send("padmin", Method::GET, &path, None).await).await), vec![e2, e1]);
+    let err = error_of(t.send("padmin", Method::GET, &format!("/v1/access-events?member_id={a}"), None).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden");
+    error_of(t.send("pdev", Method::GET, &path, None).await, 403).await;
+    // An Admin of another project holds no grant here: the project's existence isn't revealed.
+    md.add_granted(t.w.tenant, "oadmin", p2, PlatformRole::Admin, &[]);
+    let err = error_of(t.send("oadmin", Method::GET, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+// MH-37: each event carries `branch_id` (null when the change isn't per branch).
+#[tokio::test]
+async fn events_carry_branch_id() {
+    let t = mw(Mode::SelfHosted).await;
+    let admin = t.w.metadata.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
+    let with = seed_event(&t, Some(admin), "role_created", None, Some(t.w.project), Some(t.w.dev));
+    let without = seed_event(&t, Some(admin), "grant_put", Some(admin), Some(t.w.project), None);
+    for path in ["/v1/access-events".to_string(), format!("/v1/projects/{}/access-events", t.w.project)] {
+        let page = body_of(t.send(DEFAULT_SUB, Method::GET, &path, None).await).await;
+        let events = page["events"].as_array().unwrap();
+        let find = |id: i64| events.iter().find(|e| e["id"] == id).unwrap_or_else(|| panic!("{id} in {page}"));
+        // First failure: the key is missing.
+        assert_eq!(find(with).get("branch_id"), Some(&json!(t.w.dev)), "{path}");
+        assert_eq!(find(without).get("branch_id"), Some(&Value::Null), "{path}: present and null");
+    }
+}
+
+/// The role events the log holds, as `(action, event)`.
+fn role_events(t: &Mw) -> Vec<(String, chelabase_metadata::members::AccessEvent)> {
+    t.w.metadata
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|e| e.action.starts_with("role_"))
+        .map(|e| (e.action.clone(), e.clone()))
+        .collect()
+}
+
+// P25/MH-37: the role routes write `role_created`, `role_updated` and `role_deleted` after the
+// worker answers Done, with the project, database and branch; a refused or failed call writes
+// none, and no event carries a password.
+#[tokio::test]
+async fn role_create_update_delete_write_events_with_the_branch() {
+    let t = mw(Mode::SelfHosted).await;
+    let admin = t.w.metadata.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
+    let dev = t.w.dev;
+    let roles = format!("/v1/databases/{}/branches/{}/roles", t.w.db, dev);
+    let ep = t.w.metadata.branch(dev).endpoint_id.unwrap();
+    t.w.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
+    t.w.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+
+    // Refused or failed first: nothing is logged.
+    for reply in ["role_exists", "role_cap_reached", "branch_not_ready"] {
+        *t.w.jobs.role_reply.lock().unwrap() = Some(Ok(role_reply(reply)));
+        error_of(t.send(DEFAULT_SUB, Method::POST, &roles, Some(json!({ "name": "app" }))).await, 409).await;
+    }
+    *t.w.jobs.role_reply.lock().unwrap() = Some(Err(ResetError::Transport("no worker".into())));
+    error_of(t.send(DEFAULT_SUB, Method::DELETE, &format!("{roles}/app"), None).await, 503).await;
+    *t.w.jobs.role_reply.lock().unwrap() = None;
+    error_of(t.send(DEFAULT_SUB, Method::POST, &roles, Some(json!({ "name": "Bad Name!" }))).await, 422).await;
+    error_of(t.send(DEFAULT_SUB, Method::PATCH, &format!("{roles}/postgres"), Some(json!({ "inherit": false }))).await, 422).await;
+    assert!(role_events(&t).is_empty(), "a refusal or failure wrote an event: {:?}", role_events(&t));
+
+    // First failure of the task: no `role_created` event.
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &roles, Some(json!({ "name": "app" }))).await.status(), 201);
+    assert_eq!(t.send(DEFAULT_SUB, Method::PATCH, &format!("{roles}/app"), Some(json!({ "inherit": false }))).await.status(), 202);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("{roles}/app"), None).await.status(), 200, "T10: a delete answers what it reassigned");
+    // A password reset isn't a role change event.
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("{roles}/app/reset-password"), None).await.status(), 204);
+
+    let events = role_events(&t);
+    let actions: Vec<&str> = events.iter().map(|(a, _)| a.as_str()).collect();
+    assert_eq!(actions, ["role_created", "role_updated", "role_deleted"]);
+    for (action, e) in &events {
+        assert_eq!(e.branch_id, Some(dev.as_uuid()), "{action}");
+        assert_eq!(e.database_id, Some(t.w.db.as_uuid()), "{action}");
+        assert_eq!(e.project_id, Some(t.w.project.as_uuid()), "{action}");
+        assert_eq!(e.actor_member_id, Some(admin), "{action}");
+        assert_eq!(e.target_member_id, None, "{action}");
+        let detail = e.after.as_ref().or(e.before.as_ref()).unwrap_or_else(|| panic!("{action}: no before/after"));
+        assert_eq!(detail["role"], "app", "{action}");
+        let text = format!("{:?}{:?}", e.before, e.after).to_lowercase();
+        assert!(!text.contains("password") && !text.contains("s3cret"), "{action}: {text}");
+    }
+    let created = events[0].1.after.as_ref().unwrap();
+    assert!(created.get("login").is_some() && created.get("attributes").is_some(), "{created}");
+    // The log shows them, with the branch, on the project's Activity.
+    let page = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/projects/{}/access-events", t.w.project), None).await).await;
+    let shown: Vec<(&str, &Value)> =
+        page["events"].as_array().unwrap().iter().map(|e| (e["action"].as_str().unwrap(), &e["branch_id"])).collect();
+    assert_eq!(shown, [("role_deleted", &json!(dev)), ("role_updated", &json!(dev)), ("role_created", &json!(dev))]);
+}
+
+// ---- Members hub T8: personal logins, revocation's side effects, suspension (spec Part 6) ----
+//
+// Through the fakes: the routes' powers row by row (Part 7), the password shown once, names
+// (D3), every revocation path clearing the proxy cache (P4) and reconciling (P16 b),
+// suspension with Zitadel's lock (D5, S7), and what personal logins are hidden from (MH-11,
+// MH-12, MH-21). The fake's personal-login records (`FakeLogin`) stand for T3's metadata.
+
+use chelabase_metadata::personal_logins::{LoginEndpoint, LoginStatus, RevokeReason};
+
+/// The T8 world: `mw`'s (project Billing, database web1 with main `ep-0123456789ab` and `dev`),
+/// each member behind a Zitadel mock user (their sub) so suspension can lock them: `alice` and
+/// `bob` Developers with `app`, `vera` a Viewer, `pam` an Admin of Billing, and `oscar` an
+/// Admin of project Elsewhere only. Each is (member id, sub).
+struct Pl {
+    t: Mw,
+    alice: (uuid::Uuid, String),
+    bob: (uuid::Uuid, String),
+    vera: (uuid::Uuid, String),
+    pam: (uuid::Uuid, String),
+    oscar: (uuid::Uuid, String),
+    elsewhere: ProjectId,
+}
+
+async fn pl_world() -> Pl {
+    let t = mw(Mode::SelfHosted).await;
+    let elsewhere = t.w.metadata.create_project(t.w.tenant, "Elsewhere").await.unwrap().id;
+    let person = |name: &str, project: ProjectId, role: PlatformRole| {
+        let sub = t.mock.add_user_in("org-1", &format!("{name}@x.com"), "Secret-pass1", true);
+        (t.w.metadata.add_granted(t.w.tenant, &sub, project, role, &["app"]), sub)
+    };
+    let alice = person("alice", t.w.project, PlatformRole::Developer);
+    let bob = person("bob", t.w.project, PlatformRole::Developer);
+    let vera = person("vera", t.w.project, PlatformRole::Viewer);
+    let pam = person("pam", t.w.project, PlatformRole::Admin);
+    let oscar = person("oscar", elsewhere, PlatformRole::Admin);
+    Pl { t, alice, bob, vera, pam, oscar, elsewhere }
+}
+
+/// Another ready database of `project` named `name`, its main on `endpoint`.
+fn add_database(w: &MemberWorld, project: ProjectId, name: &str, endpoint: &str) -> DatabaseId {
+    let mut db = sample_database(w.tenant);
+    db.project_id = project;
+    db.name = name.into();
+    db.database_name = Some(name.into());
+    db.owner_role = Some("postgres".into());
+    db.main.endpoint_id = Some(endpoint.into());
+    let id = db.database_id;
+    w.metadata.insert_database(db);
+    id
+}
+
+/// Marks a fake record revoked, as the metadata's revocation does (MH-9: no verifier left).
+fn revoked(reason: RevokeReason) -> impl FnOnce(&mut FakeLogin) {
+    move |l| {
+        l.login.status = LoginStatus::Revoked;
+        l.login.revoked_at = Some(chrono::Utc::now());
+        l.login.revoked_reason = Some(reason);
+        l.verifier = None;
+    }
+}
+
+impl Pl {
+    fn db(&self) -> DatabaseId {
+        self.t.w.db
+    }
+    fn main(&self) -> BranchId {
+        BranchId::from(self.t.w.db)
+    }
+    fn main_ep(&self) -> String {
+        self.t.main_endpoint()
+    }
+    fn dev_ep(&self) -> String {
+        self.t.w.metadata.branch(self.t.w.dev).endpoint_id.unwrap()
+    }
+    /// The (endpoint, role) of each row of a login named `name` on main and `dev`.
+    fn rows(&self, name: &str) -> Vec<(String, String)> {
+        vec![(self.main_ep(), name.to_string()), (self.dev_ep(), name.to_string())]
+    }
+    fn cache(&self) -> &FakeCache {
+        &self.t.w.app.cache
+    }
+    fn me(&self) -> uuid::Uuid {
+        self.t.w.metadata.member(self.t.w.tenant, DEFAULT_SUB).unwrap().id
+    }
+    fn status_of(&self, member: uuid::Uuid) -> MemberStatus {
+        self.t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == member).unwrap().status
+    }
+    /// One more member of the tenant behind a Zitadel mock user, granted `role` on `project`.
+    fn add_person(&self, name: &str, project: ProjectId, role: PlatformRole) -> (uuid::Uuid, String) {
+        let sub = self.t.mock.add_user_in("org-1", &format!("{name}@x.com"), "Secret-pass1", true);
+        (self.t.w.metadata.add_granted(self.t.w.tenant, &sub, project, role, &["app"]), sub)
+    }
+    /// A live login of `who` on web1 named `name`, with its rows on main and `dev`.
+    fn seed(&self, who: &(uuid::Uuid, String), name: &str) -> FakeLogin {
+        self.t.w.metadata.seed_personal_login(who.0, self.db(), name)
+    }
+    fn login_path(&self) -> String {
+        format!("/v1/databases/{}/personal-login", self.db())
+    }
+    fn member_logins_path(&self, member: uuid::Uuid) -> String {
+        format!("/v1/members/{member}/personal-logins")
+    }
+    fn database_logins_path(&self) -> String {
+        format!("/v1/databases/{}/personal-logins", self.db())
+    }
+    fn delete_path(&self, member: uuid::Uuid) -> String {
+        format!("/v1/databases/{}/personal-logins/{member}", self.db())
+    }
+    async fn send(&self, sub: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
+        self.t.send(sub, method, path, body).await
+    }
+    async fn put_login(&self, sub: &str, name: &str) -> reqwest::Response {
+        self.send(sub, Method::PUT, &self.login_path(), Some(json!({ "name": name }))).await
+    }
+    async fn reset_login(&self, sub: &str) -> reqwest::Response {
+        self.send(sub, Method::POST, &format!("{}/reset-password", self.login_path()), None).await
+    }
+    /// `POST /v1/members/{member}/{action}`: `suspend`, `reinstate` or `revoke-postgres-access`.
+    async fn member_action(&self, sub: &str, member: uuid::Uuid, action: &str) -> reqwest::Response {
+        self.send(sub, Method::POST, &format!("/v1/members/{member}/{action}"), None).await
+    }
+    /// How many times Zitadel was asked `POST /v2/users/{user}/{verb}`.
+    fn zitadel_calls(&self, user: &str, verb: &str) -> usize {
+        let want = format!("POST /v2/users/{user}/{verb}");
+        self.t.mock.calls().iter().filter(|c| **c == want).count()
+    }
+}
+
+/// `valid_until` of a login view is about 90 days from now (D4).
+fn assert_ninety_days(login: &Value) {
+    let until: chrono::DateTime<chrono::Utc> = login["valid_until"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no valid_until: {login}"))
+        .parse()
+        .unwrap();
+    let hours = (until - chrono::Utc::now()).num_hours();
+    assert!((89 * 24..=90 * 24).contains(&hours), "valid_until {until} is not 90 days out");
+}
+
+// Part 7: create and reset are the caller's own, for Developer and above (tenant admins
+// included); a Viewer (R9), a member narrowed below Developer on the database, and a member
+// with no grant on the project get none.
+#[tokio::test]
+async fn personal_login_create_is_own_and_developer_plus() {
+    let p = pl_world().await;
+    let resp = p.put_login(&p.alice.1, "alice_login").await;
+    assert_eq!(resp.status(), 201, "a Developer creates their own login");
+    let body = body_of(resp).await;
+    let login = &body["login"];
+    assert_eq!(login["member_id"], json!(p.alice.0), "{body}");
+    assert_eq!(login["database_id"], json!(p.db()), "{body}");
+    assert_eq!(login["project_id"], json!(p.t.w.project), "{body}");
+    assert_eq!(login["database_name"], "web1", "{body}");
+    assert_eq!(login["role_name"], "alice_login", "{body}");
+    assert_eq!(login["status"], "active", "{body}");
+    assert_eq!(login["revoked_at"], Value::Null, "{body}");
+    assert_eq!(login["revoked_reason"], Value::Null, "{body}");
+    assert_ninety_days(login);
+    for (sub, id, name) in [(p.pam.1.as_str(), p.pam.0, "pam_login"), (DEFAULT_SUB, p.me(), "admin_login")] {
+        let resp = p.put_login(sub, name).await;
+        assert_eq!(resp.status(), 201, "{name}");
+        assert_eq!(body_of(resp).await["login"]["member_id"], json!(id), "{name}: always the caller's own");
+    }
+
+    let err = error_of(p.put_login(&p.vera.1, "vera_login").await, 403).await;
+    assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("developer")));
+    let err = error_of(p.reset_login(&p.vera.1).await, 403).await;
+    assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("developer")));
+    p.t.w.metadata.narrow(p.bob.0, p.db(), OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    let err = error_of(p.put_login(&p.bob.1, "bob_login").await, 403).await;
+    assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("developer")), "overrides count");
+    let err = error_of(p.put_login(&p.oscar.1, "oscar_login").await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    for who in [&p.vera, &p.bob, &p.oscar] {
+        assert!(p.t.w.metadata.personal_login(who.0, p.db()).is_none(), "a refusal makes nothing");
+    }
+
+    // Reset acts on the caller's own login, and only theirs.
+    let resp = p.reset_login(&p.alice.1).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["login"]["member_id"], json!(p.alice.0));
+}
+
+// MH-15: the password is server-generated (128 bits or more), answered once with `no-store`
+// and a connection string for main's default database (P23), and never again: not listed, not
+// revealable, not in an access event, a worker request, a cache message or a log line. Only a
+// SCRAM verifier is stored.
+#[tokio::test]
+async fn create_answers_the_password_once_with_no_store() {
+    let logs = Logs::default();
+    let _guard = {
+        let logs = logs.clone();
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter("orchestrator=trace,chelabase_metadata=trace,chelabase_neon=trace")
+                .with_writer(move || logs.clone())
+                .finish(),
+        )
+    };
+    let p = pl_world().await;
+    let resp = p.put_login(&p.alice.1, "alice_login").await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(resp.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"));
+    let body = body_of(resp).await;
+    let password = body["password"].as_str().unwrap_or_else(|| panic!("no password: {body}")).to_string();
+    assert!(password.len() >= 22 && password.chars().all(|c| c.is_ascii_alphanumeric()), "{password}");
+    let uri = body["connection_string"].as_str().unwrap_or_else(|| panic!("no connection_string: {body}"));
+    assert!(uri.starts_with(&format!("postgresql://alice_login:{password}@{}.", p.main_ep())), "{uri}");
+    assert!(uri.contains("/web1"), "{uri}");
+    assert!(body["ready_on_main"].is_boolean(), "{body}");
+
+    let stored = p
+        .t
+        .w
+        .metadata
+        .personal_login(p.alice.0, p.db())
+        .expect("the record")
+        .verifier
+        .expect("a verifier");
+    assert!(stored.starts_with("SCRAM-SHA-256$") && !stored.contains(&password), "{stored}");
+
+    let listed = p.send(&p.alice.1, Method::GET, &p.member_logins_path(p.alice.0), None).await;
+    assert_eq!(listed.status(), 200);
+    let listed = listed.text().await.unwrap();
+    assert!(listed.contains("alice_login") && !listed.contains(&password) && !listed.contains("SCRAM"), "{listed}");
+    let reveal = format!("/v1/databases/{}/branches/{}/connection?role=alice_login", p.db(), p.main());
+    assert_eq!(p.send(DEFAULT_SUB, Method::GET, &reveal, None).await.status(), 404, "never revealable");
+
+    let events = format!("{:?}", p.t.w.metadata.events.lock().unwrap());
+    assert!(!events.contains(&password) && !events.contains(&stored), "{events}");
+    let requests = format!(
+        "{:?}{:?}",
+        p.t.w.jobs.member_reconciles.lock().unwrap(),
+        p.t.w.jobs.member_role_enqueues.lock().unwrap()
+    );
+    assert!(!requests.contains(&password), "{requests}");
+    assert!(!format!("{:?}", p.cache().sent()).contains(&password));
+    let text = logs.text();
+    assert!(!text.contains(&password) && !text.contains(&stored), "{text}");
+
+    let other = body_of(p.put_login(&p.pam.1, "pam_login").await).await;
+    assert!(other["password"].is_string() && other["password"] != json!(password), "{other}");
+}
+
+// MH-15: a live login is 409 `personal_login_exists`, whatever the name (renaming is delete
+// and create). P6: a revoked record is replaced, its name free for its own member (S10).
+#[tokio::test]
+async fn create_twice_is_personal_login_exists() {
+    let p = pl_world().await;
+    assert_eq!(p.put_login(&p.alice.1, "alice_login").await.status(), 201);
+    for name in ["alice_login", "alice_other"] {
+        let err = error_of(p.put_login(&p.alice.1, name).await, 409).await;
+        assert_eq!(code_of(&err), "personal_login_exists", "{name}");
+    }
+    p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), revoked(RevokeReason::AccessLost));
+    let resp = p.put_login(&p.alice.1, "alice_login").await;
+    assert_eq!(resp.status(), 201, "a revoked record is replaced");
+    assert_eq!(body_of(resp).await["login"]["status"], "active");
+}
+
+// T3-M4: a create that replaces an expired (or revoked) record tells the proxy cache about the
+// old record's rows, which the replace removes.
+#[tokio::test]
+async fn create_replacing_an_expired_login_clears_the_cache_for_its_old_rows() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_old");
+    p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), |l| {
+        l.login.valid_until = chrono::Utc::now() - chrono::Duration::minutes(1);
+        l.login.status = LoginStatus::Expired;
+    });
+    assert_eq!(p.put_login(&p.alice.1, "alice_new").await.status(), 201);
+    assert!(
+        p.cache().wait_for(&p.rows("alice_old")).await,
+        "the replaced record's rows are cleared from the proxy cache: {:?}",
+        p.cache().sent()
+    );
+}
+
+// D3: the name is free but unique across every branch of the database, against every role
+// there and every login of the database (any status): 409 `role_exists`. The shape and the
+// reserved names are refused (422).
+#[tokio::test]
+async fn a_name_taken_on_another_branch_is_role_exists() {
+    let p = pl_world().await;
+    p.t.w.metadata.add_role(&p.dev_ep(), "billing", RoleOrigin::Sql, false, false);
+    let err = error_of(p.put_login(&p.alice.1, "billing").await, 409).await;
+    assert_eq!(code_of(&err), "role_exists", "a role on another branch holds the name");
+    p.seed(&p.bob, "shared");
+    p.t.w.metadata.edit_personal_login(p.bob.0, p.db(), revoked(RevokeReason::AccessLost));
+    let err = error_of(p.put_login(&p.alice.1, "shared").await, 409).await;
+    assert_eq!(code_of(&err), "role_exists", "another member's revoked login still holds its name");
+
+    let long = "a".repeat(64);
+    for name in ["Alice", "1abc", "a-b", "", long.as_str()] {
+        let err = error_of(p.put_login(&p.alice.1, name).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_role_name", "{name:?}");
+    }
+    for name in ["postgres", "owner", "anon", "authenticator", "pg_monitor", "cb_m_x", "chelabase_x"] {
+        let err = error_of(p.put_login(&p.alice.1, name).await, 422).await;
+        assert_eq!(code_of(&err), "reserved_role_name", "{name}");
+    }
+    let err = error_of(p.send(&p.alice.1, Method::PUT, &p.login_path(), Some(json!({}))).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request", "the name is required");
+    assert!(p.t.w.metadata.personal_login(p.alice.0, p.db()).is_none(), "no refusal wrote anything");
+    assert_eq!(p.put_login(&p.alice.1, "alice_login").await.status(), 201);
+}
+
+// P7, S9: create asks main for one synchronous member-filtered reconcile and enqueues the
+// other branches; `ready_on_main` is true only when the reply is `Done` and the login's row is
+// on main's endpoint.
+#[tokio::test]
+async fn create_asks_main_for_a_synchronous_reconcile_and_enqueues_the_others() {
+    let p = pl_world().await;
+    let (main, main_ep) = (p.main(), p.main_ep());
+    let store = p.t.w.metadata.personal_logins.clone();
+    *p.t.w.jobs.member_reconcile_hook.lock().unwrap() = Some(Arc::new(move |r: &MemberRolesReconcileRequest| {
+        if r.branch_id != main.as_uuid() {
+            return;
+        }
+        let Some(member) = r.member_id else { return };
+        for l in store.lock().unwrap().iter_mut().filter(|l| l.login.member_id == member) {
+            l.endpoints.push(LoginEndpoint {
+                branch_id: main.as_uuid(),
+                endpoint_id: main_ep.clone(),
+                role_name: l.login.role_name.clone(),
+            });
+        }
+    }));
+    let resp = p.put_login(&p.alice.1, "alice_login").await;
+    assert_eq!(resp.status(), 201);
+    let body = body_of(resp).await;
+    assert_eq!(body["ready_on_main"], true, "{body}");
+    assert_eq!(
+        p.t.w.jobs.member_reconciles.lock().unwrap().clone(),
+        vec![MemberRolesReconcileRequest { branch_id: main.as_uuid(), member_id: Some(p.alice.0), from_ddl: false }],
+        "one synchronous reconcile, of main, for that member"
+    );
+    let enqueued = p.t.w.jobs.member_role_enqueues.lock().unwrap().clone();
+    assert!(enqueued.contains(&p.t.w.dev), "the other branches are enqueued: {enqueued:?}");
+
+    // `Done` without the login's row on main isn't ready.
+    *p.t.w.jobs.member_reconcile_hook.lock().unwrap() = None;
+    let resp = p.put_login(&p.pam.1, "pam_login").await;
+    assert_eq!(resp.status(), 201);
+    assert_eq!(body_of(resp).await["ready_on_main"], false);
+}
+
+// S9: any reconcile outcome but `Done` is `ready_on_main: false`, never an error: the login is
+// made and its password answered (201, not 503).
+#[tokio::test]
+async fn create_reports_ready_on_main_false_when_the_reconcile_times_out() {
+    let p = pl_world().await;
+    let outcomes = [
+        (&p.alice, "alice_login", Err(ResetError::Timeout)),
+        (&p.pam, "pam_login", Err(ResetError::Transport("no worker listening".into()))),
+        (&p.bob, "bob_login", Ok(MemberRolesReply::Failed { message: "compute not ready".into() })),
+    ];
+    for (who, name, reply) in outcomes {
+        *p.t.w.jobs.member_reconcile_reply.lock().unwrap() = Some(reply);
+        let resp = p.put_login(&who.1, name).await;
+        assert_eq!(resp.status(), 201, "{name}: the login is made all the same");
+        let body = body_of(resp).await;
+        assert_eq!(body["ready_on_main"], false, "{body}");
+        assert!(body["password"].as_str().is_some_and(|s| !s.is_empty()), "{body}");
+    }
+}
+
+// P8, D4: a reset answers a new password once (no-store), renews `valid_until` to 90 days,
+// stores a new verifier and tells the proxy cache about every row of the login. Without a live
+// login (none, or a revoked one) it is 404.
+#[tokio::test]
+async fn reset_renews_valid_until_and_clears_the_cache() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), |l| {
+        l.login.valid_until = chrono::Utc::now() + chrono::Duration::days(3)
+    });
+    let before = p.t.w.metadata.personal_login(p.alice.0, p.db()).unwrap().verifier.unwrap();
+    let resp = p.reset_login(&p.alice.1).await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("no-store"));
+    let body = body_of(resp).await;
+    let password = body["password"].as_str().unwrap_or_else(|| panic!("no password: {body}")).to_string();
+    assert_ninety_days(&body["login"]);
+    let uri = body["connection_string"].as_str().unwrap_or_else(|| panic!("no connection_string: {body}"));
+    assert!(uri.starts_with(&format!("postgresql://alice_login:{password}@{}.", p.main_ep())), "{uri}");
+    let after = p.t.w.metadata.personal_login(p.alice.0, p.db()).unwrap().verifier.unwrap();
+    assert!(after != before && after.starts_with("SCRAM-SHA-256$") && !after.contains(&password), "{after}");
+    assert!(
+        p.cache().wait_for(&p.rows("alice_login")).await,
+        "every row of the login is cleared from the proxy cache: {:?}",
+        p.cache().sent()
+    );
+    assert!(!format!("{:?}", p.t.w.metadata.events.lock().unwrap()).contains(&password));
+
+    let err = error_of(p.reset_login(&p.pam.1).await, 404).await;
+    assert_eq!(code_of(&err), "not_found", "no login");
+    p.seed(&p.bob, "bob_login");
+    p.t.w.metadata.edit_personal_login(p.bob.0, p.db(), revoked(RevokeReason::RevokedNow));
+    let err = error_of(p.reset_login(&p.bob.1).await, 404).await;
+    assert_eq!(code_of(&err), "not_found", "a revoked login isn't reset");
+}
+
+// Part 7: a login is deleted by its member, a tenant admin, or an Admin of the database's
+// project; anyone else gets 404. The deleted rows are cleared from the proxy cache.
+#[tokio::test]
+async fn personal_login_delete_by_self_tenant_admin_or_project_admin() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    p.seed(&p.bob, "bob_login");
+    assert_eq!(p.send(&p.alice.1, Method::DELETE, &p.delete_path(p.alice.0), None).await.status(), 204, "own");
+    assert!(p.t.w.metadata.personal_login(p.alice.0, p.db()).is_none());
+    assert!(
+        p.cache().wait_for(&p.rows("alice_login")).await,
+        "the deleted rows are cleared from the proxy cache: {:?}",
+        p.cache().sent()
+    );
+
+    for (who, sub) in [("a Developer", &p.alice.1), ("a Viewer", &p.vera.1), ("another project's Admin", &p.oscar.1)] {
+        let err = error_of(p.send(sub, Method::DELETE, &p.delete_path(p.bob.0), None).await, 404).await;
+        assert_eq!(code_of(&err), "not_found", "{who}");
+    }
+    assert!(p.t.w.metadata.personal_login(p.bob.0, p.db()).is_some(), "the refusals deleted nothing");
+    assert_eq!(p.send(&p.pam.1, Method::DELETE, &p.delete_path(p.bob.0), None).await.status(), 204, "the project's Admin");
+    assert!(p.t.w.metadata.personal_login(p.bob.0, p.db()).is_none());
+    p.seed(&p.bob, "bob_again");
+    assert_eq!(p.send(DEFAULT_SUB, Method::DELETE, &p.delete_path(p.bob.0), None).await.status(), 204, "a tenant admin");
+    let err = error_of(p.send(DEFAULT_SUB, Method::DELETE, &p.delete_path(p.bob.0), None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found", "nothing left to delete");
+}
+
+// MH-22: self sees all of their own, a tenant admin all, a project Admin those on their
+// projects, everyone else an empty list (200, never 403). No verifier or password is listed.
+#[tokio::test]
+async fn personal_login_list_is_filtered_by_caller() {
+    let p = pl_world().await;
+    let web9 = add_database(&p.t.w, p.elsewhere, "web9", "ep-0000000000e9");
+    p.t.w.metadata.grant(p.alice.0, p.elsewhere, PlatformRole::Developer, &[]);
+    p.seed(&p.alice, "alice_login");
+    p.t.w.metadata.seed_personal_login(p.alice.0, web9, "alice_e9");
+    let path = p.member_logins_path(p.alice.0);
+    let names = |body: &Value| -> Vec<String> {
+        let mut out: Vec<String> = body["logins"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no logins: {body}"))
+            .iter()
+            .map(|l| l["role_name"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    let cases: [(&str, &str, &[&str]); 6] = [
+        ("self", p.alice.1.as_str(), &["alice_e9", "alice_login"]),
+        ("a tenant admin", DEFAULT_SUB, &["alice_e9", "alice_login"]),
+        ("Billing's Admin", p.pam.1.as_str(), &["alice_login"]),
+        ("Elsewhere's Admin", p.oscar.1.as_str(), &["alice_e9"]),
+        ("a Viewer", p.vera.1.as_str(), &[]),
+        ("another Developer", p.bob.1.as_str(), &[]),
+    ];
+    for (who, sub, want) in cases {
+        let resp = p.send(sub, Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 200, "{who}");
+        let text = resp.text().await.unwrap();
+        assert!(!text.contains("SCRAM"), "{who}: {text}");
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(names(&body), want.to_vec(), "{who}: {body}");
+    }
+    let own = body_of(p.send(&p.alice.1, Method::GET, &path, None).await).await;
+    let fields: std::collections::BTreeSet<&str> =
+        own["logins"][0].as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(
+        fields,
+        std::collections::BTreeSet::from([
+            "created_at", "database_id", "database_name", "member_id", "project_id", "revoked_at",
+            "revoked_reason", "role_name", "status", "valid_until",
+        ]),
+        "{own}"
+    );
+    p.t.w.metadata.edit_personal_login(p.alice.0, p.db(), revoked(RevokeReason::AccessLost));
+    let own = body_of(p.send(&p.alice.1, Method::GET, &path, None).await).await;
+    let revoked = own["logins"].as_array().unwrap().iter().find(|l| l["role_name"] == "alice_login").unwrap().clone();
+    assert_eq!((revoked["status"].clone(), revoked["revoked_reason"].clone()), (json!("revoked"), json!("access_lost")));
+    assert!(revoked["revoked_at"].is_string(), "{revoked}");
+}
+
+// P24, S8: the database's list is for its project's Admins and tenant admins, with every
+// record whatever its status.
+#[tokio::test]
+async fn database_personal_logins_are_project_admin_only() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    p.seed(&p.bob, "bob_login");
+    p.t.w.metadata.edit_personal_login(p.bob.0, p.db(), revoked(RevokeReason::AccessLost));
+    let path = p.database_logins_path();
+    for sub in [p.pam.1.as_str(), DEFAULT_SUB] {
+        let resp = p.send(sub, Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 200, "{sub}");
+        let body = body_of(resp).await;
+        let mut got: Vec<(String, String, Value)> = body["logins"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no logins: {body}"))
+            .iter()
+            .map(|l| (l["role_name"].as_str().unwrap().to_string(), l["status"].as_str().unwrap().to_string(), l["member_id"].clone()))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("alice_login".to_string(), "active".to_string(), json!(p.alice.0)),
+                ("bob_login".to_string(), "revoked".to_string(), json!(p.bob.0)),
+            ],
+            "{sub}"
+        );
+    }
+    for sub in [&p.alice.1, &p.vera.1] {
+        let err = error_of(p.send(sub, Method::GET, &path, None).await, 403).await;
+        assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("admin")), "{sub}");
+    }
+    let err = error_of(p.send(&p.oscar.1, Method::GET, &path, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+// Part 7: suspend, reinstate and revoke-now are tenant admins' only, even on oneself.
+#[tokio::test]
+async fn suspend_reinstate_and_revoke_are_tenant_admin_only() {
+    let p = pl_world().await;
+    for (who, sub) in [("a Developer", &p.alice.1), ("a project Admin", &p.pam.1), ("a Viewer", &p.vera.1)] {
+        for action in ["suspend", "reinstate", "revoke-postgres-access"] {
+            let err = error_of(p.member_action(sub, p.bob.0, action).await, 403).await;
+            assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("tenant admin")), "{action} by {who}");
+        }
+    }
+    let err = error_of(p.member_action(&p.alice.1, p.alice.0, "suspend").await, 403).await;
+    assert_eq!(code_of(&err), "forbidden", "not even oneself");
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Active);
+
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert_eq!((body["id"].clone(), body["status"].clone()), (json!(p.bob.0), json!("suspended")), "{body}");
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["status"], "active");
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "revoke-postgres-access").await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert!(body["revoked"].is_u64() && body["rotated_branches"].is_u64(), "{body}");
+}
+
+// P4, MH-9: every write that changes a member's access tells the proxy cache about every row
+// of the member's logins (grant put and delete, override put and delete, tenant admin cleared,
+// remove, suspend, reinstate, revoke-now). Valkey being down doesn't fail the write.
+#[tokio::test]
+async fn every_access_write_clears_the_proxy_cache_for_the_members_logins() {
+    let p = pl_world().await;
+    let project = p.t.w.project;
+    let grant = |m: uuid::Uuid| format!("/v1/projects/{project}/grants/{m}");
+    let told = |name: String, what: &'static str| {
+        let p = &p;
+        async move {
+            assert!(
+                p.cache().wait_for(&p.rows(&name)).await,
+                "{what}: the proxy cache is told about every row of the member's login: {:?}",
+                p.cache().sent()
+            );
+            p.cache().clear();
+        }
+    };
+
+    let m = p.add_person("m_put", project, PlatformRole::Developer);
+    p.seed(&m, "m_put");
+    let resp = p.send(DEFAULT_SUB, Method::PUT, &grant(m.0), Some(json!({ "platform_role": "viewer", "pg_roles": [] }))).await;
+    assert_eq!(resp.status(), 200);
+    told("m_put".into(), "grant put").await;
+
+    let m = p.add_person("m_del", project, PlatformRole::Developer);
+    p.seed(&m, "m_del");
+    assert!(p.send(DEFAULT_SUB, Method::DELETE, &grant(m.0), None).await.status().is_success());
+    told("m_del".into(), "grant delete").await;
+
+    let m = p.add_person("m_oput", project, PlatformRole::Developer);
+    p.seed(&m, "m_oput");
+    let body = json!({ "database_id": p.db(), "platform_role": "viewer" });
+    assert_eq!(p.send(DEFAULT_SUB, Method::PUT, &format!("{}/overrides", grant(m.0)), Some(body)).await.status(), 200);
+    told("m_oput".into(), "override put").await;
+
+    let m = p.add_person("m_odel", project, PlatformRole::Developer);
+    p.t.w.metadata.narrow(m.0, p.db(), OverrideRow { platform_role: Some(PlatformRole::Developer), pg_roles: None });
+    p.seed(&m, "m_odel");
+    let path = format!("{}/overrides?database_id={}", grant(m.0), p.db());
+    assert!(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status().is_success());
+    told("m_odel".into(), "override delete").await;
+
+    let sub = p.t.mock.add_user_in("org-1", "m_admin@x.com", "Secret-pass1", true);
+    let m = (p.t.w.metadata.add_member(p.t.w.tenant, &sub, MemberStatus::Active, true), sub);
+    p.seed(&m, "m_admin");
+    let resp = p.send(DEFAULT_SUB, Method::PATCH, &format!("/v1/members/{}", m.0), Some(json!({ "tenant_admin": false }))).await;
+    assert_eq!(resp.status(), 200);
+    told("m_admin".into(), "tenant admin cleared").await;
+
+    let m = p.add_person("m_rm", project, PlatformRole::Developer);
+    p.seed(&m, "m_rm");
+    assert_eq!(p.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{}", m.0), None).await.status(), 204);
+    told("m_rm".into(), "remove").await;
+
+    let m = p.add_person("m_susp", project, PlatformRole::Developer);
+    p.seed(&m, "m_susp");
+    assert_eq!(p.member_action(DEFAULT_SUB, m.0, "suspend").await.status(), 200);
+    told("m_susp".into(), "suspend").await;
+    assert_eq!(p.member_action(DEFAULT_SUB, m.0, "reinstate").await.status(), 200);
+    told("m_susp".into(), "reinstate").await;
+
+    let m = p.add_person("m_now", project, PlatformRole::Developer);
+    p.seed(&m, "m_now");
+    assert_eq!(p.member_action(DEFAULT_SUB, m.0, "revoke-postgres-access").await.status(), 200);
+    told("m_now".into(), "revoke-now").await;
+
+    *p.cache().down.lock().unwrap() = true;
+    let m = p.add_person("m_down", project, PlatformRole::Developer);
+    p.seed(&m, "m_down");
+    assert_eq!(
+        p.member_action(DEFAULT_SUB, m.0, "revoke-postgres-access").await.status(),
+        200,
+        "Valkey down doesn't fail the write (the verifier is already gone)"
+    );
+}
+
+// P15: a tenant admin can't suspend themself (409 `conflict`; the last-active-admin check
+// that follows in the metadata is reachable through the API only by a self-suspension, which
+// this refuses first); an invited or pending member can't be suspended (409 `conflict`);
+// another tenant's member, or none, is 404.
+#[tokio::test]
+async fn suspending_yourself_or_the_last_tenant_admin_is_refused() {
+    let p = pl_world().await;
+    let me = p.me();
+    let err = error_of(p.member_action(DEFAULT_SUB, me, "suspend").await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(p.status_of(me), MemberStatus::Active);
+    let invited = p.t.w.metadata.add_member(p.t.w.tenant, "inv", MemberStatus::Invited, false);
+    let pending = p.t.w.metadata.add_member(p.t.w.tenant, "pend", MemberStatus::Pending, false);
+    for (what, m) in [("invited", invited), ("pending", pending)] {
+        let err = error_of(p.member_action(DEFAULT_SUB, m, "suspend").await, 409).await;
+        assert_eq!(code_of(&err), "conflict", "{what}");
+        let err = error_of(p.member_action(DEFAULT_SUB, m, "reinstate").await, 409).await;
+        assert_eq!(code_of(&err), "conflict", "{what} can't be reinstated");
+    }
+    let stranger = p.t.w.metadata.add_member(TenantId::new(), "s", MemberStatus::Active, false);
+    for m in [stranger, uuid::Uuid::new_v4()] {
+        for action in ["suspend", "reinstate", "revoke-postgres-access"] {
+            let err = error_of(p.member_action(DEFAULT_SUB, m, action).await, 404).await;
+            assert_eq!(code_of(&err), "not_found", "{action}");
+        }
+    }
+}
+
+// D5, P14, S7: suspend ends the member's Zitadel sessions and locks the user; the suspended
+// member is refused everywhere but `/v1/me` (which says so); suspending again redoes the lock.
+// Reinstate unlocks; reinstating an active member redoes only the unlock.
+#[tokio::test]
+async fn suspend_locks_the_zitadel_user_and_reinstate_unlocks_it() {
+    let p = pl_world().await;
+    let z = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
+    z.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
+    z.create_session(&p.alice.1, "Secret-pass1").await.unwrap();
+    assert_eq!(p.t.mock.session_count(), 2);
+
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["status"], "suspended");
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the Zitadel user is locked");
+    assert_eq!(p.t.mock.session_count(), 1, "only bob's sessions ended");
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
+
+    let project = format!("/v1/projects/{}", p.t.w.project);
+    let logins = p.member_logins_path(p.bob.0);
+    for path in ["/v1/projects", project.as_str(), "/v1/members", logins.as_str()] {
+        let err = error_of(p.send(&p.bob.1, Method::GET, path, None).await, 403).await;
+        assert_eq!(code_of(&err), "member_suspended", "{path}");
+    }
+    let err = error_of(p.put_login(&p.bob.1, "bob_login").await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+    let me = body_of(p.send(&p.bob.1, Method::GET, "/v1/me", None).await).await;
+    assert_eq!(me["member"]["status"], "suspended", "{me}");
+
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200, "S7: a retry");
+    assert_eq!(p.zitadel_calls(&p.bob.1, "lock"), 2, "the retry locks again");
+
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(body_of(resp).await["status"], "active");
+    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the Zitadel user is unlocked");
+    assert_eq!(p.send(&p.bob.1, Method::GET, "/v1/projects", None).await.status(), 200);
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await.status(), 200, "S7: a retry");
+    assert_eq!(p.zitadel_calls(&p.bob.1, "unlock"), 2, "the retry unlocks again");
+}
+
+// S7: a lock Zitadel refuses is 503 with the Chelabase side done; the retry completes it. The
+// same for reinstate's unlock.
+#[tokio::test]
+async fn a_failed_lock_is_completed_by_the_retry() {
+    let p = pl_world().await;
+    p.t.mock.fail("/lock", 500, "Errors.Internal", 1);
+    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended, "the Chelabase side is done");
+    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200);
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the retry locked the user");
+
+    p.t.mock.fail("/unlock", 500, "Errors.Internal", 1);
+    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Active, "the Chelabase side is done");
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await.status(), 200);
+    assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "the retry unlocked the user");
+}
+
+// MH-11: every generic role route treats a personal login as absent: not listed; reset,
+// delete, update, sessions and the connection reveal are 404, and the worker is never asked.
+#[tokio::test]
+async fn generic_role_routes_hide_personal_logins() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    p.t.w.metadata.add_role(&p.dev_ep(), "app", RoleOrigin::Api, false, false);
+    let dev = p.t.w.dev;
+    let roles = format!("/v1/databases/{}/branches/{dev}/roles", p.db());
+    let listed = body_of(p.send(DEFAULT_SUB, Method::GET, &roles, None).await).await;
+    let names: Vec<&str> = listed.as_array().unwrap().iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"app") && !names.contains(&"alice_login"), "{listed}");
+    let calls = [
+        (Method::POST, format!("{roles}/alice_login/reset-password"), None),
+        (Method::DELETE, format!("{roles}/alice_login"), None),
+        (Method::PATCH, format!("{roles}/alice_login"), Some(json!({ "inherit": false }))),
+        (Method::GET, format!("{roles}/alice_login/sessions"), None),
+        (Method::GET, format!("/v1/databases/{}/branches/{dev}/connection?role=alice_login", p.db()), None),
+    ];
+    for (method, path, body) in calls {
+        let what = format!("{method} {path}");
+        let err = error_of(p.send(DEFAULT_SUB, method, &path, body).await, 404).await;
+        assert_eq!(code_of(&err), "not_found", "{what}");
+    }
+    assert!(p.t.w.jobs.role_calls.lock().unwrap().is_empty(), "the worker was never asked");
+    assert!(p.t.w.jobs.session_reads.lock().unwrap().is_empty());
+}
+
+// MH-21: act-as of a personal login is refused for everyone, tenant admins and the login's own
+// member included, with `forbidden` `role:<name>`.
+#[tokio::test]
+async fn act_as_a_personal_login_is_forbidden_even_for_a_tenant_admin() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    p.t.w.metadata.add_branch_db(p.main(), "web1", "postgres", DatabaseOrigin::Main);
+    let base = format!("/v1/databases/{}/branches/{}", p.db(), p.main());
+    let calls = vec![
+        (Method::GET, format!("{base}/console/schema?role=alice_login"), None),
+        (
+            Method::POST,
+            format!("{base}/console/query"),
+            Some(json!({ "role": "alice_login", "tree": { "v": 1, "op": "select", "from": "notes" } })),
+        ),
+        (
+            Method::POST,
+            format!("{base}/sql"),
+            Some(json!({ "run_id": uuid::Uuid::new_v4(), "role": "alice_login", "sql": "select 1" })),
+        ),
+        (
+            Method::POST,
+            format!("{base}/schema-changes"),
+            Some(json!({ "role": "alice_login", "dry_run": true, "operations": [{ "set_table_comment": { "table": { "schema": "public", "name": "notes" }, "comment": null } }] })),
+        ),
+    ];
+    for (who, sub) in [("a tenant admin", DEFAULT_SUB), ("a project Admin", p.pam.1.as_str()), ("the login's member", p.alice.1.as_str())] {
+        for (method, path, body) in calls.clone() {
+            let what = format!("{method} {path} as {who}");
+            let resp = p.send(sub, method, &path, body).await;
+            let status = resp.status().as_u16();
+            let err = body_of(resp).await;
+            assert_eq!(
+                (status, &err["error"]["code"], &err["error"]["required"]),
+                (403, &json!("forbidden"), &json!("role:alice_login")),
+                "{what}: {err}"
+            );
+        }
+    }
+}
+
+// MH-21, S12: no grant or override may name a personal login: a project grant is refused for a
+// login of any database of the project (Admin grants included, whose roles aren't otherwise
+// checked), an override for a login of its database, also one whose rows aren't on any branch
+// yet (S11).
+#[tokio::test]
+async fn grants_and_overrides_refuse_a_personal_login_name() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    let web2 = add_database(&p.t.w, p.t.w.project, "web2", "ep-0000000000b2");
+    p.t.w.metadata.seed_personal_login(p.bob.0, web2, "bob_web2");
+    // A login whose rows the worker hasn't made yet: a record only.
+    p.seed(&p.pam, "fresh_login");
+    p.t.w.metadata.edit_personal_login(p.pam.0, p.db(), |l| l.endpoints.clear());
+    for rows in p.t.w.metadata.roles.lock().unwrap().values_mut() {
+        rows.retain(|r| r.name != "fresh_login");
+    }
+    let project = p.t.w.project;
+    let grant = format!("/v1/projects/{project}/grants/{}", p.vera.0);
+    for (role, name) in [("admin", "alice_login"), ("admin", "bob_web2"), ("developer", "fresh_login")] {
+        let body = json!({ "platform_role": role, "pg_roles": [name] });
+        let err = error_of(p.send(DEFAULT_SUB, Method::PUT, &grant, Some(body)).await, 422).await;
+        assert_eq!((code_of(&err), &err["error"]["role"]), ("invalid_request", &json!(name)), "a {role} grant naming {name}");
+    }
+    assert_eq!(
+        p.t.w.metadata.grants.lock().unwrap().get(&(p.vera.0, project.as_uuid())).map(|g| g.platform_role),
+        Some(PlatformRole::Viewer),
+        "the grant is unchanged"
+    );
+    let overrides = format!("/v1/projects/{project}/grants/{}/overrides", p.pam.0);
+    for (db, name) in [(p.db(), "alice_login"), (web2, "bob_web2"), (p.db(), "fresh_login")] {
+        let body = json!({ "database_id": db, "platform_role": "admin", "pg_roles": [name] });
+        let err = error_of(p.send(DEFAULT_SUB, Method::PUT, &overrides, Some(body)).await, 422).await;
+        assert_eq!((code_of(&err), &err["error"]["role"]), ("invalid_request", &json!(name)), "an override naming {name}");
+    }
+    assert!(p.t.w.metadata.overrides.lock().unwrap().is_empty(), "no override written");
+}
+
+// MH-12: a key can't be bound to a personal login, even by a tenant admin; the worker isn't
+// asked and nothing is stored.
+#[tokio::test]
+async fn a_key_cannot_be_bound_to_a_personal_login() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    let keys = format!("/v1/databases/{}/branches/{}/keys", p.db(), p.main());
+    let err = error_of(p.send(DEFAULT_SUB, Method::POST, &keys, Some(json!({ "name": "k", "role": "alice_login" }))).await, 403).await;
+    assert_eq!((code_of(&err), &err["error"]["required"]), ("forbidden", &json!("role:alice_login")));
+    assert!(p.t.w.metadata.keys.lock().unwrap().is_empty(), "no key stored");
+    assert!(p.t.w.jobs.role_checks.lock().unwrap().is_empty(), "the worker isn't asked about it");
+}
+
+// P16 (b), S2: revoke-now revokes every live login (`revoked_now`), marks the member's
+// `cb_m_*` roles for rotation, reconciles every branch of every project the member reaches
+// (which rotates them and ends their sessions) and tells the proxy cache about every row.
+// Studio access is untouched.
+#[tokio::test]
+async fn revoke_now_revokes_logins_and_reconciles_every_reached_project() {
+    let p = pl_world().await;
+    let web9 = add_database(&p.t.w, p.elsewhere, "web9", "ep-0000000000e9");
+    p.t.w.metadata.grant(p.alice.0, p.elsewhere, PlatformRole::Developer, &[]);
+    p.seed(&p.alice, "alice_login");
+    p.t.w.metadata.seed_personal_login(p.alice.0, web9, "alice_e9");
+    p.t.w.metadata.member_roles.lock().unwrap().push(MemberBranchRole {
+        member_id: p.alice.0,
+        branch_id: p.t.w.dev.as_uuid(),
+        role_name: chelabase_types::role_name::member_role_name(p.alice.0),
+        password_enc: "v1:sealed".into(),
+        applied_roles: vec!["app".into()],
+    });
+    p.t.clear_enqueued();
+
+    let resp = p.member_action(DEFAULT_SUB, p.alice.0, "revoke-postgres-access").await;
+    assert_eq!(resp.status(), 200);
+    let body = body_of(resp).await;
+    assert_eq!(body["revoked"], 2, "{body}");
+    assert!(body["rotated_branches"].is_u64(), "{body}");
+    for db in [p.db(), web9] {
+        let l = p.t.w.metadata.personal_login(p.alice.0, db).unwrap();
+        assert_eq!((l.login.status, l.login.revoked_reason), (LoginStatus::Revoked, Some(RevokeReason::RevokedNow)));
+        assert!(l.verifier.is_none(), "no verifier is left");
+    }
+    let rows = p.t.w.metadata.member_roles.lock().unwrap().clone();
+    assert!(
+        rows.iter().filter(|r| r.member_id == p.alice.0).all(|r| r.password_enc.is_empty()),
+        "the member's roles are marked for rotation: {rows:?}"
+    );
+    let enqueued = p.t.enqueued();
+    for b in [p.main(), p.t.w.dev, BranchId::from(web9)] {
+        assert!(enqueued.contains(&b), "{b} reconciles: {enqueued:?}");
+    }
+    let mut want = p.rows("alice_login");
+    want.push(("ep-0000000000e9".into(), "alice_e9".into()));
+    assert!(p.cache().wait_for(&want).await, "every row is cleared from the proxy cache: {:?}", p.cache().sent());
+    assert_eq!(p.send(&p.alice.1, Method::GET, "/v1/projects", None).await.status(), 200, "Studio access is untouched");
+}
+
+// S11, D3: the role routes can't make a role under a personal login's name, on a branch where
+// the login is (main) or isn't yet (a new branch).
+#[tokio::test]
+async fn create_role_refuses_a_personal_login_name() {
+    let p = pl_world().await;
+    p.seed(&p.alice, "alice_login");
+    let feature = p.t.w.metadata.add_branch(p.db(), "feature", p.main(), BranchKind::Normal, BranchStatus::Ready);
+    for branch in [p.main(), feature] {
+        let path = format!("/v1/databases/{}/branches/{branch}/roles", p.db());
+        let err = error_of(p.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "name": "alice_login" }))).await, 409).await;
+        assert_eq!(code_of(&err), "role_exists", "{branch}");
+    }
+    assert!(p.t.w.jobs.role_creates.lock().unwrap().is_empty(), "the worker is never asked");
+}
+
+// --- Members hub final round, area B: privilege ops and keys ------------------------------
+
+/// Every privilege op that names a schema, on `schema`, granting to (or revoking from) `role`.
+fn schema_named_ops(schema: &str, role: &str) -> Vec<Value> {
+    let t = json!({ "schema": schema, "name": "t" });
+    vec![
+        json!({ "grant": { "table": t, "grant": { "privileges": ["select"], "grantee": { "role": role } } } }),
+        json!({ "revoke": { "table": t, "grant": { "privileges": ["select"], "grantee": "public" } } }),
+        json!({ "grant_schema": { "schema": schema, "grantee": { "role": role }, "privileges": ["usage"] } }),
+        json!({ "revoke_schema": { "schema": schema, "grantee": { "role": role }, "privileges": ["create"] } }),
+        json!({ "grant_sequence": { "sequence": t, "grantee": { "role": role }, "privileges": ["usage"] } }),
+        json!({ "revoke_sequence": { "sequence": t, "grantee": { "role": role }, "privileges": ["usage"], "grant_option_only": true } }),
+        json!({ "alter_default_privileges": { "for_role": "postgres", "schema": schema, "object": "tables",
+            "grant": true, "grantee": { "role": role }, "privileges": ["select"] } }),
+        json!({ "set_all_rows": { "table": t, "role": role, "enabled": true } }),
+    ]
+}
+
+// T4-5: privilege ops on the schemas the hub never shows (Postgres's own, `information_schema`,
+// Chelabase's) are refused explicitly, 400 `invalid_request` with the op's `op_index`, before
+// any compute; an ordinary schema gets as far as the compute (none in the fake).
+#[tokio::test]
+async fn privilege_ops_on_hidden_schemas_are_refused_before_any_compute() {
+    let t = sql_app().await;
+    let main = t.main();
+    for schema in ["pg_catalog", "pg_toast", "pg_temp_3", "information_schema", "chelabase", "chelabase_merge", "chelabase_guard"] {
+        for op in schema_named_ops(schema, "readers") {
+            let body = json!({ "operations": [schema_usage_op("readers"), op.clone()] });
+            let err = answer(t.changes(main, body).await, 400).await;
+            assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("invalid_request", Some(1)), "{schema}: {op}: {err}");
+        }
+    }
+    assert_eq!(t.compute_lookups(), 0, "refused before any compute");
+    for op in schema_named_ops("app", "readers") {
+        let resp = t.changes(main, json!({ "operations": [op.clone()] })).await;
+        assert_eq!(code_of(&answer(resp, 503).await), "unavailable", "{op}");
+    }
+}
+
+// T5-M4: an owner run is recognised by the owner's real name too (`Requested::from_name`), so a
+// caller below Admin naming it is told `required: "admin"`, as for `owner` in any case.
+#[tokio::test]
+async fn an_owner_run_named_by_the_owners_real_name_needs_admin() {
+    let (t, _dev) = act_as_app().await;
+    let main = t.main();
+    let path = format!("{}/schema-changes", t.branch(main));
+    for role in ["postgres", "owner", "OWNER"] {
+        let body = json!({ "role": role, "operations": [schema_usage_op("billing")] });
+        let err = answer(t.send_as("dev", Method::POST, &path, Some(body)).await, 403).await;
+        assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("admin")), "{role}: {err}");
+    }
+}
+
+/// Waits (bounded) until a backend of `user` in the scratch database waits on a lock.
+async fn wait_for_lock_wait(scratch: &ScratchCompute, user: &str) {
+    let sql = format!(
+        "SELECT EXISTS (SELECT FROM pg_stat_activity WHERE datname = '{}' AND usename = '{user}' AND wait_event_type = 'Lock')",
+        scratch.database
+    );
+    for _ in 0..300 {
+        if scratch.yes(&sql).await {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("no backend of {user} ever waited on a lock");
+}
+
+/// A pool on the scratch database as the cluster's admin (an open transaction's session).
+async fn scratch_pool(scratch: &ScratchCompute) -> sqlx::PgPool {
+    let opts: sqlx::postgres::PgConnectOptions = (*scratch.admin.connect_options()).clone();
+    sqlx::PgPool::connect_with(opts.database(&scratch.database)).await.unwrap()
+}
+
+// T4-5: an extension's schema (a schema that is a member of an extension), the objects in it,
+// and functions in a hidden schema (named by OID: `pg_catalog.now()`) are refused the same way,
+// 400 `invalid_request` with `op_index`, in a dry run too; nothing runs.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn privilege_ops_on_extension_schemas_and_catalog_functions_are_refused() {
+    let (scratch, t) = changes_app("hid-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    t.known_roles(&[&reader]);
+    scratch
+        .exec_in(&format!(
+            "CREATE SCHEMA ext_s AUTHORIZATION {o};
+             CREATE TABLE ext_s.t (id int); ALTER TABLE ext_s.t OWNER TO {o};
+             CREATE FUNCTION ext_s.g() RETURNS int LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION ext_s.g() OWNER TO {o};
+             ALTER EXTENSION plpgsql ADD SCHEMA ext_s;"
+        ))
+        .await;
+    let now_oid: u64 = scratch.text("SELECT 'pg_catalog.now()'::regprocedure::oid::text").await.parse().unwrap();
+    let g_oid: u64 = scratch.text("SELECT 'ext_s.g()'::regprocedure::oid::text").await.parse().unwrap();
+    let mut ops = schema_named_ops("ext_s", &reader);
+    for (oid, identity) in [(now_oid, "pg_catalog.now()"), (g_oid, "ext_s.g()")] {
+        let function = json!({ "oid": oid, "identity": identity });
+        ops.push(json!({ "grant_function": { "function": function, "grantee": { "role": reader } } }));
+        ops.push(json!({ "revoke_function": { "function": function, "grantee": "public" } }));
+    }
+    for op in ops {
+        for dry_run in [true, false] {
+            let body = json!({ "dry_run": dry_run, "operations": [schema_usage_op(&reader), op.clone()] });
+            let err = answer(t.changes(main, body).await, 400).await;
+            assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("invalid_request", Some(1)), "{op} dry_run={dry_run}: {err}");
+        }
+    }
+    for schema in ["public", "ext_s"] {
+        assert_eq!(scratch.schema_acl(schema, &reader).await, "", "nothing ran: no ACL entry of the reader on {schema}");
+    }
+    assert!(scratch.yes("SELECT has_function_privilege('public', 'pg_catalog.now()', 'EXECUTE')").await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// T5-I1: a function's `regprocedure` text is produced under `search_path = ''`, so it names
+// the function the read named whatever the role it then runs as resolves. Here the owner's
+// `$user` schema holds `f()`, and the function's owner `x1` (whom the grant runs as) has an
+// `f()` of its own in its `$user` schema: the grant lands on the read's function only.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_function_grant_run_as_its_owner_names_the_functions_schema() {
+    let (scratch, t) = changes_app("fsp-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x1] = scratch.make_roles(["reader", "x1"]).await;
+    t.known_roles(&[&reader]);
+    scratch.exec_cluster(&format!("GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE")).await;
+    scratch
+        .exec_in(&format!(
+            "CREATE SCHEMA {o} AUTHORIZATION {o}; GRANT USAGE ON SCHEMA {o} TO {x1};
+             CREATE SCHEMA {x1} AUTHORIZATION {x1};
+             CREATE FUNCTION {o}.f() RETURNS int LANGUAGE sql AS 'SELECT 1'; ALTER FUNCTION {o}.f() OWNER TO {x1};
+             CREATE FUNCTION {x1}.f() RETURNS int LANGUAGE sql AS 'SELECT 2'; ALTER FUNCTION {x1}.f() OWNER TO {x1};
+             REVOKE EXECUTE ON FUNCTION {o}.f() FROM PUBLIC; REVOKE EXECUTE ON FUNCTION {x1}.f() FROM PUBLIC;"
+        ))
+        .await;
+    let db = scratch.database.clone();
+    let page = answer(t.privileges(main, &db, &format!("?role={reader}&schema={o}")).await, 200).await;
+    let f = listed(&page, "f");
+    let (oid, identity) = (f["oid"].as_u64().unwrap(), f["identity"].as_str().unwrap().to_string());
+    let ops = json!([{ "grant_function": { "function": { "oid": oid, "identity": identity }, "grantee": { "role": reader } } }]);
+    let real = answer(t.changes(main, json!({ "operations": ops })).await, 200).await;
+    assert_eq!(real["committed"], true, "{real}");
+    assert!(scratch.yes(&format!("SELECT has_function_privilege('{reader}', '{o}.f()', 'EXECUTE')")).await, "the read's function");
+    assert!(!scratch.yes(&format!("SELECT has_function_privilege('{reader}', '{x1}.f()', 'EXECUTE')")).await, "not x1's own f()");
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[x1, reader]).await;
+}
+
+// T5-I2: verify runs whenever every statement ran or was skipped as already dropped: in a
+// request that drops an enum (cascading to a column) and the column (skipped), a revoke another
+// grantor's entry survives is still 409 `privileges_not_applied`, and the whole request rolls
+// back.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_mixed_request_with_a_skipped_drop_still_verifies() {
+    let (scratch, t) = changes_app("mixv-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, mid] = scratch.make_roles(["reader", "mid"]).await;
+    scratch
+        .exec_in(&format!(
+            "CREATE TYPE public.mood AS ENUM ('ok'); ALTER TYPE public.mood OWNER TO {o};
+             ALTER TABLE public.notes ADD COLUMN m public.mood;
+             GRANT SELECT ON public.notes TO {mid} WITH GRANT OPTION;
+             SET ROLE {mid}; GRANT SELECT ON public.notes TO {reader}; RESET ROLE;"
+        ))
+        .await;
+    let ops = json!([
+        { "drop_enum": { "schema": "public", "name": "mood" } },
+        { "drop_column": { "table": public_table("notes"), "column": "m" } },
+        revoke_op("notes", &["select"], &reader),
+    ]);
+    let none = no_dependents_hash();
+    let err = answer(t.changes(main, json!({ "operations": ops, "cascade": { "dependents_hash": none } })).await, 409).await;
+    assert_eq!(code_of(&err), "privileges_not_applied", "{err}");
+    let want = json!({ "object": relation_target("notes"), "privilege": "SELECT", "grantee": reader,
+        "still_granted_by": mid, "column": null, "wanted": false });
+    assert!(err["error"]["mismatches"].as_array().is_some_and(|m| m.contains(&want)), "{want} in {err}");
+    assert!(scratch.yes("SELECT to_regtype('public.mood') IS NOT NULL").await, "rolled back");
+    assert_eq!(scratch.acl("public.notes", &reader).await, format!("{mid}:SELECT"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, mid]).await;
+}
+
+// T5-M1: a statement's `not applied` warning (01006/01007) is still 409
+// `privileges_not_applied`, and the answer names what differs (the re-read runs before
+// failing): a grant that didn't land (`wanted: true`) and a revoke another grantor's entry
+// survives (`still_granted_by`).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_warned_statement_names_its_mismatches() {
+    let (scratch, t) = changes_app("warn2-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [grp, g, h] = scratch.make_roles(["grp", "g", "h"]).await;
+    let (_, member_role) = developer_acting_as(&t, &scratch, &grp).await;
+    scratch.exec_in(&format!("GRANT SELECT ON public.notes TO {grp}; GRANT SELECT ON public.notes TO {h}")).await;
+    let path = format!("{}/schema-changes", t.branch(main));
+    let cases = [
+        (grant_op("notes", &["select"], &g), json!({ "object": relation_target("notes"), "privilege": "SELECT", "grantee": g,
+            "still_granted_by": null, "column": null, "wanted": true })),
+        (revoke_op("notes", &["select"], &h), json!({ "object": relation_target("notes"), "privilege": "SELECT", "grantee": h,
+            "still_granted_by": o, "column": null, "wanted": false })),
+    ];
+    for (op, want) in cases {
+        let body = json!({ "role": grp, "operations": [op.clone()] });
+        let err = answer(t.send_as("dev-a", Method::POST, &path, Some(body)).await, 409).await;
+        assert_eq!(code_of(&err), "privileges_not_applied", "{op}: {err}");
+        assert_eq!(err["error"]["op_index"], 0, "{op}: {err}");
+        assert!(err["error"]["mismatches"].as_array().is_some_and(|m| m.contains(&want)), "{op}: {want} in {err}");
+    }
+    assert_eq!(scratch.acl("public.notes", &g).await, "");
+    assert_eq!(scratch.acl("public.notes", &h).await, format!("{o}:SELECT"));
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[member_role, grp, g, h]).await;
+}
+
+// T5-M2: the `expect_acl` check (and the owners' read) runs after the request's locks: here the
+// request waits for its drop's `LOCK TABLE` while another session changes the ACL it read and
+// commits; the request then answers 409 `privileges_changed_since_read` and changes nothing.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_acl_check_runs_after_the_requests_locks() {
+    let (scratch, t) = changes_app("lockh-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, other] = scratch.make_roles(["reader", "other"]).await;
+    t.known_roles(&[&reader]);
+    scratch.exec_in(&format!("CREATE TABLE public.t2 (id int, c int); ALTER TABLE public.t2 OWNER TO {o};")).await;
+    let db = scratch.database.clone();
+    let page = answer(t.privileges(main, &db, &format!("?role={reader}&schema=public")).await, 200).await;
+    let hash = listed(&page, "notes")["acl_hash"].as_str().unwrap().to_string();
+    let blocker = scratch_pool(&scratch).await;
+    let mut tx = blocker.begin().await.unwrap();
+    sqlx::query("SELECT count(*) FROM public.t2").execute(&mut *tx).await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!("GRANT INSERT ON public.notes TO {other}"))).execute(&mut *tx).await.unwrap();
+    let body = json!({
+        "lock_timeout_ms": 30000,
+        "operations": [{ "drop_column": { "table": public_table("t2"), "column": "c" } }, grant_op("notes", &["select"], &reader)],
+        "expect_acl": [{ "object": relation_target("notes"), "acl_hash": hash }],
+    });
+    let (resp, ()) = tokio::join!(t.changes(main, body), async {
+        wait_for_lock_wait(&scratch, &o).await;
+        tx.commit().await.unwrap();
+    });
+    let err = answer(resp, 409).await;
+    assert_eq!(code_of(&err), "privileges_changed_since_read", "{err}");
+    assert_eq!(err["error"]["objects"], json!([relation_target("notes")]), "{err}");
+    assert!(scratch.yes("SELECT EXISTS (SELECT FROM pg_attribute WHERE attrelid = 'public.t2'::regclass AND attname = 'c' AND NOT attisdropped)").await);
+    assert_eq!(scratch.acl("public.notes", &reader).await, "");
+    blocker.close().await;
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader, other]).await;
+}
+
+// T5-M3: after a statement run as an object's owner X, only the database owner's own
+// membership rows of X are compared: a membership of X granted to another role meanwhile (here
+// while the statement waits on another session's uncommitted default-privileges row) is no
+// spurious 500; the request commits.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_unrelated_membership_of_the_owner_role_is_no_failure() {
+    let (scratch, t) = changes_app("memb-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader, x1, other] = scratch.make_roles(["reader", "x1", "other"]).await;
+    scratch.exec_cluster(&format!("GRANT {x1} TO {o} WITH INHERIT FALSE, SET TRUE")).await;
+    let before = scratch.memberships(&o).await;
+    let blocker = scratch_pool(&scratch).await;
+    let mut tx = blocker.begin().await.unwrap();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "ALTER DEFAULT PRIVILEGES FOR ROLE {x1} IN SCHEMA public GRANT SELECT ON TABLES TO {other}"
+    )))
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    let body = json!({ "lock_timeout_ms": 30000, "operations": [default_select_op(&x1, true, &reader)] });
+    let (resp, ()) = tokio::join!(t.changes(main, body), async {
+        wait_for_lock_wait(&scratch, &o).await;
+        scratch.exec_cluster(&format!("GRANT {x1} TO {other}")).await;
+        tx.rollback().await.unwrap();
+    });
+    let real = answer(resp, 200).await;
+    assert_eq!(real["committed"], true, "{real}");
+    assert_eq!(scratch.default_acl(&x1, &reader).await, format!("{x1}:SELECT"));
+    assert_eq!(scratch.memberships(&o).await, before, "P26: the owner's own rows are unchanged");
+    blocker.close().await;
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[other, x1, reader]).await;
+}
+
+// T5-M5: an aggregate (or window function) named by OID is refused cleanly, 400
+// `invalid_request` with `op_index` (the editor offers functions and procedures only), never a
+// 404 that says it doesn't exist; a dry run's answer carries `dry_run: true`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_aggregate_is_refused_not_missing() {
+    let (scratch, t) = changes_app("agg-pass").await;
+    let main = t.main();
+    let o = scratch.owner.clone();
+    let [reader] = scratch.make_roles(["reader"]).await;
+    t.known_roles(&[&reader]);
+    scratch
+        .exec_in(&format!(
+            "CREATE AGGREGATE public.agg(integer) (SFUNC = int4pl, STYPE = integer); ALTER AGGREGATE public.agg(integer) OWNER TO {o};"
+        ))
+        .await;
+    let oid: u64 = scratch.text("SELECT 'public.agg(integer)'::regprocedure::oid::text").await.parse().unwrap();
+    let function = json!({ "oid": oid, "identity": "public.agg(integer)" });
+    for op in [
+        json!({ "grant_function": { "function": function, "grantee": { "role": reader } } }),
+        json!({ "revoke_function": { "function": function, "grantee": "public" } }),
+    ] {
+        for dry_run in [true, false] {
+            let err = answer(t.changes(main, json!({ "dry_run": dry_run, "operations": [op.clone()] })).await, 400).await;
+            assert_eq!((code_of(&err), err["error"]["op_index"].as_u64()), ("invalid_request", Some(0)), "{op}: {err}");
+            assert_eq!(err["error"]["dry_run"].as_bool(), dry_run.then_some(true), "{op}: {err}");
+        }
+    }
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[reader]).await;
+}
+
+// EOS-H1: a secret key's role may not be, or inherit, a role with the hub's "all rows" policy
+// on the branch (every row would reach the data API through the key): creating the key is 422
+// `exposes_data_api` with the chain from the key's role, and no key is stored. A role that
+// reaches no such role gets its key.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_key_for_a_role_reaching_an_all_rows_role_is_refused() {
+    let (scratch, t) = changes_app("keyx-pass").await;
+    let main = t.main();
+    let [r, k, s] = scratch.make_roles(["r", "k", "s"]).await;
+    t.known_roles(&[&r, &k, &s]);
+    scratch.exec_in("ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY").await;
+    let on = answer(t.changes(main, json!({ "operations": [all_rows_op("notes", &r, true)] })).await, 200).await;
+    assert_eq!(on["committed"], true, "{on}");
+    scratch.exec_cluster(&format!("GRANT {r} TO {k}")).await;
+    // final B2 (fail closed, via the worker): the check is the worker's now; the fake worker
+    // answers what the worker's own check reads on this compute (worker unit and live tests),
+    // and the request must name the key's role alone.
+    for (role, chain) in [(&k, json!([k, r])), (&r, json!([r]))] {
+        let reply = chelabase_nats::AllRowsCheckReply::Exposed { chain: serde_json::from_value(chain.clone()).unwrap() };
+        *t.jobs.all_rows_reply.lock().unwrap() = Some(Ok(reply));
+        let err = answer(t.send(Method::POST, &t.keys(main), Some(json!({ "name": "ci", "role": role }))).await, 422).await;
+        assert_eq!(code_of(&err), "exposes_data_api", "{role}: {err}");
+        assert_eq!(err["error"]["chain"], chain, "{role}: {err}");
+        let asked = t.jobs.all_rows_checks.lock().unwrap().last().cloned().expect("the worker is asked");
+        assert_eq!((asked.branch_id, asked.starting, asked.change), (main, vec![role.to_string()], None));
+    }
+    *t.jobs.all_rows_reply.lock().unwrap() = None;
+    assert!(t.list_keys(main).await.iter().all(|key| key["name"] != "ci"), "no key stored");
+    let resp = t.send(Method::POST, &t.keys(main), Some(json!({ "name": "safe", "role": s }))).await;
+    assert_eq!(resp.status(), 201, "{:?}", resp.text().await);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[k, s, r]).await;
+}
+
+// EOS-H1: a role change that would make a live secret key's role reach a role with the hub's
+// "all rows" policy (the key's role itself, or a role it inherits, joining it) is 422
+// `exposes_data_api` with the chain from the key's role, and the worker is never asked; a
+// change that exposes nothing goes through.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_role_change_exposing_a_keys_role_to_all_rows_is_refused() {
+    let (scratch, t) = changes_app("keyr-pass").await;
+    let main = t.main();
+    let [r, k, m] = scratch.make_roles(["r", "k", "m"]).await;
+    t.known_roles(&[&r, &k, &m]);
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    for role in [&k, &m] {
+        t.metadata.add_role(&ep, role, RoleOrigin::Sql, false, false);
+    }
+    scratch.exec_in("ALTER TABLE public.notes ENABLE ROW LEVEL SECURITY").await;
+    let on = answer(t.changes(main, json!({ "operations": [all_rows_op("notes", &r, true)] })).await, 200).await;
+    assert_eq!(on["committed"], true, "{on}");
+    scratch.exec_cluster(&format!("GRANT {m} TO {k}")).await;
+    t.seed_secret_key(main, "ci", &k);
+    // final B2 (fail closed, via the worker): the fake worker answers what the worker's own
+    // check reads; the request carries the data API roles (the key's role among them) and the
+    // change.
+    for (role, chain) in [(&m, json!([k, m, r])), (&k, json!([k, r]))] {
+        let reply = chelabase_nats::AllRowsCheckReply::Exposed { chain: serde_json::from_value(chain.clone()).unwrap() };
+        *t.jobs.all_rows_reply.lock().unwrap() = Some(Ok(reply));
+        let path = format!("{}/{role}", t.roles(main));
+        let err = answer(t.send(Method::PATCH, &path, Some(json!({ "member_of": [r] }))).await, 422).await;
+        assert_eq!(code_of(&err), "exposes_data_api", "{role}: {err}");
+        assert_eq!(err["error"]["chain"], chain, "{role}: {err}");
+        let asked = t.jobs.all_rows_checks.lock().unwrap().last().cloned().expect("the worker is asked");
+        assert!(asked.starting.contains(&k), "{asked:?}");
+        assert_eq!(
+            asked.change,
+            Some(chelabase_nats::MembershipChange { role: role.to_string(), member_of: vec![r.clone()] })
+        );
+    }
+    *t.jobs.all_rows_reply.lock().unwrap() = None;
+    assert!(t.jobs.role_calls.lock().unwrap().iter().all(|c| !c.starts_with("update:")), "the worker is never asked");
+    let path = format!("{}/{m}", t.roles(main));
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "member_of": [] }))).await.status(), 202);
+    wait_no_editor_sessions(&scratch).await;
+    scratch.drop_with(&[k, m, r]).await;
+}
+
+// ---- final B2: EOS-H1 fails closed, via the worker (user ruling 2026-10-23)
+//
+// Key creation and a role's `member_of` change ask the worker for the all-rows check
+// (`chelabase.rpc.roles.all_rows_check`, run as `cloud_admin`): an exposure is 422
+// `exposes_data_api` with the worker's chain; a check that can't complete (the worker's
+// `failed`, a timeout, no worker) is 503 and nothing is created or sent; never allowed.
+
+fn all_rows_exposed(chain: &[&str]) -> chelabase_nats::AllRowsCheckReply {
+    chelabase_nats::AllRowsCheckReply::Exposed { chain: chain.iter().map(|r| r.to_string()).collect() }
+}
+
+/// The ways an all-rows check can't complete, and the 503 code each answers.
+fn all_rows_failures() -> [(Result<chelabase_nats::AllRowsCheckReply, ResetError>, &'static str); 3] {
+    [
+        (Ok(chelabase_nats::AllRowsCheckReply::Failed { message: "compute unreachable: secret detail".into() }), "unavailable"),
+        (Err(ResetError::Timeout), "unavailable"),
+        (Err(ResetError::Transport("no worker listening".into())), "worker_unavailable"),
+    ]
+}
+
+#[tokio::test]
+async fn key_create_asks_the_worker_for_the_all_rows_check() {
+    let t = branching().await;
+    t.seed_public_key(t.main());
+    let resp = t.send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" }))).await;
+    assert_eq!(
+        *t.jobs.all_rows_checks.lock().unwrap(),
+        vec![chelabase_nats::AllRowsCheckRequest { branch_id: t.main(), starting: vec!["reporting".into()], change: None }],
+        "a key create asks for its role alone, with no change"
+    );
+    assert_eq!(resp.status(), 201, "a clear check creates the key");
+    assert!(t.metadata.keys.lock().unwrap().iter().any(|(k, _)| k.name == "ci"));
+}
+
+#[tokio::test]
+async fn key_create_the_worker_finds_exposing_is_422_with_its_chain() {
+    let t = branching().await;
+    *t.jobs.all_rows_reply.lock().unwrap() = Some(Ok(all_rows_exposed(&["reporting", "grp", "everything"])));
+    let err = error_of(
+        t.send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" }))).await,
+        422,
+    )
+    .await;
+    assert_eq!(code_of(&err), "exposes_data_api", "{err}");
+    assert_eq!(err["error"]["chain"], json!(["reporting", "grp", "everything"]), "{err}");
+    assert!(t.metadata.keys.lock().unwrap().is_empty(), "no key stored");
+}
+
+#[tokio::test]
+async fn key_create_fails_closed_when_the_all_rows_check_cannot_complete() {
+    let t = branching().await;
+    for (answer, code) in all_rows_failures() {
+        *t.jobs.all_rows_reply.lock().unwrap() = Some(answer.clone());
+        let resp = t.send(Method::POST, &t.keys(t.main()), Some(json!({ "name": "ci", "role": "reporting" }))).await;
+        assert_eq!(resp.status(), 503, "{answer:?}: never allowed on a failed check");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(code_of(&err), code, "{answer:?}: {err}");
+        assert!(!message_of(&err).contains("secret detail"), "{err}");
+        assert!(t.metadata.keys.lock().unwrap().is_empty(), "{answer:?}: no key stored");
+    }
+}
+
+/// `app` on a ready `dev` branch, with a secret key on role `k`, a revoked one on role
+/// `gone`, the public key (`anon`) and, on main, a key on role `elsewhere`.
+fn membership_change_setup(t: &Branching) -> BranchId {
+    let dev = t.ready("dev");
+    let ep = t.with_owner_row(dev);
+    t.metadata.add_role(&ep, "app", RoleOrigin::Api, false, false);
+    t.seed_public_key(dev);
+    t.seed_secret_key(dev, "ci", "k");
+    let (revoked, _) = t.seed_secret_key(dev, "old", "gone");
+    for (key, _) in t.metadata.keys.lock().unwrap().iter_mut() {
+        if key.id == revoked {
+            key.revoked_at = Some(chrono::Utc::now());
+        }
+    }
+    t.seed_secret_key(t.main(), "other", "elsewhere");
+    dev
+}
+
+#[tokio::test]
+async fn a_membership_change_asks_the_worker_with_the_data_api_roles() {
+    let t = branching().await;
+    let dev = membership_change_setup(&t);
+    let path = format!("{}/app", t.roles(dev));
+    let resp = t.send(Method::PATCH, &path, Some(json!({ "member_of": ["readers"] }))).await;
+    assert_eq!(
+        *t.jobs.all_rows_checks.lock().unwrap(),
+        vec![chelabase_nats::AllRowsCheckRequest {
+            branch_id: dev,
+            starting: ["anon", "authenticated", "authenticator", "k"].map(String::from).to_vec(),
+            change: Some(chelabase_nats::MembershipChange { role: "app".into(), member_of: vec!["readers".into()] }),
+        }],
+        "the data API roles and this branch's live keys' roles, sorted, deduplicated; the change as sent"
+    );
+    assert_eq!(resp.status(), 202, "a clear check goes on to the worker's update");
+    assert_eq!(*t.jobs.role_calls.lock().unwrap(), vec!["update:app".to_string()]);
+    // A change without `member_of` isn't checked; a membership refused here isn't either.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "inherit": false }))).await.status(), 202);
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "member_of": ["anon"] }))).await, 422).await;
+    assert_eq!(code_of(&err), "role_membership_not_allowed");
+    assert_eq!(t.jobs.all_rows_checks.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_membership_change_the_worker_finds_exposing_is_422_and_never_applied() {
+    let t = branching().await;
+    let dev = membership_change_setup(&t);
+    *t.jobs.all_rows_reply.lock().unwrap() = Some(Ok(all_rows_exposed(&["k", "app", "everything"])));
+    let path = format!("{}/app", t.roles(dev));
+    let err = error_of(t.send(Method::PATCH, &path, Some(json!({ "member_of": ["everything"] }))).await, 422).await;
+    assert_eq!(code_of(&err), "exposes_data_api", "{err}");
+    assert_eq!(err["error"]["chain"], json!(["k", "app", "everything"]), "{err}");
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty(), "the update is never sent");
+}
+
+#[tokio::test]
+async fn a_membership_change_fails_closed_when_the_all_rows_check_cannot_complete() {
+    let t = branching().await;
+    let dev = membership_change_setup(&t);
+    let path = format!("{}/app", t.roles(dev));
+    for (answer, code) in all_rows_failures() {
+        *t.jobs.all_rows_reply.lock().unwrap() = Some(answer.clone());
+        let resp = t.send(Method::PATCH, &path, Some(json!({ "member_of": ["everything"] }))).await;
+        assert_eq!(resp.status(), 503, "{answer:?}: never allowed on a failed check");
+        let err: Value = resp.json().await.unwrap();
+        assert_eq!(code_of(&err), code, "{answer:?}: {err}");
+        assert!(!message_of(&err).contains("secret detail"), "{err}");
+    }
+    assert!(t.jobs.role_calls.lock().unwrap().is_empty(), "the update is never sent");
 }

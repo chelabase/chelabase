@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Members hub comps</title>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+:root { --bg: #f4f1ec; --fg: #1d1a17; --dim: #5f574f; --line: rgb(29 26 23 / 0.15); --accent: #8a5a32; color-scheme: light; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #0c0b0a; --fg: #ebe6e0; --dim: #b0a89f; --line: rgb(235 230 224 / 0.15); --accent: #f2c7a3; color-scheme: dark; } }
+:root[data-theme="dark"] { --bg: #0c0b0a; --fg: #ebe6e0; --dim: #b0a89f; --line: rgb(235 230 224 / 0.15); --accent: #f2c7a3; color-scheme: dark; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 "Atkinson Hyperlegible Next", system-ui, sans-serif; }
+main { max-width: 72rem; margin: 0 auto; padding: 40px 16px 64px; }
+h1 { font-size: 28px; margin: 0 0 6px; }
+h2 { font-size: 18px; margin: 40px 0 12px; }
+p, li { max-width: 72ch; }
+.dim { color: var(--dim); }
+code { font: 13px "JetBrains Mono", ui-monospace, monospace; }
+a { color: inherit; text-underline-offset: 3px; }
+a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+ol.comps { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 20px; }
+ol.comps li { border: 1px solid var(--line); padding: 12px; display: grid; gap: 8px; align-content: start; max-width: none; }
+ol.comps img { width: 100%; height: 200px; object-fit: cover; object-position: top left; border: 1px solid var(--line); display: block; }
+ol.comps h3 { margin: 0; font-size: 15px; }
+ol.comps .links { font-size: 13px; display: flex; gap: 12px; flex-wrap: wrap; }
+ol.comps p { margin: 0; font-size: 14px; color: var(--dim); }
+</style>
+</head>
+<body><main>
+<h1>Members hub, step 1: comps</h1>
+<p class="dim">Static comps in Studio's Basalt system (dark, as Studio ships). Each opens as a page; PNGs are full-page captures at 1440 and 390 wide. Realistic data: Northwind Labs, 14 people across Billing app, Ops console and Data warehouse.</p>
+<h2>Look at these first</h2>
+<ul>
+<li><b>Roster cards</b> (01): square cards, initials in a hairline square, level as a tag; every group carries a one-line meaning. Cards and list share the groups.</li>
+<li><b>Grant card</b> (04): segmented platform role, the role checklist (checked first, "also gives", Admin-only with reasons, escaped names), one Save per card, unsaved state as a sand edge.</li>
+<li><b>Privilege editor</b> (08–10): one matrix per schema with a column drill-in, staged cells in sand, greyed "owned by X" rows, and the review / refusal / conflict states in the one right panel.</li>
+<li><b>Personal logins</b> (04, 05, 12): Admins see Delete only; Renew lives on the owner's own page; the reveal says where the login works (P23).</li>
+<li><b>Phone width</b>: the rail becomes a header menu trigger (DESIGN.md's open gap); matrices scroll inside their frame, the page never scrolls sideways.</li>
+</ul>
+<h2>Screens</h2>
+<ol class="comps">
+<li><a href="01-roster-cards.html"><img src="png/01-roster-cards-1440.png" alt="Members roster at 1440 wide" loading="lazy"></a>
+<h3><a href="01-roster-cards.html">01 · Members roster</a></h3>
+<div class="links"><a href="png/01-roster-cards-1440.png">PNG 1440</a><a href="png/01-roster-cards-390.png">PNG 390</a></div>
+<p>Tenant admin's People tab in cards: Requests above, then the MH-35 groups by highest level, each with a count and a one-line meaning. Status (Invited, Suspended) decides the group before level. Square cards, initials in a hairline square, level as a tag; the only sand fill is Invite people.</p></li>
+<li><a href="02-roster-list-developer.html"><img src="png/02-roster-list-developer-1440.png" alt="Members roster list at 1440 wide" loading="lazy"></a>
+<h3><a href="02-roster-list-developer.html">02 · Members roster list</a></h3>
+<div class="links"><a href="png/02-roster-list-developer-1440.png">PNG 1440</a><a href="png/02-roster-list-developer-390.png">PNG 390</a></div>
+<p>A Developer's view in list: read-only (no Invite, no row menus, no Requests, no Activity tab). Levels and project counts cover only projects Lena can see (R1), so Aiden, who works only on Ops console, sits under Other projects (MH-35). Below 40rem the rows stack.</p></li>
+<li><a href="03-roster-project-filter.html"><img src="png/03-roster-project-filter-1440.png" alt="Members by project at 1440 wide" loading="lazy"></a>
+<h3><a href="03-roster-project-filter.html">03 · Members by project</a></h3>
+<div class="links"><a href="png/03-roster-project-filter-1440.png">PNG 1440</a><a href="png/03-roster-project-filter-390.png">PNG 390</a></div>
+<p>The project filter regroups everyone by their role on Billing app: Admins (tenant admins marked, they're Admin everywhere), Developers, Viewers, then No access on Billing app. Invited and Suspended stay status groups. The Level column becomes the role on that project.</p></li>
+<li><a href="04-member-admin-view.html"><img src="png/04-member-admin-view-1440.png" alt="Member page at 1440 wide" loading="lazy"></a>
+<h3><a href="04-member-admin-view.html">04 · Member page</a></h3>
+<div class="links"><a href="png/04-member-admin-view-1440.png">PNG 1440</a><a href="png/04-member-admin-view-390.png">PNG 390</a></div>
+<p>A tenant admin on Sofia's page. Header actions by power (Suspend and Revoke Postgres access now are tenant-admin only, Remove from tenant in the overflow). One card per project with the segmented platform role and the filterable role checklist: checked first, 'also gives' chains, the escaped bidi name refunds\u202Ereview, the Admin-only group with reasons, and step 2's locked 'via team' row (lock + link, never sent in the PUT). The warehouse card shows unsaved edits (sand pending edge, its own Save). Logins: Admins see Delete only; expiring soon is a coral-outlined square.</p></li>
+<li><a href="05-member-self.html"><img src="png/05-member-self-1440.png" alt="Your member page at 1440 wide" loading="lazy"></a>
+<h3><a href="05-member-self.html">05 · Your member page</a></h3>
+<div class="links"><a href="png/05-member-self-1440.png">PNG 1440</a><a href="png/05-member-self-390.png">PNG 390</a></div>
+<p>Sofia's own page: project access is read-only (no Save, roles listed but disabled, no Admin-only group), personal logins are hers to manage. Her billing-prod login expires in 9 days, so the row offers Renew and a prompt names the date and what renewing does (new password, 90 more days).</p></li>
+<li><a href="06-member-suspended.html"><img src="png/06-member-suspended-1440.png" alt="Suspended member at 1440 wide" loading="lazy"></a>
+<h3><a href="06-member-suspended.html">06 · Suspended member</a></h3>
+<div class="links"><a href="png/06-member-suspended-1440.png">PNG 1440</a><a href="png/06-member-suspended-390.png">PNG 390</a></div>
+<p>A suspended member: the status is coral, a coral-bordered box says when, by whom and what stopped, and Reinstate is the page's one sand action. Grants stay visible and editable ('effective once reinstated'); revoked logins stay listed with their reason until deleted (P6).</p></li>
+<li><a href="07-roles-tab.html"><img src="png/07-roles-tab-1440.png" alt="Roles tab at 1440 wide" loading="lazy"></a>
+<h3><a href="07-roles-tab.html">07 · Roles tab</a></h3>
+<div class="links"><a href="png/07-roles-tab-1440.png">PNG 1440</a><a href="png/07-roles-tab-390.png">PNG 390</a></div>
+<p>The Roles tab for an Admin: project → database → branch → Postgres database pickers (search params), the protected-branch note, role cards with NOLOGIN/LOGIN, owner-level in coral, member counts (Admins only, MH-34; a Developer sees the same cards without counts and without the logins list), a privilege summary, and the escaped name. Personal logins are never role cards: they get their own Admin-only list (P24) linking to each member.</p></li>
+<li><a href="08-role-page.html"><img src="png/08-role-page-1440.png" alt="Role privileges at 1440 wide" loading="lazy"></a>
+<h3><a href="08-role-page.html">08 · Role privileges</a></h3>
+<div class="links"><a href="png/08-role-page-1440.png">PNG 1440</a><a href="png/08-role-page-390.png">PNG 390</a></div>
+<p>A project Admin on billing_editor: one schema block per schema with Schema, Tables and views (objects × 8 privileges, 'all' per row and column), the column drill-in open on customers, All rows with its caveat line, Sequences, Functions, Future objects. Staged cells carry the sand pending edge; the right panel collects them (one panel, one sand: Review changes). payments and close_period are owned by ledger_svc, which the owner can't SET to: greyed with a lock and 'change in SQL as ledger_svc'. Grantors show where they matter (neon_superuser, P30); grant option is shown and only revocable (MH-29).</p></li>
+<li><a href="09-role-review.html"><img src="png/09-role-review-1440.png" alt="Review privilege changes at 1440 wide" loading="lazy"></a>
+<h3><a href="09-role-review.html">09 · Review privilege changes</a></h3>
+<div class="links"><a href="png/09-role-review-1440.png">PNG 1440</a><a href="png/09-role-review-390.png">PNG 390</a></div>
+<p>Review changes: the dry-run SQL, the exposure flag (authenticated inherits reports_reader), and the dry run's 422 exposes_data_api on All rows with the server's chain. Apply stays disabled until the refused change is removed.</p></li>
+<li><a href="10-role-conflict.html"><img src="png/10-role-conflict-1440.png" alt="Privileges not applied at 1440 wide" loading="lazy"></a>
+<h3><a href="10-role-conflict.html">10 · Privileges not applied</a></h3>
+<div class="links"><a href="png/10-role-conflict-1440.png">PNG 1440</a><a href="png/10-role-conflict-390.png">PNG 390</a></div>
+<p>After Apply, the server's verify-after check (MH-24) found SELECT still held through another grantor: 409 privileges_not_applied, named object, privilege and grantor, everything rolled back. The staleness 409 (privileges_changed_since_read) is a different message: reload, keep the staged changes.</p></li>
+<li><a href="11-create-role.html"><img src="png/11-create-role-1440.png" alt="Create role at 1440 wide" loading="lazy"></a>
+<h3><a href="11-create-role.html">11 · Create role</a></h3>
+<div class="links"><a href="png/11-create-role-1440.png">PNG 1440</a><a href="png/11-create-role-390.png">PNG 390</a></div>
+<p>Create role: name with the API's rule, NOLOGIN by default (spelled as 'Group role'), Advanced open: member of (with the data-API chain noted), inherit, bypass RLS tagged owner-level, connection limit, valid until. Owner-level creation stays in the branch Roles panel. After creating, Studio opens the new role's page.</p></li>
+<li><a href="12-login-reveal.html"><img src="png/12-login-reveal-1440.png" alt="Personal login password at 1440 wide" loading="lazy"></a>
+<h3><a href="12-login-reveal.html">12 · Personal login password</a></h3>
+<div class="links"><a href="png/12-login-reveal-1440.png">PNG 1440</a><a href="png/12-login-reveal-390.png">PNG 390</a></div>
+<p>The shown-once reveal after New login (or Reset / Renew): password and main-branch connection string, each with Copy; P23's note on branches; the roles the login can SET ROLE into. 'You won't see this password again' is plain chalk weight, not a warning colour. Done is the only way out (no click-outside dismissal); the secret lives in the dialog's state only.</p></li>
+<li><a href="13-invite-compose.html"><img src="png/13-invite-compose-1440.png" alt="Invite people at 1440 wide" loading="lazy"></a>
+<h3><a href="13-invite-compose.html">13 · Invite people</a></h3>
+<div class="links"><a href="png/13-invite-compose-1440.png">PNG 1440</a><a href="png/13-invite-compose-390.png">PNG 390</a></div>
+<p>Several emails per invite: pasted addresses become chips, an invalid one is coral-outlined with its reason and is never sent (the button counts only valid ones). Delivery and access are shared by the batch; access rows are today's grant rows.</p></li>
+<li><a href="14-invite-results.html"><img src="png/14-invite-results-1440.png" alt="Invite results at 1440 wide" loading="lazy"></a>
+<h3><a href="14-invite-results.html">14 · Invite results</a></h3>
+<div class="links"><a href="png/14-invite-results-1440.png">PNG 1440</a><a href="png/14-invite-results-390.png">PNG 390</a></div>
+<p>After sending: one result per email (R8: sent in sequence), seafoam square for done, solid coral for failed with the server's reason in words. The title counts. Failed addresses can go back into the form; the successful ones aren't sent twice.</p></li>
+<li><a href="15-suspend-dialog.html"><img src="png/15-suspend-dialog-1440.png" alt="Suspend member at 1440 wide" loading="lazy"></a>
+<h3><a href="15-suspend-dialog.html">15 · Suspend member</a></h3>
+<div class="links"><a href="png/15-suspend-dialog-1440.png">PNG 1440</a><a href="png/15-suspend-dialog-390.png">PNG 390</a></div>
+<p>Suspend's confirm: what stops now, what's kept, how to undo it, and the permanent alternative. Destructive button, no sand.</p></li>
+<li><a href="16-revoke-now-dialog.html"><img src="png/16-revoke-now-dialog-1440.png" alt="Revoke Postgres access at 1440 wide" loading="lazy"></a>
+<h3><a href="16-revoke-now-dialog.html">16 · Revoke Postgres access</a></h3>
+<div class="links"><a href="png/16-revoke-now-dialog-1440.png">PNG 1440</a><a href="png/16-revoke-now-dialog-390.png">PNG 390</a></div>
+<p>Revoke Postgres access now: names the logins that stop, says sessions end (P16: cb_m_* passwords rotate, so Studio's own sessions reconnect), and what's untouched.</p></li>
+</ol>
+</main></body></html>

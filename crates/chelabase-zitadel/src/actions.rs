@@ -79,6 +79,9 @@ pub enum UserEventKind {
     Gone,
     Deactivated,
     PasswordChanged,
+    /// D7: `user.reactivated` or `user.unlocked`: a tenant member's offboarded mark is cleared;
+    /// an app user is upserted as for [`UserEventKind::Upsert`].
+    Reactivated,
 }
 
 pub fn user_event_kind(event_type: &str) -> Option<UserEventKind> {
@@ -86,8 +89,8 @@ pub fn user_event_kind(event_type: &str) -> Option<UserEventKind> {
         "user.human.added"
         | "user.human.selfregistered"
         | "user.human.email.changed"
-        | "user.human.email.verified"
-        | "user.reactivated" => UserEventKind::Upsert,
+        | "user.human.email.verified" => UserEventKind::Upsert,
+        "user.reactivated" | "user.unlocked" => UserEventKind::Reactivated,
         "user.removed" => UserEventKind::Gone,
         "user.deactivated" | "user.locked" => UserEventKind::Deactivated,
         "user.human.password.changed" => UserEventKind::PasswordChanged,
@@ -178,9 +181,12 @@ mod tests {
             "user.human.selfregistered",
             "user.human.email.changed",
             "user.human.email.verified",
-            "user.reactivated",
         ] {
             assert_eq!(user_event_kind(t), Some(Upsert), "{t}");
+        }
+        // D7 (final round A): a reactivation or an unlock clears the offboarded mark.
+        for t in ["user.reactivated", "user.unlocked"] {
+            assert_eq!(user_event_kind(t), Some(Reactivated), "{t}");
         }
         assert_eq!(user_event_kind("user.removed"), Some(Gone));
         assert_eq!(user_event_kind("user.deactivated"), Some(Deactivated));

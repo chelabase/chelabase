@@ -7,7 +7,7 @@
 //! reaches the row through forwarding first). A change the API wrote that the compute never
 //! confirmed (`attributes_pending`) is driven onto the compute instead of being recorded over.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chelabase_metadata::{
@@ -19,8 +19,7 @@ use chelabase_secrets::seal_role_password;
 use chelabase_types::BranchId;
 use chelabase_types::data_key::DataKeyKind;
 use chelabase_types::role_name::{
-    has_reserved_prefix, is_membership_reserved, is_reserved_for, is_reserved_target,
-    mark_personal_login_sql, quote_ident, quote_literal,
+    has_reserved_prefix, is_membership_reserved, is_reserved_for, quote_ident, quote_literal,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use chelabase_types::role_password::{PasswordKind, hash_kind};
@@ -34,15 +33,24 @@ use crate::{OWNER_ROLE, Worker, credentials};
 /// `pg_database` are cluster-wide, so any database sees the same catalog.
 pub const SYSTEM_DATABASE: &str = "postgres";
 
-/// Every role's OID, hex-encoded name and BYPASSRLS (`t`/`f`, E33), for the secret keys'
+/// Every role's OID, hex-encoded name, BYPASSRLS (`t`/`f`, E33) and whether it carries the
+/// personal-login marker (`t`/`f`, T6, MH-12: the round-4 predicate), for the secret keys'
 /// identities and marks. The comment is the fakes' needle.
 pub const KEY_ROLES_SQL: &str = "SET search_path = pg_catalog, pg_temp;\n\
      SELECT /* chelabase: key roles */ oid::text || ' ' || encode(convert_to(rolname, 'UTF8'), 'hex') \
-     || CASE WHEN rolbypassrls THEN ' t' ELSE ' f' END FROM pg_roles;";
+     || CASE WHEN rolbypassrls THEN ' t' ELSE ' f' END \
+     || CASE WHEN EXISTS (SELECT 1 FROM pg_db_role_setting s WHERE s.setrole = pg_roles.oid \
+     AND s.setdatabase = 0 AND EXISTS (SELECT 1 FROM unnest(s.setconfig) AS c \
+     WHERE starts_with(c, 'chelabase.managed_role='))) THEN ' t' ELSE ' f' END FROM pg_roles;";
 
-/// [`KEY_ROLES_SQL`]'s lines: `(oid, name, bypass_rls)`; a line without the flag (an older
+/// [`KEY_ROLES_SQL`]'s lines: `(oid, name, bypass_rls, marked)`; a missing flag (an older
 /// read) is `false`.
-pub fn parse_key_role_flags(out: &str) -> anyhow::Result<Vec<(i64, String, bool)>> {
+pub fn parse_key_role_catalog(out: &str) -> anyhow::Result<Vec<(i64, String, bool, bool)>> {
+    let flag = |field: Option<&str>, what: &str| match field {
+        None | Some("f") => Ok(false),
+        Some("t") => Ok(true),
+        Some(other) => Err(anyhow::anyhow!("a role line with a bad {what} flag {other:?}")),
+    };
     out.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
@@ -51,11 +59,8 @@ pub fn parse_key_role_flags(out: &str) -> anyhow::Result<Vec<(i64, String, bool)
             let name = fields
                 .next()
                 .ok_or_else(|| anyhow::anyhow!("a role line without a name: {line:?}"))?;
-            let bypass = match fields.next() {
-                None | Some("f") => false,
-                Some("t") => true,
-                Some(other) => anyhow::bail!("a role line with a bad BYPASSRLS flag {other:?}"),
-            };
+            let bypass = flag(fields.next(), "BYPASSRLS")?;
+            let marked = flag(fields.next(), "marker")?;
             if fields.next().is_some() {
                 anyhow::bail!("a role line with extra fields");
             }
@@ -63,9 +68,18 @@ pub fn parse_key_role_flags(out: &str) -> anyhow::Result<Vec<(i64, String, bool)
                 .parse::<i64>()
                 .map_err(|e| anyhow::anyhow!("a role line with a bad OID {oid:?}: {e}"))?;
             let name = unhex(name).ok_or_else(|| anyhow::anyhow!("a role line with a bad name"))?;
-            Ok((oid, name, bypass))
+            Ok((oid, name, bypass, marked))
         })
         .collect()
+}
+
+/// [`KEY_ROLES_SQL`]'s lines: `(oid, name, bypass_rls)`; a line without the flag (an older
+/// read) is `false`.
+pub fn parse_key_role_flags(out: &str) -> anyhow::Result<Vec<(i64, String, bool)>> {
+    Ok(parse_key_role_catalog(out)?
+        .into_iter()
+        .map(|(oid, name, bypass, _)| (oid, name, bypass))
+        .collect())
 }
 
 /// [`KEY_ROLES_SQL`]'s lines: `(oid, name)`.
@@ -120,10 +134,13 @@ pub fn plan_key_bypass(
 ///   the name is gone.
 ///
 /// Public keys are left alone.
+///
+/// T6 (MH-12): a live key bound to a name in `marked` (a personal login) is revoked.
 pub fn plan_key_roles(
     keys: &[DataKeyRecord],
     catalog: &[(i64, String)],
     timeline: &str,
+    marked: &BTreeSet<String>,
 ) -> Vec<KeyRoleFix> {
     let name_of = |oid: i64| catalog.iter().find(|(o, _)| *o == oid).map(|(_, n)| n);
     let oid_of = |name: &str| catalog.iter().find(|(_, n)| n == name).map(|(o, _)| *o);
@@ -135,8 +152,12 @@ pub fn plan_key_roles(
     keys.iter()
         .filter(|k| k.kind == DataKeyKind::Secret && k.revoked_at.is_none())
         .filter_map(|k| match k.role_oid {
+            // MH-12: a personal login never backs a key, whatever its identity says.
+            _ if marked.contains(&k.role) => Some(revoke(k)),
             Some(oid) if k.role_timeline.as_deref() == Some(timeline) => match name_of(oid) {
                 None => Some(revoke(k)),
+                // A rename onto a personal login's name is never followed (MH-12).
+                Some(name) if marked.contains(name) => Some(revoke(k)),
                 Some(name) if *name != k.role => Some(KeyRoleFix::Follow {
                     id: k.id,
                     from: k.role.clone(),
@@ -702,7 +723,18 @@ pub fn plan_resync(
             RoleLevel::Plain
         }
     };
-    let is_copy = |c: &&RoleCopy| c.origin != RoleOrigin::Owner && c.name != owner;
+    // T6 (spec Part 6 "Convergence", MH-9, MH-10, S1): personal rows are their records' alone
+    // and marked roles the member-role reconciler's. The resync never records, recreates,
+    // repairs or removes either; a marked role is never recorded as `sql`.
+    let is_copy = |c: &&RoleCopy| {
+        c.origin != RoleOrigin::Owner && c.name != owner && c.origin != RoleOrigin::Personal
+    };
+    let personal_name = |name: &str| {
+        copies
+            .iter()
+            .any(|c| c.origin == RoleOrigin::Personal && c.name == name)
+    };
+    let marked = |name: &str| observed.roles.iter().any(|o| o.name == name && o.marked);
     let row_of = |name: &str| copies.iter().filter(is_copy).find(|c| c.name == name);
     let seen = |name: &str| observed.roles.iter().any(|o| o.name == name);
     let mut repairs = Vec::new();
@@ -720,6 +752,7 @@ pub fn plan_resync(
         .filter(is_copy)
         .filter(|c| c.origin == RoleOrigin::Api)
         .filter(|c| !has_reserved_prefix(&c.name))
+        .filter(|c| !marked(&c.name))
     {
         let stored = row.scram_verifier.as_deref();
         let o = observed.roles.iter().find(|o| o.name == row.name);
@@ -813,66 +846,20 @@ pub fn plan_resync(
         });
     }
 
-    // Personal logins (RT4-4): one the catalog lost is made again with its stored verifier, its
-    // surviving memberships and the marker, in one script run as the superuser, only under a
-    // name a personal login may take and only with a whole SCRAM verifier. Its row is never
-    // removed from the metadata. One that exists is handled below like any catalog role: it
-    // keeps its origin only while the catalog shows the marker.
-    for row in copies
-        .iter()
-        .filter(is_copy)
-        .filter(|c| c.origin == RoleOrigin::Personal)
-        .filter(|c| !is_reserved_target(&c.name, owner) && !seen(&c.name))
-    {
-        let Some(stored) = row
-            .scram_verifier
-            .as_deref()
-            .filter(|v| chelabase_neon::scram::is_verifier(v))
-        else {
-            error!(role = %row.name, "a personal login has no whole stored verifier; the resync skips it");
-            continue;
-        };
-        let kept: Vec<String> = row
-            .attributes
-            .member_of
-            .iter()
-            .filter(|g| seen(g.as_str()))
-            .cloned()
-            .collect();
-        let attributes = RoleAttributes {
-            member_no_set: Vec::new(),
-            member_admin: Vec::new(),
-            member_of: kept,
-            ..row.attributes.clone()
-        };
-        let wanted = WantedRole {
-            name: &row.name,
-            owner_level: false,
-            login: true,
-            attributes: &attributes,
-        };
-        push_repair(
-            &mut repairs,
-            &row.name,
-            create_personal_login_sql(&wanted, stored),
-        );
-        write.upserts.push(CopyUpsert {
-            name: row.name.clone(),
-            origin: RoleOrigin::Personal,
-            verifier: Some(stored.to_string()),
-            password_enc: SealedChange::Keep,
-            login: true,
-            level: RoleLevel::Plain,
-            pending: false,
-            attributes,
-            api_owner_level: None,
-            no_password: false,
-        });
-    }
-
-    // Everything else: the database wins.
+    // Everything else: the database wins. A marked role or a personal row's name is left to
+    // the member-role reconciler; another origin's row of a marked name is removed (a marked
+    // role is never `sql` or `api`, and the reconciler then writes its personal row).
     for o in observed.roles.iter().filter(|o| o.name != owner) {
         let row = row_of(&o.name);
+        if o.marked || personal_name(&o.name) {
+            if o.marked
+                && let Some(r) = row
+            {
+                warn!(role = %o.name, origin = r.origin.as_str(), "a marked role has a row of another origin; the resync removes the row");
+                write.removals.push(o.name.clone());
+            }
+            continue;
+        }
         if row.is_some_and(|r| r.origin == RoleOrigin::Api) {
             continue;
         }
@@ -904,10 +891,7 @@ pub fn plan_resync(
             // password was removed. It exists, so it's kept (members can be granted it), with no
             // verifier; Chelabase's reserved names (the data API's roles) are not listed.
             Some((PasswordKind::Other, _)) | None => {
-                // A personal login's row is never removed: under a reserved name it is recorded
-                // as an SQL role below, like any personal row the resync doesn't adopt.
-                let personal_row = row.is_some_and(|r| r.origin == RoleOrigin::Personal);
-                if is_reserved_for(&o.name, owner) && !personal_row {
+                if is_reserved_for(&o.name, owner) {
                     if row.is_some() {
                         write.removals.push(o.name.clone());
                     }
@@ -920,21 +904,9 @@ pub fn plan_resync(
             Some(r) if r.scram_verifier == verifier => SealedChange::Keep,
             _ => SealedChange::Clear,
         };
-        // A personal login keeps its origin only while the catalog shows the marker and its name
-        // is one a personal login may take: an unmarked role of the same name (say an
-        // owner-made `alice` on a point-in-time child) is the owner's, never adopted.
-        let personal_row = row.is_some_and(|r| r.origin == RoleOrigin::Personal);
-        let personal = personal_row && o.marked && !is_reserved_target(&o.name, owner);
-        if personal_row && !personal {
-            warn!(role = %o.name, marked = o.marked, "a personal login's name exists without the marker (or is reserved); the resync records it as an SQL role");
-        }
         write.upserts.push(CopyUpsert {
             name: o.name.clone(),
-            origin: if personal {
-                RoleOrigin::Personal
-            } else {
-                RoleOrigin::Sql
-            },
+            origin: RoleOrigin::Sql,
             verifier,
             password_enc,
             login: o.login,
@@ -985,7 +957,13 @@ impl FreshPasswords {
         mut generate: impl FnMut(&str) -> (String, String),
     ) -> Vec<RepairGroup> {
         let mut script = Vec::new();
-        for o in observed.roles.iter_mut().filter(|o| o.name != owner) {
+        // T6 (D2, MH-14): a marked role (a personal login) is left out: the member-role
+        // reconciler sets it to its record's verifier.
+        for o in observed
+            .roles
+            .iter_mut()
+            .filter(|o| o.name != owner && !o.marked)
+        {
             let Some(current) = o.password.as_deref() else {
                 continue;
             };
@@ -1098,7 +1076,21 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             };
             // T8 I3: roles made, dropped or changed in SQL (attributes, memberships) can change
             // what member roles may hold (R16) or which names grants find.
-            if !changed.is_empty() {
+            // T6 (MH-10): a marked role without its personal row, or a personal row whose
+            // marked role is missing, is the member-role reconciler's to converge.
+            // T6-M2: a marked role under a name no personal login may take (the owner, a
+            // reserved name) is one the reconciler leaves alone, so it is never drift.
+            let personal_drift = observed.roles.iter().any(|o| {
+                o.marked
+                    && chelabase_types::role_name::check_login_role_name(&o.name).is_ok()
+                    && !copies
+                        .iter()
+                        .any(|c| c.origin == RoleOrigin::Personal && c.name == o.name)
+            }) || copies.iter().any(|c| {
+                c.origin == RoleOrigin::Personal
+                    && !observed.roles.iter().any(|o| o.marked && o.name == c.name)
+            });
+            if !changed.is_empty() || personal_drift {
                 self.member_role_requests.request(branch);
             }
             // A role re-created or set back in SQL may be cached with its old password too.
@@ -1159,8 +1151,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(timeline) = self.current_timeline(branch).await else {
             return;
         };
-        let flagged = match self.computes.admin_sql(ep, database, KEY_ROLES_SQL).await {
-            Ok(out) => match parse_key_role_flags(&out) {
+        let read = match self.computes.admin_sql(ep, database, KEY_ROLES_SQL).await {
+            Ok(out) => match parse_key_role_catalog(&out) {
                 Ok(catalog) if !catalog.is_empty() => catalog,
                 Ok(_) => {
                     warn!(branch_id = %branch, "secret keys versus roles: the role list came back empty");
@@ -1180,11 +1172,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, "secret keys versus roles: the branch's timeline moved during the read; the next resync repairs them");
             return;
         }
+        let flagged: Vec<(i64, String, bool)> = read
+            .iter()
+            .map(|(oid, name, bypass, _)| (*oid, name.clone(), *bypass))
+            .collect();
+        let marked: BTreeSet<String> = read
+            .iter()
+            .filter(|(_, _, _, marked)| *marked)
+            .map(|(_, name, _, _)| name.clone())
+            .collect();
         let catalog: Vec<(i64, String)> = flagged
             .iter()
             .map(|(oid, name, _)| (*oid, name.clone()))
             .collect();
-        let mut fixes = plan_key_roles(&keys, &catalog, &timeline);
+        let mut fixes = plan_key_roles(&keys, &catalog, &timeline, &marked);
         let marks = plan_key_bypass(&keys, &flagged, &fixes);
         fixes.extend(marks);
         if fixes.is_empty() {
@@ -1377,24 +1378,6 @@ fn create_role_options(role: &WantedRole<'_>, verifier: Option<&str>) -> Vec<Str
         options.push(format!("PASSWORD {}", quote_literal(verifier)));
     }
     options
-}
-
-/// The script that makes a lost personal login again (RT4-4): one transaction run by the
-/// superuser session (no `SET ROLE`, so the owner holds no ADMIN on it and grants nothing
-/// itself), the role, its memberships and then the marker, so no session sees it unmarked.
-fn create_personal_login_sql(role: &WantedRole<'_>, verifier: &str) -> String {
-    let ident = quote_ident(role.name);
-    let mut sql = format!(
-        "BEGIN;\nCREATE ROLE {ident} {};",
-        create_role_options(role, Some(verifier)).join(" ")
-    );
-    for group in &role.attributes.member_of {
-        sql.push_str(&format!("\nGRANT {} TO {ident};", quote_ident(group)));
-    }
-    sql.push('\n');
-    sql.push_str(&mark_personal_login_sql(role.name));
-    sql.push_str("\nCOMMIT;");
-    sql
 }
 
 /// `SET ROLE <owner>; CREATE ROLE … [NO]LOGIN [attributes] [PASSWORD …]; GRANT <group> TO …;
@@ -1667,7 +1650,7 @@ mod tests {
         let legacy_gone = key("ghost", None);
         let keys = vec![alive.clone(), gone.clone(), moved.clone(), recreated.clone(), legacy.clone(), legacy_gone.clone()];
         assert_eq!(
-            plan_key_roles(&keys, &catalog, NOW),
+            plan_key_roles(&keys, &catalog, NOW, &BTreeSet::new()),
             vec![
                 KeyRoleFix::Revoke { id: gone.id, role: "dropped".into(), oid: Some(16385) },
                 KeyRoleFix::Follow { id: moved.id, from: "old_name".into(), to: "renamed".into(), oid: 16390, timeline: NOW.into() },
@@ -1676,11 +1659,11 @@ mod tests {
                 KeyRoleFix::Revoke { id: legacy_gone.id, role: "ghost".into(), oid: None },
             ]
         );
-        assert!(plan_key_roles(&[alive], &catalog, NOW).is_empty(), "a key whose OID has its name");
+        assert!(plan_key_roles(&[alive], &catalog, NOW, &BTreeSet::new()).is_empty(), "a key whose OID has its name");
         // Public keys are never touched.
         let mut public = key("anon", None);
         public.kind = DataKeyKind::Public;
-        assert!(plan_key_roles(&[public], &[], NOW).is_empty());
+        assert!(plan_key_roles(&[public], &[], NOW, &BTreeSet::new()).is_empty());
     }
 
     // E26: after a timeline switch (reset, restore, a merge's reset) the catalog's OID counter
@@ -1694,7 +1677,7 @@ mod tests {
         // Same name, same OID after the switch: kept, stamped with the current timeline.
         let same = key_on("app", Some(16384), Some(BEFORE));
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&same), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&same), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Restamp {
                 id: same.id,
                 role: "app".into(),
@@ -1707,19 +1690,19 @@ mod tests {
         // at 16390. After the reset the key is revoked, never moved to `x`.
         let reused = key_on("app", Some(16390), Some(BEFORE));
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&reused), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&reused), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Revoke { id: reused.id, role: "app".into(), oid: Some(16390) }]
         );
         // The OID is gone on the new timeline: revoked.
         let gone = key_on("app", Some(16500), Some(BEFORE));
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&gone), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&gone), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Revoke { id: gone.id, role: "app".into(), oid: Some(16500) }]
         );
         // No timeline recorded: the same rules, the timeline stamped when kept.
         let unstamped = key_on("app", Some(16384), None);
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&unstamped), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&unstamped), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Restamp {
                 id: unstamped.id,
                 role: "app".into(),
@@ -1730,7 +1713,7 @@ mod tests {
         );
         let unstamped_reused = key_on("app", Some(16390), None);
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&unstamped_reused), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&unstamped_reused), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Revoke { id: unstamped_reused.id, role: "app".into(), oid: Some(16390) }]
         );
     }
@@ -1741,7 +1724,7 @@ mod tests {
         let catalog = vec![(16384, "app".to_string()), (16390, "renamed".to_string())];
         let moved = key_on("old_name", Some(16390), Some(NOW));
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&moved), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&moved), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Follow {
                 id: moved.id,
                 from: "old_name".into(),
@@ -1752,7 +1735,7 @@ mod tests {
         );
         let legacy = key_on("app", None, None);
         assert_eq!(
-            plan_key_roles(std::slice::from_ref(&legacy), &catalog, NOW),
+            plan_key_roles(std::slice::from_ref(&legacy), &catalog, NOW, &BTreeSet::new()),
             vec![KeyRoleFix::Backfill { id: legacy.id, role: "app".into(), oid: 16384, timeline: NOW.into() }]
         );
     }
@@ -1829,7 +1812,7 @@ mod tests {
                             continue; // the column's CHECK: no timeline without an OID
                         }
                         let k = key_on(role, oid, timeline);
-                        let fixes = plan_key_roles(std::slice::from_ref(&k), catalog, NOW);
+                        let fixes = plan_key_roles(std::slice::from_ref(&k), catalog, NOW, &BTreeSet::new());
                         let after = apply_fixes(&k, &fixes);
                         let case = format!("{k:?} on {catalog:?}: {fixes:?}");
                         let name_of = |o: i64| catalog.iter().find(|(c, _)| *c == o).map(|(_, n)| n.clone());
@@ -1851,7 +1834,7 @@ mod tests {
                                 assert_eq!(served(after, catalog).as_ref(), Some(bound), "served as its bound role: {case}");
                                 assert_eq!(after.role_timeline.as_deref(), Some(NOW), "stamped: {case}");
                                 assert!(
-                                    plan_key_roles(std::slice::from_ref(after), catalog, NOW).is_empty(),
+                                    plan_key_roles(std::slice::from_ref(after), catalog, NOW, &BTreeSet::new()).is_empty(),
                                     "stable: {case}"
                                 );
                             }
@@ -1888,7 +1871,7 @@ mod tests {
         let mut public = key("anon", None);
         public.kind = DataKeyKind::Public;
         let keys = vec![gained.clone(), lost.clone(), gone, legacy.clone(), right, public];
-        let fixes = plan_key_roles(&keys, &names, NOW);
+        let fixes = plan_key_roles(&keys, &names, NOW, &BTreeSet::new());
         assert_eq!(
             plan_key_bypass(&keys, &catalog, &fixes),
             vec![
@@ -3321,53 +3304,145 @@ mod tests {
             .unwrap_or_else(|| panic!("no repair group for {role}: {repairs:?}"))
     }
 
-    // A personal login the catalog lost is made again with its marker, in the same script
-    // (one group = one script = one transaction), and nowhere else.
+    /// MH-18 (amended, T6-C1): the personal logins' quarantine role (`NOLOGIN`, no password)
+    /// is never listed: no row is recorded for it, and one that exists is removed, with no
+    /// repair.
     #[test]
-    fn a_lost_personal_login_is_recreated_marked_in_the_same_script() {
-        use chelabase_types::role_name::mark_personal_login_sql;
-        let copies = [personal("alice", Some(SCRAM_WHOLE)), copy("api_gone", RoleOrigin::Api, Some(SCRAM_B))];
-
-        let (repairs, write) = plan_resync(OWNER_ROLE, &copies, &observed(vec![]));
-
-        let group = group_of(&repairs, "alice");
-        let script = group.statements.join("\n");
-        let create = script.find("CREATE ROLE \"alice\"").expect(&script);
-        let mark = script.find(&mark_personal_login_sql("alice")).expect(&script);
-        assert!(create < mark, "{script}");
-        assert!(script.contains(&format!("PASSWORD '{SCRAM_WHOLE}'")), "{script}");
-        let marked_groups: Vec<&str> = repairs
-            .iter()
-            .filter(|g| g.statements.iter().any(|s| s.contains("chelabase.managed_role")))
-            .map(|g| g.role.as_str())
-            .collect();
-        assert_eq!(marked_groups, ["alice"], "only the personal login is marked: {repairs:?}");
-        // Not removed from the metadata, and never downgraded to another origin.
-        assert!(!write.removals.contains(&"alice".to_string()), "{write:?}");
-        if let Some(u) = upsert(&write, "alice") {
-            assert_eq!(u.origin, RoleOrigin::Personal);
-        }
+    fn resync_never_lists_the_quarantine_role() {
+        let mut quarantine = role("chelabase_orphaned", None);
+        quarantine.login = false;
+        quarantine.owner_admin = false;
+        let (repairs, write) = plan_resync(OWNER_ROLE, &[], &observed(vec![quarantine.clone()]));
+        assert!(upsert(&write, "chelabase_orphaned").is_none(), "{write:?}");
+        assert!(repairs.iter().all(|g| g.role != "chelabase_orphaned"), "{repairs:?}");
+        let stale = [copy("chelabase_orphaned", RoleOrigin::Sql, None)];
+        let (repairs, write) = plan_resync(OWNER_ROLE, &stale, &observed(vec![quarantine]));
+        assert!(upsert(&write, "chelabase_orphaned").is_none(), "{write:?}");
+        assert!(write.removals.contains(&"chelabase_orphaned".to_string()), "{write:?}");
+        assert!(repairs.iter().all(|g| g.role != "chelabase_orphaned"), "{repairs:?}");
     }
 
-    // K6 H2: the marked role's memberships are granted by a superuser (the script has no
-    // `SET ROLE owner`), because the guard refuses the owner's GRANT of a marked role and a
-    // `DROP OWNED BY <grantor>` would take memberships the owner granted.
+    // T6 (spec Part 6 "Convergence", MH-9, MH-10, S1; replaces the RT4-4 recreate tests
+    // deliberately): the resync never records, recreates or repairs a marked role or a personal
+    // row. The member-role reconciler converges them; the metadata keeps personal rows to their
+    // records. Every other role is handled as before.
     #[test]
-    fn a_recreated_personal_login_gets_its_memberships_from_a_superuser() {
-        let mut row = personal("alice", Some(SCRAM_WHOLE));
-        row.attributes.member_of = vec!["readers".into(), "gone_group".into()];
-        let (repairs, _) = plan_resync(
+    fn resync_leaves_marked_roles_and_personal_rows_alone() {
+        // lost: a personal row whose role the catalog lost; kept: a personal row with its
+        // marked role (another verifier); orphan: a marked role with no row; taken: a personal
+        // row whose name an unmarked role holds; plain: an ordinary SQL role.
+        let mut kept = role("kept", Some(SCRAM_B));
+        kept.marked = true;
+        kept.owner_admin = false;
+        let mut orphan = role("orphan", Some(SCRAM_A));
+        orphan.marked = true;
+        orphan.owner_admin = false;
+        let mut orphan_group = role("orphan_nopass", None);
+        orphan_group.marked = true;
+        let taken = role("taken", Some(SCRAM_A));
+        let copies = [
+            personal("lost", Some(SCRAM_WHOLE)),
+            personal("kept", Some(SCRAM_A)),
+            personal("taken", Some(SCRAM_WHOLE)),
+        ];
+        let (repairs, write) = plan_resync(
             OWNER_ROLE,
-            &[row],
-            &observed(vec![role("readers", None)]),
+            &copies,
+            &observed(vec![kept, orphan, orphan_group, taken, role("plain", Some(SCRAM_A))]),
         );
+        for name in ["lost", "kept", "orphan", "orphan_nopass", "taken"] {
+            assert!(
+                repairs.iter().all(|g| g.role != name),
+                "{name}: no repair: {repairs:?}"
+            );
+            assert!(upsert(&write, name).is_none(), "{name}: never recorded: {write:?}");
+            assert!(!write.removals.contains(&name.to_string()), "{name}: never removed: {write:?}");
+        }
+        assert!(
+            repairs.iter().flat_map(|g| &g.statements).all(|s| !s.contains("managed_role")),
+            "{repairs:?}"
+        );
+        assert_eq!(upsert(&write, "plain").map(|u| u.origin), Some(RoleOrigin::Sql));
+    }
 
-        let script = group_of(&repairs, "alice").statements.join("\n");
-        assert!(script.contains("GRANT \"readers\" TO \"alice\";"), "{script}");
-        assert!(!script.contains("gone_group"), "a group dropped in SQL is gone: {script}");
-        assert!(!script.contains("SET ROLE"), "{script}");
-        assert!(!script.contains("RESET ROLE"), "{script}");
-        assert!(!script.contains("WITH ADMIN"), "the owner gets no ADMIN on it: {script}");
+    // The whole path: one resync over a branch whose catalog lost a personal login and holds an
+    // orphaned marked role makes nothing, writes no verifier and keeps the personal row as its
+    // record left it.
+    #[tokio::test(start_paused = true)]
+    async fn the_resync_never_recreates_or_records_a_personal_login() {
+        let (w, journal) = worker();
+        let (branch, ep) = ready(&w, &journal).await;
+        {
+            let mut state = w.metadata.state();
+            let endpoint = state.endpoints.get_mut(&ep).unwrap();
+            endpoint.set_verifier("alice", Some(SCRAM_WHOLE));
+            endpoint
+                .logins
+                .insert("alice".into(), FakeLogin::new(RoleOrigin::Personal, None, false));
+        }
+        // The catalog: no `alice`, and `ghost` marked (a restore's orphan) with a password.
+        let catalog = [
+            d_line("app", "postgres", false),
+            r_line("ghost", true, Some(SCRAM_A), false, false, false),
+            format!("m|{}||||||||||\n", hex::encode("ghost")),
+        ]
+        .concat();
+        w.computes.answer("FROM pg_authid", &catalog);
+
+        w.resync(branch).await.unwrap();
+
+        let sql = w.computes.sql.lock().unwrap().clone();
+        assert!(
+            // The catalog read names `chelabase.managed_role=` (the marker predicate); only a
+            // statement that writes the marker (ALTER ROLE … SET/RESET, set_config) is refused.
+            !sql.iter().any(|(_, _, s)| s.contains("CREATE ROLE")
+                || (s.contains("managed_role")
+                    && (s.contains("ALTER ROLE") || s.contains("RESET") || s.contains("set_config")))),
+            "{sql:?}"
+        );
+        let state = w.metadata.state();
+        let logins = &state.endpoints[&ep].logins;
+        assert_eq!(logins["alice"].origin, RoleOrigin::Personal);
+        assert_eq!(state.endpoints[&ep].verifier("alice").as_deref(), Some(SCRAM_WHOLE));
+        assert!(!logins.contains_key("ghost"), "a marked role is never recorded: {logins:?}");
+    }
+
+    // T6 (D2, MH-14): a protected parent's child gets fresh passwords on every role with one,
+    // except marked roles: the reconciler sets those to their record's verifier.
+    #[test]
+    fn fresh_passwords_skip_marked_roles() {
+        let mut fresh = FreshPasswords::new([]);
+        let mut alice = role("alice", Some(SCRAM_A));
+        alice.marked = true;
+        let mut seen = observed(vec![alice, role("app", Some(SCRAM_A))]);
+        let script = fresh.assign(OWNER_ROLE, &mut seen, |name| {
+            (format!("SCRAM-SHA-256$4096:c2FsdA==${name}:x"), format!("sealed-{name}"))
+        });
+        let roles: Vec<&str> = script.iter().map(|g| g.role.as_str()).collect();
+        assert_eq!(roles, ["app"], "{script:?}");
+        assert_eq!(seen.roles[0].password.as_deref(), Some(SCRAM_A), "alice keeps its password");
+    }
+
+    // T6 (MH-12): a live secret key bound to a marked role (a personal login) is revoked,
+    // whatever its OID and timeline say; public keys and other keys are left alone.
+    #[test]
+    fn key_roles_bound_to_a_marked_role_are_revoked() {
+        let marked = BTreeSet::from(["alice".to_string()]);
+        let catalog = [(10, "alice".to_string()), (11, "app".to_string())];
+        let bound = key("alice", Some(10));
+        let unstamped = key("alice", None);
+        let other = key("app", Some(11));
+        let fixes = plan_key_roles(&[bound.clone(), unstamped.clone(), other], &catalog, NOW, &marked);
+        assert_eq!(
+            fixes,
+            [
+                KeyRoleFix::Revoke { id: bound.id, role: "alice".into(), oid: Some(10) },
+                KeyRoleFix::Revoke { id: unstamped.id, role: "alice".into(), oid: None },
+            ]
+        );
+        let mut public = key("alice", Some(10));
+        public.kind = DataKeyKind::Public;
+        assert!(plan_key_roles(&[public], &catalog, NOW, &marked).is_empty());
     }
 
     // The personal login's catalog role isn't owner-administered like an API role: the resync
@@ -3426,47 +3501,5 @@ mod tests {
         assert!(repairs.is_empty() && write.removals == ["sql_gone"], "{repairs:?} {write:?}");
         // The script `create_role_sql` makes has no marker for any input.
         assert!(!create_role_sql(OWNER_ROLE, &wanted, None).contains("managed_role"));
-    }
-
-    // The whole path: a personal login dropped behind the platform's back is made again by one
-    // resync, marked in the same script that creates it (live: `a_recreated_personal_login_is_marked_again`).
-    #[tokio::test(start_paused = true)]
-    async fn the_resync_recreates_a_lost_personal_login_marked() {
-        use chelabase_types::role_name::mark_personal_login_sql;
-        let (w, journal) = worker();
-        let (branch, ep) = ready(&w, &journal).await;
-        {
-            let mut state = w.metadata.state();
-            let endpoint = state.endpoints.get_mut(&ep).unwrap();
-            endpoint.set_verifier("alice", Some(SCRAM_WHOLE));
-            endpoint.logins.insert(
-                "alice".into(),
-                FakeLogin {
-                    origin: RoleOrigin::Personal,
-                    password_enc: None,
-                    pending: false,
-                    login: true,
-                    level: RoleLevel::Plain,
-                    api_owner_level: false,
-                    attributes: RoleAttributes::default(),
-                    attributes_pending: false,
-                    attributes_change_id: None,
-                },
-            );
-        }
-        w.computes.answer("FROM pg_authid", &d_line("app", "postgres", false));
-
-        w.resync(branch).await.unwrap();
-
-        let sql = w.computes.sql.lock().unwrap().clone();
-        let made: Vec<&String> = sql
-            .iter()
-            .map(|(_, _, s)| s)
-            .filter(|s| s.contains("CREATE ROLE \"alice\""))
-            .collect();
-        assert_eq!(made.len(), 1, "{sql:?}");
-        assert!(made[0].contains(&mark_personal_login_sql("alice")), "{}", made[0]);
-        let state = w.metadata.state();
-        assert_eq!(state.endpoints[&ep].logins["alice"].origin, RoleOrigin::Personal);
     }
 }

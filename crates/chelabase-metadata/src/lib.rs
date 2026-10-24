@@ -15,6 +15,7 @@ mod ddl;
 pub mod members;
 mod merges;
 mod neon;
+pub mod personal_logins;
 mod projects;
 mod saved_queries;
 mod schema_bases;
@@ -532,13 +533,17 @@ impl MetadataClient {
         .bind(database_id.as_uuid())
         .execute(&mut *tx)
         .await?;
+        // EOS-6, T3-M3: no personal login outlives its database (MH-9).
+        personal_logins::revoke_database_logins(&mut tx, &[database_id.as_uuid()]).await?;
         tx.commit().await?;
         Ok(BeginDelete::Started)
     }
 
-    /// Turn the database row into a tombstone. Its branches are marked deleted one by one
+    /// Turn the database row into a tombstone, revoking any personal login still live on it
+    /// (MH-9). Its branches are marked deleted one by one
     /// ([`MetadataClient::mark_branch_deleted`]), each once its resources are gone.
     pub async fn mark_deleted(&self, database_id: DatabaseId) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
             UPDATE databases
@@ -547,8 +552,10 @@ impl MetadataClient {
             "#,
         )
         .bind(database_id.as_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        personal_logins::revoke_database_logins(&mut tx, &[database_id.as_uuid()]).await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -91,6 +91,7 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}` | Zitadel token | Project Admin |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/privileges` | Zitadel token | Project Viewer |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-password` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-to-parent` | Zitadel token | Branch: Developer unprotected, Admin protected |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/restore` | Zitadel token | Branch: Developer unprotected, Admin protected |
@@ -101,6 +102,7 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Zitadel token | Project Admin |
 | DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |
 | PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/delete-preview` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/reset-password` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/sessions` | Zitadel token | Project Admin |
 | POST | `/v1/databases/\{id\}/branches/\{branch_id\}/schema-changes` | Zitadel token | Act as, by branch: Developer unprotected, Admin protected, and the role in your set |
@@ -123,6 +125,10 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/v1/databases/\{id\}/merges/\{merge_id\}/recompute` | Zitadel token | Branch: Developer unprotected, Admin protected |
 | POST | `/v1/databases/\{id\}/merges/\{merge_id\}/rehearse` | Zitadel token | Branch: Developer unprotected, Admin protected |
 | POST | `/v1/databases/\{id\}/merges/\{merge_id\}/retry` | Zitadel token | Branch: Developer unprotected, Admin protected |
+| PUT | `/v1/databases/\{id\}/personal-login` | Zitadel token | Project Developer |
+| POST | `/v1/databases/\{id\}/personal-login/reset-password` | Zitadel token | Project Developer |
+| GET | `/v1/databases/\{id\}/personal-logins` | Zitadel token | Project Admin |
+| DELETE | `/v1/databases/\{id\}/personal-logins/\{member_id\}` | Zitadel token | Tenant member |
 | POST | `/v1/databases/\{id\}/reset-password` | Zitadel token | Project Admin |
 | GET | `/v1/databases/\{id\}/sql-queries` | Zitadel token | Project Developer |
 | POST | `/v1/databases/\{id\}/sql-queries` | Zitadel token | Project Developer |
@@ -141,6 +147,10 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | PATCH | `/v1/members/\{member_id\}` | Zitadel token | Tenant admin |
 | POST | `/v1/members/\{member_id\}/approve` | Zitadel token | Tenant admin |
 | POST | `/v1/members/\{member_id\}/decline` | Zitadel token | Tenant admin |
+| GET | `/v1/members/\{member_id\}/personal-logins` | Zitadel token | Tenant member |
+| POST | `/v1/members/\{member_id\}/reinstate` | Zitadel token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/revoke-postgres-access` | Zitadel token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/suspend` | Zitadel token | Tenant admin |
 | GET | `/v1/openapi.json` | none | Public |
 | GET | `/v1/projects` | Zitadel token | Tenant member |
 | POST | `/v1/projects` | Zitadel token | Tenant admin |

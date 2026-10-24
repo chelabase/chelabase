@@ -2,18 +2,19 @@
 //!
 //! [`authorize`] is the one way a handler reaches a project or database for a caller. It
 //! resolves the target (project ← database ← branch), checks that it belongs to the caller's
-//! tenant, reads the caller's grant rows (no cache: a revoke counts on the next request),
-//! computes the effective grant and asks [`decide`]. Each handler passes its own endpoint's
+//! tenant, reads the caller's access sources (no cache: a revoke counts on the next request),
+//! takes their effective access ([`chelabase_types::access::GrantSources::effective`]) and
+//! asks [`decide`]. Each handler passes its own endpoint's
 //! `policy.access`, so `chelabase_routes` stays the single table of who may call what.
 
-use chelabase_metadata::members::{GrantRow, MemberRecord, MemberStatus, OverrideRow};
+use chelabase_metadata::members::{MemberRecord, MemberStatus};
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use chelabase_metadata::{DatabaseRecord, DatabaseStatus, ProjectRecord, RoleLevel, RoleRow};
 use chelabase_types::access::{
-    Access, CallerFacts, Deny, Grant, MemberFacts, Narrowing, PgRole, PlatformRole, Requested,
-    RoleSet, act_as_reserved, decide, effective, tenant_admin_grant,
+    Access, CallerFacts, Deny, Effective, MemberFacts, PgRole, PlatformRole, Requested, RoleSet,
+    act_as_reserved, decide, tenant_admin_effective,
 };
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
@@ -90,9 +91,9 @@ pub struct Authorized {
     /// The project row, for a project target.
     pub project: Option<ProjectRecord>,
     pub project_id: Option<Uuid>,
-    /// The caller's effective grant on the target (a tenant admin's is
-    /// [`tenant_admin_grant`]); `None` below a project or without one.
-    pub grant: Option<Grant>,
+    /// The caller's effective access on the target (a tenant admin's is
+    /// [`tenant_admin_effective`]); `None` below a project or without one.
+    pub grant: Option<Effective>,
     /// The target branch's protection, read for `Branch` routes; `None` when not read or the
     /// branch isn't the database's.
     pub branch_protected: Option<bool>,
@@ -165,6 +166,16 @@ pub fn deny_to_api(d: Deny) -> ApiError {
             ErrorCode::NotAvailableInPlatformMode,
             "not available in platform mode",
         ),
+        Deny::Suspended => ApiError::new(
+            403,
+            ErrorCode::MemberSuspended,
+            "your membership is suspended; ask a tenant admin",
+        ),
+        Deny::Offboarded => ApiError::new(
+            403,
+            ErrorCode::MemberOffboarded,
+            "your account was deactivated, locked or removed in the identity provider; ask a tenant admin",
+        ),
     }
 }
 
@@ -173,19 +184,15 @@ fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
     ApiError::internal()
 }
 
-/// A stored project grant as an access grant (`owner` never stored, R7; an Admin grant is
-/// every role, R17).
-pub(crate) fn grant_of(row: &GrantRow) -> Grant {
-    row.to_grant()
-}
-
-pub(crate) fn narrowing_of(row: &OverrideRow) -> Narrowing {
-    Narrowing {
-        platform_role: row.platform_role,
-        roles: row
-            .pg_roles
-            .as_ref()
-            .map(|roles| roles.iter().map(|r| PgRole::parse(r)).collect()),
+/// The minimum level an act-as route needs of the requested role (D1), as [`decide`] reads it;
+/// `None` for other routes.
+fn act_as_minimum(access: Access, branch_protected: Option<bool>) -> Option<PlatformRole> {
+    match access {
+        Access::ActAs(min) => Some(min),
+        Access::ActAsBranch { unprotected, protected } => {
+            Some(if branch_protected.unwrap_or(true) { protected } else { unprotected })
+        }
+        _ => None,
     }
 }
 
@@ -193,10 +200,14 @@ pub(crate) fn narrowing_of(row: &OverrideRow) -> Narrowing {
 pub(crate) fn member_facts(member: Option<&MemberRecord>) -> MemberFacts {
     match member {
         None => MemberFacts::NotMember,
+        // D7: the identity provider's mark comes before the status (a removed member stays
+        // removed).
+        Some(m) if m.offboarded && m.status != MemberStatus::Removed => MemberFacts::Offboarded,
         Some(m) => match m.status {
             MemberStatus::Invited => MemberFacts::Invited,
             MemberStatus::Pending => MemberFacts::Pending,
             MemberStatus::Removed => MemberFacts::Removed,
+            MemberStatus::Suspended => MemberFacts::Suspended,
             MemberStatus::Active => MemberFacts::Active {
                 tenant_admin: m.tenant_admin,
                 has_any_grant: true,
@@ -244,11 +255,12 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
             ..
         } if needs_project => {
             let member_id = principal.member.as_ref().expect("an active member").id;
+            // T2-4: any access source counts, a team's included.
             let any = state
                 .metadata
-                .member_projects(member_id)
+                .member_grant_sources(principal.tenant_id, member_id)
                 .await
-                .map_err(|err| internal("load member projects", err))?;
+                .map_err(|err| internal("load member grant sources", err))?;
             if any.is_empty() {
                 return Err(answer(Deny::NoAccessYet));
             }
@@ -322,20 +334,15 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
     let mut grant = None;
     if let (MemberFacts::Active { tenant_admin, .. }, Some(project_id)) = (member, project_id) {
         if tenant_admin {
-            grant = Some(tenant_admin_grant());
+            grant = Some(tenant_admin_effective());
         } else {
             let member_id = principal.member.as_ref().expect("an active member").id;
-            let rows = state
+            grant = state
                 .metadata
-                .grant_rows(member_id, project_id, target.database())
+                .grant_sources(member_id, project_id, target.database())
                 .await
-                .map_err(|err| internal("load grants", err))?;
-            grant = rows.project.as_ref().map(|project| {
-                effective(
-                    &grant_of(project),
-                    rows.database.as_ref().map(narrowing_of).as_ref(),
-                )
-            });
+                .map_err(|err| internal("load grants", err))?
+                .effective();
         }
     }
     let caller = CallerFacts {
@@ -363,20 +370,30 @@ pub async fn authorize<M: MetadataPort, J: JobPort>(
     let mut graph: Option<RoleGraph> = None;
     let mut graph_loaded = false;
     if let Err(deny) = decided {
-        // R21: a role reachable through a granted role's chain counts as granted.
-        let allowed_by_chain = match (&deny, act_as_role, grant.as_ref(), record.as_ref()) {
-            (Deny::Forbidden { required }, Some(name), Some(g), Some(r))
+        // R21: a role reachable through a granted role's chain counts as granted, at that
+        // granted role's own level (D1): only roles held at the route's minimum lead on.
+        let min = act_as_minimum(access, branch_protected);
+        let allowed_by_chain = match (&deny, act_as_role, grant.as_ref(), record.as_ref(), min) {
+            (Deny::Forbidden { required }, Some(name), Some(g), Some(r), Some(min))
                 if required.starts_with("role:") && !act_as_reserved(name) =>
             {
                 graph = RoleGraph::load(state, r, target.branch()).await?;
                 graph_loaded = true;
-                graph.as_ref().is_some_and(|gr| gr.chain_grants(&g.roles, name))
+                graph.as_ref().is_some_and(|gr| gr.chain_grants(&g.roles_at_least(min), name))
             }
             _ => false,
         };
         if !allowed_by_chain {
             return Err(answer(deny));
         }
+    }
+
+    // MH-21: a personal login is one member's own identity: nobody acts as it, its member and
+    // tenant admins included.
+    if let (Some(name), Some(r)) = (act_as_role, record.as_ref())
+        && is_personal_login(state, r, name).await?
+    {
+        return Err(answer(Deny::Forbidden { required: format!("role:{name}") }));
     }
 
     // 4. R16, R22, R23 (the single rule, `RoleGraph::refusal`): a role that is, or reaches,
@@ -575,7 +592,7 @@ impl RoleGraph {
     /// owner-level, LOGIN or reserved role contributes nothing. Every role (`All`) already
     /// allows every role it may (R18: never the data API's, which need a grant naming them),
     /// so its chains add nothing.
-    fn chain_grants(&self, granted: &RoleSet, name: &str) -> bool {
+    pub(crate) fn chain_grants(&self, granted: &RoleSet, name: &str) -> bool {
         let RoleSet::Only(set) = granted else {
             return false;
         };
@@ -620,15 +637,44 @@ pub(crate) async fn authorize_key_role<M: MetadataPort, J: JobPort>(
         Requested::Role(name) => name,
     };
     let graph = RoleGraph::load(state, record, Some(branch)).await?;
-    let direct = !act_as_reserved(name) && grant.roles.contains(&PgRole::Named(name.to_string()));
-    let by_chain = !act_as_reserved(name)
-        && graph.as_ref().is_some_and(|g| g.chain_grants(&grant.roles, name));
+    // D1: a key acts as its role on the data API, writes included, so the role (or the granted
+    // role whose chain reaches it) must be held at Developer, the key routes' minimum.
+    let held = grant.roles_at_least(PlatformRole::Developer);
+    let direct = !act_as_reserved(name) && held.contains(&PgRole::Named(name.to_string()));
+    let by_chain = !act_as_reserved(name) && graph.as_ref().is_some_and(|g| g.chain_grants(&held, name));
     if !direct && !by_chain {
         return Err(deny_to_api(Deny::Forbidden { required: format!("role:{name}") }));
     }
     // R33: the single rule, as for act-as.
     if graph.as_ref().is_some_and(|g| g.refusal(name).is_some()) {
         return Err(admin());
+    }
+    Ok(())
+}
+
+/// Whether `name` is a personal login of the database (any status): the generic role routes
+/// treat one as absent (MH-11), act-as and keys refuse it (MH-21, MH-12).
+pub(crate) async fn is_personal_login<M: MetadataPort, J: JobPort>(
+    state: &AppState<M, J>,
+    record: &DatabaseRecord,
+    name: &str,
+) -> Result<bool, ApiError> {
+    state
+        .metadata
+        .is_personal_login_name(record.database_id.as_uuid(), name)
+        .await
+        .map_err(|err| internal("personal login names", err))
+}
+
+/// MH-12: a data key's role can't be a personal login, whoever asks (the worker also revokes
+/// any key bound to one). 403 `forbidden` with `required: role:<name>`, as for act-as.
+pub(crate) async fn refuse_personal_login_key<M: MetadataPort, J: JobPort>(
+    state: &AppState<M, J>,
+    record: &DatabaseRecord,
+    role: &str,
+) -> Result<(), ApiError> {
+    if is_personal_login(state, record, role).await? {
+        return Err(deny_to_api(Deny::Forbidden { required: format!("role:{role}") }));
     }
     Ok(())
 }

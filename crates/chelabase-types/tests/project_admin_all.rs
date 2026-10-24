@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use chelabase_types::access::{effective, tenant_admin_grant, Grant, Narrowing, PgRole, PlatformRole, RoleSet};
+use chelabase_types::access::{tenant_admin_effective, Grant, GrantSources, Narrowing, PgRole, PlatformRole, RoleSet};
 
 fn only(names: &[&str]) -> RoleSet {
     RoleSet::Only(names.iter().map(|n| if *n == "owner" { PgRole::Owner } else { PgRole::Named((*n).to_string()) }).collect())
@@ -15,29 +15,36 @@ fn set(names: &[&str]) -> BTreeSet<PgRole> {
 }
 
 fn admin_all() -> Grant {
-    Grant { platform_role: PlatformRole::Admin, roles: RoleSet::All }
+    Grant { platform_role: PlatformRole::Admin, roles: RoleSet::all() }
+}
+
+/// The effective shape of a project Admin's grant under `db`.
+fn effective(db: Option<Narrowing>) -> Grant {
+    let e = GrantSources::new(Some(admin_all()), Vec::new(), db).effective().expect("a source");
+    Grant { platform_role: e.platform_role, roles: e.roles }
 }
 
 #[test]
 fn a_project_admin_with_every_role_keeps_it_without_an_override() {
-    assert_eq!(effective(&admin_all(), None), admin_all());
+    assert_eq!(effective(None), admin_all());
 }
 
 #[test]
 fn a_roles_override_narrows_a_project_admins_every_role() {
     let roles = Narrowing { platform_role: None, roles: Some(set(&["sales"])) };
-    assert_eq!(effective(&admin_all(), Some(&roles)), Grant { platform_role: PlatformRole::Admin, roles: only(&["owner", "sales"]) });
+    assert_eq!(effective(Some(roles)), Grant { platform_role: PlatformRole::Admin, roles: only(&["owner", "sales"]) });
 }
 
 #[test]
 fn a_level_override_below_admin_without_roles_leaves_no_roles() {
     let dev = Narrowing { platform_role: Some(PlatformRole::Developer), roles: None };
-    assert_eq!(effective(&admin_all(), Some(&dev)), Grant { platform_role: PlatformRole::Developer, roles: only(&[]) });
+    assert_eq!(effective(Some(dev)), Grant { platform_role: PlatformRole::Developer, roles: only(&[]) });
     let both = Narrowing { platform_role: Some(PlatformRole::Developer), roles: Some(set(&["sales"])) };
-    assert_eq!(effective(&admin_all(), Some(&both)), Grant { platform_role: PlatformRole::Developer, roles: only(&["sales"]) });
+    assert_eq!(effective(Some(both)), Grant { platform_role: PlatformRole::Developer, roles: only(&["sales"]) });
 }
 
 #[test]
-fn the_tenant_admin_grant_is_still_admin_with_every_role() {
-    assert_eq!(tenant_admin_grant(), admin_all());
+fn the_tenant_admin_effective_is_still_admin_with_every_role() {
+    let e = tenant_admin_effective();
+    assert_eq!(Grant { platform_role: e.platform_role, roles: e.roles }, admin_all());
 }

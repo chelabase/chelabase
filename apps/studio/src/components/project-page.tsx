@@ -212,12 +212,13 @@ function DatabasesTable({
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
   }
   return (
+    <div className="relative max-w-full overflow-x-auto">
     <table className="w-full text-left text-sm">
       <thead className="border-b text-muted-foreground">
         <tr>
-          <th className="py-2 font-medium">Name</th>
-          <th className="py-2 font-medium">Status</th>
-          <th className="py-2 font-medium">Endpoint</th>
+          <th className="py-2 pr-4 font-medium">Name</th>
+          <th className="py-2 pr-4 font-medium">Status</th>
+          <th className="py-2 pr-4 font-medium">Endpoint</th>
           <th className="py-2 font-medium">Actions</th>
         </tr>
       </thead>
@@ -231,9 +232,9 @@ function DatabasesTable({
           <ProjectCapsContext.Provider key={db.database_id} value={dbCaps}>
           <Fragment>
             <tr className="border-b last:border-0">
-              <td className="py-2">{db.name}</td>
-              <td className="py-2">{db.status}</td>
-              <td className="py-2 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
+              <td className="py-2 pr-4">{db.name}</td>
+              <td className="py-2 pr-4">{db.status}</td>
+              <td className="py-2 pr-4 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
               <td className="py-2">
                 <div className="flex flex-wrap items-start gap-2">
                   <DatabaseActions database={db} />
@@ -319,5 +320,6 @@ function DatabasesTable({
         })}
       </tbody>
     </table>
+    </div>
   );
 }

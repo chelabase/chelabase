@@ -1,16 +1,20 @@
 //! One operation's statements. Every function validates the names it renders and returns
 //! [`DdlErrorKind`]; `render` attaches the operation index.
 
+use std::collections::BTreeSet;
+
+use chelabase_types::access::{act_as_reserved, data_api_role};
 use chelabase_types::table_api::{
     ColumnChange, ColumnSpec, CommentChange, ConstraintKindSpec, ConstraintSpec, CreateTable,
-    DefaultChange, EnumPosition, FkAction, Grantee, IdentityChange, IdentityKind, IndexKey,
-    IndexSpec, LockLevel, NullsOrder, Operation, PolicyCommandSpec, PolicySpec, Privilege,
-    TableGrant, TableRef, TypeSpec,
+    DefaultChange, DefaultObject, EnumPosition, FkAction, Grantee, IdentityChange, IdentityKind,
+    IndexKey, IndexSpec, LockLevel, NullsOrder, Operation, PolicyCommandSpec, PolicySpec,
+    Privilege, PrivilegeName, SchemaPrivilege, SequencePrivilege, TableGrant, TableRef, TypeSpec,
 };
 
 use super::{DdlErrorKind, RenderContext};
 use crate::model::{Column, Grant, Index, NamedRole, Oid, Policy, PolicyCommand, RoleRef};
 use crate::plan::ddl as merge;
+use crate::privileges::{ALL_ROWS_MARKER, all_rows_policy_name};
 use crate::sql::{ident, literal, qualified};
 
 type R<T> = Result<T, DdlErrorKind>;
@@ -57,17 +61,35 @@ pub(super) fn concurrent(op: &Operation) -> bool {
 }
 
 /// `catalog_current`: no earlier operation of the request changed what `ctx` says about the
-/// operation's objects (otherwise a column's current type is unknown).
+/// operation's objects (otherwise a column's current type is unknown). The operation alone in
+/// its request (see [`operation_in`]).
+#[cfg(test)]
 pub(super) fn operation(
     op: &Operation,
     ctx: &RenderContext,
     catalog_current: bool,
 ) -> R<Vec<Stmt>> {
+    operation_in(op, ctx, catalog_current, &mut AllRowsOverlay::default())
+}
+
+/// [`operation`] as one of a request's operations: `all_rows` carries what the request's
+/// earlier `SetAllRows` ops left (T4-3).
+pub(super) fn operation_in(
+    op: &Operation,
+    ctx: &RenderContext,
+    catalog_current: bool,
+    all_rows: &mut AllRowsOverlay,
+) -> R<Vec<Stmt>> {
     use LockLevel::{AccessExclusive, ShareRowExclusive, ShareUpdateExclusive};
+    if let Some(schema) = privilege_op_schema(op)
+        && super::hidden_schema(schema)
+    {
+        return Err(DdlErrorKind::HiddenSchema(schema.to_string()));
+    }
     let drop_behaviour = if ctx.cascade { "CASCADE" } else { "RESTRICT" };
     let one = |table: &TableRef, lock: LockLevel, sql: String| Ok(vec![Stmt::on(table, lock, sql)]);
     match op {
-        Operation::CreateTable(c) => create_table(c),
+        Operation::CreateTable(c) => create_table(c, ctx),
         Operation::RenameTable { table, to } => one(
             table,
             AccessExclusive,
@@ -301,14 +323,22 @@ pub(super) fn operation(
             AccessExclusive,
             format!("DROP POLICY {} ON {}", name_q(policy)?, table_q(table)?),
         ),
-        Operation::Grant { table, grant } => Ok(grant_statements(grant, &table_q(table)?)?
-            .into_iter()
-            .map(|sql| Stmt::on(table, LockLevel::None, sql))
-            .collect()),
-        Operation::Revoke { table, grant } => Ok(revoke_statements(grant, &table_q(table)?)?
-            .into_iter()
-            .map(|sql| Stmt::on(table, LockLevel::None, sql))
-            .collect()),
+        Operation::Grant { table, grant } => {
+            let tq = table_q(table)?;
+            check_table_grant(grant, false, ctx)?;
+            Ok(grant_statements(grant, &tq)?
+                .into_iter()
+                .map(|sql| Stmt::on(table, LockLevel::None, sql))
+                .collect())
+        }
+        Operation::Revoke { table, grant } => {
+            let tq = table_q(table)?;
+            check_table_grant(grant, true, ctx)?;
+            Ok(revoke_statements(grant, &tq)?
+                .into_iter()
+                .map(|sql| Stmt::on(table, LockLevel::None, sql))
+                .collect())
+        }
         Operation::CreateEnum {
             schema,
             name: e,
@@ -381,7 +411,408 @@ pub(super) fn operation(
                 qualified(name(schema)?, name(e)?)
             ),
         )]),
+        Operation::GrantSchema {
+            schema,
+            grantee,
+            privileges,
+        } => {
+            let on = format!("SCHEMA {}", name_q(schema)?);
+            let names: Vec<&str> = privileges.iter().map(|p| schema_privilege(*p)).collect();
+            off_statements(object_grants(&names, grantee, ctx, &on, Revoking::No)?)
+        }
+        Operation::RevokeSchema {
+            schema,
+            grantee,
+            privileges,
+            grant_option_only,
+        } => {
+            let on = format!("SCHEMA {}", name_q(schema)?);
+            let names: Vec<&str> = privileges.iter().map(|p| schema_privilege(*p)).collect();
+            off_statements(object_grants(
+                &names,
+                grantee,
+                ctx,
+                &on,
+                Revoking::Yes(*grant_option_only),
+            )?)
+        }
+        Operation::GrantSequence {
+            sequence,
+            grantee,
+            privileges,
+        } => {
+            let on = format!("SEQUENCE {}", table_q(sequence)?);
+            let names: Vec<&str> = privileges.iter().map(|p| sequence_privilege(*p)).collect();
+            off_statements(object_grants(&names, grantee, ctx, &on, Revoking::No)?)
+        }
+        Operation::RevokeSequence {
+            sequence,
+            grantee,
+            privileges,
+            grant_option_only,
+        } => {
+            let on = format!("SEQUENCE {}", table_q(sequence)?);
+            let names: Vec<&str> = privileges.iter().map(|p| sequence_privilege(*p)).collect();
+            off_statements(object_grants(
+                &names,
+                grantee,
+                ctx,
+                &on,
+                Revoking::Yes(*grant_option_only),
+            )?)
+        }
+        Operation::GrantFunction { function, grantee } => {
+            let on = format!("ROUTINE {}", resolved_function(ctx, function.oid)?);
+            off_statements(object_grants(&["EXECUTE"], grantee, ctx, &on, Revoking::No)?)
+        }
+        Operation::RevokeFunction {
+            function,
+            grantee,
+            grant_option_only,
+        } => {
+            let on = format!("ROUTINE {}", resolved_function(ctx, function.oid)?);
+            off_statements(object_grants(
+                &["EXECUTE"],
+                grantee,
+                ctx,
+                &on,
+                Revoking::Yes(*grant_option_only),
+            )?)
+        }
+        Operation::AlterDefaultPrivileges {
+            for_role,
+            schema,
+            object,
+            grant,
+            grantee,
+            privileges,
+        } => off_statements(default_privileges(
+            for_role, schema, *object, *grant, grantee, privileges, ctx,
+        )?),
+        Operation::SetAllRows {
+            table,
+            role: r,
+            enabled,
+        } => set_all_rows(table, r, *enabled, ctx, all_rows),
     }
+}
+
+/// The schema a privilege op names (T4-5); `None` for the other ops and for function ops
+/// (named by OID: the orchestrator checks their schema).
+pub fn privilege_op_schema(op: &Operation) -> Option<&str> {
+    match op {
+        Operation::Grant { table, .. }
+        | Operation::Revoke { table, .. }
+        | Operation::SetAllRows { table, .. } => Some(&table.schema),
+        Operation::GrantSequence { sequence, .. } | Operation::RevokeSequence { sequence, .. } => {
+            Some(&sequence.schema)
+        }
+        Operation::GrantSchema { schema, .. }
+        | Operation::RevokeSchema { schema, .. }
+        | Operation::AlterDefaultPrivileges { schema, .. } => Some(schema),
+        _ => None,
+    }
+}
+
+/// Whether a privilege statement grants or revokes (and then whether only the grant option).
+#[derive(Clone, Copy)]
+enum Revoking {
+    No,
+    Yes(bool),
+}
+
+/// Statements on no table of the request (schemas, sequences, routines, default privileges).
+fn off_statements(sqls: Vec<String>) -> R<Vec<Stmt>> {
+    Ok(sqls
+        .into_iter()
+        .map(|sql| Stmt::off(LockLevel::None, sql))
+        .collect())
+}
+
+pub(crate) fn schema_privilege(p: SchemaPrivilege) -> &'static str {
+    match p {
+        SchemaPrivilege::Usage => "USAGE",
+        SchemaPrivilege::Create => "CREATE",
+    }
+}
+
+pub(crate) fn sequence_privilege(p: SequencePrivilege) -> &'static str {
+    match p {
+        SequencePrivilege::Usage => "USAGE",
+        SequencePrivilege::Select => "SELECT",
+        SequencePrivilege::Update => "UPDATE",
+    }
+}
+
+/// The server's `regprocedure` text for `oid` (P11): the client's `identity` never reaches SQL.
+fn resolved_function(ctx: &RenderContext, oid: u32) -> R<&str> {
+    ctx.resolved_functions
+        .get(&oid)
+        .map(String::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or(DdlErrorKind::UnresolvedFunction(oid))
+}
+
+/// A privilege op's grantee (MH-28, S5): `PUBLIC` only in a revoke; a role must be a plain role
+/// name ([`role`]) the allow-list ([`super::privilege_grantee`]) takes, with the session role as
+/// the owner.
+fn privilege_grantee_ref(g: &Grantee, revoking: bool, ctx: &RenderContext) -> R<RoleRef> {
+    match g {
+        Grantee::Public if revoking => Ok(RoleRef::Public),
+        Grantee::Public => Err(DdlErrorKind::GranteeNotAllowed("PUBLIC".to_string())),
+        Grantee::Role(r) => {
+            let r = role(r)?;
+            super::privilege_grantee(r, &ctx.session_role)?;
+            Ok(RoleRef::Role {
+                oid: Oid(0),
+                name: r.to_string(),
+            })
+        }
+    }
+}
+
+/// One `GRANT`/`REVOKE` per privilege on `on` (`SCHEMA s`, `SEQUENCE s.q`, `ROUTINE f(…)`), with
+/// no grant option (MH-29).
+fn object_grants(
+    privileges: &[&str],
+    grantee: &Grantee,
+    ctx: &RenderContext,
+    on: &str,
+    revoking: Revoking,
+) -> R<Vec<String>> {
+    if privileges.is_empty() {
+        return Err(DdlErrorKind::Empty("privileges"));
+    }
+    let grantee = privilege_grantee_ref(grantee, matches!(revoking, Revoking::Yes(_)), ctx)?;
+    privileges
+        .iter()
+        .map(|p| {
+            let model = Grant {
+                grantor: NamedRole {
+                    oid: Oid(0),
+                    name: String::new(),
+                },
+                grantee: grantee.clone(),
+                privilege: (*p).to_string(),
+                grantable: false,
+            };
+            match revoking {
+                Revoking::No => merge::grant_sql(&model, on, None),
+                Revoking::Yes(option_only) => merge::revoke_sql(&model, on, None, option_only),
+            }
+            .ok_or(DdlErrorKind::Unsupported("privilege"))
+        })
+        .collect()
+}
+
+/// `MAINTAIN` exists from Postgres 17 (an unknown version, 0, counts as older).
+fn maintain_supported(ctx: &RenderContext) -> R<()> {
+    if ctx.server_version_num < 170_000 {
+        Err(DdlErrorKind::PrivilegeNotSupported("MAINTAIN"))
+    } else {
+        Ok(())
+    }
+}
+
+/// The table `Grant`/`Revoke` (and `CreateTable.grants`) checks: privileges first, then the
+/// grantee allow-list (S5), no grant option on a grant (S21), `MAINTAIN` by server version.
+pub(super) fn check_table_grant(g: &TableGrant, revoking: bool, ctx: &RenderContext) -> R<()> {
+    if g.privileges.is_empty() {
+        return Err(DdlErrorKind::Empty("privileges"));
+    }
+    privilege_grantee_ref(&g.grantee, revoking, ctx)?;
+    if !revoking && g.with_grant_option {
+        return Err(DdlErrorKind::Unsupported(
+            "with_grant_option: a grant never carries the grant option",
+        ));
+    }
+    if g.privileges.contains(&Privilege::Maintain) {
+        maintain_supported(ctx)?;
+    }
+    Ok(())
+}
+
+/// `ALTER DEFAULT PRIVILEGES FOR ROLE r IN SCHEMA s GRANT|REVOKE p ON <objects> TO|FROM g`, one
+/// per privilege. `FOR ROLE` is the session role or a role outside the reserved names (MH-28);
+/// each privilege must exist for the object kind.
+fn default_privileges(
+    for_role: &str,
+    schema: &str,
+    object: DefaultObject,
+    grant: bool,
+    grantee: &Grantee,
+    privileges: &[PrivilegeName],
+    ctx: &RenderContext,
+) -> R<Vec<String>> {
+    if privileges.is_empty() {
+        return Err(DdlErrorKind::Empty("privileges"));
+    }
+    let schema_q = name_q(schema)?;
+    let for_role = name(for_role)?;
+    // An empty session role is not known yet (the orchestrator's check before any compute):
+    // a reserved name may then still be the session role (the database owner's real name), so
+    // only what never is one is refused; the render in the transaction checks the rest.
+    let reserved = !ctx.session_role.is_empty() && act_as_reserved(for_role);
+    if for_role != ctx.session_role
+        && (reserved || data_api_role(for_role) || role(for_role).is_err())
+    {
+        return Err(DdlErrorKind::ForRoleNotAllowed(for_role.to_string()));
+    }
+    let grantee = merge::role_ref(&privilege_grantee_ref(grantee, !grant, ctx)?);
+    let objects = match object {
+        DefaultObject::Tables => "TABLES",
+        DefaultObject::Sequences => "SEQUENCES",
+        DefaultObject::Functions => "FUNCTIONS",
+    };
+    privileges
+        .iter()
+        .map(|p| {
+            let keyword = default_privilege(object, *p).ok_or(DdlErrorKind::Unsupported(
+                "a privilege the default privileges' object kind doesn't have",
+            ))?;
+            if *p == PrivilegeName::Maintain {
+                maintain_supported(ctx)?;
+            }
+            let head = format!(
+                "ALTER DEFAULT PRIVILEGES FOR ROLE {} IN SCHEMA {schema_q}",
+                ident(for_role)
+            );
+            Ok(if grant {
+                format!("{head} GRANT {keyword} ON {objects} TO {grantee}")
+            } else {
+                format!("{head} REVOKE {keyword} ON {objects} FROM {grantee}")
+            })
+        })
+        .collect()
+}
+
+/// The SQL keyword of `p`.
+pub(crate) fn privilege_name_keyword(p: PrivilegeName) -> &'static str {
+    use PrivilegeName as P;
+    match p {
+        P::Select => "SELECT",
+        P::Insert => "INSERT",
+        P::Update => "UPDATE",
+        P::Delete => "DELETE",
+        P::Truncate => "TRUNCATE",
+        P::References => "REFERENCES",
+        P::Trigger => "TRIGGER",
+        P::Maintain => "MAINTAIN",
+        P::Usage => "USAGE",
+        P::Execute => "EXECUTE",
+    }
+}
+
+/// The keyword of `p` when `object` has it.
+fn default_privilege(object: DefaultObject, p: PrivilegeName) -> Option<&'static str> {
+    use PrivilegeName as P;
+    let keyword = privilege_name_keyword(p);
+    let has = match object {
+        DefaultObject::Tables => !matches!(p, P::Usage | P::Execute),
+        DefaultObject::Sequences => matches!(p, P::Usage | P::Select | P::Update),
+        DefaultObject::Functions => matches!(p, P::Execute),
+    };
+    has.then_some(keyword)
+}
+
+/// T4-3: what the request's earlier `SetAllRows` ops left on each table they touched.
+#[derive(Default)]
+pub(super) struct AllRowsOverlay {
+    /// (schema, table) → its policy names and the hub's policies per role, after the earlier
+    /// ops.
+    tables: std::collections::BTreeMap<(String, String), TableAllRows>,
+}
+
+struct TableAllRows {
+    /// Every policy name on the table.
+    taken: BTreeSet<String>,
+    /// Role → the names of its hub "all rows" policies.
+    ours: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// The hub's "all rows" policy for `role` (MH-26): a permissive `FOR ALL` policy whose only
+/// role is `role`, `USING (true) WITH CHECK (true)`, commented with [`ALL_ROWS_MARKER`].
+pub(crate) fn is_all_rows_policy(p: &Policy, role: &str) -> bool {
+    p.permissive
+        && p.command == PolicyCommand::All
+        && matches!(p.roles.as_slice(), [RoleRef::Role { name, .. }] if name == role)
+        && p.using.as_deref().map(str::trim) == Some("true")
+        && p.with_check.as_deref().map(str::trim) == Some("true")
+        && p.comment.as_deref() == Some(ALL_ROWS_MARKER)
+}
+
+/// On: `CREATE POLICY` of that shape under a name none of the table's policies has, plus the
+/// marker comment; nothing when the table already has one. Off: `DROP POLICY` of each policy of
+/// exactly that shape and marker, whatever its name (a user's own policies are never touched).
+///
+/// T4-3: earlier `SetAllRows` ops of the same request are taken into account through
+/// `overlay`, so a request ends as its last toggle on a (table, role) says.
+fn set_all_rows(
+    table: &TableRef,
+    r: &str,
+    enabled: bool,
+    ctx: &RenderContext,
+    overlay: &mut AllRowsOverlay,
+) -> R<Vec<Stmt>> {
+    let tq = table_q(table)?;
+    let r = role(r)?;
+    super::privilege_grantee(r, &ctx.session_role)?;
+    let policies: &[Policy] = ctx
+        .table(table)
+        .map_or(&[], |t| t.table.policies.as_slice());
+    let state = overlay
+        .tables
+        .entry((table.schema.clone(), table.name.clone()))
+        .or_insert_with(|| TableAllRows {
+            taken: policies.iter().map(|p| p.name.clone()).collect(),
+            ours: Default::default(),
+        });
+    let TableAllRows { taken, ours } = state;
+    let ours = ours.entry(r.to_string()).or_insert_with(|| {
+        policies
+            .iter()
+            .filter(|p| is_all_rows_policy(p, r))
+            .map(|p| p.name.clone())
+            .collect()
+    });
+    let stmt = |sql: String| Stmt::on(table, LockLevel::AccessExclusive, sql);
+    if !enabled {
+        let drops = ours
+            .iter()
+            .map(|p| Ok(stmt(format!("DROP POLICY {} ON {tq}", name_q(p)?))))
+            .collect::<R<Vec<_>>>()?;
+        for p in std::mem::take(ours) {
+            taken.remove(&p);
+        }
+        return Ok(drops);
+    }
+    if !ours.is_empty() {
+        return Ok(Vec::new());
+    }
+    let policy_name = all_rows_policy_name(r, taken);
+    ours.push(policy_name.clone());
+    taken.insert(policy_name.clone());
+    let model = Policy {
+        oid: Oid(0),
+        name: name(&policy_name)?.to_string(),
+        command: PolicyCommand::All,
+        permissive: true,
+        roles: vec![RoleRef::Role {
+            oid: Oid(0),
+            name: r.to_string(),
+        }],
+        using: Some("true".to_string()),
+        with_check: Some("true".to_string()),
+        comment: None,
+    };
+    Ok(vec![
+        stmt(merge::create_policy(&model, &tq)),
+        stmt(merge::comment(
+            "POLICY",
+            &format!("{} ON {tq}", ident(&policy_name)),
+            &Some(ALL_ROWS_MARKER.to_string()),
+        )),
+    ])
 }
 
 /// An enum label: a name (non-empty, at most 63 bytes, no NUL), rendered as a literal.
@@ -745,7 +1176,7 @@ pub(super) fn policy_sql(p: &PolicySpec, table_q: &str) -> R<String> {
     Ok(merge::create_policy(&model, table_q))
 }
 
-fn privilege_keyword(p: Privilege) -> &'static str {
+pub(crate) fn privilege_keyword(p: Privilege) -> &'static str {
     match p {
         Privilege::Select => "SELECT",
         Privilege::Insert => "INSERT",
@@ -822,7 +1253,7 @@ fn column_comment(table_q: &str, column: &str, text: &Option<String>) -> R<Strin
     ))
 }
 
-fn create_table(c: &CreateTable) -> R<Vec<Stmt>> {
+fn create_table(c: &CreateTable, ctx: &RenderContext) -> R<Vec<Stmt>> {
     let tq = table_q(&c.table)?;
     if c.columns.is_empty() {
         return Err(DdlErrorKind::Empty("columns"));
@@ -859,6 +1290,7 @@ fn create_table(c: &CreateTable) -> R<Vec<Stmt>> {
         sqls.push(policy_sql(p, &tq)?);
     }
     for g in &c.grants {
+        check_table_grant(g, false, ctx)?;
         sqls.extend(grant_statements(g, &tq)?);
     }
     if let Some(owner) = &c.owner {

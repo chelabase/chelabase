@@ -330,6 +330,9 @@ impl MetadataClient {
         .bind(&started)
         .execute(&mut *tx)
         .await?;
+        // EOS-6: the project is deleting, so no login on any of its databases qualifies.
+        let all: Vec<uuid::Uuid> = databases.iter().map(|(db, _)| *db).collect();
+        crate::personal_logins::revoke_database_logins(&mut tx, &all).await?;
         tx.commit().await?;
         Ok(BeginProjectDelete::Started(started.into_iter().map(DatabaseId).collect()))
     }
@@ -400,6 +403,16 @@ impl MetadataClient {
         .bind(id.as_uuid())
         .execute(&mut *tx)
         .await?;
+        // EOS-6: any login still live on the project's databases goes with it. The database
+        // rows are locked first, so a create in flight (which locks its database `FOR SHARE`)
+        // is waited for or waits.
+        let databases: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT id FROM databases WHERE project_id = $1 ORDER BY id FOR NO KEY UPDATE",
+        )
+        .bind(id.as_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        crate::personal_logins::revoke_database_logins(&mut tx, &databases).await?;
         tx.commit().await?;
         Ok(())
     }

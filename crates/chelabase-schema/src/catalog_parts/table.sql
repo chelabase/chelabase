@@ -124,12 +124,16 @@
         'permissive', p.polpermissive,
         'roles', (SELECT coalesce(jsonb_agg(jsonb_build_object('oid', pr.r::int8, 'name', rr.rolname)
                     ORDER BY pr.r), '[]'::jsonb)
-                  FROM unnest(p.polroles) pr(r) LEFT JOIN pg_roles rr ON rr.oid = pr.r),
+                  FROM unnest(p.polroles) pr(r) LEFT JOIN pg_roles rr ON rr.oid = pr.r
+                  WHERE pr.r NOT IN (SELECT oid FROM hidden)),
         'using', pg_get_expr(p.polqual, p.polrelid),
         'with_check', pg_get_expr(p.polwithcheck, p.polrelid),
         'comment', obj_description(p.oid, 'pg_policy')
       ) ORDER BY p.polname), '[]'::jsonb)
       FROM pg_policy p
       WHERE p.polrelid = t.oid
+        -- T4-7: a policy's roles get the ACL grantees' exclusion; one whose every role is
+        -- hidden isn't listed (an empty list would read as TO PUBLIC).
+        AND EXISTS (SELECT FROM unnest(p.polroles) pr(r) WHERE pr.r NOT IN (SELECT oid FROM hidden))
         AND NOT (t.is_users AND p.polname IN ('chelabase_users_select_own', 'chelabase_users_update_own')))
   )

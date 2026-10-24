@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Member page</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible+Next:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="comp.css">
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs><symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol><symbol id="i-box" viewBox="0 0 24 24"><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></symbol><symbol id="i-table" viewBox="0 0 24 24"><path d="M9 3H5a2 2 0 0 0-2 2v4m6-6h10a2 2 0 0 1 2 2v4M9 3v18m0 0h10a2 2 0 0 0 2-2V9M9 21H5a2 2 0 0 1-2-2V9m0 0h18"/></symbol><symbol id="i-book" viewBox="0 0 24 24"><path d="M12 7v14"/><path d="M16 12h2"/><path d="M16 8h2"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/><path d="M6 12h2"/><path d="M6 8h2"/></symbol><symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/></symbol><symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol><symbol id="i-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol><symbol id="i-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol><symbol id="i-lock" viewBox="0 0 24 24"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></symbol><symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol><symbol id="i-grid" viewBox="0 0 24 24"><rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/></symbol><symbol id="i-list" viewBox="0 0 24 24"><path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/></symbol><symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14"/><path d="M12 5v14"/></symbol><symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></symbol><symbol id="i-copy" viewBox="0 0 24 24"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></symbol><symbol id="i-key" viewBox="0 0 24 24"><path d="M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"/><circle cx="16.5" cy="7.5" r=".5"/></symbol><symbol id="i-back" viewBox="0 0 24 24"><path d="m12 19-7-7 7-7"/><path d="M19 12H5"/></symbol><symbol id="i-user" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="10" r="3"/><path d="M7 20.662V19a2 2 0 0 1 2-2h6a2 2 0 0 1 2 2v1.662"/></symbol><symbol id="i-pclose" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/><path d="m8 9 3 3-3 3"/></symbol><symbol id="i-sidebar" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></symbol><symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 12h16"/><path d="M4 6h16"/><path d="M4 18h16"/></symbol><symbol id="i-renew" viewBox="0 0 24 24"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></symbol><symbol id="i-cols" viewBox="0 0 24 24"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/><path d="M15 3v18"/></symbol><symbol id="i-ext" viewBox="0 0 24 24"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol></defs></svg>
+<a class="sr" href="#content">Skip to content</a>
+<div class="shell">
+  <aside class="rail" aria-label="Studio"><div class="rail-in">
+    <div class="home"><span class="mark" aria-label="Chelabase"></span></div>
+    <nav>
+      <a class="item" href="#" title="Projects"><svg class="i " aria-hidden="true"><use href="#i-box"/></svg></a>
+      <a class="item" href="#" title="Table editor"><svg class="i " aria-hidden="true"><use href="#i-table"/></svg></a>
+      <a class="item" href="#" title="API reference"><svg class="i " aria-hidden="true"><use href="#i-book"/></svg></a>
+      <a class="item on" href="#" aria-current="page" title="Members, 1 request waiting"><svg class="i " aria-hidden="true"><use href="#i-users"/></svg></a>
+    </nav>
+    <div class="foot"><svg class="i " aria-hidden="true"><use href="#i-sidebar"/></svg></div>
+  </div></aside>
+  <div class="col">
+    <header class="topbar">
+      <button class="btn icon ghost menu-btn" aria-label="Menu"><svg class="i " aria-hidden="true"><use href="#i-menu"/></svg></button>
+      <div class="crumbs"><span>Members</span><svg class="i s14" aria-hidden="true"><use href="#i-right"/></svg><b>Sofia Marchetti</b></div>
+      <div class="acct"><svg class="i " aria-hidden="true"><use href="#i-user"/></svg><span>Mara Okafor</span></div>
+    </header>
+    <main class="main" id="content"><div class="page"><a class="back" href="01-roster-cards.html"><svg class="i s16" aria-hidden="true"><use href="#i-back"/></svg>Members</a>
+<div class="mhead">
+  <div class="id"><span class="av lg">SM</span><div style="min-width:0">
+    <h1>Sofia Marchetti</h1>
+    <div class="facts"><span>sofia@northwind.dev</span><span class="tag">Developer</span><span>Active</span><span>Joined 9 May 2026</span></div>
+  </div></div>
+  <div class="acts"><button class="btn outline">Make tenant admin</button><button class="btn outline"><svg class="i s16" aria-hidden="true"><use href="#i-key"/></svg>Revoke Postgres access now</button><button class="btn danger">Suspend</button><button class="btn icon outline" aria-label="More actions for Sofia Marchetti"><svg class="i s16" aria-hidden="true"><use href="#i-more"/></svg></button></div>
+</div>
+<section class="section"><div class="sh"><div><h2>Project access</h2><p class="note dim">Each project's platform role and the Postgres roles Sofia may act as. Each card saves on its own.</p></div></div>
+
+<div class="gcard">
+  <div class="gh"><h3>Billing app</h3><span class="dim note">billing-prod, billing-dev</span></div>
+  <div class="gb">
+    <div><div class="flabel">Platform role</div><div class="seg" role="radiogroup" aria-label="Platform role"><span role="radio" aria-checked="false" class="">No access</span><span role="radio" aria-checked="false" class="">Viewer</span><span role="radio" aria-checked="true" class="on">Developer</span><span role="radio" aria-checked="false" class="">Admin</span></div><p class="note dim" style="margin-top:6px">Runs SQL and edits data as the roles below, shares saved queries, manages app users and unprotected branches.</p></div>
+    <div><div class="flabel">Postgres roles <span>Checked roles come first; a role's chain comes with it</span></div><div class="check" role="group" aria-label="Postgres roles on Billing app">
+  <div class="cf"><span class="field"><svg class="i s16 dim" aria-hidden="true"><use href="#i-search"/></svg><span class="ph">Filter 9 roles</span></span></div>
+  <div class="ci "><span class="cb on" role="checkbox" aria-checked="true" aria-label="billing_editor"></span><span class="rn">billing_editor</span><span class="gives">also gives <span class="mono">billing_reader</span></span><span class="r"></span></div>
+  <div class="ci "><span class="cb on" role="checkbox" aria-checked="true" aria-label="billing_reader"></span><span class="rn">billing_reader</span><span class="r"></span></div>
+  <div class="ci locked"><span class="cb on dis" role="checkbox" aria-checked="true" aria-label="support_agent"></span><span class="rn">support_agent</span><span class="r"><svg class="i s12" aria-hidden="true"><use href="#i-lock"/></svg><span>via <a href="#">Support team</a></span><span class="tag">step 2</span></span></div>
+  <div class="ci off"><span class="cb " role="checkbox" aria-checked="false" aria-label="reports_reader"></span><span class="rn">reports_reader</span><span class="r">only on billing-prod</span></div>
+  <div class="ci off"><span class="cb " role="checkbox" aria-checked="false" aria-label="refunds‮review"></span><span class="rn">refunds<span class="esc" title="U+202E">\u202e</span>review</span><span class="r">only on billing-prod</span></div>
+  <div class="ci off"><span class="cb " role="checkbox" aria-checked="false" aria-label="webhook_worker"></span><span class="rn">webhook_worker</span><span class="gives">also gives <span class="mono">billing_reader</span></span><span class="r"></span></div>
+  <div class="sub">Admin only</div>
+  <div class="ci off"><span class="cb dis" role="checkbox" aria-checked="false" aria-label="billing_admin"></span><span class="rn">billing_admin</span><span class="r">Reaches <span class="mono">billing_owner</span>, which is owner-level</span></div>
+  <div class="ci off"><span class="cb dis" role="checkbox" aria-checked="false" aria-label="migrator"></span><span class="rn">migrator</span><span class="r">LOGIN role</span></div>
+  <div class="ci off"><span class="cb dis" role="checkbox" aria-checked="false" aria-label="audit_bypass"></span><span class="rn">audit_bypass</span><span class="r">Bypasses RLS</span></div>
+</div></div>
+    <div class="disclose"><svg class="i s16" aria-hidden="true"><use href="#i-right"/></svg><b>Narrow on a database</b><span>Same on billing-prod and billing-dev</span></div>
+  </div>
+  <div class="gf"><span class="eff">Effective: <b>Developer</b> · <span class="mono">billing_editor, billing_reader</span> (+ <span class="mono">support_agent</span> via Support team)</span><button class="btn sm danger">Take access away</button><button class="btn sm primary" disabled>Save</button></div>
+</div>
+<div class="gcard dirty">
+  <div class="gh"><h3>Data warehouse</h3><span class="dim note">warehouse</span><span style="margin-left:auto" class="line"><span class="sq sand"></span>Unsaved changes</span></div>
+  <div class="gb">
+    <div><div class="flabel">Platform role</div><div class="seg" role="radiogroup" aria-label="Platform role"><span role="radio" aria-checked="false" class="">No access</span><span role="radio" aria-checked="false" class="">Viewer</span><span role="radio" aria-checked="true" class="on">Developer</span><span role="radio" aria-checked="false" class="">Admin</span></div></div>
+    <div><div class="flabel">Postgres roles</div><div class="check" role="group" aria-label="Postgres roles on Data warehouse">
+  <div class="ci "><span class="cb on" role="checkbox" aria-checked="true" aria-label="reports_reader"></span><span class="rn">reports_reader</span></div>
+  <div class="ci pend"><span class="cb on" role="checkbox" aria-checked="true" aria-label="etl_writer"></span><span class="rn">etl_writer</span><span class="gives">also gives <span class="mono">staging_reader</span></span></div>
+  <div class="ci off"><span class="cb " role="checkbox" aria-checked="false" aria-label="staging_reader"></span><span class="rn">staging_reader</span></div>
+  <div class="ci off"><span class="cb " role="checkbox" aria-checked="false" aria-label="analyst"></span><span class="rn">analyst</span><span class="gives">also gives <span class="mono">reports_reader</span></span></div>
+</div></div>
+    <div class="disclose"><svg class="i s16" aria-hidden="true"><use href="#i-right"/></svg><b>Narrow on a database</b><span>Narrowed on warehouse: Viewer, <span class="mono">reports_reader</span> only</span></div>
+  </div>
+  <div class="gf"><span class="eff">Effective: <b>Developer</b> · <span class="mono">reports_reader, etl_writer</span> (+ <span class="mono">staging_reader</span>)</span><button class="btn sm ghost">Discard</button><button class="btn sm primary">Save</button></div>
+</div>
+<div class="gcard" style="border-style:dashed;border-color:var(--line-strong)">
+  <div class="gh add-row" style="border:0"><h3 style="font-weight:500">Add access to a project</h3><span class="dim note">Sofia has no access on Ops console</span>
+  <span style="margin-left:auto;display:flex;gap:8px"><span class="field select" style="width:180px;height:32px"><span class="v">Ops console</span><svg class="i s16 dim" aria-hidden="true"><use href="#i-down"/></svg></span><button class="btn outline sm"><svg class="i s16" aria-hidden="true"><use href="#i-plus"/></svg>Add</button></span></div>
+</div></section>
+<section class="section"><div class="sh"><div><h2>Personal Postgres logins</h2><p class="note dim">Sofia's own logins, one per database, for psql and other clients.</p></div></div>
+<div class="wrap"><table class="grid"><thead><tr><th>Database</th><th>Login</th><th>Expires</th><th class="hide-sm">Created</th><th></th></tr></thead><tbody>
+<tr><td>billing-prod<div class="dim label">Billing app</div></td><td class="mono">sofia</td><td class="note"><span class="line"><span class="sq coral-o"></span>in 9 days · 1 Nov</span></td><td class="hide-sm dim note">3 Aug 2026</td>
+<td style="text-align:right;white-space:nowrap"><button class="btn sm ghost">Delete</button></td></tr><tr><td>warehouse<div class="dim label">Data warehouse</div></td><td class="mono">sofia_m</td><td class="note">in 71 days · 2 Jan 2027</td><td class="hide-sm dim note">23 Oct 2026</td>
+<td style="text-align:right;white-space:nowrap"><button class="btn sm ghost">Delete</button></td></tr><tr><td><span class="dim">ops</span><div class="dim label">Ops console</div></td><td class="mono dim">sofia</td><td class="note"><span class="dim">Revoked 12 Oct: access to Ops console was taken away</span></td><td class="hide-sm dim note">6 Jun 2026</td>
+<td style="text-align:right;white-space:nowrap"><button class="btn sm ghost">Delete</button></td></tr>
+</tbody></table></div>
+<p class="note dim" style="margin-top:10px">Only Sofia can create, reset or renew her logins. Expiring soon: <span class="mono">sofia</span> on billing-prod, 1 Nov.</p>
+<p class="note dim" style="margin-top:8px">A login works on every branch of its database where Sofia has Developer access or more. Connection strings are for the main branch; on another branch, use that branch's host.</p></section>
+<section class="section"><div class="sh"><div><h2>Activity</h2><p class="note dim">Changes to Sofia's access made through Chelabase.</p></div></div><div class="events">
+  <div class="ev"><time title="2026-10-23 09:14 UTC">2 hours ago</time><span>Sofia Marchetti created the personal login <span class="mono">sofia_m</span> on warehouse</span><svg class="i s16 dim" aria-hidden="true"><use href="#i-down"/></svg></div>
+  <div class="ev"><time title="2026-10-12 16:40 UTC">12 Oct</time><span>Priya Raman took Sofia Marchetti's access to Ops console away; her login <span class="mono">sofia</span> on ops was revoked</span><svg class="i s16 dim" aria-hidden="true"><use href="#i-down"/></svg></div>
+  <div class="ev"><time title="2026-10-02 11:05 UTC">2 Oct</time><span>Mara Okafor changed Sofia Marchetti's access on Data warehouse: Viewer → Developer</span><svg class="i s16 dim" aria-hidden="true"><use href="#i-down"/></svg></div>
+  <div class="ev"><time title="2026-08-03 08:22 UTC">3 Aug</time><span>Sofia Marchetti created the personal login <span class="mono">sofia</span> on billing-prod</span><svg class="i s16 dim" aria-hidden="true"><use href="#i-down"/></svg></div>
+</div><button class="btn ghost sm" style="margin-top:8px">Show older</button></section></div></main>
+  </div>
+</div>
+
+</body>
+</html>
