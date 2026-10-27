@@ -1,9 +1,10 @@
-import { Fragment, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import type { Branch, BranchDatabaseView, Project } from "@chelabase/management-client";
 import { Modal } from "@/components/ui/dialog";
 import { NewBranchForm } from "@/components/new-branch-form";
 import { relativeTime } from "@/lib/members";
 import { branchTree, type EditorParams } from "@/lib/table-editor/context";
+import { fadeMask, scrollFade, type ScrollFade } from "@/lib/scroll-fade";
 import { Picker, type PickerOption } from "./picker";
 
 const NEW_BRANCH = "\u0000new-branch";
@@ -54,6 +55,23 @@ const slash = (
 /** The header's context bar: one labelled picker per level, and the role to act as. */
 export function ContextBar({ params, navigate, projects, branches, pgDatabases, actAs, onActAs, rolesError = null, historyWindow, onBranchesOpen, onBranchCreated }: ContextBarProps) {
   const [newBranch, setNewBranch] = useState(false);
+  const barRef = useRef<HTMLDivElement>(null);
+  const [fade, setFade] = useState<ScrollFade>({ start: false, end: false });
+  const measure = useCallback(() => {
+    const el = barRef.current;
+    if (!el) return;
+    const next = scrollFade(el.scrollLeft, el.clientWidth, el.scrollWidth);
+    setFade((prev) => (prev.start === next.start && prev.end === next.end ? prev : next));
+  }, []);
+  // The bar scrolls sideways when it doesn't fit: fade the edges that have more behind them.
+  useEffect(() => {
+    measure();
+    const el = barRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(el);
+    return () => observer.disconnect();
+  });
   const project = projects?.find((p) => p.id === params.projectId);
   const tree = branches ? branchTree(branches) : undefined;
   const branch = branches?.find((b) => b.id === params.branchId);
@@ -83,7 +101,12 @@ export function ContextBar({ params, navigate, projects, branches, pgDatabases, 
 
   return (
     // Narrow screens: the bar scrolls sideways rather than overflowing the header.
-    <div className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto [&>*]:shrink-0 sm:overflow-x-visible">
+    <div
+      ref={barRef}
+      onScroll={measure}
+      style={{ maskImage: fadeMask(fade), WebkitMaskImage: fadeMask(fade) }}
+      className="flex min-w-0 flex-1 items-center gap-2 overflow-x-auto [&>*]:shrink-0 sm:[&>*]:shrink"
+    >
       {projects ? (
         <Picker
           label="Project"

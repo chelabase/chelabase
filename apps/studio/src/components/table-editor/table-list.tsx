@@ -70,7 +70,7 @@ export function TableList({ params, navigate, objects, noDatabase = false, exact
   const rowCount = (o: ObjectSummary, current: boolean) => o.row_estimate ?? (current ? exactRows : null);
 
   return (
-    <nav aria-label="Tables" className="flex w-[248px] shrink-0 flex-col gap-3 border-r border-line bg-deep py-3">
+    <nav aria-label="Tables" className="flex w-[248px] shrink-0 flex-col gap-3 border-r border-line bg-deep py-3 max-[40rem]:w-full max-[40rem]:border-r-0 max-[40rem]:border-b">
       <div className="space-y-2 px-3">
         <Picker
           label="Schema"
@@ -93,7 +93,7 @@ export function TableList({ params, navigate, objects, noDatabase = false, exact
       <p className="px-4 text-xs tracking-wider text-chalk-dim uppercase">
         {objects ? `${schema ?? ""} · ${countLine(inSchema)}` : noDatabase ? "No database" : "Loading…"}
       </p>
-      <ul className="min-h-0 flex-1 overflow-y-auto">
+      <ul className="min-h-0 flex-1 overflow-y-auto max-[40rem]:max-h-40 max-[40rem]:flex-none">
         {shown.map((o, i) => {
           const current = view === "table" && o.name === params.table;
           const kindId = o.kind !== "table" ? `${ids}-kind-${i}` : undefined;

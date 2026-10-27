@@ -12,7 +12,6 @@ import {
 } from "react";
 import { ClawMark, Wordmark } from "@chelabase/lagoon/crab-marks";
 import type { RailBehaviour } from "@/lib/rail-preference";
-import { useMediaQuery } from "@/lib/use-media-query";
 import { cn } from "@/lib/utils";
 import { RailBehaviourMenu } from "./rail-behaviour-menu";
 import { RailItem } from "./rail-item";
@@ -28,6 +27,10 @@ export interface AppRailProps {
   onBehaviourChange: (next: RailBehaviour) => void;
   /** Counts on rail items (Members: sign-up requests waiting). */
   badges?: RailBadges;
+  /** `drawer`: the overlay below the narrow breakpoint. Always expanded with labels, ignores `behaviour`, no setting menu. */
+  variant?: "docked" | "drawer";
+  /** Called when any link, the home link included, is clicked. */
+  onNavigate?: () => void;
 }
 
 /**
@@ -35,7 +38,7 @@ export interface AppRailProps {
  * there. `<Link>` forces the attribute whenever its route matches, so this keeps TanStack's
  * navigation (href, click handling, preload) via `useLinkProps` and drops the active-state props.
  */
-function HomeLink({ children }: { children: ReactNode }) {
+function HomeLink({ children, onNavigate }: { children: ReactNode; onNavigate?: () => void }) {
   const { "aria-current": _ariaCurrent, "data-status": _dataStatus, ...props } = useLinkProps({
     to: "/app",
     activeProps: {},
@@ -44,6 +47,10 @@ function HomeLink({ children }: { children: ReactNode }) {
     <a
       {...props}
       aria-label="Chelabase Studio home"
+      onClick={(e) => {
+        (props as ComponentPropsWithRef<"a">).onClick?.(e);
+        onNavigate?.();
+      }}
       className="flex h-[52px] shrink-0 items-center px-[14px] text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand"
     >
       {children}
@@ -56,12 +63,10 @@ function HomeLink({ children }: { children: ReactNode }) {
  * rail keeps a 56px slot in the grid and its panel widens over the page when the
  * pointer rests on it, focus enters it, or its behaviour menu is open.
  */
-export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRailProps) {
-  // Below 40rem a pinned-open rail would take most of the width (and scroll the page sideways):
-  // it keeps the narrow slot and opens over the page, as in hover mode. The menu still shows
-  // the chosen setting.
-  const narrow = useMediaQuery("(max-width: 40rem)");
-  const behaviour: RailBehaviour = narrow && chosen === "expanded" ? "hover" : chosen;
+export function AppRail({ behaviour: chosen, onBehaviourChange, badges, variant = "docked", onNavigate }: AppRailProps) {
+  const drawer = variant === "drawer";
+  // The drawer always shows labels, whatever the stored setting (which it leaves untouched).
+  const behaviour: RailBehaviour = drawer ? "expanded" : chosen;
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const navRef = useRef<HTMLElement>(null);
   const openTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -194,6 +199,7 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRai
           pathname={pathname}
           expanded={expanded}
           tooltip={behaviour === "collapsed"}
+          onNavigate={onNavigate}
           badge={entry.kind === "link" ? badges?.[entry.id] : undefined}
         />
       ))}
@@ -205,6 +211,7 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRai
       ref={navRef}
       aria-label="Studio"
       className={cn("app-rail relative h-full shrink-0", hover && "w-14")}
+      data-variant={variant}
       data-behaviour={behaviour}
       data-expanded={expanded ? "true" : "false"}
       onPointerDown={() => {
@@ -218,11 +225,11 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRai
         className={cn(
           "flex h-full flex-col overflow-hidden border-r border-line-strong bg-deep text-chalk",
           "transition-[width] duration-200 ease-lagoon motion-reduce:transition-none",
-          expanded ? "w-[232px]" : "w-14",
+          drawer ? "w-full" : expanded ? "w-[232px]" : "w-14",
           hover && "absolute top-0 left-0 z-30",
         )}
       >
-        <HomeLink>
+        <HomeLink onNavigate={onNavigate}>
           {expanded ? (
             <Wordmark className="font-serif text-xl whitespace-nowrap" />
           ) : (
@@ -232,14 +239,16 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges }: AppRai
         <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden">
           {behaviour === "collapsed" ? <Tooltip.Provider delay={300}>{items}</Tooltip.Provider> : items}
         </div>
-        <div className="shrink-0 border-t border-line py-2">
-          <RailBehaviourMenu
-            behaviour={chosen}
-            onBehaviourChange={onBehaviourChange}
-            onOpenChange={handleMenuOpenChange}
-            labelsVisible={expanded}
-          />
-        </div>
+        {!drawer && (
+          <div className="shrink-0 border-t border-line py-2">
+            <RailBehaviourMenu
+              behaviour={chosen}
+              onBehaviourChange={onBehaviourChange}
+              onOpenChange={handleMenuOpenChange}
+              labelsVisible={expanded}
+            />
+          </div>
+        )}
       </div>
     </nav>
   );

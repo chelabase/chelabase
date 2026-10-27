@@ -19,7 +19,7 @@ import { Menu, MenuItem, MenuNote } from "@/components/ui/menu";
 import { errorText } from "@/lib/errors";
 import { initials, memberName, memberStatus, ROLE_LABEL, utc, type StatusText } from "@/lib/members";
 import type { HubSearch } from "@/lib/members-search";
-import { useMediaQuery } from "@/lib/use-media-query";
+import { NARROW_QUERY, useMediaQuery } from "@/lib/use-media-query";
 import { groupRoster, LevelBadge, Tag, useViewPreference, ViewToggle, type Group, type GroupKey, type RosterView } from "./hub";
 import { breakableEmail } from "./breakable-email";
 import { InviteDialog } from "./invite-dialog";
@@ -47,7 +47,7 @@ export type Confirm =
 export const LAST_ADMIN = (name: string) => `${name} is the last tenant admin. Make someone else a tenant admin first.`;
 
 /** Below 40rem the roster stacks: one block per person instead of a table. */
-const NARROW = "(max-width: 40rem)";
+
 
 /** The roster's place in the URL: the project filter, the view and the name filter (`/app/members?project=&view=&q=`). */
 interface Nav {
@@ -137,7 +137,7 @@ function PeopleRoster({ members, selfId, tenantAdmin, projects, onStatus: setSta
   const project = projects.find((p) => p.id === nav.project);
   const filterId = useId();
   const projectId = useId();
-  const narrow = useMediaQuery(NARROW);
+  const narrow = useMediaQuery(NARROW_QUERY);
   const inviteButton = useRef<HTMLButtonElement>(null);
   /** Each row's menu trigger, so a dialog opened from a row hands focus back to it. */
   const triggers = useRef(new Map<string, HTMLElement>());

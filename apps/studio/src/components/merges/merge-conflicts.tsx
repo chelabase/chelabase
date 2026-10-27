@@ -156,7 +156,7 @@ export function MergeConflicts({
         return (
           <fieldset key={c.id} className="m-0 min-w-0 space-y-3 rounded-lg border p-3 text-sm">
             <legend className="px-1 font-medium">
-              {CONFLICT_KIND_LABEL[c.kind] ?? c.kind}: <span className="font-mono">{title}</span>
+              {CONFLICT_KIND_LABEL[c.kind] ?? c.kind}: <span className="font-mono [overflow-wrap:anywhere]">{title}</span>
             </legend>
             {c.kind === "column_order" ? (
               <p className="text-muted-foreground">

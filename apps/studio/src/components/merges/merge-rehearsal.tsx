@@ -120,7 +120,7 @@ export function MergeRehearsal({ merge, plan, targetName, pending, onRehearse }:
           <ul className="space-y-2">
             {produced.map((d) => (
               <li key={`${d.key.kind}:${itemName(d.key)}`} className="space-y-1">
-                <span className="font-mono">{itemName(d.key)}</span>
+                <span className="font-mono [overflow-wrap:anywhere]">{itemName(d.key)}</span>
                 <pre
                   tabIndex={0}
                   aria-label={`What your own SQL produced for ${itemName(d.key)}`}
@@ -140,7 +140,7 @@ export function MergeRehearsal({ merge, plan, targetName, pending, onRehearse }:
           <ul className="list-disc pl-5">
             {drift.map((d) => (
               <li key={`${d.key.kind}:${itemName(d.key)}`}>
-                <span className="font-mono">{itemName(d.key)}</span>: {DRIFT_TEXT[d.kind] ?? d.kind}
+                <span className="font-mono [overflow-wrap:anywhere]">{itemName(d.key)}</span>: {DRIFT_TEXT[d.kind] ?? d.kind}
               </li>
             ))}
           </ul>

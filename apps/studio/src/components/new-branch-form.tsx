@@ -67,11 +67,11 @@ export function NewBranchForm({ databaseId, branches, historyWindow, defaultPare
   return (
     <form onSubmit={submit} className="space-y-2 rounded-lg border p-3 text-sm">
       <div className="flex flex-wrap items-end gap-3">
-        <label className="flex flex-col gap-1">
+        <label className="flex min-w-0 max-w-full flex-col gap-1">
           <span>Branch name</span>
-          <input value={name} onChange={(e) => setName(e.target.value)} className={`${field} w-56`} />
+          <input value={name} onChange={(e) => setName(e.target.value)} className={`${field} w-56 max-w-full`} />
         </label>
-        <label className="flex flex-col gap-1">
+        <label className="flex min-w-0 max-w-full flex-col gap-1">
           <span>Parent</span>
           <select value={parent} onChange={(e) => setParent(e.target.value)} className={field}>
             {parents.map((b) => (
@@ -81,7 +81,7 @@ export function NewBranchForm({ databaseId, branches, historyWindow, defaultPare
             ))}
           </select>
         </label>
-        <fieldset className="flex items-center gap-3">
+        <fieldset className="flex min-w-0 flex-wrap items-center gap-3">
           <label className="flex items-center gap-1">
             <input type="radio" name="point" checked={mode === "now"} onChange={() => setMode("now")} />
             Now
@@ -92,7 +92,7 @@ export function NewBranchForm({ databaseId, branches, historyWindow, defaultPare
           </label>
         </fieldset>
         {mode === "time" && (
-          <label className="flex flex-col gap-1">
+          <label className="flex min-w-0 max-w-full flex-col gap-1">
             <span>Point in time</span>
             <input
               type="datetime-local"

@@ -39,7 +39,7 @@ export function UsersTab({ projectId }: { projectId: string }) {
           placeholder="Search by email"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          className="h-8 w-64 rounded-lg border border-input bg-background px-2 text-sm"
+          className="h-8 w-64 max-w-full rounded-lg border border-input bg-background px-2 text-sm"
         />
         <Button onClick={() => setCreating(true)}>Create user</Button>
       </div>

@@ -13,3 +13,6 @@ export function useMediaQuery(query: string): boolean {
     () => false,
   );
 }
+
+/** The phone-width breakpoint shared by the rail, the drawer and the breadcrumbs. */
+export const NARROW_QUERY = "(width < 40rem)";

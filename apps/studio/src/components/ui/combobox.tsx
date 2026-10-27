@@ -39,7 +39,7 @@ export interface MultiComboboxProps {
 }
 
 const optionRow =
-  "grid cursor-default grid-cols-[1rem_1fr] items-start gap-2 px-2 py-1.5 outline-none select-none data-[highlighted]:bg-chalk/[0.08] data-[highlighted]:outline-solid data-[highlighted]:outline-2 data-[highlighted]:-outline-offset-2 data-[highlighted]:outline-sand data-[disabled]:text-chalk-dim";
+  "grid cursor-default grid-cols-[1rem_minmax(0,1fr)] items-start gap-2 px-2 py-1.5 outline-none select-none data-[highlighted]:bg-chalk/[0.08] data-[highlighted]:outline-solid data-[highlighted]:outline-2 data-[highlighted]:-outline-offset-2 data-[highlighted]:outline-sand data-[disabled]:text-chalk-dim";
 
 /**
  * A multi-select combobox: a field that filters, chips for what's chosen and a listbox popup
@@ -78,15 +78,15 @@ export function MultiCombobox({ label, options, value, onValueChange, chipDetail
               return (
                 <Combobox.Chip
                   key={v}
-                  aria-label={v}
+                  aria-label={extra ? `${v}, ${extra}` : v}
                   className={cn(
-                    "flex items-center gap-1 border px-1.5 text-sm leading-6 outline-none focus-within:outline-2 focus-within:outline-sand",
+                    "flex min-w-0 max-w-full items-center gap-1 border px-1.5 text-sm leading-6 outline-none focus-within:outline-2 focus-within:outline-sand",
                     bad ? "border-coral text-coral" : "border-line-strong text-chalk",
                   )}
                 >
-                  <span className={code}>{v}</span>
-                  {extra && <span className="text-chalk-dim">{extra}</span>}
-                  <Combobox.ChipRemove aria-label={`Remove ${v}`} className="flex size-4 items-center justify-center hover:bg-chalk/[0.08]">
+                  <span title={v} className={cn("min-w-0 truncate", code)}>{v}</span>
+                  {extra && <span title={extra} className="min-w-0 break-all text-chalk-dim">{extra}</span>}
+                  <Combobox.ChipRemove aria-label={`Remove ${v}`} className="flex size-4 shrink-0 items-center justify-center hover:bg-chalk/[0.08]">
                     <X aria-hidden="true" size={12} strokeWidth={1.5} />
                   </Combobox.ChipRemove>
                 </Combobox.Chip>
@@ -119,7 +119,7 @@ export function MultiCombobox({ label, options, value, onValueChange, chipDetail
                 return (
                   <Combobox.Item key={v} value={v} disabled={!!o.disabledReason} className={optionRow}>
                     <Combobox.ItemIndicator className="col-start-1 mt-1 size-2 bg-sand" />
-                    <span className="col-start-2">
+                    <span className="col-start-2 min-w-0 [overflow-wrap:anywhere]">
                       <span className={code}>{v}</span>
                       {o.detail && <span className="text-chalk-dim"> {o.detail}</span>}
                       {o.disabledReason && <span className="block text-xs text-chalk-dim">{o.disabledReason}</span>}
@@ -198,7 +198,7 @@ export function FreeTextCombobox({ label, options, value, onValueChange, type = 
                 const o = byValue.get(v);
                 return (
                   <Autocomplete.Item key={v} value={v} className={optionRow}>
-                    <span className="col-start-2">
+                    <span className="col-start-2 min-w-0 [overflow-wrap:anywhere]">
                       {v}
                       {o?.detail && <span className="text-chalk-dim"> {o.detail}</span>}
                     </span>

@@ -12,6 +12,8 @@ export interface RailItemProps {
   tooltip: boolean;
   /** Things waiting on this section (Members: sign-up requests); nothing shows at 0. */
   badge?: number;
+  /** Called when the link is clicked, even when it is the current page (the drawer closes on it). */
+  onNavigate?: () => void;
 }
 
 /** "Members, 2 requests waiting": the link's accessible name when it carries a count. */
@@ -27,7 +29,7 @@ function Label({ text, expanded }: { text: string; expanded: boolean }) {
 }
 
 /** One rail entry: a section link (with the sand edge-mark when current) or a not-built-yet placeholder. */
-export function RailItem({ entry, pathname, expanded, tooltip, badge = 0 }: RailItemProps) {
+export function RailItem({ entry, pathname, expanded, tooltip, badge = 0, onNavigate }: RailItemProps) {
   const Icon = entry.icon;
   const counted = entry.kind === "link" && badge > 0;
   const icon = (
@@ -60,6 +62,7 @@ export function RailItem({ entry, pathname, expanded, tooltip, badge = 0 }: Rail
       to={entry.to === "/app/tables" ? TABLES_ROUTE : entry.to}
       aria-label={counted ? badgeName(entry.label, badge) : undefined}
       aria-current={active ? "page" : undefined}
+      onClick={onNavigate}
       activeOptions={{ exact: true }}
       activeProps={{}}
       className={cn(

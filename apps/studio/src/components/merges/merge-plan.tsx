@@ -201,7 +201,7 @@ export function MergePlan({ databaseId, targetName, merge, plan, editable, save 
                   return (
                     <li key={s.id} className="space-y-2 rounded-lg border p-3">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-mono">{s.id}</span>
+                        <span className="font-mono [overflow-wrap:anywhere]">{s.id}</span>
                         <Badge>{KIND_LABEL[s.kind] ?? s.kind}</Badge>
                         {s.data_loss && <Badge hazard>Loses data</Badge>}
                         {s.security && <Badge hazard>Security</Badge>}
@@ -299,11 +299,11 @@ export function MergePlan({ databaseId, targetName, merge, plan, editable, save 
             {merge.steps.map((s) => (
               <li key={s.id} aria-label={`Your step ${s.id}`} className="space-y-2 rounded-lg border p-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="font-mono">{s.id}</span>
+                  <span className="font-mono [overflow-wrap:anywhere]">{s.id}</span>
                   <span className="text-xs text-muted-foreground">
                     {s.after ? (
                       <>
-                        after <span className="font-mono">{s.after}</span>
+                        after <span className="font-mono [overflow-wrap:anywhere]">{s.after}</span>
                       </>
                     ) : (
                       "at the start"

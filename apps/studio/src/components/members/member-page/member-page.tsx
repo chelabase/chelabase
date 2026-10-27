@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { Link, useSearch } from "@tanstack/react-router";
 import { ArrowLeft } from "lucide-react";
 import { useGetMe, useListMembers, type MeResponse, type Member } from "@chelabase/management-client";
+import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { Button } from "@/components/ui/button";
 import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
@@ -92,6 +93,7 @@ function suspendedLine(member: Member, roster: readonly Member[]): string {
 function Page({ member, me, roster }: { member: Member; me: MeResponse; roster: readonly Member[] }) {
   const [status, setStatus] = useState<string | null>(null);
   const name = memberName(member);
+  useCrumbLabel("memberId", member.id, name);
   const first = firstName(name);
   const selfId = me.member?.id ?? null;
   const self = selfId === member.id;

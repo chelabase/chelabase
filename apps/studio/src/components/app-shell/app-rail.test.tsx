@@ -70,20 +70,38 @@ afterEach(() => {
 });
 
 describe("AppRail", () => {
-  // The browser pass: at 375px "Expanded" took 232px of the width and the page scrolled sideways.
-  // Below 40rem it keeps the narrow rail in the layout and opens over the page like "hover".
-  it("expanded below 40rem: the rail stays narrow in the layout and opens over the page", async () => {
-    const original = window.matchMedia;
-    window.matchMedia = ((query: string) =>
-      ({ matches: query.includes("max-width: 40rem"), media: query, onchange: null, addEventListener: () => {}, removeEventListener: () => {}, addListener: () => {}, removeListener: () => {}, dispatchEvent: () => false }) as MediaQueryList);
-    try {
-      const { nav } = await renderRail("expanded");
-      expect(nav).toHaveAttribute("data-expanded", "false");
-      expect(nav.className).toContain("w-14");
-    } finally {
-      window.matchMedia = original;
-    }
-  });
+  // Replaces "expanded below 40rem: the rail stays narrow…" (T2, intended contract change): below
+  // 40rem the docked rail isn't rendered; the drawer variant is always expanded, whatever the setting.
+  it.each(["collapsed", "hover", "expanded"] as const)(
+    "drawer variant with stored %s: labels shown, no tooltip, no setting menu",
+    async (stored) => {
+      const onBehaviourChange = vi.fn();
+      const onNavigate = vi.fn();
+      const root = createRootRoute();
+      const index = createRoute({
+        getParentRoute: () => root,
+        path: "/app",
+        component: () => (
+          <AppRail variant="drawer" behaviour={stored} onBehaviourChange={onBehaviourChange} onNavigate={onNavigate} />
+        ),
+      });
+      const router = createRouter({
+        routeTree: root.addChildren([index]),
+        history: createMemoryHistory({ initialEntries: ["/app"] }),
+      });
+      render(<RouterProvider router={router} />);
+      const nav = await screen.findByRole("navigation", { name: "Studio" });
+      expect(nav).toHaveAttribute("data-expanded", "true");
+      expect(within(screen.getByRole("link", { name: "Projects" })).getByText("Projects")).not.toHaveClass("sr-only");
+      expect(screen.queryByRole("button")).toBeNull();
+      const user = userEvent.setup();
+      await user.click(screen.getByRole("link", { name: "Chelabase Studio home" }));
+      expect(onNavigate).toHaveBeenCalledTimes(1);
+      await user.click(screen.getByRole("link", { name: "Projects" }));
+      expect(onNavigate).toHaveBeenCalledTimes(2);
+      expect(onBehaviourChange).not.toHaveBeenCalled();
+    },
+  );
 
   it("expanded: labels are visible and no tooltip appears on focus", async () => {
     const { nav } = await renderRail("expanded");

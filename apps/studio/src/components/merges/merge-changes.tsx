@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from "react";
+import { Fragment, useId, type ReactNode } from "react";
 import {
   OBJ_KIND_LABEL,
   changeVerb,
@@ -15,6 +15,21 @@ export interface MergeChangesProps {
   analysis: Analysis;
   sourceName: string;
   targetName: string;
+}
+
+/** A dotted identifier whose lines break at the dots first. */
+export function DottedName({ name }: { name: string }) {
+  const parts = name.split(".");
+  return (
+    <>
+      {parts.map((part, i) => (
+        <Fragment key={i}>
+          {i < parts.length - 1 ? `${part}.` : part}
+          {i < parts.length - 1 && <wbr />}
+        </Fragment>
+      ))}
+    </>
+  );
 }
 
 const BADGE = "rounded-full border px-2 py-0.5 text-xs";
@@ -95,10 +110,10 @@ export function MergeChanges({ analysis, sourceName, targetName }: MergeChangesP
               const name = itemName(item.key);
               const sides = itemSides(item);
               return (
-                <li key={item.id}>
-                  <details aria-label={name} className="rounded-lg border px-3 py-2 text-sm">
+                <li key={item.id} className="min-w-0">
+                  <details aria-label={name} className="min-w-0 rounded-lg border px-3 py-2 text-sm">
                     <summary className="flex cursor-pointer flex-wrap items-center gap-2">
-                      <span className="font-mono">{name}</span>
+                      <span className="min-w-0 font-mono [overflow-wrap:anywhere]"><DottedName name={name} /></span>
                       <Badge>{outcomeLabel(item.outcome)}</Badge>
                       {item.data_loss && <Badge hazard>Loses data</Badge>}
                       {item.security && <Badge hazard>Security</Badge>}
@@ -130,7 +145,7 @@ export function MergeChanges({ analysis, sourceName, targetName }: MergeChangesP
               const how = r.change === "unchanged" ? `unchanged on ${sourceName}` : `${r.change ?? "changed"} on ${sourceName}`;
               return (
                 <li key={i}>
-                  {kindText(o.kind)} <span className="font-mono">{qualified}</span>: {how}
+                  {kindText(o.kind)} <span className="font-mono [overflow-wrap:anywhere]"><DottedName name={qualified} /></span>: {how}
                   {r.needed_by && r.needed_by.length > 0 && (
                     <span className="text-muted-foreground"> (needed by {r.needed_by.join(", ")})</span>
                   )}

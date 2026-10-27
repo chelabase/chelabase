@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
+import { useOverflowFocusable } from "@/lib/use-overflow-focusable";
 import { Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChevronDown } from "lucide-react";
@@ -22,7 +23,7 @@ import { Button } from "@/components/ui/button";
 import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { memberName, ROLE_LABEL } from "@/lib/members";
-import { useMediaQuery } from "@/lib/use-media-query";
+import { NARROW_QUERY, useMediaQuery } from "@/lib/use-media-query";
 import { cn } from "@/lib/utils";
 import { AddPeopleDialog } from "./add-people-dialog";
 import { editorId, GrantEditor } from "./grant-editor";
@@ -33,7 +34,7 @@ import { YourAccess } from "./your-access";
 const PAGE = 50;
 const ADD = "\u0000add";
 /** Below 40rem the Per database column folds under the Postgres roles cell. */
-const NARROW = "(max-width: 40rem)";
+
 
 /**
  * A project's Access tab. Everyone with access sees it; below project Admin it is "Your access"
@@ -67,7 +68,8 @@ function AdminAccess({ project }: { project: Project }) {
   const members = useListMembers();
   const { sources, loading: rolesLoading } = useRoleSources(project.databases);
   const chains = useMemo(() => chainsOf(sources), [sources]);
-  const narrow = useMediaQuery(NARROW);
+  const narrow = useMediaQuery(NARROW_QUERY);
+  const scroll = useOverflowFocusable();
 
   const [openId, setOpenId] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -168,7 +170,7 @@ function AdminAccess({ project }: { project: Project }) {
           )
         ) : (
           <>
-            <div className="relative max-w-full min-w-0 overflow-x-auto">
+            <div ref={scroll.ref} tabIndex={scroll.tabIndex} role="region" aria-label="Access table" className="relative max-w-full min-w-0 overflow-x-auto">
               <table aria-label="People with access" className="w-full text-left text-sm">
                 <thead className="border-b border-line text-chalk-dim">
                   <tr>

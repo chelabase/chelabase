@@ -1,29 +1,59 @@
 import { Menu } from "@base-ui/react/menu";
 import { useQueryClient } from "@tanstack/react-query";
-import { CircleUser, LogOut } from "lucide-react";
+import { CircleUser, LogOut, Menu as MenuIcon } from "lucide-react";
+import type { RefObject } from "react";
+import { Breadcrumbs } from "./crumbs";
 
 export interface AppHeaderProps {
   profile: { name?: string; email?: string };
   onSignOut: () => void;
+  /** Narrow widths: given, the header starts with a menu button that calls it. */
+  onMenu?: () => void;
+  menuOpen?: boolean;
+  /** The drawer popup's id; `aria-controls` points at it while the drawer is open. */
+  menuControlsId?: string;
+  menuButtonRef?: RefObject<HTMLButtonElement | null>;
 }
 
 const focusRing =
   "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sand";
 
-/** The top bar of the signed-in shell: a context slot (`#app-header-context`, filled by `HeaderContext`) and the profile menu. */
-export function AppHeader({ profile, onSignOut }: AppHeaderProps) {
+/** The top bar of the signed-in shell: the breadcrumbs, a context slot (`#app-header-context`, filled by `HeaderContext`) and the profile menu. */
+export function AppHeader({ profile, onSignOut, onMenu, menuOpen = false, menuControlsId, menuButtonRef }: AppHeaderProps) {
   const queryClient = useQueryClient();
   const label = profile.name || profile.email;
   return (
-    <header className="sticky top-0 z-20 flex h-[52px] shrink-0 items-center justify-between border-b border-line bg-background px-4">
-      <div id="app-header-context" data-slot="context" className="flex min-w-0 flex-1 items-center pr-3" />
+    <header className="sticky top-0 z-20 flex min-h-[52px] shrink-0 items-center border-b border-line bg-background px-4 sm:has-[#app-header-context>*]:[&_nav]:max-w-[10rem] max-[40rem]:flex-wrap">
+      <div className="flex h-[52px] min-w-0 items-center max-[40rem]:flex-1">
+      {onMenu && (
+        <button
+          ref={menuButtonRef}
+          type="button"
+          aria-label="Menu"
+          aria-haspopup="dialog"
+          aria-expanded={menuOpen}
+          aria-controls={menuOpen ? menuControlsId : undefined}
+          onClick={onMenu}
+          className={`-ml-2 mr-1 flex size-10 shrink-0 items-center justify-center hover:bg-chalk/[0.08] ${focusRing}`}
+        >
+          <MenuIcon aria-hidden="true" size={20} strokeWidth={1.5} />
+        </button>
+      )}
+      <Breadcrumbs />
+      </div>
+      {/* Wide: beside the crumbs. Below the breakpoint: a full-width second row (P5, amended). */}
+      <div
+        id="app-header-context"
+        data-slot="context"
+        className="flex min-w-0 flex-1 items-center px-3 sm:has-[>*]:min-w-[20rem] max-[40rem]:order-last max-[40rem]:-mx-4 max-[40rem]:basis-[calc(100%+2rem)] max-[40rem]:overflow-x-auto max-[40rem]:border-t max-[40rem]:border-line max-[40rem]:px-4 max-[40rem]:py-2 max-[40rem]:empty:hidden"
+      />
       <Menu.Root>
         <Menu.Trigger
           aria-label={label ? undefined : "Account"}
-          className={`flex h-9 items-center gap-2 px-2 text-sm hover:bg-chalk/[0.08] data-[popup-open]:bg-chalk/[0.08] ${focusRing}`}
+          className={`flex h-9 shrink-0 items-center gap-2 px-2 text-sm hover:bg-chalk/[0.08] data-[popup-open]:bg-chalk/[0.08] ${focusRing}`}
         >
           <CircleUser aria-hidden="true" size={18} strokeWidth={1.5} />
-          {label && <span>{label}</span>}
+          {label && <span className="max-[40rem]:sr-only">{label}</span>}
         </Menu.Trigger>
         <Menu.Portal>
           <Menu.Positioner align="end" sideOffset={6} className="z-50">

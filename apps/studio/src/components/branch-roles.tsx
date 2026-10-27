@@ -1,4 +1,5 @@
 import { useId, useState, type FormEvent } from "react";
+import { useOverflowFocusable } from "@/lib/use-overflow-focusable";
 import { Link } from "@tanstack/react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -103,6 +104,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
   const [pending, setPending] = useState<Pending>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const scroll = useOverflowFocusable();
   // Set by a submit with a bad name; the hint shows until the name changes.
   const [nameHint, setNameHint] = useState<string | null>(null);
   const nameId = useId();
@@ -202,7 +204,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
           {errorText(roles.error)}
         </p>
       )}
-      <div className="relative max-w-full overflow-x-auto">
+      <div ref={scroll.ref} tabIndex={scroll.tabIndex} className="relative max-w-full overflow-x-auto" role="region" aria-label="Roles table">
       <table className="w-full min-w-[40rem] text-left">
         <thead className="border-b text-muted-foreground">
           <tr>
@@ -269,7 +271,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
               <td className="whitespace-nowrap py-1 pr-4">{created(r.created_at)}</td>
               <td className="py-1">
                 {admin && (
-                <div className="flex gap-2">
+                <div className="flex flex-wrap gap-2">
                   <Button
                     size="xs"
                     variant="outline"
@@ -313,7 +315,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
           <p>
             {`Reset the password for ${pending.role.name}? The current password stops working for new connections.`}
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy} onClick={confirm}>
               Confirm reset
             </Button>
@@ -369,7 +371,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
       {admin && (
         <form onSubmit={submit} className="space-y-1">
           <div className="flex flex-wrap items-end gap-3">
-            <div className="flex flex-col gap-1">
+            <div className="flex min-w-0 max-w-full flex-col gap-1">
               <label htmlFor={nameId}>Owner-level role name</label>
               <input
                 id={nameId}
@@ -381,7 +383,7 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
                 maxLength={63}
                 aria-invalid={nameHint ? true : undefined}
                 aria-describedby={nameHint ? hintId : undefined}
-                className={`${field} w-48`}
+                className={`${field} w-48 max-w-full`}
               />
             </div>
             <Button type="submit" size="sm" variant="outline" disabled={busy}>

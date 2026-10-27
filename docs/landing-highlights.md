@@ -7,6 +7,20 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
+## Studio shell: phone navigation, breadcrumbs, no clipped content (2026-10-27, awaiting merge)
+
+Branch `studio-shell`; plan `docs/superpowers/plans/2026-10-27-studio-shell.md`. Studio only; no fork change, no image build.
+
+### Studio on a phone
+- **Problem:** below the rail breakpoint Studio had no way to navigate (the rail was a fixed strip), no sense of where you were, and some pages hid content: the project's Branches table and forms were clipped (KI-1) and the invite dialog's role chips spilled out of their borders (KI-2).
+- **What we built:**
+  - A menu button in the header that opens the navigation as a drawer with labels. Escape, the backdrop or following a link closes it, and focus returns to the button.
+  - A header breadcrumb on every page (projects, project, database, merge, tables, members, member, role), with names supplied by the pages from data they already loaded. On a phone a trail longer than two collapses its middle into a "…" menu of links.
+  - Branches and project forms scroll inside their own region instead of clipping; role chips truncate inside their border.
+- **Unlocks:** the same Studio is usable at 390 px, which the members hub and later pages build on.
+- **Evidence:** full Studio vitest and typecheck green on the branch; captures at 390 and 1440 in `docs/superpowers/designs/2026-10-27-studio-shell/png/`; browser pass on the stack confirmed the drawer (open, Escape, backdrop, link; focus back on the button), the "…" menu, a 52 px header on every page, no horizontal page scroll on 7 of 9 top-level pages at 390, and chips truncating inside the chip. The pass also found defects (Tables page and merge page at 390, Tables context bar at 1440), listed in the plan's Status.
+- **Status:** awaiting merge.
+
 ## Members hub, step 1: one place for people, roles and privileges (2026-10-24, shipped: merged into `main` `6e3c8df3`)
 
 Branch `members-hub`; spec `docs/superpowers/specs/2026-10-23-members-hub-design.md`; plan `docs/superpowers/plans/2026-10-23-members-hub-step-1.md`. No fork change (it builds on fork round 4's personal-login marker).

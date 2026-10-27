@@ -14,6 +14,7 @@ import type {
 } from "@chelabase/management-client";
 import { Route as MembersRoute } from "@/routes/app.members";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
+import { CrumbsRoot } from "@/test/render-crumbs";
 import { renderWithQuery } from "@/test/render";
 import { P1, P2, person } from "../hub/fixtures";
 import { RolePage } from "./role-page";
@@ -279,6 +280,8 @@ export interface Opts {
   /** Overrides, keyed like `fakeFetch`'s routes. */
   routes?: Record<string, FakeHandler>;
   initial?: string;
+  /** Wraps the router in the crumb labels provider with the header trail (default off). */
+  crumbs?: boolean;
 }
 
 export const PRIV = `/v1/databases/${D1}/branches/${B1}/pg-databases/${PG}/privileges`;
@@ -364,7 +367,7 @@ export function mountTab(opts: Opts = {}, initial = "/app/members?tab=roles") {
 export function mountPage(opts: Opts & { role?: string; pgDatabase?: string | null } = {}) {
   const data = opts.data ?? privData();
   const name = opts.role ?? ROLE;
-  const root = createRootRoute();
+  const root = createRootRoute(opts.crumbs ? { component: CrumbsRoot } : undefined);
   const { memberPage, rolePage } = landing(root);
   const page = rolePage(function Page() {
     const p = page.useParams() as unknown as { databaseId: string; branchId: string; role: string };

@@ -1,8 +1,11 @@
-import type { ReactNode } from "react";
+import { useRouterState } from "@tanstack/react-router";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useRailBehaviour } from "@/lib/rail-preference";
-import { useMediaQuery } from "@/lib/use-media-query";
+import { NARROW_QUERY, useMediaQuery } from "@/lib/use-media-query";
 import { AppHeader } from "./app-header";
 import { AppRail } from "./app-rail";
+import { CrumbLabelsProvider } from "./crumbs";
+import { RailDrawer } from "./rail-drawer";
 import type { RailBadges } from "./rail-items";
 
 export interface AppShellProps {
@@ -20,13 +23,23 @@ export interface AppShellProps {
  */
 export function AppShell({ profile, onSignOut, badges, children }: AppShellProps) {
   const [behaviour, setBehaviour] = useRailBehaviour();
-  // Below 40rem an expanded rail opens over the page (see AppRail): its column stays narrow.
-  const narrow = useMediaQuery("(max-width: 40rem)");
-  const railWidth = behaviour === "expanded" && !narrow ? "232px" : "56px";
+  // Below the breakpoint the rail isn't docked: it opens as a drawer from the header's menu button.
+  const narrow = useMediaQuery(NARROW_QUERY);
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const drawerId = useId();
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const open = narrow && drawerOpen;
+  // A navigation, or a resize to wide, closes the drawer.
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [pathname, narrow]);
+  const railWidth = behaviour === "expanded" ? "232px" : "56px";
   return (
+    <CrumbLabelsProvider>
     <div
       className="grid min-h-screen bg-background text-foreground transition-[grid-template-columns] duration-200 ease-lagoon motion-reduce:transition-none"
-      style={{ gridTemplateColumns: `${railWidth} 1fr` }}
+      style={{ gridTemplateColumns: narrow ? "1fr" : `${railWidth} 1fr` }}
     >
       <a
         href="#content"
@@ -34,15 +47,35 @@ export function AppShell({ profile, onSignOut, badges, children }: AppShellProps
       >
         Skip to content
       </a>
-      <div className="sticky top-0 z-30 h-screen">
-        <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} badges={badges} />
-      </div>
+      {/* The drawer stays mounted so a resize to wide closes it (and restores focus) instead of unmounting an open dialog. */}
+      <RailDrawer open={open} onOpenChange={setDrawerOpen} id={drawerId} returnFocusRef={menuButtonRef}>
+        <AppRail
+          variant="drawer"
+          behaviour={behaviour}
+          onBehaviourChange={setBehaviour}
+          badges={badges}
+          onNavigate={() => setDrawerOpen(false)}
+        />
+      </RailDrawer>
+      {!narrow && (
+        <div className="sticky top-0 z-30 h-screen">
+          <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} badges={badges} />
+        </div>
+      )}
       <div className="flex min-w-0 flex-col">
-        <AppHeader profile={profile} onSignOut={onSignOut} />
+        <AppHeader
+          profile={profile}
+          onSignOut={onSignOut}
+          onMenu={narrow ? () => setDrawerOpen((o) => !o) : undefined}
+          menuOpen={open}
+          menuControlsId={drawerId}
+          menuButtonRef={menuButtonRef}
+        />
         <main id="content" tabIndex={-1} className="min-w-0 flex-1 outline-none">
           {children}
         </main>
       </div>
     </div>
+    </CrumbLabelsProvider>
   );
 }

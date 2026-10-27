@@ -9,6 +9,7 @@ import type {
   ProjectGrant,
 } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
+import { CrumbsRoot } from "@/test/render-crumbs";
 import { renderWithQuery } from "@/test/render";
 import { P1, P2, person } from "../hub/fixtures";
 import { MemberPage } from "./index";
@@ -149,6 +150,8 @@ export interface Opts {
   events?: AccessEvent[];
   routes?: Record<string, FakeHandler>;
   initial?: string;
+  /** Wraps the router in the crumb labels provider with the header trail (default off). */
+  crumbs?: boolean;
 }
 
 export const ok = (body: unknown, status = 200): FakeHandler => () => jsonResponse(body, status);
@@ -182,7 +185,7 @@ export function mount(opts: Opts = {}) {
     routes[`GET /v1/databases/${d}/branches/${BRANCH_OF[d]}/roles`] ??= ok(ROLES[d]);
   }
   const f = fakeFetch(routes);
-  const root = createRootRoute();
+  const root = createRootRoute(opts.crumbs ? { component: CrumbsRoot } : undefined);
   const page = createRoute({
     getParentRoute: () => root,
     path: "/app/members/$memberId",

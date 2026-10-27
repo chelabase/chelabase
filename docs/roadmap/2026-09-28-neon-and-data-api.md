@@ -30,6 +30,11 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 > - The stack, worktree and branch are removed. `main` carries `ctutils` 0.4.5 (RUSTSEC-2026-0385) through the merge.
 > - Known issues KI-1 (the project Branches page hides overflow) and KI-2 (invite role chips spill at 1440) go to the Studio shell step.
 > - **Step 2 (teams) started 2026-10-27** on branch `members-hub-teams` (`.worktrees/members-hub-teams`). The user decided T2-2: the SQL editor's hidden member role gets only roles held at Developer level or higher (the same rule as personal logins). The plan is being written at `docs/superpowers/plans/2026-10-27-members-hub-step-2.md` on that branch; its Status block is the source of truth once committed.
+> - **Advisories (2026-10-27).**
+>   - **Chelabase `main`:** zstd 0.14.3 / zstd-safe 8.2 / zstd-sys 2.1.2, via the `chelabase/pingora` branch `chelabase/advisories` (`0eddec5`), merged `0c05f25f`.
+>   - **`chelabase/neon` `main`:** fast-forwarded to `09b4c7313`: ctutils 0.4.6; 11 zstd advisories, which brought zstd 0.14 / tonic+prost 0.14 / parquet 60; and the flaky safekeeper fanout test fixed (a test-side LSN mismatch, 300/300 runs).
+>   - **Still red, user ruling:** RUSTSEC-2026-0387 (crypto-bigint 0.5 via aws-sigv4's `sigv4a` and jose-jwk's p256 0.13). It waits for upstream releases; the neon advisories job stays red until then.
+>   - **Images and `NEON_REF` not rebuilt (user):** the next fork step picks the fixes up.
 > - **In parallel (user, 2026-10-27): the Studio shell step** (below, KI-1/KI-2 included) on branch `studio-shell` (`.worktrees/studio-shell`), plan `docs/superpowers/plans/2026-10-27-studio-shell.md` being written. It keeps its edits to `apps/studio/src/components/members/*` minimal; whichever branch merges second rebases.
 >
 > Say `continue members hub`.

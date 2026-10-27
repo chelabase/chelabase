@@ -17,8 +17,8 @@ export function RlsBanner({ target, reason, enabled }: { target: TableTarget; re
   if (!base.rls_enabled) {
     const staged = projected.rls_enabled;
     return (
-      <div role="alert" className="flex items-center gap-4 border-b border-coral/60 bg-coral/[0.08] px-4 py-2 text-sm">
-        <p className="flex-1 text-chalk">
+      <div role="alert" className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-coral/60 bg-coral/[0.08] px-4 py-2 text-sm">
+        <p className="min-w-0 flex-1 basis-48 text-chalk">
           {RLS_OFF}
           {staged && <span className="text-chalk-dim"> · turning it on is in your pending changes</span>}
         </p>

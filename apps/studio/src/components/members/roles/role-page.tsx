@@ -12,6 +12,7 @@ import {
   useListRoles,
   type BranchRole,
 } from "@chelabase/management-client";
+import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { Tabs } from "@/components/ui/tabs";
 import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
@@ -72,6 +73,7 @@ export function RolePage({ databaseId, branchId, role, pgDatabase }: RolePagePro
   const members = useListMembers({ query: { enabled: admin } });
   const row = roles.data?.find((r) => r.name === role);
   const found = row !== undefined && isManaged(row);
+  useCrumbLabel("role", role, found ? escapeName(role) : undefined);
   const editor = usePrivilegeEditor({ databaseId, branchId, pg: pgName ?? "", role, enabled: found && pgName !== undefined });
   const [section, setSection] = useState<Section>("privileges");
 

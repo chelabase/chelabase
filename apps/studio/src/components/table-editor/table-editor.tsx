@@ -13,6 +13,7 @@ import {
   type ObjectSummary,
   type Project,
 } from "@chelabase/management-client";
+import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -234,6 +235,7 @@ function Editor({ params, navigate }: TableEditorProps) {
     (!actAsReady ? "Loading roles…" : !allowed.owner && actAs === null ? "You can't act as any Postgres role here." : null);
   const rows = pg ? rowAccess(caps, { owner: allowed.owner && actAs === null, roles: actAs ? [actAs] : [] }, pg) : null;
   const object = objects.data?.objects?.find((o) => o.schema === current.schema && o.name === current.table);
+  useCrumbLabel("table", object ? current.table : undefined, current.table);
   const target: TableTarget | null =
     ready && current.table && pg && current.schema
       ? {
@@ -345,7 +347,7 @@ function Editor({ params, navigate }: TableEditorProps) {
   }
 
   return (
-    <div ref={fill.ref} style={fill.style} className="flex min-h-0">
+    <div ref={fill.ref} style={fill.style} className="flex min-h-0 max-[40rem]:flex-col">
       <HeaderContext>
         <ContextBar
           params={current}
@@ -368,7 +370,7 @@ function Editor({ params, navigate }: TableEditorProps) {
         noDatabase={ready && !current.pgDatabase}
         exactRows={exactRows}
       />
-      <div className="flex min-w-0 flex-1 flex-col">{main}</div>
+      <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">{main}</div>
       <EditorPanel
         target={draftTarget ?? target}
         access={draftTarget ? null : rows}

@@ -427,7 +427,7 @@ export function BranchActions({
           ) : (
             !reviewQuery.isError && <p className="text-muted-foreground">Loading the review…</p>
           )}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy || !review} onClick={() => void confirmProtect()}>
               Confirm protect
             </Button>
@@ -463,7 +463,7 @@ export function BranchActions({
           ) : (
             !reviewQuery.isError && <p className="text-muted-foreground">Loading the review…</p>
           )}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy || !review} onClick={() => void acknowledgeReview()}>
               Acknowledge
             </Button>
@@ -480,7 +480,7 @@ export function BranchActions({
             Reset {branch.name} to its parent? Everything written to {branch.name} since it was created is
             discarded, and it gets the parent&apos;s current data.
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy} onClick={() => void resetToParent()}>
               Confirm reset to parent
             </Button>
@@ -509,7 +509,7 @@ export function BranchActions({
             {bounds.min.replace("T", " ")} to now:{" "}
             {toLocalInput(new Date()).replace("T", " ")}). The current data is kept as a backup branch.
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy} onClick={restore}>
               Confirm restore
             </Button>
@@ -525,7 +525,7 @@ export function BranchActions({
           <p>
             Delete {branch.name}? Its backups are deleted with it. This can&apos;t be undone.
           </p>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy} onClick={() => void remove()}>
               Confirm delete branch
             </Button>

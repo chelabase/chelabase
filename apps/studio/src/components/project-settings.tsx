@@ -78,7 +78,7 @@ function RenameForm({ project }: { project: ProjectInfo }) {
               setSaved(false);
             }}
             maxLength={64}
-            className="h-8 w-64 border border-input bg-background px-2"
+            className="h-8 w-64 max-w-full border border-input bg-background px-2"
           />
         </label>
         <Button type="submit" disabled={!trimmed || trimmed === project.name || update.isPending}>

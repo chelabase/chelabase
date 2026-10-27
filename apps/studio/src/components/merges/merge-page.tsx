@@ -23,6 +23,7 @@ import {
   type MergeSummary,
   type UpdateMergeRequest,
 } from "@chelabase/management-client";
+import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { Button } from "@/components/ui/button";
 import { projectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
@@ -100,6 +101,9 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
   // Every change to a merge is judged by its target: Developer on an open branch, Admin on a
   // protected one. Others read the merge.
   const me = useGetMe();
+  const crumbProject = me.data?.tenant?.projects.find((p) => p.id === projectId);
+  useCrumbLabel("projectId", projectId, crumbProject?.name);
+  useCrumbLabel("databaseId", databaseId, crumbProject?.databases.find((d) => d.database_id === databaseId)?.name);
   const caps = projectCaps(me.data, projectId, databaseId);
   const canAct = caps.atLeast(target?.protected ? "admin" : "developer");
 
@@ -267,7 +271,7 @@ export function MergePage({ projectId, databaseId, mergeId, createClient }: Merg
           </p>
           {goneReason && (
             <p>
-              Why: <span className="font-mono text-xs">{goneReason}</span>
+              Why: <span className="font-mono text-xs [overflow-wrap:anywhere]">{goneReason}</span>
             </p>
           )}
           <p>

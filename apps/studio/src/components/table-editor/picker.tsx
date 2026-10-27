@@ -52,6 +52,13 @@ const row =
  * A searchable single-choice menu: a Base UI combobox that opens on a click in its field, shows
  * the current choice as its value and lists one level's options in a deep-water popup.
  */
+/** Header picker value sizing: its text width, never forced wider than it needs (min of 7rem and its own width). */
+export function headerWidth(shown: string): { flex: string; width: number; minWidth: string } {
+  const n = Math.min(28, Math.max(7, shown.length + 1));
+  // `width: 0` + a `Nch` basis: the field's min-content is its minimum, so the bar's pickers shrink together.
+  return { flex: `1 1 ${n}ch`, width: 0, minWidth: `min(7rem, ${n}ch)` };
+}
+
 export function Picker({ label, options, value, onChange, mono, look = "header", disabled, placeholder, describedBy, acceptTyped, caption, onOpenChange }: PickerProps) {
   const [typed, setTyped] = useState("");
   const text = typed.trim();
@@ -83,7 +90,7 @@ export function Picker({ label, options, value, onChange, mono, look = "header",
       <div
         className={cn(
           "relative flex items-center gap-2 border border-line-strong focus-within:outline-2 focus-within:-outline-offset-1 focus-within:outline-sand",
-          look === "header" ? "h-9 pr-6 pl-2" : "h-9 w-full pr-6 pl-2",
+          look === "header" ? "h-9 min-w-0 pr-6 pl-2" : "h-9 w-full pr-6 pl-2",
           disabled && "opacity-60",
         )}
       >
@@ -101,13 +108,14 @@ export function Picker({ label, options, value, onChange, mono, look = "header",
         <Combobox.Input
           aria-label={label}
           aria-describedby={describedBy}
+          title={shown || undefined}
           placeholder={placeholder}
           className={cn(
             "h-full min-w-0 border-0 bg-transparent p-0 text-sm text-chalk outline-none placeholder:text-chalk-dim",
-            look === "field" ? "w-full" : "",
+            look === "field" ? "w-full" : "max-w-[16rem] truncate",
             code,
           )}
-          style={look === "header" ? { width: `${Math.min(28, Math.max(7, shown.length + 1))}ch` } : undefined}
+          style={look === "header" ? { ...headerWidth(shown) } : undefined}
         />
         <ChevronDown aria-hidden="true" size={14} strokeWidth={1.5} className="pointer-events-none absolute right-2 text-chalk-dim" />
       </div>

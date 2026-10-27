@@ -1,4 +1,5 @@
 import { Fragment, lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useOverflowFocusable } from "@/lib/use-overflow-focusable";
 import { Link } from "@tanstack/react-router";
 import {
   ApiError,
@@ -9,6 +10,7 @@ import {
   type ProjectInfo,
 } from "@chelabase/management-client";
 import { TABLES_ROUTE } from "@/components/app-shell/rail-items";
+import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Tabs } from "@/components/ui/tabs";
 import { ProjectCapsContext, noAccess, projectCaps } from "@/lib/capabilities";
@@ -87,11 +89,12 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   const failure = project.data === undefined ? project.error : null;
   const restarting = project.error?.signInRestarted === true || me.error?.signInRestarted === true;
   const caps = projectCaps(me.data, projectId);
+  useCrumbLabel("projectId", projectId, project.data?.name);
 
   // A member with no project at all sees the no-access screen here too, not a 403 (Q9).
   if (me.data && noAccess(me.data)) {
     return (
-      <div className="mx-auto max-w-4xl space-y-8 p-8">
+      <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
         <NoAccess me={me.data} checking={me.isFetching} onCheck={() => void me.refetch()} />
       </div>
     );
@@ -106,7 +109,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
 
   return (
     <ProjectCapsContext.Provider value={caps}>
-    <div className="mx-auto max-w-4xl space-y-8 p-8">
+    <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : gone ? (
@@ -208,13 +211,14 @@ function DatabasesTable({
   );
   const toggle = (id: string, view: DatabaseView) =>
     setOpen(open?.id === id && open.view === view ? null : { id, view });
+  const scroll = useOverflowFocusable();
   if (databases.length === 0) {
     return <p className="text-sm text-muted-foreground">No databases yet.</p>;
   }
   return (
-    <div className="relative max-w-full overflow-x-auto">
+    <div ref={scroll.ref} tabIndex={scroll.tabIndex} className="relative max-w-full overflow-x-auto [container-type:inline-size]" role="region" aria-label="Databases table">
     <table className="w-full text-left text-sm">
-      <thead className="border-b text-muted-foreground">
+      <thead className="border-b text-muted-foreground @max-[44rem]:hidden">
         <tr>
           <th className="py-2 pr-4 font-medium">Name</th>
           <th className="py-2 pr-4 font-medium">Status</th>
@@ -231,11 +235,11 @@ function DatabasesTable({
           return (
           <ProjectCapsContext.Provider key={db.database_id} value={dbCaps}>
           <Fragment>
-            <tr className="border-b last:border-0">
-              <td className="py-2 pr-4">{db.name}</td>
-              <td className="py-2 pr-4">{db.status}</td>
-              <td className="py-2 pr-4 font-mono">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
-              <td className="py-2">
+            <tr className="border-b align-top last:border-0 @max-[44rem]:block @max-[44rem]:py-2">
+              <td className="max-w-[14rem] py-2 pr-4 @max-[44rem]:block @max-[44rem]:max-w-none @max-[44rem]:py-0.5 @max-[44rem]:pr-0"><span className="block truncate" title={db.name}>{db.name}</span></td>
+              <td className="py-2 pr-4 @max-[44rem]:block @max-[44rem]:py-0.5 @max-[44rem]:pr-0">{db.status}</td>
+              <td className="py-2 pr-4 font-mono @max-[44rem]:block @max-[44rem]:py-0.5 @max-[44rem]:pr-0">{db.host && db.port ? `${db.host}:${db.port}` : "—"}</td>
+              <td className="py-2 @max-[44rem]:block @max-[44rem]:pb-0 @max-[44rem]:pt-1.5">
                 <div className="flex flex-wrap items-start gap-2">
                   <DatabaseActions database={db} />
                   <Button
@@ -295,7 +299,8 @@ function DatabasesTable({
             </tr>
             {open?.id === db.database_id && db.status === "ready" && (
               <tr className="border-b last:border-0">
-                <td colSpan={4}>
+                <td colSpan={4} className="w-full max-w-0 @max-[44rem]:block @max-[44rem]:max-w-none">
+                  <div className="sticky left-0 w-[100cqw]">
                   {open.view === "branches" ? (
                     <DatabaseBranches
                       projectId={projectId}
@@ -311,6 +316,7 @@ function DatabasesTable({
                   ) : (
                     <DatabaseDataApi apiUrl={apiUrl} database={db} />
                   )}
+                  </div>
                 </td>
               </tr>
             )}

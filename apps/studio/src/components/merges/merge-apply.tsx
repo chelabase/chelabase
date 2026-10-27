@@ -205,7 +205,7 @@ export function MergeApply({
       {events.length > 0 && (
         <details className="rounded-lg border px-3 py-2">
           <summary className="cursor-pointer">Merge log ({events.length})</summary>
-          <ol aria-label="Merge log" className="space-y-0.5 pt-2 font-mono text-xs">
+          <ol aria-label="Merge log" className="space-y-0.5 pt-2 font-mono text-xs [overflow-wrap:anywhere]">
             {events.map((e, i) => (
               <li key={i} className={e.outcome === "failed" ? "text-destructive" : undefined}>
                 <span className="text-muted-foreground">{clock(e.at)}</span> {logLine(e)}

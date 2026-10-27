@@ -168,7 +168,7 @@ export function MergeFinish({
                   return (
                     <li key={`${l.kind}:${l.schema}.${l.table}.${l.name}`} className="space-y-1 rounded-lg border p-3">
                       <p>
-                        <span className="font-mono">
+                        <span className="font-mono [overflow-wrap:anywhere]">
                           {l.schema}.{l.table}
                         </span>
                         : {leftoverText(l)}
@@ -200,7 +200,7 @@ export function MergeFinish({
           <ul className="space-y-1">
             {result.created_roles.map((r) => (
               <li key={r.name} className="flex flex-wrap items-center gap-2">
-                <span className="font-mono">{r.name}</span>
+                <span className="font-mono [overflow-wrap:anywhere]">{r.name}</span>
                 <Link
                   to="/app/projects/$projectId"
                   params={{ projectId }}
@@ -222,7 +222,7 @@ export function MergeFinish({
           <ul className="list-disc pl-5">
             {drift.map((d) => (
               <li key={`${d.key.kind}:${itemName(d.key)}`}>
-                <span className="font-mono">{itemName(d.key)}</span>: {d.kind}
+                <span className="font-mono [overflow-wrap:anywhere]">{itemName(d.key)}</span>: {d.kind}
               </li>
             ))}
           </ul>
@@ -237,7 +237,7 @@ export function MergeFinish({
           </p>
           <ul className="list-disc pl-5">
             {produced.map((d) => (
-              <li key={`${d.key.kind}:${itemName(d.key)}`} className="font-mono">
+              <li key={`${d.key.kind}:${itemName(d.key)}`} className="font-mono [overflow-wrap:anywhere]">
                 {itemName(d.key)}
               </li>
             ))}

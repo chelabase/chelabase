@@ -75,13 +75,13 @@ export function CreateDatabaseForm({ projectId }: CreateDatabaseFormProps) {
 
   return (
     <form onSubmit={submit} className="flex flex-wrap items-end gap-3">
-      <label className="flex flex-col gap-1 text-sm">
+      <label className="flex min-w-0 max-w-full flex-col gap-1 text-sm">
         <span>Database name</span>
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
           disabled={busy}
-          className="h-8 w-64 rounded-lg border border-input bg-background px-2"
+          className="h-8 w-64 max-w-full rounded-lg border border-input bg-background px-2"
           placeholder="web1"
         />
       </label>
