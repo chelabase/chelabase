@@ -9,6 +9,7 @@ import {
   useListBranches,
   useListMembers,
   useListProjectGrants,
+  useListProjectTeamGrants,
   useListRoles,
   type BranchRole,
 } from "@chelabase/management-client";
@@ -21,7 +22,7 @@ import { escapeName } from "../hub/escape-name";
 import { Tag } from "./bits";
 import { DangerZone } from "./delete-role";
 import { Holders, Memberships } from "./memberships";
-import { holdersOf, isManaged } from "./model";
+import { holdersByMember, holdersOf, isManaged, teamHoldersOf } from "./model";
 import { PrivilegeEditor } from "./privilege-editor";
 import { PrivilegePanel } from "./privilege-panel";
 import { usePrivilegeEditor } from "./use-privilege-editor";
@@ -70,6 +71,7 @@ export function RolePage({ databaseId, branchId, role, pgDatabase }: RolePagePro
   const pgName = pgDatabase ?? pgDatabases.data?.find((d) => d.main)?.name;
   const dbOwner = pgDatabases.data?.find((d) => d.name === pgName)?.owner ?? null;
   const grants = useListProjectGrants(project?.id ?? "", { query: { enabled: admin && project !== undefined } });
+  const teamGrants = useListProjectTeamGrants(project?.id ?? "", { query: { enabled: admin && project !== undefined } });
   const members = useListMembers({ query: { enabled: admin } });
   const row = roles.data?.find((r) => r.name === role);
   const found = row !== undefined && isManaged(row);
@@ -104,7 +106,7 @@ export function RolePage({ databaseId, branchId, role, pgDatabase }: RolePagePro
     );
   }
   // Holders count in the Members tab: wait for the grants (Admins only) so the tabs don't jump.
-  if (!me.data || !roles.data || !branches.data || (admin && grants.isPending) || (pgDatabase === undefined && pgDatabases.isPending)) {
+  if (!me.data || !roles.data || !branches.data || (admin && (grants.isPending || teamGrants.isPending)) || (pgDatabase === undefined && pgDatabases.isPending)) {
     return frame(<p className="text-sm text-chalk-dim">Loading the role…</p>);
   }
   if (!project || !database || !branch) {
@@ -127,10 +129,11 @@ export function RolePage({ databaseId, branchId, role, pgDatabase }: RolePagePro
   }
 
   const rows = roles.data;
-  const holders = admin && grants.data ? holdersOf(role, grants.data, databaseId, rows) : null;
+  // A failed team read leaves the own-grant holders (the list is then short of the team ones, never wrong).
+  const holders = admin && grants.data ? [...holdersOf(role, grants.data, databaseId, rows), ...teamHoldersOf(role, teamGrants.data ?? [], rows, grants.data, databaseId)] : null;
   const tabs: { id: Section; label: string }[] = [
     { id: "privileges", label: "Privileges" },
-    ...(holders ? [{ id: "members" as const, label: `Members ${holders.length}` }] : []),
+    ...(holders ? [{ id: "members" as const, label: `Members ${holdersByMember(holders).length}` }] : []),
     { id: "memberships", label: "Memberships" },
     ...(admin ? [{ id: "danger" as const, label: "Danger zone" }] : []),
   ];

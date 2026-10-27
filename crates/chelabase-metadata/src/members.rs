@@ -271,6 +271,9 @@ pub struct OpenInvite {
 pub struct ProjectAccess {
     pub grants: Vec<(Uuid, GrantRow)>,
     pub overrides: Vec<(Uuid, Uuid, OverrideRow)>,
+    /// Every member of every team with a grant on the project: (team, member, grant), by team
+    /// then member (step 2).
+    pub teams: Vec<(Uuid, Uuid, GrantRow)>,
 }
 
 /// The `access_events.action` values.
@@ -317,10 +320,21 @@ pub enum AccessAction {
     RoleDeleted,
     /// Written by the privilege editor: `after: {pg_database, acted_as, ops}`, never SQL.
     PrivilegesChanged,
+    /// Team events (P9): `after` (and `before` for deletes and removals) is `{team: {id, name},
+    /// grants, affected_member_ids}`; created and updated also carry `description`.
+    TeamCreated,
+    TeamUpdated,
+    TeamDeleted,
+    TeamGrantPut,
+    TeamGrantDeleted,
+    /// Targets the member added.
+    TeamMemberAdded,
+    /// Targets the member removed.
+    TeamMemberRemoved,
 }
 
 impl AccessAction {
-    pub const ALL: [AccessAction; 28] = [
+    pub const ALL: [AccessAction; 35] = [
         Self::MemberJoined,
         Self::AdminClaimed,
         Self::AdminSet,
@@ -349,6 +363,13 @@ impl AccessAction {
         Self::RoleUpdated,
         Self::RoleDeleted,
         Self::PrivilegesChanged,
+        Self::TeamCreated,
+        Self::TeamUpdated,
+        Self::TeamDeleted,
+        Self::TeamGrantPut,
+        Self::TeamGrantDeleted,
+        Self::TeamMemberAdded,
+        Self::TeamMemberRemoved,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -381,6 +402,13 @@ impl AccessAction {
             Self::RoleUpdated => "role_updated",
             Self::RoleDeleted => "role_deleted",
             Self::PrivilegesChanged => "privileges_changed",
+            Self::TeamCreated => "team_created",
+            Self::TeamUpdated => "team_updated",
+            Self::TeamDeleted => "team_deleted",
+            Self::TeamGrantPut => "team_grant_put",
+            Self::TeamGrantDeleted => "team_grant_deleted",
+            Self::TeamMemberAdded => "team_member_added",
+            Self::TeamMemberRemoved => "team_member_removed",
         }
     }
 }
@@ -416,6 +444,54 @@ pub struct Observed {
     pub grant: Option<GrantRow>,
     /// By database.
     pub overrides: std::collections::BTreeMap<Uuid, OverrideRow>,
+    /// Team id → that team's grant on `project`, for the member's teams (step 2, P7).
+    pub teams: std::collections::BTreeMap<Uuid, GrantRow>,
+}
+
+impl Observed {
+    /// The sources on `database` (its override, if any), or at project level for `None`.
+    pub fn sources(&self, database: Option<Uuid>) -> GrantSources {
+        GrantSources::new(
+            self.grant.as_ref().map(GrantRow::to_grant),
+            self.teams.values().map(GrantRow::to_grant).collect(),
+            database
+                .and_then(|db| self.overrides.get(&db))
+                .map(OverrideRow::to_narrowing),
+        )
+    }
+
+    /// The state with the own grant replaced (`None`: deleted).
+    pub fn with_own(&self, grant: Option<GrantRow>) -> Observed {
+        Observed { grant, ..self.clone() }
+    }
+
+    /// The state with the override on `database` replaced (`None`: deleted).
+    pub fn with_override(&self, database: Uuid, o: Option<OverrideRow>) -> Observed {
+        let mut after = self.clone();
+        match o {
+            Some(o) => after.overrides.insert(database, o),
+            None => after.overrides.remove(&database),
+        };
+        after
+    }
+
+    /// The state with `team`'s grant replaced (`None`: the team gives nothing here, or the
+    /// member isn't in it).
+    pub fn with_team(&self, team: Uuid, grant: Option<GrantRow>) -> Observed {
+        let mut after = self.clone();
+        match grant {
+            Some(g) => after.teams.insert(team, g),
+            None => after.teams.remove(&team),
+        };
+        after
+    }
+}
+
+/// A team as an invite's check read it (P25): its grants on non-deleted projects, by project id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamSeen {
+    pub team: Uuid,
+    pub grants: Vec<(Uuid, GrantRow)>,
 }
 
 impl ProjectAccess {
@@ -430,41 +506,95 @@ impl ProjectAccess {
                 .filter(|(m, _, _)| *m == member)
                 .map(|(_, d, o)| (*d, o.clone()))
                 .collect(),
+            teams: self
+                .teams
+                .iter()
+                .filter(|(_, m, _)| *m == member)
+                .map(|(t, _, g)| (*t, g.clone()))
+                .collect(),
         }
     }
 }
 
-/// [`Observed`] as it stands now, read inside the write's transaction.
-async fn observe_tx(tx: &mut Tx, member: Uuid, project: Uuid) -> Result<Observed, AccessWriteError> {
-    let grant = sqlx::query(
-        "SELECT platform_role, pg_roles FROM project_grants WHERE member_id = $1 AND project_id = $2",
-    )
-    .bind(member)
-    .bind(project)
-    .fetch_optional(&mut **tx)
-    .await?
-    .map(|r| grant_from_parts(r.try_get("platform_role")?, r.try_get("pg_roles")?))
-    .transpose()?;
+/// [`Observed`] as it stands now, read inside the write's transaction. The team grants are
+/// read as the shared shape reads them (P4, P27): teams of the member's tenant, on a
+/// non-deleted project of that tenant.
+pub(crate) async fn observe_tx(tx: &mut Tx, member: Uuid, project: Uuid) -> Result<Observed, sqlx::Error> {
+    let mut all = observe_many_tx(tx, &[member], &[project]).await?;
+    Ok(all.remove(&(member, project)).unwrap_or(Observed { project, ..Observed::default() }))
+}
+
+/// [`observe_tx`] for every pair of `members` × `projects` at once: three set-based reads,
+/// whatever the sizes. Every pair has an entry (empty when the member has no access there).
+pub(crate) async fn observe_many_tx(
+    tx: &mut Tx,
+    members: &[Uuid],
+    projects: &[Uuid],
+) -> Result<std::collections::BTreeMap<(Uuid, Uuid), Observed>, sqlx::Error> {
+    let mut out: std::collections::BTreeMap<(Uuid, Uuid), Observed> = members
+        .iter()
+        .flat_map(|m| projects.iter().map(move |p| ((*m, *p), Observed { project: *p, ..Observed::default() })))
+        .collect();
+    if out.is_empty() {
+        return Ok(out);
+    }
     let rows = sqlx::query(
-        "SELECT o.database_id, o.platform_role, o.pg_roles
-         FROM database_grant_overrides o JOIN databases d ON d.id = o.database_id
-         WHERE o.member_id = $1 AND d.project_id = $2",
+        "SELECT member_id, project_id, platform_role, pg_roles FROM project_grants
+         WHERE member_id = ANY($1) AND project_id = ANY($2)",
     )
-    .bind(member)
-    .bind(project)
+    .bind(members)
+    .bind(projects)
     .fetch_all(&mut **tx)
     .await?;
-    let overrides = rows
-        .iter()
-        .map(|r| {
+    for r in &rows {
+        let key: (Uuid, Uuid) = (r.try_get("member_id")?, r.try_get("project_id")?);
+        if let Some(o) = out.get_mut(&key) {
+            o.grant = Some(grant_from_parts(r.try_get("platform_role")?, r.try_get("pg_roles")?)?);
+        }
+    }
+    let rows = sqlx::query(
+        "SELECT o.member_id, d.project_id, o.database_id, o.platform_role, o.pg_roles
+         FROM database_grant_overrides o JOIN databases d ON d.id = o.database_id
+         WHERE o.member_id = ANY($1) AND d.project_id = ANY($2)",
+    )
+    .bind(members)
+    .bind(projects)
+    .fetch_all(&mut **tx)
+    .await?;
+    for r in &rows {
+        let key: (Uuid, Uuid) = (r.try_get("member_id")?, r.try_get("project_id")?);
+        if let Some(o) = out.get_mut(&key) {
             let role: Option<String> = r.try_get("platform_role")?;
-            Ok((
+            o.overrides.insert(
                 r.try_get("database_id")?,
                 override_from_parts(role.as_deref(), r.try_get("pg_roles")?)?,
-            ))
-        })
-        .collect::<Result<_, sqlx::Error>>()?;
-    Ok(Observed { project, grant, overrides })
+            );
+        }
+    }
+    let rows = sqlx::query(
+        "SELECT tm.member_id, tg.project_id, tg.team_id, tg.platform_role, tg.pg_roles
+         FROM team_members tm
+         JOIN teams tt ON tt.id = tm.team_id
+         JOIN members mm ON mm.id = tm.member_id AND mm.tenant_id = tt.tenant_id
+         JOIN team_grants tg ON tg.team_id = tm.team_id AND tg.project_id = ANY($2)
+         JOIN projects tp ON tp.id = tg.project_id AND tp.tenant_id = tt.tenant_id
+                         AND tp.status <> 'deleted'
+         WHERE tm.member_id = ANY($1)",
+    )
+    .bind(members)
+    .bind(projects)
+    .fetch_all(&mut **tx)
+    .await?;
+    for r in &rows {
+        let key: (Uuid, Uuid) = (r.try_get("member_id")?, r.try_get("project_id")?);
+        if let Some(o) = out.get_mut(&key) {
+            o.teams.insert(
+                r.try_get("team_id")?,
+                grant_from_parts(r.try_get("platform_role")?, r.try_get("pg_roles")?)?,
+            );
+        }
+    }
+    Ok(out)
 }
 
 /// `Changed` unless the member's access is still what `expect` read.
@@ -478,6 +608,31 @@ async fn require_observed(
     } else {
         Err(AccessWriteError::Changed)
     }
+}
+
+/// Everything `member` holds, as [`Observed`] per non-deleted project where they have an own
+/// grant, an override or a team's grant (demotion, R17): sorted by project, none empty.
+pub(crate) async fn member_observed_tx(tx: &mut Tx, member: Uuid) -> Result<Vec<Observed>, sqlx::Error> {
+    let projects: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT s.project_id FROM (
+             SELECT project_id FROM project_grants WHERE member_id = $1
+             UNION
+             SELECT d.project_id FROM database_grant_overrides o
+               JOIN databases d ON d.id = o.database_id WHERE o.member_id = $1
+             UNION
+             SELECT tg.project_id FROM team_members tm
+               JOIN team_grants tg ON tg.team_id = tm.team_id WHERE tm.member_id = $1
+         ) s JOIN projects p ON p.id = s.project_id AND p.status <> 'deleted'
+         ORDER BY 1",
+    )
+    .bind(member)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(observe_many_tx(tx, &[member], &projects)
+        .await?
+        .into_values()
+        .filter(|o| o.grant.is_some() || !o.overrides.is_empty() || !o.teams.is_empty())
+        .collect())
 }
 
 // --- Row mapping -------------------------------------------------------------------------------
@@ -638,16 +793,52 @@ fn override_from_parts(
     })
 }
 
-/// The one select list every access read shares (MH-2): the own grant `g` and the override
-/// `d`. Step 2 adds the team grants here. A macro, so the queries stay `&'static str`.
+/// The one select list every access read shares (MH-2): the own grant `g`, the override `d`
+/// and the team grants `t` (from [`team_grants_lateral!`]). A macro, so the queries stay
+/// `&'static str`.
 macro_rules! grant_source_columns {
     () => {
         "g.platform_role AS g_role, g.pg_roles AS g_roles,
-         d.member_id IS NOT NULL AS d_found, d.platform_role AS d_role, d.pg_roles AS d_roles"
+         d.member_id IS NOT NULL AS d_found, d.platform_role AS d_role, d.pg_roles AS d_roles,
+         t.t_grants"
     };
 }
 
-/// A row of [`grant_source_columns!`] as [`GrantSources`] (no team grants in step 1).
+/// P4, P27: the member's team grants on one project, as the column `t.t_grants` (a JSON array
+/// of `{team_id, platform_role, pg_roles}` by team id, `'[]'` when none). Only teams of the
+/// member's own tenant count, and only their grants on a non-deleted project of that tenant, so
+/// a crafted cross-tenant `team_members` or `team_grants` row is ignored. Both arguments are
+/// SQL expressions given as string literals (the member's id and the project's id).
+macro_rules! team_grants_lateral {
+    ($member:literal, $project:literal) => {
+        concat!(
+            " LEFT JOIN LATERAL (
+                SELECT coalesce(jsonb_agg(jsonb_build_object('team_id', tg.team_id,
+                         'platform_role', tg.platform_role, 'pg_roles', tg.pg_roles)
+                         ORDER BY tg.team_id), '[]'::jsonb) AS t_grants
+                FROM team_members tm
+                JOIN teams tt ON tt.id = tm.team_id
+                JOIN members mm ON mm.id = tm.member_id AND mm.tenant_id = tt.tenant_id
+                JOIN team_grants tg ON tg.team_id = tm.team_id AND tg.project_id = ",
+            $project,
+            "
+                JOIN projects tp ON tp.id = tg.project_id AND tp.tenant_id = tt.tenant_id
+                                AND tp.status <> 'deleted'
+                WHERE tm.member_id = ",
+            $member,
+            ") t ON true "
+        )
+    };
+}
+
+/// One element of [`team_grants_lateral!`]'s array (its `team_id` only orders it).
+#[derive(Deserialize)]
+struct TeamGrantJson {
+    platform_role: String,
+    pg_roles: Vec<String>,
+}
+
+/// A row of [`grant_source_columns!`] as [`GrantSources`].
 fn grant_sources_of(r: &sqlx::postgres::PgRow) -> Result<GrantSources, sqlx::Error> {
     let own = match r.try_get::<Option<String>, _>("g_role")? {
         Some(role) => Some(grant_from_parts(&role, r.try_get("g_roles")?)?.to_grant()),
@@ -659,7 +850,13 @@ fn grant_sources_of(r: &sqlx::postgres::PgRow) -> Result<GrantSources, sqlx::Err
     } else {
         None
     };
-    Ok(GrantSources::new(own, Vec::new(), database))
+    let teams: Vec<TeamGrantJson> = serde_json::from_value(r.try_get::<Value, _>("t_grants")?)
+        .map_err(|e| decode_error(format!("invalid team grants: {e}")))?;
+    let teams = teams
+        .into_iter()
+        .map(|t| Ok(grant_from_parts(&t.platform_role, t.pg_roles)?.to_grant()))
+        .collect::<Result<Vec<_>, sqlx::Error>>()?;
+    Ok(GrantSources::new(own, teams, database))
 }
 
 /// Role sets are stored sorted, without duplicates.
@@ -690,12 +887,19 @@ macro_rules! member_columns {
 }
 
 /// The columns [`MemberListing`] adds to [`member_columns`] (selected from `members` alone). A
-/// grant on a soft-deleted project is no access, as in `member_projects`.
+/// grant on a soft-deleted project is no access, as in `member_projects`; a team grant counts
+/// as the shared shape reads it (P4, P27).
 macro_rules! listing_columns {
     () => {
         ", created_at, (tenant_admin OR EXISTS (
             SELECT 1 FROM project_grants g JOIN projects p ON p.id = g.project_id
-            WHERE g.member_id = members.id AND p.status <> 'deleted')) AS has_access"
+            WHERE g.member_id = members.id AND p.status <> 'deleted') OR EXISTS (
+            SELECT 1 FROM team_members tm
+            JOIN teams tt ON tt.id = tm.team_id AND tt.tenant_id = members.tenant_id
+            JOIN team_grants tg ON tg.team_id = tm.team_id
+            JOIN projects tp ON tp.id = tg.project_id AND tp.tenant_id = tt.tenant_id
+                            AND tp.status <> 'deleted'
+            WHERE tm.member_id = members.id)) AS has_access"
     };
 }
 
@@ -727,6 +931,8 @@ pub struct NewInvite<'a> {
     pub expires_at: DateTime<Utc>,
     pub token_hash: [u8; 32],
     pub grants: &'a [(Uuid, GrantRow)],
+    /// The teams the invitee joins, as the invite's check read them (P25).
+    pub teams: &'a [TeamSeen],
 }
 
 /// One `access_events` row, written in the transaction of the change it records.
@@ -1000,8 +1206,8 @@ async fn take_claims(
 }
 
 /// The projects whose branches a member's access change must reconcile, by id: those of its
-/// grants, its overrides, its member roles and its personal logins (any status: a revoked
-/// login's role may still be on a branch).
+/// grants, its overrides, its member roles, its personal logins (any status: a revoked
+/// login's role may still be on a branch) and its teams' grants (MH-5).
 pub(crate) async fn touched_projects(tx: &mut Tx, member: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
     sqlx::query_scalar(
         "SELECT project_id FROM project_grants WHERE member_id = $1
@@ -1015,6 +1221,9 @@ pub(crate) async fn touched_projects(tx: &mut Tx, member: Uuid) -> Result<Vec<Uu
          UNION
          SELECT d.project_id FROM personal_logins l
            JOIN databases d ON d.id = l.database_id WHERE l.member_id = $1
+         UNION
+         SELECT tg.project_id FROM team_members tm
+           JOIN team_grants tg ON tg.team_id = tm.team_id WHERE tm.member_id = $1
          ORDER BY 1",
     )
     .bind(member)
@@ -1160,6 +1369,191 @@ async fn insert_grants(
         grants_json.push(value);
     }
     Ok(grants_json)
+}
+
+/// A team's grants on non-deleted projects of `tenant`, by project id (as every read counts
+/// them, P27).
+pub(crate) async fn team_grants_tx(
+    tx: &mut Tx,
+    tenant: Uuid,
+    team: Uuid,
+) -> Result<Vec<(Uuid, GrantRow)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT tg.project_id, tg.platform_role, tg.pg_roles
+         FROM team_grants tg
+         JOIN projects p ON p.id = tg.project_id AND p.tenant_id = $1 AND p.status <> 'deleted'
+         WHERE tg.team_id = $2
+         ORDER BY tg.project_id",
+    )
+    .bind(tenant)
+    .bind(team)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok((
+                r.try_get("project_id")?,
+                grant_from_parts(r.try_get("platform_role")?, r.try_get("pg_roles")?)?,
+            ))
+        })
+        .collect()
+}
+
+/// A team's name when it is a team of `tenant`.
+pub(crate) async fn team_name_in(
+    tx: &mut Tx,
+    tenant: Uuid,
+    team: Uuid,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT name FROM teams WHERE id = $1 AND tenant_id = $2")
+        .bind(team)
+        .bind(tenant)
+        .fetch_optional(&mut **tx)
+        .await
+}
+
+/// The `grants` of a team event (P9): `[{project_id, platform_role, pg_roles}]`.
+pub(crate) fn team_grants_json(grants: &[(Uuid, GrantRow)]) -> Value {
+    Value::Array(
+        grants
+            .iter()
+            .map(|(project, g)| {
+                let mut value = grant_json(g);
+                value["project_id"] = json!(project);
+                value
+            })
+            .collect(),
+    )
+}
+
+/// A team event's `before`/`after` (P9, P38): the team, the grants the event concerns and the
+/// members it reaches (lowercase hyphenated ids, sorted).
+pub(crate) fn team_event_json(team: Uuid, name: &str, grants: &[(Uuid, GrantRow)], affected: &[Uuid]) -> Value {
+    let mut ids: Vec<String> = affected.iter().map(Uuid::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    json!({
+        "team": { "id": team, "name": name },
+        "grants": team_grants_json(grants),
+        "affected_member_ids": ids,
+    })
+}
+
+/// The distinct teams of an invite or approval, in the order given.
+fn distinct_teams(teams: &[TeamSeen]) -> Vec<&TeamSeen> {
+    let mut seen = std::collections::HashSet::new();
+    teams.iter().filter(|t| seen.insert(t.team)).collect()
+}
+
+/// P25: under the tenant lock, `Changed` unless every team is still a team of `tenant` whose
+/// grants on non-deleted projects are the ones the check read.
+async fn require_teams_seen(tx: &mut Tx, tenant: Uuid, teams: &[TeamSeen]) -> Result<(), AccessWriteError> {
+    for seen in distinct_teams(teams) {
+        if team_name_in(tx, tenant, seen.team).await?.is_none() {
+            return Err(AccessWriteError::Changed);
+        }
+        let mut want = seen.grants.clone();
+        want.sort_by_key(|(project, _)| *project);
+        if team_grants_tx(tx, tenant, seen.team).await? != want {
+            return Err(AccessWriteError::Changed);
+        }
+    }
+    Ok(())
+}
+
+/// What a write that joins teams knows of the member's access before it (I4).
+#[derive(Clone, Copy)]
+enum Before<'a> {
+    /// A member with no access until this transaction (new, re-invited or pending), so nothing
+    /// to compare.
+    Fresh,
+    /// What the check read, one per project; every project a joined team reaches must be among
+    /// them (T1 audit (b)).
+    Checked(&'a [Observed]),
+}
+
+/// T1 audit (b), I4: `Conflict` unless `expect` names every project the `teams` reach, with
+/// nothing written: a project missing there was never checked.
+fn require_expect_covers(teams: &[TeamSeen], expect: &[Observed]) -> Result<(), AccessWriteError> {
+    let missing = teams
+        .iter()
+        .flat_map(|t| t.grants.iter().map(|(p, _)| *p))
+        .find(|p| !expect.iter().any(|o| o.project == *p));
+    match missing {
+        Some(project) => Err(AccessWriteError::Conflict(format!(
+            "the member's access on project {project}, which a team reaches, wasn't checked"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// P12: adds `member` to each team (checked by [`require_teams_seen`] in this transaction,
+/// under the tenant lock); one `team_member_added` (targeting the member) per membership
+/// added. Returns the grant projects of the teams joined (the projects whose access changed for
+/// `member`), by id, without duplicates. With `Before::Checked`, refuses first unless the check
+/// read every project the teams reach ([`require_expect_covers`]).
+async fn add_team_memberships(
+    tx: &mut Tx,
+    tenant: Uuid,
+    actor: Uuid,
+    member: Uuid,
+    teams: &[TeamSeen],
+    before: Before<'_>,
+) -> Result<Vec<Uuid>, AccessWriteError> {
+    if let Before::Checked(expect) = before {
+        require_expect_covers(teams, expect)?;
+    }
+    let mut projects = Vec::new();
+    for seen in distinct_teams(teams) {
+        let name = team_name_in(tx, tenant, seen.team).await?.ok_or(AccessWriteError::Changed)?;
+        let inserted = sqlx::query(
+            "INSERT INTO team_members (team_id, member_id, added_by) VALUES ($1, $2, $3)
+             ON CONFLICT (team_id, member_id) DO NOTHING",
+        )
+        .bind(seen.team)
+        .bind(member)
+        .bind(actor)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            continue;
+        }
+        let mut grants = seen.grants.clone();
+        grants.sort_by_key(|(project, _)| *project);
+        projects.extend(grants.iter().map(|(project, _)| *project));
+        NewEvent::new(tenant, Some(actor), AccessAction::TeamMemberAdded, Some(member))
+            .after(team_event_json(seen.team, &name, &grants, &[member]))
+            .write(tx)
+            .await?;
+    }
+    projects.sort();
+    projects.dedup();
+    Ok(projects)
+}
+
+/// Whether an invite's grants or teams give any access (the listing's `has_access`).
+fn gives_access(grants: &[(Uuid, GrantRow)], teams: &[TeamSeen]) -> bool {
+    !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty())
+}
+
+/// P10: deletes every team membership of `member`; returns the teams as `[{id, name}]` by
+/// name. The caller holds the tenant row (P26).
+async fn delete_team_memberships(tx: &mut Tx, member: Uuid) -> Result<Value, sqlx::Error> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT t.id, t.name FROM team_members tm JOIN teams t ON t.id = tm.team_id
+         WHERE tm.member_id = $1 ORDER BY lower(t.name), t.id",
+    )
+    .bind(member)
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM team_members WHERE member_id = $1")
+        .bind(member)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Value::Array(
+        rows.into_iter().map(|(id, name)| json!({ "id": id, "name": name })).collect(),
+    ))
 }
 
 fn members_from(rows: Vec<MemberRow>) -> Result<Vec<MemberRecord>, sqlx::Error> {
@@ -1377,8 +1771,8 @@ impl MetadataClient {
     }
 
     /// Every source of a member's access on `project` and their override on `database`, in one
-    /// query (MH-2). A `None` database reads no override. Team grants are step 2's: `teams` is
-    /// empty until then. Doesn't look at the member's status: callers check that.
+    /// query (MH-2): the own grant, the member's team grants (P4) and the override. A `None`
+    /// database reads no override. Doesn't look at the member's status: callers check that.
     pub async fn grant_sources(
         &self,
         member: Uuid,
@@ -1390,7 +1784,8 @@ impl MetadataClient {
             grant_source_columns!(),
             " FROM (VALUES ($1::uuid)) m (id)
              LEFT JOIN project_grants g ON g.member_id = m.id AND g.project_id = $2
-             LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $3"
+             LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $3",
+            team_grants_lateral!("m.id", "$2::uuid")
         ))
         .bind(member)
         .bind(project)
@@ -1400,9 +1795,9 @@ impl MetadataClient {
         Ok(grant_sources_of(&r)?)
     }
 
-    /// [`Self::grant_sources`] for every member with a grant on `project` or an override on
-    /// `database`, in one query, by member id (the member-role reconciler's read per branch).
-    /// Doesn't look at the members' status: callers check that.
+    /// [`Self::grant_sources`] for every member with a grant on `project`, a team grant on it
+    /// or an override on `database`, in one query, by member id (the member-role reconciler's
+    /// read per branch). Doesn't look at the members' status: callers check that.
     pub async fn database_grant_sources(
         &self,
         project: Uuid,
@@ -1413,8 +1808,9 @@ impl MetadataClient {
             grant_source_columns!(),
             " FROM members m
              LEFT JOIN project_grants g ON g.member_id = m.id AND g.project_id = $1
-             LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $2
-             WHERE g.member_id IS NOT NULL OR d.member_id IS NOT NULL
+             LEFT JOIN database_grant_overrides d ON d.member_id = m.id AND d.database_id = $2",
+            team_grants_lateral!("m.id", "$1::uuid"),
+            " WHERE g.member_id IS NOT NULL OR d.member_id IS NOT NULL OR t.t_grants <> '[]'::jsonb
              ORDER BY m.id"
         ))
         .bind(project)
@@ -1479,7 +1875,8 @@ impl MetadataClient {
     /// T2-4 (P1, MH-2): every project of the tenant that isn't deleted where the member has an
     /// access source, with its sources at the project level (no database narrowing), by project
     /// id. The one read `/v1/me`, the project list and realtime's project list take a member's
-    /// projects from; step 2 adds the team grants here. Doesn't look at the member's status.
+    /// projects from: an own grant or a team grant (P4) makes a row; an override alone doesn't.
+    /// Doesn't look at the member's status.
     pub async fn member_grant_sources(
         &self,
         tenant: TenantId,
@@ -1489,9 +1886,11 @@ impl MetadataClient {
             "SELECT p.id AS project_id, ",
             grant_source_columns!(),
             " FROM projects p
-             JOIN project_grants g ON g.project_id = p.id AND g.member_id = $2
-             LEFT JOIN database_grant_overrides d ON false
-             WHERE p.tenant_id = $1 AND p.status <> 'deleted'
+             LEFT JOIN project_grants g ON g.project_id = p.id AND g.member_id = $2
+             LEFT JOIN database_grant_overrides d ON false",
+            team_grants_lateral!("$2::uuid", "p.id"),
+            " WHERE p.tenant_id = $1 AND p.status <> 'deleted'
+               AND (g.member_id IS NOT NULL OR t.t_grants <> '[]'::jsonb)
              ORDER BY p.id"
         ))
         .bind(tenant.as_uuid())
@@ -1675,8 +2074,8 @@ impl MetadataClient {
             .collect())
     }
 
-    /// The project's grants (any member status) by member id, and the overrides on its
-    /// databases by (member, database).
+    /// The project's grants (any member status) by member id, the overrides on its databases
+    /// by (member, database), and its team grants by (team, member) for every team member.
     pub async fn project_access(&self, project: Uuid) -> Result<ProjectAccess, MetadataError> {
         let rows = sqlx::query(
             "SELECT member_id, platform_role, pg_roles FROM project_grants
@@ -1713,7 +2112,33 @@ impl MetadataClient {
                 ))
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()?;
-        Ok(ProjectAccess { grants, overrides })
+        // P4, P27: as the shared shape reads team grants (the member's tenant's teams, a
+        // non-deleted project of that tenant).
+        let rows = sqlx::query(
+            "SELECT tg.team_id, tm.member_id, tg.platform_role, tg.pg_roles
+             FROM team_grants tg
+             JOIN teams tt ON tt.id = tg.team_id
+             JOIN projects tp ON tp.id = tg.project_id AND tp.tenant_id = tt.tenant_id
+                             AND tp.status <> 'deleted'
+             JOIN team_members tm ON tm.team_id = tg.team_id
+             JOIN members mm ON mm.id = tm.member_id AND mm.tenant_id = tt.tenant_id
+             WHERE tg.project_id = $1
+             ORDER BY tg.team_id, tm.member_id",
+        )
+        .bind(project)
+        .fetch_all(&self.pool)
+        .await?;
+        let teams = rows
+            .iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("team_id")?,
+                    r.try_get("member_id")?,
+                    grant_from_parts(r.try_get("platform_role")?, r.try_get("pg_roles")?)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        Ok(ProjectAccess { grants, overrides, teams })
     }
 
     /// Adds a person who is already in the tenant's Zitadel org, active and with a password
@@ -1723,6 +2148,7 @@ impl MetadataClient {
     /// member row with that Zitadel user, a removed one included (R29: a removed member comes
     /// back only through an invite code), or a grant naming `owner` (R7), is `Conflict`; a
     /// project that isn't active in the tenant, or a missing tenant, `NotFound`.
+    #[allow(clippy::too_many_arguments)] // the pinned signature (P25)
     pub async fn add_existing_user(
         &self,
         actor: Uuid,
@@ -1731,6 +2157,7 @@ impl MetadataClient {
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
@@ -1749,6 +2176,7 @@ impl MetadataClient {
                 "already a member of the tenant, or removed (invite them again)".into(),
             ));
         }
+        require_teams_seen(&mut tx, tenant_id, teams).await?;
         let id = Uuid::new_v4();
         release_email(&mut tx, tenant_id, id, email).await?;
         let raw = sqlx::query_as::<_, ListingRaw>(concat!(
@@ -1767,7 +2195,7 @@ impl MetadataClient {
         .await
         .map_err(write_error)?;
         let mut listing = MemberListing::try_from(raw)?;
-        listing.has_access = !grants.is_empty();
+        listing.has_access = gives_access(grants, teams);
         let member = listing.member.clone();
         let grants_json = insert_grants(&mut tx, tenant_id, member.id, actor, grants).await?;
         NewEvent::new(
@@ -1780,6 +2208,7 @@ impl MetadataClient {
         .after(json!({ "status": "active", "email": member.email, "grants": grants_json }))
         .write(&mut tx)
         .await?;
+        add_team_memberships(&mut tx, tenant_id, actor, member.id, teams, Before::Fresh).await?;
         tx.commit().await?;
         Ok(listing)
     }
@@ -1793,6 +2222,7 @@ impl MetadataClient {
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
@@ -1810,6 +2240,7 @@ impl MetadataClient {
             MemberStatus::Removed => return Err(AccessWriteError::MemberNotFound),
             _ => return Err(AccessWriteError::Conflict("the member isn't waiting for approval".into())),
         }
+        require_teams_seen(&mut tx, tenant, teams).await?;
         let raw = sqlx::query_as::<_, ListingRaw>(concat!(
             "UPDATE members SET status = 'active', accepted_at = now(), updated_at = now()
              WHERE id = $1 RETURNING ",
@@ -1819,7 +2250,7 @@ impl MetadataClient {
         .fetch_one(&mut *tx)
         .await?;
         let mut listing = MemberListing::try_from(raw)?;
-        listing.has_access = !grants.is_empty();
+        listing.has_access = gives_access(grants, teams);
         let grants_json = insert_grants(&mut tx, tenant, member, actor, grants).await?;
         NewEvent::new(tenant, Some(actor), AccessAction::MemberApproved, Some(member))
             .single_project(grants)
@@ -1827,6 +2258,7 @@ impl MetadataClient {
             .after(json!({ "status": "active", "grants": grants_json }))
             .write(&mut tx)
             .await?;
+        add_team_memberships(&mut tx, tenant, actor, member, teams, Before::Fresh).await?;
         revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
         tx.commit().await?;
         Ok(listing)
@@ -1902,6 +2334,29 @@ impl MetadataClient {
         member: Uuid,
         admin: bool,
     ) -> Result<(), AccessWriteError> {
+        self.set_tenant_admin_checked(actor, member, admin, None).await
+    }
+
+    /// Everything the member holds (own grants, overrides, team grants), one [`Observed`] per
+    /// non-deleted project they reach, sorted by project: what a demotion is checked against.
+    pub async fn member_observed(&self, member: Uuid) -> Result<Vec<Observed>, MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        let out = member_observed_tx(&mut tx, member).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// [`Self::set_tenant_admin`] after a check (R17, P6, P25): a demotion that would write
+    /// compares, under the tenant lock then the member's, everything the member keeps
+    /// ([`Self::member_observed`]) with `expect`, what the check read; any difference is
+    /// `Changed` with nothing written. `None`, a promotion, or an unchanged flag compare nothing.
+    pub async fn set_tenant_admin_checked(
+        &self,
+        actor: Option<Uuid>,
+        member: Uuid,
+        admin: bool,
+        expect: Option<&[Observed]>,
+    ) -> Result<(), AccessWriteError> {
         let tenant = member_tenant(&self.pool, member)
             .await?
             .ok_or(AccessWriteError::NotFound)?;
@@ -1927,6 +2382,12 @@ impl MetadataClient {
         {
             return Err(AccessWriteError::LastTenantAdmin);
         }
+        if !admin
+            && let Some(expect) = expect
+            && member_observed_tx(&mut tx, member).await? != expect
+        {
+            return Err(AccessWriteError::Changed);
+        }
         sqlx::query("UPDATE members SET tenant_admin = $2, updated_at = now() WHERE id = $1")
             .bind(member)
             .bind(admin)
@@ -1947,11 +2408,12 @@ impl MetadataClient {
         Ok(())
     }
 
-    /// Marks a member removed: its grants and overrides are deleted, its open invites revoked
-    /// and its live personal logins revoked (`member_removed`). Returns the projects whose
-    /// branches need a member-role reconcile (its grants', its overrides', those it has member
-    /// roles in and those of its personal logins), by id. Removing the last active admin is
-    /// `LastTenantAdmin`; removing a removed member writes nothing.
+    /// Marks a member removed: its grants, overrides and team memberships are deleted (P10,
+    /// under the tenant lock, P26), its open invites revoked and its live personal logins
+    /// revoked (`member_removed`, whose `before` lists the teams). Returns the projects whose
+    /// branches need a member-role reconcile (its grants', its overrides', its teams' grants',
+    /// those it has member roles in and those of its personal logins), by id. Removing the last
+    /// active admin is `LastTenantAdmin`; removing a removed member writes nothing.
     pub async fn remove_member(
         &self,
         actor: Uuid,
@@ -1976,6 +2438,7 @@ impl MetadataClient {
         }
         let touched = touched_projects(&mut tx, member).await?;
         let (grants, overrides) = delete_member_grants(&mut tx, member).await?;
+        let teams = delete_team_memberships(&mut tx, member).await?;
         sqlx::query(
             "UPDATE invites SET revoked_at = now()
              WHERE member_id = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
@@ -2001,6 +2464,7 @@ impl MetadataClient {
             "tenant_admin": m.tenant_admin,
             "grants": grants,
             "overrides": overrides,
+            "teams": teams,
         })))
         .after(json!({ "status": "removed", "tenant_admin": false }))
         .write(&mut tx)
@@ -2036,7 +2500,7 @@ impl MetadataClient {
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
     ) -> Result<Vec<Uuid>, AccessWriteError> {
-        self.put_project_grants_checked(actor, member, grants, &[]).await
+        self.put_project_grants_checked(actor, member, grants, &[], &[]).await
     }
 
     /// [`Self::put_project_grants`] after a check of `expect` (I4): under the member's lock each
@@ -2052,16 +2516,22 @@ impl MetadataClient {
         expect: &Observed,
     ) -> Result<bool, AccessWriteError> {
         Ok(!self
-            .put_project_grants_checked(actor, member, &[(project, grant.clone())], std::slice::from_ref(expect))
+            .put_project_grants_checked(actor, member, &[(project, grant.clone())], &[], std::slice::from_ref(expect))
             .await?
             .is_empty())
     }
 
+    /// [`Self::put_project_grants`] after a check of `expect`, adding the member to `teams`
+    /// (P12, P25): with teams it takes the tenant row before the member (P6) and refuses with
+    /// `Changed` any team whose grants differ from what the check read. Returns the projects
+    /// whose access changed: those of the grants written (in the order given), then those of
+    /// the teams joined that aren't among them (by id).
     pub async fn put_project_grants_checked(
         &self,
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
         expect: &[Observed],
     ) -> Result<Vec<Uuid>, AccessWriteError> {
         if grants.iter().any(|(_, g)| g.names_owner()) {
@@ -2073,9 +2543,25 @@ impl MetadataClient {
                 "a project is named in more than one grant".into(),
             ));
         }
+        // T1 audit (b): every project the teams reach was checked (refused before any lock).
+        require_expect_covers(teams, expect)?;
         let mut tx = self.pool.begin().await?;
+        // P6, P26: a write that adds team memberships takes the tenant row before the member.
+        let locked_tenant = if teams.is_empty() {
+            None
+        } else {
+            let tenant = member_tenant(&self.pool, member)
+                .await?
+                .ok_or(AccessWriteError::NotFound)?;
+            lock_tenant(&mut tx, tenant).await?;
+            Some(tenant)
+        };
         let m = lock_writable_member(&mut tx, member).await?;
         let tenant = m.tenant_id.as_uuid();
+        if locked_tenant.is_some_and(|t| t != tenant) {
+            return Err(AccessWriteError::Changed);
+        }
+        require_teams_seen(&mut tx, tenant, teams).await?;
         for observed in expect {
             require_observed(&mut tx, member, observed).await?;
         }
@@ -2085,8 +2571,15 @@ impl MetadataClient {
                 changed.push(*project);
             }
         }
-        if !changed.is_empty() {
+        // A team joined without grants changes no access, so it reaches no project.
+        let joined = add_team_memberships(&mut tx, tenant, actor, member, teams, Before::Checked(expect)).await?;
+        if !changed.is_empty() || !joined.is_empty() {
             revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
+        }
+        for project in joined {
+            if !changed.contains(&project) {
+                changed.push(project);
+            }
         }
         tx.commit().await?;
         Ok(changed)
@@ -2098,8 +2591,29 @@ impl MetadataClient {
         member: Uuid,
         project: Uuid,
     ) -> Result<(), AccessWriteError> {
+        self.delete_project_grant_checked(actor, member, project, None).await
+    }
+
+    /// [`Self::delete_project_grant`] after a check of `expect` (I4, MH-4): `Changed` when,
+    /// under the member's lock, their access on the project (own grant, overrides, team
+    /// grants) is no longer what the check read. The member's lock is enough (P6): a team write
+    /// locks every member it reaches before its own re-read, so it either commits before this
+    /// re-read (and this one sees it) or re-reads after this commit (and sees the grant gone).
+    pub async fn delete_project_grant_checked(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        project: Uuid,
+        expect: Option<&Observed>,
+    ) -> Result<(), AccessWriteError> {
         let mut tx = self.pool.begin().await?;
         let m = lock_writable_member(&mut tx, member).await?;
+        if let Some(expect) = expect {
+            if expect.project != project {
+                return Err(AccessWriteError::Changed);
+            }
+            require_observed(&mut tx, member, expect).await?;
+        }
         let before = sqlx::query(
             "DELETE FROM project_grants WHERE member_id = $1 AND project_id = $2
              RETURNING platform_role, pg_roles",
@@ -2303,7 +2817,7 @@ impl MetadataClient {
         tenant: TenantId,
         new: NewInvite<'_>,
     ) -> Result<(MemberListing, Uuid), AccessWriteError> {
-        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants } = new;
+        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants, teams } = new;
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict(OWNER_IS_IMPLIED.into()));
         }
@@ -2339,6 +2853,7 @@ impl MetadataClient {
                 "another member has this email".into(),
             ));
         }
+        require_teams_seen(&mut tx, tenant_id, teams).await?;
         let raw = match &existing {
             Some(removed) => {
                 sqlx::query_as::<_, ListingRaw>(concat!(
@@ -2370,10 +2885,11 @@ impl MetadataClient {
         }
         .map_err(write_error)?;
         let mut listing = MemberListing::try_from(raw)?;
-        listing.has_access = !grants.is_empty();
+        listing.has_access = gives_access(grants, teams);
         let member = listing.member.clone();
         if existing.is_some() {
             delete_member_grants(&mut tx, member.id).await?;
+            delete_team_memberships(&mut tx, member.id).await?;
         }
         let grants_json = insert_grants(&mut tx, tenant_id, member.id, actor, grants).await?;
         let invite = Uuid::new_v4();
@@ -2399,6 +2915,7 @@ impl MetadataClient {
         .after(json!({ "email": member.email, "expires_at": expires_at, "grants": grants_json }))
         .write(&mut tx)
         .await?;
+        add_team_memberships(&mut tx, tenant_id, actor, member.id, teams, Before::Fresh).await?;
         revoke_unqualified_logins(&mut tx, Some(actor), member.id).await?;
         tx.commit().await?;
         Ok((listing, invite))
@@ -2485,8 +3002,12 @@ impl MetadataClient {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AccessWriteError::NotFound)?;
+        let tenant: Uuid = member_tenant(&self.pool, member)
+            .await?
+            .ok_or(AccessWriteError::NotFound)?;
         let mut tx = self.pool.begin().await?;
-        // Lock order: the member, then its invite.
+        // Lock order: the tenant (its team memberships go, P26), the member, then its invite.
+        lock_tenant(&mut tx, tenant).await?;
         let m = lock_member(&mut tx, member)
             .await?
             .ok_or(AccessWriteError::NotFound)?;
@@ -2518,6 +3039,7 @@ impl MetadataClient {
         .execute(&mut *tx)
         .await?;
         let (grants, overrides) = delete_member_grants(&mut tx, member).await?;
+        let teams = delete_team_memberships(&mut tx, member).await?;
         sqlx::query(
             "UPDATE members SET status = 'removed', tenant_admin = false, updated_at = now()
              WHERE id = $1",
@@ -2532,7 +3054,7 @@ impl MetadataClient {
             Some(member),
         )
         .before(Some(
-            json!({ "status": "invited", "grants": grants, "overrides": overrides }),
+            json!({ "status": "invited", "grants": grants, "overrides": overrides, "teams": teams }),
         ))
         .after(match reason {
             Some(reason) => json!({ "status": "removed", "reason": reason }),
@@ -2648,7 +3170,8 @@ impl MetadataClient {
     /// The tenant's access log, newest first: `before_id` pages back, `project` keeps only
     /// that project's events: those carrying it as `project_id`, and those whose `before` or
     /// `after` lists a grant on it (invites, additions and removals naming several projects);
-    /// `member` keeps only the events whose target or actor is that member. Both filters apply
+    /// `member` keeps only the events whose target or actor is that member, or whose `before`
+    /// or `after` lists it in `affected_member_ids` (team events, MH-7). Both filters apply
     /// together.
     pub async fn access_events(
         &self,
@@ -2671,7 +3194,9 @@ impl MetadataClient {
                AND ($2::uuid IS NULL OR e.project_id = $2
                     OR e.before -> 'grants' @> jsonb_build_array(jsonb_build_object('project_id', $2::text))
                     OR e.after -> 'grants' @> jsonb_build_array(jsonb_build_object('project_id', $2::text)))
-               AND ($5::uuid IS NULL OR e.target_member_id = $5 OR e.actor_member_id = $5)
+               AND ($5::uuid IS NULL OR e.target_member_id = $5 OR e.actor_member_id = $5
+                    OR e.after -> 'affected_member_ids' @> jsonb_build_array($5::text)
+                    OR e.before -> 'affected_member_ids' @> jsonb_build_array($5::text))
                AND ($3::bigint IS NULL OR e.id < $3)
              ORDER BY e.id DESC
              LIMIT $4",
@@ -2921,6 +3446,26 @@ impl MetadataClient {
 mod tests {
     use super::*;
 
+    // T1 audit (b), coder's edges: an `expect` must name every project a joined team reaches;
+    // extra projects (the own grants') are fine, and teams without grants need nothing.
+    #[test]
+    fn an_expect_must_cover_every_team_project() {
+        let (p, q, r) = (Uuid::from_u128(10), Uuid::from_u128(20), Uuid::from_u128(30));
+        let g = GrantRow { platform_role: PlatformRole::Viewer, pg_roles: vec![] };
+        let seen = |team: u128, projects: &[Uuid]| TeamSeen {
+            team: Uuid::from_u128(team),
+            grants: projects.iter().map(|p| (*p, g.clone())).collect(),
+        };
+        let at = |project: Uuid| Observed { project, ..Observed::default() };
+        let teams = [seen(1, &[p]), seen(2, &[q, p])];
+        assert!(require_expect_covers(&teams, &[at(p), at(q)]).is_ok());
+        assert!(require_expect_covers(&teams, &[at(r), at(q), at(p)]).is_ok(), "extra projects");
+        assert!(matches!(require_expect_covers(&teams, &[at(p)]), Err(AccessWriteError::Conflict(m)) if m.contains(&q.to_string())));
+        assert!(matches!(require_expect_covers(&teams, &[]), Err(AccessWriteError::Conflict(_))));
+        assert!(require_expect_covers(&[seen(3, &[])], &[]).is_ok(), "a team without grants");
+        assert!(require_expect_covers(&[], &[]).is_ok(), "no teams");
+    }
+
     fn raw(status: &str) -> MemberRaw {
         MemberRaw {
             id: Uuid::from_u128(1),
@@ -3139,8 +3684,81 @@ mod tests {
                 "role_updated",
                 "role_deleted",
                 "privileges_changed",
+                // Members hub step 2 (P9): the team events.
+                "team_created",
+                "team_updated",
+                "team_deleted",
+                "team_grant_put",
+                "team_grant_deleted",
+                "team_member_added",
+                "team_member_removed",
             ]
         );
+    }
+
+    fn g(role: PlatformRole, roles: &[&str]) -> GrantRow {
+        GrantRow { platform_role: role, pg_roles: roles.iter().map(|r| r.to_string()).collect() }
+    }
+
+    // P7: an `Observed` reads as the sources it holds: the own grant, every team grant (by team
+    // id) and, for a database, that database's override; `with_*` builds the state a write would
+    // leave without touching the original.
+    #[test]
+    fn observed_sources_and_the_after_state() {
+        let (project, db1, db2) = (Uuid::from_u128(10), Uuid::from_u128(20), Uuid::from_u128(21));
+        let (x, y) = (Uuid::from_u128(30), Uuid::from_u128(31));
+        let own = g(PlatformRole::Viewer, &["app"]);
+        let tx = g(PlatformRole::Developer, &["etl"]);
+        let narrow = OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None };
+        let observed = Observed {
+            project,
+            grant: Some(own.clone()),
+            overrides: [(db1, narrow.clone())].into_iter().collect(),
+            teams: [(x, tx.clone())].into_iter().collect(),
+        };
+        assert_eq!(
+            observed.sources(Some(db1)),
+            GrantSources::new(Some(own.to_grant()), vec![tx.to_grant()], Some(narrow.to_narrowing())),
+            "on a database with an override"
+        );
+        assert_eq!(
+            observed.sources(Some(db2)),
+            GrantSources::new(Some(own.to_grant()), vec![tx.to_grant()], None),
+            "on a database without one"
+        );
+        assert_eq!(
+            observed.sources(None),
+            GrantSources::new(Some(own.to_grant()), vec![tx.to_grant()], None),
+            "at project level"
+        );
+
+        // A second team, with a lower id, comes first.
+        let w = Uuid::from_u128(29);
+        let tw = g(PlatformRole::Admin, &[]);
+        let more = observed.with_team(w, Some(tw.clone()));
+        assert_eq!(
+            more.sources(None),
+            GrantSources::new(Some(own.to_grant()), vec![tw.to_grant(), tx.to_grant()], None)
+        );
+        // Replacing and removing a team's grant.
+        let ty = g(PlatformRole::Viewer, &[]);
+        assert_eq!(observed.with_team(y, Some(ty.clone())).teams.get(&y), Some(&ty));
+        assert_eq!(observed.with_team(x, Some(ty.clone())).teams.get(&x), Some(&ty));
+        assert!(observed.with_team(x, None).teams.is_empty(), "with_team(x, None) drops x");
+        // Own grant and override.
+        assert_eq!(
+            observed.with_own(None).sources(None),
+            GrantSources::new(None, vec![tx.to_grant()], None)
+        );
+        let admin = g(PlatformRole::Admin, &[]);
+        assert_eq!(observed.with_own(Some(admin.clone())).grant, Some(admin));
+        assert!(observed.with_override(db1, None).overrides.is_empty());
+        let other = OverrideRow { platform_role: None, pg_roles: Some(vec!["app".into()]) };
+        assert_eq!(observed.with_override(db2, Some(other.clone())).overrides.get(&db2), Some(&other));
+        // The original is untouched.
+        assert_eq!(observed.teams.len(), 1);
+        assert_eq!(observed.grant, Some(own));
+        assert_eq!(observed.overrides.len(), 1);
     }
 
     #[test]

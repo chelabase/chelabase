@@ -2380,10 +2380,9 @@ fn opening_resets_the_marker_with_quoted_names() {
     assert_eq!(reset_born_closed_sql("db"), "ALTER DATABASE \"db\" RESET neon.born_closed;");
 }
 
-// Members hub T2 (MH-2): the reconcile reads `database_grant_sources` and grants the member
-// role every role of `Effective::roles` (Viewer-level ones included: the member role serves
-// Viewer act-as routes too; only personal logins filter by level, T6). A member with an
-// override and no source gets nothing, never a default.
+// Members hub T2 (MH-2): the reconcile reads `database_grant_sources`; step 2's T2-2 (P18):
+// the member role holds only the roles held at Developer or above, so the team's Viewer-level
+// `sales` stays out. A member with an override and no source gets nothing, never a default.
 #[tokio::test]
 async fn reconcile_reads_grant_sources() {
     let (w, _journal) = worker();
@@ -2429,7 +2428,7 @@ async fn reconcile_reads_grant_sources() {
             roles: vec![MemberRoleApplied {
                 member_id: member,
                 role_name: member_role_name(member),
-                applied_roles: vec!["billing".into(), "sales".into()],
+                applied_roles: vec!["billing".into()],
             }]
         }
     );
@@ -2781,7 +2780,7 @@ async fn plan_never_grants_the_owner_or_an_owner_level_role() {
 
 /// D1, spec Part 6 "Memberships": a personal login holds only the roles held at Developer or
 /// above (`Effective::roles_at_least(Developer)`), safe ones only, `INHERIT FALSE, SET TRUE`
-/// (R10); the member role keeps its Viewer-level roles.
+/// (R10); so does the member role since step 2's T2-2 (P18).
 #[tokio::test]
 async fn plan_grants_only_developer_level_safe_roles() {
     let (w, _journal) = worker();
@@ -2808,8 +2807,8 @@ async fn plan_grants_only_developer_level_safe_roles() {
     );
     assert_eq!(
         granted_to(&w, &member_role_name(member)),
-        set(&["billing", "reports"]),
-        "the member role keeps Viewer-level roles"
+        set(&["billing"]),
+        "T2-2: the member role holds no Viewer-level role either"
     );
 }
 
@@ -3510,4 +3509,286 @@ async fn an_emptied_member_role_password_is_rotated_with_sessions_ended() {
     assert_ne!(password, "the old password");
     let verifier = rotate.split('\'').nth(1).unwrap();
     assert!(chelabase_neon::scram::verifies(verifier, &password));
+}
+
+// --- Members hub step 2, T4 (T2-2, P18, P37): the member role holds only the roles held at
+// Developer or above. Whether it exists still follows the full effective set, so a member
+// whose roles are all below Developer keeps a member role with no memberships (the table
+// API read's CONNECT check logs in as it). -----------------------------------------------------
+
+/// The project of `branch`'s database.
+fn project_of(w: &FakeWorker, branch: BranchId) -> Uuid {
+    w.metadata.database(db_of(w, branch)).project_id.as_uuid()
+}
+
+/// `member`'s own grant on `branch`'s project becomes `level` over `roles`.
+fn own_grant(w: &FakeWorker, branch: BranchId, member: Uuid, level: PlatformRole, roles: &[&str]) {
+    let project = project_of(w, branch);
+    w.metadata.state().grants.insert(
+        (member, project),
+        GrantRow { platform_role: level, pg_roles: roles.iter().map(|r| r.to_string()).collect() },
+    );
+}
+
+/// One more team grant of `member` on `branch`'s project (the fake's team source).
+fn team_grant(w: &FakeWorker, branch: BranchId, member: Uuid, level: PlatformRole, roles: &[&str]) {
+    let project = project_of(w, branch);
+    w.metadata.state().team_grants.entry((member, project)).or_default().push(Grant {
+        platform_role: level,
+        roles: RoleSet::Only(roles.iter().map(|r| PgRole::parse(r)).collect()),
+    });
+}
+
+/// The reply's applied roles for `member` (`None`: no member role wanted).
+fn applied_for(reply: &MemberRolesReply, member: Uuid) -> Option<Vec<String>> {
+    let MemberRolesReply::Done { roles } = reply else { panic!("{reply:?}") };
+    roles.iter().find(|r| r.member_id == member).map(|r| r.applied_roles.clone())
+}
+
+/// T2-2: own Developer `{billing}` and a team's Viewer `{reports}` → the member role holds
+/// `billing` only; the row records the memberships, not the full set.
+#[tokio::test]
+async fn member_role_holds_only_roles_at_developer_or_above() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    team_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "reports"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["billing".to_string()]), "{reply:?}");
+    let role = member_role_name(member);
+    assert_eq!(granted_to(&w, &role), set(&["billing"]), "{:#?}", plain_scripts(&w));
+    assert_eq!(w.metadata.state().member_roles[0].applied_roles, ["billing"]);
+}
+
+/// T2-2: a role that drops below Developer (here: only a team names it, at Viewer) is revoked
+/// from an existing member role at the next reconcile, its sessions end, and the role and the
+/// rest of its memberships stay.
+#[tokio::test]
+async fn a_role_downgraded_below_developer_is_revoked_and_its_sessions_end() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    team_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    let role = member_role_name(member);
+    let verifier = row(&w, branch, member, "pw", &["billing", "reports"]);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &Cat {
+            roles: &["!postgres", "billing", "reports", &role],
+            memberships: &[(&role, "billing"), (&role, "reports")],
+            edges: &[],
+            passwords: &[(&role, &verifier)],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    );
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["billing".to_string()]), "{reply:?}");
+    let sql = texts(&w);
+    assert_eq!(sql.len(), 1, "{sql:?}");
+    assert!(
+        sql[0].contains(&format!("REVOKE reports FROM {role};\n{}", terminate_sql(&role))),
+        "{}",
+        sql[0]
+    );
+    assert!(!sql[0].contains("GRANT"), "{}", sql[0]);
+    assert!(!dropped(&w, &role), "the member role stays");
+    assert_eq!(w.metadata.state().member_roles[0].applied_roles, ["billing"]);
+}
+
+/// T2-2 through an override (P18, P37): a Developer grant capped at Viewer on the database
+/// leaves the member role with no memberships: every one is revoked (sessions end), the role
+/// is kept, and the row records the empty set.
+#[tokio::test]
+async fn an_override_below_developer_revokes_every_membership_but_keeps_the_role() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    let db = db_of(&w, branch);
+    w.metadata.state().overrides.insert(
+        (member, db.as_uuid()),
+        chelabase_metadata::members::OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None },
+    );
+    let role = member_role_name(member);
+    let verifier = row(&w, branch, member, "pw", &["billing"]);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &Cat {
+            roles: &["!postgres", "billing", &role],
+            memberships: &[(&role, "billing")],
+            edges: &[],
+            passwords: &[(&role, &verifier)],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    );
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(Vec::new()), "{reply:?}");
+    let sql = texts(&w);
+    assert_eq!(sql.len(), 1, "{sql:?}");
+    assert!(
+        sql[0].contains(&format!("REVOKE billing FROM {role};\n{}", terminate_sql(&role))),
+        "{}",
+        sql[0]
+    );
+    assert!(!dropped(&w, &role), "the member role stays: {:#?}", plain_scripts(&w));
+    assert_eq!(w.metadata.state().member_roles[0].applied_roles, Vec::<String>::new());
+}
+
+/// P18, P37: a member whose roles are all below Developer still gets a member role (created,
+/// with a sealed password and a row), holding nothing.
+#[tokio::test]
+async fn a_viewer_only_member_keeps_a_member_role_without_memberships() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["reports"]).await;
+    own_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "reports"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(Vec::new()), "{reply:?}");
+    let role = member_role_name(member);
+    assert!(created(&w, &role), "{:#?}", plain_scripts(&w));
+    assert_eq!(granted_to(&w, &role), BTreeSet::new(), "{:#?}", plain_scripts(&w));
+    let rows = w.metadata.state().member_roles.clone();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].role_name, role);
+    assert!(rows[0].applied_roles.is_empty(), "{rows:?}");
+    open_member_role_password(&w.key, branch.as_uuid(), &role, &rows[0].password_enc)
+        .expect("the row's password opens");
+}
+
+/// P37's "keep": a Viewer-only member's converged empty member role is left alone (no drop, no
+/// grant, no rotation).
+#[tokio::test]
+async fn a_viewer_only_members_converged_role_is_kept_untouched() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["reports"]).await;
+    own_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    let role = member_role_name(member);
+    let verifier = row(&w, branch, member, "pw", &[]);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &Cat {
+            roles: &["!postgres", "reports", &role],
+            memberships: &[],
+            edges: &[],
+            passwords: &[(&role, &verifier)],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    );
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(Vec::new()), "{reply:?}");
+    assert_eq!(texts(&w), Vec::<String>::new());
+}
+
+/// T4 edge: a role held at Viewer by the own grant and at Developer by a team keeps its
+/// highest level (D1), so the member role holds it.
+#[tokio::test]
+async fn a_role_developer_through_a_team_is_held_despite_a_viewer_own_grant() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    own_grant(&w, branch, member, PlatformRole::Viewer, &["billing"]);
+    team_grant(&w, branch, member, PlatformRole::Developer, &["billing"]);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["billing".to_string()]), "{reply:?}");
+    assert_eq!(granted_to(&w, &member_role_name(member)), set(&["billing"]));
+}
+
+/// MH-2 with T2-2: a member with no own grant, only team grants, gets a member role holding
+/// the team roles held at Developer or above.
+#[tokio::test]
+async fn reconcile_grants_a_team_only_member() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &[]).await;
+    let project = project_of(&w, branch);
+    w.metadata.state().grants.remove(&(member, project));
+    team_grant(&w, branch, member, PlatformRole::Developer, &["billing"]);
+    team_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "reports"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["billing".to_string()]), "{reply:?}");
+    assert_eq!(granted_to(&w, &member_role_name(member)), set(&["billing"]));
+}
+
+/// A role two sources name keeps the better level (D1): a team's Developer on `reports` wins
+/// over the own Viewer grant, so `reports` is held; `billing`, Viewer-only, is not.
+#[tokio::test]
+async fn a_role_held_at_developer_through_any_source_is_granted() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &[]).await;
+    own_grant(&w, branch, member, PlatformRole::Viewer, &["billing", "reports"]);
+    team_grant(&w, branch, member, PlatformRole::Developer, &["reports"]);
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "billing", "reports"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["reports".to_string()]), "{reply:?}");
+}
+
+/// An Admin (`All { plus }`) keeps every safe role; a data API name in `plus` stays only when
+/// held at Developer or above (`anon` via a Viewer team is left out, `authenticated` via a
+/// Developer team is kept).
+#[tokio::test]
+async fn an_admin_keeps_every_safe_role_and_data_api_names_only_at_developer() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &[]).await;
+    own_grant(&w, branch, member, PlatformRole::Admin, &[]);
+    team_grant(&w, branch, member, PlatformRole::Viewer, &["anon"]);
+    team_grant(&w, branch, member, PlatformRole::Developer, &["authenticated"]);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &cat(&["!postgres", "billing", "reports", "anon", "authenticated"]),
+    );
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(
+        applied_for(&reply, member),
+        Some(vec!["authenticated".to_string(), "billing".to_string(), "reports".to_string()]),
+        "{reply:?}"
+    );
+}
+
+/// R21: a Developer-level role whose chain reaches a role the member holds only at Viewer is
+/// still granted (its chain is its own power); the Viewer-level role is not granted directly.
+#[tokio::test]
+async fn a_developer_roles_chain_through_a_viewer_level_role_is_kept() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["billing"]).await;
+    team_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    w.computes.answer_at(
+        &ep,
+        "chelabase: member roles",
+        &Cat {
+            roles: &["!postgres", "billing", "reports"],
+            memberships: &[],
+            edges: &[("billing", "reports")],
+            passwords: &[],
+            databases: &[("app", "postgres")],
+        }
+        .answer(),
+    );
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(vec!["billing".to_string()]), "{reply:?}");
+    assert_eq!(granted_to(&w, &member_role_name(member)), set(&["billing"]));
+}
+
+/// MH-16 unchanged: on a protected branch a Viewer-only member's empty member role still
+/// carries the DDL guard's marker, and nothing else.
+#[tokio::test]
+async fn a_viewer_only_member_role_on_a_protected_branch_is_locked_and_holds_nothing() {
+    let (w, _journal) = worker();
+    let (branch, ep, member) = setup(&w, &["reports"]).await;
+    own_grant(&w, branch, member, PlatformRole::Viewer, &["reports"]);
+    w.metadata.state().branches.get_mut(&branch).unwrap().protected = true;
+    w.computes.answer(BRANCH_PROTECTED_CHECK_MARK, "on");
+    w.computes.answer_at(&ep, "chelabase: member roles", &cat(&["!postgres", "reports"]));
+    let reply = w.reconcile_member_roles(branch, None).await;
+    assert_eq!(applied_for(&reply, member), Some(Vec::new()), "{reply:?}");
+    let role = member_role_name(member);
+    assert_eq!(granted_to(&w, &role), BTreeSet::new(), "{:#?}", plain_scripts(&w));
+    assert!(
+        texts(&w).iter().any(|s| s.contains(&format!("GRANT chelabase_schema_locked TO {role}"))),
+        "{:?}",
+        texts(&w)
+    );
 }

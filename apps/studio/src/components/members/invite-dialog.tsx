@@ -12,6 +12,7 @@ import { GrantRows, toInviteGrants, type GrantRow } from "./grant-rows";
 import { inviteFailure, looksLikeEmail, type InviteFailure } from "./invite-errors";
 import type { OneTimeLink } from "./invite-link-panel";
 import { refreshAccess } from "./keys";
+import { TeamPicker } from "./team-picker";
 
 export interface InviteDialogProps {
   open: boolean;
@@ -111,6 +112,9 @@ function accessLine(rows: readonly GrantRow[], projects: readonly Project[]): st
   return rows.map((r) => `${ROLE_LABEL[r.platformRole]} on ${projects.find((p) => p.id === r.projectId)?.name ?? "a project"}`).join(", ");
 }
 
+/** P12: `team_ids` goes on the tenant invite only when teams are chosen. */
+const teamField = (teamIds: readonly string[]): { team_ids?: string[] } => (teamIds.length > 0 ? { team_ids: [...teamIds] } : {});
+
 const chipOf = (raw: string): Chip => {
   const email = raw.trim().toLowerCase();
   return { email, valid: looksLikeEmail(email) };
@@ -148,6 +152,7 @@ function InviteForm({
   const [chips, setChips] = useState<Chip[]>([]);
   const [draft, setDraft] = useState("");
   const [rows, setRows] = useState<GrantRow[]>([]);
+  const [teamIds, setTeamIds] = useState<string[]>([]);
   const [how, setHow] = useState<Delivery>("email");
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<InviteFailure>({});
@@ -218,7 +223,7 @@ function InviteForm({
     setFailure({});
     try {
       // The plain function, not a mutation hook: a link's URL must never reach a cache.
-      const result = await createInvite({ email: address, delivery: how, grants: toInviteGrants(rows) });
+      const result = await createInvite({ email: address, delivery: how, grants: toInviteGrants(rows), ...teamField(teamIds) });
       // BP-1: a person who was invited but has not accepted gets a new invite, not "already a member".
       const again = result.outcome === "existing_member" && result.member.status === "invited" && result.member.invite;
       const link = again ? (await resendInvite(again.id, { delivery: how })).invite_url : result.invite_url;
@@ -252,7 +257,7 @@ function InviteForm({
     const sent: Sent[] = [];
     for (const email of emails) {
       try {
-        const r = await createInvite({ email, delivery: how, grants: toInviteGrants(rows) });
+        const r = await createInvite({ email, delivery: how, grants: toInviteGrants(rows), ...teamField(teamIds) });
         if (r.outcome === "existing_member") {
           if (r.member.status === "invited" && r.member.invite) {
             const out = await resendInvite(r.member.invite.id, { delivery: how });
@@ -428,7 +433,8 @@ function InviteForm({
           )}
         </div>
         <DeliveryField info={info} value={how} onChange={setHow} error={failure.delivery} />
-        <GrantRows projects={projects} rows={rows} onChange={setRows} errors={failure.rows} legendNote="the same for everyone in this invite" />
+        <TeamPicker value={teamIds} onChange={setTeamIds} disabled={busy} />
+        <GrantRows projects={projects} rows={rows} onChange={setRows} errors={failure.rows} legendNote="the same for everyone in this invite" copyFrom teamsChosen={teamIds.length > 0} />
       </fieldset>
       {failure.form && (
         <p role="alert" className="text-sm text-coral">

@@ -4288,8 +4288,9 @@ type RestCalls = Arc<Mutex<Vec<RestCall>>>;
 
 type RestAnswer = Arc<dyn Fn(&Value) -> (u16, Vec<(&'static str, &'static str)>, Value) + Send + Sync>;
 
-/// A rest stand-in that records every request (on any path) and answers the console route
-/// with `answer(body)` and the schema route with `answer(null)`; other paths answer 404.
+/// A rest stand-in that records every request (on any path) and answers the console routes
+/// (`/query`, and T5's full-cell `/cell`, P36) with `answer(body)` and the schema route with
+/// `answer(null)`; other paths answer 404.
 async fn mock_rest_console(answer: RestAnswer) -> (String, RestCalls) {
     use axum::extract::Request;
     let calls: RestCalls = Arc::default();
@@ -4310,7 +4311,8 @@ async fn mock_rest_console(answer: RestAnswer) -> (String, RestCalls) {
             let body = String::from_utf8_lossy(&bytes).into_owned();
             log.lock().unwrap().push(RestCall { path: path.clone(), query, headers, body: body.clone() });
             let schema = path.starts_with("/internal/schema/");
-            if !schema && !(path.starts_with("/internal/console/") && path.ends_with("/query")) {
+            let console = path.starts_with("/internal/console/") && (path.ends_with("/query") || path.ends_with("/cell"));
+            if !schema && !console {
                 return axum::response::IntoResponse::into_response(axum::http::StatusCode::NOT_FOUND);
             }
             let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
@@ -9300,14 +9302,15 @@ async fn me_lists_narrowed_databases() {
             "platform_role": "admin",
             // R17: an Admin grant is every role, whatever a row names.
             "roles": "all",
-            "databases": [{ "database_id": w.db, "platform_role": "developer", "roles": ["app"] }],
+            "role_levels": {},
+            "databases": [{ "database_id": w.db, "platform_role": "developer", "roles": ["app"], "role_levels": { "app": "developer" } }],
         }]),
         "{me}"
     );
     // A role-only override keeps the grant's role.
     w.metadata.narrow(m, w.db, OverrideRow { platform_role: None, pg_roles: Some(vec!["reports".into()]) });
     let me: Value = w.app.send_as("nat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!(me["projects"][0]["databases"], json!([{ "database_id": w.db, "platform_role": "admin", "roles": ["owner", "reports"] }]));
+    assert_eq!(me["projects"][0]["databases"], json!([{ "database_id": w.db, "platform_role": "admin", "roles": ["owner", "reports"], "role_levels": { "reports": "admin" } }]));
     // No override: an empty list. A tenant admin: always empty.
     w.metadata.add_granted(w.tenant, "pia", w.project, PlatformRole::Viewer, &[]);
     let me: Value = w.app.send_as("pia", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
@@ -9689,7 +9692,7 @@ async fn me_lists_capabilities() {
     assert_eq!(me["instance_admin"], json!(false));
     assert_eq!(
         me["projects"],
-        json!([{ "project_id": w.project, "platform_role": "developer", "roles": ["billing", "sales"], "databases": [] }])
+        json!([{ "project_id": w.project, "platform_role": "developer", "roles": ["billing", "sales"], "role_levels": { "billing": "developer", "sales": "developer" }, "databases": [] }])
     );
     // The tenant overview shows only the projects the member is granted.
     let names: Vec<&str> = me["tenant"]["projects"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
@@ -9706,8 +9709,8 @@ async fn me_lists_capabilities() {
     assert!(me["member"]["id"].as_str().is_some_and(|id| id.len() == 36), "{me}");
     assert_eq!(me["instance_admin"], json!(true));
     let mut expected = vec![
-        json!({ "project_id": w.project, "platform_role": "admin", "roles": "all", "databases": [] }),
-        json!({ "project_id": other, "platform_role": "admin", "roles": "all", "databases": [] }),
+        json!({ "project_id": w.project, "platform_role": "admin", "roles": "all", "role_levels": {}, "databases": [] }),
+        json!({ "project_id": other, "platform_role": "admin", "roles": "all", "role_levels": {}, "databases": [] }),
     ];
     let mut got = me["projects"].as_array().unwrap().clone();
     let key = |v: &Value| v["project_id"].as_str().unwrap().to_string();
@@ -13653,6 +13656,246 @@ async fn row_routes_validate_before_any_compute() {
     assert_eq!(code_of(&error_of(t.table_post(main, "public/notes/rows/default", json!({})).await, 503).await), "unavailable");
 }
 
+// --- T5 (Q1, P40): a full-cell read as a role held below Developer goes through rest --------
+
+/// A branching app whose rest is `rest`, with the console's seeded databases (`web1` main and
+/// on, `analytics` and `scratch` off), the owner `postgres`, group roles `billing`,
+/// `billing_admin` (which can become `billing`), `sales` and `boss` on main, and `mixed`: a
+/// Developer through their own grant (`sales`) and a Viewer through a team's grant
+/// (`billing_admin`, `boss`). Their member role holds `sales` only (T2-2).
+async fn cell_app_at(rest: &str) -> (Branching, uuid::Uuid) {
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let jobs = FakeJobs::default();
+    let app = spawn_app_with_rest(metadata.clone(), jobs.clone(), rest).await;
+    let db = ready_database(tenant, &app.key);
+    let id = db.database_id;
+    metadata.insert_database(db);
+    let t = Branching { app, metadata, jobs, db: id };
+    let main = t.seeded();
+    let ep = t.metadata.branch(main).endpoint_id.unwrap();
+    t.metadata.add_role(&ep, "postgres", RoleOrigin::Owner, true, false);
+    t.metadata.add_role(&ep, "editor", RoleOrigin::Api, false, false);
+    t.metadata.add_group_role(&ep, "billing", &[]);
+    t.metadata.add_group_role(&ep, "billing_admin", &["billing"]);
+    t.metadata.add_group_role(&ep, "sales", &[]);
+    t.metadata.add_group_role(&ep, "boss", &[]);
+    let mixed = t.grant_member("mixed", PlatformRole::Developer, &["sales"]);
+    let project = t.metadata.database(t.db).project_id;
+    t.metadata.team_grant(
+        mixed,
+        project,
+        Grant {
+            platform_role: PlatformRole::Viewer,
+            roles: chelabase_types::access::RoleSet::Only(
+                [PgRole::Named("billing_admin".into()), PgRole::Named("boss".into())].into_iter().collect(),
+            ),
+        },
+    );
+    t.put_member_role(t.member_role_row(mixed, main, &["sales"]));
+    (t, mixed)
+}
+
+/// [`cell_app_at`] with the rest stand-in answering `answer`.
+async fn cell_app(answer: RestAnswer) -> (Branching, RestCalls) {
+    let (rest, calls) = mock_rest_console(answer).await;
+    let (t, _) = cell_app_at(&rest).await;
+    (t, calls)
+}
+
+impl Branching {
+    /// `POST …/tables/public/notes/cell` as `sub`.
+    async fn cell_as(&self, sub: &str, branch: BranchId, body: Value) -> reqwest::Response {
+        self.send_as(sub, Method::POST, &format!("{}/tables/public/notes/cell", self.branch(branch)), Some(body)).await
+    }
+}
+
+fn cell_of_id() -> Value {
+    json!({ "value": "1", "bytes": 4, "data_type": "integer" })
+}
+
+/// rest's 403 for a column the role can't select (the management body, P40).
+fn column_refused() -> Value {
+    json!({ "error": {
+        "code": "permission_denied", "message": "permission denied for table notes", "op_index": null,
+        "sqlstate": "42501", "detail": null, "hint": null, "position": null
+    } })
+}
+
+// A Viewer-level team role reads a full cell through rest's console path: the stand-in gets
+// `/internal/console/{branch}/cell` with the bearer and `{role, database, schema, table, key,
+// column}` (main's database by name, as the console sends it), the worker's role check runs
+// once, and no member-role session is opened (no compute lookup). A column the role lacks is
+// rest's 403 as it came. A role reached only through the Viewer-level chain goes to rest as
+// itself. The access refusals stay where they were, before rest.
+#[tokio::test]
+async fn get_cell_below_developer_goes_through_rest() {
+    let answer: RestAnswer = Arc::new(|request: &Value| match request["column"].as_str() {
+        Some("id") => (200, vec![], cell_of_id()),
+        _ => (403, vec![], column_refused()),
+    });
+    let (t, calls) = cell_app(answer).await;
+    let main = t.main();
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" })).await;
+    assert_eq!(resp.status(), 200, "the read went to rest");
+    assert_eq!(resp.json::<Value>().await.unwrap(), cell_of_id());
+    {
+        let calls = calls.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0].path, format!("/internal/console/{}/cell", main.as_uuid()));
+        assert!(calls[0].headers.contains(&format!("authorization: Bearer {REST_TOKEN}")), "{}", calls[0].headers);
+        let body: Value = serde_json::from_str(&calls[0].body).unwrap();
+        assert_eq!(
+            body,
+            json!({ "role": "billing_admin", "database": "web1", "schema": "public", "table": "notes",
+                    "key": { "id": 1 }, "column": "id" })
+        );
+    }
+    assert_eq!(t.compute_lookups(), 0, "no member-role session");
+    assert_eq!(t.role_checks(), vec![(main, "billing_admin".to_string())]);
+
+    // A column the role lacks: rest's refusal, unchanged.
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "body" })).await;
+    assert_eq!(error_of(resp, 403).await, column_refused());
+
+    // Reached only through `billing_admin`'s chain (Viewer level): rest, as `billing`, with the
+    // database named.
+    let resp = t
+        .cell_as("mixed", main, json!({ "role": "billing", "database": "web1", "key": { "id": 1 }, "column": "id" }))
+        .await;
+    assert_eq!(resp.status(), 200);
+    let last: Value = serde_json::from_str(&calls.lock().unwrap().last().unwrap().body).unwrap();
+    assert_eq!((last["role"].as_str(), last["database"].as_str()), (Some("billing"), Some("web1")), "{last}");
+    assert_eq!(calls.lock().unwrap().len(), 3);
+    assert_eq!(t.compute_lookups(), 0);
+
+    // Refused before rest, as today: a reserved name (422), a role not in the set and the
+    // owner's name (403 `forbidden`), and an owner-level role the worker refuses (403
+    // `role_refused`, not remembered).
+    let refused = |role: &'static str| json!({ "role": role, "key": { "id": 1 }, "column": "id" });
+    let err = error_of(t.cell_as("mixed", main, refused("authenticator")).await, 422).await;
+    assert_eq!(code_of(&err), "invalid_request");
+    for role in ["editor", "postgres"] {
+        let err = error_of(t.cell_as("mixed", main, refused(role)).await, 403).await;
+        assert_eq!(code_of(&err), "forbidden", "{role}");
+    }
+    *t.jobs.role_check.lock().unwrap() = Some(Ok(CheckDataRoleReply::refused("the role `boss` can create databases")));
+    for _ in 0..2 {
+        let err = error_of(t.cell_as("mixed", main, refused("boss")).await, 403).await;
+        assert_eq!(code_of(&err), "role_refused");
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3, "no refusal reached rest");
+    assert_eq!(t.compute_lookups(), 0);
+}
+
+// A role held at Developer (`sales`, the member's own grant) keeps today's member-role session:
+// the compute is looked up (503 in the fakes), rest is never asked and no role check runs, with
+// the data API on or off.
+#[tokio::test]
+async fn get_cell_at_developer_keeps_the_member_role_path() {
+    let (t, calls) = cell_app(rest_ok(cell_of_id())).await;
+    let main = t.main();
+    let body = json!({ "role": "sales", "key": { "id": 1 }, "column": "id" });
+    let resp = t.cell_as("mixed", main, body.clone()).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert_eq!(t.compute_lookups(), 1);
+    t.metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::Off);
+    let resp = t.cell_as("mixed", main, body).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert_eq!(t.compute_lookups(), 2);
+    assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
+    assert!(t.role_checks().is_empty());
+}
+
+// `role: None` (the owner) never goes to rest: the tenant admin reads on the owner's session; a
+// Viewer is refused as today. The tenant admin naming a role holds it at Admin: member path too.
+#[tokio::test]
+async fn get_cell_as_the_owner_never_calls_rest() {
+    let (t, calls) = cell_app(rest_ok(cell_of_id())).await;
+    let main = t.main();
+    let path = format!("{}/tables/public/notes/cell", t.branch(main));
+    let resp = t.send(Method::POST, &path, Some(json!({ "key": { "id": 1 }, "column": "id" }))).await;
+    assert_eq!(code_of(&error_of(resp, 503).await), "unavailable");
+    assert_eq!(t.compute_lookups(), 1);
+    let resp = t.send(Method::POST, &path, Some(json!({ "role": "billing", "key": { "id": 1 }, "column": "id" }))).await;
+    assert_ne!(resp.status(), 200, "the fakes have no compute");
+    t.grant_member("vic", PlatformRole::Viewer, &["billing_admin"]);
+    let err = error_of(t.cell_as("vic", main, json!({ "key": { "id": 1 }, "column": "id" })).await, 403).await;
+    assert_eq!(code_of(&err), "forbidden");
+    assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
+    assert!(t.role_checks().is_empty());
+}
+
+// The rest path needs the data API on the picked database: off is 409 `data_api_disabled`
+// before the role check and before rest; an unknown database is 404. A database turned off
+// between the check and rest's answer (rest says `unknown_database`) is re-read: 409 too.
+#[tokio::test]
+async fn get_cell_through_rest_needs_the_data_api() {
+    let (t, calls) = cell_app(rest_ok(cell_of_id())).await;
+    let main = t.main();
+    t.metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::Off);
+    for database in [Value::Null, json!("web1"), json!("analytics")] {
+        let body = json!({ "role": "billing_admin", "database": database, "key": { "id": 1 }, "column": "id" });
+        let err = error_of(t.cell_as("mixed", main, body).await, 409).await;
+        assert_eq!(code_of(&err), "data_api_disabled", "{database}");
+    }
+    let body = json!({ "role": "billing_admin", "database": "nope", "key": { "id": 1 }, "column": "id" });
+    assert_eq!(code_of(&error_of(t.cell_as("mixed", main, body).await, 404).await), "not_found");
+    assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock().unwrap());
+    assert!(t.role_checks().is_empty(), "{:?}", t.role_checks());
+    assert_eq!(t.compute_lookups(), 0);
+
+    // Turned off while the request was on its way: rest's `unknown_database`, re-read.
+    type Slot = Arc<Mutex<Option<(FakeMetadata, BranchId)>>>;
+    let slot: Slot = Arc::default();
+    let seen = slot.clone();
+    let answer: RestAnswer = Arc::new(move |_| {
+        if let Some((metadata, branch)) = seen.lock().unwrap().as_ref() {
+            metadata.set_data_api(*branch, "web1", chelabase_metadata::DataApiState::Off);
+        }
+        (404, vec![], json!({ "error": { "code": "unknown_database", "message": "the database doesn't exist or isn't served by this key" } }))
+    });
+    let (t, calls) = cell_app(answer).await;
+    let main = t.main();
+    *slot.lock().unwrap() = Some((t.metadata.clone(), main));
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" })).await;
+    assert_eq!(code_of(&error_of(resp, 409).await), "data_api_disabled");
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+// rest's answers come back as they are (status, body, `Retry-After`); rest unreachable is 503
+// `unavailable` with `Retry-After`.
+#[tokio::test]
+async fn get_cell_through_rest_passes_its_answer_on() {
+    let answer: RestAnswer = Arc::new(|request: &Value| match request["column"].as_str() {
+        Some("body") => (403, vec![], column_refused()),
+        _ => (503, vec![("retry-after", "2")], json!({ "error": { "code": "unavailable", "message": "try again" } })),
+    });
+    let (t, _) = cell_app(answer).await;
+    let main = t.main();
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "body" })).await;
+    assert_eq!(error_of(resp, 403).await, column_refused());
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" })).await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(resp.headers()["retry-after"], "2");
+    assert_eq!(resp.json::<Value>().await.unwrap(), json!({ "error": { "code": "unavailable", "message": "try again" } }));
+    assert_eq!(t.compute_lookups(), 0);
+
+    // Nothing listens where rest should be.
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
+    let (t, _) = cell_app_at(&dead).await;
+    let main = t.main();
+    let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" })).await;
+    assert_eq!(resp.status(), 503);
+    assert!(resp.headers().contains_key("retry-after"));
+    assert_eq!(code_of(&resp.json::<Value>().await.unwrap()), "unavailable");
+    assert_eq!(t.compute_lookups(), 0);
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn default_rows_and_full_cells_over_http() {
@@ -15906,4 +16149,592 @@ async fn a_membership_change_fails_closed_when_the_all_rows_check_cannot_complet
         assert!(!message_of(&err).contains("secret detail"), "{err}");
     }
     assert!(t.jobs.role_calls.lock().unwrap().is_empty(), "the update is never sent");
+}
+
+// ---- Members hub step 2 (T23, part B): invites, roster and reads around teams ----------------
+
+mod t23_teams {
+    use super::*;
+
+    /// A tenant invite body with these teams and no grants.
+    fn invite_with_teams(email: &str, teams: Value) -> Value {
+        json!({ "email": email, "grants": [], "team_ids": teams })
+    }
+
+    fn members_of(t: &Mw, team: uuid::Uuid) -> Vec<uuid::Uuid> {
+        t.w.metadata.stored_team(team).map(|x| x.members.into_iter().collect()).unwrap_or_default()
+    }
+
+    fn count(t: &Mw, action: &str) -> usize {
+        t.actions().iter().filter(|a| *a == action).count()
+    }
+
+    /// The member's row of the roster as `sub` sees it.
+    async fn roster_row(t: &Mw, sub: &str, member: uuid::Uuid) -> Value {
+        let list = body_of(t.send(sub, Method::GET, "/v1/members", None).await).await;
+        list.as_array()
+            .unwrap_or_else(|| panic!("the roster: {list}"))
+            .iter()
+            .find(|m| m["id"] == json!(member))
+            .cloned()
+            .unwrap_or_else(|| panic!("{member} isn't listed: {list}"))
+    }
+
+    // MH-8, P31: the project invite refuses `team_ids` in any form, `[]` and `null` included; the
+    // same invite without the field goes through.
+    #[tokio::test]
+    async fn project_invite_refuses_team_ids() {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Billing team");
+        let path = format!("/v1/projects/{}/invites", t.w.project);
+        for teams in [json!([]), json!([team]), Value::Null] {
+            let body = json!({ "email": "eve@x.com", "platform_role": "viewer", "pg_roles": [], "team_ids": teams });
+            let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(body)).await, 422).await;
+            assert_eq!(code_of(&err), "invalid_request", "{teams}: {err}");
+            assert_eq!(message_of(&err), "teams can be attached only by a tenant admin's invite", "{teams}: {err}");
+        }
+        assert!(t.mock.user("eve@x.com").is_none(), "no Zitadel user was made");
+        assert!(t.actions().is_empty(), "nothing written: {:?}", t.actions());
+        assert!(members_of(&t, team).is_empty());
+        let body = json!({ "email": "eve@x.com", "platform_role": "viewer", "pg_roles": [] });
+        assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, Some(body)).await.status(), 201);
+    }
+
+    // P12: `team_ids` on the tenant invite adds the memberships in the invite's transaction on
+    // every outcome, one `team_member_added` each; the reconcile covers the teams' projects and
+    // the answer's access counts them (T9-I1: built from what was written).
+    #[tokio::test]
+    async fn tenant_invite_with_team_ids_adds_memberships_on_every_outcome() {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Billing team");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Developer, &[]);
+        let z = t.mock.add_user_in("org-1", "dana@x.com", "Secret-pass1", true);
+        let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Active, false);
+        t.w.metadata.set_member(t.w.tenant, "bob", |m| m.email = Some("bob@x.com".into()));
+        for (email, outcome, status) in [("new@x.com", "invited", 201), ("dana@x.com", "added", 201), ("bob@x.com", "existing_member", 200)] {
+            t.clear_enqueued();
+            let added = count(&t, "team_member_added");
+            let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams(email, json!([team])))).await;
+            assert_eq!(resp.status(), status, "{email}");
+            let body = body_of(resp).await;
+            assert_eq!(body["outcome"], outcome, "{body}");
+            let id: uuid::Uuid = body["member"]["id"].as_str().unwrap().parse().unwrap();
+            assert!(members_of(&t, team).contains(&id), "{outcome}: the membership is written");
+            assert_eq!(count(&t, "team_member_added"), added + 1, "{outcome}: one event per team");
+            assert_eq!(t.enqueued(), t.branches(), "{outcome}: the team's project reconciles");
+            assert_eq!(body["member"]["has_access"], true, "{outcome}: {body}");
+            assert_eq!(
+                body["member"]["access"]["projects"],
+                json!([{ "project_id": t.w.project, "platform_role": "developer", "via": "team" }]),
+                "{outcome}: {body}"
+            );
+        }
+        assert_eq!(t.w.metadata.member(t.w.tenant, &z).map(|m| members_of(&t, team).contains(&m.id)), Some(true));
+        assert!(members_of(&t, team).contains(&bob));
+    }
+
+    // P7, P12: an invite's grants and teams are checked together on the union, per project: an
+    // existing member narrowed on web1 to {Viewer, [login]} can't join an Admin team (R17 keeps
+    // the override's `login`); a new person can't get a team's `boss` at Developer. Refused with
+    // the team and project named; nothing written.
+    #[tokio::test]
+    async fn invite_team_ids_are_checked_on_the_union() {
+        let t = mw(Mode::SelfHosted).await;
+        t.second_database();
+        let admins = t.w.metadata.seed_team(t.w.tenant, "Admins");
+        t.w.metadata.seed_team_grant(admins, t.w.project, PlatformRole::Admin, &[]);
+        let bosses = t.w.metadata.seed_team(t.w.tenant, "Bosses");
+        t.w.metadata.seed_team_grant(bosses, t.w.project, PlatformRole::Developer, &["boss"]);
+        let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+        t.w.metadata.set_member(t.w.tenant, "m", |r| r.email = Some("m@x.com".into()));
+        t.w.metadata.grant(m, t.w.project, PlatformRole::Developer, &["plain"]);
+        t.w.metadata.narrow(m, t.w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: Some(vec!["login".into()]) });
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams("m@x.com", json!([admins])))).await, 422).await;
+        assert_eq!(code_of(&err), "invalid_request", "{err}");
+        assert_eq!(
+            (err["error"]["role"].as_str(), err["error"]["database_id"].clone(), err["error"]["team_id"].clone(), err["error"]["project_id"].clone()),
+            (Some("login"), json!(t.w.db), json!(admins), json!(t.w.project)),
+            "{err}"
+        );
+        assert!(members_of(&t, admins).is_empty(), "nothing written");
+        // A new person: grants and teams together. `plain` alone is fine; the team's `boss` isn't.
+        let body = json!({ "email": "new@x.com", "grants": [{ "project_id": t.w.project, "platform_role": "developer", "pg_roles": ["plain"] }], "team_ids": [bosses] });
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 422).await;
+        assert_eq!((err["error"]["role"].as_str(), err["error"]["team_id"].clone()), (Some("boss"), json!(bosses)), "{err}");
+        assert!(members_of(&t, bosses).is_empty());
+        assert!(
+            !t.w.metadata.members.lock().unwrap().iter().any(|r| r.email.as_deref() == Some("new@x.com")),
+            "no member row"
+        );
+        assert!(t.actions().is_empty(), "{:?}", t.actions());
+    }
+
+    // Final fix round, defect 3: an invite's or approval's grants and teams are checked on the
+    // union they write, not step by step. An own Viewer `{login}` (a LOGIN role) with a team
+    // granting Admin is Admin from a source (R17): valid, so the invite and the approval go
+    // through. A union that is invalid in the end is still refused: naming the team when its
+    // grant is why, and no team when the own grant's role is.
+    #[tokio::test]
+    async fn invite_teams_are_checked_on_the_written_union_not_step_by_step() {
+        let t = mw(Mode::SelfHosted).await;
+        t.second_database();
+        let admins = t.w.metadata.seed_team(t.w.tenant, "Admins");
+        t.w.metadata.seed_team_grant(admins, t.w.project, PlatformRole::Admin, &[]);
+        let viewer_login = json!([{ "project_id": t.w.project, "platform_role": "viewer", "pg_roles": ["login"] }]);
+        let body = json!({ "email": "new@x.com", "grants": viewer_login, "team_ids": [admins] });
+        let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await;
+        let status = resp.status();
+        let answer: Value = resp.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 201, "the invite: {answer}");
+        let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+        let body = json!({ "grants": viewer_login, "team_ids": [admins] });
+        let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{pat}/approve"), Some(body)).await;
+        let status = resp.status();
+        let answer: Value = resp.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 200, "the approval: {answer}");
+        assert!(members_of(&t, admins).contains(&pat));
+
+        // Invalid in the end because of the team: `boss` at Developer reaches the owner on web1.
+        let bosses = t.w.metadata.seed_team(t.w.tenant, "Bosses");
+        t.w.metadata.seed_team_grant(bosses, t.w.project, PlatformRole::Developer, &["boss"]);
+        let body = json!({ "email": "b@x.com", "grants": [{ "project_id": t.w.project, "platform_role": "viewer", "pg_roles": [] }], "team_ids": [bosses] });
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 422).await;
+        assert_eq!(
+            (err["error"]["role"].as_str(), err["error"]["team_id"].clone(), err["error"]["project_id"].clone()),
+            (Some("boss"), json!(bosses), json!(t.w.project)),
+            "{err}"
+        );
+        // Invalid in the end because of the own grant: `login` at Developer (a team's level).
+        let devs = t.w.metadata.seed_team(t.w.tenant, "Devs");
+        t.w.metadata.seed_team_grant(devs, t.w.project, PlatformRole::Developer, &["plain"]);
+        let body = json!({ "email": "c@x.com", "grants": viewer_login, "team_ids": [devs] });
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 422).await;
+        assert_eq!((err["error"]["role"].as_str(), err["error"]["project_id"].clone()), (Some("login"), json!(t.w.project)), "{err}");
+        assert!(err["error"]["team_id"].is_null(), "the own grant is why: {err}");
+        assert!(members_of(&t, bosses).is_empty() && members_of(&t, devs).is_empty(), "nothing written");
+    }
+
+    // P12: approval takes `team_ids` as the invite does: memberships in the approval's
+    // transaction, one event each, the teams' projects reconciled, the answer's access counting
+    // them; and the same union check.
+    #[tokio::test]
+    async fn approve_with_team_ids() {
+        let t = mw(Mode::SelfHosted).await;
+        t.second_database();
+        let team = t.w.metadata.seed_team(t.w.tenant, "Billing team");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Developer, &["plain"]);
+        let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+        let path = format!("/v1/members/{pat}/approve");
+        let resp = t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "grants": [], "team_ids": [team] }))).await;
+        assert_eq!(resp.status(), 200);
+        let member = body_of(resp).await;
+        assert_eq!((member["status"].as_str(), member["has_access"].as_bool()), (Some("active"), Some(true)), "{member}");
+        assert_eq!(member["access"]["projects"], json!([{ "project_id": t.w.project, "platform_role": "developer", "via": "team" }]), "{member}");
+        assert!(members_of(&t, team).contains(&pat));
+        assert_eq!(t.actions(), vec!["member_approved", "team_member_added"]);
+        assert_eq!(t.enqueued(), {
+            let mut b = t.branches();
+            b.push(BranchId::from(DatabaseId(t.w.metadata.databases.lock().unwrap().values().find(|d| d.name == "web2").unwrap().database_id.as_uuid())));
+            b.sort_by_key(|b| b.as_uuid());
+            b
+        });
+        // The union check: a team's `boss` at Developer is refused (web1), nothing written.
+        let bosses = t.w.metadata.seed_team(t.w.tenant, "Bosses");
+        t.w.metadata.seed_team_grant(bosses, t.w.project, PlatformRole::Developer, &["boss"]);
+        let sam = t.w.metadata.add_member(t.w.tenant, "sam", MemberStatus::Pending, false);
+        let err = error_of(
+            t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{sam}/approve"), Some(json!({ "team_ids": [bosses] }))).await,
+            422,
+        )
+        .await;
+        assert_eq!((err["error"]["role"].as_str(), err["error"]["team_id"].clone()), (Some("boss"), json!(bosses)), "{err}");
+        assert_eq!(t.w.metadata.member(t.w.tenant, "sam").unwrap().status, MemberStatus::Pending);
+        assert!(members_of(&t, bosses).is_empty());
+    }
+
+    // P12: at most 50 ids, deduplicated, each a team of the caller's tenant, else 422 naming the
+    // id; nothing written. Duplicates count once.
+    #[tokio::test]
+    async fn unknown_foreign_or_too_many_team_ids_are_422() {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Ours");
+        let foreign = t.w.metadata.seed_team(TenantId::new(), "Theirs");
+        let unknown = uuid::Uuid::new_v4();
+        let pat = t.w.metadata.add_member(t.w.tenant, "pat", MemberStatus::Pending, false);
+        let approve = format!("/v1/members/{pat}/approve");
+        let many: Vec<uuid::Uuid> = (0..51).map(|_| uuid::Uuid::new_v4()).collect();
+        for bad in [unknown, foreign] {
+            for (path, body) in [
+                ("/v1/invites".to_string(), invite_with_teams("new@x.com", json!([team, bad]))),
+                (approve.clone(), json!({ "team_ids": [bad] })),
+            ] {
+                let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(body)).await, 422).await;
+                assert_eq!(code_of(&err), "invalid_request", "{path}: {err}");
+                assert_eq!(err["error"]["team_id"], json!(bad), "{path}: the id is named: {err}");
+            }
+        }
+        for (path, body) in [("/v1/invites".to_string(), invite_with_teams("new@x.com", json!(many))), (approve.clone(), json!({ "team_ids": many }))] {
+            let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(body)).await, 422).await;
+            assert_eq!(code_of(&err), "invalid_request", "{path}: {err}");
+        }
+        assert!(t.actions().is_empty(), "{:?}", t.actions());
+        assert!(t.mock.user("new@x.com").is_none(), "refused before Zitadel");
+        // 50 is the limit after deduplication: one id 51 times is one team.
+        let same: Vec<uuid::Uuid> = vec![team; 51];
+        let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams("new@x.com", json!(same)))).await;
+        assert_eq!(resp.status(), 201);
+        assert_eq!(count(&t, "team_member_added"), 1);
+    }
+
+    // P25: a team grant changed between the invite's check and its write is `Changed`: the
+    // invite is checked again on the new team and written; a second change is a 409 with
+    // nothing written.
+    #[tokio::test]
+    async fn an_invite_racing_a_team_grant_change_is_retried() {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Racy");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Viewer, &[]);
+        let project = t.w.project;
+        t.w.metadata.race_teams_once(move |md| md.seed_team_grant(team, project, PlatformRole::Developer, &[]));
+        let resp = t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams("new@x.com", json!([team])))).await;
+        assert_eq!(resp.status(), 201);
+        let body = body_of(resp).await;
+        let id: uuid::Uuid = body["member"]["id"].as_str().unwrap().parse().unwrap();
+        assert!(members_of(&t, team).contains(&id), "written on the retry");
+        assert_eq!(body["member"]["access"]["projects"][0]["platform_role"], "developer", "built from what was written: {body}");
+        // An existing member, and the team changes twice.
+        let bob = t.w.metadata.add_member(t.w.tenant, "bob", MemberStatus::Active, false);
+        t.w.metadata.set_member(t.w.tenant, "bob", |m| m.email = Some("bob@x.com".into()));
+        for role in [PlatformRole::Viewer, PlatformRole::Developer] {
+            t.w.metadata.race_teams_once(move |md| md.seed_team_grant(team, project, role, &[]));
+        }
+        let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_with_teams("bob@x.com", json!([team])))).await, 409).await;
+        assert_eq!(code_of(&err), "conflict", "{err}");
+        assert!(!members_of(&t, team).contains(&bob), "nothing written");
+    }
+
+    // P13: the roster's `via` names where each project's level comes from (`own`, `team`, `both`)
+    // and the level is the best source's; a tenant admin's projects stay `own`.
+    #[tokio::test]
+    async fn roster_via_reports_own_team_and_both() {
+        let t = mw(Mode::SelfHosted).await;
+        let p = t.w.project;
+        let own = t.w.metadata.add_granted(t.w.tenant, "own", p, PlatformRole::Developer, &[]);
+        let team_only = t.w.metadata.add_member(t.w.tenant, "teamonly", MemberStatus::Active, false);
+        let both = t.w.metadata.add_granted(t.w.tenant, "both", p, PlatformRole::Viewer, &[]);
+        let team = t.w.metadata.seed_team(t.w.tenant, "Devs");
+        t.w.metadata.seed_team_grant(team, p, PlatformRole::Developer, &[]);
+        let viewers = t.w.metadata.seed_team(t.w.tenant, "Viewers");
+        t.w.metadata.seed_team_grant(viewers, p, PlatformRole::Viewer, &[]);
+        t.w.metadata.seed_team_member(viewers, team_only);
+        t.w.metadata.seed_team_member(team, both);
+        for (member, role, via, level) in [
+            (own, "developer", "own", "developer"),
+            (team_only, "viewer", "team", "viewer"),
+            (both, "developer", "both", "developer"),
+        ] {
+            let row = roster_row(&t, DEFAULT_SUB, member).await;
+            assert_eq!(row["access"]["projects"], json!([{ "project_id": p, "platform_role": role, "via": via }]), "{row}");
+            assert_eq!(row["access"]["level"], level, "{row}");
+            assert_eq!(row["has_access"], true, "{row}");
+        }
+        let admin = t.w.metadata.member(t.w.tenant, DEFAULT_SUB).unwrap().id;
+        let row = roster_row(&t, DEFAULT_SUB, admin).await;
+        assert!(row["access"]["projects"].as_array().unwrap().iter().all(|p| p["via"] == "own"), "{row}");
+    }
+
+    // R1 on the roster's team-derived levels: a caller who sees only project A never learns of a
+    // team grant on B (MH-35's `other` still applies).
+    #[tokio::test]
+    async fn roster_level_counts_team_grants_on_visible_projects_only() {
+        let t = mw(Mode::SelfHosted).await;
+        let a = t.w.project;
+        let b = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+        t.w.metadata.add_granted(t.w.tenant, "seer", a, PlatformRole::Viewer, &[]);
+        let x = t.w.metadata.add_granted(t.w.tenant, "x", a, PlatformRole::Viewer, &[]);
+        let y = t.w.metadata.add_member(t.w.tenant, "y", MemberStatus::Active, false);
+        let team = t.w.metadata.seed_team(t.w.tenant, "B admins");
+        t.w.metadata.seed_team_grant(team, b, PlatformRole::Admin, &[]);
+        t.w.metadata.seed_team_member(team, x);
+        t.w.metadata.seed_team_member(team, y);
+        let row = roster_row(&t, "seer", x).await;
+        assert_eq!(row["access"]["level"], "viewer", "{row}");
+        assert_eq!(row["access"]["projects"], json!([{ "project_id": a, "platform_role": "viewer", "via": "own" }]), "{row}");
+        let row = roster_row(&t, "seer", y).await;
+        assert_eq!((row["access"]["level"].as_str(), row["has_access"].as_bool()), (Some("other"), Some(true)), "{row}");
+        assert_eq!(row["access"]["projects"], json!([]), "{row}");
+        let row = roster_row(&t, DEFAULT_SUB, x).await;
+        assert_eq!(row["access"]["level"], "admin", "{row}");
+    }
+
+    // P14, R1, MH-34 on `GET /v1/members/{id}/teams`: every team of the member, each with its
+    // grants on the caller's visible projects only, `pg_roles` null below the project's Admins.
+    #[tokio::test]
+    async fn member_teams_are_filtered_by_visibility_and_pg_roles_rule() {
+        let t = mw(Mode::SelfHosted).await;
+        let a = t.w.project;
+        let b = t.w.metadata.create_project(t.w.tenant, "Other").await.unwrap().id;
+        let dev = t.w.metadata.add_granted(t.w.tenant, "dev", a, PlatformRole::Developer, &[]);
+        let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+        let alpha = t.w.metadata.seed_team(t.w.tenant, "alpha");
+        t.w.metadata.seed_team_grant(alpha, a, PlatformRole::Developer, &["reports"]);
+        let beta = t.w.metadata.seed_team(t.w.tenant, "Beta");
+        t.w.metadata.seed_team_grant(beta, b, PlatformRole::Admin, &[]);
+        for team in [alpha, beta] {
+            t.w.metadata.seed_team_member(team, m);
+        }
+        let path = format!("/v1/members/{m}/teams");
+        let list = body_of(t.send("dev", Method::GET, &path, None).await).await;
+        assert_eq!(list.as_array().map(Vec::len), Some(2), "{list}");
+        assert_eq!((list[0]["name"].as_str(), list[1]["name"].as_str()), (Some("alpha"), Some("Beta")), "by lower(name): {list}");
+        assert_eq!(list[0]["projects"], json!([{ "project_id": a, "platform_role": "developer", "pg_roles": null }]), "{list}");
+        assert_eq!(list[1]["projects"], json!([]), "a project dev can't see is never named: {list}");
+        assert_eq!(list[0]["member_ids"], json!([m]), "{list}");
+        let list = body_of(t.send(DEFAULT_SUB, Method::GET, &path, None).await).await;
+        assert_eq!(list[0]["projects"][0]["pg_roles"], json!(["reports"]), "{list}");
+        assert_eq!(list[1]["projects"], json!([{ "project_id": b, "platform_role": "admin", "pg_roles": [] }]), "{list}");
+        // A member with no teams: an empty list.
+        let list = body_of(t.send("dev", Method::GET, &format!("/v1/members/{dev}/teams"), None).await).await;
+        assert_eq!(list, json!([]));
+    }
+
+    // P15, P30: the project's team grants are listed for its Admins (by lower(name)); the grants
+    // list stays the own grants' array.
+    #[tokio::test]
+    async fn project_team_grants_are_listed_for_project_admins() {
+        let t = mw(Mode::SelfHosted).await;
+        let p = t.w.project;
+        let padmin = t.w.metadata.add_granted(t.w.tenant, "padmin", p, PlatformRole::Admin, &[]);
+        t.w.metadata.add_granted(t.w.tenant, "dev", p, PlatformRole::Developer, &[]);
+        let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+        let zeta = t.w.metadata.seed_team(t.w.tenant, "Zeta");
+        t.w.metadata.seed_team_grant(zeta, p, PlatformRole::Viewer, &["reports"]);
+        t.w.metadata.seed_team_member(zeta, m);
+        let alpha = t.w.metadata.seed_team(t.w.tenant, "alpha");
+        t.w.metadata.seed_team_grant(alpha, p, PlatformRole::Developer, &[]);
+        let elsewhere = t.w.metadata.seed_team(t.w.tenant, "Elsewhere");
+        t.w.metadata.seed_team_member(elsewhere, m);
+        let path = format!("/v1/projects/{p}/team-grants");
+        let resp = t.send("padmin", Method::GET, &path, None).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            body_of(resp).await,
+            json!([
+                { "team_id": alpha, "name": "alpha", "platform_role": "developer", "pg_roles": [], "member_ids": [] },
+                { "team_id": zeta, "name": "Zeta", "platform_role": "viewer", "pg_roles": ["reports"], "member_ids": [m] },
+            ])
+        );
+        let err = error_of(t.send("dev", Method::GET, &path, None).await, 403).await;
+        assert_eq!(err["error"]["required"], "admin", "{err}");
+        // The grants list is unchanged: the own grants only.
+        let grants = body_of(t.send("padmin", Method::GET, &format!("/v1/projects/{p}/grants"), None).await).await;
+        let ids: Vec<&str> = grants.as_array().unwrap().iter().map(|g| g["member_id"].as_str().unwrap()).collect();
+        assert!(!ids.contains(&m.to_string().as_str()), "a team member isn't a grant: {grants}");
+        assert!(ids.contains(&padmin.to_string().as_str()), "{grants}");
+    }
+
+    // P16: reinstating a member reconciles its teams' projects too.
+    #[tokio::test]
+    async fn reinstate_reconciles_team_projects() {
+        let t = mw(Mode::SelfHosted).await;
+        let s = t.w.metadata.add_member(t.w.tenant, "s", MemberStatus::Active, false);
+        let team = t.w.metadata.seed_team(t.w.tenant, "Team");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Developer, &[]);
+        t.w.metadata.seed_team_member(team, s);
+        t.w.metadata.set_member(t.w.tenant, "s", |m| m.status = MemberStatus::Suspended);
+        t.clear_enqueued();
+        let resp = t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{s}/reinstate"), None).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(t.enqueued(), t.branches(), "the team's project reconciles");
+    }
+
+    // P10, MH-5: removing a member drops its memberships (`member_removed` lists the teams) and
+    // reconciles its teams' projects.
+    #[tokio::test]
+    async fn remove_member_reconciles_team_projects() {
+        let t = mw(Mode::SelfHosted).await;
+        let zid = t.mock.add_user_in("org-1", "r@x.com", "Secret-pass1", true);
+        let r = t.w.metadata.add_member(t.w.tenant, &zid, MemberStatus::Active, false);
+        let team = api_team(&t.w.app, "Team", t.w.project, "developer", &[], &[r]).await;
+        t.clear_enqueued();
+        let resp = t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{r}"), None).await;
+        assert_eq!(resp.status(), 204);
+        assert_eq!(t.enqueued(), t.branches(), "the team's project reconciles");
+        assert!(members_of(&t, team).is_empty(), "the membership is gone");
+        let removed = t.w.metadata.events.lock().unwrap().iter().rev().find(|e| e.action == "member_removed").cloned().unwrap();
+        assert_eq!(removed.before.unwrap()["teams"], json!([{ "id": team, "name": "Team" }]));
+    }
+
+    // MH-7: a member's Activity (`member_id`) shows the team events that reached them, even when
+    // they are neither the actor nor the target.
+    #[tokio::test]
+    async fn member_activity_finds_team_events() {
+        let t = mw(Mode::SelfHosted).await;
+        let m = t.w.metadata.add_member(t.w.tenant, "m", MemberStatus::Active, false);
+        let other = t.w.metadata.add_member(t.w.tenant, "other", MemberStatus::Active, false);
+        let team = api_team(&t.w.app, "Team", t.w.project, "viewer", &[], &[m]).await;
+        let resp = t
+            .send(DEFAULT_SUB, Method::PUT, &format!("/v1/teams/{team}/grants/{}", t.w.project), Some(json!({ "platform_role": "developer", "pg_roles": [] })))
+            .await;
+        assert_eq!(resp.status(), 200);
+        let page = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/access-events?member_id={m}"), None).await).await;
+        let actions: Vec<&str> = page["events"].as_array().unwrap().iter().map(|e| e["action"].as_str().unwrap()).collect();
+        assert_eq!(actions, vec!["team_grant_put", "team_member_added"], "{page}");
+        let page = body_of(t.send(DEFAULT_SUB, Method::GET, &format!("/v1/access-events?member_id={other}"), None).await).await;
+        assert_eq!(page["events"], json!([]), "{page}");
+    }
+
+    // --- MH-2: one route per caller of the grant sources, with a team-only member -------------
+
+    /// A team-only member `tom` (no own grant) in two teams: `Editors` gives Developer
+    /// `{billing_editor}`, `Readers` Viewer `{billing_reader}`; both roles are NOLOGIN groups
+    /// on `dev`.
+    async fn team_only() -> (MemberWorld, uuid::Uuid) {
+        let w = member_world(Mode::SelfHosted).await;
+        let ep = w.metadata.branch(w.dev).endpoint_id.unwrap();
+        w.metadata.add_group_role(&ep, "billing_editor", &[]);
+        w.metadata.add_group_role(&ep, "billing_reader", &[]);
+        let tom = w.metadata.add_member(w.tenant, "tom", MemberStatus::Active, false);
+        api_team(&w.app, "Editors", w.project, "developer", &["billing_editor"], &[tom]).await;
+        api_team(&w.app, "Readers", w.project, "viewer", &["billing_reader"], &[tom]).await;
+        (w, tom)
+    }
+
+    /// An access refusal: `forbidden`, `no_access_yet`, `pending_approval`, `member_suspended`,
+    /// or the project route's "not found" (R1).
+    fn refused(status: u16, body: &Value) -> bool {
+        matches!(body["error"]["code"].as_str(), Some("forbidden" | "no_access_yet" | "pending_approval" | "member_suspended"))
+            || (status == 404 && body["error"]["message"] == "not found")
+    }
+
+    async fn as_tom(w: &MemberWorld, method: Method, path: &str, body: Option<Value>) -> (u16, Value) {
+        let resp = w.app.send_as("tom", "org-1", method, path, body).await;
+        let status = resp.status().as_u16();
+        (status, resp.json().await.unwrap_or(Value::Null))
+    }
+
+    fn branch_path(w: &MemberWorld) -> String {
+        format!("/v1/databases/{}/branches/{}", w.db, w.dev.as_uuid())
+    }
+
+    #[tokio::test]
+    async fn team_only_member_is_admitted() {
+        let (w, _) = team_only().await;
+        let (status, body) = as_tom(&w, Method::GET, &format!("/v1/databases/{}", w.db), None).await;
+        assert_eq!(status, 200, "{body}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_lists_the_project() {
+        let (w, _) = team_only().await;
+        let (status, list) = as_tom(&w, Method::GET, "/v1/projects", None).await;
+        assert_eq!(status, 200, "{list}");
+        let ids: Vec<&str> = list.as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec![w.project.to_string().as_str()], "{list}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_me_lists_the_project() {
+        let (w, _) = team_only().await;
+        let (status, me) = as_tom(&w, Method::GET, "/v1/me", None).await;
+        assert_eq!(status, 200, "{me}");
+        assert_eq!(me["projects"].as_array().map(Vec::len), Some(1), "{me}");
+        assert_eq!(me["projects"][0]["project_id"], json!(w.project), "{me}");
+        assert_eq!(me["projects"][0]["platform_role"], "developer", "{me}");
+        assert_eq!(me["projects"][0]["roles"], json!(["billing_editor", "billing_reader"]), "{me}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_acts_as_a_team_role_in_the_table_api() {
+        let (w, _) = team_only().await;
+        let table = format!("{}/tables/public/notes", branch_path(&w));
+        let (status, body) = as_tom(&w, Method::GET, &table, None).await;
+        assert!(!refused(status, &body), "read: {status} {body}");
+        let row = format!("{table}/rows/default");
+        let (status, body) = as_tom(&w, Method::POST, &row, Some(json!({ "role": "billing_editor" }))).await;
+        assert!(!refused(status, &body), "act as a Developer team role: {status} {body}");
+        // A Viewer team role opens no Developer route (D1).
+        let (status, err) = as_tom(&w, Method::POST, &row, Some(json!({ "role": "billing_reader" }))).await;
+        assert_eq!((status, err["error"]["required"].as_str()), (403, Some("role:billing_reader")), "{err}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_console_as_a_team_role() {
+        let (w, _) = team_only().await;
+        let console = format!("{}/console/query", branch_path(&w));
+        for role in ["billing_reader", "billing_editor"] {
+            let body = json!({ "role": role, "tree": { "v": 1, "op": "select", "from": "notes" } });
+            let (status, answer) = as_tom(&w, Method::POST, &console, Some(body)).await;
+            assert!(!refused(status, &answer), "{role}: {status} {answer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn team_only_member_runs_sql_as_a_developer_team_role() {
+        let (w, _) = team_only().await;
+        let sql = format!("{}/sql", branch_path(&w));
+        let run = |role: &str| json!({ "run_id": uuid::Uuid::new_v4(), "role": role, "sql": "select 1" });
+        let (status, body) = as_tom(&w, Method::POST, &sql, Some(run("billing_editor"))).await;
+        assert!(!refused(status, &body), "{status} {body}");
+        let (status, err) = as_tom(&w, Method::POST, &sql, Some(run("billing_reader"))).await;
+        assert_eq!((status, err["error"]["required"].as_str()), (403, Some("role:billing_reader")), "{err}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_merges() {
+        let (w, _) = team_only().await;
+        let merges = format!("{}/merges", branch_path(&w));
+        let (status, body) = as_tom(&w, Method::POST, &merges, Some(json!({ "direction": "into_parent", "database": "app" }))).await;
+        assert!(!refused(status, &body), "{status} {body}");
+    }
+
+    #[tokio::test]
+    async fn team_only_member_key_role_needs_developer() {
+        let (w, _) = team_only().await;
+        let keys = format!("{}/keys", branch_path(&w));
+        let (status, body) = as_tom(&w, Method::POST, &keys, Some(json!({ "name": "editor-key", "role": "billing_editor" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let (status, err) = as_tom(&w, Method::POST, &keys, Some(json!({ "name": "reader-key", "role": "billing_reader" }))).await;
+        assert_eq!((status, err["error"]["required"].as_str()), (403, Some("role:billing_reader")), "{err}");
+    }
+
+    // Admin through a team reveals and resets the owner password (Project(Admin) routes).
+    #[tokio::test]
+    async fn team_admin_reveals_the_owner_password() {
+        let w = member_world(Mode::SelfHosted).await;
+        let ann = w.metadata.add_member(w.tenant, "ann", MemberStatus::Active, false);
+        api_team(&w.app, "Admins", w.project, "admin", &[], &[ann]).await;
+        let resp = w.app.send_as("ann", "org-1", Method::GET, &format!("/v1/databases/{}/connection", w.db), None).await;
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["password"], "s3cret", "{body}");
+        let resp = w.app.send_as("ann", "org-1", Method::POST, &format!("/v1/databases/{}/reset-password", w.db), None).await;
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap_or(Value::Null);
+        assert!(!refused(status, &body), "{status} {body}");
+    }
+
+    // The roster counts a team-only member's access (`has_access`, `via: team`).
+    #[tokio::test]
+    async fn team_only_member_has_access_in_the_roster() {
+        let (w, tom) = team_only().await;
+        let list: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/members", None).await.json().await.unwrap();
+        let row = list.as_array().unwrap().iter().find(|m| m["id"] == json!(tom)).cloned().unwrap();
+        assert_eq!(row["has_access"], true, "{row}");
+        assert_eq!(row["access"]["projects"], json!([{ "project_id": w.project, "platform_role": "developer", "via": "team" }]), "{row}");
+    }
+
+    // A project Admin through a team manages the project's grants, and grant validation runs.
+    #[tokio::test]
+    async fn team_only_project_admin_writes_checked_grants() {
+        let w = member_world(Mode::SelfHosted).await;
+        let ann = w.metadata.add_member(w.tenant, "ann", MemberStatus::Active, false);
+        api_team(&w.app, "Admins", w.project, "admin", &[], &[ann]).await;
+        let other = w.metadata.add_member(w.tenant, "other", MemberStatus::Active, false);
+        let grant = format!("/v1/projects/{}/grants/{other}", w.project);
+        let resp = w.app.send_as("ann", "org-1", Method::PUT, &grant, Some(json!({ "platform_role": "viewer", "pg_roles": [] }))).await;
+        assert_eq!(resp.status(), 200);
+        let resp = w.app.send_as("ann", "org-1", Method::PUT, &grant, Some(json!({ "platform_role": "viewer", "pg_roles": ["owner"] }))).await;
+        assert_eq!(resp.status(), 422);
+    }
 }

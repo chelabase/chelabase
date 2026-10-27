@@ -244,6 +244,12 @@ impl Effective {
         Self { platform_role, roles, role_levels }
     }
 
+    /// Each named role and its level (D1): under `All` only the `plus` names (the data API
+    /// roles a source names); every other role is held at the platform level.
+    pub fn role_levels(&self) -> &BTreeMap<String, PlatformRole> {
+        &self.role_levels
+    }
+
     /// The level the member holds `name` at (`All`: the platform level for any name
     /// [`RoleSet::may_act_as`] accepts); `None` when not held. Never a reserved name.
     pub fn level_of(&self, name: &str) -> Option<PlatformRole> {

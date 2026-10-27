@@ -144,6 +144,24 @@ struct FakeMetadata {
     personal_logins: Arc<Mutex<Vec<FakeLogin>>>,
     /// Final round A (T9-I1): `member_project_roles` fails with a database error while set.
     fail_member_project_roles: Arc<Mutex<bool>>,
+    /// Members hub step 2 (T23): the teams (any tenant) with their grants and members, as T1's
+    /// `teams`, `team_grants` and `team_members` hold them. Every grant-source read unions them
+    /// as the shared shape does (P4, P27).
+    teams: Arc<Mutex<Vec<FakeTeam>>>,
+    /// T23 (P25): a write "another request" makes just before the next re-read of an invite's
+    /// or approval's teams (`teams_seen_hold`), apart from `race_before_write` so a checked
+    /// grant write's `settle` never takes it.
+    race_before_teams_seen: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
+}
+
+/// Members hub step 2 (T23): one team as the fake keeps it.
+#[derive(Clone, Debug)]
+struct FakeTeam {
+    record: chelabase_metadata::teams::TeamRecord,
+    /// By project (any project id: the reads keep the non-deleted ones of the team's tenant).
+    grants: std::collections::BTreeMap<uuid::Uuid, GrantRow>,
+    /// Member ids (any member: the reads keep the ones of the team's tenant).
+    members: std::collections::BTreeSet<uuid::Uuid>,
 }
 
 /// Members hub T8: one personal-login record as the fake keeps it.
@@ -1894,7 +1912,9 @@ impl MetadataPort for FakeMetadata {
         database: Option<uuid::Uuid>,
     ) -> Result<GrantSources, MetadataError> {
         let own = self.grants.lock().unwrap().get(&(member, project)).map(GrantRow::to_grant);
-        let teams = self.team_grants.lock().unwrap().get(&(member, project)).cloned().unwrap_or_default();
+        let mut teams = self.team_grants.lock().unwrap().get(&(member, project)).cloned().unwrap_or_default();
+        // T23: the stored teams, as the shared shape reads them (P4, P27).
+        teams.extend(self.stored_team_grants(member, project).values().map(GrantRow::to_grant));
         let narrowing = database
             .and_then(|d| self.overrides.lock().unwrap().get(&(member, d)).cloned())
             .map(|o| Narrowing {
@@ -1935,6 +1955,63 @@ impl MetadataPort for FakeMetadata {
             .collect();
         out.sort_by_key(|(p, _)| *p);
         Ok(out)
+    }
+
+    // T23: the team port methods delegate to the fake's `fake_*` methods.
+    async fn list_teams(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        self.fake_list_teams(tenant)
+    }
+
+    async fn team(&self, tenant: TenantId, team: uuid::Uuid) -> Result<Option<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        self.fake_team(tenant, team)
+    }
+
+    async fn member_teams(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        self.fake_member_teams(member)
+    }
+
+    async fn project_team_grants(&self, project: uuid::Uuid) -> Result<Vec<chelabase_metadata::teams::ProjectTeamGrant>, MetadataError> {
+        self.fake_project_team_grants(project)
+    }
+
+    async fn create_team(
+        &self,
+        actor: uuid::Uuid,
+        tenant: TenantId,
+        name: &str,
+        description: &str,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        self.fake_create_team(actor, tenant, name, description)
+    }
+
+    async fn update_team(
+        &self,
+        actor: uuid::Uuid,
+        tenant: TenantId,
+        team: uuid::Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        self.fake_update_team(actor, tenant, team, name, description)
+    }
+
+    async fn team_change_observed(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> Result<Vec<(uuid::Uuid, Observed)>, chelabase_metadata::teams::TeamWriteError> {
+        self.fake_team_change_observed(tenant, change)
+    }
+
+    async fn write_team_checked(
+        &self,
+        actor: uuid::Uuid,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+        expect: &[(uuid::Uuid, Observed)],
+        skipped_admins: &[uuid::Uuid],
+    ) -> Result<chelabase_metadata::teams::TeamWrite, chelabase_metadata::teams::TeamWriteError> {
+        self.fake_write_team_checked(actor, tenant, change, expect, skipped_admins)
     }
 }
 
@@ -2954,31 +3031,37 @@ impl FakeMetadata {
             write(self);
         }
         for e in expect {
-            let databases: Vec<uuid::Uuid> = self
-                .databases
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|d| d.project_id.as_uuid() == e.project)
-                .map(|d| d.database_id.as_uuid())
-                .collect();
-            let now = Observed {
-                project: e.project,
-                grant: self.grants.lock().unwrap().get(&(member, e.project)).cloned(),
-                overrides: self
-                    .overrides
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .filter(|((m, d), _)| *m == member && databases.contains(d))
-                    .map(|((_, d), o)| (*d, o.clone()))
-                    .collect(),
-            };
-            if now != *e {
+            if self.observed_now(member, e.project) != *e {
                 return Err(AccessWriteError::Changed);
             }
         }
         Ok(())
+    }
+
+    /// What `observe_tx` reads now: the member's own grant on `project`, its overrides on the
+    /// project's databases and its teams' grants there (T23, P7).
+    fn observed_now(&self, member: uuid::Uuid, project: uuid::Uuid) -> Observed {
+        let databases: Vec<uuid::Uuid> = self
+            .databases
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|d| d.project_id.as_uuid() == project)
+            .map(|d| d.database_id.as_uuid())
+            .collect();
+        Observed {
+            project,
+            grant: self.grants.lock().unwrap().get(&(member, project)).cloned(),
+            overrides: self
+                .overrides
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((m, d), _)| *m == member && databases.contains(d))
+                .map(|((_, d), o)| (*d, o.clone()))
+                .collect(),
+            teams: self.stored_team_grants(member, project),
+        }
     }
 
     /// `revoke_invite`, with the reason the event carries (`delivery_failed`).
@@ -3040,7 +3123,10 @@ impl FakeMetadata {
             .filter(|p| p.status != ProjectStatus::Deleted)
             .map(|p| p.id.as_uuid())
             .collect();
-        let has_access = m.tenant_admin || self.grants.lock().unwrap().keys().any(|(member, p)| *member == m.id && live.contains(p));
+        let has_access = m.tenant_admin
+            || self.grants.lock().unwrap().keys().any(|(member, p)| *member == m.id && live.contains(p))
+            // T23 (P4): a team grant counts as the shared shape reads it.
+            || live.iter().any(|p| !self.stored_team_grants(m.id, *p).is_empty());
         chelabase_metadata::members::MemberListing { created_at: self.created_at(m.id), has_access, member: m }
     }
 
@@ -3152,8 +3238,11 @@ impl FakeMetadata {
         if m.tenant_admin {
             return Some(PlatformRole::Admin);
         }
-        let granted = self.grants.lock().unwrap().get(&(member, db.project_id.as_uuid()))?.platform_role;
-        let narrowed = self.overrides.lock().unwrap().get(&(member, database)).and_then(|o| o.platform_role);
+        // P5 (T23): the best level among the own grant and the member's teams' grants.
+        let project = db.project_id.as_uuid();
+        let own = self.grants.lock().unwrap().get(&(member, project)).map(|g| g.platform_role);
+        let granted = own.into_iter().chain(self.stored_team_grants(member, project).values().map(|g| g.platform_role)).max()?;
+        let narrowed =self.overrides.lock().unwrap().get(&(member, database)).and_then(|o| o.platform_role);
         Some(narrowed.map_or(granted, |o| o.min(granted)))
     }
 
@@ -3209,6 +3298,8 @@ impl FakeMetadata {
     /// projects of its overrides, of the branches holding its member roles and of its logins.
     fn login_touched_projects(&self, member: uuid::Uuid) -> Vec<uuid::Uuid> {
         let mut out: Vec<uuid::Uuid> = self.grants.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, p)| *p).collect();
+        // T23: its teams' grant projects too.
+        out.extend(self.member_team_projects(member));
         let mut databases: Vec<uuid::Uuid> = self.overrides.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, d)| *d).collect();
         databases.extend(self.personal_logins.lock().unwrap().iter().filter(|l| l.login.member_id == member).map(|l| l.login.database_id));
         let mut branches: Vec<BranchId> = self.member_branch_roles.lock().unwrap().iter().filter(|(m, _)| *m == member).map(|(_, b)| *b).collect();
@@ -3321,7 +3412,16 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             .map(|((m, d), o)| (*m, *d, o.clone()))
             .collect();
         overrides.sort_by_key(|(m, d, _)| (*m, *d));
-        Ok(chelabase_metadata::members::ProjectAccess { grants, overrides })
+        // T23: every member of every team with a grant on the project, by team then member.
+        let mut teams: Vec<(uuid::Uuid, uuid::Uuid, GrantRow)> = Vec::new();
+        let members: Vec<uuid::Uuid> = self.members.lock().unwrap().iter().map(|m| m.id).collect();
+        for m in members {
+            for (team, g) in self.stored_team_grants(m, project) {
+                teams.push((team, m, g));
+            }
+        }
+        teams.sort_by_key(|(t, m, _)| (*t, *m));
+        Ok(chelabase_metadata::members::ProjectAccess { grants, overrides, teams })
     }
 
     async fn project_branches(&self, project: uuid::Uuid) -> Result<Vec<uuid::Uuid>, MetadataError> {
@@ -3370,7 +3470,15 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             .filter(|e| {
                 e.tenant_id == tenant
                     && project.is_none_or(|p| event_names_project(e, p))
-                    && member.is_none_or(|m| e.target_member_id == Some(m) || e.actor_member_id == Some(m))
+                    && member.is_none_or(|m| {
+                        // P9, P38 (T1's filter): a team event that reached the member counts.
+                        let reached = |v: &Option<Value>| {
+                            v.as_ref().is_some_and(|v| {
+                                v["affected_member_ids"].as_array().is_some_and(|ids| ids.contains(&json!(m.to_string())))
+                            })
+                        };
+                        e.target_member_id == Some(m) || e.actor_member_id == Some(m) || reached(&e.before) || reached(&e.after)
+                    })
                     && before_id.is_none_or(|b| e.id < b)
             })
             .take(limit as usize)
@@ -3379,23 +3487,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             .collect())
     }
 
-    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<(uuid::Uuid, uuid::Uuid, PlatformRole)>, MetadataError> {
-        if *self.fail_member_project_roles.lock().unwrap() {
-            return Err(MetadataError::Config("member project roles unreadable".into()));
-        }
-        let members = self.members.lock().unwrap();
-        let live: HashSet<uuid::Uuid> =
-            self.projects.lock().unwrap().iter().filter(|p| p.status != ProjectStatus::Deleted).map(|p| p.id.as_uuid()).collect();
-        let mut out: Vec<_> = self
-            .grants
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|((m, p), _)| live.contains(p) && members.iter().any(|x| x.id == *m && x.tenant_id == tenant && x.status != MemberStatus::Removed))
-            .map(|((m, p), g)| (*m, *p, g.platform_role))
-            .collect();
-        out.sort_by_key(|(m, p, _)| (*m, *p));
-        Ok(out)
+    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::personal_logins::MemberProjectRole>, MetadataError> {
+        self.fake_member_project_roles(tenant)
     }
 
     async fn is_personal_login_name(&self, database: uuid::Uuid, name: &str) -> Result<bool, MetadataError> {
@@ -3625,12 +3718,24 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(self.login_touched_projects(member))
     }
 
-    async fn reinstate_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<()> {
+    async fn reinstate_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<Vec<uuid::Uuid>> {
         use chelabase_metadata::members::AccessWriteError;
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::NotFound)?;
+        // P16: the projects the member reaches through its own grants and its teams.
+        let mut reached: Vec<uuid::Uuid> = self
+            .grants
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|(x, p)| *x == member && self.project_live_in(m.tenant_id, *p))
+            .map(|(_, p)| *p)
+            .collect();
+        reached.extend(self.member_team_projects(member));
+        reached.sort();
+        reached.dedup();
         match m.status {
             MemberStatus::Suspended => {}
-            MemberStatus::Active => return Ok(()),
+            MemberStatus::Active => return Ok(reached),
             _ => return Err(AccessWriteError::Conflict("only a suspended member can be reinstated".into())),
         }
         {
@@ -3645,7 +3750,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
                 .before(json!({ "status": "suspended" }))
                 .after(json!({ "status": "active" })),
         );
-        Ok(())
+        Ok(reached)
     }
 
     async fn revoke_postgres_access(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<Vec<uuid::Uuid>> {
@@ -3689,7 +3794,17 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(())
     }
 
-    async fn set_tenant_admin(&self, actor: Option<uuid::Uuid>, member: uuid::Uuid, admin: bool) -> FakeWrite<()> {
+    async fn member_observed(&self, member: uuid::Uuid) -> Result<Vec<Observed>, MetadataError> {
+        Ok(self.member_observed_now(member))
+    }
+
+    async fn set_tenant_admin(
+        &self,
+        actor: Option<uuid::Uuid>,
+        member: uuid::Uuid,
+        admin: bool,
+        expect: Option<&[Observed]>,
+    ) -> FakeWrite<()> {
         use chelabase_metadata::members::AccessWriteError;
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::NotFound)?;
         if admin && m.status == MemberStatus::Removed {
@@ -3703,6 +3818,17 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         if !admin && m.status == MemberStatus::Active && self.other_active_admins(m.tenant_id, member) == 0 {
             return Err(AccessWriteError::LastTenantAdmin);
+        }
+        // As the real one under the tenant lock: the pending race runs, then a demotion is
+        // `Changed` when anything the member keeps differs from what the check read.
+        if !admin && let Some(expect) = expect {
+            let race = self.race_before_write.lock().unwrap().pop_front();
+            if let Some(write) = race {
+                write(self);
+            }
+            if self.member_observed_now(member) != expect {
+                return Err(AccessWriteError::Changed);
+            }
         }
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().tenant_admin = admin;
         let action = if admin { "admin_set" } else { "admin_unset" };
@@ -3735,8 +3861,19 @@ impl orchestrator::members::MembersPort for FakeMetadata {
                 touched.push(db);
             }
         }
+        // T23 (P10, MH-5): its teams' grant projects, read before the memberships go.
+        touched.extend(self.member_team_projects(member));
         touched.sort();
         touched.dedup();
+        let teams: Vec<Value> = {
+            let mut all = self.teams.lock().unwrap();
+            let mut out = Vec::new();
+            for t in all.iter_mut().filter(|t| t.members.contains(&member)) {
+                t.members.remove(&member);
+                out.push(json!({ "id": t.record.id, "name": t.record.name }));
+            }
+            out
+        };
         let grants: Vec<Value> = self
             .grants
             .lock()
@@ -3756,16 +3893,27 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             x.status = MemberStatus::Removed;
             x.tenant_admin = false;
         }
-        self.log(Change::new(m.tenant_id, Some(actor), "member_removed", Some(member)).before(json!({ "grants": grants })));
+        let mut before = json!({ "grants": grants });
+        if !teams.is_empty() {
+            before["teams"] = json!(teams);
+        }
+        self.log(Change::new(m.tenant_id, Some(actor), "member_removed", Some(member)).before(before));
         Ok(touched)
     }
 
     async fn put_project_grant(&self, actor: uuid::Uuid, member: uuid::Uuid, project: uuid::Uuid, grant: &GrantRow, expect: &Observed) -> FakeWrite<bool> {
-        Ok(!self.put_project_grants(actor, member, &[(project, grant.clone())], std::slice::from_ref(expect)).await?.is_empty())
+        Ok(!self.put_project_grants(actor, member, &[(project, grant.clone())], &[], std::slice::from_ref(expect)).await?.is_empty())
     }
 
     /// As the real one: all or nothing, an unchanged grant writes nothing.
-    async fn put_project_grants(&self, actor: uuid::Uuid, member: uuid::Uuid, grants: &[(uuid::Uuid, GrantRow)], expect: &[Observed]) -> FakeWrite<Vec<uuid::Uuid>> {
+    async fn put_project_grants(
+        &self,
+        actor: uuid::Uuid,
+        member: uuid::Uuid,
+        grants: &[(uuid::Uuid, GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
+        expect: &[Observed],
+    ) -> FakeWrite<Vec<uuid::Uuid>> {
         use chelabase_metadata::members::AccessWriteError;
         if grants.iter().any(|(_, g)| g.names_owner()) {
             return Err(AccessWriteError::Conflict("owner".into()));
@@ -3778,6 +3926,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         if grants.iter().any(|(p, _)| !self.project_active_in(m.tenant_id, *p)) {
             return Err(AccessWriteError::NotFound);
         }
+        // P25: the teams first (under the tenant lock), then the member's `expect`.
+        self.teams_seen_hold(m.tenant_id, teams)?;
         self.settle(member, expect)?;
         let mut changed = Vec::new();
         for (project, grant) in grants {
@@ -3791,12 +3941,27 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             self.log(Change::new(m.tenant_id, Some(actor), "grant_put", Some(member)).scope(Some(*project), None).after(json!({ "platform_role": grant.platform_role.as_str(), "pg_roles": roles })));
             changed.push(*project);
         }
+        // P12: the memberships; a team joined reaches its grants' projects.
+        let before: HashSet<uuid::Uuid> =
+            self.teams.lock().unwrap().iter().filter(|t| t.members.contains(&member)).map(|t| t.record.id).collect();
+        self.add_team_memberships(actor, m.tenant_id, member, teams);
+        for seen in teams.iter().filter(|t| !before.contains(&t.team)) {
+            for (project, _) in &seen.grants {
+                if !changed.contains(project) {
+                    changed.push(*project);
+                }
+            }
+        }
         Ok(changed)
     }
 
-    async fn delete_project_grant(&self, actor: uuid::Uuid, member: uuid::Uuid, project: uuid::Uuid) -> FakeWrite<()> {
+    async fn delete_project_grant(&self, actor: uuid::Uuid, member: uuid::Uuid, project: uuid::Uuid, expect: &Observed) -> FakeWrite<()> {
         use chelabase_metadata::members::AccessWriteError;
         let m = self.writable_member(member)?;
+        if expect.project != project {
+            return Err(AccessWriteError::Changed);
+        }
+        self.settle(member, std::slice::from_ref(expect))?;
         self.grants.lock().unwrap().remove(&(member, project)).ok_or(AccessWriteError::NotFound)?;
         self.log(Change::new(m.tenant_id, Some(actor), "grant_deleted", Some(member)).scope(Some(project), None));
         Ok(())
@@ -3852,7 +4017,9 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         new: chelabase_metadata::members::NewInvite<'_>,
     ) -> FakeWrite<(chelabase_metadata::members::MemberListing, uuid::Uuid)> {
         use chelabase_metadata::members::{AccessWriteError, NewInvite};
-        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants } = new;
+        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants, teams } = new;
+        // P25: the teams must still be what the check read, or nothing is written.
+        self.teams_seen_hold(tenant, teams)?;
         let email = email.trim().to_lowercase();
         let existing = self.member(tenant, zitadel_user_id);
         if existing.as_ref().is_some_and(|m| m.status != MemberStatus::Removed) {
@@ -3893,9 +4060,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             accepted: false,
         });
         self.log(Change::new(tenant, Some(actor), "invite_created", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
+        self.add_team_memberships(actor, tenant, id, teams);
         let listing = chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
-            has_access: !grants.is_empty(),
+            has_access: !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty()),
             member: record,
         };
         Ok((listing, invite))
@@ -3909,8 +4077,11 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         email: &str,
         name: &str,
         grants: &[(uuid::Uuid, GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
     ) -> FakeWrite<chelabase_metadata::members::MemberListing> {
         use chelabase_metadata::members::AccessWriteError;
+        // P25: the teams must still be what the check read, or nothing is written.
+        self.teams_seen_hold(tenant, teams)?;
         let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
         // R29: any row with the user, a removed one included, comes back only by invite code.
         if self.member(tenant, zitadel_user_id).is_some() {
@@ -3938,9 +4109,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             members.push(record.clone());
         }
         self.log(Change::new(tenant, Some(actor), "member_added", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
+        self.add_team_memberships(actor, tenant, id, teams);
         Ok(chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
-            has_access: !grants.is_empty(),
+            has_access: !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty()),
             member: record,
         })
     }
@@ -3983,6 +4155,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         actor: uuid::Uuid,
         member: uuid::Uuid,
         grants: &[(uuid::Uuid, GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
     ) -> FakeWrite<chelabase_metadata::members::MemberListing> {
         use chelabase_metadata::members::AccessWriteError;
         if self.vanish_on_approve.lock().unwrap().take() == Some(member)
@@ -3996,6 +4169,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             MemberStatus::Removed => return Err(AccessWriteError::MemberNotFound),
             _ => return Err(AccessWriteError::Conflict("the member isn't waiting for approval".into())),
         }
+        // P25: the teams must still be what the check read, or nothing is written.
+        self.teams_seen_hold(m.tenant_id, teams)?;
         self.insert_member_grants(m.tenant_id, member, grants)?;
         let record = {
             let mut members = self.members.lock().unwrap();
@@ -4005,9 +4180,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             row.clone()
         };
         self.log(Change::new(m.tenant_id, Some(actor), "member_approved", Some(member)).scope(single_project(grants), None).before(json!({ "status": "pending" })).after(json!({ "status": "active", "grants": grants_json(grants) })));
+        self.add_team_memberships(actor, m.tenant_id, member, teams);
         Ok(chelabase_metadata::members::MemberListing {
             created_at: self.created_at(record.id),
-            has_access: !grants.is_empty(),
+            has_access: !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty()),
             member: record,
         })
     }
@@ -4041,4 +4217,631 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         Ok(())
     }
+}
+
+// --- Members hub step 2 (T23): teams ----------------------------------------------------------
+//
+// The fake's side of T1's `teams.rs` and the team parts of `members.rs`, behaving as their docs
+// say. The `fake_*` methods have the signatures of `MetadataClient`'s methods of the same name
+// without the prefix (synchronous); the port's fake impls delegate to them. `seed_*` write
+// directly (no event, no check), for test setup.
+
+type TeamWriteResult<T> = Result<T, chelabase_metadata::teams::TeamWriteError>;
+
+/// A team event's `before`/`after` (P9, P38), as T1's `team_event_json` builds it.
+fn team_event_json(team: uuid::Uuid, name: &str, grants: &[(uuid::Uuid, GrantRow)], affected: &[uuid::Uuid]) -> Value {
+    let mut ids: Vec<String> = affected.iter().map(uuid::Uuid::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    json!({ "team": { "id": team, "name": name }, "grants": grants_json(grants), "affected_member_ids": ids })
+}
+
+#[allow(dead_code)]
+impl FakeMetadata {
+    /// A team of `tenant` (no event, no check); returns its id.
+    fn seed_team(&self, tenant: TenantId, name: &str) -> uuid::Uuid {
+        let now = chrono::Utc::now();
+        let id = uuid::Uuid::new_v4();
+        self.teams.lock().unwrap().push(FakeTeam {
+            record: chelabase_metadata::teams::TeamRecord {
+                id,
+                tenant_id: tenant,
+                name: name.into(),
+                description: String::new(),
+                created_by: None,
+                created_at: now,
+                updated_at: now,
+            },
+            grants: Default::default(),
+            members: Default::default(),
+        });
+        id
+    }
+
+    /// A team grant (no event, no check; an Admin grant names no roles, as `GrantRow::new`).
+    fn seed_team_grant(&self, team: uuid::Uuid, project: ProjectId, role: PlatformRole, pg_roles: &[&str]) {
+        let roles: Vec<String> = pg_roles.iter().map(|r| r.to_string()).collect();
+        let mut teams = self.teams.lock().unwrap();
+        let t = teams.iter_mut().find(|t| t.record.id == team).expect("team");
+        t.grants.insert(project.as_uuid(), GrantRow::new(role, &roles));
+    }
+
+    /// A team membership (no event, no check).
+    fn seed_team_member(&self, team: uuid::Uuid, member: uuid::Uuid) {
+        let mut teams = self.teams.lock().unwrap();
+        teams.iter_mut().find(|t| t.record.id == team).expect("team").members.insert(member);
+    }
+
+    /// The stored team, if any (any tenant).
+    fn stored_team(&self, team: uuid::Uuid) -> Option<FakeTeam> {
+        self.teams.lock().unwrap().iter().find(|t| t.record.id == team).cloned()
+    }
+
+    /// Whether `project` is a non-deleted project of `tenant`.
+    fn project_live_in(&self, tenant: TenantId, project: uuid::Uuid) -> bool {
+        self.projects
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.id.as_uuid() == project && p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+    }
+
+    fn member_tenant(&self, member: uuid::Uuid) -> Option<TenantId> {
+        self.members.lock().unwrap().iter().find(|m| m.id == member).map(|m| m.tenant_id)
+    }
+
+    /// The team's grants as the reads keep them: non-deleted projects of its tenant, by project.
+    fn live_team_grants(&self, t: &FakeTeam) -> Vec<(uuid::Uuid, GrantRow)> {
+        t.grants
+            .iter()
+            .filter(|(p, _)| self.project_live_in(t.record.tenant_id, **p))
+            .map(|(p, g)| (*p, g.clone()))
+            .collect()
+    }
+
+    /// The team's members of its own tenant, by id.
+    fn live_team_members(&self, t: &FakeTeam) -> Vec<uuid::Uuid> {
+        t.members.iter().copied().filter(|m| self.member_tenant(*m) == Some(t.record.tenant_id)).collect()
+    }
+
+    /// The shared shape's team grants (P4, P27): team id → grant on `project`, for the
+    /// member's teams of its own tenant, on a non-deleted project of that tenant.
+    fn stored_team_grants(&self, member: uuid::Uuid, project: uuid::Uuid) -> std::collections::BTreeMap<uuid::Uuid, GrantRow> {
+        let Some(tenant) = self.member_tenant(member) else { return Default::default() };
+        if !self.project_live_in(tenant, project) {
+            return Default::default();
+        }
+        self.teams
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.record.tenant_id == tenant && t.members.contains(&member))
+            .filter_map(|t| t.grants.get(&project).map(|g| (t.record.id, g.clone())))
+            .collect()
+    }
+
+    /// What `member_observed_tx` reads now: one non-empty `Observed` per project the member
+    /// reaches (own grant, override or team grant), sorted by project.
+    fn member_observed_now(&self, member: uuid::Uuid) -> Vec<Observed> {
+        let mut projects: Vec<uuid::Uuid> =
+            self.grants.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, p)| *p).collect();
+        let overridden: Vec<uuid::Uuid> =
+            self.overrides.lock().unwrap().keys().filter(|(m, _)| *m == member).map(|(_, d)| *d).collect();
+        for d in overridden {
+            if let Some(db) = self.databases.lock().unwrap().get(&DatabaseId(d)) {
+                projects.push(db.project_id.as_uuid());
+            }
+        }
+        projects.extend(self.member_team_projects(member));
+        projects.sort();
+        projects.dedup();
+        projects
+            .into_iter()
+            .map(|p| self.observed_now(member, p))
+            .filter(|o| o.grant.is_some() || !o.overrides.is_empty() || !o.teams.is_empty())
+            .collect()
+    }
+
+    /// Every project the member reaches through a team, by id.
+    fn member_team_projects(&self, member: uuid::Uuid) -> Vec<uuid::Uuid> {
+        let teams: Vec<FakeTeam> =
+            self.teams.lock().unwrap().iter().filter(|t| t.members.contains(&member)).cloned().collect();
+        let mut out: Vec<uuid::Uuid> = teams
+            .iter()
+            .filter(|t| self.member_tenant(member) == Some(t.record.tenant_id))
+            .flat_map(|t| self.live_team_grants(t).into_iter().map(|(p, _)| p))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    fn team_detail(&self, t: &FakeTeam) -> chelabase_metadata::teams::TeamDetail {
+        chelabase_metadata::teams::TeamDetail {
+            team: t.record.clone(),
+            grants: self.live_team_grants(t),
+            member_ids: self.live_team_members(t),
+        }
+    }
+
+    /// Teams chosen by `keep`, by lower(name) then id.
+    fn team_details(&self, keep: impl Fn(&FakeTeam) -> bool) -> Vec<chelabase_metadata::teams::TeamDetail> {
+        let mut teams: Vec<FakeTeam> = self.teams.lock().unwrap().iter().filter(|t| keep(t)).cloned().collect();
+        teams.sort_by_key(|t| (t.record.name.to_lowercase(), t.record.id));
+        teams.iter().map(|t| self.team_detail(t)).collect()
+    }
+
+    fn fake_list_teams(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        Ok(self.team_details(|t| t.record.tenant_id == tenant))
+    }
+
+    fn fake_team(&self, tenant: TenantId, team: uuid::Uuid) -> Result<Option<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        Ok(self.team_details(|t| t.record.id == team && t.record.tenant_id == tenant).into_iter().next())
+    }
+
+    fn fake_member_teams(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        let tenant = self.member_tenant(member);
+        Ok(self.team_details(|t| t.members.contains(&member) && Some(t.record.tenant_id) == tenant))
+    }
+
+    fn fake_project_team_grants(&self, project: uuid::Uuid) -> Result<Vec<chelabase_metadata::teams::ProjectTeamGrant>, MetadataError> {
+        Ok(self
+            .team_details(|t| t.grants.contains_key(&project))
+            .into_iter()
+            .filter_map(|d| {
+                let grant = d.grants.iter().find(|(p, _)| *p == project)?.1.clone();
+                Some(chelabase_metadata::teams::ProjectTeamGrant { team_id: d.team.id, name: d.team.name, grant, member_ids: d.member_ids })
+            })
+            .collect())
+    }
+
+    /// P2: trimmed, 1–80 characters; a description at most 500 (else `Conflict`).
+    fn checked_team_name(name: &str) -> TeamWriteResult<String> {
+        let name = name.trim();
+        if !(1..=80).contains(&name.chars().count()) {
+            return Err(chelabase_metadata::teams::TeamWriteError::Conflict("a team name has 1 to 80 characters".into()));
+        }
+        Ok(name.to_string())
+    }
+
+    fn checked_team_description(description: &str) -> TeamWriteResult<String> {
+        if description.chars().count() > 500 {
+            return Err(chelabase_metadata::teams::TeamWriteError::Conflict("a team description has at most 500 characters".into()));
+        }
+        Ok(description.to_string())
+    }
+
+    fn team_name_taken(&self, tenant: TenantId, name: &str, except: Option<uuid::Uuid>) -> bool {
+        self.teams.lock().unwrap().iter().any(|t| {
+            t.record.tenant_id == tenant && Some(t.record.id) != except && t.record.name.to_lowercase() == name.to_lowercase()
+        })
+    }
+
+    fn fake_create_team(&self, actor: uuid::Uuid, tenant: TenantId, name: &str, description: &str) -> TeamWriteResult<chelabase_metadata::teams::TeamRecord> {
+        let name = Self::checked_team_name(name)?;
+        let description = Self::checked_team_description(description)?;
+        if self.team_name_taken(tenant, &name, None) {
+            return Err(chelabase_metadata::teams::TeamWriteError::NameTaken);
+        }
+        let id = self.seed_team(tenant, &name);
+        let record = {
+            let mut teams = self.teams.lock().unwrap();
+            let t = teams.iter_mut().find(|t| t.record.id == id).unwrap();
+            t.record.description = description.clone();
+            t.record.created_by = Some(actor);
+            t.record.clone()
+        };
+        let mut after = team_event_json(id, &record.name, &[], &[]);
+        after["description"] = json!(description);
+        self.log(Change::new(tenant, Some(actor), "team_created", None).after(after));
+        Ok(record)
+    }
+
+    fn fake_update_team(
+        &self,
+        actor: uuid::Uuid,
+        tenant: TenantId,
+        team: uuid::Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> TeamWriteResult<chelabase_metadata::teams::TeamRecord> {
+        use chelabase_metadata::teams::TeamWriteError;
+        let name = name.map(Self::checked_team_name).transpose()?;
+        let description = description.map(Self::checked_team_description).transpose()?;
+        let before = self.stored_team(team).filter(|t| t.record.tenant_id == tenant).ok_or(TeamWriteError::NotFound)?.record;
+        let new_name = name.unwrap_or_else(|| before.name.clone());
+        let new_description = description.unwrap_or_else(|| before.description.clone());
+        if new_name == before.name && new_description == before.description {
+            return Ok(before);
+        }
+        if self.team_name_taken(tenant, &new_name, Some(team)) {
+            return Err(TeamWriteError::NameTaken);
+        }
+        let after = {
+            let mut teams = self.teams.lock().unwrap();
+            let t = teams.iter_mut().find(|t| t.record.id == team).unwrap();
+            t.record.name = new_name;
+            t.record.description = new_description;
+            t.record.updated_at = chrono::Utc::now();
+            t.record.clone()
+        };
+        let mut before_json = team_event_json(team, &before.name, &[], &[]);
+        before_json["description"] = json!(before.description);
+        let mut after_json = team_event_json(team, &after.name, &[], &[]);
+        after_json["description"] = json!(after.description);
+        self.log(Change::new(tenant, Some(actor), "team_updated", None).before(before_json).after(after_json));
+        Ok(after)
+    }
+
+    /// T1's `plan`: validates the change in `tenant` and returns the team, its grants (as the
+    /// reads keep them) and the affected members and projects (`affected_sets`).
+    #[allow(clippy::type_complexity)]
+    fn team_plan(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> TeamWriteResult<(FakeTeam, Vec<(uuid::Uuid, GrantRow)>, Vec<uuid::Uuid>, Vec<uuid::Uuid>)> {
+        use chelabase_metadata::teams::{TeamChange, TeamWriteError};
+        if let TeamChange::PutGrant { grant, .. } = change
+            && grant.names_owner()
+        {
+            return Err(TeamWriteError::Conflict(
+                "the owner role is never granted: the admin platform role implies the database owner".into(),
+            ));
+        }
+        let team = self.stored_team(change.team()).filter(|t| t.record.tenant_id == tenant).ok_or(TeamWriteError::NotFound)?;
+        match change {
+            TeamChange::PutGrant { project, .. } => {
+                if !self.project_active_in(tenant, *project) {
+                    return Err(TeamWriteError::ProjectNotFound);
+                }
+            }
+            TeamChange::DeleteGrant { project, .. } => {
+                let found = self.projects.lock().unwrap().iter().any(|p| p.id.as_uuid() == *project && p.tenant_id == tenant);
+                if !found {
+                    return Err(TeamWriteError::ProjectNotFound);
+                }
+            }
+            TeamChange::AddMember { member, .. } | TeamChange::RemoveMember { member, .. } => {
+                let m = self.members.lock().unwrap().iter().find(|m| m.id == *member).cloned();
+                match m {
+                    Some(m) if m.tenant_id == tenant => match m.status {
+                        MemberStatus::Removed => return Err(TeamWriteError::MemberNotFound),
+                        MemberStatus::Pending if matches!(change, TeamChange::AddMember { .. }) => {
+                            return Err(TeamWriteError::MemberPending);
+                        }
+                        _ => {}
+                    },
+                    _ => return Err(TeamWriteError::MemberNotFound),
+                }
+            }
+            TeamChange::Delete { .. } => {}
+        }
+        let members = self.live_team_members(&team);
+        let grants = self.live_team_grants(&team);
+        let mut projects: Vec<uuid::Uuid> = grants.iter().map(|(p, _)| *p).collect();
+        let (affected, projects) = match change {
+            TeamChange::PutGrant { project, .. } | TeamChange::DeleteGrant { project, .. } => (members, vec![*project]),
+            TeamChange::AddMember { member, .. } | TeamChange::RemoveMember { member, .. } => {
+                projects.sort();
+                (vec![*member], projects)
+            }
+            TeamChange::Delete { .. } => {
+                projects.sort();
+                (members, projects)
+            }
+        };
+        Ok((team, grants, affected, projects))
+    }
+
+    /// T1's `observe`: every affected member × project as it stands; for `AddMember` each one
+    /// also holds the team's grant on its project (what the member would get), so a team grant
+    /// changed between the check and the write is `Changed`.
+    fn team_observed(
+        &self,
+        change: &chelabase_metadata::teams::TeamChange,
+        grants: &[(uuid::Uuid, GrantRow)],
+        affected: &[uuid::Uuid],
+        projects: &[uuid::Uuid],
+    ) -> Vec<(uuid::Uuid, Observed)> {
+        use chelabase_metadata::teams::TeamChange;
+        affected
+            .iter()
+            .flat_map(|m| projects.iter().map(move |p| (*m, *p)))
+            .map(|(m, p)| {
+                let mut observed = self.observed_now(m, p);
+                if let TeamChange::AddMember { team, .. } = change
+                    && let Some((_, g)) = grants.iter().find(|(gp, _)| *gp == p)
+                {
+                    observed.teams.insert(*team, g.clone());
+                }
+                (m, observed)
+            })
+            .collect()
+    }
+
+    fn fake_team_change_observed(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> TeamWriteResult<Vec<(uuid::Uuid, Observed)>> {
+        let (_, grants, affected, projects) = self.team_plan(tenant, change)?;
+        Ok(self.team_observed(change, &grants, &affected, &projects))
+    }
+
+    /// MH-9: after a write, every live login of `member` that no longer qualifies is revoked
+    /// (`access_lost`, one event when any).
+    fn revoke_unqualified_logins(&self, actor: uuid::Uuid, member: uuid::Uuid) {
+        use chelabase_metadata::personal_logins::{LoginStatus, RevokeReason};
+        let Some(tenant) = self.member_tenant(member) else { return };
+        let live: Vec<uuid::Uuid> = self
+            .personal_logins
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.login.member_id == member && l.login.revoked_at.is_none())
+            .map(|l| l.login.database_id)
+            .collect();
+        let lost: Vec<uuid::Uuid> =
+            live.into_iter().filter(|d| self.login_level(member, *d).is_none_or(|l| l < PlatformRole::Developer)).collect();
+        if lost.is_empty() {
+            return;
+        }
+        for l in self.personal_logins.lock().unwrap().iter_mut().filter(|l| l.login.member_id == member && lost.contains(&l.login.database_id)) {
+            l.login.revoked_at = Some(chrono::Utc::now());
+            l.login.revoked_reason = Some(RevokeReason::AccessLost);
+            l.login.status = LoginStatus::Revoked;
+            l.verifier = None;
+        }
+        self.log(
+            Change::new(tenant, Some(actor), "personal_logins_revoked", Some(member))
+                .after(json!({ "count": lost.len(), "reason": "access_lost" })),
+        );
+    }
+
+    /// T1's `write_team_checked`: runs the pending race (`race_once`), then `Changed` unless
+    /// the check's read (`expect`, the affected set included) still holds; else writes the
+    /// change and its event (P9), revokes what stops qualifying (MH-9), and answers what it
+    /// reached. An unchanged write logs nothing (`changed: false`).
+    fn fake_write_team_checked(
+        &self,
+        actor: uuid::Uuid,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+        expect: &[(uuid::Uuid, Observed)],
+        skipped_admins: &[uuid::Uuid],
+    ) -> TeamWriteResult<chelabase_metadata::teams::TeamWrite> {
+        use chelabase_metadata::teams::{TeamChange, TeamWrite, TeamWriteError};
+        let race = self.race_before_write.lock().unwrap().pop_front();
+        if let Some(write) = race {
+            write(self);
+        }
+        let (team, grants, affected_ids, projects) = self.team_plan(tenant, change)?;
+        if self.team_observed(change, &grants, &affected_ids, &projects) != expect {
+            return Err(TeamWriteError::Changed);
+        }
+        // As the real one under the locks: a member the check skipped as a tenant admin must
+        // still be one (a demotion committed since is `Changed`).
+        let still_admin = |id: &uuid::Uuid| {
+            self.members
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| m.id == *id && m.tenant_id == tenant && m.tenant_admin && m.status != MemberStatus::Removed)
+        };
+        if affected_ids.iter().any(|id| skipped_admins.contains(id) && !still_admin(id)) {
+            return Err(TeamWriteError::Changed);
+        }
+        let affected: Vec<(uuid::Uuid, String)> = affected_ids
+            .iter()
+            .map(|id| {
+                let m = self.members.lock().unwrap().iter().find(|m| m.id == *id).cloned().ok_or(TeamWriteError::MemberNotFound)?;
+                Ok((m.id, m.zitadel_user_id))
+            })
+            .collect::<TeamWriteResult<_>>()?;
+        let reached = TeamWrite { changed: false, affected: affected.clone(), projects: projects.clone() };
+        let (id, name) = (team.record.id, team.record.name.clone());
+        let event = {
+            let mut teams = self.teams.lock().unwrap();
+            let pos = teams.iter().position(|t| t.record.id == id).unwrap();
+            let t = &mut teams[pos];
+            match change {
+                TeamChange::PutGrant { project, grant, .. } => {
+                    let after = GrantRow::new(grant.platform_role, &grant.pg_roles);
+                    let before = t.grants.insert(*project, after.clone());
+                    if before.as_ref() == Some(&after) {
+                        return Ok(reached);
+                    }
+                    Change::new(tenant, Some(actor), "team_grant_put", None)
+                        .scope(Some(*project), None)
+                        .before(before.map(|b| team_event_json(id, &name, &[(*project, b)], &affected_ids)))
+                        .after(team_event_json(id, &name, &[(*project, after)], &affected_ids))
+                }
+                TeamChange::DeleteGrant { project, .. } => {
+                    let Some(before) = t.grants.remove(project) else { return Ok(reached) };
+                    Change::new(tenant, Some(actor), "team_grant_deleted", None)
+                        .scope(Some(*project), None)
+                        .before(team_event_json(id, &name, &[(*project, before)], &affected_ids))
+                }
+                TeamChange::AddMember { member, .. } => {
+                    if !t.members.insert(*member) {
+                        return Ok(reached);
+                    }
+                    Change::new(tenant, Some(actor), "team_member_added", Some(*member))
+                        .after(team_event_json(id, &name, &grants, &[*member]))
+                }
+                TeamChange::RemoveMember { member, .. } => {
+                    if !t.members.remove(member) {
+                        return Ok(reached);
+                    }
+                    Change::new(tenant, Some(actor), "team_member_removed", Some(*member))
+                        .before(team_event_json(id, &name, &grants, &[*member]))
+                }
+                TeamChange::Delete { .. } => {
+                    teams.remove(pos);
+                    Change::new(tenant, Some(actor), "team_deleted", None)
+                        .before(team_event_json(id, &name, &grants, &affected_ids))
+                }
+            }
+        };
+        if let Some(t) = self.teams.lock().unwrap().iter_mut().find(|t| t.record.id == id) {
+            t.record.updated_at = chrono::Utc::now();
+        }
+        self.log(event);
+        for (member, _) in &affected {
+            self.revoke_unqualified_logins(actor, *member);
+        }
+        Ok(TeamWrite { changed: true, affected, projects })
+    }
+
+    /// The team as an invite's check reads it (P25): its grants on non-deleted projects.
+    fn fake_team_seen(&self, tenant: TenantId, team: uuid::Uuid) -> Option<chelabase_metadata::members::TeamSeen> {
+        let t = self.stored_team(team).filter(|t| t.record.tenant_id == tenant)?;
+        Some(chelabase_metadata::members::TeamSeen { team, grants: self.live_team_grants(&t) })
+    }
+
+    /// A write another request makes just before the next re-read of an invite's or approval's
+    /// teams (P25).
+    fn race_teams_once(&self, write: impl FnOnce(&FakeMetadata) + Send + 'static) {
+        self.race_before_teams_seen.lock().unwrap().push_back(Box::new(write));
+    }
+
+    /// P25 under the tenant lock: runs the pending teams race (`race_teams_once`), then
+    /// `Changed` unless every team is still a team of `tenant` with the grants the check read.
+    fn teams_seen_hold(&self, tenant: TenantId, teams: &[chelabase_metadata::members::TeamSeen]) -> FakeWrite<()> {
+        use chelabase_metadata::members::AccessWriteError;
+        if teams.is_empty() {
+            return Ok(());
+        }
+        let race = self.race_before_teams_seen.lock().unwrap().pop_front();
+        if let Some(write) = race {
+            write(self);
+        }
+        for seen in teams {
+            if self.fake_team_seen(tenant, seen.team).as_ref() != Some(seen) {
+                return Err(AccessWriteError::Changed);
+            }
+        }
+        Ok(())
+    }
+
+    /// The invite's or approval's memberships (P12), one `team_member_added` each; a member
+    /// already in a team is left as it is.
+    fn add_team_memberships(&self, actor: uuid::Uuid, tenant: TenantId, member: uuid::Uuid, teams: &[chelabase_metadata::members::TeamSeen]) {
+        for seen in teams {
+            let added = {
+                let mut all = self.teams.lock().unwrap();
+                all.iter_mut()
+                    .find(|t| t.record.id == seen.team)
+                    .map(|t| (t.members.insert(member), t.record.name.clone()))
+            };
+            if let Some((true, name)) = added {
+                self.log(
+                    Change::new(tenant, Some(actor), "team_member_added", Some(member))
+                        .after(team_event_json(seen.team, &name, &seen.grants, &[member])),
+                );
+            }
+        }
+    }
+
+    /// `teams_seen_hold`, then the memberships: what `add_existing_user`, `approve_member` and
+    /// `put_project_grants_checked` do with their `teams` (P25), for the port's fake impls.
+    fn apply_teams_seen(&self, actor: uuid::Uuid, tenant: TenantId, member: uuid::Uuid, teams: &[chelabase_metadata::members::TeamSeen]) -> FakeWrite<()> {
+        self.teams_seen_hold(tenant, teams)?;
+        self.add_team_memberships(actor, tenant, member, teams);
+        Ok(())
+    }
+
+    /// P13: one row per (member, project) with the best level among the sources and where it
+    /// comes from, by member then project (live members of `tenant`, non-deleted projects).
+    fn fake_member_project_roles(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::personal_logins::MemberProjectRole>, MetadataError> {
+        use chelabase_metadata::personal_logins::{GrantVia, MemberProjectRole};
+        if *self.fail_member_project_roles.lock().unwrap() {
+            return Err(MetadataError::Config("member project roles unreadable".into()));
+        }
+        let members: Vec<uuid::Uuid> = self
+            .members
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m.tenant_id == tenant && m.status != MemberStatus::Removed)
+            .map(|m| m.id)
+            .collect();
+        let projects: Vec<uuid::Uuid> = self
+            .projects
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|p| p.tenant_id == tenant && p.status != ProjectStatus::Deleted)
+            .map(|p| p.id.as_uuid())
+            .collect();
+        let mut out = Vec::new();
+        for m in &members {
+            for p in &projects {
+                let own = self.grants.lock().unwrap().get(&(*m, *p)).map(|g| g.platform_role);
+                let team = self.stored_team_grants(*m, *p).values().map(|g| g.platform_role).max();
+                let (platform_role, via) = match (own, team) {
+                    (Some(o), Some(t)) => (o.max(t), GrantVia::Both),
+                    (Some(o), None) => (o, GrantVia::Own),
+                    (None, Some(t)) => (t, GrantVia::Team),
+                    (None, None) => continue,
+                };
+                out.push(MemberProjectRole { member: *m, project: *p, platform_role, via });
+            }
+        }
+        out.sort_by_key(|r| (r.member, r.project));
+        Ok(out)
+    }
+}
+
+/// T23 tests' setup through the team API, as the default caller (org-1's tenant admin): a team
+/// named `name` with `role` and `pg_roles` on `project` and these members. Every call must
+/// answer as P17 pins (201 create, 200 grant and member puts); returns the team's id.
+#[allow(dead_code)]
+async fn api_team(app: &TestApp, name: &str, project: ProjectId, role: &str, pg_roles: &[&str], members: &[uuid::Uuid]) -> uuid::Uuid {
+    let resp = app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/teams", Some(json!({ "name": name }))).await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 201, "POST /v1/teams {name}: {body}");
+    let team: uuid::Uuid = body["id"].as_str().expect("the team's id").parse().unwrap();
+    let grant = format!("/v1/teams/{team}/grants/{project}");
+    let resp = app.send_as(DEFAULT_SUB, "org-1", Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": pg_roles }))).await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "PUT {grant}: {body}");
+    for m in members {
+        api_add_to_team(app, team, *m).await;
+    }
+    team
+}
+
+/// [`api_team`] with the members added before the grant, so the grant is checked on their
+/// union. For a grant an empty team couldn't hold on its own (a role safe only for members who
+/// are Admin through another source; final fix round, defect 1).
+#[allow(dead_code)]
+async fn api_team_joined(app: &TestApp, name: &str, project: ProjectId, role: &str, pg_roles: &[&str], members: &[uuid::Uuid]) -> uuid::Uuid {
+    let resp = app.send_as(DEFAULT_SUB, "org-1", Method::POST, "/v1/teams", Some(json!({ "name": name }))).await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 201, "POST /v1/teams {name}: {body}");
+    let team: uuid::Uuid = body["id"].as_str().expect("the team's id").parse().unwrap();
+    for m in members {
+        api_add_to_team(app, team, *m).await;
+    }
+    let grant = format!("/v1/teams/{team}/grants/{project}");
+    let resp = app.send_as(DEFAULT_SUB, "org-1", Method::PUT, &grant, Some(json!({ "platform_role": role, "pg_roles": pg_roles }))).await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "PUT {grant}: {body}");
+    team
+}
+
+/// `PUT /v1/teams/{team}/members/{member}` as the default caller; must answer 200.
+#[allow(dead_code)]
+async fn api_add_to_team(app: &TestApp, team: uuid::Uuid, member: uuid::Uuid) {
+    let path = format!("/v1/teams/{team}/members/{member}");
+    let resp = app.send_as(DEFAULT_SUB, "org-1", Method::PUT, &path, None).await;
+    let status = resp.status().as_u16();
+    let body: Value = resp.json().await.unwrap_or(Value::Null);
+    assert_eq!(status, 200, "PUT {path}: {body}");
 }

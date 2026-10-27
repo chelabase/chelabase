@@ -10,4 +10,6 @@ export type AccessVia = typeof AccessVia[keyof typeof AccessVia];
 
 export const AccessVia = {
   own: 'own',
+  team: 'team',
+  both: 'both',
 } as const;

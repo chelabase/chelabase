@@ -891,6 +891,83 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
+    /// The tenant's teams (members hub step 2): everyone in the tenant reads them; the handler
+    /// filters projects (R1) and Postgres roles (MH-34) by the caller.
+    pub const LIST_TEAMS: Endpoint =
+        key_endpoint("orchestrator.list_teams", Method::Get, "/v1/teams", Access::TenantMember);
+
+    pub const CREATE_TEAM: Endpoint =
+        key_endpoint("orchestrator.create_team", Method::Post, "/v1/teams", Access::TenantAdmin);
+
+    /// One team, with its member ids (filtered as [`LIST_TEAMS`]).
+    pub const GET_TEAM: Endpoint = key_endpoint(
+        "orchestrator.get_team",
+        Method::Get,
+        "/v1/teams/{team_id}",
+        Access::TenantMember,
+    );
+
+    /// Renames a team or changes its description.
+    pub const UPDATE_TEAM: Endpoint = key_endpoint(
+        "orchestrator.update_team",
+        Method::Patch,
+        "/v1/teams/{team_id}",
+        Access::TenantAdmin,
+    );
+
+    pub const DELETE_TEAM: Endpoint = key_endpoint(
+        "orchestrator.delete_team",
+        Method::Delete,
+        "/v1/teams/{team_id}",
+        Access::TenantAdmin,
+    );
+
+    /// Creates or replaces a team's grant on a project (checked on every member's union, MH-4).
+    pub const PUT_TEAM_GRANT: Endpoint = key_endpoint(
+        "orchestrator.put_team_grant",
+        Method::Put,
+        "/v1/teams/{team_id}/grants/{project_id}",
+        Access::TenantAdmin,
+    );
+
+    pub const DELETE_TEAM_GRANT: Endpoint = key_endpoint(
+        "orchestrator.delete_team_grant",
+        Method::Delete,
+        "/v1/teams/{team_id}/grants/{project_id}",
+        Access::TenantAdmin,
+    );
+
+    /// Adds a member to a team (idempotent).
+    pub const PUT_TEAM_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.put_team_member",
+        Method::Put,
+        "/v1/teams/{team_id}/members/{member_id}",
+        Access::TenantAdmin,
+    );
+
+    pub const DELETE_TEAM_MEMBER: Endpoint = key_endpoint(
+        "orchestrator.delete_team_member",
+        Method::Delete,
+        "/v1/teams/{team_id}/members/{member_id}",
+        Access::TenantAdmin,
+    );
+
+    /// A member's teams (filtered as [`LIST_TEAMS`]).
+    pub const LIST_MEMBER_TEAMS: Endpoint = key_endpoint(
+        "orchestrator.list_member_teams",
+        Method::Get,
+        "/v1/members/{member_id}/teams",
+        Access::TenantMember,
+    );
+
+    /// The team grants on a project, with each team's members (P15, P30).
+    pub const LIST_PROJECT_TEAM_GRANTS: Endpoint = key_endpoint(
+        "orchestrator.list_project_team_grants",
+        Method::Get,
+        "/v1/projects/{id}/team-grants",
+        Access::Project(Admin),
+    );
+
     /// The database's tables, views and other relations (kind, size, whether the table API edits
     /// them).
     pub const LIST_OBJECTS: Endpoint = key_endpoint(
@@ -1236,6 +1313,17 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::SUSPEND_MEMBER,
     orchestrator::REINSTATE_MEMBER,
     orchestrator::REVOKE_MEMBER_POSTGRES_ACCESS,
+    orchestrator::LIST_TEAMS,
+    orchestrator::CREATE_TEAM,
+    orchestrator::GET_TEAM,
+    orchestrator::UPDATE_TEAM,
+    orchestrator::DELETE_TEAM,
+    orchestrator::PUT_TEAM_GRANT,
+    orchestrator::DELETE_TEAM_GRANT,
+    orchestrator::PUT_TEAM_MEMBER,
+    orchestrator::DELETE_TEAM_MEMBER,
+    orchestrator::LIST_MEMBER_TEAMS,
+    orchestrator::LIST_PROJECT_TEAM_GRANTS,
     orchestrator::LIST_OBJECTS,
     orchestrator::GET_TABLE,
     orchestrator::LIST_TYPES,
@@ -1986,6 +2074,20 @@ mod tests {
             ("orchestrator.suspend_member", Access::TenantAdmin),
             ("orchestrator.reinstate_member", Access::TenantAdmin),
             ("orchestrator.revoke_member_postgres_access", Access::TenantAdmin),
+            // Members hub step 2 (T23): teams. Everyone in the tenant reads them (R1 and MH-34
+            // filter in the handler); tenant admins edit; the project's team grants are its
+            // Admins' (P15, P30).
+            ("orchestrator.list_teams", Access::TenantMember),
+            ("orchestrator.create_team", Access::TenantAdmin),
+            ("orchestrator.get_team", Access::TenantMember),
+            ("orchestrator.update_team", Access::TenantAdmin),
+            ("orchestrator.delete_team", Access::TenantAdmin),
+            ("orchestrator.put_team_grant", Access::TenantAdmin),
+            ("orchestrator.delete_team_grant", Access::TenantAdmin),
+            ("orchestrator.put_team_member", Access::TenantAdmin),
+            ("orchestrator.delete_team_member", Access::TenantAdmin),
+            ("orchestrator.list_member_teams", Access::TenantMember),
+            ("orchestrator.list_project_team_grants", Access::Project(Admin)),
             // Data API.
             ("rest.query", Access::DataKey),
             ("rest.schema", Access::DataKey),
@@ -2067,6 +2169,51 @@ mod tests {
             ("PUT", format!("/v1/databases/{id}/personal-login"), "orchestrator.put_personal_login"),
             ("DELETE", format!("/v1/databases/{id}/personal-logins/{id}"), "orchestrator.delete_personal_login"),
             ("POST", format!("/v1/members/{id}/revoke-postgres-access"), "orchestrator.revoke_member_postgres_access"),
+        ] {
+            match match_endpoint(Scope::Api, method, &path) {
+                Match::Found(ep) => assert_eq!(ep.name, name, "{method} {path}"),
+                other => panic!("{method} {path}: {other:?}"),
+            }
+        }
+    }
+
+    /// Members hub step 2 (T23): the team endpoints, as pinned (the plan's "Orchestrator (T23)"
+    /// routes table), on the orchestrator's management API; the member's teams and the project's
+    /// team grants match their own paths, not their parents'.
+    #[test]
+    fn members_hub_team_endpoints_are_declared() {
+        use PlatformRole::Admin;
+        let pinned: [(Method, &str, &str, Access); 11] = [
+            (Method::Get, "/v1/teams", "orchestrator.list_teams", Access::TenantMember),
+            (Method::Post, "/v1/teams", "orchestrator.create_team", Access::TenantAdmin),
+            (Method::Get, "/v1/teams/{team_id}", "orchestrator.get_team", Access::TenantMember),
+            (Method::Patch, "/v1/teams/{team_id}", "orchestrator.update_team", Access::TenantAdmin),
+            (Method::Delete, "/v1/teams/{team_id}", "orchestrator.delete_team", Access::TenantAdmin),
+            (Method::Put, "/v1/teams/{team_id}/grants/{project_id}", "orchestrator.put_team_grant", Access::TenantAdmin),
+            (Method::Delete, "/v1/teams/{team_id}/grants/{project_id}", "orchestrator.delete_team_grant", Access::TenantAdmin),
+            (Method::Put, "/v1/teams/{team_id}/members/{member_id}", "orchestrator.put_team_member", Access::TenantAdmin),
+            (Method::Delete, "/v1/teams/{team_id}/members/{member_id}", "orchestrator.delete_team_member", Access::TenantAdmin),
+            (Method::Get, "/v1/members/{member_id}/teams", "orchestrator.list_member_teams", Access::TenantMember),
+            (Method::Get, "/v1/projects/{id}/team-grants", "orchestrator.list_project_team_grants", Access::Project(Admin)),
+        ];
+        for (method, path, name, access) in pinned {
+            let ep = declared(method, path);
+            assert_eq!(ep.name, name, "{path}");
+            assert_eq!(ep.service, Service::Orchestrator, "{path}");
+            assert_eq!(ep.scope, Scope::Api, "{path}");
+            assert_eq!(ep.policy.auth, Auth::Management, "{path}");
+            assert_eq!(ep.policy.cors, Cors::Studio, "{path}");
+            assert_eq!(ep.policy.access, access, "{path}");
+        }
+        let id = "6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11";
+        for (method, path, name) in [
+            ("GET", format!("/v1/members/{id}/teams"), "orchestrator.list_member_teams"),
+            ("GET", format!("/v1/members/{id}/personal-logins"), "orchestrator.list_member_personal_logins"),
+            ("GET", format!("/v1/projects/{id}/team-grants"), "orchestrator.list_project_team_grants"),
+            ("GET", format!("/v1/projects/{id}/grants"), "orchestrator.list_project_grants"),
+            ("PUT", format!("/v1/teams/{id}/grants/{id}"), "orchestrator.put_team_grant"),
+            ("DELETE", format!("/v1/teams/{id}/members/{id}"), "orchestrator.delete_team_member"),
+            ("PATCH", format!("/v1/teams/{id}"), "orchestrator.update_team"),
         ] {
             match match_endpoint(Scope::Api, method, &path) {
                 Match::Found(ep) => assert_eq!(ep.name, name, "{method} {path}"),

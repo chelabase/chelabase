@@ -3808,6 +3808,7 @@ dependencies = [
  "chelabase-neon",
  "chelabase-query",
  "chelabase-routes",
+ "chelabase-schema",
  "chelabase-secrets",
  "chelabase-types",
  "chrono",

@@ -716,9 +716,14 @@ impl Model {
                 }
                 roles
             };
+            // T2-2 (P18): the member role exists while any safe role is held, at any level, and
+            // holds them only when they are held at Developer or above. With one source every
+            // role is held at the grant's level, capped by the override.
             let roles = live.safe(&roles);
             if !roles.is_empty() {
-                out.insert(member_role_name(m.id), roles);
+                let capped = narrow_level.map_or(*level, |l| (*level).min(l));
+                let held = if capped >= PlatformRole::Developer { roles } else { BTreeSet::new() };
+                out.insert(member_role_name(m.id), held);
             }
         }
         out
@@ -1087,6 +1092,138 @@ async fn partial_revoke_terminates_the_session_and_keeps_the_rest() {
             fx.as_member(m, "SET ROLE billing;").await,
             "billing is revoked",
         );
+    })
+    .await;
+}
+
+impl Fx {
+    /// A team of the test's tenant with `member` in it, granting `level` (`viewer`,
+    /// `developer`, `admin`) over `roles` on the project. Written straight to the step-2 team
+    /// tables (T1's migration, `20261027000001_teams.sql`): T4 is built before T1's team API
+    /// is merged, and the reconcile only reads the tables (through `database_grant_sources`).
+    async fn team_raw(&self, member: Uuid, level: &str, roles: &[&str]) -> Uuid {
+        let team = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO teams (id, tenant_id, name) SELECT $1, p.tenant_id, $2 FROM projects p WHERE p.id = $3",
+        )
+        .bind(team)
+        .bind(format!("live team {}", team.simple()))
+        .bind(self.project)
+        .execute(self.metadata.pool())
+        .await
+        .expect("insert the team");
+        sqlx::query(
+            "INSERT INTO team_grants (team_id, project_id, platform_role, pg_roles) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(team)
+        .bind(self.project)
+        .bind(level)
+        .bind(roles.iter().map(|r| r.to_string()).collect::<Vec<String>>())
+        .execute(self.metadata.pool())
+        .await
+        .expect("insert the team grant");
+        sqlx::query("INSERT INTO team_members (team_id, member_id) VALUES ($1, $2)")
+            .bind(team)
+            .bind(member)
+            .execute(self.metadata.pool())
+            .await
+            .expect("insert the team member");
+        team
+    }
+
+    /// The team's grant on the project moves to `level`, straight in the table.
+    async fn team_level_raw(&self, team: Uuid, level: &str) {
+        let done = sqlx::query(
+            "UPDATE team_grants SET platform_role = $1, updated_at = now() WHERE team_id = $2 AND project_id = $3",
+        )
+        .bind(level)
+        .bind(team)
+        .bind(self.project)
+        .execute(self.metadata.pool())
+        .await
+        .expect("update the team grant");
+        assert_eq!(done.rows_affected(), 1, "the team grant exists");
+    }
+}
+
+/// T2-2 (step 2, T4): a role the member holds only through a team, downgraded to Viewer,
+/// leaves the member role at the next reconcile; the session acting as it ends, the role and
+/// its other memberships stay, and the SQL editor's way back in (`RESET ROLE; SET ROLE …`)
+/// is refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack running this step's worker and metadata"]
+async fn a_team_role_downgraded_to_viewer_leaves_the_member_role() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        let team = fx.team_raw(m, "developer", &["sales"]).await;
+        fx.reconcile(fx.main).await;
+        let role = member_role_name(m);
+        assert_eq!(
+            fx.catalog(&fx.ep).await.get(&role).cloned(),
+            Some(BTreeSet::from(["billing".to_string(), "sales".to_string()])),
+            "a Developer team grant reaches the member role"
+        );
+        let password = fx.password(fx.main, &role).await;
+        let session = {
+            let fx = fx.clone();
+            tokio::spawn(async move {
+                fx.as_member(m, "SET ROLE sales;\nSELECT pg_sleep(60);").await
+            })
+        };
+        wait_for_sessions(&fx, &role, 1).await;
+        fx.team_level_raw(team, "viewer").await;
+        fx.reconcile(fx.main).await;
+        let ended = tokio::time::timeout(Duration::from_secs(10), session)
+            .await
+            .expect("the session ended at once")
+            .unwrap();
+        assert_terminated(ended);
+        assert_eq!(
+            fx.catalog(&fx.ep).await.get(&role).cloned(),
+            Some(BTreeSet::from(["billing".to_string()])),
+            "sales, now held at Viewer only, is revoked"
+        );
+        assert_eq!(fx.password(fx.main, &role).await, password, "the role and its password stay");
+        assert_eq!(
+            fx.as_member(m, "SET ROLE billing;\nSELECT current_user;").await.unwrap(),
+            "billing"
+        );
+        assert_set_role_refused(
+            fx.as_member(m, "SET ROLE billing;\nRESET ROLE;\nSET ROLE sales;").await,
+            "a Viewer-level role from the editor's session",
+        );
+        // A second run changes nothing (the row records the memberships).
+        let rows = fx.rows(fx.main).await;
+        fx.reconcile(fx.main).await;
+        assert_eq!(fx.rows(fx.main).await, rows);
+    })
+    .await;
+}
+
+/// T2-2, P18: a member held to Viewer (here an own grant moved down from Developer, as a
+/// step-1 member role holding Viewer-level roles is at its first reconcile) keeps a member
+/// role with no memberships: it still logs in (the table API read's CONNECT check), and
+/// `SET ROLE` to the Viewer-level role is refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the workbench stack running this step's worker"]
+async fn a_viewer_only_member_role_logs_in_but_sets_no_role() {
+    live(|fx| async move {
+        let m = fx.members[0].id;
+        fx.grant(m, PlatformRole::Developer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        let role = member_role_name(m);
+        let password = fx.password(fx.main, &role).await;
+        fx.grant(m, PlatformRole::Viewer, &["billing"]).await;
+        fx.reconcile(fx.main).await;
+        assert_eq!(
+            fx.catalog(&fx.ep).await.get(&role).cloned(),
+            Some(BTreeSet::new()),
+            "the member role stays, holding nothing"
+        );
+        assert_eq!(fx.password(fx.main, &role).await, password, "kept, not made again");
+        assert_eq!(fx.as_member(m, "SELECT current_user;").await.unwrap(), role);
+        assert_set_role_refused(fx.as_member(m, "SET ROLE billing;").await, "a Viewer-level role");
     })
     .await;
 }

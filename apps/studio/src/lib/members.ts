@@ -1,4 +1,5 @@
 import type { AccessEvent, Member, PlatformRole } from "@chelabase/management-client";
+import { escapeName } from "@/components/members/hub/escape-name";
 
 /** A member's name: their display name, else their email's local part. */
 export function memberName(m: Pick<Member, "display_name" | "email">): string {
@@ -104,6 +105,17 @@ const named = (e: AccessEvent, keys: string[], prefix: string): string => {
 const loginName = (e: AccessEvent) => named(e, ["login", "role", "name"], "");
 const roleName = (e: AccessEvent, prefix = "") => named(e, ["role", "name"], prefix);
 
+/** A team event's team name, from `after` (else `before`): `{team: {id, name}}`. */
+const teamOf = (e: AccessEvent): string => {
+  for (const side of [e.after, e.before]) {
+    const name = field(field(side, "team"), "name");
+    if (typeof name === "string" && name !== "") return escapeName(name);
+  }
+  return "a deleted team";
+};
+/** The team event's one grant (a grant put or delete concerns exactly one project). */
+const teamGrant = (v: unknown): GrantLike | undefined => grantsOf(v)[0];
+
 /** One access event as a sentence (the Activity list and the project's access log). */
 export function eventSentence(e: AccessEvent, ctx: SentenceContext): string {
   const person = (id: string | null, email: string | null, system: string) => {
@@ -192,6 +204,35 @@ export function eventSentence(e: AccessEvent, ctx: SentenceContext): string {
       return `${actor} deleted the Postgres role${roleName(e)}${e.database_id ? ` on ${database}` : ""}`;
     case "privileges_changed":
       return `${actor} changed privileges${roleName(e, " of")}${e.database_id ? ` on ${database}` : ""}`;
+    case "team_created":
+      return `${actor} created the team ${teamOf(e)}`;
+    case "team_updated": {
+      const before = field(field(e.before, "team"), "name");
+      const after = field(field(e.after, "team"), "name");
+      return typeof before === "string" && typeof after === "string" && before !== after
+        ? `${actor} renamed the team ${escapeName(before)} to ${escapeName(after)}`
+        : `${actor} changed the team ${teamOf(e)}`;
+    }
+    case "team_deleted":
+      return `${actor} deleted the team ${teamOf(e)}`;
+    case "team_grant_put": {
+      const after = teamGrant(e.after);
+      const before = teamGrant(e.before);
+      const on = after ? projectOf(after.project_id, ctx) : project;
+      if (!after) return `${actor} changed the team ${teamOf(e)}'s access on ${on}`;
+      if (before && before.platform_role === after.platform_role) return `${actor} changed the team ${teamOf(e)}'s Postgres roles on ${on}`;
+      return before
+        ? `${actor} changed the team ${teamOf(e)}'s access on ${on}: ${ROLE_LABEL[before.platform_role]} → ${ROLE_LABEL[after.platform_role]}`
+        : `${actor} gave the team ${teamOf(e)} ${ROLE_LABEL[after.platform_role]} on ${on}`;
+    }
+    case "team_grant_deleted": {
+      const gone = teamGrant(e.before);
+      return `${actor} took the team ${teamOf(e)}'s access to ${gone ? projectOf(gone.project_id, ctx) : project} away`;
+    }
+    case "team_member_added":
+      return `${actor} added ${target} to the team ${teamOf(e)}`;
+    case "team_member_removed":
+      return `${actor} removed ${target} from the team ${teamOf(e)}`;
     default:
       return `${actor} changed access (${e.action})`;
   }
@@ -220,6 +261,13 @@ export function eventFields(value: unknown, ctx: SentenceContext, action?: strin
         (g) => `${ROLE_LABEL[g.platform_role]} on ${projectOf(g.project_id, ctx)}${g.pg_roles.length > 0 ? ` (${g.pg_roles.join(", ")})` : ""}`,
       );
       out.push({ label: "Access", value: grants.length > 0 ? grants.join("; ") : "No project access" });
+    } else if (key === "team") {
+      const name = field(v, "name");
+      out.push({ label: "Team", value: typeof name === "string" && name !== "" ? escapeName(name) : "a deleted team" });
+    } else if (key === "affected_member_ids" && Array.isArray(v)) {
+      const names = v.filter((x): x is string => typeof x === "string").map((id) => ctx.names.get(id) ?? "a former member");
+      // Nothing listed is a project's log: it never says who else the team reaches.
+      if (names.length > 0) out.push({ label: "People reached", value: names.length > 5 ? `${names.slice(0, 5).join(", ")} and ${names.length - 5} more` : names.join(", ") });
     } else if (key === "expires_at" && typeof v === "string") out.push({ label: "Expires", value: utc(v) });
     else if (key === "email") out.push({ label: "Email", value: typeof v === "string" ? v : "Unknown" });
     else if (key === "tenant_admin" && typeof v === "boolean") out.push({ label: "Tenant admin", value: v ? "Yes" : "No" });

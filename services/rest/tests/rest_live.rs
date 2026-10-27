@@ -1021,6 +1021,84 @@ async fn internal_schema_for_a_console_role() {
     .await;
 }
 
+/// T5 (Q1, P40): the full-cell read through rest's console path runs as the role, through
+/// `authenticator` (granted the role by the worker's check, as the orchestrator's
+/// `check_role` does first). A role with `SELECT (id, big)` only reads those columns: `id` is
+/// 200 with its `CellValue`, `body` is 403 `permission_denied` with the database's fields
+/// (SQLSTATE 42501, the member-role path's body), a missing row 404 `not_found`, a value
+/// over 64 MiB as text 413 `too_large`. An owner-level role never gets a connection's read.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn console_cell_reads_as_the_role_and_refuses_a_column_it_lacks() {
+    live("cell", |l| async move {
+        l.owner(
+            "CREATE ROLE viewer_r NOLOGIN;
+             CREATE ROLE cell_boss NOLOGIN CREATEDB;
+             CREATE TABLE public.cells (id int PRIMARY KEY, body text, big text);
+             INSERT INTO public.cells VALUES (1, 'secret', 'small'), (2, 'secret', repeat('x', 64 * 1024 * 1024 + 1));
+             GRANT USAGE ON SCHEMA public TO viewer_r;
+             GRANT SELECT (id, big) ON public.cells TO viewer_r;",
+        )
+        .await;
+        assert!(matches!(
+            l.worker.check_data_role(l.main_id(), "viewer_r").await,
+            RoleCheck::Ok(_, false)
+        ));
+        let cell = |role: &'static str, id: i64, column: &'static str| {
+            let l = &l;
+            async move {
+                let resp = tokio::time::timeout(
+                    Duration::from_secs(60),
+                    l.http
+                        .post(format!(
+                            "http://{}/internal/console/{}/cell",
+                            l.internal,
+                            l.main_id().as_uuid()
+                        ))
+                        .bearer_auth(&l.internal_token)
+                        .json(&json!({
+                            "role": role, "database": l.database_name, "schema": "public",
+                            "table": "cells", "key": { "id": id }, "column": column
+                        }))
+                        .send(),
+                )
+                .await
+                .expect("answered within 60 s")
+                .unwrap();
+                Live::answer(resp).await
+            }
+        };
+        let answer = cell("viewer_r", 1, "id").await;
+        assert_eq!(answer.ok(), &json!({ "value": "1", "bytes": 4, "data_type": "integer" }));
+        assert_eq!(cell("viewer_r", 1, "big").await.ok()["value"], "small");
+        let denied = cell("viewer_r", 1, "body").await;
+        let error = denied.error(403, "permission_denied");
+        assert_eq!(error["sqlstate"], "42501", "{denied:?}");
+        assert!(error["message"].as_str().is_some_and(|m| m.contains("permission denied")), "{denied:?}");
+        for key in ["op_index", "detail", "hint", "position"] {
+            assert!(error.get(key).is_some(), "{key}: {denied:?}");
+        }
+        cell("viewer_r", 99, "big").await.error(404, "not_found");
+        cell("viewer_r", 2, "big").await.error(413, "too_large");
+        // The table's shape errors answer as on the member-role path.
+        cell("viewer_r", 1, "nope").await.error(400, "unknown_column");
+        // Without `database`: main.
+        let resp = l
+            .http
+            .post(format!("http://{}/internal/console/{}/cell", l.internal, l.main_id().as_uuid()))
+            .bearer_auth(&l.internal_token)
+            .json(&json!({ "role": "viewer_r", "schema": "public", "table": "cells", "key": { "id": 1 }, "column": "id" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(Live::answer(resp).await.ok()["value"], "1");
+        // rest's own guard: a role that doesn't exist, and an owner-level one.
+        cell("cell_ghost", 1, "id").await.error(404, "unknown_role");
+        cell("cell_boss", 1, "id").await.error(403, "role_not_allowed");
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn rls_policy_is_enforced() {

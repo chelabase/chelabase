@@ -81,6 +81,9 @@ export function buildCrumbs(pathname: string, params: CrumbParams, labels: Crumb
       if (params.branchId) search.branch = params.branchId;
       return finish([members, { key: "roles", label: "Roles", to: "/app/members", search }, dynamic("role", "role", params, labels)]);
     }
+    if (params.teamId !== undefined) {
+      return finish([members, { key: "teams", label: "Teams", to: "/app/members", search: { tab: "teams" } }, dynamic("team", "teamId", params, labels)]);
+    }
     if (params.memberId !== undefined) return finish([members, dynamic("member", "memberId", params, labels)]);
     return [{ key: "members", label: "Members" }];
   }

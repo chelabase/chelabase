@@ -240,8 +240,16 @@ fn path_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> String {
     } else {
         w.db.as_uuid()
     };
-    let path = e
-        .path
+    // Members hub step 2 (P35): a team of the walk's tenant, fresh for each call (a walked
+    // delete never takes another route's team away).
+    let path = if e.path.contains("{team_id}") {
+        let team = w.metadata.seed_team(w.tenant, &format!("walk-{}", uuid::Uuid::new_v4()));
+        e.path.replace("{team_id}", &team.to_string())
+    } else {
+        e.path.to_string()
+    };
+    let path = path
+        .replace("{project_id}", &w.project.as_uuid().to_string())
         .replace("{id}", &id.to_string())
         .replace("{branch_id}", &w.dev.as_uuid().to_string())
         .replace("{merge_id}", &w.merge.to_string())
@@ -334,6 +342,10 @@ fn body_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> Option<Value> {
         (r::APPROVE_MEMBER.name, json!({ "grants": [] })),
         // Members hub T8: the personal login's name.
         ("orchestrator.put_personal_login", json!({ "name": "walked" })),
+        // Members hub step 2 (P35): the team writes.
+        ("orchestrator.create_team", json!({ "name": format!("walked-{}", uuid::Uuid::new_v4()) })),
+        ("orchestrator.update_team", json!({ "description": "walked" })),
+        ("orchestrator.put_team_grant", json!({ "platform_role": "viewer", "pg_roles": [] })),
     ];
     if let Some((_, body)) = typed.into_iter().find(|(n, _)| *n == name) {
         return Some(body);

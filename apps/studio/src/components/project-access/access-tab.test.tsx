@@ -299,7 +299,7 @@ describe("AccessTab", () => {
     await userEvent.click(within(editor).getByRole("button", { name: "Save" }));
     // On Bo's card, in Studio's words (never the server's sentence), with the chain and database
     // (the shared card is given the project's databases).
-    const alert = await within(editor).findByText("Only Admin can hold billing_admin on orders: it reaches app_login, a LOGIN role.");
+    const alert = await within(editor).findByText((_, el) => el?.tagName === "P" && el.textContent === "Only Admin can hold billing_admin on orders: it reaches app_login, a LOGIN role.");
     expect(alert).toBeInTheDocument();
     expect(within(editor).queryByText(/can't be held below Admin/)).toBeNull();
     expect(within(editor).getByText("billing_admin → app_login")).toBeInTheDocument();
@@ -321,7 +321,7 @@ describe("AccessTab", () => {
     const editor = await openEditor("Gus");
     await userEvent.click(await within(editor).findByRole("checkbox", { name: "billing_admin" }));
     await userEvent.click(within(editor).getByRole("button", { name: "Save" }));
-    expect(await within(editor).findByText("Only Admin can hold reporting on orders: it's a LOGIN role.")).toBeInTheDocument();
+    expect(await within(editor).findByText((_, el) => el?.tagName === "P" && el.textContent === "Only Admin can hold reporting on orders: it's a LOGIN role.")).toBeInTheDocument();
     expect(within(editor).queryByText(/why the grant was refused/)).toBeNull();
   });
 

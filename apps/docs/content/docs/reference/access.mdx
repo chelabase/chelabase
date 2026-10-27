@@ -31,6 +31,18 @@ How a refusal answers:
 
 `GET /v1/me` returns the caller's capabilities: tenant admin, instance admin, and per project the platform role, the Postgres roles they may act as and (`projects[].databases`) the databases a grant override narrows. It answers 200 for a pending sign-up too, with `member.status: "pending"`. Studio only hides what you can't do; the API decides. See [Members and invites](/docs/using/members-and-invites) and [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
 
+## Effective access
+
+A member's effective access on a project combines their own grant with the grants of their teams (see [Teams](/docs/using/members-and-invites#teams)), then narrows it by their per-database overrides:
+
+- **Union of sources.** The platform role is the best level among the own grant and the team grants. Admin from any source is Admin, holding every Postgres role.
+- **Per-role levels.** Each Postgres role keeps the highest level among the sources that name it. An *Act as* route needs the platform level the route asks for **and** the role held at that level or above: a role held only at Viewer can't be used on `POST …/sql`.
+- **Narrowing afterwards.** A database override is intersected with the union; it never widens.
+- **Checked on every write.** Own-grant, override, team and invite writes are checked on the resulting union for each affected member and database.
+- **The data API's extras.** `anon` and `authenticated` are held only when a source names them, Admins included.
+
+`GET /v1/me` reports the union per project. `POST …/tables/{schema}/{table}/cell` (*Act as: Viewer*) for a role held below Developer is read through the data API's connection, so it needs the data API on for the Postgres database (409 `data_api_disabled` when off).
+
 ## Every route
 
 Sorted by path. Credentials: *Zitadel token* is a management token; the data API's keys are described under [Data API](/docs/using/data-api).
@@ -151,6 +163,7 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/v1/members/\{member_id\}/reinstate` | Zitadel token | Tenant admin |
 | POST | `/v1/members/\{member_id\}/revoke-postgres-access` | Zitadel token | Tenant admin |
 | POST | `/v1/members/\{member_id\}/suspend` | Zitadel token | Tenant admin |
+| GET | `/v1/members/\{member_id\}/teams` | Zitadel token | Tenant member |
 | GET | `/v1/openapi.json` | none | Public |
 | GET | `/v1/projects` | Zitadel token | Tenant member |
 | POST | `/v1/projects` | Zitadel token | Tenant admin |
@@ -167,6 +180,7 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | DELETE | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Zitadel token | Project Admin |
 | PUT | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Zitadel token | Project Admin |
 | POST | `/v1/projects/\{id\}/invites` | Zitadel token | Project Admin |
+| GET | `/v1/projects/\{id\}/team-grants` | Zitadel token | Project Admin |
 | GET | `/v1/projects/\{id\}/users` | Zitadel token | Project Viewer |
 | POST | `/v1/projects/\{id\}/users` | Zitadel token | Project Developer |
 | DELETE | `/v1/projects/\{id\}/users/\{user_id\}` | Zitadel token | Project Developer |
@@ -178,6 +192,15 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | GET | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Zitadel token | Project Viewer |
 | GET | `/v1/realtime/socket` | none | Public |
 | POST | `/v1/realtime/tickets` | Zitadel token | Signed in |
+| GET | `/v1/teams` | Zitadel token | Tenant member |
+| POST | `/v1/teams` | Zitadel token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}` | Zitadel token | Tenant admin |
+| GET | `/v1/teams/\{team_id\}` | Zitadel token | Tenant member |
+| PATCH | `/v1/teams/\{team_id\}` | Zitadel token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Zitadel token | Tenant admin |
+| PUT | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Zitadel token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}/members/\{member_id\}` | Zitadel token | Tenant admin |
+| PUT | `/v1/teams/\{team_id\}/members/\{member_id\}` | Zitadel token | Tenant admin |
 | PATCH | `/v1/tenant` | Zitadel token | Tenant admin |
 
 {/* END GENERATED access-table */}

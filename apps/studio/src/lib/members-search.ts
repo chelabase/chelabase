@@ -1,6 +1,6 @@
 /** The hub routes' search params, each parsed against its own shape; anything else is dropped (MH-38b). */
 
-export const MEMBERS_TABS = ["people", "roles", "activity", "instance"] as const;
+export const MEMBERS_TABS = ["people", "roles", "teams", "activity", "instance"] as const;
 export type MembersTab = (typeof MEMBERS_TABS)[number];
 export type RosterViewParam = "cards" | "list";
 
@@ -64,4 +64,12 @@ export function validateMemberPageSearch(search: Record<string, unknown>): HubSe
 /** `/app/members/roles/$databaseId/$branchId/$role`. */
 export function validateRolePageSearch(search: Record<string, unknown>): { pg_database?: string } {
   return pick<{ pg_database?: string }>([["pg_database", parseText(search.pg_database)]]);
+}
+
+/** `/app/members/teams/$teamId`: the Teams tab's view and name filter, so the back link restores them. */
+export function validateTeamPageSearch(search: Record<string, unknown>): { view?: RosterViewParam; q?: string } {
+  return pick<{ view?: RosterViewParam; q?: string }>([
+    ["view", parseView(search.view)],
+    ["q", parseText(search.q)],
+  ]);
 }

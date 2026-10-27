@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { PlatformRoleField, ROLE_HINT } from "./platform-role-field";
 import { whereText } from "@/lib/refusal-extra";
 import { RolePicker } from "./role-picker";
+import { CopyFromMember } from "./copy-from-member";
 
 export interface GrantRow {
   projectId: string;
@@ -39,13 +40,17 @@ export interface GrantRowsProps {
   disabled?: boolean;
   /** Said after "Access" in the legend ("the same for everyone in this invite"). */
   legendNote?: string;
+  /** Offer "Copy from a member" (the tenant invite and the approval; never a project's invite). */
+  copyFrom?: boolean;
+  /** One or more teams are chosen alongside: with no project the person still gets what the teams give. */
+  teamsChosen?: boolean;
 }
 
 /**
  * The "Access" section of the invite and approve dialogs: zero or more projects, each with a
  * platform role (Developer first) and the Postgres roles. A project is used once at most.
  */
-export function GrantRows({ projects, rows, onChange, errors = {}, disabled, legendNote }: GrantRowsProps) {
+export function GrantRows({ projects, rows, onChange, errors = {}, disabled, legendNote, copyFrom = false, teamsChosen = false }: GrantRowsProps) {
   const used = new Set(rows.map((r) => r.projectId));
   const free = projects.filter((p) => !used.has(p.id) && p.status !== "deleting");
   const update = useCallback(
@@ -58,9 +63,12 @@ export function GrantRows({ projects, rows, onChange, errors = {}, disabled, leg
         <span className="font-medium">Access</span>
         {legendNote && <span className="font-normal text-chalk-dim"> · {legendNote}</span>}
       </legend>
+      {copyFrom && <CopyFromMember projects={projects} onCopy={onChange} disabled={disabled} />}
       {rows.length === 0 && (
         <p className="text-sm text-chalk-dim">
-          Without a project, they join with no access; you can give access later from a project's Access tab.
+          {teamsChosen
+            ? "Without a project, they get only their teams' access; you can give more later from a project's Access tab."
+            : "Without a project, they join with no access; you can give access later from a project's Access tab."}
         </p>
       )}
       <ul className="space-y-3">

@@ -7,7 +7,32 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Studio shell: phone navigation, breadcrumbs, no clipped content (2026-10-27, awaiting merge)
+## Members hub, step 2: teams with live-linked access (2026-10-27, in progress, end-of-step pending)
+
+Branch `members-hub-teams`; spec `docs/superpowers/specs/2026-10-23-members-hub-design.md` (D1-D6); plan `docs/superpowers/plans/2026-10-27-members-hub-step-2.md`. No fork change.
+
+### Teams that grant access, live
+- **Problem:** access was granted one person per project. Giving ten people the same access meant ten grants, and changing it meant ten edits.
+- **What we built:**
+  - **Teams** hold per-project grants (platform role plus Postgres roles). Members get them live: effective access is their own grant plus their teams' grants, narrowed afterwards by their database overrides. Nothing is copied.
+  - **Per-role levels:** each Postgres role keeps the highest level among the sources naming it, so a Viewer-level team grant can't lift a role to Developer.
+  - **Every team write is checked on the union** for every affected member and database, under the tenant lock then the members' locks in id order. A personal login that stops qualifying is revoked in the same transaction, and the same side effects as a grant write fire (realtime, proxy cache, reconcile).
+  - **Invites and approvals can attach teams** (`team_ids`); the project invite refuses them.
+  - Studio gains a Teams tab and team page.
+- **What it unlocks:** onboarding and offboarding by team membership, with a downgrade reaching the SQL editor role and personal logins at once.
+- **Evidence (suites written for the step):**
+  - metadata: `members_live` extended for teams, including the SQL/Rust agreement test and an interleaving test of the lock order;
+  - orchestrator `tests/teams.rs`: `a_team_grant_is_checked_on_the_union_for_every_member_and_database`, `every_write_sequence_keeps_the_invariant` (proptest), `every_team_write_fires_realtime_cache_and_reconcile`;
+  - `tests/api.rs`: `project_invite_refuses_team_ids`, `tenant_invite_with_team_ids_adds_memberships_on_every_outcome`, one `team_only_member_*` test per caller, the T23 audit's two union-check race tests;
+  - live (end-of-step pass, not yet run): `just teams-e2e`.
+
+### SQL editor role holds only Developer-level roles
+- **Problem:** the hidden member role behind the SQL editor held every role the member could act as, Viewer-level ones included, so a role held at Viewer could be set from a Developer-only editor.
+- **What we built:** the hidden role is granted only roles held at Developer or above, and a downgrade revokes the role at once. The table editor's full-cell read as a role held below Developer goes through the data API's connection (`authenticator` + `SET ROLE`), answering 409 `data_api_disabled` when the data API is off.
+- **Evidence:** `member_roles_live` and `sql_run_live::the_sql_editor_cannot_set_a_viewer_level_role` (compiled, live run pending); `rest_live::console_cell_reads_as_the_role_and_refuses_a_column_it_lacks` (live run pending).
+- **Status:** in progress, end-of-step pending.
+
+## Studio shell: phone navigation, breadcrumbs, no clipped content (2026-10-27, shipped: merged `5b4ab478`)
 
 Branch `studio-shell`; plan `docs/superpowers/plans/2026-10-27-studio-shell.md`. Studio only; no fork change, no image build.
 

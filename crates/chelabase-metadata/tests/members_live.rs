@@ -10,11 +10,13 @@
 
 use chelabase_metadata::members::{
     AccessAction, AccessEvent, AccessWriteError, Admission, GrantRow, MemberBranchRole,
-    MemberStatus, NewInvite, OverrideRow,
+    MemberStatus, NewInvite, Observed, OverrideRow, TeamSeen,
 };
 use chelabase_metadata::personal_logins::{
-    AccessEventInput, LoginEndpoint, LoginStatus, LoginWriteError, PersonalLogin, RevokeReason,
+    AccessEventInput, GrantVia, LoginEndpoint, LoginStatus, LoginWriteError, MemberProjectRole,
+    PersonalLogin, RevokeReason,
 };
+use chelabase_metadata::teams::{TeamChange, TeamWrite, TeamWriteError};
 use chelabase_metadata::{
     BranchStatus, CreateBranchOutcome, DatabaseStatus, MetadataClient, MetadataConfig, NewBranch,
     NewEndpoint, RenameCopyOutcome,
@@ -226,7 +228,7 @@ const TOKEN: [u8; 32] = [7; 32];
 
 /// An invite of `zitadel_user_id` at `email`, open for a week, with `TOKEN` and `grants`.
 fn new_invite<'a>(zitadel_user_id: &'a str, email: &'a str, grants: &'a [(Uuid, GrantRow)]) -> NewInvite<'a> {
-    NewInvite { zitadel_user_id, email, expires_at: week(), token_hash: TOKEN, grants }
+    NewInvite { zitadel_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[] }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1803,7 +1805,7 @@ async fn existing_user_is_added_active() {
     let g = grant(PlatformRole::Developer, &["app"]);
     let events = s.event_count(t).await;
     let u = c
-        .add_existing_user(a.id, t, "zu", " U@x.com", "U", &[(p, g.clone())])
+        .add_existing_user(a.id, t, "zu", " U@x.com", "U", &[(p, g.clone())], &[])
         .await
         .unwrap();
     assert_eq!(
@@ -1815,7 +1817,7 @@ async fn existing_user_is_added_active() {
     assert_eq!(c.member_projects(u.id).await.unwrap(), vec![(p, g.clone())]);
     assert_eq!(c.member(stale.id).await.unwrap().unwrap().email, None);
     assert!(matches!(
-        c.add_existing_user(a.id, t, "zu", "u@x.com", "U", &[]).await,
+        c.add_existing_user(a.id, t, "zu", "u@x.com", "U", &[], &[]).await,
         Err(AccessWriteError::Conflict(_))
     ));
     // A project of another tenant is NotFound, with nothing written.
@@ -1823,7 +1825,7 @@ async fn existing_user_is_added_active() {
     let foreign = s.project(other).await;
     let before = s.event_count(t).await;
     assert!(matches!(
-        c.add_existing_user(a.id, t, "zv", "v@x.com", "V", &[(foreign, g.clone())]).await,
+        c.add_existing_user(a.id, t, "zv", "v@x.com", "V", &[(foreign, g.clone())], &[]).await,
         Err(AccessWriteError::NotFound)
     ));
     assert_eq!(s.event_count(t).await, before);
@@ -1833,7 +1835,7 @@ async fn existing_user_is_added_active() {
     c.set_tenant_admin(Some(a.id), u.id, true).await.unwrap();
     c.remove_member(a.id, u.id).await.unwrap();
     assert!(matches!(
-        c.add_existing_user(a.id, t, "zu", "u@x.com", "U2", &[]).await,
+        c.add_existing_user(a.id, t, "zu", "u@x.com", "U2", &[], &[]).await,
         Err(AccessWriteError::Conflict(_))
     ));
     let (back, _) = c
@@ -1930,7 +1932,7 @@ async fn project_events_include_listed_grants() {
         .await
         .unwrap();
     let u = c
-        .add_existing_user(a.id, t, "z3", "three@x.com", "T", &[(p2, g.clone())])
+        .add_existing_user(a.id, t, "z3", "three@x.com", "T", &[(p2, g.clone())], &[])
         .await
         .unwrap();
     c.put_project_grant(a.id, u.id, p, &g).await.unwrap();
@@ -2014,8 +2016,8 @@ async fn member_listings_report_has_access() {
     let c = &s.client;
     let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     assert!(a.tenant_admin);
-    let granted = c.add_existing_user(a.id, t, "zg", "g@x.com", "G", &[(p, grant(PlatformRole::Viewer, &[]))]).await.unwrap();
-    let bare = c.add_existing_user(a.id, t, "zb", "b@x.com", "B", &[]).await.unwrap();
+    let granted = c.add_existing_user(a.id, t, "zg", "g@x.com", "G", &[(p, grant(PlatformRole::Viewer, &[]))], &[]).await.unwrap();
+    let bare = c.add_existing_user(a.id, t, "zb", "b@x.com", "B", &[], &[]).await.unwrap();
     let list = c.list_member_listings(t).await.unwrap();
     let has = |id: Uuid| list.iter().find(|l| l.member.id == id).unwrap().has_access;
     assert_eq!((has(a.id), has(granted.id), has(bare.id)), (true, true, false));
@@ -2169,7 +2171,7 @@ async fn pending_member_lifecycle() {
 
     // Approval: active, with the grants, one event, in one step.
     let events = s.event_count(t).await;
-    let listing = c.approve_member(a.id, b.id, &[(p, grant(PlatformRole::Developer, &[]))]).await.unwrap();
+    let listing = c.approve_member(a.id, b.id, &[(p, grant(PlatformRole::Developer, &[]))], &[]).await.unwrap();
     assert_eq!(listing.member.status, MemberStatus::Active);
     assert!(listing.has_access);
     assert_eq!(s.event_count(t).await, events + 1);
@@ -2179,19 +2181,19 @@ async fn pending_member_lifecycle() {
         c.grant_sources(b.id, p, None).await.unwrap().effective().map(|e| e.platform_role),
         Some(PlatformRole::Developer)
     );
-    assert!(matches!(c.approve_member(a.id, b.id, &[]).await, Err(AccessWriteError::Conflict(_))));
+    assert!(matches!(c.approve_member(a.id, b.id, &[], &[]).await, Err(AccessWriteError::Conflict(_))));
 
     // A grant naming the owner, or a project of another tenant, writes nothing.
     let d = c.ensure_member(t, "d", "d@x.com", "D", Admission::Pending).await.unwrap();
     let events = s.event_count(t).await;
     assert!(matches!(
-        c.approve_member(a.id, d.id, &[(p, grant(PlatformRole::Developer, &["owner"]))]).await,
+        c.approve_member(a.id, d.id, &[(p, grant(PlatformRole::Developer, &["owner"]))], &[]).await,
         Err(AccessWriteError::Conflict(_))
     ));
     let other = s.tenant().await;
     let foreign = s.project(other).await;
     assert!(matches!(
-        c.approve_member(a.id, d.id, &[(foreign, grant(PlatformRole::Viewer, &[]))]).await,
+        c.approve_member(a.id, d.id, &[(foreign, grant(PlatformRole::Viewer, &[]))], &[]).await,
         Err(AccessWriteError::NotFound)
     ));
     assert_eq!(c.member_by_zitadel(t, "d").await.unwrap().unwrap().status, MemberStatus::Pending);
@@ -2203,7 +2205,7 @@ async fn pending_member_lifecycle() {
     assert_eq!(actions(t).await.last().map(String::as_str), Some("member_declined"));
     assert!(matches!(c.decline_member(a.id, d.id).await, Err(AccessWriteError::MemberNotFound)));
     assert!(matches!(c.decline_member(a.id, b.id).await, Err(AccessWriteError::Conflict(_))));
-    assert!(matches!(c.approve_member(a.id, d.id, &[]).await, Err(AccessWriteError::MemberNotFound)));
+    assert!(matches!(c.approve_member(a.id, d.id, &[], &[]).await, Err(AccessWriteError::MemberNotFound)));
 
     // A pending member never becomes the first admin; the next person to ask claims it.
     let t2 = s.tenant().await;
@@ -2464,7 +2466,7 @@ async fn member_status_write_matrix() {
                 GrantDelete => name(c.delete_project_grant(admin.id, id, p).await),
                 OverridePut => name(c.put_override(admin.id, id, db, &narrower).await),
                 OverrideDelete => name(c.delete_override(admin.id, id, db).await),
-                Approve => name(c.approve_member(admin.id, id, &[]).await),
+                Approve => name(c.approve_member(admin.id, id, &[], &[]).await),
                 Decline => name(c.decline_member(admin.id, id).await),
                 Promote => name(c.set_tenant_admin(Some(admin.id), id, true).await),
                 Remove => name(c.remove_member(admin.id, id).await),
@@ -2518,13 +2520,44 @@ struct Hub {
 }
 
 impl Scratch {
-    /// A member row in any status (status writes are under test elsewhere).
+    /// A member row in any status (status writes are under test elsewhere). A suspended row gets
+    /// its `suspended_at` (`members_suspended_has_at`).
     async fn member_row(&self, t: TenantId, zid: &str, status: &str, tenant_admin: bool) -> Uuid {
-        let id = Uuid::new_v4();
-        sqlx::query(
+        self.insert_member_row(
+            "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, tenant_admin, suspended_at)
+             VALUES ($1, $2, $3, $4, $5, $6, CASE WHEN $5 = 'suspended' THEN now() END)",
+            t,
+            zid,
+            status,
+            tenant_admin,
+        )
+        .await
+    }
+
+    /// [`Self::member_row`] on a database whose `members` has no D10 columns (the backfill test
+    /// drops `suspended_at` and `suspended_by` first).
+    async fn member_row_before_d10(&self, t: TenantId, zid: &str, status: &str) -> Uuid {
+        self.insert_member_row(
             "INSERT INTO members (id, tenant_id, zitadel_user_id, email, status, tenant_admin)
              VALUES ($1, $2, $3, $4, $5, $6)",
+            t,
+            zid,
+            status,
+            false,
         )
+        .await
+    }
+
+    async fn insert_member_row(
+        &self,
+        sql: &'static str,
+        t: TenantId,
+        zid: &str,
+        status: &str,
+        tenant_admin: bool,
+    ) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query(sql)
         .bind(id)
         .bind(t.as_uuid())
         .bind(zid)
@@ -2998,7 +3031,7 @@ async fn run_revocation_model(s: &Scratch, steps: Vec<W>) -> Result<(), String> 
             W::SetAdmin(i, on) => c.set_tenant_admin(Some(h.admin), pick(i).0, on).await,
             W::Remove(i) => c.remove_member(h.admin, pick(i).0).await.map(|_| ()),
             W::Suspend(i) => c.suspend_member(h.admin, pick(i).0).await.map(|_| ()),
-            W::Reinstate(i) => c.reinstate_member(h.admin, pick(i).0).await,
+            W::Reinstate(i) => c.reinstate_member(h.admin, pick(i).0).await.map(|_| ()),
             W::RevokeNow(i) => c.revoke_postgres_access(h.admin, pick(i).0).await.map(|_| ()),
             W::Reinvite(i) => {
                 let (_, zid) = pick(i);
@@ -3021,7 +3054,7 @@ async fn run_revocation_model(s: &Scratch, steps: Vec<W>) -> Result<(), String> 
                     .await
                     .map_err(|e| format!("step {n}: sign-up: {e}"))?;
                 let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
-                let approved = c.approve_member(h.admin, m.id, &grants).await.map(|_| ());
+                let approved = c.approve_member(h.admin, m.id, &grants, &[]).await.map(|_| ());
                 pool.push((m.id, zid));
                 approved
             }
@@ -3699,9 +3732,9 @@ async fn the_suspended_by_migration_backfills_suspended_members() {
         .execute(pool)
         .await
         .unwrap();
-    let with_event = s.member_row(h.t, "ev", "suspended", false).await;
-    let without = s.member_row(h.t, "noev", "suspended", false).await;
-    let active = s.member_row(h.t, "act", "active", false).await;
+    let with_event = s.member_row_before_d10(h.t, "ev", "suspended").await;
+    let without = s.member_row_before_d10(h.t, "noev", "suspended").await;
+    let active = s.member_row_before_d10(h.t, "act", "active").await;
     let old = Utc::now() - Duration::days(30);
     let newer = Utc::now() - Duration::days(10);
     let stamp = Utc::now() - Duration::days(3);
@@ -4214,7 +4247,7 @@ async fn personal_login_reads_report_status_and_qualifies() {
 
     // The worker's records: the predicate, from SQL; a suspended member (written directly
     // here, bypassing the revoking write) doesn't qualify.
-    sqlx::query("UPDATE members SET status = 'suspended' WHERE id = $1")
+    sqlx::query("UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1")
         .bind(carol)
         .execute(c.pool())
         .await
@@ -4231,9 +4264,10 @@ async fn personal_login_reads_report_status_and_qualifies() {
     assert_eq!(listings.iter().find(|l| l.id == carol).map(|l| l.status), Some(MemberStatus::Suspended));
     assert_eq!(c.member_listing(carol).await.unwrap().map(|l| l.status), Some(MemberStatus::Suspended));
     let roles = c.member_project_roles(h.t).await.unwrap();
-    assert!(roles.contains(&(alice, h.p, PlatformRole::Developer)), "{roles:?}");
-    assert!(roles.contains(&(carol, h.p, PlatformRole::Admin)), "{roles:?}");
-    assert!(!roles.iter().any(|(m, _, _)| *m == other.admin), "another tenant's members");
+    let own = |member, platform_role| MemberProjectRole { member, project: h.p, platform_role, via: GrantVia::Own };
+    assert!(roles.contains(&own(alice, PlatformRole::Developer)), "{roles:?}");
+    assert!(roles.contains(&own(carol, PlatformRole::Admin)), "{roles:?}");
+    assert!(!roles.iter().any(|r| r.member == other.admin), "another tenant's members");
     s.finish().await;
 }
 
@@ -4517,5 +4551,1311 @@ async fn a_personal_row_is_never_renamed() {
     assert!(!matches!(out, RenameCopyOutcome::Renamed { .. }), "{out:?}");
     assert_eq!(s.personal_rows("alice").await, vec![(h.ep.clone(), Some(V1.to_string()))]);
     assert!(s.personal_rows("renamed").await.is_empty());
+    s.finish().await;
+}
+
+// ---- Members hub step 2, T1: teams ----------------------------------------------------------
+//
+// Setup writes teams, team grants and memberships with plain SQL (`raw_*`), so each test's
+// first failure is the read or write under test, never its setup.
+
+impl Scratch {
+    /// A team of `t` named `name`.
+    async fn raw_team(&self, t: TenantId, name: &str) -> Uuid {
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO teams (id, tenant_id, name) VALUES ($1, $2, $3)")
+            .bind(id)
+            .bind(t.as_uuid())
+            .bind(name)
+            .execute(self.client.pool())
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Sets `team`'s grant on `project` to `g` as stored (no normalising).
+    async fn raw_team_grant(&self, team: Uuid, project: Uuid, g: &GrantRow) {
+        sqlx::query(
+            "INSERT INTO team_grants (team_id, project_id, platform_role, pg_roles) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (team_id, project_id)
+             DO UPDATE SET platform_role = EXCLUDED.platform_role, pg_roles = EXCLUDED.pg_roles",
+        )
+        .bind(team)
+        .bind(project)
+        .bind(g.platform_role.as_str())
+        .bind(&g.pg_roles)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn raw_team_member(&self, team: Uuid, member: Uuid) {
+        sqlx::query("INSERT INTO team_members (team_id, member_id) VALUES ($1, $2)")
+            .bind(team)
+            .bind(member)
+            .execute(self.client.pool())
+            .await
+            .unwrap();
+    }
+
+    /// Sets `member`'s own grant on `project` to `g` as stored.
+    async fn raw_grant(&self, member: Uuid, project: Uuid, g: &GrantRow) {
+        sqlx::query(
+            "INSERT INTO project_grants (member_id, project_id, platform_role, pg_roles) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (member_id, project_id)
+             DO UPDATE SET platform_role = EXCLUDED.platform_role, pg_roles = EXCLUDED.pg_roles",
+        )
+        .bind(member)
+        .bind(project)
+        .bind(g.platform_role.as_str())
+        .bind(&g.pg_roles)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn raw_override(&self, member: Uuid, db: Uuid, o: &OverrideRow) {
+        sqlx::query(
+            "INSERT INTO database_grant_overrides (member_id, database_id, platform_role, pg_roles)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(member)
+        .bind(db)
+        .bind(o.platform_role.map(|r| r.as_str()))
+        .bind(&o.pg_roles)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+    }
+
+    /// A live login record of `member` on `db` named `name` (V1, 90 days), inserted without the
+    /// qualification check: the team writes under test must revoke it.
+    async fn raw_login(&self, member: Uuid, db: Uuid, name: &str) {
+        sqlx::query(
+            "INSERT INTO personal_logins (member_id, database_id, role_name, scram_verifier, valid_until)
+             VALUES ($1, $2, $3, $4, now() + interval '90 days')",
+        )
+        .bind(member)
+        .bind(db)
+        .bind(name)
+        .bind(V1)
+        .execute(self.client.pool())
+        .await
+        .unwrap();
+    }
+
+    async fn delete_project(&self, project: Uuid) {
+        sqlx::query("UPDATE projects SET status = 'deleted' WHERE id = $1")
+            .bind(project)
+            .execute(self.client.pool())
+            .await
+            .unwrap();
+    }
+
+    /// The teams `member` is in, by id.
+    async fn memberships_of(&self, member: Uuid) -> Vec<Uuid> {
+        sqlx::query_scalar("SELECT team_id FROM team_members WHERE member_id = $1 ORDER BY team_id")
+            .bind(member)
+            .fetch_all(self.client.pool())
+            .await
+            .unwrap()
+    }
+
+    /// `team`'s grant on `project` as stored.
+    async fn team_grant_row(&self, team: Uuid, project: Uuid) -> Option<GrantRow> {
+        let row: Option<(String, Vec<String>)> = sqlx::query_as(
+            "SELECT platform_role, pg_roles FROM team_grants WHERE team_id = $1 AND project_id = $2",
+        )
+        .bind(team)
+        .bind(project)
+        .fetch_optional(self.client.pool())
+        .await
+        .unwrap();
+        row.map(|(role, pg_roles)| GrantRow { platform_role: PlatformRole::parse(&role).unwrap(), pg_roles })
+    }
+
+    /// `chelabase_member_level(member, db)`.
+    async fn level(&self, member: Uuid, db: Uuid) -> Option<String> {
+        sqlx::query_scalar("SELECT chelabase_member_level($1, $2)")
+            .bind(member)
+            .bind(db)
+            .fetch_one(self.client.pool())
+            .await
+            .unwrap()
+    }
+
+    /// How many rows of `table` reference `team`.
+    async fn team_rows(&self, table: &str, team: Uuid) -> i64 {
+        let column = if table == "teams" { "id" } else { "team_id" };
+        sqlx::query_scalar(AssertSqlSafe(format!("SELECT count(*) FROM {table} WHERE {column} = $1")))
+            .bind(team)
+            .fetch_one(self.client.pool())
+            .await
+            .unwrap()
+    }
+}
+
+/// `change` as a checked team write, with the check's read taken just before (I4).
+async fn team_write(s: &Scratch, h: &Hub, change: &TeamChange) -> Result<TeamWrite, TeamWriteError> {
+    let expect = s.client.team_change_observed(h.t, change).await?;
+    s.client.write_team_checked(h.admin, h.t, change, &expect).await
+}
+
+fn changed(w: &Result<TeamWrite, TeamWriteError>) -> bool {
+    matches!(w, Ok(TeamWrite { changed: true, .. }))
+}
+
+/// Grants as `GrantSources` takes them (team grants by team id).
+fn grants_of(teams: &[(Uuid, GrantRow)]) -> Vec<chelabase_types::access::Grant> {
+    let mut teams = teams.to_vec();
+    teams.sort_by_key(|(id, _)| *id);
+    teams.iter().map(|(_, g)| g.to_grant()).collect()
+}
+
+/// Lowercase hyphenated ids, sorted, as JSON (P38).
+fn id_strings(ids: &[Uuid]) -> serde_json::Value {
+    let mut ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    ids.sort();
+    json!(ids)
+}
+
+// P5, P28 (MH-2): the SQL level function and its predicate agree with `GrantSources::effective`
+// and `access::qualifies` over own grant × two team grants × override, for active and suspended
+// members, tenant admins included. Level compared for active members, `qualifies` for every row.
+// The override-only rows catch the `LEAST` trap (no source must stay no level).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_level_agrees_with_rust_over_teams() {
+    #[derive(Clone, Copy, Debug)]
+    enum Ov {
+        None,
+        Level(PlatformRole),
+        RolesOnly,
+    }
+    use PlatformRole::{Admin, Developer, Viewer};
+    let levels = [None, Some(Viewer), Some(Developer), Some(Admin)];
+    let overrides = [Ov::None, Ov::Level(Viewer), Ov::Level(Developer), Ov::Level(Admin), Ov::RolesOnly];
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let p = s.project(t).await;
+    let db = s.database(t, p).await;
+    // Two teams per level (slots 0 and 1), each granting `p` and naming its own role.
+    let mut teams = std::collections::BTreeMap::new();
+    for slot in 0..2 {
+        for l in [Viewer, Developer, Admin] {
+            let id = s.raw_team(t, &format!("t{slot}-{}", l.as_str())).await;
+            let g = GrantRow::new(l, &[format!("t{slot}")]);
+            s.raw_team_grant(id, p, &g).await;
+            teams.insert((slot, l), (id, g));
+        }
+    }
+    let mut failures = Vec::new();
+    let mut n = 0;
+    for status in ["active", "suspended"] {
+        for tenant_admin in [false, true] {
+            for own in levels {
+                for t0 in levels {
+                    for t1 in levels {
+                        for o in overrides {
+                            n += 1;
+                            let id = s.member_row(t, &format!("z{n}"), status, tenant_admin).await;
+                            let own_row = own.map(|l| GrantRow::new(l, &["app".to_string()]));
+                            if let Some(g) = &own_row {
+                                s.raw_grant(id, p, g).await;
+                            }
+                            let mut joined = Vec::new();
+                            for (slot, l) in [(0, t0), (1, t1)] {
+                                if let Some(l) = l {
+                                    let (team, g) = teams[&(slot, l)].clone();
+                                    s.raw_team_member(team, id).await;
+                                    joined.push((team, g));
+                                }
+                            }
+                            let override_row = match o {
+                                Ov::None => None,
+                                Ov::Level(l) => Some(OverrideRow { platform_role: Some(l), pg_roles: None }),
+                                Ov::RolesOnly => Some(OverrideRow { platform_role: None, pg_roles: Some(vec!["app".into()]) }),
+                            };
+                            if let Some(row) = &override_row {
+                                s.raw_override(id, db, row).await;
+                            }
+                            let effective = if tenant_admin {
+                                Some(tenant_admin_effective())
+                            } else {
+                                GrantSources::new(
+                                    own_row.as_ref().map(GrantRow::to_grant),
+                                    grants_of(&joined),
+                                    override_row.as_ref().map(OverrideRow::to_narrowing),
+                                )
+                                .effective()
+                            };
+                            let active = status == "active";
+                            let want_q = qualifies(active, effective.as_ref());
+                            let want_level = effective.map(|e| e.platform_role.as_str().to_string());
+                            let case = format!("{status} admin={tenant_admin} own={own:?} teams=({t0:?}, {t1:?}) override={o:?}");
+                            let (level, q): (Option<String>, bool) = sqlx::query_as(
+                                "SELECT chelabase_member_level($1, $2), chelabase_personal_login_qualifies($1, $2)",
+                            )
+                            .bind(id)
+                            .bind(db)
+                            .fetch_one(s.client.pool())
+                            .await
+                            .unwrap_or_else(|e| panic!("{case}: {e}"));
+                            if active && level != want_level {
+                                failures.push(format!("{case}: level SQL {level:?}, Rust {want_level:?}"));
+                            }
+                            if q != want_q {
+                                failures.push(format!("{case}: qualifies SQL {q}, Rust {want_q}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} failures over {n} members:\n{}", failures.len(), failures.join("\n"));
+    s.finish().await;
+}
+
+// P4 (MH-2): `grant_sources` reads the member's team grants on the project (by team id) with the
+// own grant and the override; teams without a grant there, and teams the member isn't in, don't
+// count.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn grant_sources_include_team_grants() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let alice = s.active(&h, "alice").await;
+    let bob = s.active(&h, "bob").await;
+    let own = grant(PlatformRole::Viewer, &["app"]);
+    s.raw_grant(alice, h.p, &own).await;
+    let narrow = OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None };
+    s.raw_override(alice, h.db, &narrow).await;
+    let (x, y) = (s.raw_team(h.t, "x").await, s.raw_team(h.t, "y").await);
+    let gx = grant(PlatformRole::Developer, &["etl"]);
+    let gy = grant(PlatformRole::Admin, &[]);
+    s.raw_team_grant(x, h.p, &gx).await;
+    s.raw_team_grant(y, h.p, &gy).await;
+    // A team granting `p` that alice isn't in, and one of hers granting only `q`.
+    let z = s.raw_team(h.t, "z").await;
+    s.raw_team_grant(z, h.p, &grant(PlatformRole::Admin, &[])).await;
+    let w = s.raw_team(h.t, "w").await;
+    s.raw_team_grant(w, q, &grant(PlatformRole::Admin, &[])).await;
+    for team in [x, y, w] {
+        s.raw_team_member(team, alice).await;
+    }
+    s.raw_team_member(x, bob).await;
+    let teams = grants_of(&[(x, gx.clone()), (y, gy.clone())]);
+    assert_eq!(
+        c.grant_sources(alice, h.p, Some(h.db)).await.unwrap(),
+        GrantSources::new(Some(own.to_grant()), teams.clone(), Some(narrow.to_narrowing())),
+        "alice on the database: own grant, both teams' grants on p, the override"
+    );
+    assert_eq!(
+        c.grant_sources(alice, h.p, None).await.unwrap(),
+        GrantSources::new(Some(own.to_grant()), teams, None),
+        "alice at project level"
+    );
+    assert_eq!(
+        c.grant_sources(bob, h.p, Some(h.db)).await.unwrap(),
+        GrantSources::new(None, vec![gx.to_grant()], None),
+        "bob holds p through x only"
+    );
+    s.finish().await;
+}
+
+// P4 (MH-2): the worker's per-branch read lists a member whose only source is a team grant on the
+// project; a member whose team grants another project isn't listed.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn database_grant_sources_list_team_only_members() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let alice = s.granted(&h, "alice", PlatformRole::Viewer).await;
+    let bob = s.active(&h, "bob").await;
+    let carol = s.active(&h, "carol").await;
+    let x = s.raw_team(h.t, "x").await;
+    let gx = grant(PlatformRole::Developer, &["etl"]);
+    s.raw_team_grant(x, h.p, &gx).await;
+    s.raw_team_member(x, bob).await;
+    let w = s.raw_team(h.t, "w").await;
+    s.raw_team_grant(w, q, &grant(PlatformRole::Admin, &[])).await;
+    s.raw_team_member(w, carol).await;
+    let rows = c.database_grant_sources(h.p, h.db).await.unwrap();
+    let of = |m: Uuid| rows.iter().find(|(id, _)| *id == m).map(|(_, g)| g.clone());
+    assert_eq!(of(bob), Some(GrantSources::new(None, vec![gx.to_grant()], None)), "bob, through x only: {rows:?}");
+    assert_eq!(
+        of(alice),
+        Some(GrantSources::new(Some(grant(PlatformRole::Viewer, &[]).to_grant()), vec![], None))
+    );
+    assert_eq!(of(carol), None, "carol's team grants another project");
+    let ids: Vec<Uuid> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, sorted(ids.clone()), "by member id");
+    s.finish().await;
+}
+
+// P4 (MH-2, T2-4): `/v1/me`'s and the project list's read lists every non-deleted project where
+// the member has an own grant or a team grant, with the sources at project level; a member with
+// only an override has no row (empty sources stay `None`).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_grant_sources_list_team_only_projects() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let gone = s.project(h.t).await;
+    let alice = s.active(&h, "alice").await;
+    let own = grant(PlatformRole::Viewer, &[]);
+    s.raw_grant(alice, h.p, &own).await;
+    let x = s.raw_team(h.t, "x").await;
+    let gx = grant(PlatformRole::Developer, &["etl"]);
+    s.raw_team_grant(x, q, &gx).await;
+    s.raw_team_grant(x, gone, &gx).await;
+    s.raw_team_member(x, alice).await;
+    s.delete_project(gone).await;
+    let mut want = vec![
+        (h.p, GrantSources::new(Some(own.to_grant()), vec![], None)),
+        (q, GrantSources::new(None, vec![gx.to_grant()], None)),
+    ];
+    want.sort_by_key(|(p, _)| *p);
+    assert_eq!(c.member_grant_sources(h.t, alice).await.unwrap(), want, "p (own) and q (team), not the deleted project");
+    // An override alone is no access.
+    let carol = s.active(&h, "carol").await;
+    s.raw_override(carol, h.db, &OverrideRow { platform_role: Some(PlatformRole::Admin), pg_roles: None }).await;
+    assert_eq!(c.member_grant_sources(h.t, carol).await.unwrap(), vec![]);
+    s.finish().await;
+}
+
+// P4: the member list's `has_access` counts a team grant on a non-deleted project.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn has_access_counts_team_grants() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let gone = s.project(h.t).await;
+    let bob = s.active(&h, "bob").await;
+    let carol = s.active(&h, "carol").await;
+    let dave = s.active(&h, "dave").await;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    s.raw_team_member(x, bob).await;
+    let y = s.raw_team(h.t, "y").await;
+    s.raw_team_grant(y, gone, &grant(PlatformRole::Admin, &[])).await;
+    s.raw_team_member(y, carol).await;
+    s.delete_project(gone).await;
+    let z = s.raw_team(h.t, "z").await;
+    s.raw_team_member(z, dave).await;
+    let has = |l: Option<chelabase_metadata::members::MemberListing>| l.map(|l| l.has_access);
+    assert_eq!(has(c.member_listing(bob).await.unwrap()), Some(true), "bob has p through x");
+    assert_eq!(has(c.member_listing(carol).await.unwrap()), Some(false), "a deleted project is no access");
+    assert_eq!(has(c.member_listing(dave).await.unwrap()), Some(false), "a team without grants is no access");
+    let listings = c.list_member_listings(h.t).await.unwrap();
+    let listed = |m: Uuid| listings.iter().find(|l| l.id == m).map(|l| l.has_access);
+    assert_eq!((listed(bob), listed(carol), listed(dave)), (Some(true), Some(false), Some(false)));
+    s.finish().await;
+}
+
+// P13: the roster's levels are the best among the sources per (member, project), with `via`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_project_roles_report_own_team_and_both() {
+    use PlatformRole::{Admin, Developer, Viewer};
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let gone = s.project(h.t).await;
+    let [alice, bob, carol, dave, erin, frank] = [
+        s.active(&h, "alice").await,
+        s.active(&h, "bob").await,
+        s.active(&h, "carol").await,
+        s.active(&h, "dave").await,
+        s.active(&h, "erin").await,
+        s.active(&h, "frank").await,
+    ];
+    let team = |name: &'static str, level: PlatformRole, project: Uuid| {
+        let s = &s;
+        async move {
+            let id = s.raw_team(h.t, name).await;
+            s.raw_team_grant(id, project, &grant(level, &[])).await;
+            id
+        }
+    };
+    let tv = team("tv", Viewer, h.p).await;
+    let td = team("td", Developer, h.p).await;
+    let ta = team("ta", Admin, h.p).await;
+    let tgone = team("tgone", Admin, gone).await;
+    s.raw_grant(alice, h.p, &grant(Viewer, &[])).await; // own only
+    s.raw_team_member(td, bob).await; // team only
+    s.raw_grant(carol, h.p, &grant(Viewer, &[])).await; // both, the team better
+    s.raw_team_member(ta, carol).await;
+    s.raw_grant(dave, h.p, &grant(Developer, &[])).await; // both, own better
+    s.raw_team_member(tv, dave).await;
+    s.raw_team_member(tv, erin).await; // two teams
+    s.raw_team_member(td, erin).await;
+    s.raw_team_member(tgone, frank).await; // a deleted project only
+    s.delete_project(gone).await;
+    let ours = [alice, bob, carol, dave, erin, frank];
+    let got: Vec<MemberProjectRole> =
+        c.member_project_roles(h.t).await.unwrap().into_iter().filter(|r| ours.contains(&r.member)).collect();
+    let row = |member, platform_role, via| MemberProjectRole { member, project: h.p, platform_role, via };
+    let mut want = vec![
+        row(alice, Viewer, GrantVia::Own),
+        row(bob, Developer, GrantVia::Team),
+        row(carol, Admin, GrantVia::Both),
+        row(dave, Developer, GrantVia::Both),
+        row(erin, Developer, GrantVia::Team),
+    ];
+    want.sort_by_key(|r| (r.member, r.project));
+    assert_eq!(got, want);
+    s.finish().await;
+}
+
+// P4, P27 (MH-2): crafted cross-tenant rows never count, in any read: a member of this tenant in
+// another tenant's team, a team of this tenant granting another tenant's project, and another
+// tenant's member in this tenant's team.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn another_tenants_team_never_counts() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let u = s.hub().await;
+    let c = &s.client;
+    let alice = s.active(&h, "alice").await;
+    let legit = s.raw_team(h.t, "legit").await;
+    let gv = grant(PlatformRole::Viewer, &[]);
+    s.raw_team_grant(legit, h.p, &gv).await;
+    s.raw_team_member(legit, alice).await;
+    // Crafted: another tenant's team granting this tenant's project, with alice in it.
+    let foreign = s.raw_team(u.t, "foreign").await;
+    s.raw_team_grant(foreign, h.p, &grant(PlatformRole::Admin, &[])).await;
+    s.raw_team_member(foreign, alice).await;
+    // Crafted: this tenant's team granting another tenant's project, with alice in it.
+    let crafted = s.raw_team(h.t, "crafted").await;
+    s.raw_team_grant(crafted, u.p, &grant(PlatformRole::Admin, &[])).await;
+    s.raw_team_member(crafted, alice).await;
+    // Crafted: another tenant's member in this tenant's team.
+    let mallory = s.active(&u, "mallory").await;
+    s.raw_team_member(legit, mallory).await;
+
+    let only_legit = GrantSources::new(None, vec![gv.to_grant()], None);
+    assert_eq!(c.grant_sources(alice, h.p, Some(h.db)).await.unwrap(), only_legit, "only legit counts on p");
+    assert_eq!(s.level(alice, h.db).await.as_deref(), Some("viewer"), "the level function counts only legit");
+    assert!(!s.sql_qualifies(alice, h.db).await);
+    assert_eq!(c.grant_sources(alice, u.p, None).await.unwrap(), GrantSources::default(), "u's project");
+    assert_eq!(c.member_grant_sources(h.t, alice).await.unwrap(), vec![(h.p, only_legit.clone())]);
+    let rows = c.database_grant_sources(h.p, h.db).await.unwrap();
+    assert_eq!(rows.iter().find(|(m, _)| *m == alice).map(|(_, g)| g.clone()), Some(only_legit));
+    assert!(!rows.iter().any(|(m, _)| *m == mallory), "another tenant's member in legit: {rows:?}");
+    let roles = c.member_project_roles(h.t).await.unwrap();
+    let alices: Vec<_> = roles.iter().filter(|r| r.member == alice).cloned().collect();
+    assert_eq!(
+        alices,
+        vec![MemberProjectRole { member: alice, project: h.p, platform_role: PlatformRole::Viewer, via: GrantVia::Team }]
+    );
+    assert!(!roles.iter().any(|r| r.member == mallory));
+    // Mallory reaches nothing through legit.
+    assert_eq!(c.grant_sources(mallory, h.p, Some(h.db)).await.unwrap(), GrantSources::default());
+    assert_eq!(s.level(mallory, h.db).await, None);
+    assert_eq!(c.member_grant_sources(u.t, mallory).await.unwrap(), vec![]);
+    assert_eq!(c.member_listing(mallory).await.unwrap().map(|l| l.has_access), Some(false));
+    s.finish().await;
+}
+
+// P25: an invite or approval with teams re-reads the teams under the tenant lock; a team grant
+// changed since its check read them (or a team gone, or of another tenant) is `Changed` with
+// nothing written, on all four paths.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_invite_with_teams_sees_a_team_grant_change_as_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    let seen = [TeamSeen { team: x, grants: vec![(h.p, grant(PlatformRole::Viewer, &[]))] }];
+    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    let bob = s.active(&h, "bob").await;
+    let bob_seen = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    // The team grant changes after the checks read it.
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Developer, &["etl"])).await;
+    let members = s.member_count(h.t).await;
+    let events = s.event_count(h.t).await;
+
+    let invite = NewInvite { teams: &seen, ..new_invite("zi", "i@x.com", &[]) };
+    let r = c.create_invited_member(h.admin, h.t, invite).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "invite: {r:?}");
+    let r = c.add_existing_user(h.admin, h.t, "ze", "e@x.com", "E", &[], &seen).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "add existing user: {r:?}");
+    let r = c.approve_member(h.admin, pending.id, &[], &seen).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "approve: {r:?}");
+    let r = c
+        .put_project_grants_checked(h.admin, bob, &[], &seen, std::slice::from_ref(&bob_seen))
+        .await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "invite of an existing member: {r:?}");
+    assert_eq!(s.member_count(h.t).await, members, "no member written");
+    assert_eq!(s.event_count(h.t).await, events, "no event written");
+    assert_eq!(s.status_of(pending.id).await, MemberStatus::Pending);
+    assert!(s.memberships_of(bob).await.is_empty() && s.memberships_of(pending.id).await.is_empty());
+
+    // A team gone, or another tenant's, is `Changed` too.
+    let u = s.hub().await;
+    let theirs = s.raw_team(u.t, "theirs").await;
+    let gone = s.raw_team(h.t, "gone").await;
+    sqlx::query("DELETE FROM teams WHERE id = $1").bind(gone).execute(c.pool()).await.unwrap();
+    for (label, team) in [("another tenant's team", theirs), ("a deleted team", gone)] {
+        let seen = [TeamSeen { team, grants: vec![] }];
+        let r = c.approve_member(h.admin, pending.id, &[], &seen).await;
+        assert!(matches!(r, Err(AccessWriteError::Changed)), "{label}: {r:?}");
+    }
+    assert_eq!(s.status_of(pending.id).await, MemberStatus::Pending);
+    s.finish().await;
+}
+
+/// Runs `write` while another session holds the tenant row; panics unless it waits for it.
+/// Returns the write's result once the holder commits.
+async fn waits_for_the_tenant<T, F>(s: &Scratch, t: TenantId, label: &str, write: F) -> T
+where
+    T: std::fmt::Debug + Send + 'static,
+    F: std::future::Future<Output = T> + Send + 'static,
+{
+    let hold = s.hold_tenant(t).await;
+    let task = tokio::spawn(write);
+    blocked_or_done(s, &[], &task).await;
+    if task.is_finished() {
+        let r = task.await.unwrap();
+        panic!("{label} didn't wait for the tenant row: {r:?}");
+    }
+    hold.commit().await.unwrap();
+    task.await.unwrap()
+}
+
+// P26: every writer of `team_members` holds the tenant row first, so a team's member set is
+// stable under the tenant lock: team member add and remove, team delete, the invite paths with
+// teams, and `remove_member`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn every_team_members_writer_holds_the_tenant() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = s.client.clone();
+    let (t, admin) = (h.t, h.admin);
+    let x = s.raw_team(t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    let seen = vec![TeamSeen { team: x, grants: vec![(h.p, grant(PlatformRole::Viewer, &[]))] }];
+    let alice = s.active(&h, "alice").await;
+
+    let team_change = |change: TeamChange| {
+        let c = c.clone();
+        async move {
+            let expect = c.team_change_observed(t, &change).await?;
+            c.write_team_checked(admin, t, &change, &expect).await
+        }
+    };
+    let w = waits_for_the_tenant(&s, t, "team member add", team_change(TeamChange::AddMember { team: x, member: alice })).await;
+    assert!(changed(&w), "{w:?}");
+    let w = waits_for_the_tenant(&s, t, "team member remove", team_change(TeamChange::RemoveMember { team: x, member: alice })).await;
+    assert!(changed(&w), "{w:?}");
+
+    let invited = waits_for_the_tenant(&s, t, "invite with teams", {
+        let (c, seen) = (c.clone(), seen.clone());
+        async move {
+            let invite = NewInvite { teams: &seen, ..new_invite("zi", "i@x.com", &[]) };
+            c.create_invited_member(admin, t, invite).await.map(|(l, _)| l.id)
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.memberships_of(invited).await, vec![x]);
+    let added = waits_for_the_tenant(&s, t, "add existing user with teams", {
+        let (c, seen) = (c.clone(), seen.clone());
+        async move { c.add_existing_user(admin, t, "ze", "e@x.com", "E", &[], &seen).await.map(|l| l.id) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.memberships_of(added).await, vec![x]);
+    let pending = c.ensure_member(t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
+    waits_for_the_tenant(&s, t, "approve with teams", {
+        let (c, seen) = (c.clone(), seen.clone());
+        async move { c.approve_member(admin, pending, &[], &seen).await.map(|_| ()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.memberships_of(pending).await, vec![x]);
+    let bob = s.active(&h, "bob").await;
+    let bob_seen = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    waits_for_the_tenant(&s, t, "invite of an existing member with teams", {
+        let (c, seen) = (c.clone(), seen.clone());
+        async move { c.put_project_grants_checked(admin, bob, &[], &seen, &[bob_seen]).await.map(|_| ()) }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.memberships_of(bob).await, vec![x]);
+    waits_for_the_tenant(&s, t, "remove_member", {
+        let c = c.clone();
+        async move { c.remove_member(admin, bob).await.map(|_| ()) }
+    })
+    .await
+    .unwrap();
+    assert!(s.memberships_of(bob).await.is_empty());
+    let w = waits_for_the_tenant(&s, t, "team delete", team_change(TeamChange::Delete { team: x })).await;
+    assert!(changed(&w), "{w:?}");
+    s.finish().await;
+}
+
+// MH-9 via P3: a team write that makes `chelabase_personal_login_qualifies` false revokes in its
+// own transaction (verifier gone when the write returns, one `personal_logins_revoked` for the
+// member): a grant downgraded to Viewer, a grant deleted, a member removed, a team deleted. An
+// unaffected login stays live.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn team_writes_revoke_logins_that_stop_qualifying() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let keep = s.granted(&h, "keep", PlatformRole::Developer).await;
+    s.login(keep, h.db, "keep").await;
+    let labels = ["downgrade to viewer", "grant delete", "member removed", "team delete"];
+    for (i, label) in labels.into_iter().enumerate() {
+        let team = s.raw_team(h.t, label).await;
+        s.raw_team_grant(team, h.p, &grant(PlatformRole::Developer, &[])).await;
+        let m = s.active(&h, &format!("m{i}")).await;
+        s.raw_team_member(team, m).await;
+        s.raw_login(m, h.db, &format!("m{i}")).await;
+        let change = match i {
+            0 => TeamChange::PutGrant { team, project: h.p, grant: grant(PlatformRole::Viewer, &[]) },
+            1 => TeamChange::DeleteGrant { team, project: h.p },
+            2 => TeamChange::RemoveMember { team, member: m },
+            _ => TeamChange::Delete { team },
+        };
+        let since = last_event_id(&s, h.t).await;
+        let w = team_write(&s, &h, &change).await;
+        assert!(changed(&w), "{label}: {w:?}");
+        assert_eq!(s.record_verifier(m, h.db).await, None, "{label}: the login outlived the write");
+        let revoked: Vec<AccessEvent> = s
+            .events_of(h.t, "personal_logins_revoked")
+            .await
+            .into_iter()
+            .filter(|e| e.id > since)
+            .collect();
+        assert_eq!(revoked.len(), 1, "{label}: {revoked:?}");
+        assert_eq!(revoked[0].target_member_id, Some(m), "{label}");
+    }
+    assert_eq!(s.record_verifier(keep, h.db).await.as_deref(), Some(V1), "an unaffected login stays");
+    s.finish().await;
+}
+
+// I4 (MH-4b): a team write whose check read is stale (the member's own grant, override or
+// another team's grant changed since) is `Changed`, and nothing is written.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_team_write_refuses_a_stale_expect_with_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.active(&h, "alice").await;
+    let x = s.raw_team(h.t, "x").await;
+    let y = s.raw_team(h.t, "y").await;
+    let dev = grant(PlatformRole::Developer, &[]);
+    s.raw_team_grant(x, h.p, &dev).await;
+    s.raw_team_member(x, alice).await;
+    s.raw_team_member(y, alice).await;
+    let change = TeamChange::PutGrant { team: x, project: h.p, grant: grant(PlatformRole::Viewer, &[]) };
+    for label in ["own grant", "override", "another team's grant"] {
+        let expect = c.team_change_observed(h.t, &change).await.unwrap();
+        assert_eq!(
+            expect.iter().map(|(m, o)| (*m, o.project)).collect::<Vec<_>>(),
+            vec![(alice, h.p)],
+            "{label}: the check reads alice on p"
+        );
+        match label {
+            "own grant" => s.raw_grant(alice, h.p, &grant(PlatformRole::Admin, &[])).await,
+            "override" => {
+                s.raw_override(alice, h.db, &OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None })
+                    .await
+            }
+            _ => s.raw_team_grant(y, h.p, &grant(PlatformRole::Admin, &[])).await,
+        }
+        let events = s.event_count(h.t).await;
+        let w = c.write_team_checked(h.admin, h.t, &change, &expect).await;
+        assert!(matches!(w, Err(TeamWriteError::Changed)), "{label}: {w:?}");
+        assert_eq!(s.team_grant_row(x, h.p).await, Some(dev.clone()), "{label}: nothing written");
+        assert_eq!(s.event_count(h.t).await, events, "{label}: no event");
+    }
+    s.finish().await;
+}
+
+// I4 (MH-4b): the affected set is part of the check: a member added to the team, or a team grant
+// added, since the check read it is `Changed` with nothing written.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_team_write_whose_affected_set_changed_is_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let alice = s.active(&h, "alice").await;
+    let bob = s.active(&h, "bob").await;
+    let carol = s.active(&h, "carol").await;
+    let x = s.raw_team(h.t, "x").await;
+    let dev = grant(PlatformRole::Developer, &[]);
+    s.raw_team_grant(x, h.p, &dev).await;
+    s.raw_team_member(x, alice).await;
+
+    let put = TeamChange::PutGrant { team: x, project: h.p, grant: grant(PlatformRole::Viewer, &[]) };
+    let expect = c.team_change_observed(h.t, &put).await.unwrap();
+    assert_eq!(expect.len(), 1, "the check reads alice on p: {expect:?}");
+    s.raw_team_member(x, bob).await;
+    let w = c.write_team_checked(h.admin, h.t, &put, &expect).await;
+    assert!(matches!(w, Err(TeamWriteError::Changed)), "a member joined since the check: {w:?}");
+    assert_eq!(s.team_grant_row(x, h.p).await, Some(dev.clone()));
+
+    let add = TeamChange::AddMember { team: x, member: carol };
+    let expect = c.team_change_observed(h.t, &add).await.unwrap();
+    assert_eq!(expect.iter().map(|(m, o)| (*m, o.project)).collect::<Vec<_>>(), vec![(carol, h.p)]);
+    s.raw_team_grant(x, q, &dev).await;
+    let w = c.write_team_checked(h.admin, h.t, &add, &expect).await;
+    assert!(matches!(w, Err(TeamWriteError::Changed)), "a grant was added since the check: {w:?}");
+    assert!(s.memberships_of(carol).await.is_empty(), "nothing written");
+    s.finish().await;
+}
+
+// P6, P7: an own-grant or override write's `Observed` includes the member's team grants, so a
+// team grant changed between its check and its write is `Changed`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_own_grant_write_sees_a_team_change_as_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let bob = s.active(&h, "bob").await;
+    let own = grant(PlatformRole::Viewer, &[]);
+    s.raw_grant(bob, h.p, &own).await;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    s.raw_team_member(x, bob).await;
+    let observed = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    assert_eq!(
+        observed.teams,
+        [(x, grant(PlatformRole::Viewer, &[]))].into_iter().collect(),
+        "the check's read includes bob's team grant"
+    );
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Developer, &["etl"])).await;
+    let r = c
+        .put_project_grants_checked(h.admin, bob, &[(h.p, grant(PlatformRole::Developer, &[]))], &[], std::slice::from_ref(&observed))
+        .await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "grant: {r:?}");
+    assert_eq!(c.member_projects(bob).await.unwrap(), vec![(h.p, own)], "nothing written");
+    let narrow = OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None };
+    let r = c.put_override_checked(h.admin, bob, h.db, &narrow, Some(&observed)).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "override: {r:?}");
+    // The project-level reads agree with what the write re-reads.
+    let fresh: Observed = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    assert_eq!(fresh.teams.get(&x), Some(&grant(PlatformRole::Developer, &["etl"])));
+    s.finish().await;
+}
+
+// I4, MH-4 (T23 audit): an own-grant delete compares what its check read, team grants
+// included: a team grant written since is `Changed` with nothing deleted; the read as it stands
+// deletes.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_own_grant_delete_sees_a_team_change_as_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let bob = s.active(&h, "bob").await;
+    let own = grant(PlatformRole::Admin, &[]);
+    s.raw_grant(bob, h.p, &own).await;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    s.raw_team_member(x, bob).await;
+    let observed = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Developer, &["etl"])).await;
+    let events = s.event_count(h.t).await;
+    let r = c.delete_project_grant_checked(h.admin, bob, h.p, Some(&observed)).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "{r:?}");
+    assert_eq!(c.member_projects(bob).await.unwrap(), vec![(h.p, own)], "nothing deleted");
+    assert_eq!(s.event_count(h.t).await, events, "no event");
+    // Another project's read is `Changed` too, whatever it holds.
+    let elsewhere = Observed { project: Uuid::new_v4(), ..Default::default() };
+    let r = c.delete_project_grant_checked(h.admin, bob, h.p, Some(&elsewhere)).await;
+    assert!(matches!(r, Err(AccessWriteError::Changed)), "{r:?}");
+    let fresh = c.project_access(h.p).await.unwrap().observed(h.p, bob);
+    c.delete_project_grant_checked(h.admin, bob, h.p, Some(&fresh)).await.unwrap();
+    assert!(c.member_projects(bob).await.unwrap().is_empty(), "deleted");
+    s.finish().await;
+}
+
+// I4, MH-4 (T23 audit): adding a member compares the team's grants as its check read them, not
+// only which projects they're on: a grant changed since (same project, other roles) is
+// `Changed` with nothing written.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn adding_a_member_sees_a_team_grant_change_as_changed() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let carol = s.active(&h, "carol").await;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    let add = TeamChange::AddMember { team: x, member: carol };
+    let expect = c.team_change_observed(h.t, &add).await.unwrap();
+    assert_eq!(
+        expect.iter().map(|(m, o)| (*m, o.project, o.teams.get(&x).cloned())).collect::<Vec<_>>(),
+        vec![(carol, h.p, Some(grant(PlatformRole::Viewer, &[])))],
+        "the check's read holds what the team would give carol"
+    );
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Developer, &["etl"])).await;
+    let events = s.event_count(h.t).await;
+    let w = c.write_team_checked(h.admin, h.t, &add, &expect).await;
+    assert!(matches!(w, Err(TeamWriteError::Changed)), "the team's grant changed since the check: {w:?}");
+    assert!(s.memberships_of(carol).await.is_empty(), "nothing written");
+    assert_eq!(s.event_count(h.t).await, events, "no event");
+    let expect = c.team_change_observed(h.t, &add).await.unwrap();
+    let w = c.write_team_checked(h.admin, h.t, &add, &expect).await;
+    assert!(matches!(w, Ok(TeamWrite { changed: true, .. })), "{w:?}");
+    s.finish().await;
+}
+
+/// Whether a `FOR NO KEY UPDATE NOWAIT` of `table`'s row `id` gets the lock now (`false` when
+/// another session holds it: 55P03).
+async fn row_free(s: &Scratch, table: &str, id: Uuid) -> bool {
+    let mut tx = s.client.pool().begin().await.unwrap();
+    let r = sqlx::query(AssertSqlSafe(format!("SELECT 1 FROM {table} WHERE id = $1 FOR NO KEY UPDATE NOWAIT")))
+        .bind(id)
+        .execute(&mut *tx)
+        .await;
+    tx.rollback().await.unwrap();
+    match r {
+        Ok(_) => true,
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("55P03") => false,
+        Err(e) => panic!("probe {table} {id}: {e}"),
+    }
+}
+
+// P6 (MH-4): a team write takes the tenant row, then the affected members in id order. Another
+// session holds B (the higher id): the write waits on B's holder alone, already holding the
+// tenant and A. A member the write doesn't reach stays free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn team_writes_lock_the_tenant_then_members_in_id_order() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = s.client.clone();
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    let mut ab = [s.active(&h, "a").await, s.active(&h, "b").await];
+    ab.sort();
+    let [a, b] = ab;
+    let other = s.active(&h, "other").await;
+    for m in [a, b] {
+        s.raw_team_member(x, m).await;
+    }
+    let change = TeamChange::PutGrant { team: x, project: h.p, grant: grant(PlatformRole::Developer, &[]) };
+    let expect = c.team_change_observed(h.t, &change).await.unwrap();
+    let mut hold = c.pool().begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM members WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(b)
+        .execute(&mut *hold)
+        .await
+        .unwrap();
+    let holder: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *hold).await.unwrap();
+    let task = tokio::spawn({
+        let (c, change) = (c.clone(), change.clone());
+        let (admin, t) = (h.admin, h.t);
+        async move { c.write_team_checked(admin, t, &change, &expect).await }
+    });
+    let waiting = blocked_or_done(&s, &[], &task).await;
+    if task.is_finished() {
+        let r = task.await.unwrap();
+        panic!("the team write didn't wait for B's row: {r:?}");
+    }
+    assert_eq!(waiting.len(), 1, "one waiter: {waiting:?}");
+    let blockers: Vec<i32> = sqlx::query_scalar("SELECT unnest(pg_blocking_pids($1))")
+        .bind(waiting[0])
+        .fetch_all(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(blockers, vec![holder], "the write waits on B's holder");
+    assert!(!row_free(&s, "tenants", h.t.as_uuid()).await, "the write holds the tenant while it waits for B");
+    assert!(!row_free(&s, "members", a).await, "the write holds A (the lower id) before B");
+    assert!(row_free(&s, "members", other).await, "a member the write doesn't reach is free");
+    hold.commit().await.unwrap();
+    let w = task.await.unwrap();
+    assert!(changed(&w), "{w:?}");
+    s.finish().await;
+}
+
+// P9, P38 (MH-7): team events carry the team, the grants concerned and the affected members;
+// the member filter finds an event through `affected_member_ids` (in `after`, or `before` for a
+// removal), and a member add or remove targets that member.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn team_events_carry_affected_members_and_the_member_filter_finds_them() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let alice = s.active(&h, "alice").await;
+    let bob = s.active(&h, "bob").await;
+    let carol = s.active(&h, "carol").await;
+    let x = s.raw_team(h.t, "Data").await;
+    s.raw_team_member(x, alice).await;
+    s.raw_team_member(x, bob).await;
+    let found = |events: Vec<AccessEvent>, id: i64| events.iter().any(|e| e.id == id);
+
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project: h.p, grant: grant(PlatformRole::Developer, &["app"]) }).await;
+    assert!(changed(&w), "{w:?}");
+    let put = s.events_of(h.t, "team_grant_put").await;
+    assert_eq!(put.len(), 1, "{put:?}");
+    let put = &put[0];
+    let after = put.after.clone().unwrap();
+    assert_eq!(after["team"], json!({ "id": x, "name": "Data" }));
+    assert_eq!(after["grants"], json!([{ "project_id": h.p, "platform_role": "developer", "pg_roles": ["app"] }]));
+    assert_eq!(after["affected_member_ids"], id_strings(&[alice, bob]));
+    assert_eq!((put.actor_member_id, put.target_member_id, put.project_id), (Some(h.admin), None, Some(h.p)));
+    assert!(found(c.access_events(h.t, None, Some(bob), None, 100).await.unwrap(), put.id), "bob's log");
+    assert!(!found(c.access_events(h.t, None, Some(carol), None, 100).await.unwrap(), put.id), "carol's log");
+
+    let w = team_write(&s, &h, &TeamChange::AddMember { team: x, member: carol }).await;
+    assert!(changed(&w), "{w:?}");
+    let added = s.events_of(h.t, "team_member_added").await;
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!(added[0].target_member_id, Some(carol));
+    assert!(found(c.access_events(h.t, None, Some(carol), None, 100).await.unwrap(), added[0].id));
+
+    let w = team_write(&s, &h, &TeamChange::RemoveMember { team: x, member: alice }).await;
+    assert!(changed(&w), "{w:?}");
+    let removed = s.events_of(h.t, "team_member_removed").await;
+    assert_eq!(removed.len(), 1, "{removed:?}");
+    assert_eq!(removed[0].target_member_id, Some(alice));
+
+    let w = team_write(&s, &h, &TeamChange::DeleteGrant { team: x, project: h.p }).await;
+    assert!(changed(&w), "{w:?}");
+    let deleted = s.events_of(h.t, "team_grant_deleted").await;
+    assert_eq!(deleted.len(), 1, "{deleted:?}");
+    assert_eq!(deleted[0].project_id, Some(h.p));
+    // Bob and carol are in the team now; alice isn't.
+    for (m, want) in [(bob, true), (carol, true), (alice, false)] {
+        let log = c.access_events(h.t, None, Some(m), None, 100).await.unwrap();
+        assert_eq!(found(log, deleted[0].id), want, "member {m}'s log and the grant delete");
+    }
+    s.finish().await;
+}
+
+// P9 (MH-7): the project log shows a team's grant events on that project (through `project_id`
+// or `grants`) and a member added to a team that grants it, never another project's grant event.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn team_grant_events_are_in_the_project_log() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let bob = s.active(&h, "bob").await;
+    let x = s.raw_team(h.t, "x").await;
+    for project in [h.p, q] {
+        let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project, grant: grant(PlatformRole::Viewer, &[]) }).await;
+        assert!(changed(&w), "{w:?}");
+    }
+    let w = team_write(&s, &h, &TeamChange::AddMember { team: x, member: bob }).await;
+    assert!(changed(&w), "{w:?}");
+    let log = c.access_events(h.t, Some(h.p), None, None, 100).await.unwrap();
+    let puts: Vec<Option<Uuid>> = log.iter().filter(|e| e.action == "team_grant_put").map(|e| e.project_id).collect();
+    assert_eq!(puts, vec![Some(h.p)], "p's log: its team grant, not q's");
+    assert!(log.iter().any(|e| e.action == "team_member_added"), "p's log: bob joined a team granting p");
+    s.finish().await;
+}
+
+// P10 (MH-5): removing a member deletes its team memberships in the same transaction, its
+// touched projects include its teams' projects, and `member_removed` lists the teams.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn remove_member_drops_team_memberships_and_touches_team_projects() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let alice = s.active(&h, "alice").await;
+    let x = s.raw_team(h.t, "Ops").await;
+    s.raw_team_grant(x, q, &grant(PlatformRole::Developer, &[])).await;
+    s.raw_team_member(x, alice).await;
+    let touched = c.remove_member(h.admin, alice).await.unwrap();
+    assert!(touched.contains(&q), "the team's project is touched: {touched:?}");
+    assert!(s.memberships_of(alice).await.is_empty(), "memberships deleted");
+    let removed = s.events_of(h.t, "member_removed").await;
+    assert_eq!(removed.last().and_then(|e| e.before.clone()).map(|b| b["teams"].clone()), Some(json!([{ "id": x, "name": "Ops" }])));
+    assert!(s.events_of(h.t, "team_member_removed").await.is_empty(), "no separate team events (P10)");
+    s.finish().await;
+}
+
+// P16: reinstate returns the touched projects, team grant projects included (also on the
+// already-active no-op); suspend's include them too.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn reinstate_returns_team_projects() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let alice = s.granted(&h, "alice", PlatformRole::Viewer).await;
+    let x = s.raw_team(h.t, "x").await;
+    s.raw_team_grant(x, q, &grant(PlatformRole::Developer, &[])).await;
+    s.raw_team_member(x, alice).await;
+    let suspended = c.suspend_member(h.admin, alice).await.unwrap();
+    let reinstated = c.reinstate_member(h.admin, alice).await.unwrap();
+    assert_eq!(sorted(reinstated.clone()), sorted(vec![h.p, q]), "own and team projects");
+    assert_eq!(sorted(c.reinstate_member(h.admin, alice).await.unwrap()), sorted(vec![h.p, q]), "the no-op too");
+    assert!(suspended.contains(&q), "suspend: {suspended:?}");
+    s.finish().await;
+}
+
+// P2: team names are unique per tenant, case-insensitively, on create and rename.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn team_names_are_unique_per_tenant_case_insensitively() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let u = s.hub().await;
+    let c = &s.client;
+    let data = c.create_team(h.admin, h.t, "Data", "the data team").await;
+    assert!(data.is_ok(), "create: {data:?}");
+    let data = data.unwrap();
+    assert_eq!((data.name.as_str(), data.description.as_str(), data.tenant_id), ("Data", "the data team", h.t));
+    let r = c.create_team(h.admin, h.t, "data", "").await;
+    assert!(matches!(r, Err(TeamWriteError::NameTaken)), "{r:?}");
+    let r = c.create_team(u.admin, u.t, "DATA", "").await;
+    assert!(r.is_ok(), "another tenant may use the name: {r:?}");
+    let ops = c.create_team(h.admin, h.t, "Ops", "").await.unwrap();
+    let r = c.update_team(h.admin, h.t, ops.id, Some("dAtA"), None).await;
+    assert!(matches!(r, Err(TeamWriteError::NameTaken)), "rename: {r:?}");
+    let r = c.update_team(h.admin, h.t, ops.id, Some("OPS"), Some("ops")).await.unwrap();
+    assert_eq!((r.name.as_str(), r.description.as_str()), ("OPS", "ops"), "a team may change its own name's case");
+    assert_eq!(s.events_of(h.t, "team_created").await.len(), 2);
+    assert_eq!(s.events_of(h.t, "team_updated").await.len(), 1);
+    s.finish().await;
+}
+
+// P17: a team grant on another tenant's project, or on a deleted one, is `ProjectNotFound`;
+// another tenant's team is `NotFound`. Nothing is written.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_team_grant_on_another_tenants_project_is_project_not_found() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let u = s.hub().await;
+    let gone = s.project(h.t).await;
+    s.delete_project(gone).await;
+    let x = s.raw_team(h.t, "x").await;
+    let v = grant(PlatformRole::Viewer, &[]);
+    for (label, project) in [("another tenant's project", u.p), ("a deleted project", gone)] {
+        let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project, grant: v.clone() }).await;
+        assert!(matches!(w, Err(TeamWriteError::ProjectNotFound)), "{label}: {w:?}");
+        assert_eq!(s.team_grant_row(x, project).await, None, "{label}");
+    }
+    let theirs = s.raw_team(u.t, "theirs").await;
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: theirs, project: h.p, grant: v }).await;
+    assert!(matches!(w, Err(TeamWriteError::NotFound)), "another tenant's team: {w:?}");
+    assert_eq!(s.team_grant_row(theirs, h.p).await, None);
+    s.finish().await;
+}
+
+// P17: a pending sign-up can't join a team (`MemberPending`); a removed member or another
+// tenant's is `MemberNotFound`.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn adding_a_pending_member_is_member_pending() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let u = s.hub().await;
+    let c = &s.client;
+    let x = s.raw_team(h.t, "x").await;
+    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
+    let w = team_write(&s, &h, &TeamChange::AddMember { team: x, member: pending }).await;
+    assert!(matches!(w, Err(TeamWriteError::MemberPending)), "pending: {w:?}");
+    let removed = s.active(&h, "gone").await;
+    c.remove_member(h.admin, removed).await.unwrap();
+    let stranger = s.active(&u, "stranger").await;
+    for (label, member) in [("removed", removed), ("another tenant's", stranger)] {
+        let w = team_write(&s, &h, &TeamChange::AddMember { team: x, member }).await;
+        assert!(matches!(w, Err(TeamWriteError::MemberNotFound)), "{label}: {w:?}");
+    }
+    for m in [pending, removed, stranger] {
+        assert!(s.memberships_of(m).await.is_empty());
+    }
+    s.finish().await;
+}
+
+// P3 (R17, R7): a team grant is written as a grant is: Admin names no roles, roles below Admin
+// sorted and deduplicated, `owner` refused (`Conflict`).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_admin_team_grant_names_no_roles() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let q = s.project(h.t).await;
+    let x = s.raw_team(h.t, "x").await;
+    let admin = GrantRow { platform_role: PlatformRole::Admin, pg_roles: vec!["app".into()] };
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project: h.p, grant: admin }).await;
+    assert!(changed(&w), "{w:?}");
+    assert_eq!(s.team_grant_row(x, h.p).await, Some(grant(PlatformRole::Admin, &[])), "Admin names no roles");
+    let messy = GrantRow { platform_role: PlatformRole::Developer, pg_roles: vec!["b".into(), "a".into(), "b".into()] };
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project: q, grant: messy }).await;
+    assert!(changed(&w), "{w:?}");
+    assert_eq!(s.team_grant_row(x, q).await, Some(grant(PlatformRole::Developer, &["a", "b"])));
+    let owner = grant(PlatformRole::Developer, &["owner"]);
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project: q, grant: owner }).await;
+    assert!(matches!(w, Err(TeamWriteError::Conflict(_))), "owner: {w:?}");
+    assert_eq!(s.team_grant_row(x, q).await, Some(grant(PlatformRole::Developer, &["a", "b"])));
+    // The same grant again commits nothing.
+    let w = team_write(&s, &h, &TeamChange::PutGrant { team: x, project: q, grant: grant(PlatformRole::Developer, &["a", "b"]) }).await;
+    assert!(matches!(w, Ok(TeamWrite { changed: false, .. })), "unchanged: {w:?}");
+    s.finish().await;
+}
+
+// P12, P25 (metadata half): every invite path with teams adds the memberships in the grants'
+// transaction, one `team_member_added` (targeting the member) per team; a refused write adds
+// none.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn invites_and_approvals_add_teams_in_the_same_transaction() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let q = s.project(h.t).await;
+    let x = s.raw_team(h.t, "x").await;
+    let y = s.raw_team(h.t, "y").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
+    s.raw_team_grant(y, q, &grant(PlatformRole::Developer, &[])).await;
+    let sx = TeamSeen { team: x, grants: vec![(h.p, grant(PlatformRole::Viewer, &[]))] };
+    let sy = TeamSeen { team: y, grants: vec![(q, grant(PlatformRole::Developer, &[]))] };
+    let joined = |since: i64, member: Uuid| {
+        let s = &s;
+        async move {
+            s.events_of(h.t, "team_member_added")
+                .await
+                .into_iter()
+                .filter(|e| e.id > since && e.target_member_id == Some(member))
+                .count()
+        }
+    };
+
+    let since = last_event_id(&s, h.t).await;
+    let teams = [sx.clone()];
+    let (invited, _) = c
+        .create_invited_member(h.admin, h.t, NewInvite { teams: &teams, ..new_invite("zi", "i@x.com", &[]) })
+        .await
+        .unwrap();
+    assert_eq!(s.memberships_of(invited.id).await, vec![x], "the invitee joins x");
+    assert_eq!(joined(since, invited.id).await, 1);
+
+    let since = last_event_id(&s, h.t).await;
+    let added = c.add_existing_user(h.admin, h.t, "ze", "e@x.com", "E", &[], &[sx.clone(), sy.clone()]).await.unwrap();
+    assert_eq!(s.memberships_of(added.id).await, sorted(vec![x, y]));
+    assert_eq!(joined(since, added.id).await, 2);
+
+    let since = last_event_id(&s, h.t).await;
+    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    c.approve_member(h.admin, pending.id, &[], std::slice::from_ref(&sy)).await.unwrap();
+    assert_eq!(s.memberships_of(pending.id).await, vec![y]);
+    assert_eq!(joined(since, pending.id).await, 1);
+
+    let since = last_event_id(&s, h.t).await;
+    let bob = s.active(&h, "bob").await;
+    let expect = [c.project_access(h.p).await.unwrap().observed(h.p, bob)];
+    c.put_project_grants_checked(h.admin, bob, &[], std::slice::from_ref(&sx), &expect).await.unwrap();
+    assert_eq!(s.memberships_of(bob).await, vec![x]);
+    assert_eq!(joined(since, bob).await, 1);
+
+    // A refused approval (bob isn't pending) adds no membership.
+    let r = c.approve_member(h.admin, bob, &[], std::slice::from_ref(&sy)).await;
+    assert!(matches!(r, Err(AccessWriteError::Conflict(_))), "{r:?}");
+    assert_eq!(s.memberships_of(bob).await, vec![x]);
+    s.finish().await;
+}
+
+// P27, the checklist: a deleted project's team grant is no access in any read, and a suspended
+// or offboarded member reaches nothing through a team.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn a_deleted_projects_team_grant_is_no_access() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let c = &s.client;
+    let gone = s.project(h.t).await;
+    let gone_db = s.database(h.t, gone).await;
+    let alice = s.active(&h, "alice").await;
+    let x = s.raw_team(h.t, "x").await;
+    let v = grant(PlatformRole::Viewer, &[]);
+    let d = grant(PlatformRole::Developer, &[]);
+    s.raw_team_grant(x, h.p, &v).await;
+    s.raw_team_grant(x, gone, &d).await;
+    s.raw_team_member(x, alice).await;
+    s.delete_project(gone).await;
+
+    assert_eq!(
+        c.grant_sources(alice, h.p, None).await.unwrap(),
+        GrantSources::new(None, vec![v.to_grant()], None),
+        "a live project's team grant counts"
+    );
+    assert_eq!(c.grant_sources(alice, gone, Some(gone_db)).await.unwrap(), GrantSources::default());
+    assert_eq!(c.member_grant_sources(h.t, alice).await.unwrap(), vec![(h.p, GrantSources::new(None, vec![v.to_grant()], None))]);
+    assert!(!c.database_grant_sources(gone, gone_db).await.unwrap().iter().any(|(m, _)| *m == alice));
+    assert!(!s.sql_qualifies(alice, gone_db).await);
+    assert!(!c.member_project_roles(h.t).await.unwrap().iter().any(|r| r.project == gone));
+
+    // Through a Developer team on p: an active member qualifies, a suspended or offboarded one
+    // doesn't.
+    let y = s.raw_team(h.t, "y").await;
+    s.raw_team_grant(y, h.p, &d).await;
+    let dave = s.active(&h, "dave").await;
+    let bob = s.active(&h, "bob").await;
+    let carol = s.active(&h, "carol").await;
+    for m in [dave, bob, carol] {
+        s.raw_team_member(y, m).await;
+    }
+    sqlx::query("UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1")
+        .bind(bob)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE members SET offboarded_at = now() WHERE id = $1").bind(carol).execute(c.pool()).await.unwrap();
+    assert!(s.sql_qualifies(dave, h.db).await, "an active Developer through y");
+    assert_eq!(s.level(bob, h.db).await, None, "suspended");
+    assert!(!s.sql_qualifies(bob, h.db).await, "suspended");
+    assert!(!s.sql_qualifies(carol, h.db).await, "offboarded");
+    s.finish().await;
+}
+
+// P9: deleting a team cascades its grants and memberships and logs exactly one event, which
+// lists what the team gave and whom it reached.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn deleting_a_team_cascades_and_logs_one_event() {
+    let s = Scratch::new().await;
+    let h = s.hub().await;
+    let alice = s.active(&h, "alice").await;
+    let bob = s.active(&h, "bob").await;
+    let x = s.raw_team(h.t, "Gone").await;
+    s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &["app"])).await;
+    s.raw_team_member(x, alice).await;
+    s.raw_team_member(x, bob).await;
+    let since = last_event_id(&s, h.t).await;
+    let w = team_write(&s, &h, &TeamChange::Delete { team: x }).await;
+    assert!(changed(&w), "{w:?}");
+    assert_eq!(actions_since(&s, h.t, since).await, vec!["team_deleted".to_string()]);
+    for table in ["teams", "team_grants", "team_members"] {
+        assert_eq!(s.team_rows(table, x).await, 0, "{table}");
+    }
+    let e = s.events_of(h.t, "team_deleted").await.pop().unwrap();
+    let before = e.before.unwrap();
+    assert_eq!(before["team"], json!({ "id": x, "name": "Gone" }));
+    assert_eq!(before["grants"], json!([{ "project_id": h.p, "platform_role": "viewer", "pg_roles": ["app"] }]));
+    assert_eq!(before["affected_member_ids"], id_strings(&[alice, bob]));
+    assert_eq!(e.target_member_id, None);
     s.finish().await;
 }

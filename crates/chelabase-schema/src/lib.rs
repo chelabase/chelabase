@@ -12,6 +12,7 @@
 
 pub mod analysis;
 pub mod catalog;
+pub mod cell;
 pub mod compare;
 pub mod ddl;
 pub mod error;

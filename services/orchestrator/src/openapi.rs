@@ -621,6 +621,54 @@ impl MetadataPort for Doc {
     async fn member_overrides(&self, member: Uuid) -> Result<Vec<(Uuid, Uuid, chelabase_metadata::members::OverrideRow)>, MetadataError> {
         match *self {}
     }
+    async fn list_teams(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        match *self {}
+    }
+    async fn team(&self, tenant: TenantId, team: Uuid) -> Result<Option<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        match *self {}
+    }
+    async fn member_teams(&self, member: Uuid) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        match *self {}
+    }
+    async fn project_team_grants(&self, project: Uuid) -> Result<Vec<chelabase_metadata::teams::ProjectTeamGrant>, MetadataError> {
+        match *self {}
+    }
+    async fn create_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        name: &str,
+        description: &str,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        match *self {}
+    }
+    async fn update_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        team: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        match *self {}
+    }
+    async fn team_change_observed(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> Result<Vec<(Uuid, chelabase_metadata::members::Observed)>, chelabase_metadata::teams::TeamWriteError> {
+        match *self {}
+    }
+    async fn write_team_checked(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+        expect: &[(Uuid, chelabase_metadata::members::Observed)],
+        skipped_admins: &[Uuid],
+    ) -> Result<chelabase_metadata::teams::TeamWrite, chelabase_metadata::teams::TeamWriteError> {
+        match *self {}
+    }
 }
 
 #[allow(unused_variables)]
@@ -802,7 +850,7 @@ impl members::MembersPort for Doc {
     ) -> Result<Vec<chelabase_metadata::members::AccessEvent>, MetadataError> {
         match *self {}
     }
-    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<(Uuid, Uuid, chelabase_types::access::PlatformRole)>, MetadataError> {
+    async fn member_project_roles(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::personal_logins::MemberProjectRole>, MetadataError> {
         match *self {}
     }
     async fn record_access_event(&self, e: &chelabase_metadata::personal_logins::AccessEventInput<'_>) -> Result<(), MetadataError> {
@@ -856,13 +904,22 @@ impl members::MembersPort for Doc {
     async fn suspend_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
         match *self {}
     }
-    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<(), DocWriteError> {
+    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
         match *self {}
     }
     async fn revoke_postgres_access(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
         match *self {}
     }
-    async fn set_tenant_admin(&self, actor: Option<Uuid>, member: Uuid, admin: bool) -> Result<(), DocWriteError> {
+    async fn member_observed(&self, member: Uuid) -> Result<Vec<chelabase_metadata::members::Observed>, MetadataError> {
+        match *self {}
+    }
+    async fn set_tenant_admin(
+        &self,
+        actor: Option<Uuid>,
+        member: Uuid,
+        admin: bool,
+        expect: Option<&[chelabase_metadata::members::Observed]>,
+    ) -> Result<(), DocWriteError> {
         match *self {}
     }
     async fn remove_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, DocWriteError> {
@@ -871,10 +928,23 @@ impl members::MembersPort for Doc {
     async fn put_project_grant(&self, actor: Uuid, member: Uuid, project: Uuid, grant: &GrantRow, expect: &chelabase_metadata::members::Observed) -> Result<bool, DocWriteError> {
         match *self {}
     }
-    async fn put_project_grants(&self, actor: Uuid, member: Uuid, grants: &[(Uuid, GrantRow)], expect: &[chelabase_metadata::members::Observed]) -> Result<Vec<Uuid>, DocWriteError> {
+    async fn put_project_grants(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        grants: &[(Uuid, GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
+        expect: &[chelabase_metadata::members::Observed],
+    ) -> Result<Vec<Uuid>, DocWriteError> {
         match *self {}
     }
-    async fn delete_project_grant(&self, actor: Uuid, member: Uuid, project: Uuid) -> Result<(), DocWriteError> {
+    async fn delete_project_grant(
+        &self,
+        actor: Uuid,
+        member: Uuid,
+        project: Uuid,
+        expect: &chelabase_metadata::members::Observed,
+    ) -> Result<(), DocWriteError> {
         match *self {}
     }
     async fn put_override(
@@ -906,6 +976,7 @@ impl members::MembersPort for Doc {
         email: &str,
         name: &str,
         grants: &[(Uuid, chelabase_metadata::members::GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
     ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
         match *self {}
     }
@@ -932,6 +1003,7 @@ impl members::MembersPort for Doc {
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[chelabase_metadata::members::TeamSeen],
     ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
         match *self {}
     }
@@ -1077,6 +1149,9 @@ mod tests {
             ),
             ("DELETE /v1/projects/{id}/users/{user_id}", "deleteAppUser"),
             ("DELETE /v1/projects/{id}/users/{user_id}/sessions", "revokeAppUserSessions"),
+            ("DELETE /v1/teams/{team_id}", "deleteTeam"),
+            ("DELETE /v1/teams/{team_id}/grants/{project_id}", "deleteTeamGrant"),
+            ("DELETE /v1/teams/{team_id}/members/{member_id}", "deleteTeamMember"),
             ("GET /v1/access-events", "listAccessEvents"),
             ("GET /v1/databases/{id}", "getDatabase"),
             ("GET /v1/databases/{id}/branches", "listBranches"),
@@ -1140,14 +1215,18 @@ mod tests {
             ("GET /v1/me", "getMe"),
             ("GET /v1/members", "listMembers"),
             ("GET /v1/members/{member_id}/personal-logins", "listMemberPersonalLogins"),
+            ("GET /v1/members/{member_id}/teams", "listMemberTeams"),
             ("GET /v1/projects", "listProjects"),
             ("GET /v1/projects/{id}", "getProject"),
             ("GET /v1/projects/{id}/access-events", "listProjectAccessEvents"),
             ("GET /v1/projects/{id}/app-users", "getAppUsers"),
             ("GET /v1/projects/{id}/grants", "listProjectGrants"),
+            ("GET /v1/projects/{id}/team-grants", "listProjectTeamGrants"),
             ("GET /v1/projects/{id}/users", "listAppUsers"),
             ("GET /v1/projects/{id}/users/{user_id}", "getAppUser"),
             ("GET /v1/projects/{id}/users/{user_id}/sessions", "listAppUserSessions"),
+            ("GET /v1/teams", "listTeams"),
+            ("GET /v1/teams/{team_id}", "getTeam"),
             ("PATCH /v1/databases/{id}", "updateDatabase"),
             (
                 "PATCH /v1/databases/{id}/branches/{branch_id}",
@@ -1171,6 +1250,7 @@ mod tests {
             ("PATCH /v1/members/{member_id}", "updateMember"),
             ("PATCH /v1/projects/{id}", "updateProject"),
             ("PATCH /v1/projects/{id}/users/{user_id}", "updateAppUser"),
+            ("PATCH /v1/teams/{team_id}", "updateTeam"),
             ("PATCH /v1/tenant", "updateTenant"),
             ("POST /v1/databases", "createDatabase"),
             ("POST /v1/databases/{id}/branches", "createBranch"),
@@ -1258,6 +1338,7 @@ mod tests {
             ("POST /v1/projects/{id}/users", "createAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/deactivate", "deactivateAppUser"),
             ("POST /v1/projects/{id}/users/{user_id}/reactivate", "reactivateAppUser"),
+            ("POST /v1/teams", "createTeam"),
             (
                 "PUT /v1/databases/{id}/branches/{branch_id}/guard-exemptions/{role}",
                 "putGuardExemption",
@@ -1269,6 +1350,8 @@ mod tests {
                 "PUT /v1/projects/{id}/grants/{member_id}/overrides",
                 "putGrantOverride",
             ),
+            ("PUT /v1/teams/{team_id}/grants/{project_id}", "putTeamGrant"),
+            ("PUT /v1/teams/{team_id}/members/{member_id}", "putTeamMember"),
         ];
         let expected: Vec<(String, String)> = expected
             .iter()
@@ -1297,7 +1380,7 @@ mod tests {
             doc["components"]["securitySchemes"]["bearer"]["scheme"],
             "bearer"
         );
-        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables"];
+        let tags = ["databases", "branches", "keys", "data-api", "roles", "me", "projects", "app-users", "sql-editor", "merges", "members", "tables", "teams"];
         for (method, path, op) in operations(&doc) {
             let at = format!("{method} {path}");
             assert_eq!(
@@ -1478,6 +1561,7 @@ mod tests {
             "CreateRoleRequest",
             "CreateSavedQueryRequest",
             "CreateTable",
+            "CreateTeamRequest",
             "CreatedDataKey",
             "DataApiExposure",
             "DataApiSchema",
@@ -1581,6 +1665,7 @@ mod tests {
             "ProjectId",
             "ProjectInfo",
             "ProjectStatusView",
+            "ProjectTeamGrantView",
             "PutAppUsersRequest",
             "PutGrantOverrideRequest",
             "PutGrantRequest",
@@ -1633,6 +1718,9 @@ mod tests {
             "TableKind",
             "TablePrivilege",
             "TableRef",
+            "Team",
+            "TeamGrantRequest",
+            "TeamProjectAccess",
             "Tenant",
             "TenantId",
             "TenantName",
@@ -1651,6 +1739,7 @@ mod tests {
             "UpdateProjectRequest",
             "UpdateRoleRequest",
             "UpdateSavedQueryRequest",
+            "UpdateTeamRequest",
             "UpdateTenantRequest",
             "UserStepBody",
         ];

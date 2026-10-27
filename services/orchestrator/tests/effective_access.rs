@@ -119,3 +119,45 @@ async fn a_named_data_api_role_keeps_its_own_level_under_a_team_admin() {
     let err = error_of(w.app.send_as("ann", "org-1", Method::POST, &sql, Some(run("authenticated"))).await, 403).await;
     assert_eq!(err["error"]["required"], "role:authenticated");
 }
+
+async fn me_of(w: &MemberWorld, sub: &'static str) -> Value {
+    w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap()
+}
+
+// D1 on `/v1/me`: each held role at its own level, so Studio can gate writes per acted-as role.
+#[tokio::test]
+async fn me_carries_each_roles_level() {
+    let w = member_world(Mode::SelfHosted).await;
+    roles(&w);
+    // `mix`: own Developer `sales`, team Viewer `billing_admin`.
+    let me = me_of(&w, "mix").await;
+    assert_eq!(me["projects"][0]["role_levels"], json!({ "billing_admin": "viewer", "sales": "developer" }), "{me}");
+    // `lead`: the other way round.
+    let me = me_of(&w, "lead").await;
+    assert_eq!(me["projects"][0]["role_levels"], json!({ "billing_admin": "developer", "sales": "viewer" }), "{me}");
+}
+
+// An override narrows the level on its database (the one the editor uses), not the project's.
+#[tokio::test]
+async fn me_role_levels_apply_the_database_override() {
+    let w = member_world(Mode::SelfHosted).await;
+    let (mix, _) = roles(&w);
+    w.metadata.narrow(mix, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
+    let me = me_of(&w, "mix").await;
+    let project = &me["projects"][0];
+    assert_eq!(project["role_levels"], json!({ "billing_admin": "viewer", "sales": "developer" }), "{me}");
+    assert_eq!(project["databases"][0]["role_levels"], json!({ "billing_admin": "viewer", "sales": "viewer" }), "{me}");
+}
+
+// Admin: every role is Admin, so `roles` stays `"all"` and no role is enumerated; a tenant admin
+// the same. A named data API role keeps its own level.
+#[tokio::test]
+async fn me_role_levels_for_admin_are_not_enumerated() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "root", w.project, PlatformRole::Admin, &[]);
+    let me = me_of(&w, "root").await;
+    assert_eq!(me["projects"][0]["roles"], "all");
+    assert_eq!(me["projects"][0]["role_levels"], json!({}), "{me}");
+    let me = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json::<Value>().await.unwrap();
+    assert!(me["projects"].as_array().unwrap().iter().all(|p| p["role_levels"] == json!({})), "{me}");
+}

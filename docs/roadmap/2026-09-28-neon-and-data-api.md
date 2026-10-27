@@ -35,7 +35,7 @@ Specs are in `docs/superpowers/specs/` and plans in `docs/superpowers/plans/`.
 >   - **`chelabase/neon` `main`:** fast-forwarded to `09b4c7313`: ctutils 0.4.6; 11 zstd advisories, which brought zstd 0.14 / tonic+prost 0.14 / parquet 60; and the flaky safekeeper fanout test fixed (a test-side LSN mismatch, 300/300 runs).
 >   - **Still red, user ruling:** RUSTSEC-2026-0387 (crypto-bigint 0.5 via aws-sigv4's `sigv4a` and jose-jwk's p256 0.13). It waits for upstream releases; the neon advisories job stays red until then.
 >   - **Images and `NEON_REF` not rebuilt (user):** the next fork step picks the fixes up.
-> - **In parallel (user, 2026-10-27): the Studio shell step** (below, KI-1/KI-2 included) on branch `studio-shell` (`.worktrees/studio-shell`), plan `docs/superpowers/plans/2026-10-27-studio-shell.md` being written. It keeps its edits to `apps/studio/src/components/members/*` minimal; whichever branch merges second rebases.
+> - **Studio shell step SHIPPED (2026-10-27): merged into `main` `5b4ab478`** (breadcrumbs, phone drawer, pickers in a second row on phones, KI-1/KI-2). Plan `docs/superpowers/plans/2026-10-27-studio-shell.md` keeps the history; stack, worktree and branch removed. Step 2 (`members-hub-teams`) merges `main` in before its live pass.
 >
 > Say `continue members hub`.
 >

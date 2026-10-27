@@ -18,7 +18,10 @@ export interface AccessEvent {
      * `open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,
      * `member_suspended`, `member_reinstated`, `personal_logins_revoked`,
      * `personal_login_created`, `personal_login_reset`, `personal_login_deleted`,
-     * `role_created`, `role_updated` or `role_deleted`.
+     * `role_created`, `role_updated`, `role_deleted`, `team_created`, `team_updated`,
+     * `team_deleted`, `team_grant_put`, `team_grant_deleted`, `team_member_added` or
+     * `team_member_removed`. A team event's `before`/`after` carries the team, the grants it
+     * concerns and `affected_member_ids` (empty in a project's log).
      */
   action: string;
   /**

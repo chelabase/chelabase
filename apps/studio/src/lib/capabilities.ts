@@ -15,13 +15,24 @@ export interface ProjectCaps {
    */
   roles: "all" | string[];
   tenantAdmin: boolean;
+  /**
+   * The level each named role is held at (D1), from `role_levels`. Under `"all"` it lists only
+   * the roles held below Admin (a named data API role); every other role is at `role`. Empty
+   * when the API gives none: every role is then at `role`.
+   */
+  roleLevels: Record<string, PlatformRole>;
   atLeast: (level: PlatformRole) => boolean;
 }
 
 const RANK: Record<PlatformRole, number> = { viewer: 0, developer: 1, admin: 2 };
 
-function caps(role: PlatformRole | null, roles: "all" | string[], tenantAdmin: boolean): ProjectCaps {
-  return { role, roles, tenantAdmin, atLeast: (level) => role !== null && RANK[role] >= RANK[level] };
+function caps(
+  role: PlatformRole | null,
+  roles: "all" | string[],
+  tenantAdmin: boolean,
+  roleLevels: Record<string, PlatformRole> = {},
+): ProjectCaps {
+  return { role, roles, tenantAdmin, roleLevels, atLeast: (level) => role !== null && RANK[role] >= RANK[level] };
 }
 
 /** Everything allowed: used while `me` is unknown and outside a project (the API decides). */
@@ -40,8 +51,34 @@ export function projectCaps(me: Me | undefined, projectId: string, databaseId?: 
   if (!grant) return caps(null, [], false);
   const narrowed = databaseId ? (grant.databases ?? []).find((d) => d.database_id === databaseId) : undefined;
   // A field the narrowing leaves out is the grant's.
-  if (narrowed) return caps(narrowed.platform_role ?? grant.platform_role, narrowed.roles ?? grant.roles, false);
-  return caps(grant.platform_role, grant.roles, false);
+  if (narrowed) {
+    return caps(narrowed.platform_role ?? grant.platform_role, narrowed.roles ?? grant.roles, false, narrowed.role_levels ?? grant.role_levels ?? {});
+  }
+  return caps(grant.platform_role, grant.roles, false, grant.role_levels ?? {});
+}
+
+/**
+ * The caps while acting as `role` (null: the owner, which keeps the caller's level): the level
+ * is the one the role is held at, a role its chain reaches counting at the granting role's level
+ * (R21), so a Viewer-level role gets the Viewer gates whatever the platform level is.
+ */
+export function actingCaps(c: ProjectCaps, role: string | null, branchRoles: BranchRole[]): ProjectCaps {
+  if (role === null || c.role === null) return c;
+  let level: PlatformRole | undefined;
+  const hold = (l: PlatformRole) => {
+    if (level === undefined || RANK[l] > RANK[level]) level = l;
+  };
+  // An Admin's every role is at the platform level, a named data API role at its own.
+  if (c.roles === "all") level = c.roleLevels[role] ?? c.role;
+  else if (Object.keys(c.roleLevels).length === 0) return c;
+  else {
+    for (const [granted, l] of Object.entries(c.roleLevels)) {
+      if (granted === role || closure(branchRoles, granted).has(role)) hold(l);
+    }
+  }
+  const acted = level ?? "viewer";
+  // Never above the caller's own level on the database.
+  return caps(RANK[acted] < RANK[c.role] ? acted : c.role, c.roles, c.tenantAdmin, c.roleLevels);
 }
 
 /**

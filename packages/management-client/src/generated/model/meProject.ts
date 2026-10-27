@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { MeDatabase } from './meDatabase.ts';
+import type { MeProjectRoleLevels } from './meProjectRoleLevels.ts';
 import type { MeRoles } from './meRoles.ts';
 import type { PlatformRole } from './platformRole.ts';
 import type { ProjectId } from './projectId.ts';
@@ -17,6 +18,12 @@ export interface MeProject {
   databases: MeDatabase[];
   platform_role: PlatformRole;
   project_id: ProjectId;
+  /**
+     * The level each named role is held at (`viewer`, `developer`, `admin`; D1). With `roles`
+     * `"all"` only the roles held below the platform role are listed (a data API role a grant
+     * names); every other role is at `platform_role`.
+     */
+  role_levels?: MeProjectRoleLevels;
   /**
      * The Postgres roles the caller may act as on the project: `"all"` for an admin (a tenant
      * admin, or a project admin, R17), else the names (`owner`, the database's owner, comes

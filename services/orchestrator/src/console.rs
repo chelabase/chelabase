@@ -34,6 +34,7 @@ use chelabase_query::{Lease, Op, QueryCache, QueryFailure, RunAs, RunSettings};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::data_api_schema::DataApiSchema;
+use chelabase_types::table_api::ConsoleCellRequest;
 use chelabase_types::{ApiPath, BranchId};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -416,10 +417,11 @@ macro_rules! or_answer {
     };
 }
 
-/// T2-1 (D1): whether the caller may write as `role` (`None`: the owner): a named role held at
-/// Developer or above, or reached (R21) through the chain of one held there; the owner at the
-/// caller's own level.
-async fn may_write<M, J>(
+/// T2-1 (D1): whether the caller holds `role` (`None`: the owner) at Developer or above: a named
+/// role held there, or reached (R21) through the chain of one held there; the owner at the
+/// caller's own level. The console's write gate, and the full-cell read's path choice (P40):
+/// what the member role can `SET ROLE` to (T2-2).
+pub(crate) async fn at_developer<M, J>(
     state: &AppState<M, J>,
     authorized: &crate::access::Authorized,
     role: Option<&str>,
@@ -494,7 +496,7 @@ where
     // A Viewer only reads: a write (or a batch holding one) is refused before it reaches rest.
     // T2-1 (D1): the role's own level counts, not the member's top level.
     if write_kind(&parsed.op).is_some()
-        && !or_answer!(may_write(state, &authorized, request.role.as_deref(), branch_id).await)
+        && !or_answer!(at_developer(state, &authorized, request.role.as_deref(), branch_id).await)
     {
         return deny_to_api(Deny::Forbidden { required: PlatformRole::Developer.as_str().to_string() })
             .into_response();
@@ -996,7 +998,7 @@ where
 /// rest's answer as it is (status, JSON body, `Retry-After`). `unknown_database` means the
 /// database stopped being served since the route's check: the row is read again to say
 /// which.
-async fn pass_on<M, J>(
+pub(crate) async fn pass_on<M, J>(
     state: &AppState<M, J>,
     branch: BranchId,
     database: &str,
@@ -1049,6 +1051,50 @@ pub struct RestReply {
     pub body: axum::body::Bytes,
 }
 
+impl RestReply {
+    /// rest's response as it is: status, `Retry-After` and body.
+    async fn of(response: reqwest::Response) -> Result<Self, reqwest::Error> {
+        let status =
+            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+        let retry_after = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
+        let body = response.bytes().await?;
+        Ok(Self {
+            status,
+            retry_after,
+            body: axum::body::Bytes::from(body.to_vec()),
+        })
+    }
+}
+
+impl RestInternal {
+    /// `POST {rest}/internal/console/{branch}/cell` with `request` (the full-cell read as a
+    /// role held below Developer, P40): what rest answers, status and body as they are.
+    pub async fn cell(
+        &self,
+        branch: BranchId,
+        request: &ConsoleCellRequest,
+        timeout: Duration,
+    ) -> Result<RestReply, reqwest::Error> {
+        let url = format!(
+            "{}/internal/console/{}/cell",
+            self.url.trim_end_matches('/'),
+            branch.as_uuid()
+        );
+        let response = self
+            .http
+            .post(url)
+            .bearer_auth(&self.token)
+            .timeout(timeout)
+            .json(request)
+            .send()
+            .await?;
+        RestReply::of(response).await
+    }
+}
+
 impl RestInternal {
     /// `POST {rest}/internal/console/{branch}/query` with `{ role, database, tree }`: what
     /// rest answers, status and body as they are. Never an owner password: rest runs the role
@@ -1074,18 +1120,7 @@ impl RestInternal {
             .json(&json!({ "role": role, "database": database, "tree": tree }))
             .send()
             .await?;
-        let status =
-            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
-        let body = response.bytes().await?;
-        Ok(RestReply {
-            status,
-            retry_after,
-            body: axum::body::Bytes::from(body.to_vec()),
-        })
+        RestReply::of(response).await
     }
 }
 
@@ -1112,18 +1147,7 @@ impl RestInternal {
             .timeout(SCHEMA_TIMEOUT)
             .send()
             .await?;
-        let status =
-            StatusCode::from_u16(response.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-        let retry_after = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| HeaderValue::from_bytes(v.as_bytes()).ok());
-        let body = response.bytes().await?;
-        Ok(RestReply {
-            status,
-            retry_after,
-            body: axum::body::Bytes::from(body.to_vec()),
-        })
+        RestReply::of(response).await
     }
 }
 

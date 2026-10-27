@@ -12,8 +12,9 @@ export interface MemberProjectAccess {
   platform_role: PlatformRole;
   project_id: ProjectId;
   /**
-     * Where the role comes from: always `own` (the member's own grant; a tenant admin's
-     * admin is listed the same way).
+     * Where the role comes from: `own` (the member's own grant; a tenant admin's admin is
+     * listed the same way), `team` (only through teams) or `both`. The role is the best
+     * source's.
      */
   via: AccessVia;
 }

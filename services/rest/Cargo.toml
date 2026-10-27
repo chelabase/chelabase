@@ -18,7 +18,9 @@ anyhow = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
 chelabase-query = { workspace = true, features = ["openapi"] }
-chelabase-types = { workspace = true, features = ["openapi"] }
+# The full-cell read's shared code (`cell`, `catalog`, P40).
+chelabase-schema = { workspace = true }
+chelabase-types = { workspace = true, features = ["openapi", "axum"] }
 deadpool-postgres = { workspace = true }
 dotenvy = { workspace = true }
 moka = { workspace = true }

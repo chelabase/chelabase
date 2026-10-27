@@ -19,7 +19,7 @@ done
 [[ "$recipes" == *" workbench "* ]] || fail "there is a workbench recipe"
 just --show workbench | gq -- '-p chelabase -- workbench' || fail "just workbench forwards to the CLI"
 for e2e in neon-e2e branch-e2e storage-leak-e2e app-users-e2e data-e2e console-e2e sql-editor-e2e \
-  merge-e2e role-e2e members-e2e personal-logins-e2e auth-e2e neon-smoke; do
+  merge-e2e role-e2e members-e2e personal-logins-e2e teams-e2e auth-e2e neon-smoke; do
   just --show "$e2e" | gq "workbench run scripts/$e2e.sh" || fail "$e2e runs in the stack's runner"
 done
 just --show bench-data-api | gq 'workbench run --env CHELABASE_BENCH_TEST_BIN=' ||

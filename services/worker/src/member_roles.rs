@@ -1573,17 +1573,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 grants.get(&m.id).and_then(GrantSources::effective)
             };
             let Some(effective) = effective else { continue };
-            // The member role holds every effective role, Viewer-level ones included: it serves
-            // Viewer act-as routes too, and `authorize` checks each role's own level (D1).
-            let grant = Grant { platform_role: effective.platform_role, roles: effective.roles };
+            // Whether the member role exists: any effective role (P18), so the table API read's
+            // CONNECT check keeps working for a Viewer-level-only member.
+            let full = Grant { platform_role: effective.platform_role, roles: effective.roles.clone() };
+            if granted_roles(&full, &catalog).0.is_empty() {
+                continue;
+            }
+            // T2-2: its memberships are only the roles held at Developer level or above.
+            let grant = Grant {
+                platform_role: effective.platform_role,
+                roles: effective.roles_at_least(PlatformRole::Developer),
+            };
             // P7: on a protected branch, everyone but an Admin (tenant admins are) is marked.
             let locked = record.protected && grant.platform_role != PlatformRole::Admin;
             let (roles, skipped) = granted_roles(&grant, &catalog);
             for (role, why) in skipped {
                 debug!(branch_id = %branch, member_id = %m.id, role, ?why, "member roles: a granted role is left out");
-            }
-            if roles.is_empty() {
-                continue;
             }
             let role_name = member_role_name(m.id);
             let current = catalog.member_roles.get(&role_name);

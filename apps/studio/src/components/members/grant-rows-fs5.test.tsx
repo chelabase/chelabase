@@ -69,3 +69,12 @@ describe("invite legend (fix S5)", () => {
     expect(tokens(note)).toEqual(expect.arrayContaining(["font-normal", "text-chalk-dim"]));
   });
 });
+
+describe("empty access hint with teams", () => {
+  it("says_the_teams_access_is_all_they_get_when_a_team_is_chosen", () => {
+    const { rerender } = render(<GrantRows projects={projects} rows={[]} onChange={vi.fn()} />);
+    expect(screen.getByText(/they join with no access/)).toBeInTheDocument();
+    rerender(<GrantRows projects={projects} rows={[]} onChange={vi.fn()} teamsChosen />);
+    expect(screen.getByText(/Without a project, they get only their teams' access/)).toBeInTheDocument();
+  });
+});

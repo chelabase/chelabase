@@ -62,6 +62,23 @@ impl RevokeReason {
     }
 }
 
+/// Where a member's access to a project comes from (the roster's `via`, P13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GrantVia {
+    Own,
+    Team,
+    Both,
+}
+
+/// A member's best level on a project among its sources (P13).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemberProjectRole {
+    pub member: Uuid,
+    pub project: Uuid,
+    pub platform_role: PlatformRole,
+    pub via: GrantVia,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginStatus {
     Active,
@@ -861,14 +878,16 @@ impl MetadataClient {
         Ok(touched)
     }
 
-    /// Reinstates a suspended member: `active` again, with its grants; its logins stay revoked
-    /// (the member makes new ones). Event `member_reinstated`. Already active: `Ok` with no
-    /// write (S7); invited, pending or removed: `Conflict`; missing: `NotFound`.
+    /// Reinstates a suspended member: `active` again, with its grants and teams; its logins stay
+    /// revoked (the member makes new ones). Event `member_reinstated`. Returns the touched
+    /// projects (P16: those of its grants, overrides, member roles, personal logins and teams'
+    /// grants), also on the already-active no-op (S7: no write); invited, pending or removed:
+    /// `Conflict`; missing: `NotFound`.
     pub async fn reinstate_member(
         &self,
         actor: Uuid,
         member: Uuid,
-    ) -> Result<(), AccessWriteError> {
+    ) -> Result<Vec<Uuid>, AccessWriteError> {
         let tenant = member_tenant(&self.pool, member)
             .await?
             .ok_or(AccessWriteError::NotFound)?;
@@ -879,7 +898,11 @@ impl MetadataClient {
             .ok_or(AccessWriteError::NotFound)?;
         match m.status {
             MemberStatus::Suspended => {}
-            MemberStatus::Active => return Ok(()),
+            MemberStatus::Active => {
+                let touched = touched_projects(&mut tx, member).await?;
+                tx.commit().await?;
+                return Ok(touched);
+            }
             MemberStatus::Invited | MemberStatus::Pending | MemberStatus::Removed => {
                 return Err(AccessWriteError::Conflict(
                     "only a suspended member can be reinstated".into(),
@@ -902,8 +925,9 @@ impl MetadataClient {
         .write(&mut tx)
         .await?;
         revoke_unqualified_logins(&mut tx, Some(actor), member).await?;
+        let touched = touched_projects(&mut tx, member).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(touched)
     }
 
     /// "Revoke Postgres access now" (P16 b, S2): every live login of the member revoked
@@ -1028,29 +1052,50 @@ impl MetadataClient {
             .collect())
     }
 
-    /// Every own grant of the tenant's members on projects that aren't deleted: `(member,
-    /// project, platform_role)` by member then project (the roster, MH-35).
+    /// The roster's levels (MH-35, P13): for each (member, project) of the tenant's members on
+    /// projects that aren't deleted, the best level among the member's own grant and its teams'
+    /// grants (as the shared shape counts them, P4, P27), and where it comes from; by member
+    /// then project.
     pub async fn member_project_roles(
         &self,
         tenant: TenantId,
-    ) -> Result<Vec<(Uuid, Uuid, PlatformRole)>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT g.member_id, g.project_id, g.platform_role
-             FROM project_grants g
-             JOIN members m ON m.id = g.member_id
-             JOIN projects p ON p.id = g.project_id
-             WHERE m.tenant_id = $1 AND p.status <> 'deleted' AND m.status <> 'removed'
-             ORDER BY g.member_id, g.project_id",
+    ) -> Result<Vec<MemberProjectRole>, MetadataError> {
+        let rows: Vec<(Uuid, Uuid, String, bool, bool)> = sqlx::query_as(
+            "WITH s AS (
+               SELECT g.member_id, g.project_id, g.platform_role, true AS own
+               FROM project_grants g
+               JOIN members m ON m.id = g.member_id
+               JOIN projects p ON p.id = g.project_id
+               WHERE m.tenant_id = $1 AND p.status <> 'deleted' AND m.status <> 'removed'
+               UNION ALL
+               SELECT tm.member_id, tg.project_id, tg.platform_role, false AS own
+               FROM team_members tm
+               JOIN teams tt ON tt.id = tm.team_id AND tt.tenant_id = $1
+               JOIN members m ON m.id = tm.member_id AND m.tenant_id = tt.tenant_id
+               JOIN team_grants tg ON tg.team_id = tm.team_id
+               JOIN projects p ON p.id = tg.project_id AND p.tenant_id = tt.tenant_id
+               WHERE p.status <> 'deleted' AND m.status <> 'removed')
+             SELECT member_id, project_id,
+                    (ARRAY['viewer','developer','admin'])[max(array_position(
+                        ARRAY['viewer','developer','admin'], platform_role))],
+                    bool_or(own), bool_or(NOT own)
+             FROM s GROUP BY member_id, project_id
+             ORDER BY member_id, project_id",
         )
         .bind(tenant.as_uuid())
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(member, project, role)| {
+            .map(|(member, project, role, own, team)| {
                 let role = PlatformRole::parse(&role).ok_or_else(|| {
                     sqlx::Error::Decode(format!("invalid platform role {role:?}").into())
                 })?;
-                Ok((member, project, role))
+                let via = match (own, team) {
+                    (true, true) => GrantVia::Both,
+                    (false, true) => GrantVia::Team,
+                    _ => GrantVia::Own,
+                };
+                Ok(MemberProjectRole { member, project, platform_role: role, via })
             })
             .collect::<Result<_, sqlx::Error>>()
             .map_err(MetadataError::from)
@@ -1164,7 +1209,11 @@ mod tests {
             .position(|n| n == file)
             .unwrap_or_else(|| panic!("{file} is missing from {names:?}"));
         assert_eq!(names[at - 1], "20261023000002_members_offboarded.sql", "{names:?}");
-        assert_eq!(at, names.len() - 1, "it is the newest migration: {names:?}");
+        // Step 2's teams migration (P1) comes after it; it was the newest only in step 1.
+        assert!(
+            names[at + 1..].iter().any(|n| n == "20261027000001_teams.sql"),
+            "the teams migration runs after it: {names:?}"
+        );
         let sql = std::fs::read_to_string(format!("{dir}/{file}"))
             .unwrap()
             .to_ascii_lowercase();

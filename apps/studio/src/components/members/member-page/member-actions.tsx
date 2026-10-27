@@ -14,12 +14,15 @@ import {
   suspendMember,
   updateMember,
   useListMemberPersonalLogins,
+  useListTeams,
   type Member,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ui/confirm-dialog";
 import { Menu, MenuItem } from "@/components/ui/menu";
 import { errorText } from "@/lib/errors";
+import { refusalOrErrorText } from "@/lib/refusal-extra";
+import { RefusalText } from "@/components/project-access/refusal-text";
 import { memberName } from "@/lib/members";
 import { escapeName } from "../hub";
 import { InviteLinkDialog, type OneTimeLink } from "../invite-link-panel";
@@ -58,6 +61,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
   const [ask, setAsk] = useState<Ask | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const teamList = useListTeams({ query: { enabled: tenantAdmin } });
   const invite = member.status === "invited" ? member.invite : null;
   // Only tenant admins act on invites, so only they ask whether email can be sent.
   const delivery = useGetInviteDelivery({ query: { enabled: tenantAdmin && invite != null } });
@@ -151,7 +155,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
       refresh();
       setAsk(null);
     } catch (err) {
-      setError(err instanceof ApiError && err.code === "last_tenant_admin" && a.kind !== "suspend" ? LAST_ADMIN(name) : errorText(err));
+      setError(err instanceof ApiError && err.code === "last_tenant_admin" && a.kind !== "suspend" ? LAST_ADMIN(name) : refusalOrErrorText(err, { teamName: (id) => (teamList.data ?? []).find((t) => t.id === id)?.name }));
     } finally {
       setBusy(false);
     }
@@ -237,7 +241,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           onOpenChange={(next) => !next && setAsk(null)}
           {...copyFor({ kind: "revoke", member })}
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}
@@ -262,7 +266,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           confirm={`Suspend ${first}`}
           tone="destructive"
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}
@@ -278,7 +282,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           }
           confirm="Reinstate"
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}
@@ -309,7 +313,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           confirm="Revoke access now"
           tone="destructive"
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}
@@ -322,7 +326,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           confirm="Remove tenant admin"
           tone="destructive"
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}
@@ -332,7 +336,7 @@ export function MemberActions({ member, tenantAdmin, self, otherAdmins, onStatus
           onOpenChange={(next) => !next && setAsk(null)}
           {...copyFor({ kind: ask.kind, member })}
           busy={busy}
-          error={error}
+          error={error && <RefusalText text={error} />}
           onConfirm={() => void run(ask)}
         />
       )}

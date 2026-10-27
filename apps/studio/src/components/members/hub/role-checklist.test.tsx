@@ -2,6 +2,10 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { BranchRole } from "@chelabase/management-client";
+vi.mock("@tanstack/react-router", () => ({
+  Link: ({ children, params }: { children: React.ReactNode; params: { teamId: string } }) => <a href={`/app/members/teams/${params.teamId}`}>{children}</a>,
+}));
+
 import { roleChoices, type RoleChoice } from "../role-picker";
 import { escapeName, LevelBadge, RoleChecklist, ViewToggle } from "./index";
 
@@ -15,6 +19,8 @@ function role(name: string, extra: Partial<BranchRole> = {}): BranchRole {
 
 const choice = (value: string, extra: Partial<RoleChoice> = {}): RoleChoice => ({ value, chain: [], ...extra });
 const many = (n: number) => Array.from({ length: n }, (_, i) => choice(`role_${String(i).padStart(2, "0")}`));
+
+const markerOf = (role: string) => screen.getByRole("checkbox", { name: role }).closest("li")!.querySelector<HTMLElement>("[data-team-marker]")!;
 
 describe("RoleChecklist", () => {
   it("role_checklist_filters_above_8_and_shows_also_gives", async () => {
@@ -70,23 +76,37 @@ describe("RoleChecklist", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("shows a locked team role checked and disabled, and never puts it in onChange", async () => {
+  it("annotates a team role and keeps the own box editable (D1)", async () => {
     const onChange = vi.fn();
     const choices = [choice("own_a"), choice("own_b"), choice("support_agent")];
     render(
-      <RoleChecklist choices={choices} checked={["own_a"]} locked={[{ value: "support_agent", via: "Support team" }]} onChange={onChange} />,
+      <RoleChecklist choices={choices} checked={["own_a"]} locked={[{ value: "support_agent", teams: [{ id: "t1", name: "Support" }] }, { value: "own_a", teams: [{ id: "t2", name: "Billing" }, { id: "t3", name: "Ledger auditors" }] }]} onChange={onChange} />,
     );
+    const teamOnly = screen.getByRole("checkbox", { name: "support_agent" });
+    expect(teamOnly).toBeEnabled();
+    expect(teamOnly).not.toBeChecked();
+    expect(markerOf("support_agent")).toHaveTextContent("✓ via the Support team");
+    expect(within(markerOf("support_agent")).getByRole("link", { name: "Support" })).toHaveAttribute("href", "/app/members/teams/t1");
+    const both = screen.getByRole("checkbox", { name: "own_a" });
+    expect(both).toBeChecked();
+    expect(both).toBeEnabled();
+    expect(markerOf("own_a")).toHaveTextContent("also via the Billing and Ledger auditors teams");
+    expect(within(markerOf("own_a")).getAllByRole("link").map((a) => a.getAttribute("href"))).toEqual(["/app/members/teams/t2", "/app/members/teams/t3"]);
+    await userEvent.click(teamOnly);
+    expect(onChange).toHaveBeenLastCalledWith(["own_a", "support_agent"]);
+    await userEvent.click(both);
+    expect(onChange).toHaveBeenLastCalledWith([]);
+  });
+
+  it("lockedRows shows a team-only role checked and disabled, never in onChange", async () => {
+    const onChange = vi.fn();
+    render(<RoleChecklist choices={[choice("support_agent")]} checked={[]} locked={[{ value: "support_agent", teams: [{ id: "t1", name: "Support" }] }]} lockedRows disabled onChange={onChange} />);
     const locked = screen.getByRole("checkbox", { name: "support_agent" });
-    expect(locked).toBeDisabled();
     expect(locked).toBeChecked();
-    expect(screen.getByText(/via Support team/)).toBeInTheDocument();
+    expect(locked).toBeDisabled();
+    expect(markerOf("support_agent")).toHaveTextContent("via the Support team");
     await userEvent.click(locked);
     expect(onChange).not.toHaveBeenCalled();
-    await userEvent.click(screen.getByRole("checkbox", { name: "own_b" }));
-    expect(onChange).toHaveBeenCalledTimes(1);
-    expect(onChange.mock.calls[0][0]).toEqual(["own_a", "own_b"]);
-    await userEvent.click(screen.getByRole("checkbox", { name: "own_a" }));
-    expect(onChange).toHaveBeenLastCalledWith([]);
   });
 
   it("role_checklist_escapes_control_and_bidi_characters", async () => {

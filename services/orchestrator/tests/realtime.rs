@@ -1805,6 +1805,33 @@ async fn realtime_projects_read_every_grant_source() {
     );
 }
 
+// Members hub step 2 (T23, MH-2): a member reached only through a team made with the team API
+// sees the project in realtime's list; once removed from the team, it doesn't.
+#[tokio::test]
+async fn team_only_member_gets_realtime_projects() {
+    let t = rt().await;
+    let tam = t.metadata.add_member(t.tenant, "tam", MemberStatus::Active, false);
+    let team = api_team(&t.app, "Readers", t.project, "viewer", &[], &[tam]).await;
+    let (status, body) = t
+        .post(PROJECTS, Some(REALTIME_TOKEN), json!({ "token": t.token("tam") }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        projects_of(&body),
+        vec![(t.project.as_uuid().to_string(), vec![t.db.as_uuid().to_string()])]
+    );
+    let resp = t
+        .app
+        .send_as(DEFAULT_SUB, "org-1", Method::DELETE, &format!("/v1/teams/{team}/members/{tam}"), None)
+        .await;
+    assert_eq!(resp.status(), 204);
+    let (status, body) = t
+        .post(PROJECTS, Some(REALTIME_TOKEN), json!({ "token": t.token("tam") }))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(projects_of(&body).is_empty(), "{body}");
+}
+
 // D7, T8-1: realtime asks before it issues a Studio ticket. `/internal/realtime/member` (its
 // bearer only; `{sub, org_id}` from the gateway's identity) answers `{allowed: true}` for an
 // active member and `{allowed: false, reason: "forbidden"}` for a suspended or offboarded one,

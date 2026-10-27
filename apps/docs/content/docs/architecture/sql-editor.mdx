@@ -67,6 +67,12 @@ The run's role picker (`role` in the request) does `SET ROLE` first, to preview 
 
 For `anon` and `authenticated` (offered where the data API was set up), the worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks that grant at most every 5 minutes per branch. Other roles of the branch need no grant: roles the owner created are already its own (Postgres's `createrole_self_grant`).
 
+### The hidden member role
+
+A member's run goes through a hidden Postgres login of their own (`cb_m_<member id>`), which holds only the Postgres roles the member holds **at Developer level or above**, from their own grant and their teams' grants. `RUN_SQL` and the schema read are Developer routes, and a role held only at Viewer can't be set from the editor. The worker drops a role from the hidden login when the member's level for it falls below Developer. A member who holds roles only at Viewer keeps the hidden login with no memberships.
+
+The table editor's full-cell read (`POST …/tables/{schema}/{table}/cell`) is a Viewer route. As a role held below Developer, it doesn't use this login: it runs as that role through the data API's connection (rest). That Postgres database must have the data API on, or the read answers 409 `data_api_disabled`, and the worker's role check applies (403 `role_refused`).
+
 ## Saved queries and history
 
 Saved queries are private to their author, per database (unique name ignoring case, up to 500, 1 MiB of SQL each). Updates carry the `version` the client saw: a stale one answers 409 `saved_query_conflict` with the current row. An empty `pg_database` or `role` hint is stored as null. Studio keeps a history of runs (and the open buffer) in the browser.

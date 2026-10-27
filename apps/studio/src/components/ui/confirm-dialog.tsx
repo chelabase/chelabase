@@ -15,7 +15,7 @@ export interface ConfirmDialogProps {
   tone?: "primary" | "destructive";
   busy?: boolean;
   /** Shown above the buttons (role=alert): why the action failed, in the dialog. */
-  error?: string | null;
+  error?: ReactNode;
   onConfirm: () => void;
   finalFocus?: RefObject<HTMLElement | null>;
 }

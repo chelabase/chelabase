@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isUuid, validateMemberPageSearch, validateMembersSearch, validateRolePageSearch } from "./members-search";
+import { isUuid, validateMemberPageSearch, validateMembersSearch, validateRolePageSearch, validateTeamPageSearch } from "./members-search";
 
 const UUID = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
@@ -23,5 +23,12 @@ describe("members search", () => {
     });
     expect(validateRolePageSearch({ pg_database: "app", project: UUID, view: "cards" })).toEqual({ pg_database: "app" });
     expect(validateRolePageSearch({ pg_database: 4 })).toEqual({});
+  });
+
+  it("the teams tab is a tab; the team page carries only the view and the name filter", () => {
+    expect(validateMembersSearch({ tab: "teams" })).toEqual({ tab: "teams" });
+    expect(validateMembersSearch({ tab: "teamz" })).toEqual({});
+    expect(validateTeamPageSearch({ tab: "teams", view: "cards", q: "bill", project: UUID })).toEqual({ view: "cards", q: "bill" });
+    expect(validateTeamPageSearch({ view: "grid", q: "" })).toEqual({});
   });
 });

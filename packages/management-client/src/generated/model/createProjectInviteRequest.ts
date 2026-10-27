@@ -15,4 +15,10 @@ export interface CreateProjectInviteRequest {
   /** As in a project grant. */
   pg_roles?: string[];
   platform_role: PlatformRole;
+  /**
+     * Refused in any form, `[]` and `null` included (422 `invalid_request`): only a tenant
+     * admin's invite (`createInvite`) attaches teams (MH-8).
+     * @nullable
+     */
+  team_ids?: string[] | null;
 }

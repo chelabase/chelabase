@@ -16,6 +16,7 @@ import { InstanceTab } from "./instance-tab";
 import { ACCESS_EVENTS_KEY } from "./keys";
 import { PeopleTab } from "./people-tab";
 import { RolesTab } from "./roles/roles-tab";
+import { TeamsTab } from "./teams";
 import { TenantName } from "./tenant-name";
 
 export { parseMembersTab, type MembersTab };
@@ -50,6 +51,8 @@ export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
     { id: "people" as const, label: "People" },
     // Roles: anyone with a project grant (a tenant admin is Admin on every project).
     ...(tenantAdmin || (me.data?.projects?.length ?? 0) > 0 ? [{ id: "roles" as const, label: "Roles" }] : []),
+    // Teams: everyone reads; tenant admins edit.
+    { id: "teams" as const, label: "Teams" },
     ...(tenantAdmin ? [{ id: "activity" as const, label: "Activity" }] : []),
     // Hidden, not disabled, when the instance can't switch it (platform mode included).
     ...(instanceAdmin && settings.data?.open_signup_switchable ? [{ id: "instance" as const, label: "Instance" }] : []),
@@ -121,6 +124,8 @@ export function MembersPage({ tab, onTabChange, onSignOut }: MembersPageProps) {
             <PeopleTab members={list} selfId={selfId} tenantAdmin={tenantAdmin} projects={projects} onStatus={setStatus} />
           ) : current === "roles" ? (
             <RolesTab />
+          ) : current === "teams" ? (
+            <TeamsTab tenantAdmin={tenantAdmin} projects={projects} onStatus={setStatus} />
           ) : current === "activity" ? (
             <AccessEventList
               queryKey={ACCESS_EVENTS_KEY}

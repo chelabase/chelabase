@@ -1219,3 +1219,38 @@ async fn nothing_leaks_between_runs() {
     );
     s.drop().await;
 }
+
+// Members hub step 2, T2-2 (T4): the member role holds only the roles held at Developer or
+// above (its group here); a role the member holds only at Viewer exists on the database but
+// isn't a membership. An editor script acting as the group can't reach it, neither directly
+// nor after `RESET ROLE` back to the member role, and the refusal is the run's error event.
+// What the member role holds is the worker's (`member_roles_live`); this pins the editor side.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn the_sql_editor_cannot_set_a_viewer_level_role() {
+    let s = Scratch::new().await;
+    let m = MemberRole::new(&s).await;
+    let viewer = format!("t4_viewer_{}", s.target.user);
+    s.admin
+        .batch_execute(&format!("CREATE ROLE {viewer} NOLOGIN"))
+        .await
+        .unwrap();
+    for sql in [
+        format!("SET ROLE {viewer}"),
+        format!("RESET ROLE; SET ROLE {viewer}"),
+        format!("SET ROLE NONE; SET ROLE {viewer}"),
+    ] {
+        let events = m.run(&s, &sql).await;
+        assert_eq!(errors(&events), vec!["42501".to_string()], "{sql}: {events:?}");
+        assert_eq!(outcome(&events), Outcome::Error, "{sql}");
+    }
+    let events = m.run(&s, "RESET ROLE; SELECT current_user").await;
+    assert_eq!(rows_of(&events, 1), vec![vec![Some(m.target.user.clone())]]);
+    s.drop().await;
+    m.drop().await;
+    admin_connect()
+        .await
+        .batch_execute(&format!("DROP ROLE {viewer}"))
+        .await
+        .unwrap();
+}

@@ -22,17 +22,18 @@ use axum::response::{IntoResponse, Response};
 use chelabase_metadata::members::{
     AccessEvent as EventRecord, AccessWriteError, GrantRow, InviteState, MemberListing, MemberRecord,
     MemberStatus, NewInvite, Observed, OpenInvite,
-    OverrideRow, ProjectAccess,
+    OverrideRow, ProjectAccess, TeamSeen,
 };
 use chelabase_metadata::personal_logins::{
-    AccessEventInput, LoginEndpoint, LoginWriteError, PersonalLogin, RevokeReason,
+    AccessEventInput, GrantVia, LoginEndpoint, LoginWriteError, MemberProjectRole, PersonalLogin,
+    RevokeReason,
 };
 use chelabase_metadata::{
     BranchStatus, DatabaseRecord, DatabaseStatus, MetadataClient, MetadataError,
 };
 use chelabase_nats::{MemberRolesReconcileRequest, SUBJECT_MEMBER_ROLES_ENQUEUE};
 use chelabase_routes::orchestrator as ep;
-use chelabase_types::access::{PlatformRole, act_as_reserved};
+use chelabase_types::access::{PgRole, PlatformRole, RoleSet, act_as_reserved};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::role_name::check_any_role_name;
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
@@ -130,12 +131,12 @@ pub trait MembersPort: Send + Sync + 'static {
         limit: u32,
     ) -> impl Future<Output = Result<Vec<EventRecord>, MetadataError>> + Send;
 
-    /// Every own grant of the tenant's members: `(member, project, platform_role)` (the
-    /// roster's `access`).
+    /// The best level of each of the tenant's members on each project among their sources, and
+    /// where it comes from (P13; the roster's `access`).
     fn member_project_roles(
         &self,
         tenant: TenantId,
-    ) -> impl Future<Output = Result<Vec<(Uuid, Uuid, PlatformRole)>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<Vec<MemberProjectRole>, MetadataError>> + Send;
 
     /// Writes one event as given (the role routes').
     fn record_access_event(
@@ -211,12 +212,13 @@ pub trait MembersPort: Send + Sync + 'static {
         member: Uuid,
     ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
 
-    /// Suspended → active. Already active: `Ok`, no write (S7).
+    /// Suspended → active. Already active: `Ok`, no write (S7). Returns the projects the
+    /// member reaches (own and team grants, P16), the no-op's too.
     fn reinstate_member(
         &self,
         actor: Uuid,
         member: Uuid,
-    ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
+    ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
 
     /// P16 (b): logins revoked, member roles marked for rotation; the touched projects.
     fn revoke_postgres_access(
@@ -225,11 +227,22 @@ pub trait MembersPort: Send + Sync + 'static {
         member: Uuid,
     ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
 
+    /// Everything the member holds (own grants, overrides, team grants), one `Observed` per
+    /// non-deleted project they reach, sorted by project: what a demotion is checked against.
+    fn member_observed(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<Observed>, MetadataError>> + Send;
+
+    /// A demotion with `expect` (R17, P6, P25) compares, under the tenant lock then the
+    /// member's, everything the member keeps with what the check read: `Err(Changed)` on any
+    /// difference, nothing written. A promotion or an unchanged flag compares nothing.
     fn set_tenant_admin(
         &self,
         actor: Option<Uuid>,
         member: Uuid,
         admin: bool,
+        expect: Option<&[Observed]>,
     ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
 
     /// Returns the projects whose branches need a member-role reconcile.
@@ -250,21 +263,26 @@ pub trait MembersPort: Send + Sync + 'static {
         expect: &Observed,
     ) -> impl Future<Output = Result<bool, AccessWriteError>> + Send;
 
-    /// Several grants in one transaction (all or none), each after the check of its `expect`;
-    /// returns the projects that changed.
+    /// Several grants in one transaction (all or none), each after the check of its `expect`,
+    /// and the memberships of `teams` (P12; `Changed` when a team isn't what the check read,
+    /// P25); returns the projects whose access changed.
     fn put_project_grants(
         &self,
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
         expect: &[Observed],
     ) -> impl Future<Output = Result<Vec<Uuid>, AccessWriteError>> + Send;
 
+    /// I4, MH-4: `expect` is what the handler checked the member's remaining access against;
+    /// `Err(Changed)` if, under the member's lock, the access differs.
     fn delete_project_grant(
         &self,
         actor: Uuid,
         member: Uuid,
         project: Uuid,
+        expect: &Observed,
     ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
 
     fn put_override(
@@ -292,7 +310,8 @@ pub trait MembersPort: Send + Sync + 'static {
         new: NewInvite<'_>,
     ) -> impl Future<Output = Result<(MemberListing, Uuid), AccessWriteError>> + Send;
 
-    /// A person already in the tenant's org, added active.
+    /// A person already in the tenant's org, added active, in `teams` (P12, P25).
+    #[allow(clippy::too_many_arguments)]
     fn add_existing_user(
         &self,
         actor: Uuid,
@@ -301,6 +320,7 @@ pub trait MembersPort: Send + Sync + 'static {
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
 
     /// Also replaces the invite's token (by its hash).
@@ -334,12 +354,14 @@ pub trait MembersPort: Send + Sync + 'static {
         on: bool,
     ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
 
-    /// Approves a pending member with its first grants: active, one transaction, one event.
+    /// Approves a pending member with its first grants and teams: active, one transaction, one
+    /// event (and one `team_member_added` per team, P12, P25).
     fn approve_member(
         &self,
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
 
     /// Declines a pending member: removed. Returns its Zitadel user, to deactivate.
@@ -423,7 +445,7 @@ impl MembersPort for MetadataClient {
     async fn member_project_roles(
         &self,
         tenant: TenantId,
-    ) -> Result<Vec<(Uuid, Uuid, PlatformRole)>, MetadataError> {
+    ) -> Result<Vec<MemberProjectRole>, MetadataError> {
         MetadataClient::member_project_roles(self, tenant).await
     }
 
@@ -486,7 +508,7 @@ impl MembersPort for MetadataClient {
         MetadataClient::suspend_member(self, actor, member).await
     }
 
-    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<(), AccessWriteError> {
+    async fn reinstate_member(&self, actor: Uuid, member: Uuid) -> Result<Vec<Uuid>, AccessWriteError> {
         MetadataClient::reinstate_member(self, actor, member).await
     }
 
@@ -494,13 +516,18 @@ impl MembersPort for MetadataClient {
         MetadataClient::revoke_postgres_access(self, actor, member).await
     }
 
+    async fn member_observed(&self, member: Uuid) -> Result<Vec<Observed>, MetadataError> {
+        MetadataClient::member_observed(self, member).await
+    }
+
     async fn set_tenant_admin(
         &self,
         actor: Option<Uuid>,
         member: Uuid,
         admin: bool,
+        expect: Option<&[Observed]>,
     ) -> Result<(), AccessWriteError> {
-        MetadataClient::set_tenant_admin(self, actor, member, admin).await
+        MetadataClient::set_tenant_admin_checked(self, actor, member, admin, expect).await
     }
 
     async fn remove_member(
@@ -527,9 +554,10 @@ impl MembersPort for MetadataClient {
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
         expect: &[Observed],
     ) -> Result<Vec<Uuid>, AccessWriteError> {
-        MetadataClient::put_project_grants_checked(self, actor, member, grants, expect).await
+        MetadataClient::put_project_grants_checked(self, actor, member, grants, teams, expect).await
     }
 
     async fn delete_project_grant(
@@ -537,8 +565,9 @@ impl MembersPort for MetadataClient {
         actor: Uuid,
         member: Uuid,
         project: Uuid,
+        expect: &Observed,
     ) -> Result<(), AccessWriteError> {
-        MetadataClient::delete_project_grant(self, actor, member, project).await
+        MetadataClient::delete_project_grant_checked(self, actor, member, project, Some(expect)).await
     }
 
     async fn put_override(
@@ -579,8 +608,9 @@ impl MembersPort for MetadataClient {
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
-        MetadataClient::add_existing_user(self, actor, tenant, zitadel_user_id, email, name, grants)
+        MetadataClient::add_existing_user(self, actor, tenant, zitadel_user_id, email, name, grants, teams)
             .await
     }
 
@@ -616,8 +646,9 @@ impl MembersPort for MetadataClient {
         actor: Uuid,
         member: Uuid,
         grants: &[(Uuid, GrantRow)],
+        teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
-        MetadataClient::approve_member(self, actor, member, grants).await
+        MetadataClient::approve_member(self, actor, member, grants, teams).await
     }
 
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, AccessWriteError> {
@@ -757,49 +788,69 @@ pub(crate) struct MemberAccess {
 pub(crate) struct MemberProjectAccess {
     project_id: ProjectId,
     platform_role: PlatformRole,
-    /// Where the role comes from: always `own` (the member's own grant; a tenant admin's
-    /// admin is listed the same way).
+    /// Where the role comes from: `own` (the member's own grant; a tenant admin's admin is
+    /// listed the same way), `team` (only through teams) or `both`. The role is the best
+    /// source's.
     via: AccessVia,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AccessVia {
     Own,
+    Team,
+    Both,
 }
 
+impl From<GrantVia> for AccessVia {
+    fn from(via: GrantVia) -> Self {
+        match via {
+            GrantVia::Own => Self::Own,
+            GrantVia::Team => Self::Team,
+            GrantVia::Both => Self::Both,
+        }
+    }
+}
+
+/// One member's level on one project with its source (the roster's row, P13).
+type RosterRole = (Uuid, PlatformRole, AccessVia);
+
 /// What the roster shows of one member: `visible` is the projects the caller can see, `all` the
-/// tenant's grants `(member, project, role)` by member.
+/// tenant's levels `(project, role, via)` by member (own and team grants, P13).
 fn member_access(
     member: &MemberRecord,
     visible: &HashSet<Uuid>,
-    all: &HashMap<Uuid, Vec<(Uuid, PlatformRole)>>,
+    all: &HashMap<Uuid, Vec<RosterRole>>,
 ) -> MemberAccess {
-    let own = |project: Uuid, platform_role| MemberProjectAccess {
+    let row = |project: Uuid, platform_role, via| MemberProjectAccess {
         project_id: ProjectId::from(project),
         platform_role,
-        via: AccessVia::Own,
+        via,
     };
     if member.tenant_admin {
         let mut projects: Vec<Uuid> = visible.iter().copied().collect();
         projects.sort();
         return MemberAccess {
             level: AccessLevel::TenantAdmin,
-            projects: projects.into_iter().map(|p| own(p, PlatformRole::Admin)).collect(),
+            projects: projects
+                .into_iter()
+                .map(|p| row(p, PlatformRole::Admin, AccessVia::Own))
+                .collect(),
         };
     }
     let mut grants = all.get(&member.id).cloned().unwrap_or_default();
     let any = !grants.is_empty();
-    grants.retain(|(p, _)| visible.contains(p));
-    grants.sort_by_key(|(p, _)| *p);
-    let level = match grants.iter().map(|(_, r)| *r).max() {
+    // R1: a project the caller can't see is never named, nor counted in the level.
+    grants.retain(|(p, _, _)| visible.contains(p));
+    grants.sort_by_key(|(p, _, _)| *p);
+    let level = match grants.iter().map(|(_, r, _)| *r).max() {
         Some(PlatformRole::Admin) => AccessLevel::Admin,
         Some(PlatformRole::Developer) => AccessLevel::Developer,
         Some(PlatformRole::Viewer) => AccessLevel::Viewer,
         None if any => AccessLevel::Other,
         None => AccessLevel::None,
     };
-    MemberAccess { level, projects: grants.into_iter().map(|(p, r)| own(p, r)).collect() }
+    MemberAccess { level, projects: grants.into_iter().map(|(p, r, via)| row(p, r, via)).collect() }
 }
 
 /// An open invite.
@@ -858,6 +909,10 @@ pub(crate) struct ApproveMemberRequest {
     /// as an invite's grants are.
     #[serde(default)]
     grants: Vec<InviteGrant>,
+    /// Teams of the tenant the member joins (at most 50 after duplicates are dropped); empty is
+    /// none. Checked with the grants on the member's union, as an invite's are.
+    #[serde(default)]
+    team_ids: Vec<Uuid>,
 }
 
 /// How an invite reaches the invitee.
@@ -879,6 +934,11 @@ pub(crate) struct CreateInviteRequest {
     /// One grant per project at most; none is fine (the person starts with no access).
     #[serde(default)]
     grants: Vec<InviteGrant>,
+    /// Teams of the tenant the person joins (at most 50 after duplicates are dropped; each
+    /// must be a team of the tenant, else 422 naming it in `team_id`); empty is none. The
+    /// grants and the teams are checked together on the person's union, per project.
+    #[serde(default)]
+    team_ids: Vec<Uuid>,
     /// How the invitee gets the link. Default `email`.
     #[serde(default)]
     delivery: Delivery,
@@ -895,6 +955,20 @@ pub(crate) struct CreateProjectInviteRequest {
     /// How the invitee gets the link. Default `email`.
     #[serde(default)]
     delivery: Delivery,
+    /// Refused in any form, `[]` and `null` included (422 `invalid_request`): only a tenant
+    /// admin's invite (`createInvite`) attaches teams (MH-8).
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<Vec<Uuid>>)]
+    team_ids: Option<Value>,
+}
+
+/// P31: any value present, `null` included, is `Some` (a missing field is `None` through
+/// `#[serde(default)]`).
+fn present<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
 }
 
 /// The body of `resendInvite`; the whole body may be left out (then `email`).
@@ -1050,7 +1124,10 @@ pub(crate) struct AccessEvent {
     /// `open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,
     /// `member_suspended`, `member_reinstated`, `personal_logins_revoked`,
     /// `personal_login_created`, `personal_login_reset`, `personal_login_deleted`,
-    /// `role_created`, `role_updated` or `role_deleted`.
+    /// `role_created`, `role_updated`, `role_deleted`, `team_created`, `team_updated`,
+    /// `team_deleted`, `team_grant_put`, `team_grant_deleted`, `team_member_added` or
+    /// `team_member_removed`. A team event's `before`/`after` carries the team, the grants it
+    /// concerns and `affected_member_ids` (empty in a project's log).
     action: String,
     #[schema(required = true)]
     target_member_id: Option<Uuid>,
@@ -1103,11 +1180,11 @@ pub(crate) struct UpdateInstanceSettingsRequest {
 
 // --- Helpers -----------------------------------------------------------------------------------
 
-fn unprocessable(message: impl Into<String>) -> ApiError {
+pub(crate) fn unprocessable(message: impl Into<String>) -> ApiError {
     ApiError::invalid_request(422, message)
 }
 
-fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
+pub(crate) fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
     error!("{what}: {err}");
     ApiError::internal()
 }
@@ -1134,17 +1211,17 @@ pub(crate) fn write_failed(what: &str, err: AccessWriteError, not_found: &str) -
 
 /// A checked write is tried twice (I4): when the first finds the member's access changed since
 /// the check read it, the check runs again on the new state, and a second change is a 409.
-const CHECKED_WRITE_TRIES: usize = 2;
+pub(crate) const CHECKED_WRITE_TRIES: usize = 2;
 
 /// The caller's member id (an access check that passed means there is one).
-fn actor(member: Option<&MemberRecord>) -> Result<Uuid, ApiError> {
+pub(crate) fn actor(member: Option<&MemberRecord>) -> Result<Uuid, ApiError> {
     member
         .map(|m| m.id)
         .ok_or_else(|| internal("member route", "allowed a caller with no member row"))
 }
 
 /// A member of the tenant by id, whatever its status; another tenant's is 404 like a missing one.
-async fn tenant_member<M, J>(
+pub(crate) async fn tenant_member<M, J>(
     state: &AppState<M, J>,
     tenant: TenantId,
     id: Uuid,
@@ -1204,22 +1281,22 @@ where
     Ok(granted.into_iter().map(|(project, _)| project).collect())
 }
 
-/// The tenant's grants by member.
+/// The tenant's levels by member: `(project, best level, via)` (P13).
 async fn grants_by_member<M, J>(
     state: &AppState<M, J>,
     tenant: TenantId,
-) -> Result<HashMap<Uuid, Vec<(Uuid, PlatformRole)>>, ApiError>
+) -> Result<HashMap<Uuid, Vec<RosterRole>>, ApiError>
 where
     M: MetadataPort,
 {
-    let mut out: HashMap<Uuid, Vec<(Uuid, PlatformRole)>> = HashMap::new();
-    for (member, project, role) in state
+    let mut out: HashMap<Uuid, Vec<RosterRole>> = HashMap::new();
+    for r in state
         .metadata
         .member_project_roles(tenant)
         .await
         .map_err(|err| internal("member project roles", err))?
     {
-        out.entry(member).or_default().push((project, role));
+        out.entry(r.member).or_default().push((r.project, r.platform_role, r.via.into()));
     }
     Ok(out)
 }
@@ -1238,11 +1315,40 @@ where
     Ok(member_access(m, &visible, &all))
 }
 
-/// T9-I1: the `access` of a member whose every grant a write just made (`rows`: an invite, an
-/// addition, an approval), as the caller sees it (`visible`, read before the write). Nothing is
-/// read after the commit, so no failed read can turn a committed write into a 500.
-fn written_access(m: &MemberRecord, visible: &HashSet<Uuid>, rows: &[(Uuid, GrantRow)]) -> MemberAccess {
-    let all = HashMap::from([(m.id, rows.iter().map(|(p, g)| (*p, g.platform_role)).collect())]);
+/// The levels a write just gave: per project of `rows` and `teams`, the best level among the
+/// own grant and the teams' grants there, and where it comes from (P13), by project.
+fn written_levels(rows: &[(Uuid, GrantRow)], teams: &[TeamSeen]) -> Vec<RosterRole> {
+    invite_projects(rows, teams)
+        .into_iter()
+        .filter_map(|p| {
+            let own = rows.iter().find(|(x, _)| *x == p).map(|(_, g)| g.platform_role);
+            let team = teams
+                .iter()
+                .flat_map(|t| t.grants.iter())
+                .filter(|(x, _)| *x == p)
+                .map(|(_, g)| g.platform_role)
+                .max();
+            match (own, team) {
+                (Some(o), Some(t)) => Some((p, o.max(t), AccessVia::Both)),
+                (Some(o), None) => Some((p, o, AccessVia::Own)),
+                (None, Some(t)) => Some((p, t, AccessVia::Team)),
+                (None, None) => None,
+            }
+        })
+        .collect()
+}
+
+/// T9-I1: the `access` of a member whose every grant and team a write just made (`rows` and
+/// `teams`: an invite, an addition, an approval), as the caller sees it (`visible`, read before
+/// the write). Nothing is read after the commit, so no failed read can turn a committed write
+/// into a 500.
+fn written_access(
+    m: &MemberRecord,
+    visible: &HashSet<Uuid>,
+    rows: &[(Uuid, GrantRow)],
+    teams: &[TeamSeen],
+) -> MemberAccess {
+    let all = HashMap::from([(m.id, written_levels(rows, teams))]);
     member_access(m, visible, &all)
 }
 
@@ -1356,11 +1462,6 @@ where
     }
 }
 
-/// The projects of an invite's grants.
-fn granted_projects(grants: &[(Uuid, GrantRow)]) -> Vec<Uuid> {
-    grants.iter().map(|(p, _)| *p).collect()
-}
-
 /// [`reconcile_projects`] for every project of the tenant (a tenant admin's roles cover them).
 async fn reconcile_tenant<M, J>(state: &AppState<M, J>, tenant: TenantId)
 where
@@ -1398,44 +1499,21 @@ struct DbRoles {
 /// The Postgres side grant validation reads, per database of the project (or of the one
 /// database an override names).
 ///
-/// The invariant it keeps (T7 review): for every member and every Chelabase database, the
-/// effective grant (the project grant narrowed by that database's override) passes
-/// [`RoleContext::check_effective`] for its effective platform role. Every write that changes
-/// a grant or an override checks the state it would leave, and is refused (422, naming the
-/// database) before anything is written when that state breaks it.
-struct RoleContext {
+/// The invariant it keeps (T7 review, MH-4): for every member and every Chelabase database,
+/// the effective access (the member's own grant ∪ their teams' grants, narrowed by that
+/// database's override) passes [`RoleContext::check_effective`]. Every write that changes a
+/// grant, an override, a team's grant or a team's members checks the state it would leave for
+/// every member it reaches, and is refused (422, naming the database) before anything is
+/// written when that state breaks it.
+pub(crate) struct RoleContext {
     dbs: Vec<DbRoles>,
     /// MH-21, S12: personal-login names no grant or override may hold (any status): every
     /// database's of the project for a grant, the one database's for an override.
     personal: BTreeSet<String>,
 }
 
-/// What a grant narrowed by an override leaves: the lower platform role, and the grant's roles
-/// the override keeps. R17: an Admin grant is every role, so it keeps the override's roles,
-/// and none when an override takes it below Admin without naming roles (as
-/// [`chelabase_types::access::GrantSources::effective`] with the own grant as the only source;
-/// MH-4 moves this validation onto the union in step 2); while still Admin, the roles aren't
-/// checked.
-fn effective_on(grant: &GrantRow, o: Option<&OverrideRow>) -> (PlatformRole, Vec<String>) {
-    let role = o
-        .and_then(|o| o.platform_role)
-        .map_or(grant.platform_role, |r| r.min(grant.platform_role));
-    let roles = match o.and_then(|o| o.pg_roles.as_ref()) {
-        Some(keep) if grant.every_role() => keep.clone(),
-        None if grant.every_role() => Vec::new(),
-        Some(keep) => grant
-            .pg_roles
-            .iter()
-            .filter(|r| keep.contains(r))
-            .cloned()
-            .collect(),
-        None => grant.pg_roles.clone(),
-    };
-    (role, roles)
-}
-
 impl RoleContext {
-    async fn of<M, J>(
+    pub(crate) async fn of<M, J>(
         state: &AppState<M, J>,
         databases: &[DatabaseRecord],
     ) -> Result<Self, ApiError>
@@ -1511,7 +1589,7 @@ impl RoleContext {
     }
 
     /// Every live database of the project.
-    async fn project<M, J>(state: &AppState<M, J>, project: ProjectId) -> Result<Self, ApiError>
+    pub(crate) async fn project<M, J>(state: &AppState<M, J>, project: ProjectId) -> Result<Self, ApiError>
     where
         M: MetadataPort,
     {
@@ -1548,7 +1626,7 @@ impl RoleContext {
     /// R7: names no grant or override may hold, at any level: `owner` and the databases'
     /// owners (the admin platform role includes them), `cb_m_*`, `chelabase_*`, `pg_*` and the
     /// platform's own roles, and anything that isn't a Postgres role name.
-    fn check_names(&self, pg_roles: &[String]) -> Result<(), ApiError> {
+    pub(crate) fn check_names(&self, pg_roles: &[String]) -> Result<(), ApiError> {
         for name in pg_roles {
             let refused = |why: &str| {
                 unprocessable(format!("`{name}` can't be granted: {why}"))
@@ -1579,24 +1657,35 @@ impl RoleContext {
         Ok(())
     }
 
-    /// The invariant (R16, R21–R23): on each database (only `only`, when given), the member's
-    /// effective grant, `grant` narrowed by that database's entry in `overrides`, holds below
-    /// Admin only roles whose whole chain on every branch is plain NOLOGIN groups. The first
-    /// break is 422 `invalid_request` naming the role, its chain and the database. A chain
-    /// holding ADMIN is refused here too (R30 as changed by I2: 6a records each membership's
-    /// SET and ADMIN options).
-    fn check_effective(
-        &self,
-        grant: &GrantRow,
-        overrides: &BTreeMap<Uuid, OverrideRow>,
-        only: Option<Uuid>,
-    ) -> Result<(), ApiError> {
+    /// The invariant (R16, R21–R23, MH-4) for the state `after` a write would leave: on each
+    /// database (only `only`, when given), the member's effective access there
+    /// (`after.sources(Some(db)).effective()`: the own grant ∪ the team grants, each role at the
+    /// best level of a source naming it, narrowed by the override) holds below Admin only roles
+    /// whose whole chain on every branch is plain NOLOGIN groups. Nothing is checked without
+    /// access or at Admin. The first break is 422 `invalid_request` naming the role, its chain
+    /// and the database. A chain holding ADMIN is refused here too (R30 as changed by I2: 6a
+    /// records each membership's SET and ADMIN options).
+    pub(crate) fn check_effective(&self, after: &Observed, only: Option<Uuid>) -> Result<(), ApiError> {
         for db in self.dbs.iter().filter(|d| only.is_none_or(|o| o == d.id)) {
-            let (role, held) = effective_on(grant, overrides.get(&db.id));
+            let Some(effective) = after.sources(Some(db.id)).effective() else {
+                continue;
+            };
+            let role = effective.platform_role;
             if role == PlatformRole::Admin {
                 continue;
             }
-            for name in &held {
+            // P29: below Admin the set is `Only`; the owner is never held there.
+            let held: Vec<&str> = match &effective.roles {
+                RoleSet::Only(set) => set
+                    .iter()
+                    .filter_map(|r| match r {
+                        PgRole::Named(name) => Some(name.as_str()),
+                        PgRole::Owner => None,
+                    })
+                    .collect(),
+                RoleSet::All { .. } => Vec::new(),
+            };
+            for name in held {
                 if let Some((branch, (chain, why))) =
                     db.graphs.iter().find_map(|b| b.graph.refusal(name).map(|r| (b, r)))
                 {
@@ -1654,34 +1743,165 @@ struct CheckedGrant {
     context: RoleContext,
 }
 
-/// The invariant for an invite's grants: each is checked with the member's overrides on its
-/// project (none for a new member). Returns what each check read (empty for a new member), to
-/// pass to the write.
-async fn check_invite_grants<M, J>(
+/// The most teams an invite or an approval attaches (P12), once duplicates are dropped.
+const INVITE_TEAMS_MAX: usize = 50;
+
+/// An invite's or approval's `team_ids` (P12): duplicates dropped (the first stays), at most
+/// [`INVITE_TEAMS_MAX`], each a team of the tenant (else 422 naming it in `team_id`). Read
+/// before anything is made, so a refused id leaves no Zitadel user behind.
+async fn invite_team_ids<M, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+    ids: Vec<Uuid>,
+) -> Result<Vec<Uuid>, ApiError>
+where
+    M: MetadataPort,
+{
+    let mut seen = HashSet::new();
+    let ids: Vec<Uuid> = ids.into_iter().filter(|id| seen.insert(*id)).collect();
+    if ids.len() > INVITE_TEAMS_MAX {
+        return Err(unprocessable(format!("at most {INVITE_TEAMS_MAX} teams")));
+    }
+    teams_seen(state, tenant, &ids).await?;
+    Ok(ids)
+}
+
+/// Each team as the check reads it (P25): its grants on non-deleted projects. A team that
+/// isn't (or is no longer) one of the tenant's is 422 naming it.
+async fn teams_seen<M, J>(
+    state: &AppState<M, J>,
+    tenant: TenantId,
+    ids: &[Uuid],
+) -> Result<Vec<TeamSeen>, ApiError>
+where
+    M: MetadataPort,
+{
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        match state.metadata.team(tenant, *id).await {
+            Ok(Some(t)) => out.push(TeamSeen { team: *id, grants: t.grants }),
+            Ok(None) => {
+                return Err(unprocessable("no such team in the tenant").with_extra("team_id", json!(id)));
+            }
+            Err(err) => return Err(internal("invite: load team", err)),
+        }
+    }
+    Ok(out)
+}
+
+/// The projects an invite's grants and teams reach, by id (P25: the reconcile's and the
+/// check's set).
+fn invite_projects(grants: &[(Uuid, GrantRow)], teams: &[TeamSeen]) -> Vec<Uuid> {
+    let mut out: Vec<Uuid> = grants
+        .iter()
+        .map(|(p, _)| *p)
+        .chain(teams.iter().flat_map(|t| t.grants.iter().map(|(p, _)| *p)))
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The invariant for an invite's grants and teams together, on the person's union (P7, P12):
+/// per project of either, the member's access (none for a new person) with the invite's grant
+/// and every team's grant there, checked once as written; a refusal names the project, and the
+/// team whose grant is why when it is a team's ([`refusal_team`]). Returns what each check read (one per project, empty for a new
+/// person), to pass to the write as its `expect`.
+async fn check_invite<M, J>(
     state: &AppState<M, J>,
     member: Option<Uuid>,
     grants: &[CheckedGrant],
+    teams: &[TeamSeen],
 ) -> Result<Vec<Observed>, ApiError>
 where
     M: MetadataPort,
 {
+    let mut contexts: HashMap<Uuid, RoleContext> = HashMap::new();
     let mut observed = Vec::new();
-    for g in grants {
-        let overrides = match member {
+    for project in invite_projects(&grant_rows(grants), teams) {
+        let on_project = |err: ApiError| err.with_extra("project_id", json!(project));
+        let now = match member {
             Some(member) => {
-                let o = observe(state, g.project, member).await?;
-                let overrides = o.overrides.clone();
-                observed.push(o);
-                overrides
+                let o = observe(state, project, member).await?;
+                observed.push(o.clone());
+                o
             }
-            None => BTreeMap::new(),
+            None => Observed { project, ..Observed::default() },
         };
-        // The grant's project, so a form with several grants can show the refusal on the right one.
-        g.context
-            .check_effective(&g.grant, &overrides, None)
-            .map_err(|err| err.with_extra("project_id", json!(g.project)))?;
+        let granted = grants.iter().find(|g| g.project == project);
+        let context = match granted {
+            Some(g) => &g.context,
+            None => {
+                match contexts.entry(project) {
+                    std::collections::hash_map::Entry::Occupied(e) => &*e.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        &*e.insert(RoleContext::project(state, ProjectId::from(project)).await?)
+                    }
+                }
+            }
+        };
+        // Defect 3: only the union written is checked (a team's Admin may make an own grant's
+        // role fine, R17), never the steps towards it.
+        let mut base = now;
+        if let Some(g) = granted {
+            base = base.with_own(Some(g.grant.clone()));
+        }
+        let joined: Vec<(Uuid, &GrantRow)> = teams
+            .iter()
+            .filter_map(|t| t.grants.iter().find(|(p, _)| *p == project).map(|(_, g)| (t.team, g)))
+            .collect();
+        let after = joined
+            .iter()
+            .fold(base.clone(), |after, (team, g)| after.with_team(*team, Some((*g).clone())));
+        if let Err(err) = context.check_effective(&after, None) {
+            // The grant's project, so a form with several grants can show the refusal on the
+            // right one; and the team whose grant is why, when it is a team's.
+            return Err(match refusal_team(context, &base, &joined, &err) {
+                Some(team) => on_project(err).with_extra("team_id", json!(team)),
+                None => on_project(err),
+            });
+        }
     }
     Ok(observed)
+}
+
+/// The team an invite's refused union is attributed to. None when the state without the
+/// invite's teams (`base`: the member's access with the invite's own grant) is refused already:
+/// the own grant is why. Otherwise a team is: the first whose grant alone with `base` is
+/// refused, else (only their union breaks it) the first naming the refused role, else the first.
+fn refusal_team(context: &RoleContext, base: &Observed, joined: &[(Uuid, &GrantRow)], err: &ApiError) -> Option<Uuid> {
+    if context.check_effective(base, None).is_err() {
+        return None;
+    }
+    let alone = joined
+        .iter()
+        .find(|(team, g)| context.check_effective(&base.with_team(*team, Some((*g).clone())), None).is_err());
+    let role = err.extra.iter().find(|(k, _)| k == "role").and_then(|(_, v)| v.as_str());
+    let naming = || joined.iter().find(|(_, g)| role.is_some_and(|r| g.pg_roles.iter().any(|n| n == r)));
+    alone.or_else(naming).or(joined.first()).map(|(team, _)| *team)
+}
+
+/// A demotion's check (R17): everything the member keeps (`kept`, one per project they reach)
+/// is checked on every database of its project, as the union it is once they are no longer
+/// Admin everywhere. A refusal names the project, and the team whose grant is why when it is a
+/// team's ([`refusal_team`]).
+async fn check_demotion<M, J>(state: &AppState<M, J>, kept: &[Observed]) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+{
+    for now in kept {
+        let context = RoleContext::project(state, ProjectId::from(now.project)).await?;
+        if let Err(err) = context.check_effective(now, None) {
+            let own = Observed { teams: BTreeMap::new(), ..now.clone() };
+            let teams: Vec<(Uuid, &GrantRow)> = now.teams.iter().map(|(t, g)| (*t, g)).collect();
+            let err = match refusal_team(&context, &own, &teams, &err) {
+                Some(team) => err.with_extra("team_id", json!(team)),
+                None => err,
+            };
+            return Err(err.with_extra("project_id", json!(now.project)));
+        }
+    }
+    Ok(())
 }
 
 fn grant_rows(grants: &[CheckedGrant]) -> Vec<(Uuid, GrantRow)> {
@@ -1873,6 +2093,7 @@ async fn invite<M, J>(
     principal: &AuthPrincipal,
     email: String,
     grants: Vec<CheckedGrant>,
+    teams: Vec<Uuid>,
     delivery: Delivery,
 ) -> Result<(StatusCode, InviteResult), ApiError>
 where
@@ -1901,13 +2122,11 @@ where
             match state.metadata.member_by_zitadel(tenant, &user.id).await {
                 Ok(Some(m)) if m.status != MemberStatus::Removed => m,
                 Ok(row) => {
-                    check_invite_grants(state, None, &grants).await?;
-                    let rows = grant_rows(&grants);
                     let usable = user.state == UserState::Active && user.has_password;
                     return if usable && row.is_none() {
-                        add_user(state, principal, actor, user, &email, rows).await
+                        add_user(state, principal, actor, user, &email, &grants, &teams).await
                     } else {
-                        invite_with_code(state, principal, actor, &email, rows, Some(user), delivery).await
+                        invite_with_code(state, principal, actor, &email, &grants, &teams, Some(user), delivery).await
                     };
                 }
                 Err(err) => return Err(internal("invite: member by user", err)),
@@ -1917,9 +2136,7 @@ where
             match state.metadata.member_by_email(tenant, &email).await {
                 Ok(Some(m)) => m,
                 Ok(None) => {
-                    check_invite_grants(state, None, &grants).await?;
-                    let rows = grant_rows(&grants);
-                    return invite_with_code(state, principal, actor, &email, rows, None, delivery).await;
+                    return invite_with_code(state, principal, actor, &email, &grants, &teams, None, delivery).await;
                 }
                 Err(err) => return Err(internal("invite: member by email", err)),
             }
@@ -1944,15 +2161,17 @@ where
         .await
         .map_err(|err| internal("member listing", err))?
         .ok_or_else(|| ApiError::not_found("member not found"))?;
-    // 1. A member already: every grant checked with its overrides, then all put in one
-    // transaction.
+    // 1. A member already: the grants and the teams checked on their union, then all put in
+    // one transaction (P25: a team that changed since is `Changed`, checked again).
     let mut tries = 0;
+    let mut seen;
     let changed = loop {
         tries += 1;
-        let observed = check_invite_grants(state, Some(existing.id), &grants).await?;
+        seen = teams_seen(state, principal.tenant_id, &teams).await?;
+        let observed = check_invite(state, Some(existing.id), &grants, &seen).await?;
         match state
             .metadata
-            .put_project_grants(actor, existing.id, &grant_rows(&grants), &observed)
+            .put_project_grants(actor, existing.id, &grant_rows(&grants), &seen, &observed)
             .await
         {
             // I4: their access moved between the check and the write: check again.
@@ -1971,10 +2190,9 @@ where
         Err(err) => {
             warn!(member_id = %existing.id, "invite: the member isn't readable after its grants were put; answered from the reads before: {err:?}");
             let held = all.entry(existing.id).or_default();
-            for (project, row) in grant_rows(&grants) {
-                held.retain(|(p, _)| *p != project);
-                held.push((project, row.platform_role));
-            }
+            let written = written_levels(&grant_rows(&grants), &seen);
+            held.retain(|(p, _, _)| !written.iter().any(|(w, _, _)| w == p));
+            held.extend(written);
             let access = member_access(&listing_before.member, &visible, &all);
             Member::new(MemberListing { has_access: true, ..listing_before }, None, access)
         }
@@ -1996,7 +2214,8 @@ async fn add_user<M, J>(
     actor: Uuid,
     user: chelabase_zitadel::client::ZUser,
     email: &str,
-    grants: Vec<(Uuid, GrantRow)>,
+    checked: &[CheckedGrant],
+    teams: &[Uuid],
 ) -> Result<(StatusCode, InviteResult), ApiError>
 where
     M: MetadataPort,
@@ -2005,23 +2224,32 @@ where
     let email = Some(user.email.as_str())
         .filter(|e| !e.trim().is_empty())
         .unwrap_or(email);
+    let grants = grant_rows(checked);
     // T9-I1: what the caller sees is read before the write.
     let visible = visible_projects(state, principal).await?;
-    let listing = state
-        .metadata
-        .add_existing_user(
-            actor,
-            principal.tenant_id,
-            &user.id,
-            email,
-            &user.display_name,
-            &grants,
-        )
-        .await
-        .map_err(|err| write_failed("invite: add user", err, "project not found"))?;
+    // P25: a team changed between the check and the write is checked again.
+    let mut tries = 0;
+    let (listing, seen) = loop {
+        tries += 1;
+        let seen = teams_seen(state, principal.tenant_id, teams).await?;
+        check_invite(state, None, checked, &seen).await?;
+        match state
+            .metadata
+            .add_existing_user(actor, principal.tenant_id, &user.id, email, &user.display_name, &grants, &seen)
+            .await
+        {
+            Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
+            other => {
+                break (
+                    other.map_err(|err| write_failed("invite: add user", err, "project not found"))?,
+                    seen,
+                );
+            }
+        }
+    };
     info!(request_id = %principal.request_id, member_id = %listing.id, "invite: a user of the organisation was added");
-    reconcile_projects(state, granted_projects(&grants)).await;
-    let access = written_access(&listing.member, &visible, &grants);
+    reconcile_projects(state, invite_projects(&grants, &seen)).await;
+    let access = written_access(&listing.member, &visible, &grants, &seen);
     Ok((
         StatusCode::CREATED,
         InviteResult {
@@ -2037,12 +2265,14 @@ where
 /// may not be added straight away: reactivated first when deactivated) or a new passwordless
 /// user. Each step undoes the earlier ones when it fails, so a failed invite leaves no new
 /// user, member or mail behind.
+#[allow(clippy::too_many_arguments)]
 async fn invite_with_code<M, J>(
     state: &AppState<M, J>,
     principal: &AuthPrincipal,
     actor: Uuid,
     email: &str,
-    grants: Vec<(Uuid, GrantRow)>,
+    checked: &[CheckedGrant],
+    teams: &[Uuid],
     existing: Option<chelabase_zitadel::client::ZUser>,
     delivery: Delivery,
 ) -> Result<(StatusCode, InviteResult), ApiError>
@@ -2050,6 +2280,11 @@ where
     M: MetadataPort,
     J: JobPort,
 {
+    let grants = grant_rows(checked);
+    // P7, P12: the grants and teams are checked on the new member's union before any user is
+    // made; P25: a team that changes before the write is read and checked again there.
+    let mut seen = teams_seen(state, principal.tenant_id, teams).await?;
+    check_invite(state, None, checked, &seen).await?;
     let z = admin_zitadel(state)?;
     // T9-I1: what the caller sees is read before anything is made (a failed read here leaves
     // nothing behind).
@@ -2113,25 +2348,44 @@ where
     };
     let expires_at = invite_expiry();
     let token = InviteToken::mint();
-    let (listing, invite) = match state
-        .metadata
-        .create_invited_member(
-            actor,
-            principal.tenant_id,
-            NewInvite {
-                zitadel_user_id: &user,
-                email,
-                expires_at,
-                token_hash: token.hash,
-                grants: &grants,
-            },
-        )
-        .await
-    {
-        Ok(created) => created,
-        Err(err) => {
-            undo("a refused member").await;
-            return Err(write_failed("invite: store", err, "project not found"));
+    let mut tries = 0;
+    let (listing, invite) = loop {
+        tries += 1;
+        let stored = state
+            .metadata
+            .create_invited_member(
+                actor,
+                principal.tenant_id,
+                NewInvite {
+                    zitadel_user_id: &user,
+                    email,
+                    expires_at,
+                    token_hash: token.hash,
+                    grants: &grants,
+                    teams: &seen,
+                },
+            )
+            .await;
+        match stored {
+            Ok(created) => break created,
+            Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => {
+                let again = match teams_seen(state, principal.tenant_id, teams).await {
+                    Ok(again) => again,
+                    Err(err) => {
+                        undo("a team gone").await;
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = check_invite(state, None, checked, &again).await {
+                    undo("a refused team").await;
+                    return Err(err);
+                }
+                seen = again;
+            }
+            Err(err) => {
+                undo("a refused member").await;
+                return Err(write_failed("invite: store", err, "project not found"));
+            }
         }
     };
     let sent = match delivery {
@@ -2152,9 +2406,11 @@ where
         }
     };
     info!(request_id = %principal.request_id, member_id = %listing.id, %invite, ?delivery, "invite: created");
+    // P25: the reconcile covers the grants' and the teams' projects.
+    reconcile_projects(state, invite_projects(&grants, &seen)).await;
     // Built from what the write returned and the grants it made: nothing is read after the
     // mail (T9-I1: a link invite's URL is never lost to a failed read).
-    let access = written_access(&listing.member, &visible, &grants);
+    let access = written_access(&listing.member, &visible, &grants, &seen);
     let member = Member::new(
         listing,
         Some(Invite {
@@ -2378,6 +2634,8 @@ impl ProjectScope {
             id(o, Some("database_id")).is_some_and(|d| self.databases.contains(&d))
         });
         keep(fields, "rotated_branches", &|b| id(b, None).is_some_and(|b| self.branches.contains(&b)));
+        // P9: a project Admin sees a team event, not who else the team reaches.
+        keep(fields, "affected_member_ids", &|_| false);
         let logins = match fields.get_mut("logins") {
             Some(Value::Array(items)) => {
                 items.retain(|l| id(l, Some("database_id")).is_some_and(|d| self.databases.contains(&d)));
@@ -2473,7 +2731,7 @@ where
     operation_id = "updateMember",
     tag = "members",
     summary = "Make a member a tenant admin, or not",
-    description = "A tenant admin manages people and projects and is admin on every project. Every branch of the tenant reconciles its member roles.",
+    description = "A tenant admin manages people and projects and is admin on every project. Demoting one checks what they keep (their own grants, overrides and teams' grants) as any grant is checked. Every branch of the tenant reconciles its member roles.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     request_body = UpdateMemberRequest,
     responses(
@@ -2482,10 +2740,10 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such member (another tenant's, or a removed one, answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`last_tenant_admin`: the tenant would have no active tenant admin; `conflict`: only an active member may become a tenant admin", body = ErrorEnvelope),
+        (status = 409, description = "`last_tenant_admin`: the tenant would have no active tenant admin; `conflict`: only an active member may become a tenant admin, or the member's access changed twice while a demotion was being checked", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
-        (status = 422, description = "`invalid_request`: `tenant_admin` is missing or isn't a boolean", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: `tenant_admin` is missing or isn't a boolean; or a demotion would leave the member, below Admin, a role they can't hold (`role` names it, with `project_id`, `database_id`, `chain`, `branch_id`, `branch` and `branch_main`, and `team_id` when a team's grant is why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -2513,13 +2771,35 @@ where
     // R9 (an invited member isn't a person in the tenant yet) is checked under the member's
     // lock by `set_tenant_admin`: `conflict`.
     let changed = m.tenant_admin != body.tenant_admin;
-    tri!(
-        state
-            .metadata
-            .set_tenant_admin(Some(actor), id, body.tenant_admin)
-            .await
-            .map_err(|err| write_failed("set tenant admin", err, "member not found"))
-    );
+    if changed && !body.tenant_admin {
+        // R17: no longer Admin everywhere, the member keeps only what their own grants,
+        // overrides and teams give, which must pass the union check; the write compares it
+        // under the tenant lock (P6, P25), and a change since is checked again, then 409.
+        let mut tries = 0;
+        loop {
+            tries += 1;
+            let kept = tri!(
+                state
+                    .metadata
+                    .member_observed(id)
+                    .await
+                    .map_err(|err| internal("demote: load access", err))
+            );
+            tri!(check_demotion(&state, &kept).await);
+            match state.metadata.set_tenant_admin(Some(actor), id, false, Some(&kept)).await {
+                Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
+                other => break tri!(other.map_err(|err| write_failed("set tenant admin", err, "member not found"))),
+            }
+        }
+    } else {
+        tri!(
+            state
+                .metadata
+                .set_tenant_admin(Some(actor), id, body.tenant_admin, None)
+                .await
+                .map_err(|err| write_failed("set tenant admin", err, "member not found"))
+        );
+    }
     if changed {
         info!(request_id = %principal.request_id, member_id = %id, tenant_admin = body.tenant_admin, "member: tenant admin changed");
         access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], Vec::new()).await;
@@ -2645,21 +2925,30 @@ where
         return ApiError::not_found("member not found").into_response();
     }
     let grants = tri!(invite_grants(&state, principal.tenant_id, body.grants).await);
-    // Checked with the member's existing overrides, as any grant on a member is.
-    tri!(check_invite_grants(&state, Some(id), &grants).await);
+    let teams = tri!(invite_team_ids(&state, principal.tenant_id, body.team_ids).await);
     let rows = grant_rows(&grants);
     // T9-I1: what the caller sees is read before the write.
     let visible = tri!(visible_projects(&state, &principal).await);
-    let listing = tri!(
-        state
-            .metadata
-            .approve_member(actor, id, &rows)
-            .await
-            .map_err(|err| write_failed("approve member", err, "project not found"))
-    );
-    info!(request_id = %principal.request_id, member_id = %id, grants = rows.len(), "member: approved");
-    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], granted_projects(&rows)).await;
-    let access = written_access(&listing.member, &visible, &rows);
+    // Checked with the member's existing overrides, as any grant on a member is, together with
+    // the teams on the member's union (P12); P25: a team changed since is checked again.
+    let mut tries = 0;
+    let (listing, seen) = loop {
+        tries += 1;
+        let seen = tri!(teams_seen(&state, principal.tenant_id, &teams).await);
+        tri!(check_invite(&state, Some(id), &grants, &seen).await);
+        match state.metadata.approve_member(actor, id, &rows, &seen).await {
+            Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
+            other => {
+                break (
+                    tri!(other.map_err(|err| write_failed("approve member", err, "project not found"))),
+                    seen,
+                );
+            }
+        }
+    };
+    info!(request_id = %principal.request_id, member_id = %id, grants = rows.len(), teams = seen.len(), "member: approved");
+    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], invite_projects(&rows, &seen)).await;
+    let access = written_access(&listing.member, &visible, &rows, &seen);
     Json(Member::new(listing, None, access)).into_response()
 }
 
@@ -2845,7 +3134,8 @@ where
     tri!(authorize(&state, &principal, ep::REINSTATE_MEMBER.policy.access, Target::None).await);
     let actor = tri!(actor(principal.member.as_ref()));
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
-    tri!(
+    // P16: the projects the member reaches, own and team grants.
+    let projects = tri!(
         state
             .metadata
             .reinstate_member(actor, id)
@@ -2854,13 +3144,6 @@ where
     );
     if m.status == MemberStatus::Suspended {
         info!(request_id = %principal.request_id, member_id = %id, "member: reinstated");
-        let projects = match state.metadata.member_projects(id).await {
-            Ok(grants) => grants.into_iter().map(|(project, _)| project).collect(),
-            Err(err) => {
-                warn!(member_id = %id, "member roles: the reinstated member's projects aren't readable; the sweep will reconcile them: {err}");
-                Vec::new()
-            }
-        };
         access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], projects).await;
         if m.tenant_admin {
             reconcile_tenant(&state, principal.tenant_id).await;
@@ -3017,7 +3300,8 @@ where
     );
     let email = tri!(invite_email(&body.email));
     let grants = tri!(invite_grants(&state, principal.tenant_id, body.grants).await);
-    let (status, result) = tri!(invite(&state, &principal, email, grants, body.delivery).await);
+    let teams = tri!(invite_team_ids(&state, principal.tenant_id, body.team_ids).await);
+    let (status, result) = tri!(invite(&state, &principal, email, grants, teams, body.delivery).await);
     // S28: an invite's writer names no member: the whole tenant re-checks.
     access_changed(&state, principal.tenant_id, None);
     no_store((status, Json(result)).into_response())
@@ -3066,6 +3350,10 @@ where
         )
         .await
     );
+    // MH-8, P31: before anything else is read or made.
+    if body.team_ids.is_some() {
+        return unprocessable("teams can be attached only by a tenant admin's invite").into_response();
+    }
     let email = tri!(invite_email(&body.email));
     let grant = InviteGrant {
         project_id: project.id,
@@ -3073,7 +3361,7 @@ where
         pg_roles: body.pg_roles,
     };
     let grants = tri!(invite_grants(&state, principal.tenant_id, vec![grant]).await);
-    let (status, result) = tri!(invite(&state, &principal, email, grants, body.delivery).await);
+    let (status, result) = tri!(invite(&state, &principal, email, grants, Vec::new(), body.delivery).await);
     // S28: an invite's writer names no member: the whole tenant re-checks.
     access_changed(&state, principal.tenant_id, None);
     no_store((status, Json(result)).into_response())
@@ -3350,13 +3638,13 @@ where
     // on the project, whatever (valid) roles the request names.
     tri!(context.check_names(&body.pg_roles));
     let grant = GrantRow::new(body.platform_role, &body.pg_roles);
-    // I1: the new grant with each of the member's overrides keeps the invariant. I4: the write
-    // goes ahead only while those overrides are still what the check read.
+    // I1, MH-4: the new grant with the member's teams and each of their overrides keeps the
+    // invariant. I4: the write goes ahead only while that access is still what the check read.
     let mut tries = 0;
     let changed = loop {
         tries += 1;
         let observed = tri!(observe(&state, id, member_id).await);
-        tri!(context.check_effective(&grant, &observed.overrides, None));
+        tri!(context.check_effective(&observed.with_own(Some(grant.clone())), None));
         match state.metadata.put_project_grant(actor, member_id, id, &grant, &observed).await {
             Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
             other => {
@@ -3396,6 +3684,8 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project, member or grant (another tenant's answers the same)", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: the member's access kept changing while this was being checked; try again", body = ErrorEnvelope),
+        (status = 422, description = "`invalid_request`: what the member keeps through their teams, narrowed by their overrides, would hold a role that can be held only with the admin platform role (`role`, `database_id`; `chain`, `branch_id`, `branch` and `branch_main` too when its memberships on a branch are why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -3419,13 +3709,21 @@ where
     );
     let actor = tri!(actor(principal.member.as_ref()));
     let member = tri!(live_member(&state, principal.tenant_id, member_id).await);
-    tri!(
-        state
-            .metadata
-            .delete_project_grant(actor, member_id, id)
-            .await
-            .map_err(|err| write_failed("delete grant", err, "grant not found"))
-    );
+    // MH-4: what the member keeps (their teams' grants, narrowed by their overrides) keeps the
+    // invariant: an own Admin grant may have been what made a team's role safe to hold.
+    // I4: the delete goes ahead only while that access is still what the check read (a team
+    // grant written meanwhile is checked again).
+    let context = tri!(RoleContext::project(&state, ProjectId::from(id)).await);
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let observed = tri!(observe(&state, id, member_id).await);
+        tri!(context.check_effective(&observed.with_own(None), None));
+        match state.metadata.delete_project_grant(actor, member_id, id, &observed).await {
+            Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
+            other => break tri!(other.map_err(|err| write_failed("delete grant", err, "grant not found"))),
+        }
+    }
     info!(request_id = %principal.request_id, project_id = %id, %member_id, "grant: deleted");
     access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
@@ -3499,32 +3797,30 @@ where
     let changed = loop {
         tries += 1;
         let observed = tri!(observe(&state, id, member_id).await);
-        let Some(grant) = observed.grant.clone() else {
+        // MH-4: an override narrows the member's union (their own grant and their teams').
+        let Some(granted) = observed.sources(None).effective() else {
             return unprocessable("the member has no grant on this project to narrow").into_response();
         };
-        if body.platform_role.is_some_and(|r| r > grant.platform_role) {
+        if body.platform_role.is_some_and(|r| r > granted.platform_role) {
             return unprocessable(format!(
                 "an override can't widen the grant: its role is {}",
-                grant.platform_role.as_str()
+                granted.platform_role.as_str()
             ))
             .into_response();
         }
-        // R17: an Admin grant holds every role, so any role narrows it.
-        if let Some(extra) = body
-            .pg_roles
-            .iter()
-            .flatten()
-            .find(|r| !grant.every_role() && !grant.pg_roles.contains(r))
-        {
+        // R17: Admin from any source holds every role, so any role narrows it.
+        if let Some(extra) = body.pg_roles.iter().flatten().find(|r| match &granted.roles {
+            RoleSet::All { .. } => false,
+            RoleSet::Only(set) => !set.contains(&PgRole::Named((*r).clone())),
+        }) {
             return unprocessable(format!(
                 "an override can't widen the grant: `{extra}` isn't one of its roles"
             ))
             .with_extra("role", json!(extra))
             .into_response();
         }
-        // The invariant on this database: what the grant narrowed by the new override leaves.
-        let after = BTreeMap::from([(db, o.clone())]);
-        tri!(context.check_effective(&grant, &after, Some(db)));
+        // The invariant on this database: what the union narrowed by the new override leaves.
+        tri!(context.check_effective(&observed.with_override(db, Some(o.clone())), Some(db)));
         match state.metadata.put_override(actor, member_id, db, &o, &observed).await {
             Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
             other => {
@@ -3598,15 +3894,13 @@ where
         Ok(_) => return ApiError::not_found("database not found").into_response(),
         Err(err) => return internal("override: load database", err).into_response(),
     };
-    // The invariant on this database once the narrowing goes: the grant alone.
+    // The invariant on this database once the narrowing goes: the union alone (MH-4).
     let context = tri!(RoleContext::of(&state, std::slice::from_ref(&database)).await);
     let mut tries = 0;
     loop {
         tries += 1;
         let observed = tri!(observe(&state, id, member_id).await);
-        if let Some(grant) = &observed.grant {
-            tri!(context.check_effective(grant, &BTreeMap::new(), Some(database_id)));
-        }
+        tri!(context.check_effective(&observed.with_override(database_id, None), Some(database_id)));
         match state.metadata.delete_override(actor, member_id, database_id, &observed).await {
             Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
             other => {

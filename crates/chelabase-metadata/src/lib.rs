@@ -19,6 +19,7 @@ pub mod personal_logins;
 mod projects;
 mod saved_queries;
 mod schema_bases;
+pub mod teams;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
     ProjectAuth, RefreshNext, RefreshOutcome,

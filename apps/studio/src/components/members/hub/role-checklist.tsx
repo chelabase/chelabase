@@ -1,8 +1,9 @@
 import { useId, useState } from "react";
-import { Search } from "lucide-react";
+import { Lock, Search } from "lucide-react";
 import { Checkbox } from "@/components/table-editor/panel-bits";
 import type { RoleChoice } from "../role-picker";
 import { escapeName } from "./escape-name";
+import { joinAnd, TeamsPhrase, type TeamRef } from "./team-via";
 
 export interface RoleChecklistProps {
   choices: readonly RoleChoice[];
@@ -10,10 +11,33 @@ export interface RoleChecklistProps {
   checked: readonly string[];
   /** The roles as last saved: a row whose box differs from it is marked changed. */
   baseline?: readonly string[];
-  /** Roles given by a team (step 2): shown checked and disabled with their source; never part of `onChange`'s result. */
-  locked?: readonly { value: string; via: string }[];
+  /**
+   * Roles teams give (step 2), with every team that names each. A box always shows the member's own grant
+   * (D1), so a team role is a marker on the right ("✓ via the X team", "also via …" when the own grant names it
+   * too) and never part of `onChange`'s result. With `lockedRows` a role only a team gives shows checked and
+   * locked instead.
+   */
+  locked?: readonly { value: string; teams: readonly TeamRef[] }[];
+  lockedRows?: boolean;
+  /** Checked roles that are not allowed (Admin-only below Admin): their rows are marked. */
+  invalid?: readonly string[];
   onChange: (next: string[]) => void;
   disabled?: boolean;
+}
+
+/** The roles of `checked` that are Admin-only while the level is below Admin. */
+export function adminOnlyChecked(choices: readonly RoleChoice[], checked: readonly string[]): string[] {
+  return checked.filter((r) => choices.find((c) => c.value === r)?.disabledReason);
+}
+
+/** Names the Admin-only roles a grant holds below Admin and what to do about them. */
+export function AdminOnlyNote({ names }: { names: readonly string[] }) {
+  return (
+    <p className="text-xs text-coral">
+      {joinAnd(names, (n) => <span className="font-mono text-[12px]">{escapeName(n)}</span>, (n) => n)}{" "}
+      {names.length === 1 ? "is" : "are"} Admin-only. Untick {names.length === 1 ? "it" : "them"}, or set the level to Admin.
+    </p>
+  );
 }
 
 /** Above this many roles a filter field appears. */
@@ -24,11 +48,11 @@ const FILTER_ABOVE = 8;
  * a role that brings others says "also gives …"; a role only an Admin may hold is disabled with its
  * reason; a team's role is checked, disabled and says where it comes from.
  */
-export function RoleChecklist({ choices, checked, baseline, locked = [], onChange, disabled }: RoleChecklistProps) {
+export function RoleChecklist({ choices, checked, baseline, locked = [], lockedRows = false, invalid = [], onChange, disabled }: RoleChecklistProps) {
   const filterId = useId();
   const [query, setQueryState] = useState("");
-  const lockedBy = new Map(locked.map((l) => [l.value, l.via]));
-  const isOn = (v: string) => checked.includes(v) || lockedBy.has(v);
+  const lockedBy = new Map(locked.map((l) => [l.value, l.teams]));
+  const isOn = (v: string) => checked.includes(v) || (lockedRows && lockedBy.has(v));
   // Checked roles first, sorted at mount and when the filter changes; clicking a box never moves a row.
   const [first, setFirst] = useState<ReadonlySet<string>>(() => new Set([...checked, ...lockedBy.keys()]));
   function setQuery(next: string) {
@@ -65,12 +89,15 @@ export function RoleChecklist({ choices, checked, baseline, locked = [], onChang
         {ordered.map((c) => {
           const via = lockedBy.get(c.value);
           const blocked = c.disabledReason !== undefined && !checked.includes(c.value);
-          const off = disabled || via !== undefined || blocked;
+          const own = checked.includes(c.value);
+          const lockedRow = lockedRows && via !== undefined && !own;
+          const off = disabled || lockedRow || blocked;
           return (
             <li
               key={c.value}
-              data-changed={baseline !== undefined && via === undefined && baseline.includes(c.value) !== checked.includes(c.value) ? "true" : undefined}
-              className="flex items-start gap-2 px-2 py-1.5 data-[changed=true]:shadow-[inset_2px_0_0_var(--sand)]"
+              data-changed={baseline !== undefined && baseline.includes(c.value) !== checked.includes(c.value) ? "true" : undefined}
+              data-invalid={invalid.includes(c.value) && checked.includes(c.value) ? "true" : undefined}
+              className="flex flex-wrap items-start gap-x-2 gap-y-0.5 px-2 py-1.5 data-[changed=true]:shadow-[inset_2px_0_0_var(--sand)] data-[invalid=true]:shadow-[inset_2px_0_0_var(--coral)]"
             >
               <Checkbox
                 aria-label={escapeName(c.value)}
@@ -79,7 +106,7 @@ export function RoleChecklist({ choices, checked, baseline, locked = [], onChang
                 onChange={() => toggle(c.value)}
                 className="mt-0.5"
               />
-              <span className="min-w-0 text-sm">
+              <span className="min-w-0 flex-1 basis-40 text-sm">
                 <span className="font-mono text-[13px] break-all text-chalk">{escapeName(c.value)}</span>
                 {(c.chain.length > 0 || c.onlyOn) && (
                   <span className="ml-2 text-xs text-chalk-dim">
@@ -101,9 +128,17 @@ export function RoleChecklist({ choices, checked, baseline, locked = [], onChang
                     {c.onlyOn && `only on ${c.onlyOn.join(", ")}`}
                   </span>
                 )}
-                {via !== undefined && <span className="block text-xs text-chalk-dim">via {escapeName(via)}</span>}
                 {blocked && <span className="block text-xs text-chalk-dim">{c.disabledReason}</span>}
               </span>
+              {via !== undefined && via.length > 0 && (
+                <span data-team-marker className="ml-auto inline-flex max-w-full items-baseline gap-1.5 pl-6 text-xs text-chalk sm:pl-0">
+                  <Lock aria-hidden="true" size={12} strokeWidth={1.5} className="shrink-0 self-center text-chalk-dim" />
+                  <span>
+                    <span aria-hidden="true">✓ </span>
+                    {own ? "also via" : "via"} <TeamsPhrase teams={via} />
+                  </span>
+                </span>
+              )}
             </li>
           );
         })}

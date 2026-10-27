@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 61243bd8a26f8a16a95b2e28c624ea0be4837cdf31cbb20b67b17f99c0f9529e # shrinks to start = [(true, true), (false, false)], ops = [(Promote { member: 1 }, None), (PutTeamGrant { team: 0, role: Viewer, roles: ["lead"] }, None), (AddMember { team: 0, member: 1 }, Some(Demote { member: 1 }))]

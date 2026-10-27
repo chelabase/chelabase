@@ -5,12 +5,14 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   deleteProjectGrant,
   getListProjectGrantsQueryKey,
+  useListMemberTeams,
   useListProjectGrants,
   type MeResponse,
   type Member,
   type PlatformRole,
   type Project,
   type ProjectGrant,
+  type Team,
 } from "@chelabase/management-client";
 import { ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -28,6 +30,7 @@ import { ROLE_HINT } from "../platform-role-field";
 import { roleChoices } from "../role-picker";
 import { refreshAccess } from "../keys";
 import { firstName } from "./logins";
+import { effectiveRole, lockedRoles, provenanceNote, rolesPerTeam, teamLevel, teamsOnProject, viaWords, type TeamOnProject } from "./team-access";
 
 export interface ProjectAccessProps {
   member: Member;
@@ -49,6 +52,9 @@ export function ProjectAccess({ member, me, self, suspended, onStatus }: Project
   const adminOn = (id: string) => projectCaps(me, id).atLeast("admin");
   const heldIds = new Set(member.access.projects.map((p) => p.project_id));
   const held = member.tenant_admin ? visible : visible.filter((p) => heldIds.has(p.id));
+  // Teams only add to what the cards show; a failed read leaves the cards as the own grants make them.
+  const memberTeams = useListMemberTeams(member.id);
+  const teams: readonly Team[] = memberTeams.data ?? [];
   const [added, setAdded] = useState<string[]>([]);
   const [dirtyIds, setDirtyIds] = useState<ReadonlySet<string>>(new Set());
   const setDirty = useCallback((id: string, dirty: boolean) => {
@@ -95,11 +101,13 @@ export function ProjectAccess({ member, me, self, suspended, onStatus }: Project
             if (member.tenant_admin) return <ReadOnlyCard key={project.id} project={project}>Admin on every project, as tenant admin</ReadOnlyCard>;
             if (self) return <ReadOnlyCard key={project.id} project={project}><OwnAccess me={me} project={project} /></ReadOnlyCard>;
             if (adminOn(project.id)) {
-              return <EditableCard key={project.id} project={project} member={member} me={me} suspended={suspended} creating={isNew} onDirty={setDirty} onStatus={onStatus} />;
+              return <EditableCard key={project.id} project={project} member={member} me={me} teams={teams} suspended={suspended} creating={isNew} onDirty={setDirty} onStatus={onStatus} />;
             }
-            const role = member.access.projects.find((p) => p.project_id === project.id)?.platform_role;
+            const access = member.access.projects.find((p) => p.project_id === project.id);
+            const role = access?.platform_role;
+            const note = provenanceNote(access?.via, teamsOnProject(teams, project.id));
             return (
-              <ReadOnlyCard key={project.id} project={project}>
+              <ReadOnlyCard key={project.id} project={project} note={note}>
                 {role ? <span>{ROLE_LABEL[role]}</span> : "No access"}
               </ReadOnlyCard>
             );
@@ -132,7 +140,7 @@ function databaseLine(project: Project): string {
   return project.databases.map((d) => d.name).join(", ");
 }
 
-function CardFrame({ project, dirty, children, footer }: { project: Project; dirty?: boolean; children: ReactNode; footer?: ReactNode }) {
+function CardFrame({ project, dirty, children, footer, note }: { project: Project; dirty?: boolean; children: ReactNode; footer?: ReactNode; note?: string | null }) {
   const id = useId();
   return (
     <section aria-labelledby={id} className={cn("border bg-ink", dirty ? "border-line-strong" : "border-line")}>
@@ -141,6 +149,7 @@ function CardFrame({ project, dirty, children, footer }: { project: Project; dir
           {project.name}
         </h3>
         {project.databases.length > 0 && <span className="text-xs text-chalk-dim">{databaseLine(project)}</span>}
+        {note && <span className="text-xs text-chalk">{note}</span>}
         {dirty && (
           <span className="ml-auto inline-flex items-center gap-2 text-xs text-chalk">
             <span aria-hidden="true" className="inline-block size-2 bg-sand" />
@@ -154,9 +163,9 @@ function CardFrame({ project, dirty, children, footer }: { project: Project; dir
   );
 }
 
-function ReadOnlyCard({ project, children }: { project: Project; children: ReactNode }) {
+function ReadOnlyCard({ project, children, note }: { project: Project; children: ReactNode; note?: string | null }) {
   return (
-    <CardFrame project={project}>
+    <CardFrame project={project} note={note}>
       <div className="text-sm">{children}</div>
     </CardFrame>
   );
@@ -200,6 +209,8 @@ interface EditableCardProps {
   project: Project;
   member: Member;
   me: MeResponse;
+  /** The member's teams (P14): their roles on this project show locked, and their level counts in Effective. */
+  teams: readonly Team[];
   suspended: boolean;
   /** The member has no grant here yet (added from "Add access to a project"). */
   creating: boolean;
@@ -207,7 +218,7 @@ interface EditableCardProps {
   onStatus: (message: string | null) => void;
 }
 
-function EditableCard({ project, member, suspended, creating, onDirty, onStatus }: EditableCardProps) {
+function EditableCard({ project, member, teams, suspended, creating, onDirty, onStatus }: EditableCardProps) {
   const queryClient = useQueryClient();
   const grants = useListProjectGrants(project.id, { query: { enabled: !creating } });
   const { sources, loading } = useRoleSources(project.databases);
@@ -216,6 +227,8 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
   const [removing, setRemoving] = useState(false);
   const [removeBusy, setRemoveBusy] = useState(false);
   const [removeError, setRemoveError] = useState<string | null>(null);
+  // "Add own access" on a project the member reaches only through a team.
+  const [addOwn, setAddOwn] = useState(false);
   const [dirty, setDirtyState] = useState(false);
   const chains = useMemo(() => chainsOf(sources), [sources]);
   const onDirtyChange = useCallback(
@@ -233,6 +246,10 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
   const isNew = !found && !saved && (creating || grants.data !== undefined);
   const name = memberName(member);
   const first = firstName(name);
+  const onProject = useMemo(() => teamsOnProject(teams, project.id), [teams, project.id]);
+  const locked = useMemo(() => lockedRoles(onProject), [onProject]);
+  const via = member.access.projects.find((p) => p.project_id === project.id)?.via;
+  const note = provenanceNote(via ?? (onProject.length > 0 ? "team" : undefined), onProject);
 
   async function takeAway() {
     setRemoveBusy(true);
@@ -250,6 +267,7 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
   }
 
   const ready = !isNew && (found !== undefined || saved !== null);
+  const fromTeams = onProject.length > 0;
   const narrowed = project.databases.flatMap((d) => {
     const o = grant.overrides.find((x) => x.database_id === d.database_id);
     return o ? [`${d.name}: ${overrideWords(o)}`] : [];
@@ -259,11 +277,11 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
     <>
       {suspended ? "Effective once reinstated" : "Effective"}:{" "}
       <span className="text-chalk">
-        {draft.platformRole === "admin" ? (
+        {effectiveRole(draft.platformRole, onProject) === "admin" ? (
           "Admin · every role"
         ) : (
           <>
-            {ROLE_LABEL[draft.platformRole]}
+            {ROLE_LABEL[effectiveRole(draft.platformRole, onProject) ?? draft.platformRole]}
             {draft.pgRoles.length > 0 && " · "}
             {draft.pgRoles.map((r, i) => (
               <span key={r}>
@@ -273,6 +291,7 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
             ))}
           </>
         )}
+        {fromTeams && <TeamRoles onProject={onProject} />}
         {narrowed.length > 0 && ` · narrowed on ${narrowed.join("; ")}`}
       </span>
     </>
@@ -292,7 +311,41 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
       </div>
     );
   } else if (loading) body = <LoadingBody />;
-  else {
+  else if (isNew && !creating && !addOwn && fromTeams) {
+    // Only a team gives access here: read-only, until the admin adds an own grant.
+    const level = effectiveRole(null, onProject);
+    body = (
+      <div className="space-y-4">
+        <div className="space-y-1">
+          <p className="text-sm font-medium">Platform role</p>
+          <p className="text-sm">{level ? ROLE_LABEL[level] : "No access"}</p>
+        </div>
+        <div className="space-y-1">
+          <p className="text-sm font-medium">Postgres roles</p>
+          {level === "admin" ? (
+            <p className="text-sm">All roles</p>
+          ) : locked.length === 0 ? (
+            <p className="text-sm text-chalk-dim">No roles through the team.</p>
+          ) : (
+            <RoleChecklist
+              choices={locked.map((l) => ({ value: l.value, chain: [] as string[] }))}
+              checked={[]}
+              locked={locked}
+              lockedRows
+              disabled
+              onChange={() => {}}
+            />
+          )}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-3 text-sm">
+          <p className="min-w-0 text-chalk-dim">{effective({ platformRole: level ?? "viewer", pgRoles: [] })}</p>
+          <Button type="button" variant="outline" onClick={() => setAddOwn(true)}>
+            Add own access
+          </Button>
+        </div>
+      </div>
+    );
+  } else {
     body = (
       <GrantCard
         projectId={project.id}
@@ -304,7 +357,10 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
         onDirtyChange={onDirtyChange}
         onSaved={(stored) => setSaved({ grant: stored, base: foundKey })}
         bleed
-        summary={ready ? effective : undefined}
+        locked={locked}
+        teamLevel={(own) => teamLevel(own, onProject)}
+        onCancel={isNew && fromTeams && addOwn ? () => setAddOwn(false) : undefined}
+        summary={ready || fromTeams ? effective : undefined}
         footerAction={
           ready ? (
             <Button type="button" variant="ghost" size="sm" className="text-coral" onClick={() => setRemoving(true)}>
@@ -321,7 +377,7 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
   }
 
   return (
-    <CardFrame project={project} dirty={dirty}>
+    <CardFrame project={project} dirty={dirty} note={note}>
       {body}
       {removing && (
         <ConfirmDialog
@@ -341,6 +397,30 @@ function EditableCard({ project, member, suspended, creating, onDirty, onStatus 
         />
       )}
     </CardFrame>
+  );
+}
+
+/** The Effective line's "(+ billing_editor via Billing team, billing_reader via Readers team)": roles grouped per team. */
+function TeamRoles({ onProject }: { onProject: readonly TeamOnProject[] }) {
+  const groups = rolesPerTeam(onProject);
+  if (groups.length === 0) return <> (+ via {viaWords(onProject)})</>;
+  return (
+    <>
+      {" (+ "}
+      {groups.map((g, i) => (
+        <span key={g.team.id}>
+          {i > 0 && ", "}
+          {g.roles.map((r, j) => (
+            <span key={r}>
+              {j > 0 && ", "}
+              <span className="font-mono text-[13px]">{escapeName(r)}</span>
+            </span>
+          ))}{" "}
+          via {escapeName(g.team.name)} team
+        </span>
+      ))}
+      )
+    </>
   );
 }
 

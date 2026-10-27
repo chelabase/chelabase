@@ -6,8 +6,9 @@ license.workspace = true
 description = "Chelabase's schema merge engine: reads one Postgres database's catalog into a normalized model, three-way diff and conflicts, merged model, phased plan, export and drift compare (no HTTP, no metadata access)"
 
 [dependencies]
-# The roles path's reserved-name rules (which memberships a merge can make, E30).
-chelabase-types = { workspace = true }
+# The roles path's reserved-name rules (which memberships a merge can make, E30); `axum` for
+# `ApiError`, which the shared full-cell read (`cell`, P40) answers with.
+chelabase-types = { workspace = true, features = ["axum"] }
 # The canonical JSON a fingerprint is taken over.
 hex = { workspace = true }
 # Keyword kinds for identifier quoting; later, classifying user steps and parsing expressions.

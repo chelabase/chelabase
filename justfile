@@ -303,6 +303,12 @@ members-e2e:
 personal-logins-e2e:
     cargo run -q -p chelabase -- workbench run scripts/personal-logins-e2e.sh
 
+# Live teams story (members hub step 2): a team-only member runs SQL as a Developer team role, a
+# downgrade to Viewer refuses it, unlinks the member role and revokes the personal login, a
+# Viewer team role reads a full cell through the data API, removal and delete, MH-8
+teams-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/teams-e2e.sh
+
 # Offline checks: Neon build scripts, Compose services, neon scripts
 neon-test:
     infra/neon/tests/run.sh

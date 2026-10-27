@@ -474,6 +474,72 @@ async fn console_route_checks_the_bearer_the_body_and_the_database() {
     assert_eq!(json["error"]["message"], UNKNOWN_DATABASE);
 }
 
+/// T5 (P40): the full-cell route, `POST /internal/console/{branch_id}/cell`, on the internal
+/// listener: the bearer first (nothing is fetched without it), then the body
+/// (`deny_unknown_fields`, every field but `database` required; 400 `invalid_query` as on
+/// `/query`), then the database as the console picks it, and the connection's failures as the
+/// internal routes answer them.
+#[tokio::test]
+async fn console_cell_needs_the_bearer_and_refuses_unknown_fields() {
+    let h = harness(served).await;
+    let path = format!("/internal/console/{}/cell", Uuid::new_v4());
+    let request = serde_json::json!({
+        "role": "viewer_r", "database": "ghost", "schema": "public", "table": "notes",
+        "key": { "id": 1 }, "column": "body"
+    });
+    for bearer in [None, Some("nope")] {
+        let (status, json) = h.internal_post(&path, bearer, request.clone()).await;
+        assert_eq!(status, 401, "{bearer:?}: {json}");
+        assert_eq!(json["error"]["code"], "unauthorized", "{bearer:?}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    let with = |key: &str, value: Value| {
+        let mut body = request.clone();
+        body[key] = value;
+        body
+    };
+    let without = |key: &str| {
+        let mut body = request.clone();
+        body.as_object_mut().unwrap().remove(key);
+        body
+    };
+    for bad in [
+        with("tree", serde_json::json!({ "v": 1, "op": "select", "from": "t" })),
+        with("extra", serde_json::json!(true)),
+        without("role"),
+        without("schema"),
+        without("table"),
+        without("key"),
+        without("column"),
+        with("key", serde_json::json!([1])),
+        with("column", serde_json::json!(1)),
+        serde_json::json!([]),
+    ] {
+        let (status, json) = h.internal_post(&path, Some(TOKEN), bad.clone()).await;
+        assert_eq!(status, 400, "{bad}: {json}");
+        assert_eq!(json["error"]["code"], "invalid_query", "{bad}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0, "a refused body fetches nothing");
+    // A well-formed body reaches the database pick: `ghost` isn't served.
+    let (status, json) = h.internal_post(&path, Some(TOKEN), request.clone()).await;
+    assert_eq!(status, 404, "{json}");
+    assert_eq!(json["error"]["code"], "unknown_database");
+    assert_eq!(json["error"]["message"], UNKNOWN_DATABASE);
+    // `database` may be left out (main).
+    let mut main = request.clone();
+    main.as_object_mut().unwrap().remove("database");
+    let (status, json) = h.internal_post(&path, Some(TOKEN), main).await;
+    assert_ne!((status, &json["error"]["code"]), (400, &Value::from("invalid_query")), "{json}");
+
+    // The branch's states, as the internal routes answer them.
+    let h = harness(not_ready).await;
+    let (status, json) = h.internal_post(&path, Some(TOKEN), request.clone()).await;
+    assert_eq!((status, json), (409, serde_json::json!({ "status": "resetting" })));
+    let h = harness(unknown).await;
+    let (status, json) = h.internal_post(&path, Some(TOKEN), request).await;
+    assert_eq!((status, &json["error"]["code"]), (404, &Value::from("unknown_branch")), "{json}");
+}
+
 /// Trees that use the console-only forms (RT1 T4: `text_of` select items, `"text": true`
 /// filters), each as it stands in a select.
 fn console_only_trees() -> Vec<Value> {

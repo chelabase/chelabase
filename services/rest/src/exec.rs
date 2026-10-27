@@ -16,10 +16,18 @@ use chelabase_query::engine::{self, QueryCache, RunAs, RunSettings, with_transac
 use chelabase_query::roles::OWNER_LEVEL_SQL;
 use chelabase_query::schema::{RoleView, Schema, Visibility};
 use chelabase_query::{Lease, QueryClient};
+use chelabase_schema::catalog;
+use chelabase_schema::cell::{
+    CELL_STATEMENT_TIMEOUT_MS, KEY_TYPE_SQL, cell_query, decode_cell, primary_key,
+};
+use chelabase_schema::model::Table;
+use chelabase_types::api_error::ApiError as MgmtError;
 use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::table_api::{CellValue, ConsoleCellRequest, cell_failure};
 use serde_json::Value;
-use tokio_postgres::TransactionStatus;
-use tokio_postgres::types::Type;
+use tokio_postgres::error::ErrorPosition;
+use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::{SimpleQueryMessage, TransactionStatus};
 use uuid::Uuid;
 
 use crate::conn::{
@@ -264,6 +272,118 @@ fn run_settings(info: &ConnInfo, database: &ServedDatabase) -> RunSettings {
     }
 }
 
+/// Why the full-cell route failed: in the database or the request's shape (the management
+/// API's body, as the orchestrator's member-role path answers it), or before it (the data
+/// API's connection failures).
+#[derive(Debug)]
+pub enum CellError {
+    Cell(MgmtError),
+    Failure(Failure),
+}
+
+impl From<MgmtError> for CellError {
+    fn from(e: MgmtError) -> Self {
+        CellError::Cell(e)
+    }
+}
+
+impl From<Failure> for CellError {
+    fn from(e: Failure) -> Self {
+        CellError::Failure(e)
+    }
+}
+
+impl From<ApiError> for CellError {
+    fn from(e: ApiError) -> Self {
+        CellError::Failure(e.into())
+    }
+}
+
+impl From<Read> for CellError {
+    fn from(e: Read) -> Self {
+        match e {
+            Read::Cell(e) => CellError::Cell(e),
+            Read::Query(f) => CellError::Failure(f.into()),
+        }
+    }
+}
+
+/// A failure inside the cell read, before it is split into [`CellError`] (the session's
+/// closure can only fail with a [`chelabase_query::QueryFailure`]).
+enum Read {
+    Cell(MgmtError),
+    Query(chelabase_query::QueryFailure),
+}
+
+impl Read {
+    /// Postgres's own failure as the management body; anything else (a lost connection, a
+    /// driver error) as the data API's.
+    fn pg(e: &tokio_postgres::Error, request_id: &str) -> Self {
+        let Some(db) = e.as_db_error() else {
+            return Read::Query(chelabase_query::QueryFailure::from_pg(e, request_id));
+        };
+        let position = match db.position() {
+            Some(ErrorPosition::Original(p)) => Some(*p),
+            _ => None,
+        };
+        Read::Cell(cell_failure(
+            db.code().code(),
+            db.message(),
+            db.detail(),
+            db.hint(),
+            position,
+        ))
+    }
+}
+
+impl From<MgmtError> for Read {
+    fn from(e: MgmtError) -> Self {
+        Read::Cell(e)
+    }
+}
+
+/// The cell, in the session `c` (as the role): read-only, the key columns' types without their
+/// modifiers, the cell query, the 64 MiB backstop.
+async fn read_cell(
+    c: &tokio_postgres::Client,
+    model: &mut Table,
+    request: &ConsoleCellRequest,
+    request_id: &str,
+) -> Result<CellValue, Read> {
+    let pg = |e: tokio_postgres::Error| Read::pg(&e, request_id);
+    c.batch_execute("SET LOCAL transaction_read_only = on")
+        .await
+        .map_err(pg)?;
+    let attnums: Vec<i16> = primary_key(model)
+        .map(|pk| pk.iter().map(|c| c.attnum).collect())
+        .unwrap_or_default();
+    for attnum in attnums {
+        let Some(column) = model.columns.iter_mut().find(|c| c.attnum == attnum) else {
+            continue;
+        };
+        let row = c
+            .query_typed_one(KEY_TYPE_SQL, &[(&column.type_oid.0, Type::OID)])
+            .await
+            .map_err(pg)?;
+        column.data_type = row.try_get(0).map_err(pg)?;
+    }
+    let (sql, params) = cell_query(model, &request.key, &request.column)?;
+    let typed: Vec<(&(dyn ToSql + Sync), Type)> = params
+        .iter()
+        .map(|p| (p as &(dyn ToSql + Sync), Type::TEXT))
+        .collect();
+    let rows = c.query_typed(&sql, &typed).await.map_err(pg)?;
+    let Some(row) = rows.first() else {
+        return Err(MgmtError::not_found("no row with that key").into());
+    };
+    Ok(decode_cell(
+        row.try_get(0).map_err(pg)?,
+        row.try_get(1).map_err(pg)?,
+        row.try_get(2).map_err(pg)?,
+        row.try_get(3).map_err(pg)?,
+    )?)
+}
+
 /// What a schema read returns: the schema, each role's view, the database's
 /// `default_schema` and the connection info it was read with.
 type Schemas = (Arc<Schema>, Vec<Arc<RoleView>>, String, Arc<ConnInfo>);
@@ -432,6 +552,102 @@ impl<S: ConnSource> Engine<S> {
         let (_, served) = self.database(branch, requested, None).await?;
         let data = console_identity(branch, role);
         self.run(&data, &served, &parsed.op, true, request_id).await
+    }
+
+    /// The internal full-cell route (Q1, P40): one cell of the row with the given primary key,
+    /// read as `request.role` in `request.database` (main when absent), on a leased connection
+    /// through the console's session (`authenticator`, then `SET ROLE`, claims `{}`). The role
+    /// must exist and not be owner-level. In-database and shape failures are the management
+    /// API's ([`CellError::Cell`]), built by the code the orchestrator's member-role path
+    /// shares; connection failures are [`CellError::Failure`].
+    pub async fn console_cell(
+        &self,
+        branch: Uuid,
+        request: &ConsoleCellRequest,
+        request_id: &str,
+    ) -> Result<CellValue, CellError> {
+        let (_, served) = self
+            .database(branch, request.database.as_deref(), None)
+            .await?;
+        let conn = self.acquire(branch, &served.name, request_id).await?;
+        // Declared after `conn`, dropped before its permits are released.
+        let mut lease = Lease::new(conn.client);
+        let out = self
+            .cell_on(&lease, &conn.info, &served, branch, request, request_id)
+            .await;
+        lease.done();
+        out
+    }
+
+    async fn cell_on(
+        &self,
+        lease: &Lease,
+        info: &ConnInfo,
+        served: &ServedDatabase,
+        branch: Uuid,
+        request: &ConsoleCellRequest,
+        request_id: &str,
+    ) -> Result<CellValue, CellError> {
+        self.guard(lease, branch, Guard::Console(&request.role), request_id)
+            .await?;
+        // The table's model is its own transaction (`BEGIN … COMMIT`), so it is read before the
+        // session's, under the cell read's statement timeout; the catalog is readable by every
+        // role.
+        let client = lease.client();
+        client
+            .simple_query(&format!(
+                "SET statement_timeout = {CELL_STATEMENT_TIMEOUT_MS}"
+            ))
+            .await
+            .map_err(|e| Read::pg(&e, request_id))?;
+        let json = client
+            .simple_query(&catalog::table_sql(&request.schema, &request.table))
+            .await
+            .map_err(|e| Read::pg(&e, request_id))?
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut model = match catalog::parse_table(&json) {
+            Ok(Some(model)) => model,
+            Ok(None) => {
+                return Err(MgmtError::not_found("no such table, or not an ordinary table").into());
+            }
+            Err(e) => {
+                tracing::error!(request_id, "the cell read's table JSON: {e}");
+                return Err(MgmtError::internal().into());
+            }
+        };
+        // Shape errors (no key, wrong key columns, unknown column) before any session.
+        cell_query(&model, &request.key, &request.column)?;
+        let claims = Value::Object(Default::default());
+        let mut settings = run_settings(info, served);
+        settings.statement_timeout_ms =
+            i64::try_from(CELL_STATEMENT_TIMEOUT_MS).unwrap_or(i64::MAX);
+        let answer = engine::console_session(
+            lease,
+            &served.name,
+            RunAs::Role {
+                role: &request.role,
+                claims: &claims,
+                oid: None,
+            },
+            &settings,
+            request_id,
+            // An in-database failure is the answer, not the session's: the read-only
+            // transaction has nothing to keep, so it ends as usual and the failure goes out
+            // as the closure's `Ok`.
+            async |c, _version| match read_cell(c, &mut model, request, request_id).await {
+                Ok(cell) => Ok(Ok(cell)),
+                Err(Read::Cell(e)) => Ok(Err(e)),
+                Err(Read::Query(f)) => Err(f),
+            },
+        )
+        .await
+        .map_err(Failure::from)?;
+        Ok(answer?)
     }
 
     /// Runs `op` in `database` as `data`'s role, in one transaction. `console`: the role

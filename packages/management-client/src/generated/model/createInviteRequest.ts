@@ -14,4 +14,10 @@ export interface CreateInviteRequest {
   email: string;
   /** One grant per project at most; none is fine (the person starts with no access). */
   grants?: InviteGrant[];
+  /**
+     * Teams of the tenant the person joins (at most 50 after duplicates are dropped; each
+     * must be a team of the tenant, else 422 naming it in `team_id`); empty is none. The
+     * grants and the teams are checked together on the person's union, per project.
+     */
+  team_ids?: string[];
 }

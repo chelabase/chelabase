@@ -51,6 +51,17 @@ describe("buildCrumbs: shapes", () => {
     expect(cs[1].to).toBeUndefined();
   });
 
+  it("a team page: Members > Teams (Teams tab) > team name", () => {
+    const cs = buildCrumbs("/app/members/teams/t1", { teamId: "t1" }, labels({ teamId: lab("t1", "Billing") }));
+    expect(cs).toMatchObject([{ label: "Members", to: "/app/members" }, { label: "Teams", to: "/app/members", search: { tab: "teams" } }, { label: "Billing" }]);
+    expect(cs[2].to).toBeUndefined();
+  });
+
+  it("a team page without its label yet shows the loading mark", () => {
+    const cs = buildCrumbs("/app/members/teams/t1", { teamId: "t1" }, labels({ teamId: lab("t0", "Other") }));
+    expect(cs[2]).toMatchObject({ label: "…", loading: true });
+  });
+
   it("/app/members/roles is the member page of a member whose id is 'roles' (params decide)", () => {
     const cs = buildCrumbs("/app/members/roles", { memberId: "roles" }, labels({ memberId: lab("roles", "Rolesy") }));
     expect(cs.map((c) => c.label)).toEqual(["Members", "Rolesy"]);

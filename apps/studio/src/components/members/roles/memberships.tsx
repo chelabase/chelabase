@@ -7,22 +7,36 @@ import { Checkbox } from "@/components/table-editor/panel-bits";
 import { errorText } from "@/lib/errors";
 import { memberName } from "@/lib/members";
 import { escapeName } from "../hub/escape-name";
-import { inheritedBy, isManaged, type Holder } from "./model";
+import { TeamsPhrase, type TeamRef } from "../hub/team-via";
+import { holdersByMember, inheritedBy, isManaged, type Holder } from "./model";
+
+/** The sources of one member, with the teams that give the same role through the same grant merged into one. */
+function sourceGroups(sources: readonly Holder[]): { via: string | null; teams: TeamRef[] }[] {
+  const out: { via: string | null; teams: TeamRef[] }[] = [];
+  for (const h of sources) {
+    const team = h.team !== undefined ? { id: h.teamId ?? h.team, name: h.team } : null;
+    const same = out.find((g) => g.via === h.via && (team === null) === (g.teams.length === 0));
+    if (same) {
+      if (team && !same.teams.some((t) => t.id === team.id)) same.teams.push(team);
+    } else out.push({ via: h.via, teams: team ? [team] : [] });
+  }
+  return out;
+}
 
 /** MH-34: who holds the role (Admins only): directly, or through a role whose chain reaches it. */
 export function Holders({ holders, members }: { holders: Holder[]; members: readonly Member[] | undefined }) {
   const byId = new Map((members ?? []).map((m) => [m.id, m]));
   return (
     <div className="space-y-3">
-      <p className="text-[13px] text-chalk-dim">Members whose grant on this project gives them this role. Project Admins and tenant admins can act as every role and aren't listed.</p>
+      <p className="text-[13px] text-chalk-dim">Members whose grant, or a team's grant, on this project gives them this role. Project Admins and tenant admins can act as every role and aren't listed.</p>
       {holders.length === 0 ? (
         <p className="text-sm text-chalk-dim">No member holds this role yet. Give it to someone from their page or the People tab.</p>
       ) : (
         <ul className="divide-y divide-line border-y border-line">
-          {holders.map((h) => {
-            const m = byId.get(h.memberId);
+          {holdersByMember(holders).map(({ memberId, sources }) => {
+            const m = byId.get(memberId);
             return (
-              <li key={h.memberId} className="flex flex-wrap items-center gap-x-3 gap-y-0.5 py-2 text-sm">
+              <li key={memberId} className="flex flex-wrap items-center gap-x-3 gap-y-0.5 py-2 text-sm">
                 {m ? (
                   <Link to="/app/members/$memberId" params={{ memberId: m.id }} className="text-chalk underline decoration-line-strong underline-offset-4 hover:decoration-chalk">
                     {memberName(m)}
@@ -31,13 +45,24 @@ export function Holders({ holders, members }: { holders: Holder[]; members: read
                   <span className="text-chalk-dim">A member no longer listed</span>
                 )}{" "}
                 <span className="text-[13px] text-chalk-dim">
-                  {h.via === null ? (
-                    "granted directly"
-                  ) : (
-                    <>
-                      through <span className="font-mono">{escapeName(h.via)}</span>
-                    </>
-                  )}
+                  {sourceGroups(sources).map((g, i) => (
+                    <span key={`${g.teams.map((t) => t.id).join(",")}:${g.via ?? ""}`}>
+                      {i > 0 && "; "}
+                      {g.teams.length > 0 ? (
+                        <>
+                          via <TeamsPhrase teams={g.teams} />
+                        </>
+                      ) : g.via === null ? (
+                        "granted directly"
+                      ) : null}
+                      {g.teams.length > 0 && g.via !== null && " "}
+                      {g.via !== null && (
+                        <>
+                          through <span className="font-mono">{escapeName(g.via)}</span>
+                        </>
+                      )}
+                    </span>
+                  ))}
                 </span>
               </li>
             );

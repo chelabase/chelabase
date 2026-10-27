@@ -13,7 +13,7 @@ function read(scope: string): RosterView {
 }
 
 /** The remembered cards/list choice of a hub list (MH-38b): storage may be absent or throw, and then it is the list. */
-export function useViewPreference(scope: "roster" | "roles"): [RosterView, (next: RosterView) => void] {
+export function useViewPreference(scope: "roster" | "roles" | "teams"): [RosterView, (next: RosterView) => void] {
   const [view, setView] = useState<RosterView>(() => read(scope));
   const set = useCallback(
     (next: RosterView) => {

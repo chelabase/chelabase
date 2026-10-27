@@ -2,12 +2,14 @@ import { useEffect, useId, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { deleteProjectGrant, getListProjectGrantsQueryKey, putProjectGrant, type DatabaseSummary, type Member, type PlatformRole, type ProjectGrant } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
+import { ROLE_LABEL } from "@/lib/members";
 import { cn } from "@/lib/utils";
 import { failureOf, FailureText, type Failure } from "../../project-access/failure";
 import { refreshAccess } from "../keys";
 import { PlatformRoleField } from "../platform-role-field";
-import { roleChoices, type RoleSource } from "../role-picker";
-import { RoleChecklist } from "./role-checklist";
+import { roleChoices, type RoleChoice, type RoleSource } from "../role-picker";
+import { AdminOnlyNote, adminOnlyChecked, RoleChecklist } from "./role-checklist";
+import { TeamsPhrase, type TeamRef } from "./team-via";
 
 export interface GrantCardProps {
   projectId: string;
@@ -35,6 +37,14 @@ export interface GrantCardProps {
   footerAction?: ReactNode;
   /** The footer runs to the edges of a padded parent (the member page's card). */
   bleed?: boolean;
+  /** Roles teams give the member here (step 2): a marker "via the X team" on the row, never sent in the PUT (D1: the own grant is independent). */
+  locked?: readonly { value: string; teams: readonly TeamRef[] }[];
+  /** The level a team gives when it is higher than `own` (null when none is): said under the platform role, with the teams linked. */
+  teamLevel?: (own: PlatformRole) => { role: PlatformRole; teams: readonly TeamRef[] } | null;
+  /** A Cancel in the footer that leaves the card (a team-only member's "Add own access" going back to read-only). */
+  onCancel?: () => void;
+  /** Said under the platform role when a team contributes to it ("Access through Support team"). */
+  note?: ReactNode;
   /** Content between the form and the footer (the member page's "Narrow on a database"). */
   children?: ReactNode;
 }
@@ -45,7 +55,7 @@ const sameSet = (a: readonly string[], b: readonly string[]) => a.length === b.l
  * One project's access for one member: a platform role and the Postgres roles, saved together.
  * The PUT carries the member's own grant only (MH-38a): never a team's roles, never an override.
  */
-export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDirtyChange, creating = false, databases, onFailure, onRemoved, summary, footerAction, bleed = false, children }: GrantCardProps) {
+export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDirtyChange, creating = false, databases, onFailure, onRemoved, summary, footerAction, bleed = false, locked = [], teamLevel, onCancel, note, children }: GrantCardProps) {
   const queryClient = useQueryClient();
   // R17: an Admin grant holds every role (`"all"`); a grant moved below Admin starts with none.
   const granted = grant.pg_roles === "all" ? [] : grant.pg_roles;
@@ -57,8 +67,12 @@ export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDi
   const [failure, setFailure] = useState<Failure | null>(null);
 
   const admin = platformRole === "admin";
-  const choices = roleChoices(roleSources, platformRole);
-  const notAllowed = !admin && pgRoles.some((r) => choices.find((c) => c.value === r)?.disabledReason);
+  const baseChoices = roleChoices(roleSources, platformRole);
+  // A team's role the lists don't show (a database that isn't ready) is still listed.
+  const known = new Set(baseChoices.map((c) => c.value));
+  const choices: RoleChoice[] = [...baseChoices, ...locked.filter((l) => !known.has(l.value)).map((l) => ({ value: l.value, chain: [] as string[] }))];
+  const adminOnly = admin ? [] : adminOnlyChecked(choices, pgRoles);
+  const notAllowed = adminOnly.length > 0;
   const dirty = removing || platformRole !== grant.platform_role || (!admin && !sameSet(pgRoles, granted));
   const changed = dirty || creating;
   useEffect(() => {
@@ -102,7 +116,7 @@ export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDi
   }
 
   const lead = summary?.({ platformRole, pgRoles: admin ? [] : pgRoles });
-  const showFooter = changed || lead !== undefined || footerAction !== undefined;
+  const showFooter = changed || lead !== undefined || footerAction !== undefined || onCancel !== undefined;
 
   return (
     <div>
@@ -124,6 +138,15 @@ export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDi
           }}
           noAccess={creating ? undefined : { selected: removing, onSelect: () => setRemoving(true) }}
         />
+        {note && <p className="text-xs text-chalk-dim">{note}</p>}
+        {(() => {
+          const given = teamLevel?.(platformRole);
+          return given ? (
+            <p className="text-xs text-chalk">
+              {ROLE_LABEL[given.role]} via <TeamsPhrase teams={given.teams} />
+            </p>
+          ) : null;
+        })()}
         {removing ? null : admin ? (
           <div className="space-y-1">
             <p className="text-sm font-medium">Postgres roles</p>
@@ -139,14 +162,12 @@ export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDi
             {choices.length === 0 ? (
               <p className="text-sm text-chalk-dim">No roles to grant yet.</p>
             ) : (
-              <RoleChecklist choices={choices} checked={pgRoles} baseline={granted} onChange={setPgRoles} />
+              <RoleChecklist choices={choices} checked={pgRoles} baseline={granted} invalid={adminOnly} locked={locked} onChange={setPgRoles} />
             )}
           </div>
         )}
       </fieldset>
-      {notAllowed && !removing && (
-        <p className="text-xs text-coral">Remove the Admin-only roles, or keep Admin.</p>
-      )}
+      {notAllowed && !removing && <AdminOnlyNote names={adminOnly} />}
       {failure && <FailureText failure={failure} />}
     </form>
     {children}
@@ -160,6 +181,11 @@ export function GrantCard({ projectId, member, grant, roleSources, onSaved, onDi
         {lead !== undefined ? <p className="min-w-0 text-chalk-dim">{lead}</p> : <span />}
         <div className="flex flex-wrap items-center gap-2">
           {footerAction}
+          {onCancel && (
+            <Button type="button" variant="ghost" disabled={busy} onClick={onCancel}>
+              Cancel
+            </Button>
+          )}
           {dirty && (
             <Button type="button" variant="ghost" disabled={busy} onClick={discard}>
               Discard

@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
 import { memberName } from "@/lib/members";
 import { GrantRows, toInviteGrants, type GrantRow } from "./grant-rows";
+import { TeamPicker } from "./team-picker";
 import { inviteFailure, type InviteFailure } from "./invite-errors";
 
 export interface ApproveDialogProps {
@@ -41,6 +42,7 @@ function ApproveForm({ member, projects, onCancel, onDone }: { member: Member; p
   const queryClient = useQueryClient();
   const approve = useApproveMember();
   const [rows, setRows] = useState<GrantRow[]>([]);
+  const [teamIds, setTeamIds] = useState<string[]>([]);
   const [failure, setFailure] = useState<InviteFailure>({});
   const email = member.email ?? memberName(member);
 
@@ -49,7 +51,7 @@ function ApproveForm({ member, projects, onCancel, onDone }: { member: Member; p
     if (approve.isPending) return;
     setFailure({});
     try {
-      await approve.mutateAsync({ memberId: member.id, data: { grants: toInviteGrants(rows) } });
+      await approve.mutateAsync({ memberId: member.id, data: { grants: toInviteGrants(rows), ...(teamIds.length > 0 && { team_ids: teamIds }) } });
       refreshAccess(queryClient);
       onDone(`Approved ${email}. They can sign in now.`);
     } catch (err) {
@@ -65,7 +67,8 @@ function ApproveForm({ member, projects, onCancel, onDone }: { member: Member; p
   const busy = approve.isPending;
   return (
     <form onSubmit={submit} className="space-y-5">
-      <GrantRows projects={projects} rows={rows} onChange={setRows} errors={failure.rows} disabled={busy} />
+      <TeamPicker value={teamIds} onChange={setTeamIds} disabled={busy} />
+      <GrantRows projects={projects} rows={rows} onChange={setRows} errors={failure.rows} disabled={busy} copyFrom teamsChosen={teamIds.length > 0} />
       {(failure.form ?? failure.email) && (
         <p role="alert" className="text-sm text-coral">
           {failure.form ?? failure.email}

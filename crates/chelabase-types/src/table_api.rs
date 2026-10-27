@@ -40,6 +40,35 @@ pub fn classify_failure(sqlstate: &str, hint: Option<&str>) -> (u16, ErrorCode) 
     }
 }
 
+/// A failure inside the full-cell read as both of its paths answer it (P40): a table or schema
+/// that doesn't exist is 404 `not_found`, a text over Postgres's own limit (54000) 413
+/// `too_large`, the rest [`classify_failure`] with the database's fields as extras.
+#[cfg(feature = "axum")]
+pub fn cell_failure(
+    sqlstate: &str,
+    message: &str,
+    detail: Option<&str>,
+    hint: Option<&str>,
+    position: Option<u32>,
+) -> crate::api_error::ApiError {
+    use crate::api_error::ApiError;
+    match sqlstate {
+        "42P01" | "3F000" => ApiError::not_found("no such table"),
+        // The text form is over Postgres's own 1 GB limit (program_limit_exceeded).
+        "54000" => ApiError::new(413, ErrorCode::TooLarge, "the value is over 64 MiB"),
+        _ => {
+            let (status, code) = classify_failure(sqlstate, hint);
+            ApiError::new(status, code, message)
+                .with_extra("op_index", serde_json::Value::Null)
+                .with_extra("sqlstate", serde_json::json!(sqlstate))
+                .with_extra("message", serde_json::json!(message))
+                .with_extra("detail", serde_json::json!(detail))
+                .with_extra("hint", serde_json::json!(hint))
+                .with_extra("position", serde_json::json!(position))
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -881,6 +910,21 @@ pub struct CellRequest {
     pub column: String,
 }
 
+/// `POST /internal/console/{branch_id}/cell`'s body (rest's internal listener; the orchestrator
+/// sends it for a full-cell read as a role held below Developer, P40). `database` is the
+/// Postgres database's name (main when absent); `role` must exist and not be owner-level.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConsoleCellRequest {
+    pub role: String,
+    #[serde(default)]
+    pub database: Option<String>,
+    pub schema: String,
+    pub table: String,
+    pub key: BTreeMap<String, serde_json::Value>,
+    pub column: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -1073,5 +1117,66 @@ mod tests {
         for s in ["2BP01", "42P07", "42703", "XX000", ""] {
             assert_eq!(c(s, None), (400, ErrorCode::SchemaChangeFailed), "{s}");
         }
+    }
+
+    /// T5 (P40): the full-cell read's failures, one builder for the member-role path and rest's
+    /// console path. Missing relations and schemas are 404 without the database's fields (as
+    /// `rows.rs`'s `row_failure` answered); 54000 is 413; the rest classify as the change
+    /// endpoints do and carry `op_index: null`, `sqlstate`, `message`, `detail`, `hint` and
+    /// `position`.
+    #[cfg(feature = "axum")]
+    #[test]
+    fn cell_failure_maps_like_the_member_role_path() {
+        for s in ["42P01", "3F000"] {
+            let e = cell_failure(s, "relation \"public.t\" does not exist", None, None, Some(15));
+            assert_eq!((e.status, e.code, e.message.as_str()), (404, ErrorCode::NotFound, "no such table"), "{s}");
+        }
+        let e = cell_failure("54000", "out of memory", None, None, None);
+        assert_eq!((e.status, e.code), (413, ErrorCode::TooLarge));
+        for (s, status, code) in [
+            ("42501", 403, ErrorCode::PermissionDenied),
+            ("22P02", 400, ErrorCode::ConstraintViolation),
+            ("57014", 504, ErrorCode::Timeout),
+        ] {
+            let e = cell_failure(s, "the message", Some("the detail"), Some("the hint"), Some(7));
+            assert_eq!((e.status, e.code), (status, code), "{s}");
+            assert_eq!(e.message, "the message", "{s}");
+            let body = e.body();
+            assert_eq!(
+                body["error"],
+                json!({
+                    "code": code.as_str(), "message": "the message", "op_index": null, "sqlstate": s,
+                    "detail": "the detail", "hint": "the hint", "position": 7
+                }),
+                "{s}"
+            );
+        }
+        // Absent fields are nulls, still present.
+        let body = cell_failure("42501", "permission denied for table t", None, None, None).body();
+        for key in ["op_index", "detail", "hint", "position"] {
+            assert_eq!(body["error"].get(key), Some(&serde_json::Value::Null), "{key}: {body}");
+        }
+        assert_eq!(body["error"]["sqlstate"], "42501");
+        // The branch-protected hint wins over the SQLSTATE, as on the change endpoints.
+        let e = cell_failure("42501", "refused", None, Some(BRANCH_PROTECTED_HINT), None);
+        assert_eq!((e.status, e.code), (409, ErrorCode::BranchProtected));
+    }
+
+    /// T5 (P40): the body rest's cell route reads: `database` may be left out, nothing else may
+    /// be unknown, and it round-trips as the orchestrator sends it.
+    #[test]
+    fn console_cell_request_shape() {
+        let body = json!({
+            "role": "viewer_r", "database": "web1", "schema": "public", "table": "t",
+            "key": { "id": 1 }, "column": "id"
+        });
+        let parsed: ConsoleCellRequest = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), body);
+        let mut main = body.clone();
+        main.as_object_mut().unwrap().remove("database");
+        assert_eq!(serde_json::from_value::<ConsoleCellRequest>(main).unwrap().database, None);
+        let mut extra = body;
+        extra["tree"] = json!(1);
+        assert!(serde_json::from_value::<ConsoleCellRequest>(extra).is_err());
     }
 }

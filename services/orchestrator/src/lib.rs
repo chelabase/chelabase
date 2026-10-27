@@ -30,7 +30,7 @@ use chelabase_types::api_error::ErrorEnvelope;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use utoipa_axum::{router::OpenApiRouter, routes};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
@@ -56,6 +56,7 @@ mod roles;
 pub mod sql_editor;
 mod privileges;
 mod table_api;
+mod teams;
 pub use table_api::{DEFAULT_DRY_RUN_MAX_BYTES as DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES, dry_run_max_bytes as table_api_dry_run_max_bytes};
 pub use console::{AddrFuture, Console, ConsoleRequest, OwnerPoolKey, PostgresAddr, REALTIME_OWNER_CONNECTIONS, RestReply};
 pub use openapi::openapi;
@@ -629,6 +630,70 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         member: Uuid,
     ) -> impl Future<Output = Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError>> + Send;
 
+    /// Members hub step 2: the tenant's teams with their grants (non-deleted projects) and
+    /// members, by lower(name).
+    fn list_teams(
+        &self,
+        tenant: TenantId,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError>> + Send;
+
+    /// One team of the tenant (another tenant's is `None`).
+    fn team(
+        &self,
+        tenant: TenantId,
+        team: Uuid,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::teams::TeamDetail>, MetadataError>> + Send;
+
+    /// The member's teams, by lower(name).
+    fn member_teams(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError>> + Send;
+
+    /// Every team grant on the project, with the team's members.
+    fn project_team_grants(
+        &self,
+        project: Uuid,
+    ) -> impl Future<Output = Result<Vec<chelabase_metadata::teams::ProjectTeamGrant>, MetadataError>> + Send;
+
+    fn create_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        name: &str,
+        description: &str,
+    ) -> impl Future<Output = Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError>> + Send;
+
+    fn update_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        team: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> impl Future<Output = Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError>> + Send;
+
+    /// The check's read (I4): `(member, Observed)` for every affected member × project.
+    fn team_change_observed(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> impl Future<
+        Output = Result<Vec<(Uuid, chelabase_metadata::members::Observed)>, chelabase_metadata::teams::TeamWriteError>,
+    > + Send;
+
+    /// The change, written only while `expect` still holds and every member of
+    /// `skipped_admins` (the check skipped them as tenant admins, R17) is still one, under the
+    /// tenant lock (`Changed` otherwise).
+    fn write_team_checked(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+        expect: &[(Uuid, chelabase_metadata::members::Observed)],
+        skipped_admins: &[Uuid],
+    ) -> impl Future<Output = Result<chelabase_metadata::teams::TeamWrite, chelabase_metadata::teams::TeamWriteError>> + Send;
+
     /// T2-4 (MH-2): every live project of `tenant` where the member has an access source, with
     /// its sources at the project level, by project id: what `/v1/me`, the project list and
     /// realtime's projects read (never the own grants alone). The metadata answers it in one
@@ -1166,6 +1231,70 @@ impl MetadataPort for MetadataClient {
     async fn member_overrides(&self, member: Uuid) -> Result<Vec<(Uuid, Uuid, OverrideRow)>, MetadataError> {
         MetadataClient::member_overrides(self, member).await
     }
+
+    async fn list_teams(&self, tenant: TenantId) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        MetadataClient::list_teams(self, tenant).await
+    }
+
+    async fn team(
+        &self,
+        tenant: TenantId,
+        team: Uuid,
+    ) -> Result<Option<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        MetadataClient::team(self, tenant, team).await
+    }
+
+    async fn member_teams(&self, member: Uuid) -> Result<Vec<chelabase_metadata::teams::TeamDetail>, MetadataError> {
+        MetadataClient::member_teams(self, member).await
+    }
+
+    async fn project_team_grants(
+        &self,
+        project: Uuid,
+    ) -> Result<Vec<chelabase_metadata::teams::ProjectTeamGrant>, MetadataError> {
+        MetadataClient::project_team_grants(self, project).await
+    }
+
+    async fn create_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        name: &str,
+        description: &str,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        MetadataClient::create_team(self, actor, tenant, name, description).await
+    }
+
+    async fn update_team(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        team: Uuid,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<chelabase_metadata::teams::TeamRecord, chelabase_metadata::teams::TeamWriteError> {
+        MetadataClient::update_team(self, actor, tenant, team, name, description).await
+    }
+
+    async fn team_change_observed(
+        &self,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+    ) -> Result<Vec<(Uuid, chelabase_metadata::members::Observed)>, chelabase_metadata::teams::TeamWriteError> {
+        MetadataClient::team_change_observed(self, tenant, change).await
+    }
+
+    async fn write_team_checked(
+        &self,
+        actor: Uuid,
+        tenant: TenantId,
+        change: &chelabase_metadata::teams::TeamChange,
+        expect: &[(Uuid, chelabase_metadata::members::Observed)],
+        skipped_admins: &[Uuid],
+    ) -> Result<chelabase_metadata::teams::TeamWrite, chelabase_metadata::teams::TeamWriteError> {
+        MetadataClient::write_team_checked_skipping(self, actor, tenant, change, expect, skipped_admins).await
+    }
+
     async fn member_grant_sources(
         &self,
         tenant: TenantId,
@@ -2283,6 +2412,11 @@ struct MeProject {
     /// with the admin role). A database
     /// the grant is narrowed on may allow less: see `databases`.
     roles: MeRoles,
+    /// The level each named role is held at (`viewer`, `developer`, `admin`; D1). With `roles`
+    /// `"all"` only the roles held below the platform role are listed (a data API role a grant
+    /// names); every other role is at `platform_role`.
+    #[schema(required = false)]
+    role_levels: BTreeMap<String, chelabase_types::access::PlatformRole>,
     /// The databases of the project the caller's grant is narrowed on, with what they may do
     /// there. A database not listed has the project's `platform_role` and `roles`.
     databases: Vec<MeDatabase>,
@@ -2296,6 +2430,9 @@ struct MeDatabase {
     platform_role: chelabase_types::access::PlatformRole,
     /// The effective Postgres roles (`owner` only with the admin role).
     roles: MeRoles,
+    /// The level each named role is held at on this database, after the override.
+    #[schema(required = false)]
+    role_levels: BTreeMap<String, chelabase_types::access::PlatformRole>,
 }
 
 /// Postgres roles: `"all"` (an Admin's: every role of the branch, the owner included, but not
@@ -2441,6 +2578,7 @@ where
         .merge(app_user_admin::routes())
         .merge(members::routes())
         .merge(personal_logins::routes())
+        .merge(teams::routes())
 }
 
 /// Build the orchestrator's axum router over the given (possibly-fake) state.
@@ -2519,6 +2657,7 @@ where
                 project_id: p.id,
                 platform_role: PlatformRole::Admin,
                 roles: MeRoles::All(AllRoles::All),
+                role_levels: BTreeMap::new(),
                 databases: Vec::new(),
             })
             .collect(),
@@ -2554,6 +2693,7 @@ where
                             Some(MeDatabase {
                                 database_id: DatabaseId(*database),
                                 platform_role: narrowed.platform_role,
+                                role_levels: narrowed.role_levels().clone(),
                                 roles: roles_of(narrowed.roles),
                             })
                         })
@@ -2561,6 +2701,7 @@ where
                     Some(MeProject {
                         project_id: ProjectId(project),
                         platform_role: grant.platform_role,
+                        role_levels: grant.role_levels().clone(),
                         roles: roles_of(grant.roles),
                         databases,
                     })

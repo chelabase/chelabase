@@ -1,5 +1,6 @@
 import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
+import { useScrollFade } from "@/lib/use-scroll-fade";
 
 export interface TabItem<T extends string> {
   id: T;
@@ -21,19 +22,27 @@ export interface TabsProps<T extends string> {
  * current tab is chalk with a 2px sand rule, the rest chalk-dim, all on one hairline.
  */
 export function Tabs<T extends string>({ label, items, value, onValueChange, children }: TabsProps<T>) {
+  const scroller = useScrollFade<HTMLDivElement>();
+  // A strip that scrolls (a phone) keeps the current tab in view.
+  useEffect(() => {
+    scroller.ref.current?.querySelector<HTMLElement>("[data-active]")?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
   return (
     <TabsPrimitive.Root value={value} onValueChange={(next) => onValueChange(next as T)} className="space-y-6">
-      <TabsPrimitive.List aria-label={label} className="flex gap-1 overflow-x-auto border-b border-line">
+      <div ref={scroller.ref} onScroll={scroller.onScroll} style={scroller.style} className="overflow-x-auto">
+      <TabsPrimitive.List aria-label={label} className="flex w-max min-w-full gap-1 border-b border-line">
         {items.map((item) => (
           <TabsPrimitive.Tab
             key={item.id}
             value={item.id}
-            className="-mb-px shrink-0 border-b-2 whitespace-nowrap border-transparent px-3 py-2 text-sm font-medium text-chalk-dim outline-none hover:text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand data-[active]:border-sand data-[active]:text-chalk"
+            className="shrink-0 border-b-2 whitespace-nowrap border-transparent px-3 py-2 text-sm font-medium text-chalk-dim outline-none hover:text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand data-[active]:border-sand data-[active]:text-chalk"
           >
             {item.label}
           </TabsPrimitive.Tab>
         ))}
       </TabsPrimitive.List>
+      </div>
       <TabsPrimitive.Panel value={value} className="outline-none focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-sand">
         {children}
       </TabsPrimitive.Panel>

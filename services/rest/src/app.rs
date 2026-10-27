@@ -2,8 +2,8 @@
 //! `GET /data/v1/schema`) and trusts only the gateway's identity token, minted for `rest`
 //! with a data key's identity. The internal listener serves the orchestrator behind a
 //! static bearer: `GET /internal/schema/{branch_id}` (`?database=&role=`),
-//! `POST /internal/branches/{id}/invalidate`
-//! and `POST /internal/console/{branch_id}/query`.
+//! `POST /internal/branches/{id}/invalidate`,
+//! `POST /internal/console/{branch_id}/query` and `POST /internal/console/{branch_id}/cell`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, IDENTITY_HEADER, InternalVerifier};
 use chelabase_query::openapi::{QueryRequest, QueryResult};
 use chelabase_types::data_key::DataKeyKind;
+use chelabase_types::table_api::ConsoleCellRequest;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use subtle::ConstantTimeEq;
@@ -27,7 +28,7 @@ use uuid::Uuid;
 
 use crate::conn::{ConnError, ConnSource};
 use crate::error::ApiError;
-use crate::exec::{Engine, Failure};
+use crate::exec::{CellError, Engine, Failure};
 use crate::openapi::{DataErrorEnvelope, DataSchemaResponse};
 
 /// Largest request body (1 MiB).
@@ -120,6 +121,7 @@ pub fn internal_router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
             post(invalidate::<S>),
         )
         .route("/internal/console/{branch_id}/query", post(console::<S>))
+        .route("/internal/console/{branch_id}/cell", post(console_cell::<S>))
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(state)
 }
@@ -391,6 +393,37 @@ async fn console<S: ConnSource>(
     {
         Ok(result) => json_response(result),
         Err(f) => internal_failure(f, &rid),
+    }
+}
+
+/// The full-cell read as a role (Q1, P40): `POST /internal/console/{branch_id}/cell`. Answers
+/// the management API's `CellValue` and error body, as the orchestrator's member-role path
+/// does.
+async fn console_cell<S: ConnSource>(
+    State(state): State<Arc<AppState<S>>>,
+    Path(branch): Path<Uuid>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if let Err(e) = check_bearer(&state, &headers) {
+        return e.into_response();
+    }
+    let body = match body {
+        Ok(body) => body,
+        Err(e) if e.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return ApiError::too_large().into_response();
+        }
+        Err(e) => return ApiError::invalid_query(e.body_text()).into_response(),
+    };
+    let request: ConsoleCellRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return ApiError::invalid_query(format!("the request: {e}")).into_response(),
+    };
+    let rid = format!("console-{}", Uuid::new_v4());
+    match state.engine.console_cell(branch, &request, &rid).await {
+        Ok(cell) => axum::Json(cell).into_response(),
+        Err(CellError::Cell(e)) => e.into_response(),
+        Err(CellError::Failure(f)) => internal_failure(f, &rid),
     }
 }
 

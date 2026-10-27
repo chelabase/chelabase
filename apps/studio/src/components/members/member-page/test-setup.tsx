@@ -12,6 +12,7 @@ import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { CrumbsRoot } from "@/test/render-crumbs";
 import { renderWithQuery } from "@/test/render";
 import { P1, P2, person } from "../hub/fixtures";
+import { TeamPage } from "../teams";
 import { MemberPage } from "./index";
 
 /** Test support for the member page's RED tests (task S2): fixtures, the fake API and the router harness. */
@@ -194,9 +195,13 @@ export function mount(opts: Opts = {}) {
     },
   });
   const list = createRoute({ getParentRoute: () => root, path: "/app/members", component: () => <p>members list route</p> });
+  const team = createRoute({ getParentRoute: () => root, path: "/app/members/teams/$teamId", component: function Team() {
+      return <TeamPage teamId={(team.useParams() as unknown as { teamId: string }).teamId} />;
+    },
+  });
   const other = createRoute({ getParentRoute: () => root, path: "/other", component: () => <p>elsewhere</p> });
   const router = createRouter({
-    routeTree: root.addChildren([page, list, other]),
+    routeTree: root.addChildren([page, list, team, other]),
     history: createMemoryHistory({ initialEntries: [opts.initial ?? `/app/members/${memberId}`] }),
   });
   const view = renderWithQuery(<RouterProvider router={router} />, { fetch: f });

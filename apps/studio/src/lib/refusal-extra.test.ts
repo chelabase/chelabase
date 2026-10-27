@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "@chelabase/management-client";
-import { refusalExtra, refusalMessage } from "./refusal-extra";
+import { refusalExtra, refusalMessage, refusalOrErrorText, refusalSentence } from "./refusal-extra";
 
 const err = (extra: Record<string, unknown>) => new ApiError(422, "invalid_request", "refused", extra);
 
@@ -49,5 +49,32 @@ describe("refusalMessage", () => {
     expect(refusalMessage({ role: "r", chain: ["r"] }, "db")).toBeNull();
     expect(refusalMessage({ chain: ["r"], why: "login" }, "db")).toBeNull();
     expect(refusalMessage({ role: "r", why: "login" }, "db")).toBeNull();
+  });
+});
+
+describe("refusalSentence", () => {
+  const server =
+    "`app_login` can be held only with the admin platform role: on database `ledger` the member would be developer with it, and `app_login` is a LOGIN role";
+  const refused = (extra: Record<string, unknown> = {}) => new ApiError(422, "invalid_request", server, { role: "app_login", ...extra });
+
+  it("capitalises_levels_and_names_the_team", () => {
+    const text = refusalSentence(refused({ team_id: "t1" }), { teamName: (id) => (id === "t1" ? "Ops" : undefined) });
+    expect(text).toBe(
+      "`app_login` can be held only with the Admin platform role: on database `ledger` the member would be Developer with it, and `app_login` is a LOGIN role. The Ops team gives that access.",
+    );
+  });
+
+  it("names_no_team_when_the_id_is_unknown_or_absent", () => {
+    expect(refusalSentence(refused({ team_id: "gone" }), { teamName: () => undefined })).not.toMatch(/team gives/);
+    expect(refusalSentence(refused())).not.toMatch(/team gives/);
+  });
+
+  it("reads_the_team_id_extra", () => {
+    expect(refusalExtra(refused({ team_id: "t1" })).teamId).toBe("t1");
+  });
+
+  it("refusalOrErrorText_leaves_other_errors_alone", () => {
+    expect(refusalOrErrorText(new ApiError(409, "conflict", "changed since"))).toBe("changed since");
+    expect(refusalOrErrorText(refused())).toContain("Admin platform role");
   });
 });

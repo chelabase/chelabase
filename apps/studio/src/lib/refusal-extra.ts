@@ -1,4 +1,5 @@
-import type { ApiError } from "@chelabase/management-client";
+import { ApiError } from "@chelabase/management-client";
+import { errorText } from "@/lib/errors";
 
 /**
  * What the API's 422 for a refused grant, override or invite says about the refusal
@@ -11,6 +12,8 @@ export interface RefusalExtra {
   chain?: string[];
   databaseId?: string;
   projectId?: string;
+  /** The team whose grant is why (a team grant, a team member add, an invite's team, a demotion). */
+  teamId?: string;
   /** The branch whose roles broke it, and whether that is the database's main (M16). */
   branch?: string;
   branchMain?: boolean;
@@ -69,8 +72,46 @@ export function refusalExtra(err: ApiError): RefusalExtra {
     chain: chain.length > 0 ? chain : undefined,
     databaseId: text(err.extra.database_id),
     projectId: text(err.extra.project_id),
+    teamId: text(err.extra.team_id),
     branch: text(err.extra.branch),
     branchMain: typeof err.extra.branch_main === "boolean" ? err.extra.branch_main : undefined,
     why: WHYS.find((w) => w === err.extra.why),
   };
+}
+
+const LEVELS = "viewer|developer|admin";
+
+/** "developer" at the start of a level word, as the product writes it. */
+const capital = (w: string) => w.charAt(0).toUpperCase() + w.slice(1);
+
+export interface RefusalContext {
+  /** A team's name by id; unknown ids name no team. */
+  teamName?: (teamId: string) => string | undefined;
+  /** A database's name by id, for a sentence that doesn't name it itself. */
+  databaseName?: (databaseId: string) => string | undefined;
+}
+
+/**
+ * The server's 422 sentence for a refused grant in Studio's words: levels capitalised ("the Admin platform
+ * role", "would be Developer"), roles and databases left in backticks (drawn mono by `RefusalText`), and
+ * the team whose grant is why named. The server's sentence already names the database.
+ */
+export function refusalSentence(err: ApiError, ctx: RefusalContext = {}): string {
+  const extra = refusalExtra(err);
+  let text = err.message
+    .replace(new RegExp(`\\b(would be) (${LEVELS})\\b`, "g"), (_, a: string, l: string) => `${a} ${capital(l)}`)
+    .replace(new RegExp(`\\b(the) (${LEVELS}) (platform role)\\b`, "g"), (_, a: string, l: string, c: string) => `${a} ${capital(l)} ${c}`);
+  text = capital(text);
+  if (!text.includes("`") && extra.databaseId) {
+    const db = ctx.databaseName?.(extra.databaseId);
+    if (db) text += ` (on \`${db}\`)`;
+  }
+  const team = extra.teamId ? ctx.teamName?.(extra.teamId) : undefined;
+  if (team) text = `${text.replace(/\.$/, "")}. The ${team} team gives that access.`;
+  return text;
+}
+
+/** A refusal in Studio's words when the error is one (its `extra` names a role); the plain error text otherwise. */
+export function refusalOrErrorText(err: unknown, ctx: RefusalContext = {}): string {
+  return err instanceof ApiError && err.extra.role !== undefined ? refusalSentence(err, ctx) : errorText(err);
 }

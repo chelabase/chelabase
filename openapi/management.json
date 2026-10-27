@@ -6368,7 +6368,7 @@
           "tables"
         ],
         "summary": "One cell's full value",
-        "description": "The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413.",
+        "description": "The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413. Read as a role the caller holds below Developer, the read runs as the role through the data API's connection (rest), so the Postgres database must have the data API on (409 `data_api_disabled`) and the worker's role check applies (403 `role_refused`); the answers are the same.",
         "operationId": "getCell",
         "parameters": [
           {
@@ -6452,7 +6452,7 @@
             }
           },
           "403": {
-            "description": "`forbidden`: below Viewer on the project, or the role isn't in your set; `permission_denied`: the role may not read the column (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "description": "`forbidden`: below Viewer on the project, or the role isn't in your set; `role_refused`: the worker refuses the role (an owner-level role; below Developer only); `permission_denied`: the role may not read the column (SQLSTATE 42501); `tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `viewer`, or you may not act as the requested role: it isn't in your roles or reachable through one of them, or it is the owner, a LOGIN role or an owner-level role (all need `admin`); `required` names what's missing (`role:<name>` for a role); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
             "content": {
               "application/json": {
                 "schema": {
@@ -6472,7 +6472,7 @@
             }
           },
           "409": {
-            "description": "`owner_password_unknown`; `backup_branch`; `branch_not_ready`",
+            "description": "`owner_password_unknown`; `backup_branch`; `branch_not_ready`; `data_api_disabled`: the role is held below Developer and the database's data API is off",
             "content": {
               "application/json": {
                 "schema": {
@@ -10285,7 +10285,7 @@
           "members"
         ],
         "summary": "Make a member a tenant admin, or not",
-        "description": "A tenant admin manages people and projects and is admin on every project. Every branch of the tenant reconciles its member roles.",
+        "description": "A tenant admin manages people and projects and is admin on every project. Demoting one checks what they keep (their own grants, overrides and teams' grants) as any grant is checked. Every branch of the tenant reconciles its member roles.",
         "operationId": "updateMember",
         "parameters": [
           {
@@ -10361,7 +10361,7 @@
             }
           },
           "409": {
-            "description": "`last_tenant_admin`: the tenant would have no active tenant admin; `conflict`: only an active member may become a tenant admin",
+            "description": "`last_tenant_admin`: the tenant would have no active tenant admin; `conflict`: only an active member may become a tenant admin, or the member's access changed twice while a demotion was being checked",
             "content": {
               "application/json": {
                 "schema": {
@@ -10391,7 +10391,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: `tenant_admin` is missing or isn't a boolean",
+            "description": "`invalid_request`: `tenant_admin` is missing or isn't a boolean; or a demotion would leave the member, below Admin, a role they can't hold (`role` names it, with `project_id`, `database_id`, `chain`, `branch_id`, `branch` and `branch_main`, and `team_id` when a team's grant is why)",
             "content": {
               "application/json": {
                 "schema": {
@@ -11039,6 +11039,98 @@
           },
           "503": {
             "description": "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/members/{member_id}/teams": {
+      "get": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "List a member's teams",
+        "description": "The member's teams, by name ignoring case, with their member ids, filtered as `listTeams` is: grants only on the projects the caller can see, Postgres roles only for tenant admins and the project's Admins.",
+        "operationId": "listMemberTeams",
+        "parameters": [
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The member's teams",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Team"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such member (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
             "content": {
               "application/json": {
                 "schema": {
@@ -12396,6 +12488,26 @@
               }
             }
           },
+          "409": {
+            "description": "`conflict`: the member's access kept changing while this was being checked; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: what the member keeps through their teams, narrowed by their overrides, would hold a role that can be held only with the admin platform role (`role`, `database_id`; `chain`, `branch_id`, `branch` and `branch_main` too when its memberships on a branch are why)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -12795,6 +12907,98 @@
           },
           "503": {
             "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/projects/{id}/team-grants": {
+      "get": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "List a project's team grants",
+        "description": "Every team's grant on the project, by team name ignoring case, with the team's members (`listProjectGrants` lists the members' own grants).",
+        "operationId": "listProjectTeamGrants",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The team grants",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectTeamGrantView"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: your role on the project is below `admin` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such project (another tenant's answers the same); `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
             "content": {
               "application/json": {
                 "schema": {
@@ -13947,6 +14151,1015 @@
         ]
       }
     },
+    "/v1/teams": {
+      "get": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "List the tenant's teams",
+        "description": "Every team of the tenant, by name ignoring case, with its member count and its grants on the projects the caller can see (a tenant admin sees all; anyone else the projects where they have any access). A team's Postgres roles on a project are shown only to tenant admins and to Admins of that project; others get `pg_roles: null`. No member ids (`getTeam` has them).",
+        "operationId": "listTeams",
+        "responses": {
+          "200": {
+            "description": "The teams",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Team"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Create a team",
+        "description": "An empty team: no members, no grants. One `team_created` access event.",
+        "operationId": "createTeam",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateTeamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the body isn't well-formed JSON",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`name_taken`: a team of the tenant has this name (ignoring case)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the name is empty or over 80 characters once trimmed, or the description is over 500 characters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/teams/{team_id}": {
+      "get": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Read a team",
+        "description": "The team with its member ids, filtered as `listTeams` is.",
+        "operationId": "getTeam",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Delete a team",
+        "description": "Its members lose what it gave them (their own grants stay), checked first on each member's remaining access as any team write is. Their personal logins that stop qualifying are revoked, and every branch of the team's projects reconciles its member roles. One `team_deleted` access event naming the members it reached.",
+        "operationId": "deleteTeam",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the team's members or grants kept changing while this was being checked; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a member would be left holding a role below admin that can be held only with the admin platform role (`role`, `member_id`, `team_id`, `database_id`; `chain`, `branch_id`, `branch` and `branch_main` too when its memberships on a branch are why)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Rename a team or change its description",
+        "description": "A field left out is unchanged; an unchanged team writes nothing. One `team_updated` access event.",
+        "operationId": "updateTeam",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTeamRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`name_taken`: another team of the tenant has this name (ignoring case)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the name is empty or over 80 characters once trimmed, or the description is over 500 characters",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/teams/{team_id}/grants/{project_id}": {
+      "put": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Give a team access to a project",
+        "description": "Creates or replaces the team's grant on the project; its members get it live, beside their own grants (each Postgres role at the level of the grant naming it). `admin` holds every role (the names in `pg_roles` are checked, then dropped). The grant is checked on every member's union of sources narrowed by their overrides, on every database of the project, as `putProjectGrant` checks one grant; a refusal names the member, the team and the database. Personal logins that stop qualifying are revoked, and every branch of the project reconciles its member roles. An unchanged grant writes nothing.",
+        "operationId": "putTeamGrant",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TeamGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team or project (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`project_deleting`: the project is being deleted; `conflict`: the team's members kept changing while this was being checked; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: the body is over the 2 MB limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`invalid_request`: the request isn't `Content-Type: application/json`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a role can't be granted (`role` names it; `member_id`, `team_id`, `database_id`, `chain`, `branch_id`, `branch` and `branch_main` too when a member's union on a branch is why)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Take a team's access to a project away",
+        "description": "Its members lose what the team gave them there, checked first on each member's remaining access. Also 204 when the team had no grant there (nothing is written).",
+        "operationId": "deleteTeamGrant",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "project_id",
+            "in": "path",
+            "description": "Project id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, or there was none"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team or project (another tenant's answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the team's members kept changing while this was being checked; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: a member would be left holding a role that can be held only with the admin platform role (`role`, `member_id`, `team_id`, `database_id`, …)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/teams/{team_id}/members/{member_id}": {
+      "put": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Add a member to a team",
+        "description": "The member gets the team's grants live, checked first on their union on every database of the team's projects. Also 200 when they are already in (nothing is written).",
+        "operationId": "putTeamMember",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The team",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Team"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team or member (another tenant's, or a removed member, answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the member's sign-up waits for approval (approve it first), or their access kept changing while this was being checked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the member would hold a role that can be held only with the admin platform role (`role`, `member_id`, `team_id`, `database_id`, …)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "teams"
+        ],
+        "summary": "Remove a member from a team",
+        "description": "The member loses what the team gave them, checked first on their remaining access. Also 204 when they weren't in (nothing is written).",
+        "operationId": "deleteTeamMember",
+        "parameters": [
+          {
+            "name": "team_id",
+            "in": "path",
+            "description": "Team id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "member_id",
+            "in": "path",
+            "description": "Member id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed, or wasn't in"
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may (`required`: `tenant admin`); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: no such team or member (another tenant's, or a removed member, answers the same); `not_found`: you were removed from the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: their access kept changing while this was being checked; try again",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: the member would be left holding a role that can be held only with the admin platform role (`role`, `member_id`, `team_id`, `database_id`, …)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/tenant": {
       "patch": {
         "tags": [
@@ -14088,7 +15301,7 @@
         "properties": {
           "action": {
             "type": "string",
-            "description": "`member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,\n`member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,\n`invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,\n`open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,\n`member_suspended`, `member_reinstated`, `personal_logins_revoked`,\n`personal_login_created`, `personal_login_reset`, `personal_login_deleted`,\n`role_created`, `role_updated` or `role_deleted`."
+            "description": "`member_joined`, `member_added`, `admin_claimed`, `admin_set`, `admin_unset`,\n`member_removed`, `grant_put`, `grant_deleted`, `override_put`, `override_deleted`,\n`invite_created`, `invite_resent`, `invite_revoked`, `invite_accepted`,\n`open_signup_set`, `tenant_renamed`, `member_approved`, `member_declined`,\n`member_suspended`, `member_reinstated`, `personal_logins_revoked`,\n`personal_login_created`, `personal_login_reset`, `personal_login_deleted`,\n`role_created`, `role_updated`, `role_deleted`, `team_created`, `team_updated`,\n`team_deleted`, `team_grant_put`, `team_grant_deleted`, `team_member_added` or\n`team_member_removed`. A team event's `before`/`after` carries the team, the grants it\nconcerns and `affected_member_ids` (empty in a project's log)."
           },
           "actor_email": {
             "type": [
@@ -14209,7 +15422,9 @@
       "AccessVia": {
         "type": "string",
         "enum": [
-          "own"
+          "own",
+          "team",
+          "both"
         ]
       },
       "AcknowledgeReviewRequest": {
@@ -14451,6 +15666,14 @@
               "$ref": "#/components/schemas/InviteGrant"
             },
             "description": "One grant per project at most; none is fine (the person starts with no access). Checked\nas an invite's grants are."
+          },
+          "team_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Teams of the tenant the member joins (at most 50 after duplicates are dropped); empty is\nnone. Checked with the grants on the member's union, as an invite's are."
           }
         }
       },
@@ -15587,6 +16810,14 @@
               "$ref": "#/components/schemas/InviteGrant"
             },
             "description": "One grant per project at most; none is fine (the person starts with no access)."
+          },
+          "team_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Teams of the tenant the person joins (at most 50 after duplicates are dropped; each\nmust be a team of the tenant, else 422 naming it in `team_id`); empty is none. The\ngrants and the teams are checked together on the person's union, per project."
           }
         }
       },
@@ -15661,6 +16892,17 @@
           },
           "platform_role": {
             "$ref": "#/components/schemas/PlatformRole"
+          },
+          "team_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "Refused in any form, `[]` and `null` included (422 `invalid_request`): only a tenant\nadmin's invite (`createInvite`) attaches teams (MH-8)."
           }
         }
       },
@@ -15822,6 +17064,22 @@
           }
         },
         "additionalProperties": false
+      },
+      "CreateTeamRequest": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "At most 500 characters. Default empty."
+          },
+          "name": {
+            "type": "string",
+            "description": "Trimmed; 1 to 80 characters, unique in the tenant ignoring case."
+          }
+        }
       },
       "CreatedDataKey": {
         "type": "object",
@@ -17163,6 +18421,16 @@
             "$ref": "#/components/schemas/PlatformRole",
             "description": "The effective platform role: the grant's, or the lower one the override sets."
           },
+          "role_levels": {
+            "type": "object",
+            "description": "The level each named role is held at on this database, after the override.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PlatformRole"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "roles": {
             "$ref": "#/components/schemas/MeRoles",
             "description": "The effective Postgres roles (`owner` only with the admin role)."
@@ -17211,6 +18479,16 @@
           },
           "project_id": {
             "$ref": "#/components/schemas/ProjectId"
+          },
+          "role_levels": {
+            "type": "object",
+            "description": "The level each named role is held at (`viewer`, `developer`, `admin`; D1). With `roles`\n`\"all\"` only the roles held below the platform role are listed (a data API role a grant\nnames); every other role is at `platform_role`.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/PlatformRole"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "roles": {
             "$ref": "#/components/schemas/MeRoles",
@@ -17461,7 +18739,7 @@
           },
           "via": {
             "$ref": "#/components/schemas/AccessVia",
-            "description": "Where the role comes from: always `own` (the member's own grant; a tenant admin's\nadmin is listed the same way)."
+            "description": "Where the role comes from: `own` (the member's own grant; a tenant admin's admin is\nlisted the same way), `team` (only through teams) or `both`. The role is the best\nsource's."
           }
         }
       },
@@ -19662,6 +20940,44 @@
           "deleting"
         ]
       },
+      "ProjectTeamGrantView": {
+        "type": "object",
+        "description": "One team's grant on a project, with the team's members (`listProjectTeamGrants`).",
+        "required": [
+          "team_id",
+          "name",
+          "platform_role",
+          "pg_roles",
+          "member_ids"
+        ],
+        "properties": {
+          "member_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "By id."
+          },
+          "name": {
+            "type": "string"
+          },
+          "pg_roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Sorted; none for `admin`, which holds every role."
+          },
+          "platform_role": {
+            "$ref": "#/components/schemas/PlatformRole"
+          },
+          "team_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
       "PutAppUsersRequest": {
         "type": "object",
         "required": [
@@ -21044,6 +22360,108 @@
         },
         "additionalProperties": false
       },
+      "Team": {
+        "type": "object",
+        "description": "A team of the tenant.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "member_count",
+          "projects",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "description": {
+            "type": "string",
+            "description": "At most 500 characters; empty when it has none."
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "member_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "member_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "description": "The members' ids, by id. In `getTeam`, the writes' answers and `listMemberTeams`; absent\nfrom `listTeams`."
+          },
+          "name": {
+            "type": "string",
+            "description": "Trimmed, 1 to 80 characters, unique in the tenant ignoring case."
+          },
+          "projects": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TeamProjectAccess"
+            },
+            "description": "The team's grants on the projects the caller can see, by project id."
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "TeamGrantRequest": {
+        "type": "object",
+        "required": [
+          "platform_role"
+        ],
+        "properties": {
+          "pg_roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Postgres role names; for `admin`, which holds every role (R17), checked and dropped.\nNever `owner` or the database's owner, a reserved name or a personal login. Below admin,\nonly NOLOGIN groups whose memberships reach no owner-level, LOGIN or reserved role, for\nevery member of the team on every database (with their own grant and overrides)."
+          },
+          "platform_role": {
+            "$ref": "#/components/schemas/PlatformRole"
+          }
+        }
+      },
+      "TeamProjectAccess": {
+        "type": "object",
+        "description": "What a team gives its members on one project.",
+        "required": [
+          "project_id",
+          "platform_role",
+          "pg_roles"
+        ],
+        "properties": {
+          "pg_roles": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The Postgres roles, sorted (none for `admin`, which holds every role); `null` unless\nthe caller is a tenant admin or an Admin of the project."
+          },
+          "platform_role": {
+            "$ref": "#/components/schemas/PlatformRole"
+          },
+          "project_id": {
+            "$ref": "#/components/schemas/ProjectId"
+          }
+        }
+      },
       "Tenant": {
         "type": "object",
         "required": [
@@ -21524,6 +22942,25 @@
           }
         },
         "additionalProperties": false
+      },
+      "UpdateTeamRequest": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "At most 500 characters. Left out: unchanged."
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Trimmed; 1 to 80 characters, unique in the tenant ignoring case. Left out: unchanged."
+          }
+        }
       },
       "UpdateTenantRequest": {
         "type": "object",

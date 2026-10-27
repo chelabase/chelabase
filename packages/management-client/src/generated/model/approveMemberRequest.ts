@@ -15,4 +15,9 @@ export interface ApproveMemberRequest {
      * as an invite's grants are.
      */
   grants?: InviteGrant[];
+  /**
+     * Teams of the tenant the member joins (at most 50 after duplicates are dropped); empty is
+     * none. Checked with the grants on the member's union, as an invite's are.
+     */
+  team_ids?: string[];
 }

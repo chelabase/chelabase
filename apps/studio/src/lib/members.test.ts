@@ -181,3 +181,55 @@ describe("eventFields", () => {
     expect(eventFields({ pg_roles: [] }, ctx)).toEqual([{ label: "Postgres roles", value: "None" }]);
   });
 });
+
+describe("team events", () => {
+  const ctx = { names: new Map([["m1", "Ana"], ["m2", "Bo"]]), databaseName: () => null, projectName: (id: string) => (id === "p1" ? "Shop" : null) };
+  const team = { id: "t1", name: "Billing" };
+  const grant = (platform_role: string, pg_roles: string[] = []) => ({ project_id: "p1", platform_role, pg_roles });
+  const say = (extra: Partial<AccessEvent>) => eventSentence(event(extra), ctx);
+
+  it("team_events_have_words", () => {
+    expect(say({ action: "team_created", target_member_id: null, target_email: null, after: { team, grants: [], affected_member_ids: [] } })).toBe("Ana created the team Billing");
+    expect(say({ action: "team_updated", target_member_id: null, target_email: null, before: { team }, after: { team: { id: "t1", name: "Finance" } } })).toBe(
+      "Ana renamed the team Billing to Finance",
+    );
+    expect(say({ action: "team_updated", target_member_id: null, target_email: null, before: { team }, after: { team } })).toBe("Ana changed the team Billing");
+    expect(say({ action: "team_deleted", target_member_id: null, target_email: null, before: { team, grants: [], affected_member_ids: ["m2"] } })).toBe("Ana deleted the team Billing");
+    expect(say({ action: "team_grant_put", target_member_id: null, target_email: null, after: { team, grants: [grant("developer")] } })).toBe("Ana gave the team Billing Developer on Shop");
+    expect(
+      say({ action: "team_grant_put", target_member_id: null, target_email: null, before: { team, grants: [grant("viewer")] }, after: { team, grants: [grant("admin")] } }),
+    ).toBe("Ana changed the team Billing's access on Shop: Viewer → Admin");
+    expect(
+      say({ action: "team_grant_put", target_member_id: null, target_email: null, before: { team, grants: [grant("developer", ["a"])] }, after: { team, grants: [grant("developer", ["b"])] } }),
+    ).toBe("Ana changed the team Billing's Postgres roles on Shop");
+    expect(say({ action: "team_grant_deleted", target_member_id: null, target_email: null, before: { team, grants: [grant("viewer")] } })).toBe("Ana took the team Billing's access to Shop away");
+    expect(say({ action: "team_member_added", after: { team, affected_member_ids: ["m2"] } })).toBe("Ana added Bo to the team Billing");
+    expect(say({ action: "team_member_removed", target_member_id: "m2", before: { team } })).toBe("Ana removed Bo from the team Billing");
+  });
+
+  it("team_names_are_escaped_in_sentences_and_fields", () => {
+    const odd = { id: "t1", name: "Bi\u202Eg\\" };
+    const shown = "Bi\\u202eg\\\\";
+    expect(say({ action: "team_created", target_member_id: null, target_email: null, after: { team: odd, grants: [], affected_member_ids: [] } })).toBe(`Ana created the team ${shown}`);
+    expect(say({ action: "team_updated", target_member_id: null, target_email: null, before: { team: odd }, after: { team } })).toBe(`Ana renamed the team ${shown} to Billing`);
+    expect(say({ action: "team_member_added", after: { team: odd, affected_member_ids: ["m2"] } })).toBe(`Ana added Bo to the team ${shown}`);
+    expect(eventFields({ team: odd }, ctx)).toEqual([{ label: "Team", value: shown }]);
+  });
+
+  it("falls_back_when_the_team_or_project_is_gone", () => {
+    expect(say({ action: "team_deleted", target_member_id: null, target_email: null })).toBe("Ana deleted the team a deleted team");
+    expect(say({ action: "team_grant_deleted", target_member_id: null, target_email: null, before: { team, grants: [{ ...grant("viewer"), project_id: "gone" }] } })).toBe(
+      "Ana took the team Billing's access to a deleted project away",
+    );
+  });
+
+  it("shows_the_team_and_who_it_reaches_as_fields_and_nothing_for_a_projects_empty_list", () => {
+    expect(eventFields({ team, grants: [grant("viewer")], affected_member_ids: ["m1", "m2", "zz"] }, ctx, "team_grant_put")).toEqual([
+      { label: "Team", value: "Billing" },
+      { label: "Access", value: "Viewer on Shop" },
+      { label: "People reached", value: "Ana, Bo, a former member" },
+    ]);
+    expect(eventFields({ team, affected_member_ids: [] }, ctx).map((f) => f.label)).toEqual(["Team"]);
+  });
+});
+

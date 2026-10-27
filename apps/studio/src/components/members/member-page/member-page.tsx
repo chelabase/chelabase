@@ -16,6 +16,7 @@ import { MemberActivity } from "./member-activity";
 import { dateText, firstName } from "./logins";
 import { PersonalLogins } from "./personal-logins";
 import { ProjectAccess } from "./project-access";
+import { TeamsSection } from "./teams-section";
 
 export interface MemberPageProps {
   memberId: string;
@@ -150,6 +151,7 @@ function Page({ member, me, roster }: { member: Member; me: MeResponse; roster: 
 
       <ProjectAccess member={member} me={me} self={self} suspended={suspended} onStatus={setStatus} />
       {(self || admin) && <PersonalLogins member={member} me={me} self={self} />}
+      <TeamsSection member={member} tenantAdmin={tenantAdmin && !self} onStatus={setStatus} />
       {admin && <MemberActivity member={member} me={me} members={roster} tenantAdmin={tenantAdmin} />}
     </>
   );

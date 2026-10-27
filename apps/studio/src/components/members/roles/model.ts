@@ -9,6 +9,7 @@ import type {
   PrivilegesPage,
   PrivilegeTarget,
   ProjectGrant,
+  ProjectTeamGrantView,
   SchemaPrivileges,
 } from "@chelabase/management-client";
 import { closure, actAsReserved } from "@/lib/role-rules";
@@ -64,6 +65,10 @@ export interface Holder {
   memberId: string;
   /** The granted role it comes through; null when the grant names the role itself. */
   via: string | null;
+  /** The team whose grant gives it (step 2); absent for the member's own grant. */
+  team?: string;
+  /** That team's id, to link it. */
+  teamId?: string;
 }
 
 /** The Postgres roles a grant gives on one database: its override's when that narrows them. `"all"` (Admin) is none here. */
@@ -89,6 +94,47 @@ export function holdersOf(role: string, grants: readonly ProjectGrant[], databas
     if (via !== undefined) out.push({ memberId: g.member_id, via });
   }
   return out;
+}
+
+/**
+ * Holders through teams (P15): each member of a team whose grant names `role`, or a role whose chain
+ * reaches it, as "via <team>". Members who are Admin (an own Admin grant, or Admin through any team) already
+ * hold everything and are left out (Admins aren't listed as holders); a team with Admin gives every role and
+ * isn't listed either. The member's override on `databaseId` narrows what a team gives: its role list
+ * intersects the roles the team names (`null` leaves them whole).
+ */
+export function teamHoldersOf(
+  role: string,
+  teamGrants: readonly ProjectTeamGrantView[],
+  rows: readonly BranchRole[],
+  ownGrants: readonly ProjectGrant[],
+  databaseId: string,
+): Holder[] {
+  const admins = new Set(ownGrants.filter((g) => g.platform_role === "admin").map((g) => g.member_id));
+  for (const t of teamGrants) if (t.platform_role === "admin") for (const id of t.member_ids) admins.add(id);
+  const narrowing = new Map(ownGrants.map((g) => [g.member_id, g.overrides.find((o) => o.database_id === databaseId)?.pg_roles ?? null]));
+  const out: Holder[] = [];
+  for (const t of teamGrants) {
+    if (t.platform_role === "admin") continue;
+    for (const memberId of t.member_ids) {
+      if (admins.has(memberId)) continue;
+      const cap = narrowing.get(memberId) ?? null;
+      const named = cap === null ? t.pg_roles : t.pg_roles.filter((r) => cap.includes(r));
+      if (named.includes(role)) out.push({ memberId, via: null, team: t.name, teamId: t.team_id });
+      else {
+        const through = named.find((r) => closure(rows, r).has(role));
+        if (through !== undefined) out.push({ memberId, via: through, team: t.name, teamId: t.team_id });
+      }
+    }
+  }
+  return out;
+}
+
+/** One entry per member, in first-seen order, with every source that gives them the role. */
+export function holdersByMember(holders: readonly Holder[]): { memberId: string; sources: Holder[] }[] {
+  const byId = new Map<string, Holder[]>();
+  for (const h of holders) byId.set(h.memberId, [...(byId.get(h.memberId) ?? []), h]);
+  return [...byId].map(([memberId, sources]) => ({ memberId, sources }));
 }
 
 export const membersText = (n: number) => (n === 0 ? "No members" : plural(n, "member"));

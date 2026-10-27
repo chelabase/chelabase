@@ -7,7 +7,7 @@ A tenant is one team's workspace. Everyone in it is a **member**, and what a mem
 
 ## Roles
 
-**Tenant admin** is a flag on a member. A tenant admin sees every project, creates projects, manages members and invites, and counts as **Admin with every Postgres role (the database owner included)** on every project. A tenant always keeps at least one active tenant admin: demoting or removing the last one is refused with 409 `last_tenant_admin`, and an admin can't remove themselves.
+**Tenant admin** is a flag on a member. A tenant admin sees every project, creates projects, manages members and invites, and counts as **Admin with every Postgres role (the database owner included)** on every project. A tenant always keeps at least one active tenant admin: demoting or removing the last one is refused with 409 `last_tenant_admin`, and an admin can't remove themselves. Demoting a tenant admin checks what they keep (their own grants, overrides and teams' grants, on every project and database) exactly as a grant is checked: if it would leave them a role they can only hold as Admin, the demotion is refused with 422 `invalid_request` naming the `role`, its `project_id` and `database_id`, and the `team_id` when a team's grant is why. Change that access first, then demote.
 
 A grant gives a member a **platform role** on one project:
 
@@ -28,6 +28,55 @@ A grant also lists the **Postgres roles** the member may act as in the SQL edito
 ### Per-database overrides
 
 A project grant applies to every database in the project. An **override** narrows it for one Chelabase database. Overrides are per Chelabase database only, never per Postgres database inside it: to restrict within a database, use Postgres privileges. In Studio, a project's Access tab has **Per database**, where each line offers **Narrow** (and **Stop narrowing** once narrowed). `GET /v1/me` lists the narrowed databases per project (`projects[].databases`). The effective grant is the project grant intersected with the override: the platform role is the lower of the two and the role set is the overlap. An override can never widen access, even after the project grant changes later. Narrowing an Admin to Developer takes the owner away in that database. An Admin's every role narrows like this: an override naming roles keeps only those there (with the owner while still Admin); an override down to Developer or Viewer without naming roles leaves no roles there. A tenant admin is never narrowed.
+
+## Teams
+
+A **team** is a named set of members that holds grants of its own. Studio's **Members › Teams** tab lists them, and a team's page edits its members and its project access.
+
+- **Shape.** A name (trimmed, 1 to 80 characters, unique in the tenant ignoring case; a taken name is 409 `name_taken`) and a description (up to 500 characters). A new team has no members and no grants.
+- **Team grants** have a project grant's shape: a platform role and Postgres roles, with the same rules (an Admin grant lists no roles, `owner` is never listed, and roles that are owner-level, `LOGIN` or reserved are refused below Admin). A team may be granted Admin. Teams carry no per-database overrides.
+- **Live-linked.** A member's effective access is their own grant on the project plus the grants of every team they belong to. Nothing is copied: add a member to a team, change the team's grant or remove the grant, and every member it reaches changes at once. Their SQL editor role, personal logins, realtime and proxy caches are reconciled as for any other grant change.
+- **Per-role levels.** Each Postgres role keeps the highest level among the sources that name it, and acting as a role needs that role's level. Example: a member holds Developer with `billing_editor` through their own grant and Viewer with `billing_reader` through a team. They may run SQL as `billing_editor`, but `billing_reader` is held only at Viewer, so it never reaches the SQL editor or a personal login (those take roles held at Developer or above). The platform role is the best level among the sources.
+- **Overrides narrow afterwards.** The member's per-database overrides apply to the combined access, as they do to a single grant: the platform role is the lower of the two and the role set is the overlap.
+- **Admin from any source** is Admin on the project, holding every Postgres role.
+- **Checked on the combined access.** Every team write (grant, membership change) is checked for every affected member and database. A change that would leave any member holding a role the rules above refuse is rejected with 422, naming the member, the database and the team. Own-grant and override writes are checked on the combined access too. A write that loses a race with another is retried, then answered 409 `conflict`.
+- **Visibility.** Any member reads `GET /v1/teams` and `GET /v1/teams/{team_id}`. A tenant admin sees every project of a team; anyone else sees only the projects where they have access. A team's Postgres roles on a project are shown only to tenant admins and to Admins of that project; others get `pg_roles: null`.
+- **Removing a member** from the tenant takes them out of their teams in the same transaction, and the log's `member_removed` event records the teams they were in.
+
+The routes (all `tenant admin` to write, any member to read; see [Access per route](/docs/reference/access)):
+
+| Route | Does |
+|---|---|
+| `GET /v1/teams` | List teams with member counts and grants on visible projects |
+| `POST /v1/teams` | Create (`{"name": "Billing", "description": "…"}`), 201 |
+| `GET /v1/teams/{team_id}` | One team, with `member_ids` |
+| `PATCH /v1/teams/{team_id}` | Rename or change the description |
+| `DELETE /v1/teams/{team_id}` | Delete, 204; its members lose what it gave them |
+| `PUT /v1/teams/{team_id}/grants/{project_id}` | Give the team access to a project, body `{"platform_role": "developer", "pg_roles": ["billing_editor"]}` |
+| `DELETE /v1/teams/{team_id}/grants/{project_id}` | Take it away, 204 (also when there was none) |
+| `PUT /v1/teams/{team_id}/members/{member_id}` | Add a member, 200 (also when already in); a pending member is 409 |
+| `DELETE /v1/teams/{team_id}/members/{member_id}` | Remove a member, 204 (also when not in) |
+| `GET /v1/members/{member_id}/teams` | A member's teams, with each team's grants on the projects you can see |
+| `GET /v1/projects/{id}/team-grants` | Project Admin: the teams granted on a project, with their `member_ids` |
+
+An unknown team, project or member, or one of another tenant, is 404. Membership is edited one member at a time. For example:
+
+```bash
+curl -X POST "$API/v1/teams" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d '{"name": "Billing"}'
+
+curl -X PUT "$API/v1/teams/$TEAM/grants/$PROJECT" -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"platform_role": "developer", "pg_roles": ["billing_editor"]}'
+
+curl -X PUT "$API/v1/teams/$TEAM/members/$MEMBER" -H "Authorization: Bearer $TOKEN"
+```
+
+`GET /v1/members` reports, per project, whether a member's access is `own`, `team` or `both` (`via`). Team events (`team_created`, `team_updated`, `team_deleted`, `team_grant_put`, `team_grant_deleted`, `team_member_added`, `team_member_removed`) appear in the access log; a member's Activity (`member_id` filter) includes team events that reached them, and a project's log hides who else a team reaches.
+
+### Teams on invites and approvals
+
+A tenant admin's invite (`POST /v1/invites`) and an approval (`POST /v1/members/{id}/approve`) accept `team_ids`: up to 50 teams of the tenant (duplicates dropped; an unknown or foreign id is 422 naming it). The memberships are written in the same transaction as the grants, and the grants and teams are checked together on the combined access. This holds for a new invitee, a person already in the organization and an existing member. The **project invite** (`POST /v1/projects/{id}/invites`) refuses `team_ids` in any form, `[]` and `null` included: 422 `invalid_request`, because only a tenant admin's invite attaches teams.
 
 ### What a member without a grant sees
 

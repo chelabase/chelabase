@@ -5,6 +5,7 @@
  * OpenAPI spec version: 1
  */
 import type { DatabaseId } from './databaseId.ts';
+import type { MeDatabaseRoleLevels } from './meDatabaseRoleLevels.ts';
 import type { MeRoles } from './meRoles.ts';
 import type { PlatformRole } from './platformRole.ts';
 
@@ -15,6 +16,8 @@ export interface MeDatabase {
   database_id: DatabaseId;
   /** The effective platform role: the grant's, or the lower one the override sets. */
   platform_role: PlatformRole;
+  /** The level each named role is held at on this database, after the override. */
+  role_levels?: MeDatabaseRoleLevels;
   /** The effective Postgres roles (`owner` only with the admin role). */
   roles: MeRoles;
 }

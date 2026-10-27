@@ -51,6 +51,7 @@ import type {
   CreateProjectRequest,
   CreateRoleRequest,
   CreateSavedQueryRequest,
+  CreateTeamRequest,
   CreatedDataKey,
   DataApiSchema,
   DataKey,
@@ -96,6 +97,7 @@ import type {
   PrivilegesPage,
   ProjectGrant,
   ProjectInfo,
+  ProjectTeamGrantView,
   PutAppUsersRequest,
   PutGrantOverrideRequest,
   PutGrantRequest,
@@ -118,6 +120,8 @@ import type {
   SavedQuerySummary,
   SchemaChangeRequest,
   SchemaChangeResponse,
+  Team,
+  TeamGrantRequest,
   TenantName,
   TypeCatalog,
   UpdateAppUserRequest,
@@ -131,6 +135,7 @@ import type {
   UpdateProjectRequest,
   UpdateRoleRequest,
   UpdateSavedQueryRequest,
+  UpdateTeamRequest,
   UpdateTenantRequest
 } from './model';
 
@@ -4677,7 +4682,7 @@ export const getGetCellUrl = (id: string,
 }
 
 /**
- * The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413.
+ * The whole value of one column of the row with the given primary key, as text (a grid's preview cuts long values). `key` names exactly the primary key's columns; strings bind as given, numbers and booleans as their JSON text, compared at the column's type without its length or precision (never cut or rounded to fit). A value over 64 MiB is 413. Read as a role the caller holds below Developer, the read runs as the role through the data API's connection (rest), so the Postgres database must have the data API on (409 `data_api_disabled`) and the worker's role check applies (403 `role_refused`); the answers are the same.
  * @summary One cell's full value
  */
 export const getCell = async (id: string,
@@ -7833,7 +7838,7 @@ export const getUpdateMemberUrl = (memberId: string,) => {
 }
 
 /**
- * A tenant admin manages people and projects and is admin on every project. Every branch of the tenant reconciles its member roles.
+ * A tenant admin manages people and projects and is admin on every project. Demoting one checks what they keep (their own grants, overrides and teams' grants) as any grant is checked. Every branch of the tenant reconciles its member roles.
  * @summary Make a member a tenant admin, or not
  */
 export const updateMember = async (memberId: string,
@@ -8405,6 +8410,108 @@ export const useSuspendMember = <TError = ErrorType<ErrorEnvelope>,
       > => {
       return useMutation(getSuspendMemberMutationOptions(options), queryClient);
     }
+
+export const getListMemberTeamsUrl = (memberId: string,) => {
+
+
+
+
+  return `/v1/members/${encodeURIComponent(String(memberId))}/teams`
+}
+
+/**
+ * The member's teams, by name ignoring case, with their member ids, filtered as `listTeams` is: grants only on the projects the caller can see, Postgres roles only for tenant admins and the project's Admins.
+ * @summary List a member's teams
+ */
+export const listMemberTeams = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Team[]> => {
+
+  return customFetch<Team[]>(getListMemberTeamsUrl(memberId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListMemberTeamsQueryKey = (memberId: string,) => {
+    return [
+    `/v1/members/${memberId}/teams`
+    ] as const;
+    }
+
+
+export const getListMemberTeamsQueryOptions = <TData = Awaited<ReturnType<typeof listMemberTeams>>, TError = ErrorType<ErrorEnvelope>>(memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListMemberTeamsQueryKey(memberId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listMemberTeams>>> = ({ signal }) => listMemberTeams(memberId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: memberId !== null && memberId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListMemberTeamsQueryResult = NonNullable<Awaited<ReturnType<typeof listMemberTeams>>>
+export type ListMemberTeamsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListMemberTeams<TData = Awaited<ReturnType<typeof listMemberTeams>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMemberTeams>>,
+          TError,
+          Awaited<ReturnType<typeof listMemberTeams>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMemberTeams<TData = Awaited<ReturnType<typeof listMemberTeams>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listMemberTeams>>,
+          TError,
+          Awaited<ReturnType<typeof listMemberTeams>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListMemberTeams<TData = Awaited<ReturnType<typeof listMemberTeams>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a member's teams
+ */
+
+export function useListMemberTeams<TData = Awaited<ReturnType<typeof listMemberTeams>>, TError = ErrorType<ErrorEnvelope>>(
+ memberId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listMemberTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListMemberTeamsQueryOptions(memberId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 
 export const getListProjectsUrl = () => {
 
@@ -9798,6 +9905,108 @@ export const useCreateProjectInvite = <TError = ErrorType<ErrorEnvelope>,
       return useMutation(getCreateProjectInviteMutationOptions(options), queryClient);
     }
 
+export const getListProjectTeamGrantsUrl = (id: string,) => {
+
+
+
+
+  return `/v1/projects/${encodeURIComponent(String(id))}/team-grants`
+}
+
+/**
+ * Every team's grant on the project, by team name ignoring case, with the team's members (`listProjectGrants` lists the members' own grants).
+ * @summary List a project's team grants
+ */
+export const listProjectTeamGrants = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<ProjectTeamGrantView[]> => {
+
+  return customFetch<ProjectTeamGrantView[]>(getListProjectTeamGrantsUrl(id),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListProjectTeamGrantsQueryKey = (id: string,) => {
+    return [
+    `/v1/projects/${id}/team-grants`
+    ] as const;
+    }
+
+
+export const getListProjectTeamGrantsQueryOptions = <TData = Awaited<ReturnType<typeof listProjectTeamGrants>>, TError = ErrorType<ErrorEnvelope>>(id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListProjectTeamGrantsQueryKey(id);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listProjectTeamGrants>>> = ({ signal }) => listProjectTeamGrants(id, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListProjectTeamGrantsQueryResult = NonNullable<Awaited<ReturnType<typeof listProjectTeamGrants>>>
+export type ListProjectTeamGrantsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListProjectTeamGrants<TData = Awaited<ReturnType<typeof listProjectTeamGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectTeamGrants>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectTeamGrants>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectTeamGrants<TData = Awaited<ReturnType<typeof listProjectTeamGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listProjectTeamGrants>>,
+          TError,
+          Awaited<ReturnType<typeof listProjectTeamGrants>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListProjectTeamGrants<TData = Awaited<ReturnType<typeof listProjectTeamGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List a project's team grants
+ */
+
+export function useListProjectTeamGrants<TData = Awaited<ReturnType<typeof listProjectTeamGrants>>, TError = ErrorType<ErrorEnvelope>>(
+ id: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listProjectTeamGrants>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListProjectTeamGrantsQueryOptions(id,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
 export const getListAppUsersUrl = (id: string,
     params?: ListAppUsersParams,) => {
   const normalizedParams = new URLSearchParams();
@@ -10619,6 +10828,787 @@ export const useRevokeAppUserSessions = <TError = ErrorType<ErrorEnvelope>,
         TContext
       > => {
       return useMutation(getRevokeAppUserSessionsMutationOptions(options), queryClient);
+    }
+
+export const getListTeamsUrl = () => {
+
+
+
+
+  return `/v1/teams`
+}
+
+/**
+ * Every team of the tenant, by name ignoring case, with its member count and its grants on the projects the caller can see (a tenant admin sees all; anyone else the projects where they have any access). A team's Postgres roles on a project are shown only to tenant admins and to Admins of that project; others get `pg_roles: null`. No member ids (`getTeam` has them).
+ * @summary List the tenant's teams
+ */
+export const listTeams = async ( options?: Parameters<typeof customFetch>[1]): Promise<Team[]> => {
+
+  return customFetch<Team[]>(getListTeamsUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getListTeamsQueryKey = () => {
+    return [
+    `/v1/teams`
+    ] as const;
+    }
+
+
+export const getListTeamsQueryOptions = <TData = Awaited<ReturnType<typeof listTeams>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getListTeamsQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof listTeams>>> = ({ signal }) => listTeams({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type ListTeamsQueryResult = NonNullable<Awaited<ReturnType<typeof listTeams>>>
+export type ListTeamsQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useListTeams<TData = Awaited<ReturnType<typeof listTeams>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listTeams>>,
+          TError,
+          Awaited<ReturnType<typeof listTeams>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListTeams<TData = Awaited<ReturnType<typeof listTeams>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof listTeams>>,
+          TError,
+          Awaited<ReturnType<typeof listTeams>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useListTeams<TData = Awaited<ReturnType<typeof listTeams>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary List the tenant's teams
+ */
+
+export function useListTeams<TData = Awaited<ReturnType<typeof listTeams>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof listTeams>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getListTeamsQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getCreateTeamUrl = () => {
+
+
+
+
+  return `/v1/teams`
+}
+
+/**
+ * An empty team: no members, no grants. One `team_created` access event.
+ * @summary Create a team
+ */
+export const createTeam = async (createTeamRequest: CreateTeamRequest, options?: Parameters<typeof customFetch>[1]): Promise<Team> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Team>(getCreateTeamUrl(),
+  {
+    ...options,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(createTeamRequest)
+  }
+);}
+
+
+
+
+
+export const getCreateTeamMutationKey = () => ['createTeam'] as const;
+
+export const getCreateTeamMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createTeam>>, TError,CreateTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof createTeam>>, TError,CreateTeamMutationVariables, TContext> => {
+
+const mutationKey = getCreateTeamMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof createTeam>>, CreateTeamMutationVariables> = (props) => {
+          const {data} = props ?? {};
+
+          return  createTeam(data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type CreateTeamMutationResult = NonNullable<Awaited<ReturnType<typeof createTeam>>>
+    export type CreateTeamMutationBody = CreateTeamRequest
+    export type CreateTeamMutationError = ErrorType<ErrorEnvelope>
+    export type CreateTeamMutationVariables = {data: CreateTeamRequest}
+
+    /**
+ * @summary Create a team
+ */
+export const useCreateTeam = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof createTeam>>, TError,CreateTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof createTeam>>,
+        TError,
+        CreateTeamMutationVariables,
+        TContext
+      > => {
+      return useMutation(getCreateTeamMutationOptions(options), queryClient);
+    }
+
+export const getGetTeamUrl = (teamId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}`
+}
+
+/**
+ * The team with its member ids, filtered as `listTeams` is.
+ * @summary Read a team
+ */
+export const getTeam = async (teamId: string, options?: Parameters<typeof customFetch>[1]): Promise<Team> => {
+
+  return customFetch<Team>(getGetTeamUrl(teamId),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetTeamQueryKey = (teamId: string,) => {
+    return [
+    `/v1/teams/${teamId}`
+    ] as const;
+    }
+
+
+export const getGetTeamQueryOptions = <TData = Awaited<ReturnType<typeof getTeam>>, TError = ErrorType<ErrorEnvelope>>(teamId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetTeamQueryKey(teamId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getTeam>>> = ({ signal }) => getTeam(teamId, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: teamId !== null && teamId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetTeamQueryResult = NonNullable<Awaited<ReturnType<typeof getTeam>>>
+export type GetTeamQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetTeam<TData = Awaited<ReturnType<typeof getTeam>>, TError = ErrorType<ErrorEnvelope>>(
+ teamId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getTeam>>,
+          TError,
+          Awaited<ReturnType<typeof getTeam>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetTeam<TData = Awaited<ReturnType<typeof getTeam>>, TError = ErrorType<ErrorEnvelope>>(
+ teamId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getTeam>>,
+          TError,
+          Awaited<ReturnType<typeof getTeam>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetTeam<TData = Awaited<ReturnType<typeof getTeam>>, TError = ErrorType<ErrorEnvelope>>(
+ teamId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary Read a team
+ */
+
+export function useGetTeam<TData = Awaited<ReturnType<typeof getTeam>>, TError = ErrorType<ErrorEnvelope>>(
+ teamId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getTeam>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetTeamQueryOptions(teamId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getDeleteTeamUrl = (teamId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}`
+}
+
+/**
+ * Its members lose what it gave them (their own grants stay), checked first on each member's remaining access as any team write is. Their personal logins that stop qualifying are revoked, and every branch of the team's projects reconciles its member roles. One `team_deleted` access event naming the members it reached.
+ * @summary Delete a team
+ */
+export const deleteTeam = async (teamId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteTeamUrl(teamId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteTeamMutationKey = () => ['deleteTeam'] as const;
+
+export const getDeleteTeamMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeam>>, TError,DeleteTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteTeam>>, TError,DeleteTeamMutationVariables, TContext> => {
+
+const mutationKey = getDeleteTeamMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteTeam>>, DeleteTeamMutationVariables> = (props) => {
+          const {teamId} = props ?? {};
+
+          return  deleteTeam(teamId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteTeamMutationResult = NonNullable<Awaited<ReturnType<typeof deleteTeam>>>
+
+    export type DeleteTeamMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteTeamMutationVariables = {teamId: string}
+
+    /**
+ * @summary Delete a team
+ */
+export const useDeleteTeam = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeam>>, TError,DeleteTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteTeam>>,
+        TError,
+        DeleteTeamMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteTeamMutationOptions(options), queryClient);
+    }
+
+export const getUpdateTeamUrl = (teamId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}`
+}
+
+/**
+ * A field left out is unchanged; an unchanged team writes nothing. One `team_updated` access event.
+ * @summary Rename a team or change its description
+ */
+export const updateTeam = async (teamId: string,
+    updateTeamRequest: UpdateTeamRequest, options?: Parameters<typeof customFetch>[1]): Promise<Team> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Team>(getUpdateTeamUrl(teamId),
+  {
+    ...options,
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(updateTeamRequest)
+  }
+);}
+
+
+
+
+
+export const getUpdateTeamMutationKey = () => ['updateTeam'] as const;
+
+export const getUpdateTeamMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateTeam>>, TError,UpdateTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof updateTeam>>, TError,UpdateTeamMutationVariables, TContext> => {
+
+const mutationKey = getUpdateTeamMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof updateTeam>>, UpdateTeamMutationVariables> = (props) => {
+          const {teamId,data} = props ?? {};
+
+          return  updateTeam(teamId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type UpdateTeamMutationResult = NonNullable<Awaited<ReturnType<typeof updateTeam>>>
+    export type UpdateTeamMutationBody = UpdateTeamRequest
+    export type UpdateTeamMutationError = ErrorType<ErrorEnvelope>
+    export type UpdateTeamMutationVariables = {teamId: string;data: UpdateTeamRequest}
+
+    /**
+ * @summary Rename a team or change its description
+ */
+export const useUpdateTeam = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateTeam>>, TError,UpdateTeamMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof updateTeam>>,
+        TError,
+        UpdateTeamMutationVariables,
+        TContext
+      > => {
+      return useMutation(getUpdateTeamMutationOptions(options), queryClient);
+    }
+
+export const getPutTeamGrantUrl = (teamId: string,
+    projectId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}/grants/${encodeURIComponent(String(projectId))}`
+}
+
+/**
+ * Creates or replaces the team's grant on the project; its members get it live, beside their own grants (each Postgres role at the level of the grant naming it). `admin` holds every role (the names in `pg_roles` are checked, then dropped). The grant is checked on every member's union of sources narrowed by their overrides, on every database of the project, as `putProjectGrant` checks one grant; a refusal names the member, the team and the database. Personal logins that stop qualifying are revoked, and every branch of the project reconciles its member roles. An unchanged grant writes nothing.
+ * @summary Give a team access to a project
+ */
+export const putTeamGrant = async (teamId: string,
+    projectId: string,
+    teamGrantRequest: TeamGrantRequest, options?: Parameters<typeof customFetch>[1]): Promise<Team> => {
+
+    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+return customFetch<Team>(getPutTeamGrantUrl(teamId,projectId),
+  {
+    ...options,
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
+    body: JSON.stringify(teamGrantRequest)
+  }
+);}
+
+
+
+
+
+export const getPutTeamGrantMutationKey = () => ['putTeamGrant'] as const;
+
+export const getPutTeamGrantMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putTeamGrant>>, TError,PutTeamGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putTeamGrant>>, TError,PutTeamGrantMutationVariables, TContext> => {
+
+const mutationKey = getPutTeamGrantMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putTeamGrant>>, PutTeamGrantMutationVariables> = (props) => {
+          const {teamId,projectId,data} = props ?? {};
+
+          return  putTeamGrant(teamId,projectId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutTeamGrantMutationResult = NonNullable<Awaited<ReturnType<typeof putTeamGrant>>>
+    export type PutTeamGrantMutationBody = TeamGrantRequest
+    export type PutTeamGrantMutationError = ErrorType<ErrorEnvelope>
+    export type PutTeamGrantMutationVariables = {teamId: string;projectId: string;data: TeamGrantRequest}
+
+    /**
+ * @summary Give a team access to a project
+ */
+export const usePutTeamGrant = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putTeamGrant>>, TError,PutTeamGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putTeamGrant>>,
+        TError,
+        PutTeamGrantMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutTeamGrantMutationOptions(options), queryClient);
+    }
+
+export const getDeleteTeamGrantUrl = (teamId: string,
+    projectId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}/grants/${encodeURIComponent(String(projectId))}`
+}
+
+/**
+ * Its members lose what the team gave them there, checked first on each member's remaining access. Also 204 when the team had no grant there (nothing is written).
+ * @summary Take a team's access to a project away
+ */
+export const deleteTeamGrant = async (teamId: string,
+    projectId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteTeamGrantUrl(teamId,projectId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteTeamGrantMutationKey = () => ['deleteTeamGrant'] as const;
+
+export const getDeleteTeamGrantMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeamGrant>>, TError,DeleteTeamGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteTeamGrant>>, TError,DeleteTeamGrantMutationVariables, TContext> => {
+
+const mutationKey = getDeleteTeamGrantMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteTeamGrant>>, DeleteTeamGrantMutationVariables> = (props) => {
+          const {teamId,projectId} = props ?? {};
+
+          return  deleteTeamGrant(teamId,projectId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteTeamGrantMutationResult = NonNullable<Awaited<ReturnType<typeof deleteTeamGrant>>>
+
+    export type DeleteTeamGrantMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteTeamGrantMutationVariables = {teamId: string;projectId: string}
+
+    /**
+ * @summary Take a team's access to a project away
+ */
+export const useDeleteTeamGrant = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeamGrant>>, TError,DeleteTeamGrantMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteTeamGrant>>,
+        TError,
+        DeleteTeamGrantMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteTeamGrantMutationOptions(options), queryClient);
+    }
+
+export const getPutTeamMemberUrl = (teamId: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}/members/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * The member gets the team's grants live, checked first on their union on every database of the team's projects. Also 200 when they are already in (nothing is written).
+ * @summary Add a member to a team
+ */
+export const putTeamMember = async (teamId: string,
+    memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Team> => {
+
+  return customFetch<Team>(getPutTeamMemberUrl(teamId,memberId),
+  {
+    ...options,
+    method: 'PUT'
+
+
+  }
+);}
+
+
+
+
+
+export const getPutTeamMemberMutationKey = () => ['putTeamMember'] as const;
+
+export const getPutTeamMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putTeamMember>>, TError,PutTeamMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof putTeamMember>>, TError,PutTeamMemberMutationVariables, TContext> => {
+
+const mutationKey = getPutTeamMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof putTeamMember>>, PutTeamMemberMutationVariables> = (props) => {
+          const {teamId,memberId} = props ?? {};
+
+          return  putTeamMember(teamId,memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type PutTeamMemberMutationResult = NonNullable<Awaited<ReturnType<typeof putTeamMember>>>
+
+    export type PutTeamMemberMutationError = ErrorType<ErrorEnvelope>
+    export type PutTeamMemberMutationVariables = {teamId: string;memberId: string}
+
+    /**
+ * @summary Add a member to a team
+ */
+export const usePutTeamMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof putTeamMember>>, TError,PutTeamMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof putTeamMember>>,
+        TError,
+        PutTeamMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getPutTeamMemberMutationOptions(options), queryClient);
+    }
+
+export const getDeleteTeamMemberUrl = (teamId: string,
+    memberId: string,) => {
+
+
+
+
+  return `/v1/teams/${encodeURIComponent(String(teamId))}/members/${encodeURIComponent(String(memberId))}`
+}
+
+/**
+ * The member loses what the team gave them, checked first on their remaining access. Also 204 when they weren't in (nothing is written).
+ * @summary Remove a member from a team
+ */
+export const deleteTeamMember = async (teamId: string,
+    memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
+
+  return customFetch<void>(getDeleteTeamMemberUrl(teamId,memberId),
+  {
+    ...options,
+    method: 'DELETE'
+
+
+  }
+);}
+
+
+
+
+
+export const getDeleteTeamMemberMutationKey = () => ['deleteTeamMember'] as const;
+
+export const getDeleteTeamMemberMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeamMember>>, TError,DeleteTeamMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof deleteTeamMember>>, TError,DeleteTeamMemberMutationVariables, TContext> => {
+
+const mutationKey = getDeleteTeamMemberMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof deleteTeamMember>>, DeleteTeamMemberMutationVariables> = (props) => {
+          const {teamId,memberId} = props ?? {};
+
+          return  deleteTeamMember(teamId,memberId,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type DeleteTeamMemberMutationResult = NonNullable<Awaited<ReturnType<typeof deleteTeamMember>>>
+
+    export type DeleteTeamMemberMutationError = ErrorType<ErrorEnvelope>
+    export type DeleteTeamMemberMutationVariables = {teamId: string;memberId: string}
+
+    /**
+ * @summary Remove a member from a team
+ */
+export const useDeleteTeamMember = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof deleteTeamMember>>, TError,DeleteTeamMemberMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof deleteTeamMember>>,
+        TError,
+        DeleteTeamMemberMutationVariables,
+        TContext
+      > => {
+      return useMutation(getDeleteTeamMemberMutationOptions(options), queryClient);
     }
 
 export const getUpdateTenantUrl = () => {

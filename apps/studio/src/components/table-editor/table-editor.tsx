@@ -17,7 +17,7 @@ import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { DATA_API_ROLES, actAsRoles, dataApiActAs, projectCaps, type ProjectCaps } from "@/lib/capabilities";
+import { DATA_API_ROLES, actAsRoles, actingCaps, dataApiActAs, projectCaps, type ProjectCaps } from "@/lib/capabilities";
 import { isTransitional } from "@/lib/branches";
 import { pageSizeFor } from "@/lib/console";
 import { pollWhile } from "@/lib/query";
@@ -226,14 +226,16 @@ function Editor({ params, navigate }: TableEditorProps) {
   const rolesError = branchOk && roles.isError ? errorText(roles.error) : null;
 
   const error = projectList.error ?? me.error ?? branches.error ?? pgDatabases.error ?? objects.error;
-  const structure = branch ? structureAccess(caps, branch) : null;
+  // Write controls follow the level of the role acted as (D1), not the project's alone.
+  const actedCaps = actingCaps(caps, actAs, roles.isSuccess ? roles.data : []);
+  const structure = branch ? structureAccess(actedCaps, branch) : null;
   const structureReason = structure && !structure.allowed ? structure.reason : null;
   // Dry runs and previews are sent as the act-as role: none goes out before that role is known
   // (it would go as the owner), nor when there is no role to act as.
   const dryRunReason =
     structureReason ??
     (!actAsReady ? "Loading roles…" : !allowed.owner && actAs === null ? "You can't act as any Postgres role here." : null);
-  const rows = pg ? rowAccess(caps, { owner: allowed.owner && actAs === null, roles: actAs ? [actAs] : [] }, pg) : null;
+  const rows = pg ? rowAccess(actedCaps, { owner: allowed.owner && actAs === null, roles: actAs ? [actAs] : [] }, pg) : null;
   const object = objects.data?.objects?.find((o) => o.schema === current.schema && o.name === current.table);
   useCrumbLabel("table", object ? current.table : undefined, current.table);
   const target: TableTarget | null =
