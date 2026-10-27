@@ -7,7 +7,7 @@ Rules for entries:
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Members hub, step 1: one place for people, roles and privileges (2026-10-24, in progress: paused for the merge decision)
+## Members hub, step 1: one place for people, roles and privileges (2026-10-24, shipped: merged into `main` `6e3c8df3`)
 
 Branch `members-hub`; spec `docs/superpowers/specs/2026-10-23-members-hub-design.md`; plan `docs/superpowers/plans/2026-10-23-members-hub-step-1.md`. No fork change (it builds on fork round 4's personal-login marker).
 

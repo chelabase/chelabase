@@ -136,10 +136,11 @@ tokio-postgres = { git = "https://github.com/chelabase/rust-postgres", rev = "38
 # the removal of derivative and serde_yaml (RUSTSEC-2024-0388, RUSTSEC-2024-0449), and tokio 1.54
 # support (no zero-capacity BufReader, which tokio 1.54 panics on for every accepted connection)
 # with h2 0.4.20, the 32-per-connection malformed-stream bound kept under h2 0.4.20, and a
-# write-buffer resize that flushes pending bytes first.
+# write-buffer resize that flushes pending bytes first, and zstd 0.14.3 / zstd-safe 8.2
+# (RUSTSEC-2026-0391/0398/0403/0410).
 # From git, pingora-proxy takes its pingora-* siblings from the same checkout (path deps), so the
 # ones the gateway names directly come from the same rev too; otherwise their types would differ.
-pingora-proxy = { git = "https://github.com/chelabase/pingora", rev = "c199b4ed20961213fe520af0389a87073f2ff76c" }
-pingora-core = { git = "https://github.com/chelabase/pingora", rev = "c199b4ed20961213fe520af0389a87073f2ff76c" }
-pingora-http = { git = "https://github.com/chelabase/pingora", rev = "c199b4ed20961213fe520af0389a87073f2ff76c" }
-pingora-error = { git = "https://github.com/chelabase/pingora", rev = "c199b4ed20961213fe520af0389a87073f2ff76c" }
+pingora-proxy = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
+pingora-core = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
+pingora-http = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
+pingora-error = { git = "https://github.com/chelabase/pingora", rev = "0eddec5420f2481ce6a761443105ea7f3fc35b65" }
