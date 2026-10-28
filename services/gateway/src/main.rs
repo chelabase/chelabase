@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("gateway", "The Chelabase HTTP API gateway: the single front door.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(gateway::logging::env_filter(

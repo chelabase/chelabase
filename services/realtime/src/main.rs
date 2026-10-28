@@ -2,6 +2,7 @@
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("realtime", "The Chelabase realtime service behind the gateway.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
