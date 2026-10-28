@@ -6,6 +6,31 @@
 
 use crate::mode_policy::ModePolicy;
 
+/// Every public development bearer, by its variable: what a service uses when the variable
+/// (and its `_FILE`) is unset. The values are in this repository, so each is refused outside
+/// the workbench ([`DevDefaults::check_bearers`]).
+pub const DEV_BEARERS: [(&str, &str); 7] = [
+    ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
+    ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
+    ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
+    ("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
+    ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
+    ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", crate::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
+    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
+];
+
+/// `var`'s development default.
+///
+/// # Panics
+/// When `var` isn't in [`DEV_BEARERS`] (a programming error, caught by every service's tests).
+pub fn dev_bearer(var: &str) -> &'static str {
+    DEV_BEARERS
+        .iter()
+        .find(|(v, _)| *v == var)
+        .map(|(_, value)| *value)
+        .unwrap_or_else(|| panic!("{var} has no development default"))
+}
+
 /// Whether the development defaults are allowed (self-hosted mode only).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DevDefaults(bool);
@@ -36,6 +61,16 @@ impl DevDefaults {
 
     pub fn is_on(self) -> bool {
         self.0
+    }
+
+    /// [`Self::check_bearer`] for each `(variable, token)`, against every value in
+    /// [`DEV_BEARERS`] (one bearer set to another's default is just as public).
+    pub fn check_bearers(self, policy: &ModePolicy, bearers: &[(&str, &str)]) -> Result<(), String> {
+        let dev_values: Vec<&str> = DEV_BEARERS.iter().map(|(_, v)| *v).collect();
+        for (var, token) in bearers {
+            self.check_bearer(policy, var, token, &dev_values)?;
+        }
+        Ok(())
     }
 
     /// `Err` naming `var` when `token` is one of the public `dev_values` and neither the mode

@@ -28,6 +28,65 @@ pub fn lookup_secret(
     }
 }
 
+/// `url_var`'s URL, with its password from the file `file_var` names when that is set: put in
+/// the URL's user info, percent-encoded (`postgres://user@host/db` becomes
+/// `postgres://user:pw@host/db`), so the password is never in the environment. The file is
+/// read with [`FileValue`](crate::file_value::FileValue)'s rules as a
+/// [`SharedSecret`](crate::file_value::Sensitivity::SharedSecret) (a regular file, no symlink,
+/// not readable by others, not empty). `None` when `url_var` is unset or blank.
+///
+/// Refused, naming the variables and never the password: a URL that carries a password as
+/// well as the file, a URL with no user for it, a missing or refused file.
+pub fn url_with_password_file(
+    lookup: impl Fn(&str) -> Option<String>,
+    url_var: &str,
+    file_var: &str,
+) -> Result<Option<String>, String> {
+    use crate::file_value::{FileValue, Sensitivity, Unavailable};
+    let get = |n: &str| lookup(n).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let Some(url) = get(url_var) else {
+        return Ok(None);
+    };
+    let Some(path) = get(file_var) else {
+        return Ok(Some(url));
+    };
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| format!("{url_var} is not a URL"))?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let Some(at) = rest[..authority_end].rfind('@') else {
+        return Err(format!("{url_var} names no user for the password in {file_var}"));
+    };
+    let user = &rest[..at];
+    if user.contains(':') {
+        return Err(format!(
+            "{url_var} carries a password and {file_var} is set: give the password in one of them"
+        ));
+    }
+    let password = match FileValue::file(file_var, &path, Sensitivity::SharedSecret).get() {
+        Ok(p) => p.to_string(),
+        Err(Unavailable::NotYet { .. }) => {
+            return Err(format!("{file_var}={path} is missing or empty"));
+        }
+        Err(e) => return Err(e.to_string()),
+    };
+    Ok(Some(format!("{scheme}://{user}:{}{}", percent_encode(&password), &rest[at..])))
+}
+
+/// Every byte but the unreserved ones (`A-Z a-z 0-9 - . _ ~`) as `%XX`, as the bootstrap's
+/// `urlencoding::encode` does.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// [`lookup_secret`] on the process environment.
 pub fn env_secret(name: &str) -> Result<Option<String>, String> {
     lookup_secret(|n| std::env::var(n).ok(), name)
@@ -53,6 +112,11 @@ mod tests {
         let path = dir.join("token");
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn passwords_are_percent_encoded_like_the_bootstrap() {
+        assert_eq!(percent_encode("p@ss/w:rd%Zz ~-._é"), "p%40ss%2Fw%3Ard%25Zz%20~-._%C3%A9");
     }
 
     #[test]

@@ -168,7 +168,7 @@ async fn jwks_down_is_unavailable() {
     let config = ZitadelAuthConfig {
         issuer: jwks.issuer().into(),
         jwks_url: broken.jwks_url().into(),
-        audiences: vec![],
+        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     };
     let v = OidcVerifier::new(config);
     assert_eq!(
@@ -176,4 +176,40 @@ async fn jwks_down_is_unavailable() {
             .await,
         Err(TokenError::Unavailable)
     );
+}
+
+// #22 AC 3: realtime starts before the bootstrap has written the audiences. Until both files
+// are there, an `auth` frame's token is "can't be checked now" (never accepted, whatever its
+// audience) and the verifier isn't ready; once they appear, the right audience passes and
+// another is invalid, without a restart.
+#[tokio::test]
+async fn oidc_refuses_until_audiences() {
+    use chelabase_auth::Audiences;
+    use chelabase_types::file_value::{FileValue, Sensitivity};
+    use std::os::unix::fs::PermissionsExt;
+    let jwks = MockJwks::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (project, client) = (dir.path().join("project-id"), dir.path().join("api-client-id"));
+    let mut config = jwks.config(vec![]);
+    config.audiences = Audiences::Ids(vec![
+        FileValue::file("CHELABASE_ZITADEL_PROJECT_ID_FILE", &project, Sensitivity::Public),
+        FileValue::file("CHELABASE_ZITADEL_API_CLIENT_ID_FILE", &client, Sensitivity::Public),
+    ]);
+    let v = OidcVerifier::new(config);
+    let signed = |aud: &str| {
+        let mut c = claims(&jwks, now() as i64 + 300);
+        c["aud"] = json!(aud);
+        jwks.sign(c)
+    };
+    assert!(!v.is_ready());
+    for aud in ["p1", "anything"] {
+        assert_eq!(v.verify(&signed(aud)).await, Err(TokenError::Unavailable), "{aud}");
+    }
+    for (path, value) in [(&project, "p1\n"), (&client, "c-api\n")] {
+        std::fs::write(path, value).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    assert!(v.is_ready());
+    assert!(v.verify(&signed("p1")).await.is_ok());
+    assert_eq!(v.verify(&signed("someone-else")).await, Err(TokenError::Invalid));
 }

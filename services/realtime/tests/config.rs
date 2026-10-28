@@ -30,6 +30,8 @@ impl Env {
             "auth.feat-x.chelabase.localhost:8137",
         );
         env.set("CHELABASE_PUBLIC_SCHEME", "http");
+        // #22: the token audiences are required (an empty list never accepts a token).
+        env.set("CHELABASE_ZITADEL_AUDIENCES", "p1,c-api");
         env.set(
             "CHELABASE_INTERNAL_VERIFY_KEY",
             "/keys/gateway/internal-verify.pem",

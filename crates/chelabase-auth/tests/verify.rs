@@ -119,7 +119,7 @@ async fn a_hung_jwks_endpoint_fails_within_its_timeout() {
     let verifier = JwtVerifier::new(chelabase_auth::ZitadelAuthConfig {
         issuer: format!("http://{addr}"),
         jwks_url: format!("http://{addr}/oauth/v2/keys"),
-        audiences: vec![],
+        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     });
     let mock = MockJwks::start().await;
     let token = mock.token_for_org("user-1", "org-1", 300);
@@ -211,7 +211,7 @@ async fn jwks_endpoint_unreachable_surfaces_jwks_error() {
     let config = chelabase_auth::ZitadelAuthConfig {
         issuer: "http://irrelevant-issuer".into(),
         jwks_url: broken.jwks_url().to_string(),
-        audiences: vec![],
+        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     };
     let verifier = JwtVerifier::new(config);
 

@@ -99,23 +99,33 @@ impl GatewayConfig {
         }
 
         // A bearer is `<NAME>` or the file `<NAME>_FILE` names (the stack mounts generated
-        // secrets, S27); unset, the development default.
-        let secret = |name: &str, default: &str| -> anyhow::Result<String> {
+        // secrets, S27); unset, the development default, which only the workbench may use
+        // (`CHELABASE_DEV_DEFAULTS=1`, self-hosted mode).
+        let secret = |name: &str| -> anyhow::Result<String> {
             Ok(chelabase_types::secret_env::lookup_secret(&get, name)
                 .map_err(anyhow::Error::msg)?
-                .unwrap_or_else(|| default.to_string()))
+                .unwrap_or_else(|| chelabase_types::dev_defaults::dev_bearer(name).to_string()))
         };
+        let data_keys_token = secret("CHELABASE_DATA_KEYS_TOKEN")?;
+        let app_sessions_token = secret("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN")?;
+        chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
+            .map_err(anyhow::Error::msg)?
+            .check_bearers(
+                &chelabase_types::mode_policy::ModePolicy::new(mode),
+                &[
+                    ("CHELABASE_DATA_KEYS_TOKEN", data_keys_token.as_str()),
+                    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", app_sessions_token.as_str()),
+                ],
+            )
+            .map_err(anyhow::Error::msg)?;
         Ok(Self {
             listen,
             entry,
             upstreams,
             internal_url: or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
-            data_keys_token: secret("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys")?,
+            data_keys_token,
             app_jwt_public_key: get("CHELABASE_APP_JWT_PUBLIC_KEY").filter(|v| !v.trim().is_empty()),
-            app_sessions_token: secret(
-                "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN",
-                "chelabase-dev-app-sessions",
-            )?,
+            app_sessions_token,
             upstream_timeout: parse_timeout_secs(&or("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "60"))
                 .map_err(anyhow::Error::msg)?,
         })
@@ -180,7 +190,10 @@ mod tests {
     use super::*;
     use crate::registry::Site;
 
+    // The workbench's switch: these tests are about other settings (the dev-bearer rule has
+    // its own test, which turns it off).
     const ENTRY: &[(&str, &str)] = &[
+        ("CHELABASE_DEV_DEFAULTS", "1"),
         ("CHELABASE_PUBLIC_SCHEME", "http"),
         ("CHELABASE_STUDIO_HOST", "studio.chelabase.localhost:8000"),
         ("CHELABASE_API_HOST", "api.chelabase.localhost:8000"),
@@ -190,6 +203,57 @@ mod tests {
     fn with(extra: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
         let all: Vec<(&str, &str)> = ENTRY.iter().chain(extra.iter()).copied().collect();
         move |k: &str| all.iter().rev().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    // Selfhost-install m5 fix round, S1: the gateway's two internal bearers (data-key lookups,
+    // session liveness) never default to their public development values outside the
+    // workbench. Unset, set to a default, `=0` and platform refuse at startup, naming the
+    // variable and never the token; `=1` (self-hosted) keeps today's behaviour.
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        const OWN: [(&str, &str); 2] = [
+            ("CHELABASE_DATA_KEYS_TOKEN", "generated-data-keys-0123"),
+            ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "generated-app-sessions-0123"),
+        ];
+        let own: Vec<_> = OWN.iter().copied().chain([("CHELABASE_DEV_DEFAULTS", "")]).collect();
+        let c = GatewayConfig::from_lookup(with(&own)).unwrap();
+        assert_eq!(c.data_keys_token, "generated-data-keys-0123");
+        let pf: Vec<_> = own.iter().copied().chain([("CHELABASE_MODE", "platform"), ("CHELABASE_PUBLIC_SCHEME", "https")]).collect();
+        assert!(GatewayConfig::from_lookup(with(&pf)).is_ok());
+        for (var, _) in OWN {
+            // The test entry turns the switch on; blank is unset.
+            let other: Vec<(&'static str, &'static str)> = OWN
+                .iter()
+                .copied()
+                .filter(|(v, _)| *v != var)
+                .chain([("CHELABASE_DEV_DEFAULTS", "")])
+                .collect();
+            let dev = chelabase_types::dev_defaults::dev_bearer(var);
+            let cases: [(&str, Vec<(&'static str, &'static str)>); 4] = [
+                ("unset", other.clone()),
+                ("the default", other.iter().copied().chain([(var, dev)]).collect()),
+                ("=0", other.iter().copied().chain([("CHELABASE_DEV_DEFAULTS", "0")]).collect()),
+                (
+                    "platform",
+                    other
+                        .iter()
+                        .copied()
+                        .chain([("CHELABASE_DEV_DEFAULTS", "1"), ("CHELABASE_MODE", "platform"), ("CHELABASE_PUBLIC_SCHEME", "https")])
+                        .collect(),
+                ),
+            ];
+            for (how, pairs) in cases {
+                let err = match GatewayConfig::from_lookup(with(&pairs)) {
+                    Err(e) => format!("{e:#}"),
+                    Ok(_) => panic!("{var} {how}: the gateway started on a development bearer"),
+                };
+                assert!(err.contains(var), "{var} {how}: {err}");
+                assert!(!err.contains("chelabase-dev-"), "{var} {how}: {err}");
+            }
+            let dev_on: Vec<_> = other.iter().copied().chain([("CHELABASE_DEV_DEFAULTS", "1")]).collect();
+            let c = GatewayConfig::from_lookup(with(&dev_on)).unwrap();
+            assert_eq!(if var == OWN[0].0 { &c.data_keys_token } else { &c.app_sessions_token }, dev, "{var}");
+        }
     }
 
     #[test]
@@ -249,7 +313,14 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("CHELABASE_PUBLIC_SCHEME"), "{msg}");
-        assert!(GatewayConfig::from_lookup(with(&[("CHELABASE_MODE", "platform"), ("CHELABASE_PUBLIC_SCHEME", "https")])).is_ok());
+        // Platform mode needs its own bearers (m5 fix round).
+        assert!(GatewayConfig::from_lookup(with(&[
+            ("CHELABASE_MODE", "platform"),
+            ("CHELABASE_PUBLIC_SCHEME", "https"),
+            ("CHELABASE_DATA_KEYS_TOKEN", "generated-data-keys-0123"),
+            ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "generated-app-sessions-0123"),
+        ]))
+        .is_ok());
     }
 
     #[test]

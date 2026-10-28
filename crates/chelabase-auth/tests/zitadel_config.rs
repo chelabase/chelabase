@@ -9,6 +9,7 @@ fn the_issuer_comes_from_the_auth_host() {
     let c = ZitadelAuthConfig::from_lookup(get(&[
         ("CHELABASE_PUBLIC_SCHEME", "http"),
         ("CHELABASE_AUTH_HOST", "auth.chelabase.localhost:8000"),
+        ("CHELABASE_ZITADEL_AUDIENCES", "p1"),
     ]))
     .unwrap();
     assert_eq!(c.issuer, "http://auth.chelabase.localhost:8000");
@@ -16,6 +17,7 @@ fn the_issuer_comes_from_the_auth_host() {
     let c = ZitadelAuthConfig::from_lookup(get(&[
         ("CHELABASE_AUTH_HOST", "auth.acme.com"),
         ("CHELABASE_ZITADEL_JWKS_URL", "http://zitadel:8080/oauth/v2/keys"),
+        ("CHELABASE_ZITADEL_AUDIENCES", "p1"),
     ]))
     .unwrap();
     assert_eq!(c.issuer, "https://auth.acme.com");

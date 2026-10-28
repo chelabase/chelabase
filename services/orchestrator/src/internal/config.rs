@@ -62,15 +62,7 @@ pub struct InternalConfig {
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
 /// instance refuses each, [`InternalConfig::check_mode`]).
-pub const DEV_BEARERS: [(&str, &str); 7] = [
-    ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
-    ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
-    ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
-    ("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
-    ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
-    ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", chelabase_types::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
-    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
-];
+pub const DEV_BEARERS: [(&str, &str); 7] = chelabase_types::dev_defaults::DEV_BEARERS;
 
 /// A session never lasts longer than this after it was created (and so neither can a refresh).
 pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -305,10 +297,132 @@ impl std::fmt::Debug for InternalConfig {
     }
 }
 
+/// `CHELABASE_METADATA_DATABASE_URL`: where the metadata database is, with its password from
+/// `CHELABASE_METADATA_DATABASE_PASSWORD_FILE` when that is set (m1's `db/metadata.password`;
+/// the URL then names the user only). Required: there is no development fallback (the
+/// workbench's stack.env always sets it), so a fixed credential is never used by accident.
+/// Errors name the variables, never the URL or the password.
+pub fn metadata_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<chelabase_metadata::MetadataConfig> {
+    let database_url = chelabase_types::secret_env::url_with_password_file(
+        get,
+        "CHELABASE_METADATA_DATABASE_URL",
+        "CHELABASE_METADATA_DATABASE_PASSWORD_FILE",
+    )
+    .map_err(anyhow::Error::msg)?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "CHELABASE_METADATA_DATABASE_URL is not set: the metadata database's URL \
+             (postgres://user@host:port/database, the password in \
+             CHELABASE_METADATA_DATABASE_PASSWORD_FILE)"
+        )
+    })?;
+    Ok(chelabase_metadata::MetadataConfig { database_url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+
+    // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
+    // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
+    // `postgres://chelabase:chelabase@…`; the workbench always sets it (its stack.env).
+    // m5 fix round: the metadata password from CHELABASE_METADATA_DATABASE_PASSWORD_FILE (m1's
+    // `db/metadata.password`), so it is never in the environment. It goes into the URL's user
+    // info, percent-encoded (as the bootstrap does); the URL then carries none. Both forms, a
+    // missing, empty, symlinked or loosely-moded file are startup errors naming the variables,
+    // and the password is in no error and no `Debug`.
+    #[test]
+    fn the_metadata_password_comes_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("metadata.password");
+        let write = |contents: &str, mode: u32| {
+            let _ = std::fs::remove_file(&file);
+            std::fs::write(&file, contents).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        const SECRET: &str = "p@ss/w:rd%Zz";
+        let path = file.to_str().unwrap().to_string();
+        let config = |url: &str| {
+            let (url, path) = (url.to_string(), path.clone());
+            metadata_config(move |k| match k {
+                "CHELABASE_METADATA_DATABASE_URL" => Some(url.clone()),
+                "CHELABASE_METADATA_DATABASE_PASSWORD_FILE" => Some(path.clone()),
+                _ => None,
+            })
+        };
+        const URL: &str = "postgres://chelabase@metadata-db:5432/chelabase_metadata?sslmode=disable";
+        for mode in [0o600, 0o400, 0o640] {
+            write(&format!("{SECRET}\n"), mode);
+            let c = config(URL).unwrap_or_else(|e| panic!("{mode:o}: {e:#}"));
+            assert_eq!(
+                c.database_url,
+                "postgres://chelabase:p%40ss%2Fw%3Ard%25Zz@metadata-db:5432/chelabase_metadata?sslmode=disable"
+            );
+            // What sqlx connects with: the same user, host and database.
+            let opts = sqlx::postgres::PgConnectOptions::from_str(&c.database_url).unwrap();
+            assert_eq!((opts.get_username(), opts.get_host(), opts.get_database()),
+                ("chelabase", "metadata-db", Some("chelabase_metadata")));
+            assert!(!format!("{c:?}").contains("p%40ss") && !format!("{c:?}").contains(SECRET), "{c:?}");
+        }
+        let refused = |what: &str, url: &str, needles: &[&str]| {
+            let err = match config(url) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{what}: accepted: {c:?}"),
+            };
+            for n in needles {
+                assert!(err.contains(n), "{what}: {err}");
+            }
+            assert!(!err.contains(SECRET) && !err.contains("p%40ss") && !err.contains("in-url-pw"), "{what}: {err}");
+        };
+        write(SECRET, 0o600);
+        refused(
+            "a password in both",
+            "postgres://chelabase:in-url-pw@metadata-db:5432/m",
+            &["CHELABASE_METADATA_DATABASE_URL", "CHELABASE_METADATA_DATABASE_PASSWORD_FILE"],
+        );
+        refused("no user", "postgres://metadata-db:5432/m", &["CHELABASE_METADATA_DATABASE_URL"]);
+        for mode in [0o644, 0o604, 0o660, 0o666] {
+            write(SECRET, mode);
+            refused(&format!("mode {mode:o}"), URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        }
+        write("\n", 0o600);
+        refused("empty", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        std::fs::remove_file(&file).unwrap();
+        refused("missing", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        let real = dir.path().join("real");
+        std::fs::write(&real, SECRET).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &file).unwrap();
+        refused("a symlink", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE", "symlink"]);
+        // A URL with its own password, and no file, still works (the workbench).
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| "postgres://u:in-url-pw@db:5432/m".to_string())
+        })
+        .unwrap();
+        assert!(!format!("{c:?}").contains("in-url-pw"), "{c:?}");
+    }
+
+    #[test]
+    fn the_metadata_url_is_required() {
+        for pairs in [vec![], vec![("CHELABASE_METADATA_DATABASE_URL", " ")], vec![("CHELABASE_DEV_DEFAULTS", "1")]] {
+            let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+            let err = match metadata_config(|k| map.get(k).map(|v| v.to_string())) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{pairs:?}: a fallback metadata URL: {}", c.database_url),
+            };
+            assert!(err.contains("CHELABASE_METADATA_DATABASE_URL"), "{err}");
+        }
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| " postgres://u:p@db:5432/m ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u:p@db:5432/m");
+    }
 
     #[test]
     fn defaults_are_for_local_dev() {

@@ -10,7 +10,16 @@
 //! - a symlink, or anything but a regular file, is refused (never followed);
 //! - a file writable by its group or others is refused;
 //! - a [`Sensitivity::Secret`] file readable by its group or others is refused (`chmod 600`);
+//!   a [`Sensitivity::SharedSecret`] one readable by others (`chmod 640`);
 //! - so is a file over [`MAX_LEN`] bytes or one that isn't UTF-8.
+//!
+//! **Writers must replace a file atomically** (write a temporary file in the same directory, then
+//! rename it into place), never write it in place: the first non-empty read is cached until the
+//! process restarts, so a reader that catches a half-written file keeps the truncated value.
+//! `chelabase-init`'s writers (the secrets and the bootstrap's outputs) already do; an operator
+//! writing one by hand should too (`printf … > f.tmp && mv f.tmp f`). The file is opened with
+//! `O_NOFOLLOW | O_NONBLOCK`, so a name swapped for a symlink or a FIFO is refused or read again,
+//! and never blocks the caller.
 //!
 //! These are the bootstrap's own rules for its output dir (`chelabase-init`'s `fsx`): ids 0644,
 //! secrets 0600, no symlinks. Nothing here ever puts the value in a message: errors and `Debug`
@@ -30,6 +39,10 @@ pub enum Sensitivity {
     Public,
     /// A secret: readable and writable only by its owner (0600).
     Secret,
+    /// A secret its owner shares with one consumer group (m1's layout gives
+    /// `db/metadata.password` 0640, group postgres): readable by owner and group, never by
+    /// others, and writable by its owner only.
+    SharedSecret,
 }
 
 /// Why [`FileValue::get`] has no value. Both mean 503 `unavailable` to a caller. The message
@@ -209,6 +222,16 @@ impl fmt::Debug for FileValue {
 /// `Ok(None)`: missing or empty (not yet). `Err`: present but refused, with the reason (never
 /// the contents).
 fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String> {
+    read_with(path, sensitivity, || {})
+}
+
+/// [`read`], with `between` run after the name is checked and before it is opened (tests swap
+/// the file there).
+fn read_with(
+    path: &Path,
+    sensitivity: Sensitivity,
+    between: impl FnOnce(),
+) -> Result<Option<String>, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
@@ -224,9 +247,21 @@ fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String>
     if !named.is_file() {
         return Err("it is not a regular file".into());
     }
-    let mut file = match std::fs::File::open(path) {
+    between();
+    // Never follows a symlink and never waits (a FIFO swapped in would otherwise block until a
+    // writer came); what was opened is checked below.
+    let opened_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    };
+    let mut file = match opened_file {
         Ok(f) => f,
         Err(e) if not_found(&e) => return Ok(None),
+        // ELOOP: the name became a symlink since the check.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err("it is a symlink".into()),
         Err(e) => return Err(format!("opening it: {e}")),
     };
     // What is checked below is the file that was opened: if the name now points elsewhere
@@ -239,6 +274,11 @@ fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String>
     if mode & 0o022 != 0 {
         return Err(format!(
             "it is writable by its group or others (mode {mode:04o}); chmod go-w it"
+        ));
+    }
+    if sensitivity == Sensitivity::SharedSecret && mode & 0o007 != 0 {
+        return Err(format!(
+            "it holds a secret but is readable by others (mode {mode:04o}); chmod 640 (or 600) it"
         ));
     }
     if sensitivity == Sensitivity::Secret && mode & 0o077 != 0 {
@@ -365,6 +405,31 @@ mod tests {
         assert!(msg.contains("symlink"), "{msg}");
     }
 
+    // N1: a FIFO swapped in between the check and the open must not block the caller (a
+    // tokio worker): the open doesn't wait for a writer, and the opened file is refused (or
+    // read again later) because it isn't the regular file that was checked.
+    #[test]
+    fn a_fifo_swapped_in_never_blocks() {
+        let t = tmp();
+        let path = t.0.join("org-id");
+        write(&path, "o1", 0o644);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let got = read_with(&p, Sensitivity::Public, || {
+                std::fs::remove_file(&p).unwrap();
+                let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+                // SAFETY: a valid NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            });
+            let _ = done_tx.send(got);
+        });
+        let got = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO swapped in blocked the caller");
+        assert!(!matches!(got, Ok(Some(_))), "{got:?}");
+    }
+
     #[test]
     fn a_directory_is_refused() {
         let t = tmp();
@@ -385,6 +450,11 @@ mod tests {
             (0o600, Sensitivity::Public, true),
             (0o664, Sensitivity::Public, false),
             (0o646, Sensitivity::Public, false),
+            (0o600, Sensitivity::SharedSecret, true),
+            (0o640, Sensitivity::SharedSecret, true),
+            (0o644, Sensitivity::SharedSecret, false),
+            (0o604, Sensitivity::SharedSecret, false),
+            (0o660, Sensitivity::SharedSecret, false),
             (0o600, Sensitivity::Secret, true),
             (0o400, Sensitivity::Secret, true),
             (0o640, Sensitivity::Secret, false),
