@@ -51,7 +51,8 @@ import type {
   NextStep,
   SignInBody,
   SignUpBody,
-  SignedIn
+  SignedIn,
+  StudioConfig
 } from './model';
 
 import { customFetch } from '../fetch.ts';
@@ -1985,6 +1986,104 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
       > => {
       return useMutation(getSignUpMutationOptions(options), queryClient);
     }
+
+export const getGetStudioConfigUrl = () => {
+
+
+
+
+  return `/auth/v1/studio-config`
+}
+
+/**
+ * Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.
+ */
+export const getStudioConfig = async ( options?: Parameters<typeof customFetch>[1]): Promise<StudioConfig> => {
+
+  return customFetch<StudioConfig>(getGetStudioConfigUrl(),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetStudioConfigQueryKey = () => {
+    return [
+    `/auth/v1/studio-config`
+    ] as const;
+    }
+
+
+export const getGetStudioConfigQueryOptions = <TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetStudioConfigQueryKey();
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getStudioConfig>>> = ({ signal }) => getStudioConfig({ signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetStudioConfigQueryResult = NonNullable<Awaited<ReturnType<typeof getStudioConfig>>>
+export type GetStudioConfigQueryError = ErrorType<ErrorEnvelope>
+
+
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+  options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStudioConfig>>,
+          TError,
+          Awaited<ReturnType<typeof getStudioConfig>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getStudioConfig>>,
+          TError,
+          Awaited<ReturnType<typeof getStudioConfig>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+  options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetStudioConfigQueryOptions(options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
 
 export const getVerifyEmailUrl = () => {
 
