@@ -99,14 +99,22 @@ check "bracketed IPv6 without a port" "https|[::1]|443|external|https://[::1]" \
 check "landing default" "landing.chelabase.localhost:8000" \
   "$(env -i PATH="$PATH" HOME="$HOME" bash -c '. scripts/lib/entry.sh; printf %s "$CHELABASE_LANDING_HOST"')"
 
-# Compose takes the entry values from entry.sh only: no second copy as defaults.
-for name in CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECURE CHELABASE_PUBLIC_SCHEME \
-  CHELABASE_STUDIO_HOST CHELABASE_ZITADEL_TLS_MODE; do
-  if grep -qE "\\$\\{${name}:-" infra/compose/docker-compose.yml; then
-    echo "entry-sh: docker-compose.yml defaults ${name} (a second copy; require it instead)" >&2
-    fail=1
-  fi
-done
+# The self-hosted base file (m8) runs from .env alone, so it has defaults for the entry values:
+# each must be what entry.sh derives from .env.example (the workbench overrides them all through
+# stack.env, and init-secrets refuses an .env whose derived values don't match its hosts).
+derived="$(env -i PATH="$PATH" HOME="$HOME" bash -c '. scripts/lib/entry.sh; for n in CHELABASE_AUTH_HOST_NAME \
+  CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECURE CHELABASE_PUBLIC_SCHEME CHELABASE_STUDIO_HOST CHELABASE_API_HOST \
+  CHELABASE_AUTH_HOST CHELABASE_ZITADEL_TLS_MODE; do printf "%s=%s\n" "$n" "${!n}"; done')"
+derived+=$'\n'"CHELABASE_STUDIO_HOST_NAME=$(sed -n 's/^CHELABASE_STUDIO_HOST=//p' infra/compose/.env.example | sed 's/:[0-9]*$//')"
+derived+=$'\n'"CHELABASE_API_HOST_NAME=$(sed -n 's/^CHELABASE_API_HOST=//p' infra/compose/.env.example | sed 's/:[0-9]*$//')"
+while IFS='=' read -r name want; do
+  while read -r have; do
+    if [[ "$have" != "$want" ]]; then
+      echo "entry-sh: docker-compose.yml defaults ${name} to ${have}, but .env.example gives ${want}" >&2
+      fail=1
+    fi
+  done < <(grep -oE "\\\$\\{${name}:-[^}]*\\}" infra/compose/docker-compose.yml | sed "s/^\\\${${name}:-//; s/}\$//" | sort -u)
+done <<<"$derived"
 if ! grep -qE -- '--tlsMode \$\{CHELABASE_ZITADEL_TLS_MODE' infra/compose/docker-compose.yml; then
   echo "entry-sh: Zitadel's --tlsMode doesn't follow CHELABASE_ZITADEL_TLS_MODE" >&2
   fail=1

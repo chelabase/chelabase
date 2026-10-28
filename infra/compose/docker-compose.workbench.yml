@@ -1,7 +1,7 @@
 # The workbench overlay on docker-compose.yml: everything only the dev loop needs. Every
 # `chelabase workbench` compose call passes `-f docker-compose.yml -f docker-compose.workbench.yml`
 # (base first), so the pair is one stack; scripts/tests/compose-overlay-equiv.sh checks it renders
-# what the single file did before the split.
+# what it did before the base file became the self-hosted install (m8).
 #
 # Here: the workbench image, uid/gid and working dir of the app tier (`x-workbench`), its commands
 # (the checkout's host-built debug binaries, the Vite dev servers), the Docker group, the env
@@ -9,10 +9,40 @@
 # ports, its control subnet and static addresses, the gateway's host aliases, and the dev-only
 # services: Mailpit, the sites (profile `sites`) and the test runner (profile `runner`).
 #
+# The base file is the self-hosted install: its secrets come from the `secrets` volume that
+# init-secrets fills, its services run as the images' users, and it has no fixed credential. A
+# workbench stack keeps what it had: its keys dir and state dir (per-service files as Compose
+# secrets, the top-level `secrets:` below), the stack's uid:gid, and the fixed dev values its
+# volumes were made with (the database passwords, the S3 keys, the Zitadel masterkey). So this
+# file turns the two one-shots off (profile `self-hosted`, never activated) and sets back, with
+# `!override` (replace the base's value) and `!reset` (drop it), every key the base changed:
+# environment, user, entrypoint, command, volumes, depends_on, group_add, ports and networks.
+#
 # Compose merges this file into the base one key by key: maps (environment, networks,
-# depends_on) merge, lists of mounts merge by target, and scalars (image, command) replace. The
-# base app services carry no command, env_file, volumes or ports, so nothing here has to reset a
-# base value. YAML anchors can't cross files: the ones below are this file's own.
+# depends_on) merge, lists of mounts merge by target, and scalars (image, command) replace.
+# YAML anchors can't cross files: the ones below are this file's own.
+
+# The Neon services that read the stack's 0600 secrets run as the stack's uid:gid (the files'
+# owner), whatever the host uid is; the image's own user (uid 1000) can read them only when the
+# host uid happens to be 1000. Those without a data volume set `user:`; the pageserver and the
+# safekeepers start as root only to hand their data volume (created by the image as 1000:1000)
+# to the stack's uid once, then drop to it before anything else runs.
+x-neon-as-stack-user: &neon-as-stack-user
+  - /bin/sh
+  - -c
+  - >-
+    set -e;
+    [ "$$(stat -c %u:%g /data)" = "${CHELABASE_UID}:${CHELABASE_GID}" ] ||
+    chown -R "${CHELABASE_UID}:${CHELABASE_GID}" /data;
+    exec setpriv --reuid="${CHELABASE_UID}" --regid="${CHELABASE_GID}" --clear-groups -- "$$@"
+  - neon
+
+# S3 credentials for SeaweedFS: the workbench's fixed dev values (its volumes hold data written
+# with them). Local dev only.
+x-neon-s3-env: &neon-s3-env
+  AWS_ACCESS_KEY_ID: chelabase-dev
+  AWS_SECRET_ACCESS_KEY: chelabase-dev-secret
+  AWS_DEFAULT_REGION: us-east-1
 
 # --- The app tier's shared parts ---
 # Every path is mounted at its own host path (the checkout, the shared machine keys under
@@ -125,10 +155,169 @@ x-app-health: &app-health
   start_period: 60s
 
 services:
+  # The self-hosted install's one-shots: the workbench makes its secrets and runs its bootstrap
+  # itself (`chelabase workbench up`), so these never run here.
+  init-secrets:
+    profiles: ["self-hosted"]
+  init-bootstrap:
+    profiles: ["self-hosted"]
+
+  # The workbench's fixed dev passwords (its volumes were made with them).
+  metadata-db:
+    environment: !override
+      POSTGRES_USER: chelabase
+      POSTGRES_PASSWORD: chelabase
+      POSTGRES_DB: chelabase_metadata
+    volumes: !override
+      - metadata_pg_data:/var/lib/postgresql/data
+    depends_on: !reset {}
+
+  zitadel-db:
+    environment: !override
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes: !override
+      - zitadel_pg_data:/var/lib/postgresql/data
+    depends_on: !reset {}
+
+  storcon-db:
+    environment: !override
+      # Local dev only.
+      POSTGRES_USER: storcon
+      POSTGRES_PASSWORD: storcon
+      POSTGRES_DB: storage_controller
+    volumes: !override
+      - neon_storcon_pg_data:/var/lib/postgresql/data
+    depends_on: !reset {}
+
+  seaweedfs:
+    command: !override
+      - |
+        cat > /tmp/s3.json <<EOT
+        {"identities": [{"name": "neon",
+          "credentials": [{"accessKey": "chelabase-dev", "secretKey": "chelabase-dev-secret"}],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+        EOT
+        exec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
+    volumes: !override
+      - neon_seaweedfs_data:/data
+    depends_on: !reset {}
+
+  create-bucket:
+    environment: *neon-s3-env
+    entrypoint: !override ["/bin/sh", "-c"]
+    command: !override
+      - |
+        for i in $$(seq 60); do
+          aws --endpoint-url http://seaweedfs:8333 s3 mb s3://neon 2>/dev/null ||
+            aws --endpoint-url http://seaweedfs:8333 s3 ls s3://neon >/dev/null && exit 0
+          sleep 2
+        done
+        exit 1
+    volumes: !reset []
+
+  safekeeper1:
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    volumes: !override
+      - neon_safekeeper1_data:/data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
+  safekeeper2:
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    volumes: !override
+      - neon_safekeeper2_data:/data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
+  safekeeper3:
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    volumes: !override
+      - neon_safekeeper3_data:/data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
+
+  storage-controller:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    group_add: !reset []
+    entrypoint: !override
+      - /bin/sh
+      - -c
+      - >-
+        set -e;
+        export PUBLIC_KEY="$$(cat /run/storage-auth.pub.pem)";
+        exec storage_controller "$$@"
+      - storage_controller
+    command: !override
+      - --listen=0.0.0.0:1234
+      - --pageserver-jwt-token-file=/run/pageserver-api.jwt
+      - --safekeeper-jwt-token-file=/run/safekeeper-data.jwt
+      - --control-plane-jwt-token-file=/run/storcon-hook.token
+      - --control-plane-url=http://orchestrator:8083/storcon
+      - --database-url=postgresql://storcon:storcon@storcon-db:5432/storage_controller
+      - --timelines-onto-safekeepers
+      - --timeline-safekeeper-count=3
+    volumes: !reset []
+    secrets:
+      - {source: token-storcon-hook, target: /run/storcon-hook.token}
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-pageserver-api, target: /run/pageserver-api.jwt}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
+
+  pageserver:
+    user: "0"
+    entrypoint: *neon-as-stack-user
+    environment: *neon-s3-env
+    volumes: !override
+      - neon_pageserver_data:/data
+    secrets:
+      - {source: storage-pem, target: /run/storage-auth.pub.pem}
+      - {source: storage-generations-api, target: /run/generations-api.jwt}
+      - {source: storage-safekeeper-data, target: /run/safekeeper-data.jwt}
+
+  register-safekeepers:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    volumes: !reset []
+    secrets:
+      - {source: storage-storcon-admin, target: /run/storcon-admin.jwt}
+
+  # `chelabase workbench up` copies the CA to <state>/neon/proxy-ca.crt.
+  proxy-tls:
+    command: !override
+      - |
+        set -e
+        cd /tls
+        # The proxy runs as the stack's uid (it reads the stack's 0600 secrets too).
+        owner="${CHELABASE_UID}:${CHELABASE_GID}"
+        if [ -s tls.crt ] && openssl x509 -in tls.crt -noout -subject | grep -qF '*.localtest.me'; then
+          chown "$$owner" tls.key tls.crt ca.crt
+          echo "certificate for *.localtest.me exists"; exit 0
+        fi
+        [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+          -keyout ca.key -out ca.crt -days 3650 -subj "/CN=Chelabase local CA"
+        openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.csr \
+          -subj "/CN=*.localtest.me"
+        printf 'subjectAltName=DNS:*.localtest.me\n' > ext.cnf
+        openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
+          -extfile ext.cnf -out tls.crt
+        rm -f tls.csr ext.cnf
+        chown "$$owner" tls.key tls.crt ca.crt
+        chmod 600 ca.key tls.key
+        echo "issued a certificate for *.localtest.me"
+
   # NATS's config from the checkout and the users the workbench renders into the stack's state
   # dir (bcrypt hashes only).
   nats:
-    volumes:
+    depends_on: !reset {}
+    volumes: !override
+      - nats_data:/data
       - type: bind
         source: ${CHELABASE_CHECKOUT}/infra/compose/nats/nats.conf
         target: /etc/nats/nats.conf
@@ -140,19 +329,63 @@ services:
         read_only: true
         bind: {create_host_path: false}
 
-  # Valkey's ACL users, rendered by the workbench into the stack's state dir (SHA-256 hashes only).
+  # Valkey's ACL users, rendered by the workbench into the stack's state dir (SHA-256 hashes
+  # only). It runs as the stack's uid to read that 0600 file.
   valkey:
-    volumes:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    depends_on: !reset {}
+    volumes: !override
+      - valkey_data:/data
       - type: bind
         source: ${CHELABASE_STACK_DIR}/valkey/users.acl
         target: /etc/valkey/users.acl
         read_only: true
         bind: {create_host_path: false}
+    secrets:
+      - {source: valkey-health, target: /run/valkey-health.password}
 
   # FirstInstance writes the PATs into the stack's state dir; the bootstrap's demo.env,
-  # demo-sa.json and actions.env live there too.
+  # demo-sa.json and actions.env live there too. That mount is the whole <state>/zitadel
+  # directory (rw): it exposes nothing new to Zitadel, which generated those secrets itself (the
+  # service account's key, the actions signing key) and controls its own instance. It runs as
+  # the stack user so its PATs belong to the host user and the dir can be private, with the
+  # workbench's fixed masterkey and database passwords.
   zitadel:
-    volumes:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    command: !override start-from-init --masterkey "MasterkeyNeedsToHave32Characters" --tlsMode ${CHELABASE_ZITADEL_TLS_MODE:?set by chelabase workbench (stack.env)}
+    environment: !override
+      ZITADEL_DATABASE_POSTGRES_HOST: zitadel-db
+      ZITADEL_DATABASE_POSTGRES_PORT: 5432
+      ZITADEL_DATABASE_POSTGRES_DATABASE: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_USERNAME: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_PASSWORD: zitadel
+      ZITADEL_DATABASE_POSTGRES_USER_SSL_MODE: disable
+      ZITADEL_DATABASE_POSTGRES_ADMIN_USERNAME: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_PASSWORD: postgres
+      ZITADEL_DATABASE_POSTGRES_ADMIN_SSL_MODE: disable
+      ZITADEL_EXTERNALSECURE: "${CHELABASE_PUBLIC_SECURE:?set by chelabase workbench (stack.env)}"
+      ZITADEL_EXTERNALDOMAIN: "${CHELABASE_AUTH_HOST_NAME:?set by chelabase workbench (stack.env)}"
+      ZITADEL_EXTERNALPORT: "${CHELABASE_PUBLIC_PORT:?set by chelabase workbench (stack.env)}"
+      ZITADEL_TLS_ENABLED: "false"
+      ZITADEL_DEFAULTINSTANCE_LOGINPOLICY_ALLOWREGISTER: "false"
+      ZITADEL_FIRSTINSTANCE_PATPATH: /zitadel-bootstrap/admin.pat
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_USERNAME: chelabase-bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_MACHINE_NAME: Chelabase Bootstrap
+      ZITADEL_FIRSTINSTANCE_ORG_MACHINE_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+      ZITADEL_FIRSTINSTANCE_ORG_HUMAN_PASSWORDCHANGEREQUIRED: "false"
+      ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH: /zitadel-bootstrap/login-client.pat
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_USERNAME: login-client
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_MACHINE_NAME: Chelabase auth
+      ZITADEL_FIRSTINSTANCE_ORG_LOGINCLIENT_PAT_EXPIRATIONDATE: "2099-01-01T00:00:00Z"
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_REQUIRED: "true"
+      ZITADEL_DEFAULTINSTANCE_FEATURES_LOGINV2_BASEURI: "${CHELABASE_PUBLIC_SCHEME:?set by chelabase workbench (stack.env)}://${CHELABASE_STUDIO_HOST:?set by chelabase workbench (stack.env)}/"
+      ZITADEL_OIDC_DEFAULTLOGINURLV2: "${CHELABASE_PUBLIC_SCHEME}://${CHELABASE_STUDIO_HOST}/login?authRequest="
+      ZITADEL_OIDC_DEFAULTLOGOUTURLV2: "${CHELABASE_PUBLIC_SCHEME}://${CHELABASE_STUDIO_HOST}/logout?post_logout_redirect="
+      ZITADEL_HTTPCLIENT_DENYLIST: "localhost,0.0.0.0/8,127.0.0.0/8,169.254.0.0/16,::1/128"
+    depends_on: !override
+      zitadel-db:
+        condition: service_healthy
+    volumes: !override
       - type: bind
         source: ${CHELABASE_STACK_DIR}/zitadel
         target: /zitadel-bootstrap
@@ -176,21 +409,45 @@ services:
 
   # The proxy's Postgres port on the stack's proxy port, loopback only.
   proxy:
+    user: "${CHELABASE_UID}:${CHELABASE_GID}"
+    volumes: !override
+      - neon_proxy_tls:/tls:ro
+    secrets:
+      - {source: valkey-proxy, target: /run/valkey-proxy.password}
+      - {source: token-proxy-api, target: /run/proxy-api.token}
     ports:
       - "127.0.0.1:${CHELABASE_PROXY_PORT:?set by chelabase workbench (stack.env)}:4432"
       - "[::1]:${CHELABASE_PROXY_PORT}:4432"
 
   # --- The app tier: the checkout's host-built debug binaries in the workbench image ---------
 
+  # Each app: its env files and its own variables (`environment: !override` drops the base's
+  # self-hosted settings, which would win over the env files), its key files as Compose secrets at
+  # their keys-dir paths (`volumes: !override` drops the base's `secrets` volume mounts), and the
+  # dependencies it had (no one-shots).
   orchestrator:
     <<: *workbench
+    entrypoint: !reset []
     command: ["${CHELABASE_CHECKOUT}/target/debug/orchestrator"]
     env_file:
       - *stack-env
       - *demo-env
       - path: ${CHELABASE_STACK_DIR}/zitadel/actions.env
         required: false
-    environment:
+    environment: !override
+      # RT1 T1 (S1, S27): its own credentials, from its own secrets below.
+      - CHELABASE_NATS_USER=orchestrator
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/orchestrator.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_orchestrator
+      - CHELABASE_VALKEY_USER=control
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/control.password
+      - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
+      - CHELABASE_REST_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+      - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+      - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+      - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+      - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
+      - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       # Connection strings name the proxy's published port on the host.
       - CHELABASE_PROXY_PG_PORT=${CHELABASE_PROXY_PORT}
       # Bare names: taken from the caller's env, unset when it has none. The runner's live tests
@@ -204,23 +461,60 @@ services:
     networks:
       control:
         ipv4_address: ${CHELABASE_ORCHESTRATOR_CONTROL_IP:?set by chelabase workbench (stack.env)}
-    volumes:
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
       - *keys-orchestrator-tls-ro
       - *docker-sock
+    secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+      - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+      - {source: nats-orchestrator, target: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}
+      - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+      - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+      - {source: token-rest-internal, target: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+      - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+      - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+      - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+      - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+      - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      storage-controller:
+        condition: service_healthy
+      zitadel:
+        condition: service_healthy
 
   worker:
     <<: *workbench
+    entrypoint: !reset []
     command: ["${CHELABASE_CHECKOUT}/target/debug/worker"]
     env_file:
       - *stack-env
       - *demo-env
-    environment:
+    environment: !override
+      # RT1 T1 (S1): its own credentials, from its own secrets below.
+      - CHELABASE_NATS_USER=worker
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/worker.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_worker
+      - CHELABASE_VALKEY_USER=control
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/control.password
+      - CHELABASE_REALTIME_PG_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/realtime/pg.password
+      # The worker renews realtime's client pair with the sweep, and refreshes computes' storage tokens.
+      - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
+      - CHELABASE_STORAGE_TOKEN_REFRESH_SECS=${CHELABASE_STORAGE_TOKEN_REFRESH_SECS:-3600}
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
     group_add: ["${CHELABASE_DOCKER_GID}"]
-    volumes:
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
@@ -228,19 +522,53 @@ services:
       - *keys-orchestrator-tls-rw
       - *keys-realtime-tls-rw
       - *docker-sock
+    secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+      - {source: secrets-key, target: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+      - {source: compute-jwt-private, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+      - {source: compute-jwt-public, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+      - {source: nats-worker, target: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
+      - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+      - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
+      storage-controller:
+        condition: service_healthy
+      pageserver:
+        condition: service_healthy
+      safekeeper1:
+        condition: service_healthy
+      safekeeper2:
+        condition: service_healthy
+      safekeeper3:
+        condition: service_healthy
+      register-safekeepers:
+        condition: service_completed_successfully
+      zitadel:
+        condition: service_healthy
 
-  # The gateway's port is the stack's (published on loopback), and it answers every host of the
-  # stack on the network.
+  # The gateway's port is the stack's (published on loopback; it listens on it inside too), and
+  # it answers every host of the stack on the network. It starts before its backends (502 until
+  # they come up).
   gateway:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/gateway"]
     env_file:
       - *stack-env
       - *demo-env
-    ports:
+    environment: !override
+      # RT1 T1 (S27): the bearers it sends to the orchestrator's internal listener.
+      - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
+      - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+    ports: !override
       - "127.0.0.1:${CHELABASE_GATEWAY_PORT:?set by chelabase workbench (stack.env)}:${CHELABASE_GATEWAY_PORT}"
       - "[::1]:${CHELABASE_GATEWAY_PORT}:${CHELABASE_GATEWAY_PORT}"
-    networks:
+    networks: !override
       default:
         aliases:
           - ${CHELABASE_STUDIO_HOST_NAME:?set by chelabase workbench (stack.env)}
@@ -249,11 +577,20 @@ services:
           - ${CHELABASE_MAIL_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_DOCS_HOST_NAME:?set by chelabase workbench (stack.env)}
           - ${CHELABASE_LANDING_HOST_NAME:?set by chelabase workbench (stack.env)}
-    volumes:
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-    depends_on:
+    secrets:
+      - {source: internal-signing, target: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
+      - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+      - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${CHELABASE_GATEWAY_PORT}/_gateway/health"]
+    depends_on: !override
+      zitadel:
+        condition: service_healthy
       mailpit:
         condition: service_healthy
 
@@ -263,10 +600,28 @@ services:
     env_file:
       - *stack-env
       - *demo-env
-    volumes:
+    environment: !override
+      # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
+      - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
+    secrets:
+      - {source: zitadel-admin-pat, target: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+      - {source: zitadel-login-client-pat, target: "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"}
+      - {source: cookie, target: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
+      - {source: app-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
+      - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+    # auth has no health route here: any HTTP answer (even a 404) means it is serving.
+    healthcheck:
+      test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://127.0.0.1:8084/"]
+    depends_on: !override
+      zitadel:
+        condition: service_healthy
 
   rest:
     <<: *workbench
@@ -274,27 +629,62 @@ services:
     env_file:
       - *stack-env
       - *demo-env
-    volumes:
+    environment: !override
+      # RT1 T1 (S27): its internal bearer (both ways with the orchestrator).
+      - CHELABASE_REST_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/rest-internal.token
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
+    secrets:
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: token-rest-internal, target: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
 
   # Its static address on `control` is outside the computes' range and in the chelabase_realtime
-  # login rule.
+  # login rule. It reads demo.env for the OIDC audiences, as the gateway does.
   realtime:
     <<: *workbench
     command: ["${CHELABASE_CHECKOUT}/target/debug/realtime"]
     env_file:
       - *stack-env
       - *demo-env
+    environment: !override
+      # S1: its own credentials and secrets, from its own secrets below.
+      - CHELABASE_NATS_USER=realtime
+      - CHELABASE_NATS_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/nats/realtime.password
+      - CHELABASE_NATS_INBOX_PREFIX=_INBOX_realtime
+      - CHELABASE_VALKEY_USER=realtime
+      - CHELABASE_VALKEY_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/valkey/realtime.password
+      - CHELABASE_VALKEY_TLS=off
+      - CHELABASE_REALTIME_PG_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/realtime/pg.password
+      - CHELABASE_REALTIME_TICKET_KEY_FILE=${CHELABASE_KEYS_DIR}/realtime/ticket.key
+      - CHELABASE_REALTIME_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/realtime/internal.token
+      - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
     networks:
       control:
         ipv4_address: ${CHELABASE_REALTIME_CONTROL_IP:?set by chelabase workbench (stack.env)}
-    volumes:
+    volumes: !override
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
       - *keys-realtime-tls-ro
+    secrets:
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: nats-realtime, target: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
+      - {source: valkey-realtime, target: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
+      - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+      - {source: realtime-ticket, target: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
+      - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+    depends_on: !override
+      nats:
+        condition: service_healthy
+      valkey:
+        condition: service_healthy
 
   # Vite dev servers from the checkout (read-write: Vite's cache lives under node_modules), bound
   # to 0.0.0.0 (CHELABASE_*_BIND) and reached through the gateway; HMR goes through it too.
@@ -428,8 +818,76 @@ services:
 # The stack's control subnet, from the registry's control slot; computes take addresses from the
 # upper /23 only.
 networks:
-  control:
+  control: !override
     ipam:
       config:
         - subnet: ${CHELABASE_CONTROL_SUBNET:?set by chelabase workbench (stack.env)}
           ip_range: ${CHELABASE_CONTROL_COMPUTE_RANGE:?set by chelabase workbench (stack.env)}
+
+# The self-hosted install's secrets volume: unused here (the keys dir and the state dir hold
+# them, as Compose secrets below).
+volumes:
+  secrets: !reset null
+
+# Per-service key files (U10): each service lists the ones it reads under its own `secrets:`,
+# with `target:` set to the path it expects, so a service sees exactly its files. Compose binds
+# each host file read-only; a missing file fails `up`.
+# RT1 T1 (R11, S1, S27): the generated service secrets (`chelabase workbench up` creates each once,
+# 0600, never overwritten); a service gets its file's path as <NAME>_FILE in its own
+# `environment:`, never through stack.env.
+secrets:
+  secrets-key: {file: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+  internal-signing: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
+  internal-verify: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+  cookie: {file: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
+  app-jwt-private: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
+  app-jwt-public: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+  compute-jwt-private: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
+  compute-jwt-public: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
+  nats-orchestrator: {file: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}
+  nats-worker: {file: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
+  nats-realtime: {file: "${CHELABASE_KEYS_DIR}/nats/realtime.password"}
+  nats-runner: {file: "${CHELABASE_KEYS_DIR}/nats/runner.password"}
+  valkey-proxy: {file: "${CHELABASE_KEYS_DIR}/valkey/proxy.password"}
+  valkey-control: {file: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
+  valkey-realtime: {file: "${CHELABASE_KEYS_DIR}/valkey/realtime.password"}
+  valkey-runner: {file: "${CHELABASE_KEYS_DIR}/valkey/runner.password"}
+  valkey-health: {file: "${CHELABASE_KEYS_DIR}/valkey/health.password"}
+  realtime-pg: {file: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+  realtime-ticket: {file: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
+  realtime-internal: {file: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+  token-rest-internal: {file: "${CHELABASE_KEYS_DIR}/tokens/rest-internal.token"}
+  token-data-keys: {file: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
+  token-app-auth: {file: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+  token-app-sessions: {file: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+  token-proxy-api: {file: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+  token-storcon-hook: {file: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+  # Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped
+  # NeonJWTs the workbench signs with the pair (<keys>/neon/storage-tokens/). The runner sees
+  # them at their own paths (scripts call the storage controller); the Neon containers read them
+  # under /run.
+  storage-pem: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem"}
+  storage-pageserver-api: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt"}
+  storage-safekeeper-data: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt"}
+  storage-generations-api: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt"}
+  storage-storcon-admin: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt"}
+  # The runner's metrics token (scope metrics, minted by the workbench). A kept metrics.token
+  # isn't checked against the current compute-JWT key: after a key rotation, re-mint it with
+  # `chelabase neon mint-metrics-token`, then recreate the runner (a single-file mount keeps the
+  # old file's inode, so a running runner never sees the new token). The command writes under
+  # `CHELABASE_NEON_DIR` (default `.chelabase/neon` in the checkout): for a workbench stack, run
+  # it with that stack's `CHELABASE_NEON_DIR`.
+  storage-metrics: {file: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token"}
+  # The platform CA's certificate alone (never ca.key): auth, rest and realtime verify every
+  # compute's TLS against it (U15, CHELABASE_COMPUTE_CA_FILE).
+  compute-ca-cert: {file: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+  # The Zitadel PATs, the only state files an app opens (once, at startup, from the paths demo.env
+  # gives: CHELABASE_ZITADEL_ADMIN_PAT_FILE, CHELABASE_AUTH_TOKEN_FILE), at their own paths, ro:
+  # admin.pat for the orchestrator, the worker and auth, login-client.pat for auth. Zitadel writes
+  # them on a fresh volume, so a missing one fails the app's create or start (no longer a warning
+  # in the orchestrator or the worker): `workbench up`, `restart` and `test`'s recreate of
+  # stale apps wait for the PATs before they create these apps, and `scripts/zitadel-reset.sh`
+  # (which deletes them) returns only once Zitadel has rewritten both. A running app keeps the
+  # file it started with.
+  zitadel-admin-pat: {file: "${CHELABASE_STACK_DIR}/zitadel/admin.pat"}
+  zitadel-login-client-pat: {file: "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"}
