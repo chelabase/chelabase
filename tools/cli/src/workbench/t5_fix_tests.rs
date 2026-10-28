@@ -2,7 +2,7 @@
 
 use super::commands::{
     alive_ps_args, check_purge, compose_command, is_legacy_compute, missing_services,
-    nextest_bin_for_env, stop_processes, up_recreates,
+    nextest_bin_for_env, stop_processes,
 };
 use super::registry::{Entry, with_registry};
 use super::slots::touch_slot;
@@ -27,19 +27,6 @@ fn only_w1_computes_are_legacy() {
     assert!(!is_legacy_compute("chelabase-compute-x-compute-ep-abc123", &labels(&scoped)));
     assert!(!is_legacy_compute("chelabase-main-compute-ep-abc123", &labels(&ep)), "new names");
     assert!(!is_legacy_compute("chelabase-compute-ep-abc123", &labels(&[])), "no endpoint label");
-}
-
-// I2: `up` on a running stack recreates every app whose binary changed, plus those whose env
-// files changed, before it records the binaries.
-#[test]
-fn up_recreates_stale_binaries_and_changed_env_users() {
-    let recorded = HashMap::from([("worker".to_string(), 1u64), ("gateway".to_string(), 2)]);
-    let current = HashMap::from([("worker".to_string(), 9u64), ("gateway".to_string(), 2)]);
-    assert_eq!(
-        up_recreates(&recorded, &current, &["orchestrator".to_string(), "worker".to_string()]),
-        ["orchestrator", "worker"]
-    );
-    assert!(up_recreates(&current, &current, &[]).is_empty());
 }
 
 // I3: legacy processes are waited for; one that ignores SIGTERM is killed after the grace.

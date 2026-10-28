@@ -45,6 +45,8 @@ struct ZState {
     /// The instance's IAM members (user ids), and how many more the listing says exist.
     iam: std::collections::BTreeSet<String>,
     iam_unlisted: u32,
+    /// IAM members listed without a `userType`.
+    iam_untyped: std::collections::BTreeSet<String>,
     targets: Vec<(String, String, String)>,
     execution: Option<Value>,
 }
@@ -240,8 +242,12 @@ impl FakeZitadel {
                     .iter()
                     .map(|id| {
                         let human = s.users[id].1;
-                        json!({"userId": id, "roles": ["IAM_OWNER"],
-                            "userType": if human { "TYPE_HUMAN" } else { "TYPE_MACHINE" }})
+                        let mut m = json!({"userId": id, "roles": ["IAM_OWNER"],
+                            "userType": if human { "TYPE_HUMAN" } else { "TYPE_MACHINE" }});
+                        if s.iam_untyped.contains(id) {
+                            m.as_object_mut().unwrap().remove("userType");
+                        }
+                        m
                     })
                     .collect();
                 let total = result.len() as u32 + s.iam_unlisted;
@@ -312,7 +318,10 @@ impl FakeZitadel {
                     json!({})
                 } else if let Some(id) = other.strip_prefix("GET /v2/users/") {
                     match s.users.get(id) {
-                        Some(u) => json!({"user": {"userId": id, "state": u.3}}),
+                        Some(u) if u.1 => {
+                            json!({"user": {"userId": id, "state": u.3, "human": {}}})
+                        }
+                        Some(u) => json!({"user": {"userId": id, "state": u.3, "machine": {}}}),
                         None => {
                             return Err(
                                 ApiError::new(other, Some(404), "Errors.User.NotFound").into()
@@ -1283,4 +1292,22 @@ fn the_tenant_name_sql_has_one_home() {
             .unwrap();
     assert!(live.contains("chelabase-init/src/bootstrap/tenant_name.sql"));
     assert!(!live.contains("tools/cli/src/dev/tenant_"));
+}
+
+// N4: a member listed without a type is checked, not skipped: a human is deactivated, a
+// machine (from its user record) stays.
+#[tokio::test]
+async fn an_untyped_iam_member_is_checked_not_skipped() {
+    let w = World::new();
+    {
+        let mut s = w.zitadel.state.lock().unwrap();
+        s.iam_untyped.insert("u-human".into());
+        s.iam_untyped.insert("u-bootstrap".into());
+    }
+    w.run(Demo::Off).await.unwrap();
+    assert_eq!(human_state(&w), "USER_STATE_INACTIVE");
+    assert_eq!(
+        w.zitadel.state().users["u-bootstrap"].3,
+        "USER_STATE_ACTIVE"
+    );
 }
