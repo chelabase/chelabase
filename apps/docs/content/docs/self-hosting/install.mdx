@@ -103,7 +103,7 @@ CHELABASE_PUBLIC_PORT=9000
 
 Change the hosts before the first `up`. Zitadel's issuer is derived from the auth host and the scheme and is signed into tokens.
 
-For a real domain with TLS in front of the gateway, see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front.
+For a real domain with TLS in front of the gateway, see [Hosts](/docs/self-hosting/hosts#tls), including `CHELABASE_GATEWAY_TRUSTED_PROXIES`, which a reverse proxy in front needs so that per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
 
 ### Email (SMTP)
 
@@ -154,5 +154,4 @@ The secrets, the database volumes and the claim carry over; `init-secrets` creat
 
 - **HTTPS in front with no port in the hosts.** The install does not yet cover TLS terminated by a proxy in front of the gateway when the hosts carry no port ([chelabase/chelabase#24](https://github.com/chelabase/chelabase/issues/24)). Until that is fixed, expect to set the host-related lines by hand and check the result.
 - **No secret rotation** ([chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)).
-- **Per-IP limits behind a reverse proxy** are shared by every client; see [Hosts](/docs/self-hosting/hosts#behind-a-reverse-proxy).
 - The install is Docker Compose only. Kubernetes is not covered.

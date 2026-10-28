@@ -42,17 +42,23 @@ CHELABASE_PUBLIC_SCHEME=https
 
 ### Behind a reverse proxy
 
-<Callout type="warn">
-The gateway does not read a forwarded address from the proxy in front of it. It takes the client's address from the TCP connection and sets `X-Forwarded-For` to that address alone, replacing whatever the client sent. There is no setting that makes the gateway trust your proxy's `X-Forwarded-For`. Behind a reverse proxy, the gateway sees the proxy's address for every request.
-</Callout>
+By default the gateway takes the client's address from the TCP connection and sets `X-Forwarded-For` to that address alone, replacing whatever the client sent. Behind a reverse proxy that address is the proxy's, so every client shares one per-IP bucket: sign-up is limited to 20 an hour per client address, and one noisy client could use up the hour's sign-ups for everybody, including the setup-code claim.
 
-What goes wrong: sign-up is limited per client IP (20 sign-ups an hour), and the limit is applied to the address the gateway saw. With a proxy in front, every client shares one bucket, so one noisy client, or junk requests, can use up the hour's sign-ups for everybody. This matters most while the instance is unclaimed, because the claim is a sign-up. The setup code itself is not weakened, since its entropy makes guessing impractical, but you could be locked out of the claim until the hour passes.
+Tell the gateway which proxies to believe:
 
-What to do:
+```bash
+CHELABASE_GATEWAY_TRUSTED_PROXIES=172.16.0.0/12
+```
 
-- Claim the instance before the proxy is public (the install page's [claim step](/docs/self-hosting/install#claim-the-instance)). Once the first admin exists, sign-up is closed by default and the shared bucket costs you nothing.
-- Rate-limit and filter requests to the auth host's sign-up routes at the proxy, where the real client address is visible.
-- Keep `CHELABASE_AUTH_TRUSTED_PROXY=gateway` as the install sets it. Auth then believes the `X-Forwarded-For` the gateway appended and nobody else's.
+It takes a comma-separated list of CIDRs (`10.0.0.0/8`, `fd00::/8`) or single addresses (`192.168.1.5`), written as the gateway sees the proxy. When a request comes from one of them, the gateway reads the proxy's `X-Forwarded-For` (or `Forwarded`, its `for=`), walks it from right to left past the trusted addresses, and takes the first one that isn't trusted as the client. Requests from anyone else are handled as before, so a forged header from a client that reaches the gateway directly changes nothing. The services still get exactly one address in `X-Forwarded-For`.
+
+- **Set your proxy to add the client's address.** nginx: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`. Caddy and Traefik add it on their own. Use one of the two headers, not both.
+- **Which address to list.** With Compose and a proxy on the same machine connecting to the published port, the gateway sees the Docker network's gateway address rather than `127.0.0.1`; `docker network inspect <project>_default` shows it. Listing the whole `172.16.0.0/12` trusts every container on the Docker networks too, so prefer the one address when you can. A proxy on another machine is seen at its own address.
+- **List only what can't be forged.** Anything listed can name any client address. Never list a range your users' traffic arrives from directly; a prefix of `/0` is refused.
+- **When the header can't be trusted, the gateway falls back to the proxy's address.** That happens when a trusted proxy sends both headers or neither, a header over 4096 bytes or 32 hops, or an entry the walk reaches that isn't an address (`unknown`, an obfuscated name). The request is never refused for it.
+- Keep `CHELABASE_AUTH_TRUSTED_PROXY=gateway` as the install sets it. Auth then believes the `X-Forwarded-For` the gateway sets and nobody else's.
+
+An invalid entry stops the gateway at startup with a message naming `CHELABASE_GATEWAY_TRUSTED_PROXIES`.
 
 ## Settings
 
@@ -62,6 +68,7 @@ What to do:
 | `CHELABASE_DOCS_HOST`, `CHELABASE_LANDING_HOST`, `CHELABASE_MAIL_HOST` | unset | Optional hosts for the docs site, the landing page and Mailpit |
 | `CHELABASE_PUBLIC_SCHEME` | `https` | `http` or `https` (platform mode requires `https`) |
 | `CHELABASE_GATEWAY_LISTEN` | `127.0.0.1:8000` | Where the gateway listens: a comma-separated list of `ip:port` addresses, IPv6 in brackets (`127.0.0.1:8000,[::1]:8000`) |
+| `CHELABASE_GATEWAY_TRUSTED_PROXIES` | none | Reverse proxies whose forwarded client address the gateway believes: CIDRs or addresses, comma-separated (see [Behind a reverse proxy](#behind-a-reverse-proxy)) |
 | `CHELABASE_STUDIO_UPSTREAM` | `http://127.0.0.1:3000` | Where the gateway reaches Studio |
 | `CHELABASE_ZITADEL_UPSTREAM` | `http://127.0.0.1:8080` | Where it reaches Zitadel |
 | `CHELABASE_DOCS_UPSTREAM` | `http://127.0.0.1:3001` | The docs site (used only with a docs host) |
