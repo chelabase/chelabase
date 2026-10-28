@@ -3146,10 +3146,11 @@ impl MetadataClient {
         Ok(zitadel_user_id)
     }
 
-    /// Whether the tenant's admin was claimed (first sign-in, `admin_claimed`), or its
-    /// fresh-install claim bound (`setup_claims`), after `since`: the window in which a second
-    /// sign-up of a fresh install may still be waiting to arrive (R41, M7). The binding counts
-    /// too, so the race loser is a pending request whichever first request comes first.
+    /// Whether the tenant's admin was claimed (first sign-in, `admin_claimed`) after `since`:
+    /// the window in which a second sign-up of a fresh install may still be waiting to arrive
+    /// (R41, M7). Binding the fresh-install claim (`setup_claims`) doesn't open it: a newcomer
+    /// before the bound user's first request is refused and writes nothing, so it can't close
+    /// the sign-up gate on a claim that may turn stale (m3 re-audit, B3; AC 6).
     pub async fn admin_claimed_since(
         &self,
         tenant: TenantId,
@@ -3157,8 +3158,7 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM access_events
-                             WHERE tenant_id = $1 AND action = 'admin_claimed' AND at > $2)
-                 OR EXISTS (SELECT 1 FROM setup_claims WHERE tenant_id = $1 AND created_at > $2)",
+                             WHERE tenant_id = $1 AND action = 'admin_claimed' AND at > $2)",
         )
         .bind(tenant.as_uuid())
         .bind(since)

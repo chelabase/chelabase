@@ -9367,24 +9367,33 @@ async fn first_member_race_loser_is_a_pending_request() {
     assert!(me["member"].is_null(), "{me}");
 }
 
-// S1 (m3 audit), AC 6 through `admit`: two code-gated sign-ups, the claim bound to A. Whichever
-// first request comes first, A becomes the admin and B a pending request (the bound claim
-// opens the race window, `admin_claimed_since`), never refused.
+// AC 6 through `admit` (reworded after the m3 re-audit, B3): two code-gated sign-ups, the claim
+// bound to A. A becomes the admin whichever first request comes first. B is refused
+// (`no_access_yet`, nothing written) until A's first request, and a pending request after it.
 #[tokio::test]
-async fn setup_race_loser_is_pending_in_either_order() {
+async fn setup_race_loser_is_refused_until_the_winner_signs_in() {
     for loser_first in [true, false] {
         let w = member_world(Mode::SelfHosted).await;
         w.metadata.members.lock().unwrap().retain(|m| m.tenant_id != w.tenant);
         w.metadata.set_admin_claim(w.tenant, None);
         w.metadata.set_setup_claim(w.tenant, "user-a");
-        let order = if loser_first { ["user-b", "user-a"] } else { ["user-a", "user-b"] };
-        for sub in order {
-            let me: Value = w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-            assert!(!me["member"].is_null(), "loser_first={loser_first} {sub}: {me}");
+        let me = |sub: &'static str| {
+            let w = &w;
+            async move { w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json::<Value>().await.unwrap() }
+        };
+        if loser_first {
+            let b = me("user-b").await;
+            assert!(b["member"].is_null(), "B before A: refused, {b}");
+            assert!(w.metadata.member(w.tenant, "user-b").is_none(), "nothing written");
+            let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
+            assert_eq!(code_of(&err), "no_access_yet");
+            assert!(w.metadata.member(w.tenant, "user-b").is_none());
         }
+        assert!(!me("user-a").await["member"].is_null());
         let a = w.metadata.member(w.tenant, "user-a").unwrap();
-        let b = w.metadata.member(w.tenant, "user-b").unwrap();
         assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true), "loser_first={loser_first}");
+        assert!(!me("user-b").await["member"].is_null());
+        let b = w.metadata.member(w.tenant, "user-b").unwrap();
         assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false), "loser_first={loser_first}");
         let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
         assert_eq!(code_of(&err), "pending_approval");

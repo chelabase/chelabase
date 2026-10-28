@@ -5979,28 +5979,51 @@ async fn setup_claim_refused_once_an_admin_exists() {
     s.finish().await;
 }
 
-// S1 (m3 audit): the fresh-install race window opens when the claim is bound, not only when
-// the bound user's first request claims the admin. So the race loser whose first request comes
-// first is a `pending` request through the orchestrator's `admit` (which asks
-// `admin_claimed_since`), not refused.
+// AC 6 (reworded after the m3 re-audit, B3): the race window opens at the bound user's first
+// request (`admin_claimed`), not when the claim is bound. Before that, a newcomer is refused.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn setup_claim_opens_the_race_window() {
+async fn setup_claim_window_opens_at_the_first_admin_claim() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
     let hour_ago = Utc::now() - Duration::hours(1);
-    assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "no claim yet");
     let n = setup_nonce(&s, t).await;
     s.client.claim_setup(t, n, "user-a", None).await.unwrap();
-    assert!(s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "the bound claim opens it");
-    assert!(!s.client.admin_claimed_since(t, Utc::now() + Duration::minutes(1)).await.unwrap());
-    // An old claim (a stale one, say) is outside the window.
-    sqlx::query("UPDATE setup_claims SET created_at = now() - interval '2 hours' WHERE tenant_id = $1")
-        .bind(t.as_uuid())
-        .execute(s.client.pool())
-        .await
-        .unwrap();
-    assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap());
+    assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "binding opens no window");
+    let a = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Closed).await.unwrap();
+    assert!(a.tenant_admin);
+    assert!(s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "A's first request opens it");
+    s.finish().await;
+}
+
+// B3 (m3 re-audit): a bystander's request inside the hour after the claim is bound, before A's
+// first request, writes nothing. So the gate stays open, and once A is gone the stale claim can
+// still be replaced (AC 11): no lockout.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_bystander_never_blocks_stale_replacement() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let n = setup_nonce(&s, t).await;
+    s.client.claim_setup(t, n, "user-a", None).await.unwrap();
+    // The orchestrator's `admit`, step by step, for bystander B: refused at `Closed`, and the
+    // window that would make B pending is shut, so nothing is written.
+    assert!(not_admitted(s.client.admit_member(t, "user-b", "b@x.com", "B", Admission::Closed).await));
+    assert!(
+        !s.client.admin_claimed_since(t, Utc::now() - Duration::hours(1)).await.unwrap(),
+        "no window before A's first request: B is not made pending"
+    );
+    assert_eq!(s.member_count(t).await, 0);
+    assert!(!s.client.tenant_has_members(t).await.unwrap(), "the gate stays open");
+    // A never signed in and is gone from Zitadel: a new code-gated sign-up replaces the claim.
+    assert!(!s.client.setup_claim(t).await.unwrap().unwrap().has_member_row);
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(
+        s.client.claim_setup(t, n, "user-c", Some("user-a")).await.unwrap(),
+        chelabase_metadata::members::SetupClaimOutcome::Bound
+    );
+    let c = s.client.admit_member(t, "user-c", "c@x.com", "C", Admission::Closed).await.unwrap();
+    assert!(c.tenant_admin);
     s.finish().await;
 }
 

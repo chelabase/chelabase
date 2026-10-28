@@ -113,11 +113,10 @@ struct FakeMetadata {
     role_reads: Arc<AtomicUsize>,
     /// When each tenant's admin was claimed by a first sign-in (`admin_claimed`).
     admin_claims: Arc<Mutex<HashMap<TenantId, chrono::DateTime<chrono::Utc>>>>,
-    /// Selfhost-install m3: each tenant's fresh-install claim (bound user, when bound). With
-    /// one, only that user claims the admin (`admit_member`'s rule); without one the fake
-    /// keeps the first comer's rule the other tests build on.
-    #[allow(clippy::type_complexity)]
-    setup_claims: Arc<Mutex<HashMap<TenantId, (String, chrono::DateTime<chrono::Utc>)>>>,
+    /// Selfhost-install m3: each tenant's fresh-install claim (its bound user). With one, only
+    /// that user claims the admin (`admit_member`'s rule); without one the fake keeps the first
+    /// comer's rule the other tests build on.
+    setup_claims: Arc<Mutex<HashMap<TenantId, String>>>,
     /// A write "another request" makes just before the next checked grant or override write.
     race_before_write: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
     /// The reconciler's `member_branch_roles` rows.
@@ -354,7 +353,7 @@ impl FakeMetadata {
 
     /// Sets (or clears) when the tenant's admin was claimed.
     fn set_setup_claim(&self, tenant: TenantId, user: &str) {
-        self.setup_claims.lock().unwrap().insert(tenant, (user.into(), chrono::Utc::now()));
+        self.setup_claims.lock().unwrap().insert(tenant, user.into());
     }
 
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
@@ -1886,7 +1885,7 @@ impl MetadataPort for FakeMetadata {
         let has_admin = members
             .iter()
             .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin);
-        let bound = self.setup_claims.lock().unwrap().get(&tenant).map(|(u, _)| u.clone());
+        let bound = self.setup_claims.lock().unwrap().get(&tenant).cloned();
         let claims = !has_admin && bound.as_deref().is_none_or(|u| u == zitadel_user_id);
         let status = match (claims, admission) {
             (true, _) | (false, Admission::Active) => MemberStatus::Active,
@@ -3461,8 +3460,9 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     }
 
     async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
-        let bound = self.setup_claims.lock().unwrap().get(&tenant).is_some_and(|(_, at)| *at > since);
-        Ok(bound || self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
+        // As the real one: only the bound user's first request (`admin_claimed`) opens the
+        // window; binding the claim doesn't (m3 re-audit, B3).
+        Ok(self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
     }
 
     async fn access_events(
