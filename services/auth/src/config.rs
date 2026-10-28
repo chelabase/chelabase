@@ -155,6 +155,12 @@ fn warn_if_open(path: &str) {
     let _ = path;
 }
 
+/// Where auth's Zitadel calls go ([`Config::zitadel`]): `CHELABASE_ZITADEL_INTERNAL_URL` with
+/// the auth host as `Host`, else the issuer; a malformed internal URL stops auth (#24).
+pub fn zitadel_from_lookup(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt> {
+    chelabase_types::entry::zitadel_at(get, issuer).map_err(anyhow::Error::new)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
@@ -192,8 +198,7 @@ impl Config {
         .map_err(anyhow::Error::msg)?;
         check_listen(&listen, !trusted_proxies.is_empty())?;
         let ids = ZitadelIds::from_lookup(|name| std::env::var(name).ok())?;
-        let zitadel = chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
-            .map_err(anyhow::Error::new)?;
+        let zitadel = zitadel_from_lookup(|name| std::env::var(name).ok(), &entry.issuer())?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
@@ -365,6 +370,25 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // m13 audit N2: how auth builds `Config.zitadel` (sign-in, invites, app users' admin calls).
+    #[test]
+    fn zitadel_is_reached_at_the_internal_url_else_the_issuer() {
+        let lookup = |v: Option<&'static str>| {
+            move |k: &str| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.map(str::to_string)).flatten()
+        };
+        let set = zitadel_from_lookup(lookup(Some("http://zitadel:8080")), "https://auth.example.com").unwrap();
+        assert_eq!(set.base, "http://zitadel:8080");
+        assert_eq!(set.host.as_deref(), Some("auth.example.com"));
+        for unset in [None, Some(""), Some("  ")] {
+            let at = zitadel_from_lookup(lookup(unset), "http://auth.chelabase.localhost:8000").unwrap();
+            assert_eq!((at.base.as_str(), at.host), ("http://auth.chelabase.localhost:8000", None), "{unset:?}");
+        }
+        for bad in ["zitadel:8080", "http://zitadel:8080/x", "http://u@zitadel"] {
+            let err = zitadel_from_lookup(lookup(Some(bad)), "https://auth.example.com").unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {err}");
+        }
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: std::collections::HashMap<String, String> = pairs
