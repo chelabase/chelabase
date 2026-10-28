@@ -35,17 +35,29 @@ pub async fn harness_full(
     mode: auth::config::Mode,
     admin: bool,
 ) -> Harness {
+    harness_tweaked(skip, min_ms, mode, admin, |_| {}).await
+}
+
+/// [`harness_full`] with the config changed by `tweak` (m5: ids from files, Studio's config).
+pub async fn harness_tweaked(
+    skip: bool,
+    min_ms: u64,
+    mode: auth::config::Mode,
+    admin: bool,
+    tweak: impl FnOnce(&mut Config),
+) -> Harness {
     let internal = support::internal::FakeInternal::start().await;
     let mock = MockZitadel::start().await;
     mock.set_strict_login(true);
     let cookie_key = SecretKey::generate();
-    let config = Config {
+    let mut config = Config {
         listen: String::new(),
         issuer: mock.base.clone(),
         token: TOKEN.into(),
         cookie_key: cookie_key.clone(),
         org_id: "o1".into(),
         studio_url: "http://studio.chelabase.localhost:8000".into(),
+        studio: Default::default(),
         skip_email_verification: skip,
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),
@@ -53,6 +65,7 @@ pub async fn harness_full(
         // The test client connects from loopback: it stands in for the gateway.
         trusted_proxies: auth::guard::TrustedProxies::parse("127.0.0.1,::1").unwrap(),
     };
+    tweak(&mut config);
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
@@ -2388,4 +2401,147 @@ async fn log_and_error_scrub() {
             assert!(!body.to_string().contains(secret), "{secret} in {body}");
         }
     }
+}
+
+// ---- Selfhost-install m5: the bootstrap's outputs from files ----
+
+fn write_id(path: &std::path::Path, value: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, value).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+fn org_file(path: &std::path::Path) -> chelabase_types::file_value::FileValue {
+    chelabase_types::file_value::FileValue::file(
+        "CHELABASE_ZITADEL_ORG_ID_FILE",
+        path,
+        chelabase_types::file_value::Sensitivity::Public,
+    )
+}
+
+// AC 1: auth starts before the bootstrap has written the org id. Until it is there, sign-in,
+// sign-up (before any gate call or account), the instance probe and password reset answer
+// 503 `unavailable`, and the health check reports not-ready. Once the file appears the next
+// request succeeds, without a restart.
+#[tokio::test]
+async fn sign_in_503_until_org_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("org-id");
+    let p = path.clone();
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.org_id = org_file(&p)
+    })
+    .await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.internal.set_signup(true, "open");
+    let unavailable = || err("unavailable", messages::UNAVAILABLE);
+    for round in ["absent", "empty"] {
+        if round == "empty" {
+            write_id(&path, "\n");
+        }
+        assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
+        let ar = h.mock.add_auth_request(true);
+        let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+        assert!(a.cookies.is_empty(), "{round}: no session without the org");
+        let a = h.post("/auth/v1/sign-up", signup(&ar, "new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+        let a = h.get("/auth/v1/instance", "1.1.1.3").await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
+        let a = h.post("/auth/v1/password-reset", json!({"email": "ada@example.com"}), None, "1.1.1.4").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+    }
+    assert_eq!(h.mock.users_with_email("new@example.com"), 0, "no account was made");
+    assert!(h.internal.bodies(SIGN_UP_CALL).is_empty(), "the gate was never asked");
+
+    write_id(&path, "o1\n");
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
+    let ar = h.mock.add_auth_request(false);
+    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body["next"].clone()), (StatusCode::OK, json!("done")));
+    let a = h
+        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.2")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
+    assert_eq!(h.internal.bodies(SIGN_UP_CALL), vec![json!({"org": "o1"})]);
+}
+
+// A refused org file (a symlink here) is 503 too, never a sign-in against no org.
+#[tokio::test]
+async fn a_refused_org_file_is_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    write_id(&real, "o1\n");
+    let link = dir.path().join("org-id");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.org_id = org_file(&link)
+    })
+    .await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    let ar = h.mock.add_auth_request(false);
+    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// AC 5: `GET /auth/v1/studio-config` is exactly the six public values Studio needs, cacheable
+// for 60 s. Not configured here (the workbench) it is 404, so Studio uses its build values;
+// configured but not written yet it is 503, uncached, and auth isn't ready.
+#[tokio::test]
+async fn studio_config_shape() {
+    use chelabase_types::file_value::{FileValue, Sensitivity};
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, |c| {
+        c.studio = auth::config::StudioSettings {
+            client_id: Some("c-studio".into()),
+            project_id: Some("p1".into()),
+            api_url: "http://api.chelabase.localhost:8000".into(),
+            studio_host: "studio.chelabase.localhost:8000".into(),
+        };
+    })
+    .await;
+    let mut a = h.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK);
+    let cache = a.body.as_object_mut().unwrap().remove("_cache_control");
+    assert_eq!(cache, Some(json!("public, max-age=60")));
+    assert_eq!(
+        a.body,
+        json!({
+            "issuer": h.mock.base,
+            "clientId": "c-studio",
+            "projectId": "p1",
+            "orgId": "o1",
+            "apiUrl": "http://api.chelabase.localhost:8000",
+            "studioHost": "studio.chelabase.localhost:8000",
+        })
+    );
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
+
+    let plain = harness().await;
+    let a = plain.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    assert_eq!(a.body["error"]["code"], "not_found");
+    assert_eq!(plain.get("/health", "1.1.1.1").await.status, StatusCode::OK, "nothing to wait for");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("studio-client-id");
+    let p = path.clone();
+    let late = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.studio = auth::config::StudioSettings {
+            client_id: Some(FileValue::file("CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE", &p, Sensitivity::Public)),
+            project_id: Some("p1".into()),
+            api_url: "http://api.chelabase.localhost:8000".into(),
+            studio_host: "studio.chelabase.localhost:8000".into(),
+        };
+    })
+    .await;
+    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(a.body["error"]["code"], "unavailable");
+    assert_eq!(a.body["_cache_control"], "no-store");
+    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+    write_id(&path, "c-late\n");
+    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!((a.status, a.body["clientId"].clone()), (StatusCode::OK, json!("c-late")));
+    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::OK);
 }

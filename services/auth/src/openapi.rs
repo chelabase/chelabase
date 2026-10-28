@@ -99,6 +99,7 @@ mod tests {
         want.extend(
             [
                 ("GET", "/auth/v1/instance", "getInstance"),
+                ("GET", "/auth/v1/studio-config", "getStudioConfig"),
                 ("POST", "/auth/v1/app/sign-up", "appSignUp"),
                 ("POST", "/auth/v1/app/sign-in", "appSignIn"),
                 ("POST", "/auth/v1/app/refresh", "appRefresh"),

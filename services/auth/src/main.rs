@@ -26,11 +26,12 @@ async fn main() -> anyhow::Result<()> {
             "required"
         }
     );
+    let dev = chelabase_types::dev_defaults::DevDefaults::from_env().map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     info!("auth listening on {}", config.listen);
     let app = match AppConfig::from_env()? {
         Some(c) => {
-            AppConfig::check_internal_token(config.mode, &c.internal_token)?;
+            AppConfig::check_internal_token(config.mode, dev, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
             Some(AppUsers::from_config(&c, &config.issuer)?)
         }
@@ -38,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     };
     let signup_gate = {
         let c = AppConfig::internal_from_env()?;
-        AppConfig::check_internal_token(config.mode, &c.1)?;
+        AppConfig::check_internal_token(config.mode, dev, &c.1)?;
         auth::app_users::InternalClient::new(&c.0, &c.1)
     };
     let state = Arc::new(AppState {

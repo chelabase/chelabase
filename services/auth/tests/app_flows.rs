@@ -189,6 +189,7 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
         cookie_key: SecretKey::generate(),
         org_id: "o1".into(),
         studio_url: "http://studio.chelabase.localhost:8000".into(),
+        studio: Default::default(),
         skip_email_verification: true,
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),

@@ -1102,6 +1102,9 @@ pub mod auth {
     pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
     /// Whether the instance is unclaimed (the sign-up page asks for the setup code).
     pub const INSTANCE: Endpoint = Endpoint { method: Method::Get, ..post("auth.instance", "/auth/v1/instance") };
+    /// Studio's runtime config (its Zitadel ids and public URLs), read before it mounts.
+    pub const STUDIO_CONFIG: Endpoint =
+        Endpoint { method: Method::Get, ..post("auth.studio_config", "/auth/v1/studio-config") };
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
     pub const ACCEPT_INVITE: Endpoint = post("auth.accept_invite", "/auth/v1/accept-invite");
@@ -1337,6 +1340,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     rest::SCHEMA,
     auth::AUTH_REQUEST,
     auth::INSTANCE,
+    auth::STUDIO_CONFIG,
     auth::SIGN_IN,
     auth::SIGN_UP,
     auth::ACCEPT_INVITE,
@@ -1729,14 +1733,15 @@ mod tests {
         let platform = |e: &&Endpoint| e.service == Service::Auth && !e.path.starts_with("/auth/v1/app/");
         for ep in ENDPOINTS.iter().filter(platform) {
             // All posts, the accept page's invite description included (M8: its user id and
-            // token go in the body, never a URL); the bodiless instance state is the one GET.
-            let want = if ep.name == "auth.instance" { Method::Get } else { Method::Post };
+            // token go in the body, never a URL); the bodiless instance state and Studio's
+            // runtime config (m5) are the GETs.
+            let want = if matches!(ep.name, "auth.instance" | "auth.studio_config") { Method::Get } else { Method::Post };
             assert_eq!(ep.method, want, "{}", ep.path);
             assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
             assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
-        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 11);
+        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 12);
         assert!(matches!(match_endpoint(Scope::Api, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
     }
@@ -2098,6 +2103,7 @@ mod tests {
             // Studio sign-in.
             ("auth.auth_request", Access::Public),
             ("auth.instance", Access::Public),
+            ("auth.studio_config", Access::Public),
             ("auth.sign_in", Access::Public),
             ("auth.sign_up", Access::Public),
             ("auth.accept_invite", Access::Public),
