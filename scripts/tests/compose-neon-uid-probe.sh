@@ -44,7 +44,8 @@ docker run --rm --pull never -v "$tmp:/t" alpine chown -R "$uid:$gid" /t/m >/dev
 
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE CHELABASE_UID="$uid" CHELABASE_GID="$gid" \
   CHELABASE_KEYS_DIR="$keys" CHELABASE_STACK_DIR="$state" docker compose -p chelabase-feat-x \
-  -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" --env-file "$fixture" \
+  -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" \
+  -f "${COMPOSE_OVERLAY_UNDER_TEST:-$root/infra/compose/docker-compose.workbench.yml}" --env-file "$fixture" \
   config --no-env-resolution --format json |
   jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" || fail "compose config failed"
 q() { jq -r "$1" <<<"$config"; }

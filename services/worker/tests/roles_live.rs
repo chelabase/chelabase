@@ -728,6 +728,9 @@ async fn compose(env: &[(&str, &str)], args: &[&str]) {
     let out = tokio::process::Command::new("docker")
         .args(["compose", "-p", &required_env("CHELABASE_COMPOSE_PROJECT"), "-f"])
         .arg(format!("{checkout}/infra/compose/docker-compose.yml"))
+        // The workbench overlay, as every workbench compose call passes it.
+        .arg("-f")
+        .arg(format!("{checkout}/infra/compose/docker-compose.workbench.yml"))
         .arg("--env-file")
         .arg(format!("{}/env/stack.env", required_env("CHELABASE_STACK_DIR")))
         .args(args)

@@ -68,7 +68,10 @@ grep -q 'docker' services/worker/tests/roles_live.rs && grep -q -- '--force-recr
 grep -q 'docker-compose-plugin' infra/workbench/Dockerfile ||
   { echo "stack-urls: the runner image has the Compose plugin" >&2; bad=1; }
 fixture=scripts/tests/fixtures/workbench-stack.env
-render() { docker compose -p chelabase-feat-x -f infra/compose/docker-compose.yml --env-file "$fixture" config --format json; }
+render() {
+  docker compose -p chelabase-feat-x -f infra/compose/docker-compose.yml -f infra/compose/docker-compose.workbench.yml \
+    --env-file "$fixture" config --format json
+}
 for knob in CHELABASE_PASSWORD_STRENGTH CHELABASE_BRANCH_DATABASE_CAP; do
   [[ "$(env "$knob=on" bash -c "$(declare -f render); fixture=$fixture; render" | jq -r ".services.orchestrator.environment.$knob // empty")" == on ]] ||
     { echo "stack-urls: the orchestrator takes $knob from the caller's env" >&2; bad=1; }

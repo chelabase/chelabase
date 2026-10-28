@@ -608,7 +608,10 @@ fn values_are_written_literally() {
 fn compose_always_names_its_project_file_and_env() {
     let c = Compose {
         project: "chelabase-feat-x",
-        file: Path::new("/w/infra/compose/docker-compose.yml"),
+        files: vec![
+            Path::new("/w/infra/compose/docker-compose.yml"),
+            Path::new("/w/infra/compose/docker-compose.workbench.yml"),
+        ],
         env_file: Path::new("/s/env/stack.env"),
     };
     assert_eq!(
@@ -619,12 +622,51 @@ fn compose_always_names_its_project_file_and_env() {
             "chelabase-feat-x",
             "-f",
             "/w/infra/compose/docker-compose.yml",
+            "-f",
+            "/w/infra/compose/docker-compose.workbench.yml",
             "--env-file",
             "/s/env/stack.env",
             "ps",
             "-q"
         ]
     );
+}
+
+/// m7: every workbench compose call names the base file and then the workbench overlay, both from
+/// the stack's checkout, so no call ever renders the base file alone.
+#[test]
+fn compose_args_include_overlay() {
+    use super::commands::{Stack, runner_command};
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("m");
+    let stack = Stack::new("feat", &main.join(".worktrees/feat"), &main);
+    std::fs::create_dir_all(stack.env_file.parent().unwrap()).unwrap();
+    std::fs::write(&stack.env_file, "CHELABASE_PUBLIC_SCHEME=http\n").unwrap();
+    let compose_dir = stack.checkout.join("infra/compose");
+    let (base, overlay) = ("docker-compose.yml", "docker-compose.workbench.yml");
+    let want = [base, overlay].map(|f| compose_dir.join(f).display().to_string());
+    let files = |args: &[String]| -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == "-f")
+            .map(|w| w[1].clone())
+            .collect()
+    };
+
+    // The runner (`test`, `run`): the one builder every other call shares, through compose_cmd.
+    let cmd = runner_command(&stack, &stack.checkout, &[], &["true".to_string()]).unwrap();
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(files(&args), want, "{args:?}");
+    // The files come before the subcommand, so they apply to it.
+    let run_at = args.iter().position(|a| a == "run").unwrap();
+    let last_f = args.iter().rposition(|a| a == "-f").unwrap();
+    assert!(last_f < run_at, "{args:?}");
+
+    // The struct itself: base, then overlay.
+    let args = stack.compose().args(&["ps"]);
+    assert_eq!(files(&args), want, "{args:?}");
 }
 
 #[test]
