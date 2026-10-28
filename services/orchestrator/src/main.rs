@@ -1,5 +1,5 @@
 use chelabase_auth::internal::InternalVerifier;
-use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_metadata::MetadataClient;
 use chelabase_query::app_users::PgUsersDb;
 use chelabase_nats::{connect, ensure_control_stream, ensure_neon_events_stream, NatsConfig};
 use chelabase_neon::proxy_cache::ProxyCache;
@@ -27,9 +27,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let metadata_config = MetadataConfig::from_env().unwrap_or_else(|_| MetadataConfig {
-        database_url: "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into(),
-    });
+    let metadata_config =
+        orchestrator::internal::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;

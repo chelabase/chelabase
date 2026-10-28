@@ -536,6 +536,24 @@ pub fn build_with(
     })
 }
 
+/// `CHELABASE_METADATA_DATABASE_URL`: where the metadata database is. Required: there is no
+/// development fallback (the workbench's stack.env always sets it), so a fixed credential is
+/// never used by accident. The error names the variable, never a URL.
+pub fn metadata_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<chelabase_metadata::MetadataConfig> {
+    let database_url = get("CHELABASE_METADATA_DATABASE_URL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CHELABASE_METADATA_DATABASE_URL is not set: the metadata database's URL \
+                 (postgres://user:password@host:port/database)"
+            )
+        })?;
+    Ok(chelabase_metadata::MetadataConfig { database_url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,27 +572,98 @@ mod tests {
 
     const IMAGE: (&str, &str) = ("CHELABASE_COMPUTE_IMAGE", "chelabase/compute-node-v17:test");
 
+    // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
+    // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
+    // `postgres://chelabase:chelabase@…`; the workbench always sets it (its stack.env).
+    #[test]
+    fn the_metadata_url_is_required() {
+        for pairs in [vec![], vec![("CHELABASE_METADATA_DATABASE_URL", " ")], vec![("CHELABASE_DEV_DEFAULTS", "1")]] {
+            let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+            let err = match metadata_config(|k| map.get(k).map(|v| v.to_string())) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{pairs:?}: a fallback metadata URL: {}", c.database_url),
+            };
+            assert!(err.contains("CHELABASE_METADATA_DATABASE_URL"), "{err}");
+        }
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| " postgres://u:p@db:5432/m ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u:p@db:5432/m");
+    }
+
     // Selfhost-install m5 (AC 4): a service with an internal bearer at its development default
     // refuses to start outside the workbench. The worker holds none (it signs storage JWTs
     // with its key pair and reaches NATS with its own password, which has no default), so
-    // there is nothing to refuse. This pins that: a bearer added to its config must get the
-    // `DevDefaults::check_bearer` startup check the orchestrator and auth have.
+    // there is nothing to refuse. This pins that two ways (m5 fix round, N3):
+    // - it reads none of the real bearer variables (`DEV_BEARERS`, plain or `_FILE`), nor
+    //   anything named like one (`_TOKEN`, `_SECRET`, `_BEARER`; a heuristic for new ones);
+    // - its config is destructured field by field, with no `..`: a field added to
+    //   `WorkerConfig` fails to compile here until someone says whether it is a credential
+    //   (and, if it has a development default, adds `DevDefaults::check_bearers`).
     #[test]
     fn dev_bearer_refused_without_dev_defaults() {
         let asked = std::cell::RefCell::new(Vec::<String>::new());
         let get = lookup(&[IMAGE]);
-        WorkerConfig::from_lookup(|name| {
+        let c = WorkerConfig::from_lookup(|name| {
             asked.borrow_mut().push(name.to_string());
             get(name)
         })
         .unwrap();
         let asked = asked.into_inner();
         assert!(asked.iter().any(|n| n == "CHELABASE_COMPUTE_IMAGE"), "{asked:?}");
+        let real: Vec<String> = chelabase_types::dev_defaults::DEV_BEARERS
+            .iter()
+            .flat_map(|(var, _)| [var.to_string(), format!("{var}_FILE")])
+            .collect();
         let bearers: Vec<&String> = asked
             .iter()
-            .filter(|n| n.ends_with("_TOKEN") || n.ends_with("_TOKEN_FILE"))
+            .filter(|n| {
+                real.contains(n)
+                    || ["_TOKEN", "_TOKEN_FILE", "_SECRET", "_SECRET_FILE", "_BEARER", "_BEARER_FILE"]
+                        .iter()
+                        .any(|suffix| n.ends_with(suffix))
+            })
             .collect();
         assert!(bearers.is_empty(), "the worker reads a bearer without the dev-default check: {bearers:?}");
+        // Every field, none a bearer. Credentials it does hold have no default: the Valkey
+        // password and realtime's role password are files the stack mounts, and the Zitadel
+        // admin PAT is a file too.
+        let WorkerConfig {
+            storcon_url: _,
+            safekeeper_http: _,
+            compute_jwt_dir: _,
+            compute_network: _,
+            control_plane_uri: _,
+            stack: _,
+            valkey_url: _,
+            valkey_user: _,
+            valkey_password_file,
+            compute_image: _,
+            mode: _,
+            policy: _,
+            owner_superuser_requested: _,
+            roles: _,
+            zitadel_issuer: _,
+            zitadel_admin_pat_file,
+            app_users_reconcile_every: _,
+            member_roles_sweep_every: _,
+            identity_sweep_every: _,
+            remove_orphans: _,
+            compute_control_network: _,
+            compute_ca_dir: _,
+            compute_tls_dir: _,
+            member_login_cidrs: _,
+            storage_token_refresh_every: _,
+            realtime_login_cidrs: _,
+            realtime_tls_dir: _,
+            realtime_pg_password_file,
+        } = c;
+        assert_eq!(
+            (valkey_password_file, zitadel_admin_pat_file, realtime_pg_password_file),
+            (None, None, None),
+            "unset, a credential file is absent, never a default"
+        );
     }
 
     #[test]

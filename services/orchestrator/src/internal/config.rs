@@ -62,15 +62,7 @@ pub struct InternalConfig {
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
 /// instance refuses each, [`InternalConfig::check_mode`]).
-pub const DEV_BEARERS: [(&str, &str); 7] = [
-    ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
-    ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
-    ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
-    ("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
-    ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
-    ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", chelabase_types::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
-    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
-];
+pub const DEV_BEARERS: [(&str, &str); 7] = chelabase_types::dev_defaults::DEV_BEARERS;
 
 /// A session never lasts longer than this after it was created (and so neither can a refresh).
 pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -305,10 +297,48 @@ impl std::fmt::Debug for InternalConfig {
     }
 }
 
+/// `CHELABASE_METADATA_DATABASE_URL`: where the metadata database is. Required: there is no
+/// development fallback (the workbench's stack.env always sets it), so a fixed credential is
+/// never used by accident. The error names the variable, never a URL.
+pub fn metadata_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<chelabase_metadata::MetadataConfig> {
+    let database_url = get("CHELABASE_METADATA_DATABASE_URL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "CHELABASE_METADATA_DATABASE_URL is not set: the metadata database's URL \
+                 (postgres://user:password@host:port/database)"
+            )
+        })?;
+    Ok(chelabase_metadata::MetadataConfig { database_url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+
+    // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
+    // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
+    // `postgres://chelabase:chelabase@…`; the workbench always sets it (its stack.env).
+    #[test]
+    fn the_metadata_url_is_required() {
+        for pairs in [vec![], vec![("CHELABASE_METADATA_DATABASE_URL", " ")], vec![("CHELABASE_DEV_DEFAULTS", "1")]] {
+            let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+            let err = match metadata_config(|k| map.get(k).map(|v| v.to_string())) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{pairs:?}: a fallback metadata URL: {}", c.database_url),
+            };
+            assert!(err.contains("CHELABASE_METADATA_DATABASE_URL"), "{err}");
+        }
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| " postgres://u:p@db:5432/m ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u:p@db:5432/m");
+    }
 
     #[test]
     fn defaults_are_for_local_dev() {
