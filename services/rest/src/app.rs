@@ -59,34 +59,43 @@ pub struct Config {
     pub compute_ca: std::path::PathBuf,
 }
 
-fn env_or(name: &str, default: &str) -> String {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_owned())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| default.to_owned())
-}
-
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Blank values count as unset.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        let non_blank = |name: &str| get(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+        let env_or = |name: &str, default: &str| non_blank(name).unwrap_or_else(|| default.to_owned());
+        // `CHELABASE_REST_INTERNAL_TOKEN` or the file `…_FILE` names (S27).
+        let internal_token = chelabase_types::secret_env::lookup_secret(&get, BEARER)
+            .map_err(anyhow::Error::msg)?
+            .unwrap_or_else(|| chelabase_types::dev_defaults::dev_bearer(BEARER).to_owned());
+        // The internal listener runs SQL on any branch for whoever holds this bearer: never on
+        // a public development value, except in the workbench (`CHELABASE_DEV_DEFAULTS=1`,
+        // self-hosted mode only). Checked before anything binds.
+        let mode = chelabase_types::mode::Mode::parse(get(chelabase_types::mode::Mode::ENV).as_deref())
+            .map_err(anyhow::Error::msg)?;
+        chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
+            .map_err(anyhow::Error::msg)?
+            .check_bearers(
+                &chelabase_types::mode_policy::ModePolicy::new(mode),
+                &[(BEARER, internal_token.as_str())],
+            )
+            .map_err(anyhow::Error::msg)?;
         Ok(Config {
             addr: env_or("CHELABASE_REST_ADDR", "127.0.0.1:8085").parse()?,
             internal_addr: env_or("CHELABASE_REST_INTERNAL_ADDR", "127.0.0.1:8086").parse()?,
             internal_url: env_or("CHELABASE_INTERNAL_URL", "http://127.0.0.1:8083"),
-            // `CHELABASE_REST_INTERNAL_TOKEN` or the file `…_FILE` names (S27).
-            internal_token: chelabase_types::secret_env::env_secret("CHELABASE_REST_INTERNAL_TOKEN")
-                .map_err(anyhow::Error::msg)?
-                .unwrap_or_else(|| "chelabase-dev-rest-internal".to_owned()),
+            internal_token,
             max_connections: env_or("CHELABASE_REST_MAX_CONNECTIONS", "200").parse()?,
             max_response_bytes: env_or(
                 "CHELABASE_REST_MAX_RESPONSE_BYTES",
                 &crate::exec::DEFAULT_MAX_RESPONSE_BYTES.to_string(),
             )
             .parse()?,
-            compute_ca: std::env::var("CHELABASE_COMPUTE_CA_FILE")
-                .ok()
-                .map(|v| v.trim().to_owned())
-                .filter(|v| !v.is_empty())
+            compute_ca: non_blank("CHELABASE_COMPUTE_CA_FILE")
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "CHELABASE_COMPUTE_CA_FILE is unset: rest verifies every compute's TLS \
@@ -97,6 +106,9 @@ impl Config {
         })
     }
 }
+
+/// The internal listener's bearer, both ways.
+const BEARER: &str = "CHELABASE_REST_INTERNAL_TOKEN";
 
 /// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
 pub fn api_router<S: ConnSource>() -> OpenApiRouter<Arc<AppState<S>>> {
