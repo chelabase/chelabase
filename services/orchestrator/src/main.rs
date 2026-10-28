@@ -65,6 +65,10 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES").ok().as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
+    // Locators are Docker-only until another backend exists; an unknown backend is a startup error.
+    match chelabase_neon::BackendKind::from_env()? {
+        chelabase_neon::BackendKind::Docker => {}
+    }
     let rest = RestInternal {
         url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),

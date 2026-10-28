@@ -15,7 +15,7 @@ use axum::extract::{Query, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chelabase_neon::compute_tls::ComputeCa;
-use chelabase_neon::{ComputeBackend, ComputeSettings, DockerBackend};
+use chelabase_neon::{ComputeBackend, ComputeSettings, DockerBackend, DockerSettings};
 
 /// A container the mock lists: endpoint id, stack, Docker state.
 type Listed = (&'static str, &'static str, &'static str);
@@ -160,14 +160,19 @@ async fn engine(State(mock): State<Mock>, request: Request) -> Response {
     (StatusCode::NOT_FOUND, r#"{"message":"unexpected"}"#).into_response()
 }
 
+fn docker_settings() -> DockerSettings {
+    DockerSettings {
+        network: "stack_default".into(),
+        // A separate control network, so the join step is a request.
+        control_network: "stack_control".into(),
+    }
+}
+
 fn settings() -> ComputeSettings {
     ComputeSettings {
         image: "neon/compute-node-v17:test".into(),
-        network: "stack_default".into(),
         control_plane_uri: "http://orchestrator:8083".into(),
         stack: STACK.into(),
-        // A separate control network, so the join step is a request.
-        control_network: "stack_control".into(),
         ca: Some(Arc::new(
             ComputeCa::generate(std::time::SystemTime::now()).unwrap(),
         )),
@@ -198,7 +203,7 @@ async fn mock_backend() -> (Mock, DockerBackend) {
         bollard::API_DEFAULT_VERSION,
     )
     .unwrap();
-    (mock, DockerBackend::with_docker(settings(), docker))
+    (mock, DockerBackend::with_docker(settings(), docker_settings(), docker))
 }
 
 /// The DELETEs the mock has seen once `wait` has passed with no new one (a removal spawned on
@@ -387,7 +392,7 @@ async fn list_not_running_fails_when_the_engine_does() {
         bollard::API_DEFAULT_VERSION,
     )
     .unwrap();
-    let backend = DockerBackend::with_docker(settings(), docker);
+    let backend = DockerBackend::with_docker(settings(), docker_settings(), docker);
     assert!(backend.list_not_running().await.is_err());
 }
 

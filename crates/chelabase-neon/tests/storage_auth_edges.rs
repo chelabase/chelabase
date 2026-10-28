@@ -129,7 +129,7 @@ fn live_stack() -> String {
 /// list, then the first one with a control address on `CHELABASE_COMPUTE_NETWORK` (the network
 /// the worker reaches compute_ctl on). No running compute is a failure that says so.
 async fn running_compute_ctl() -> std::net::SocketAddr {
-    use chelabase_neon::{ComputeBackend, ComputeLocator, ComputeSettings, ComputeStatus, DockerBackend};
+    use chelabase_neon::{ComputeBackend, ComputeLocator, ComputeSettings, ComputeStatus, DockerBackend, DockerSettings};
     let stack = live_stack();
     let network = std::env::var("CHELABASE_COMPUTE_NETWORK")
         .ok()
@@ -137,11 +137,12 @@ async fn running_compute_ctl() -> std::net::SocketAddr {
         .unwrap_or_else(|| "chelabase_compute".into());
     let computes = DockerBackend::connect(ComputeSettings {
         image: String::new(),
-        network: network.clone(),
         control_plane_uri: String::new(),
         stack: stack.clone(),
-        control_network: network.clone(),
         ca: None,
+    }, DockerSettings {
+        network: network.clone(),
+        control_network: network.clone(),
     })
     .expect("a Docker client");
     let endpoints = computes.list().await.expect("listing the stack's computes");
