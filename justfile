@@ -112,6 +112,7 @@ check:
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
+    scripts/tests/compose-image-pins.sh
     just deny
     cargo check --workspace
     cargo clippy --workspace --all-targets -- -D warnings
