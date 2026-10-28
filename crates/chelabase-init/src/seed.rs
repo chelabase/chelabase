@@ -8,7 +8,7 @@
 //!
 //! # The file
 //!
-//! A dotenv subset, as compose reads it: `KEY=VALUE` lines, an optional `export ` prefix, blank
+//! A dotenv subset, as compose reads it: `KEY=VALUE` lines, an optional `export` prefix, blank
 //! lines, `#` comment lines, CRLF line ends, values unquoted (an inline comment starts at a `#`
 //! after whitespace), in single quotes or in double quotes. There is no interpolation. Only keys
 //! starting with [`PREFIX`] are kept; every other line is skipped (a quoted value spanning
@@ -185,8 +185,11 @@ pub const MIN_ACCESS_KEY_LEN: usize = 3;
 /// Zitadel's masterkey length.
 pub const MASTERKEY_LEN: usize = 32;
 /// The characters a value may hold: printable ASCII but space, quotes, backslash, backtick and
-/// `$`. The consumers read these files into URLs (percent-encoded), shell `$(cat …)`, YAML and
-/// HTTP headers, and compose would interpolate a `$` in `.env` itself.
+/// `$` (compose would interpolate a `$` in `.env` itself). This is wider than the generator's
+/// base64url and alphanumeric on purpose, so chosen passwords can meet outside policies: a value
+/// may hold `# % @ : / ? & * [ ] { } ! | < > , ; = + ^ ~ ( )`. So every consumer must read these
+/// values from their files (`*_FILE`, `POSTGRES_PASSWORD_FILE`, a URL built with the password
+/// percent-encoded), never interpolate them into a shell command line or a YAML scalar.
 pub const CHARSET: &str = "printable ASCII (! to ~) except \" ' \\ ` and $";
 /// The seeds file's largest size.
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
@@ -271,15 +274,7 @@ impl Seeds {
             }
             let (line, key) = (a.line, a.key);
             let Some(seed) = SEED_KEYS.iter().find(|k| k.key == key) else {
-                problems.push(format!(
-                    "line {line}: {} is not a seed key; the accepted keys are {}",
-                    shown_key(key),
-                    SEED_KEYS
-                        .iter()
-                        .map(|k| k.key)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
+                problems.push(unknown_key(line, key, matches!(a.value, Value::None)));
                 continue;
             };
             if let Some(first) = seen.insert(seed.key, line) {
@@ -289,7 +284,7 @@ impl Seeds {
                 continue;
             }
             let value = match a.value {
-                Value::None => Err("has no value (no `=`)".to_string()),
+                Value::None => Err("has no `=` (no value)".to_string()),
                 Value::Multiline => {
                     Err("spans more than one line: a value can't hold a newline".into())
                 }
@@ -387,19 +382,32 @@ fn check_value(rule: Rule, v: &str) -> std::result::Result<(), String> {
     }
 }
 
-/// A key for a message: itself when it is a plain name (`[A-Za-z0-9_]`, at most 64 characters),
-/// else a placeholder, since a malformed key (`KEY value`, `KEY:value`, a missing `=`) may hold
-/// the value an operator meant to write.
-fn shown_key(key: &str) -> String {
-    if !key.is_empty()
-        && key.len() <= 64
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
-        key.to_string()
-    } else {
-        format!(
-            "a malformed key (not shown, as it may hold a value; it should look like {PREFIX}NAME)"
-        )
+/// The message for a `CHELABASE_SEED_*` key that isn't exactly one of [`SEED_KEYS`]. It never
+/// holds the key's text: a typo that drops or mistypes the `=` (`KEYvalue`, `KEY_value=…`,
+/// `KEY value`) puts the value into the key. A known key it starts with is named, nothing after.
+fn unknown_key(line: usize, key: &str, no_equals: bool) -> String {
+    let known = SEED_KEYS
+        .iter()
+        .filter(|k| key.starts_with(k.key))
+        .max_by_key(|k| k.key.len())
+        .map(|k| k.key);
+    match (known, no_equals) {
+        (Some(known), true) => {
+            format!("line {line}: {known} has no `=` (the text after the key is not shown)")
+        }
+        (None, true) => format!("line {line}: a {PREFIX}* line without `=` (not shown)"),
+        (Some(known), false) => format!(
+            "line {line}: an unknown key that starts with {known}, followed by more text (not \
+             shown): is the `=` missing or mistyped?"
+        ),
+        (None, false) => format!(
+            "line {line}: an unknown {PREFIX}* key (not shown); accepted keys: {}",
+            SEED_KEYS
+                .iter()
+                .map(|k| k.key)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -438,7 +446,11 @@ fn assignments(text: &str) -> Vec<std::result::Result<Assignment<'_>, String>> {
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        let t = t.strip_prefix("export ").map(str::trim_start).unwrap_or(t);
+        // `export` and then any run of spaces or tabs.
+        let t = match t.strip_prefix("export") {
+            Some(rest) if rest.starts_with([' ', '\t']) => rest.trim_start_matches([' ', '\t']),
+            _ => t,
+        };
         let Some((key, rest)) = t.split_once('=') else {
             out.push(Ok(Assignment {
                 line,
@@ -467,10 +479,14 @@ fn assignments(text: &str) -> Vec<std::result::Result<Assignment<'_>, String>> {
                         };
                     }
                     if i >= lines.len() {
-                        out.push(Err(format!(
-                            "line {line}: {}'s value has no closing quote",
-                            shown_key(key)
-                        )));
+                        // The key is named only when it is exactly a seed key: any other text
+                        // before the `=` may hold a value.
+                        out.push(Err(match SEED_KEYS.iter().find(|k| k.key == key) {
+                            Some(k) => {
+                                format!("line {line}: {}'s value has no closing quote", k.key)
+                            }
+                            None => format!("line {line}: a value has no closing quote"),
+                        }));
                         return out;
                     }
                     body.push('\n');
@@ -537,6 +553,9 @@ mod tests {
             CHELABASE_SEED_METADATA_DB_PASSWORD=plain=with=equals-0123\r\n\
             CHELABASE_SEED_NATS_WORKER_PASSWORD='single#quoted=0123456'\n\
             export CHELABASE_SEED_VALKEY_PROXY_PASSWORD=\"double-quoted-0123\"  # a comment\n\
+            export\tCHELABASE_SEED_APP_AUTH_TOKEN=tab-after-export-0123\n\
+            export \t  CHELABASE_SEED_APP_SESSIONS_TOKEN=mixed-after-export-0123\n\
+            exportCHELABASE_NOT_STRIPPED=1\n\
               CHELABASE_SEED_S3_ACCESS_KEY = spaced-key   # inline comment\n\
             CHELABASE_SEED_S3_SECRET_KEY=hash#inside-not-a-comment\n\
             # CHELABASE_SEED_ZITADEL_MASTERKEY=commented-out-so-ignored\n\
@@ -549,12 +568,22 @@ mod tests {
             CHELABASE_SEED_ZITADEL_MASTERKEY=ABCDEFGHIJKLMNOPQRSTUVWXYZ012345";
         let seeds = Seeds::parse(text).unwrap();
         assert_eq!(
+            value(&seeds, "tokens/app-auth.token"),
+            "tab-after-export-0123"
+        );
+        assert_eq!(
+            value(&seeds, "tokens/app-sessions.token"),
+            "mixed-after-export-0123"
+        );
+        assert_eq!(
             seeds.keys().collect::<Vec<_>>(),
             [
                 "CHELABASE_SEED_METADATA_DB_PASSWORD",
                 "CHELABASE_SEED_NATS_WORKER_PASSWORD",
                 "CHELABASE_SEED_S3_ACCESS_KEY",
                 "CHELABASE_SEED_S3_SECRET_KEY",
+                "CHELABASE_SEED_APP_AUTH_TOKEN",
+                "CHELABASE_SEED_APP_SESSIONS_TOKEN",
                 "CHELABASE_SEED_VALKEY_PROXY_PASSWORD",
                 "CHELABASE_SEED_ZITADEL_MASTERKEY",
             ]
@@ -584,10 +613,27 @@ mod tests {
     fn rejects_what_compose_and_the_rules_would_trip_on() {
         let long = "a".repeat(MAX_LEN + 1);
         let cases: Vec<(String, &str, &str)> = vec![
+            // An unknown key is never echoed (it may hold a value); the accepted ones are listed.
             (
                 "CHELABASE_SEED_NOPE=0123456789abcdefgh".into(),
-                "CHELABASE_SEED_NOPE",
+                "an unknown CHELABASE_SEED_* key (not shown)",
                 "CHELABASE_SEED_METADATA_DB_PASSWORD",
+            ),
+            // A known key with text after it: the known key is named, and the `=` questioned.
+            (
+                "CHELABASE_SEED_APP_AUTH_TOKEN_x=0123456789abcdefgh".into(),
+                "CHELABASE_SEED_APP_AUTH_TOKEN",
+                "is the `=` missing or mistyped",
+            ),
+            (
+                "CHELABASE_SEED_APP_AUTH_TOKENabc".into(),
+                "line 1: CHELABASE_SEED_APP_AUTH_TOKEN has no `=`",
+                "not shown",
+            ),
+            (
+                "CHELABASE_SEED_NOPEabc".into(),
+                "line 1: a CHELABASE_SEED_* line without `=` (not shown)",
+                "line 1",
             ),
             (
                 "CHELABASE_SEED_METADATA_DB_PASSWORD=".into(),
@@ -601,8 +647,8 @@ mod tests {
             ),
             (
                 "CHELABASE_SEED_METADATA_DB_PASSWORD".into(),
-                "CHELABASE_SEED_METADATA_DB_PASSWORD",
-                "no value",
+                "line 1: CHELABASE_SEED_METADATA_DB_PASSWORD has no `=`",
+                "no `=`",
             ),
             (
                 "CHELABASE_SEED_APP_AUTH_TOKEN=short-0123".into(),
@@ -678,7 +724,7 @@ mod tests {
             ),
             (
                 "OTHER=\"never closed\nCHELABASE_SEED_APP_AUTH_TOKEN=0123456789abcdef".into(),
-                "OTHER",
+                "line 1",
                 "closing quote",
             ),
         ];
