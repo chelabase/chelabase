@@ -494,3 +494,35 @@ async fn an_aud_list_passes_only_when_it_names_one_of_our_audiences() {
     }
 }
 
+// #26: the key fetch never follows a redirect. A 3xx to a server with valid keys (here the
+// mock's own, so a followed redirect would verify) is a failed fetch: every token is refused.
+#[tokio::test]
+async fn a_redirecting_jwks_url_passes_no_token() {
+    use axum::{http::header::LOCATION, http::StatusCode, response::IntoResponse, routing::get, Router};
+    let mock = MockJwks::start().await;
+    let token = mock.token_for_org("user-1", "org-1", 300);
+    for status in [301u16, 302, 303, 307, 308] {
+        let target = mock.jwks_url().to_string();
+        let app = Router::new().route(
+            "/oauth/v2/keys",
+            get(move || {
+                let target = target.clone();
+                async move { (StatusCode::from_u16(status).unwrap(), [(LOCATION, target)]).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for host in [None, Some("auth.example.com".to_string())] {
+            let mut config = mock.config(vec![]);
+            config.jwks_url = format!("http://{addr}/oauth/v2/keys");
+            config.jwks_host = host.clone();
+            let verifier = JwtVerifier::new(config);
+            let err = verifier.verify(&token).await.unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{status} host {host:?}: got {err:?}");
+            // Nothing was cached: the next try fails the same way.
+            let err = verifier.verify(&token).await.unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{status} host {host:?}, again: got {err:?}");
+        }
+    }
+}

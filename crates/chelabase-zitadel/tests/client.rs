@@ -696,3 +696,39 @@ async fn a_client_at_an_in_network_address_names_the_auth_host() {
     assert!(matches!(plain.auth_request("V2_1").await, Err(ZError::Unavailable(_))));
     assert_eq!(*seen.lock().unwrap(), vec!["auth.example.com".to_string(), addr.to_string()]);
 }
+
+// #26: the client never follows a redirect (its calls are REST calls Zitadel answers directly).
+// A base URL that redirects to a working Zitadel fails, and the target is never asked.
+#[tokio::test]
+async fn a_redirect_is_not_followed() {
+    use axum::{http::header::LOCATION, http::StatusCode, response::IntoResponse, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let mock = MockZitadel::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let target_hits = hits.clone();
+    // The redirect's target: counts every request it gets.
+    let target = Router::new().fallback(move || {
+        target_hits.fetch_add(1, Ordering::SeqCst);
+        async { StatusCode::OK }
+    });
+    let tl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let taddr = tl.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(tl, target).await.unwrap() });
+    let auth_request = mock.add_auth_request(true);
+    for (status, to) in [(307u16, format!("http://{taddr}")), (302, mock.base.clone()), (308, mock.base.clone())] {
+        let app = Router::new().fallback(move |uri: axum::http::Uri| {
+            let to = to.clone();
+            async move { (StatusCode::from_u16(status).unwrap(), [(LOCATION, format!("{to}{uri}"))]).into_response() }
+        });
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        for host in [None, Some("auth.example.com")] {
+            let z = Zitadel::new(&format!("http://{addr}"), TOKEN).with_host(host);
+            let r = z.auth_request(&auth_request).await;
+            assert!(r.is_err(), "{status} to {host:?}: a redirect was followed: {r:?}");
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "the redirect's target was asked");
+}

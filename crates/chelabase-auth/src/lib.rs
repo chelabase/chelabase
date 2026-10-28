@@ -220,10 +220,14 @@ impl JwtVerifier {
             config,
             // A hung JWKS endpoint fails the verification well inside its callers' budgets
             // (RT1 S14: realtime gives an authorize 20 s).
+            // #26: never a redirect: a 3xx is a failed fetch, not keys from wherever it points.
+            // The builder can't fail with these settings; if it did, the default client would
+            // follow redirects, so building it is not allowed to fall back.
             http: reqwest::Client::builder()
                 .timeout(JWKS_FETCH_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .expect("the JWKS client builds"),
             cache: Arc::new(RwLock::new(None)),
             cache_ttl: Duration::from_secs(600),
         }
@@ -299,12 +303,12 @@ impl JwtVerifier {
         if let Some(host) = &self.config.jwks_host {
             request = request.header(reqwest::header::HOST, host);
         }
-        let body: JwksResponse = request
-            .send()
-            .await
-            .map_err(|e| AuthError::Jwks(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| AuthError::Jwks(e.to_string()))?
+        let response = request.send().await.map_err(|e| AuthError::Jwks(e.to_string()))?;
+        // `error_for_status` lets a 3xx through: only a 2xx carries keys (#26).
+        if !response.status().is_success() {
+            return Err(AuthError::Jwks(format!("{} answered {}", self.config.jwks_url, response.status())));
+        }
+        let body: JwksResponse = response
             .json()
             .await
             .map_err(|e| AuthError::Jwks(e.to_string()))?;
