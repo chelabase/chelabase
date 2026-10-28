@@ -2127,7 +2127,7 @@ mod tests {
         let cases: Vec<(String, &str)> = vec![
             (
                 "CHELABASE_SEED_UNKNOWN_THING=0123456789abcdefgh\n".into(),
-                "CHELABASE_SEED_UNKNOWN_THING",
+                "an unknown CHELABASE_SEED_* key",
             ),
             (
                 "CHELABASE_SEED_METADATA_DB_PASSWORD=\n".into(),
@@ -2270,6 +2270,18 @@ mod tests {
             "CHELABASE_SEED_APP_AUTH_TOKEN Sntl9QSpaceKey0001=x\n".into(),
             "CHELABASE_SEED_APP_AUTH_TOKEN-Sntl9QDash0001=0123456789abcdef\n".into(),
             "my Sntl9QNotAKey0001 ='never closed\n".into(),
+            // Audit B1 (m12): a value typed straight after a known key, with no `=` or with a
+            // name character for it, and a value after each separator.
+            "CHELABASE_SEED_APP_AUTH_TOKENSntl9QNoEqualsAlnum01\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN_Sntl9QUnderscore01=x\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN-Sntl9QDashNoEq0001\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN.Sntl9QDotNoEq0001\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN.Sntl9QDotEq0001=0123456789abcdef\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN:Sntl9QColonEq0001=0123456789abcdef\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN Sntl9QSpaceNoEq0001\n".into(),
+            "CHELABASE_SEED_Sntl9QBareValue0001\n".into(),
+            "CHELABASE_SEED_Sntl9QBareValueEq0001=x\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKENSntl9QQuoted0001='unclosed\n".into(),
         ];
         values.extend([
             "Sntl9QUnknownKeyValue0001".into(),
@@ -2286,6 +2298,16 @@ mod tests {
             "Sntl9QSpaceKey0001".into(),
             "Sntl9QDash0001".into(),
             "Sntl9QNotAKey0001".into(),
+            "Sntl9QNoEqualsAlnum01".into(),
+            "Sntl9QUnderscore01".into(),
+            "Sntl9QDashNoEq0001".into(),
+            "Sntl9QDotNoEq0001".into(),
+            "Sntl9QDotEq0001".into(),
+            "Sntl9QColonEq0001".into(),
+            "Sntl9QSpaceNoEq0001".into(),
+            "Sntl9QBareValue0001".into(),
+            "Sntl9QBareValueEq0001".into(),
+            "Sntl9QQuoted0001".into(),
         ]);
 
         let mut printed = String::new();
