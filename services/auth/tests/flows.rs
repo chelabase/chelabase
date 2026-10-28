@@ -219,7 +219,7 @@ async fn auth_request_never_offers_a_closed_sign_up() {
         .post("/auth/v1/auth-request", json!({"authRequest": p.mock.add_auth_request(true)}), None, "1.1.1.1")
         .await;
     assert_eq!(platform.body, json!({"signUp": false, "signUpAllowed": false}));
-    assert!(p.internal.queries("GET /internal/signup/allowed").is_empty());
+    assert!(p.internal.bodies("POST /internal/signup/check").is_empty());
 }
 
 #[tokio::test]
@@ -1168,7 +1168,7 @@ async fn a_decoy_sign_up_emails_the_owner_a_reset_link() {
     assert_eq!(h.mock.emails(), vec![(id, "reset".to_string())]);
 }
 
-const SIGN_UP_CALL: &str = "GET /internal/signup/allowed";
+const SIGN_UP_CALL: &str = "POST /internal/signup/check";
 
 #[tokio::test]
 async fn sign_up_refused_when_closed() {
@@ -1185,8 +1185,8 @@ async fn sign_up_refused_when_closed() {
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "sign_up_closed");
     assert_eq!(h.mock.users_with_email("new@example.com"), 0);
-    let asked = h.internal.queries(SIGN_UP_CALL);
-    assert_eq!(asked, vec!["org=o1".to_string()]);
+    let asked = h.internal.bodies(SIGN_UP_CALL);
+    assert_eq!(asked, vec![json!({"org": "o1"})]);
 }
 
 #[tokio::test]
@@ -1251,7 +1251,7 @@ async fn platform_sign_up_refused() {
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "not_available_in_platform_mode");
     assert_eq!(h.mock.users_with_email("new@example.com"), 0);
-    assert!(h.internal.queries(SIGN_UP_CALL).is_empty());
+    assert!(h.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
 fn accept(ar: &str, user: &str, code: &str, pw: &str) -> Value {
@@ -2154,4 +2154,225 @@ async fn describe_invite_is_rate_limited_and_fails_closed() {
     let down = h.describe(body, "3.3.3.3").await;
     assert_eq!(down.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(down.body["error"]["code"], "unavailable");
+}
+
+// Selfhost-install m3: an unclaimed instance's sign-up needs the setup code, and the account
+// it creates is bound to the fresh-install claim (or deleted when that fails).
+
+const SETUP_CODE: &str = "ABCD-EFGH-JKMN-PQRS-TUVW";
+const CLAIMED_CALL: &str = "POST /internal/signup/claimed";
+
+fn signup_with_code(ar: &str, email: &str, code: Option<&str>) -> Value {
+    let mut body = signup(ar, email, "Secret-pass1");
+    if let Some(code) = code {
+        body["setupCode"] = json!(code);
+    }
+    body
+}
+
+// AC 1: no or a wrong code: 403 `setup_code_invalid`, no Zitadel user, no claim.
+#[tokio::test]
+async fn sign_up_with_bad_code_creates_no_user() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    for (i, code) in [None, Some(""), Some("WRONG-CODE")].into_iter().enumerate() {
+        let a = h
+            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", code), None, &format!("1.1.1.{i}"))
+            .await;
+        assert_eq!(
+            (a.status, a.body),
+            (StatusCode::FORBIDDEN, err("setup_code_invalid", messages::SETUP_CODE_INVALID)),
+            "{code:?}"
+        );
+    }
+    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
+    assert!(h.mock.calls().iter().all(|c| !c.contains("/v2/users/new")), "no create call");
+    assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
+    // The code goes in the gate's body; a blank one is not sent at all.
+    let asked = h.internal.bodies(SIGN_UP_CALL);
+    assert_eq!(asked[0], json!({"org": "o1"}));
+    assert_eq!(asked[1], json!({"org": "o1"}));
+    assert_eq!(asked[2], json!({"org": "o1", "setup_code": "WRONG-CODE"}));
+    assert!(h.internal.queries(SIGN_UP_CALL).iter().all(String::is_empty), "nothing in a URL");
+}
+
+// AC 2 (auth side): the right code creates the account and binds the claim to it with the
+// gate's nonce; the sign-in page offers sign-up while the instance waits for its code.
+#[tokio::test]
+async fn sign_up_with_the_code_binds_the_claim() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let page = h
+        .post("/auth/v1/auth-request", json!({"authRequest": h.mock.add_auth_request(true)}), None, "1.1.1.1")
+        .await;
+    assert_eq!(page.body, json!({"signUp": true, "signUpAllowed": true}));
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
+    let user = h.mock.user("first@example.com").expect("created");
+    assert_eq!(
+        h.internal.bodies(CLAIMED_CALL),
+        vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
+    );
+}
+
+// AC 6 (auth side): the instance was claimed meanwhile (`bound: false`): the account stays.
+#[tokio::test]
+async fn an_unbound_claim_keeps_the_account() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_claimed_unbound();
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "second@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(h.mock.users_with_email("second@example.com"), 1);
+}
+
+// AC 10: `claimed` fails after the account was created: the account is deleted, and a retry
+// with the same email succeeds.
+#[tokio::test]
+async fn claimed_failure_deletes_user() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    for (status, want, code) in [
+        (500, StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        (403, StatusCode::FORBIDDEN, "setup_code_invalid"),
+    ] {
+        h.internal.set_claimed_status(Some(status));
+        let a = h
+            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, &format!("2.2.2.{status}"))
+            .await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (want, Some(code)), "{status}");
+        assert_eq!(h.mock.users_with_email("first@example.com"), 0, "deleted after a {status}");
+    }
+    h.internal.set_claimed_status(None);
+    let ar = h.mock.add_auth_request(true);
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&ar, "first@example.com", Some(SETUP_CODE)), None, "2.2.2.9")
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(h.mock.users_with_email("first@example.com"), 1);
+    assert_eq!(h.internal.bodies(CLAIMED_CALL).len(), 3);
+}
+
+// Without the admin client a failed claim couldn't be undone: no setup-code sign-up at all.
+#[tokio::test]
+async fn a_setup_sign_up_needs_the_admin_client() {
+    let h = harness_full(false, 1, auth::config::Mode::SelfHosted, false).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
+    assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
+}
+
+// The register page's question: `setupRequired` while the instance waits for its code.
+#[tokio::test]
+async fn instance_says_whether_setup_is_required() {
+    let h = harness().await;
+    let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    h.internal.set_setup_code(SETUP_CODE);
+    let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": true})));
+    // The question carries no code.
+    assert!(h.internal.bodies(SIGN_UP_CALL).iter().all(|b| *b == json!({"org": "o1"})));
+    h.internal.set_signup_status(Some(503));
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+    // Rate-limited per client.
+    h.internal.set_signup_status(None);
+    for _ in 0..57 {
+        assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::OK);
+    }
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.2").await.status, StatusCode::OK);
+    // Platform mode: never, without asking.
+    let p = harness_mode(false, 1, auth::config::Mode::Platform).await;
+    let a = p.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    assert!(p.internal.bodies(SIGN_UP_CALL).is_empty());
+}
+
+// Guessing the code is capped across every client, not only per IP and email.
+#[tokio::test]
+async fn setup_code_guesses_are_capped_globally() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let total = auth::app::SETUP_CODE_TRIES_PER_HOUR as usize + 1;
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..total {
+        let (http, base) = (h.http.clone(), h.base.clone());
+        let body = signup_with_code(&h.mock.add_auth_request(true), &format!("guess{i}@example.com"), Some("WRONG-CODE"));
+        set.spawn(async move {
+            http.post(format!("{base}/auth/v1/sign-up"))
+                .json(&body)
+                .header("x-forwarded-for", format!("9.9.9.9, 10.0.0.{}", i % 20))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    let statuses = set.join_all().await;
+    let limited = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
+    assert_eq!(limited, 1, "{statuses:?}");
+    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::FORBIDDEN).count(), total - 1);
+}
+
+/// Every log line written on this thread while the guard lives (the test's current-thread
+/// runtime runs the server's tasks here too).
+#[derive(Clone, Default)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// The code and the nonce never show in auth's logs or answers.
+#[tokio::test]
+async fn log_and_error_scrub() {
+    let sink = LogSink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let wrong = "ZZZZ-YYYY-XXXX-WWWW-VVVV";
+    let mut bodies = Vec::new();
+    for (i, code) in [wrong, SETUP_CODE].into_iter().enumerate() {
+        bodies.push(
+            h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), &format!("u{i}@example.com"), Some(code)), None, "1.1.1.1")
+                .await
+                .body,
+        );
+    }
+    h.internal.set_claimed_status(Some(403));
+    bodies.push(
+        h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "u9@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+            .await
+            .body,
+    );
+    bodies.push(h.get("/auth/v1/instance", "1.1.1.1").await.body);
+    let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("binding the fresh-install claim failed"), "{logs}");
+    for secret in [SETUP_CODE, wrong, support::internal::CLAIM_NONCE, "ABCDEFGHJKMNPQRSTUVW"] {
+        assert!(!logs.to_lowercase().contains(&secret.to_lowercase()), "{secret} in the logs");
+        for body in &bodies {
+            assert!(!body.to_string().contains(secret), "{secret} in {body}");
+        }
+    }
 }

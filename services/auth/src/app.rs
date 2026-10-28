@@ -32,6 +32,8 @@ pub mod messages {
     pub const UNAVAILABLE: &str = "Sign-in is unavailable, try again";
     pub const ACCOUNT_EXISTS: &str = "An account with this email already exists";
     pub const SIGN_UP_CLOSED: &str = "Sign-up is closed; ask an administrator for an invite";
+    pub const SETUP_CODE_INVALID: &str =
+        "The setup code is missing or wrong; the first account of a new instance needs it";
     pub const NOT_IN_PLATFORM: &str = "Sign-up isn't available in platform mode";
     pub const INVITE_EXPIRED: &str = "This invite has expired; ask for a new one";
     pub const INVITE_REVOKED: &str = "This invite is no longer valid";
@@ -68,6 +70,7 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
 fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(auth_request))
+        .routes(routes!(instance))
         .routes(routes!(sign_in))
         .routes(routes!(sign_up))
         .routes(routes!(accept_invite))
@@ -165,9 +168,20 @@ struct AuthRequestInfo {
     /// Studio goes to its sign-up page. `false` for a refused sign-up request too, which then
     /// lands on the plain sign-in page.
     sign_up: bool,
-    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the
-    /// sign-in page may offer "Create account". Always `false` in platform mode.
+    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a
+    /// setup code is configured): the sign-in page may offer "Create account". Always `false`
+    /// in platform mode.
     sign_up_allowed: bool,
+}
+
+/// What the sign-up page needs to know about this instance.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct InstanceInfo {
+    /// The instance is unclaimed (its tenant has no member yet): the first sign-up needs the
+    /// setup code that `chelabase-init secrets` printed. `false` once anyone is in, without a
+    /// configured code (then no first sign-up is taken at all), and in platform mode.
+    setup_required: bool,
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -323,7 +337,10 @@ async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthR
     }
     match s.zitadel.auth_request(&b.auth_request).await {
         Ok(asked) => {
-            let sign_up_allowed = sign_up_gate(&s).await.is_none();
+            // A fresh install waiting for its code takes a sign-up (with the code).
+            let sign_up_allowed = gate(&s, None)
+                .await
+                .is_ok_and(|a| a.allowed || a.setup_required);
             reply(
                 StatusCode::OK,
                 json!(AuthRequestInfo { sign_up: asked && sign_up_allowed, sign_up_allowed }),
@@ -331,6 +348,36 @@ async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthR
             )
         }
         Err(e) => pending_sign_in_error(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/v1/instance",
+    operation_id = "getInstance",
+    tag = "login",
+    description = "Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.",
+    responses(
+        (status = 200, description = "The instance's sign-up state", body = InstanceInfo),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn instance(State(s): S, headers: HeaderMap) -> Response {
+    let ip = client_ip(&headers);
+    if !allowed(&s, &[(format!("instance:ip:{ip}"), 60, MINUTE)]) {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    }
+    if ModePolicy::new(s.config.mode).sign_up() == SignUpRule::Refused {
+        return reply(StatusCode::OK, json!(InstanceInfo { setup_required: false }), Vec::new());
+    }
+    match gate(&s, None).await {
+        Ok(a) => reply(
+            StatusCode::OK,
+            json!(InstanceInfo { setup_required: a.setup_required }),
+            Vec::new(),
+        ),
+        Err(refused) => refused.response(),
     }
 }
 
@@ -422,6 +469,10 @@ struct SignUpBody {
     password: String,
     given_name: String,
     family_name: String,
+    /// The setup code that `chelabase-init secrets` printed: the first sign-up of an unclaimed
+    /// instance needs it (case and dashes don't matter). Ignored once the instance is claimed.
+    #[serde(default)]
+    setup_code: Option<String>,
 }
 
 #[utoipa::path(
@@ -437,7 +488,7 @@ struct SignUpBody {
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
+        (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), the unclaimed instance needs its setup code and it is missing or wrong (`setup_code_invalid`; no account is created), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
         (status = 409, description = "An account with this email exists (`email_taken`); only when email verification is off", body = ErrorEnvelope),
         (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
@@ -454,13 +505,16 @@ async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody
 async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
-    if !allowed(
-        s,
-        &[
-            (format!("sign-up:ip:{ip}"), 20, HOUR),
-            (format!("sign-up:email:{}", email_tag(&email)), 5, HOUR),
-        ],
-    ) {
+    let setup_code = b.setup_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let mut checks = vec![
+        (format!("sign-up:ip:{ip}"), 20, HOUR),
+        (format!("sign-up:email:{}", email_tag(&email)), 5, HOUR),
+    ];
+    // Guessing the setup code (about 98 bits) is also capped across every client.
+    if setup_code.is_some() {
+        checks.push(("sign-up:setup-code".to_string(), SETUP_CODE_TRIES_PER_HOUR, HOUR));
+    }
+    if !allowed(s, &checks) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if !is_auth_request_id(&b.auth_request) {
@@ -472,8 +526,15 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
     }
-    if let Some(refused) = sign_up_gate(s).await {
-        return refused;
+    let nonce = match sign_up_gate(s, setup_code).await {
+        Ok(nonce) => nonce,
+        Err(refused) => return refused.response(),
+    };
+    // A claim that fails after the account exists is undone by deleting it, which needs the
+    // admin client (the login client can't delete users): without it, no claim is attempted.
+    if nonce.is_some() && s.admin.is_none() {
+        warn!("a setup-code sign-up needs the admin Zitadel client (CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
+        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     }
     // Zitadel checks usernames, not emails, for uniqueness: never make a second account
     // for an email that already has one.
@@ -504,6 +565,11 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         }
         Err(e) => return unavailable(&e),
     };
+    if let Some(nonce) = &nonce
+        && let Some(refused) = bind_claim(s, &user_id, nonce).await
+    {
+        return refused.response();
+    }
     let session = match new_user_session(s, &user_id, &b.password).await {
         Ok(session) => session,
         Err(e) => return unavailable(&e),
@@ -514,33 +580,115 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     verify_step(s, &b.auth_request, user_id, session).await
 }
 
-/// `Some(answer)` when sign-up is refused: in platform mode always, otherwise when the
-/// tenant's orchestrator says no. Anything unclear refuses (503).
-async fn sign_up_gate(s: &AppState) -> Option<Response> {
+/// Every client's setup-code sign-ups together, per hour.
+pub const SETUP_CODE_TRIES_PER_HOUR: u32 = 300;
+
+/// Why the sign-up gate refused; [`Refusal::response`] is its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Platform,
+    Closed,
+    SetupCodeInvalid,
+    Unavailable,
+}
+
+impl Refusal {
+    fn response(self) -> Response {
+        match self {
+            Self::Platform => error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::NotAvailableInPlatformMode,
+                NOT_IN_PLATFORM,
+            ),
+            Self::Closed => error(StatusCode::FORBIDDEN, ErrorCode::SignUpClosed, SIGN_UP_CLOSED),
+            Self::SetupCodeInvalid => error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::SetupCodeInvalid,
+                SETUP_CODE_INVALID,
+            ),
+            Self::Unavailable => {
+                error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+            }
+        }
+    }
+}
+
+/// The orchestrator's sign-up answer, asked with the visitor's setup code (if any). `Err`
+/// in platform mode and whenever the gate can't answer: anything unclear refuses.
+async fn gate(
+    s: &AppState,
+    setup_code: Option<&str>,
+) -> Result<crate::app_users::internal::SignUpAnswer, Refusal> {
     if ModePolicy::new(s.config.mode).sign_up() == SignUpRule::Refused {
-        return Some(error(
-            StatusCode::FORBIDDEN,
-            ErrorCode::NotAvailableInPlatformMode,
-            NOT_IN_PLATFORM,
-        ));
+        return Err(Refusal::Platform);
     }
     let Some(gate) = &s.signup_gate else {
         warn!("no sign-up gate is configured");
-        return Some(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+        return Err(Refusal::Unavailable);
     };
-    match gate.signup_allowed(&s.config.org_id).await {
-        Ok(a) if a.allowed => None,
-        Ok(a) if a.reason == "platform" => Some(error(
-            StatusCode::FORBIDDEN,
-            ErrorCode::NotAvailableInPlatformMode,
-            NOT_IN_PLATFORM,
-        )),
-        Ok(_) => Some(error(StatusCode::FORBIDDEN, ErrorCode::SignUpClosed, SIGN_UP_CLOSED)),
-        Err(e) => {
-            warn!(error = %e, "the sign-up gate failed");
-            Some(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE))
+    gate.signup_check(&s.config.org_id, setup_code).await.map_err(|e| {
+        warn!(error = %e, "the sign-up gate failed");
+        Refusal::Unavailable
+    })
+}
+
+/// `Ok` when sign-up may go on, with the claim nonce of a fresh install's code-gated sign-up;
+/// `Err` when it is refused: in platform mode always, otherwise when the tenant's
+/// orchestrator says no. A `first_member` answer without a nonce is unclear: unavailable.
+async fn sign_up_gate(
+    s: &AppState,
+    setup_code: Option<&str>,
+) -> Result<Option<crate::app_users::internal::ClaimNonce>, Refusal> {
+    let a = gate(s, setup_code).await?;
+    if a.allowed {
+        if a.reason != "first_member" {
+            return Ok(None);
         }
+        return match a.claim_nonce {
+            Some(nonce) => Ok(Some(nonce)),
+            None => {
+                warn!("the sign-up gate allowed a first member without a claim nonce");
+                Err(Refusal::Unavailable)
+            }
+        };
     }
+    Err(match a.reason.as_str() {
+        "platform" => Refusal::Platform,
+        "setup_code_invalid" => Refusal::SetupCodeInvalid,
+        _ => Refusal::Closed,
+    })
+}
+
+/// Binds the fresh-install claim to the account just created. `None` when bound, or when the
+/// instance was claimed meanwhile (the account stays and waits as a newcomer). On any
+/// failure the account is deleted, so a retry with the same email can succeed, and the
+/// answer is `setup_code_invalid` (refused) or `unavailable`.
+async fn bind_claim(
+    s: &AppState,
+    user_id: &str,
+    nonce: &crate::app_users::internal::ClaimNonce,
+) -> Option<Refusal> {
+    let failed = match &s.signup_gate {
+        Some(gate) => match gate.signup_claimed(&s.config.org_id, user_id, nonce).await {
+            Ok(bound) => {
+                info!(user_id, bound, "fresh-install claim");
+                return None;
+            }
+            Err(e) => e,
+        },
+        None => crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into()),
+    };
+    warn!(user_id, error = %failed, "binding the fresh-install claim failed; deleting the new account");
+    // `sign_up_inner` checked the admin client before creating the account.
+    if let Some(admin) = &s.admin
+        && let Err(e) = admin.delete_user(user_id).await
+    {
+        warn!(user_id, error = %e, "deleting the unclaimed account failed");
+    }
+    Some(match failed {
+        crate::app_users::internal::InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
+        crate::app_users::internal::InternalError::Unavailable(_) => Refusal::Unavailable,
+    })
 }
 
 /// Both fields default to empty, so a missing one is a `not_found` like a wrong one.

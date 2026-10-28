@@ -11,4 +11,10 @@ export interface SignUpBody {
   familyName: string;
   givenName: string;
   password: string;
+  /**
+     * The setup code that `chelabase-init secrets` printed: the first sign-up of an unclaimed
+     * instance needs it (case and dashes don't matter). Ignored once the instance is claimed.
+     * @nullable
+     */
+  setupCode?: string | null;
 }

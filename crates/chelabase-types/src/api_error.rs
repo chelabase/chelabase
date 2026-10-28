@@ -94,6 +94,8 @@ pub enum ErrorCode {
     NotAvailableInPlatformMode,
     /// Self-sign-up is closed.
     SignUpClosed,
+    /// A fresh install's sign-up needs the setup code, and none or a wrong one was given.
+    SetupCodeInvalid,
     /// The caller signed up and waits for an admin to approve them.
     PendingApproval,
     /// The change would leave the tenant without an active admin.
@@ -158,7 +160,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 105] = [
+    pub const ALL: [ErrorCode; 106] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -237,6 +239,7 @@ impl ErrorCode {
         Self::NoAccessYet,
         Self::NotAvailableInPlatformMode,
         Self::SignUpClosed,
+        Self::SetupCodeInvalid,
         Self::PendingApproval,
         Self::LastTenantAdmin,
         Self::InviteExpired,
@@ -346,6 +349,7 @@ impl ErrorCode {
             Self::NoAccessYet => "no_access_yet",
             Self::NotAvailableInPlatformMode => "not_available_in_platform_mode",
             Self::SignUpClosed => "sign_up_closed",
+            Self::SetupCodeInvalid => "setup_code_invalid",
             Self::PendingApproval => "pending_approval",
             Self::LastTenantAdmin => "last_tenant_admin",
             Self::InviteExpired => "invite_expired",
@@ -475,7 +479,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 105] = [
+    const ALL: [(ErrorCode, &str); 106] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -554,6 +558,7 @@ mod tests {
         (ErrorCode::NoAccessYet, "no_access_yet"),
         (ErrorCode::NotAvailableInPlatformMode, "not_available_in_platform_mode"),
         (ErrorCode::SignUpClosed, "sign_up_closed"),
+        (ErrorCode::SetupCodeInvalid, "setup_code_invalid"),
         (ErrorCode::PendingApproval, "pending_approval"),
         (ErrorCode::LastTenantAdmin, "last_tenant_admin"),
         (ErrorCode::InviteExpired, "invite_expired"),

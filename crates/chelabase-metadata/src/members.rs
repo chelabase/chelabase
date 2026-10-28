@@ -88,6 +88,39 @@ pub enum Admission {
     Closed,
 }
 
+/// Who may claim `tenant_admin` while a tenant has no active admin ([`MetadataClient::ensure_member`]
+/// against [`MetadataClient::admit_member`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminClaim {
+    /// Only the Zitadel user the tenant's `setup_claims` row binds (a code-gated sign-up).
+    /// No row: nobody. What every service uses.
+    SetupBound,
+    /// Whoever asks first: the tests' and tools' shortcut. No service calls it.
+    FirstComer,
+}
+
+/// A tenant's fresh-install claim ([`MetadataClient::setup_claim`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupClaim {
+    /// The Zitadel user the claim binds.
+    pub zitadel_user_id: String,
+    pub created_at: DateTime<Utc>,
+    /// Whether that user has a member row in the tenant (any status).
+    pub has_member_row: bool,
+}
+
+/// What [`MetadataClient::claim_setup`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupClaimOutcome {
+    /// No live nonce of this tenant matched: nothing was written.
+    Refused,
+    /// The nonce was spent and the claim now binds the user.
+    Bound,
+    /// The nonce was spent, but the tenant has an active admin or a live claim of another
+    /// user: the claim is unchanged (the loser of a fresh-install race).
+    AlreadyClaimed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MemberRecord {
     pub id: Uuid,
@@ -1595,6 +1628,10 @@ impl MetadataClient {
     /// approval (event `member_joined`, status `pending`), and `Closed` writes nothing and is
     /// `NotAdmitted`. An existing row is never changed by `admission`, and a pending one stays
     /// pending.
+    ///
+    /// **Who claims the admin here is the first comer**: the tests' and tools' shortcut for a
+    /// tenant with an admin. No service calls it; the orchestrator admits people with
+    /// [`MetadataClient::admit_member`], which binds the claim to the setup code.
     pub async fn ensure_member(
         &self,
         tenant: TenantId,
@@ -1602,6 +1639,39 @@ impl MetadataClient {
         email: &str,
         name: &str,
         admission: Admission,
+    ) -> Result<MemberRecord, MetadataError> {
+        self.ensure_member_as(tenant, zitadel_user_id, email, name, admission, AdminClaim::FirstComer)
+            .await
+    }
+
+    /// [`MetadataClient::ensure_member`] as the orchestrator runs it on every request: while
+    /// the tenant has no active admin, only the Zitadel user its `setup_claims` row binds (the
+    /// account a sign-up with the right setup code created) claims `tenant_admin`, and only
+    /// from no row at all. Without a claim row nobody does. Anyone else (Zitadel's
+    /// FirstInstance human, a machine user, the loser of a sign-up race, a member left after the
+    /// sole admin was suspended) is a newcomer like any other and becomes what `admission`
+    /// says. The claim row is read in the same transaction, under the tenant lock that
+    /// [`MetadataClient::claim_setup`] takes too.
+    pub async fn admit_member(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+    ) -> Result<MemberRecord, MetadataError> {
+        self.ensure_member_as(tenant, zitadel_user_id, email, name, admission, AdminClaim::SetupBound)
+            .await
+    }
+
+    async fn ensure_member_as(
+        &self,
+        tenant: TenantId,
+        zitadel_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+        claim: AdminClaim,
     ) -> Result<MemberRecord, MetadataError> {
         #[derive(sqlx::FromRow)]
         struct Seen {
@@ -1723,11 +1793,17 @@ impl MetadataClient {
                 active
             }
             None => {
+                // Under the tenant lock: no active admin can appear, and no claim row can
+                // change (`claim_setup` takes the same lock), before this insert commits.
                 let claims: bool = sqlx::query_scalar(
                     "SELECT NOT EXISTS (SELECT 1 FROM members
-                                         WHERE tenant_id = $1 AND status = 'active' AND tenant_admin)",
+                                         WHERE tenant_id = $1 AND status = 'active' AND tenant_admin)
+                        AND ($3 OR EXISTS (SELECT 1 FROM setup_claims
+                                            WHERE tenant_id = $1 AND zitadel_user_id = $2))",
                 )
                 .bind(tenant_id)
+                .bind(zitadel_user_id)
+                .bind(claim == AdminClaim::FirstComer)
                 .fetch_one(&mut *tx)
                 .await?;
                 let status = match (claims, admission) {
@@ -3083,6 +3159,144 @@ impl MetadataClient {
         .bind(since)
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    /// Stores a setup-claim nonce's SHA-256 for `tenant`, live for `ttl`; expired nonces of
+    /// every tenant are dropped on the way.
+    pub async fn insert_setup_nonce(
+        &self,
+        tenant: TenantId,
+        nonce_hash: [u8; 32],
+        ttl: std::time::Duration,
+    ) -> Result<(), MetadataError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM setup_claim_nonces WHERE expires_at <= now()")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO setup_claim_nonces (nonce_hash, tenant_id, expires_at)
+             VALUES ($1, $2, now() + make_interval(secs => $3))",
+        )
+        .bind(&nonce_hash[..])
+        .bind(tenant.as_uuid())
+        .bind(ttl.as_secs_f64())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// The tenant's fresh-install claim, if any.
+    pub async fn setup_claim(&self, tenant: TenantId) -> Result<Option<SetupClaim>, MetadataError> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            zitadel_user_id: String,
+            created_at: DateTime<Utc>,
+            has_member_row: bool,
+        }
+        Ok(sqlx::query_as::<_, Row>(
+            "SELECT c.zitadel_user_id, c.created_at,
+                    EXISTS (SELECT 1 FROM members m
+                             WHERE m.tenant_id = c.tenant_id
+                               AND m.zitadel_user_id = c.zitadel_user_id) AS has_member_row
+               FROM setup_claims c WHERE c.tenant_id = $1",
+        )
+        .bind(tenant.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?
+        .map(|r| SetupClaim {
+            zitadel_user_id: r.zitadel_user_id,
+            created_at: r.created_at,
+            has_member_row: r.has_member_row,
+        }))
+    }
+
+    /// Spends a live setup-claim nonce of `tenant` and binds the tenant's claim to
+    /// `zitadel_user_id`, in one transaction under the tenant lock (the lock
+    /// [`MetadataClient::admit_member`] reads the claim under):
+    ///
+    /// - No live nonce with this hash for this tenant (none, expired, spent, another tenant's):
+    ///   `Refused`, nothing written. A nonce is spent only here, so each binds at most once.
+    /// - The tenant has an active admin: the nonce is spent, `AlreadyClaimed`, no row.
+    /// - No claim yet, or one of this same user: `Bound`.
+    /// - A claim of another user: replaced (`Bound`, the old user kept in `replaced_user_id`)
+    ///   only when the caller found that user gone from Zitadel (`replace_stale` names it) and
+    ///   it still has no member row; otherwise `AlreadyClaimed`, the claim unchanged.
+    pub async fn claim_setup(
+        &self,
+        tenant: TenantId,
+        nonce_hash: [u8; 32],
+        zitadel_user_id: &str,
+        replace_stale: Option<&str>,
+    ) -> Result<SetupClaimOutcome, MetadataError> {
+        if zitadel_user_id.is_empty() {
+            return Ok(SetupClaimOutcome::Refused);
+        }
+        let tenant_id = tenant.as_uuid();
+        let mut tx = self.pool.begin().await?;
+        if !lock_tenant(&mut tx, tenant_id).await? {
+            return Err(MetadataError::TenantNotFound(tenant));
+        }
+        let spent = sqlx::query(
+            "DELETE FROM setup_claim_nonces
+              WHERE nonce_hash = $1 AND tenant_id = $2 AND expires_at > now()",
+        )
+        .bind(&nonce_hash[..])
+        .bind(tenant_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if spent != 1 {
+            return Ok(SetupClaimOutcome::Refused);
+        }
+        let has_admin: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM members
+                             WHERE tenant_id = $1 AND status = 'active' AND tenant_admin)",
+        )
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if has_admin {
+            tx.commit().await?;
+            return Ok(SetupClaimOutcome::AlreadyClaimed);
+        }
+        let current: Option<(String, bool)> = sqlx::query_as(
+            "SELECT c.zitadel_user_id,
+                    EXISTS (SELECT 1 FROM members m
+                             WHERE m.tenant_id = c.tenant_id
+                               AND m.zitadel_user_id = c.zitadel_user_id)
+               FROM setup_claims c WHERE c.tenant_id = $1 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let outcome = match current {
+            None => {
+                sqlx::query("INSERT INTO setup_claims (tenant_id, zitadel_user_id) VALUES ($1, $2)")
+                    .bind(tenant_id)
+                    .bind(zitadel_user_id)
+                    .execute(&mut *tx)
+                    .await?;
+                SetupClaimOutcome::Bound
+            }
+            Some((user, _)) if user == zitadel_user_id => SetupClaimOutcome::Bound,
+            Some((user, false)) if replace_stale == Some(user.as_str()) => {
+                sqlx::query(
+                    "UPDATE setup_claims
+                        SET zitadel_user_id = $2, replaced_user_id = zitadel_user_id,
+                            created_at = now()
+                      WHERE tenant_id = $1",
+                )
+                .bind(tenant_id)
+                .bind(zitadel_user_id)
+                .execute(&mut *tx)
+                .await?;
+                SetupClaimOutcome::Bound
+            }
+            Some(_) => SetupClaimOutcome::AlreadyClaimed,
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn open_signup(&self, tenant: TenantId) -> Result<bool, MetadataError> {

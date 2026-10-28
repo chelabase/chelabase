@@ -90,6 +90,7 @@ export const ErrorCode = {
   no_access_yet: 'no_access_yet',
   not_available_in_platform_mode: 'not_available_in_platform_mode',
   sign_up_closed: 'sign_up_closed',
+  setup_code_invalid: 'setup_code_invalid',
   pending_approval: 'pending_approval',
   last_tenant_admin: 'last_tenant_admin',
   invite_expired: 'invite_expired',
