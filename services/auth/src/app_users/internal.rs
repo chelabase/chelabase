@@ -124,7 +124,7 @@ pub enum InternalError {
     /// The orchestrator answered with a 4xx; `code` is the envelope's error code.
     #[error("orchestrator refused ({status}): {code}")]
     Refused { status: u16, code: String },
-    /// No answer, a 5xx or an unreadable answer.
+    /// No answer, a 5xx, a 3xx (never followed) or an unreadable answer.
     #[error("orchestrator unavailable: {0}")]
     Unavailable(String),
 }
@@ -186,6 +186,13 @@ impl InternalClient {
                 status: status.as_u16(),
                 code,
             });
+        }
+        // #26: a 3xx (never followed) is no answer: its empty body would read as success, and a
+        // revoke or sync that met one did nothing.
+        if !status.is_success() {
+            return Err(InternalError::Unavailable(format!(
+                "{status}: the orchestrator answered with no result (redirects are not followed)"
+            )));
         }
         Ok((status, text))
     }
@@ -341,4 +348,75 @@ impl InternalClient {
 
 fn v<T: Serialize>(body: &T) -> Value {
     serde_json::to_value(body).expect("request body serialises")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    /// An "orchestrator" that answers every request with `status` and a `location` elsewhere.
+    async fn answering(status: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nlocation: http://elsewhere.invalid/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// #26: a 3xx is never followed, so it is no answer at all: a revoke or a sync that met one
+    /// did nothing, and must not report success.
+    #[tokio::test]
+    async fn a_redirect_is_not_a_successful_revoke_or_sync() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "303 See Other",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+            "304 Not Modified",
+        ] {
+            let c = InternalClient::new(&answering(status).await, "internal-token");
+            let (project_id, user_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let refresh = RefreshRequest {
+                project_id,
+                refresh_token: "rt".into(),
+            };
+            let all = RevokeUserSessions {
+                project_id,
+                keep_session_id: None,
+                created_before: None,
+            };
+            let sync = SyncRequest {
+                project_id,
+                user_id,
+                data: None,
+                origin_branch_id: None,
+            };
+            let results = [
+                ("revoke", c.revoke(Uuid::new_v4(), project_id).await),
+                ("revoke_by_token", c.revoke_by_token(&refresh).await),
+                ("revoke_user_sessions", c.revoke_user_sessions(user_id, &all).await),
+                ("sync", c.sync(&sync).await),
+            ];
+            for (what, r) in results {
+                assert!(
+                    matches!(r, Err(InternalError::Unavailable(_))),
+                    "a {status} from the orchestrator read as a successful {what}: {r:?}"
+                );
+            }
+        }
+    }
 }
