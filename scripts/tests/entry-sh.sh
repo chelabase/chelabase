@@ -57,15 +57,19 @@ for name in CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECU
   fi
 done
 
-# Compose gets the derived values too: the recipes that start Zitadel load the stack's env
-# (stack.env carries the entry values) before they run.
-for recipe in zitadel-reset zitadel-bootstrap; do
-  body="$(awk -v r="^${recipe}[ :]" '$0 ~ r {f=1;next} f&&/^[^ \t#]/{f=0} f' justfile)"
-  if ! grep -qE '\. "\$\(.*workbench env' <<<"$body"; then
-    echo "entry-sh: the $recipe recipe doesn't load the stack's env (workbench env)" >&2
-    fail=1
-  fi
-done
+# Compose gets the derived values too: the recipe that restarts Zitadel loads the stack's env
+# (stack.env carries the entry values) before it runs. zitadel-bootstrap no longer sources it
+# in the shell: `chelabase dev bootstrap` reads the stack env itself and refuses a stack
+# without one (m4, #11).
+body="$(awk '/^zitadel-reset[ :]/ {f=1;next} f&&/^[^ \t#]/{f=0} f' justfile)"
+if ! grep -qE '\. "\$\(.*workbench env' <<<"$body"; then
+  echo "entry-sh: the zitadel-reset recipe doesn't load the stack's env (workbench env)" >&2
+  fail=1
+fi
+if ! just --show zitadel-bootstrap | grep -q 'dev bootstrap'; then
+  echo "entry-sh: the zitadel-bootstrap recipe doesn't run \`chelabase dev bootstrap\` (which loads the stack's env)" >&2
+  fail=1
+fi
 
 
 # --- End-of-step review: entry.sh derives what Entry derives -------------------------------
