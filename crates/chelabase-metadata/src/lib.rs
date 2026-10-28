@@ -62,9 +62,33 @@ pub const DEMO_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000
 pub const DEMO_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0002);
 
 /// Connection configuration for the control-plane metadata Postgres.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MetadataConfig {
     pub database_url: String,
+}
+
+/// The URL without its password (it may carry one, from `CHELABASE_METADATA_DATABASE_PASSWORD_FILE`).
+impl std::fmt::Debug for MetadataConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataConfig")
+            .field("database_url", &redact_password(&self.database_url))
+            .finish()
+    }
+}
+
+/// `scheme://user:<redacted>@rest` for a URL with a password; otherwise the URL.
+fn redact_password(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".into();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_end].rfind('@') {
+        Some(at) if rest[..at].contains(':') => {
+            let user = rest[..at].split(':').next().unwrap_or_default();
+            format!("{scheme}://{user}:<redacted>{}", &rest[at..])
+        }
+        _ => url.to_string(),
+    }
 }
 
 impl MetadataConfig {

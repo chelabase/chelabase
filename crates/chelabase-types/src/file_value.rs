@@ -10,6 +10,7 @@
 //! - a symlink, or anything but a regular file, is refused (never followed);
 //! - a file writable by its group or others is refused;
 //! - a [`Sensitivity::Secret`] file readable by its group or others is refused (`chmod 600`);
+//!   a [`Sensitivity::SharedSecret`] one readable by others (`chmod 640`);
 //! - so is a file over [`MAX_LEN`] bytes or one that isn't UTF-8.
 //!
 //! **Writers must replace a file atomically** (write a temporary file in the same directory, then
@@ -38,6 +39,10 @@ pub enum Sensitivity {
     Public,
     /// A secret: readable and writable only by its owner (0600).
     Secret,
+    /// A secret its owner shares with one consumer group (m1's layout gives
+    /// `db/metadata.password` 0640, group postgres): readable by owner and group, never by
+    /// others, and writable by its owner only.
+    SharedSecret,
 }
 
 /// Why [`FileValue::get`] has no value. Both mean 503 `unavailable` to a caller. The message
@@ -271,6 +276,11 @@ fn read_with(
             "it is writable by its group or others (mode {mode:04o}); chmod go-w it"
         ));
     }
+    if sensitivity == Sensitivity::SharedSecret && mode & 0o007 != 0 {
+        return Err(format!(
+            "it holds a secret but is readable by others (mode {mode:04o}); chmod 640 (or 600) it"
+        ));
+    }
     if sensitivity == Sensitivity::Secret && mode & 0o077 != 0 {
         return Err(format!(
             "it holds a secret but is readable by its group or others (mode {mode:04o}); chmod 600 it"
@@ -440,6 +450,11 @@ mod tests {
             (0o600, Sensitivity::Public, true),
             (0o664, Sensitivity::Public, false),
             (0o646, Sensitivity::Public, false),
+            (0o600, Sensitivity::SharedSecret, true),
+            (0o640, Sensitivity::SharedSecret, true),
+            (0o644, Sensitivity::SharedSecret, false),
+            (0o604, Sensitivity::SharedSecret, false),
+            (0o660, Sensitivity::SharedSecret, false),
             (0o600, Sensitivity::Secret, true),
             (0o400, Sensitivity::Secret, true),
             (0o640, Sensitivity::Secret, false),
