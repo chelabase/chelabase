@@ -1047,6 +1047,8 @@ fn smtp_comes_from_the_env_with_a_password_file() {
     let t = tempfile::tempdir().unwrap();
     let pw = t.path().join("smtp.password");
     std::fs::write(&pw, "secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pw_path = pw.clone();
     let pw = pw.display().to_string();
     let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
         pairs
@@ -1078,6 +1080,47 @@ fn smtp_comes_from_the_env_with_a_password_file() {
     let mut no_from = full.clone();
     no_from.remove("CHELABASE_SMTP_FROM");
     assert!(smtp_from(&lookup(&no_from)).is_err());
+    // 0400 and 0640 are fine too.
+    for mode in [0o400, 0o640] {
+        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(smtp_from(&lookup(&full)).is_ok(), "{mode:o}");
+    }
+}
+
+fn smtp_env(pw: &Path) -> impl Fn(&str) -> Option<String> {
+    let m: HashMap<String, String> = [
+        ("CHELABASE_SMTP_HOST", "smtp.example.com".to_string()),
+        ("CHELABASE_SMTP_USER", "u".to_string()),
+        ("CHELABASE_SMTP_PASSWORD_FILE", pw.display().to_string()),
+        ("CHELABASE_SMTP_FROM", "noreply@example.com".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    move |k: &str| m.get(k).cloned()
+}
+
+#[test]
+fn a_world_readable_smtp_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = t.path().join("smtp.password");
+    std::fs::write(&pw, "hunter2-secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = format!("{:#}", smtp_from(&smtp_env(&pw)).err().unwrap());
+    assert!(err.contains("CHELABASE_SMTP_PASSWORD_FILE"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
+}
+
+#[test]
+fn a_symlinked_smtp_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = t.path().join("smtp.password");
+    std::fs::write(&pw, "hunter2-secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = t.path().join("link.password");
+    std::os::unix::fs::symlink(&pw, &link).unwrap();
+    let err = format!("{:#}", smtp_from(&smtp_env(&link)).err().unwrap());
+    assert!(err.contains("symlink"), "{err}");
 }
 
 #[test]

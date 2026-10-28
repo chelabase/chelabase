@@ -152,13 +152,15 @@ fn non_blank(get: &impl Fn(&str) -> Option<String>, name: &str) -> Option<String
         .filter(|v| !v.is_empty())
 }
 
+/// A secret file through the shared check (0600, 0400 or 0640; no symlink, nothing
+/// group-writable or other-readable). Errors name the variable and path, never the value.
 fn read_secret_file(name: &str, path: &str) -> Result<String> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("{name}: reading {path}"))?;
-    let value = text.trim_end_matches(['\r', '\n']).to_string();
-    if value.trim().is_empty() {
-        bail!("{name}: {path} is empty");
+    use chelabase_types::file_value::{FileValue, Sensitivity, Unavailable};
+    match FileValue::file(name, path, Sensitivity::SharedSecret).get() {
+        Ok(v) => Ok(v.to_string()),
+        Err(Unavailable::NotYet { .. }) => bail!("{name}: {path} is missing or empty"),
+        Err(e) => bail!("{e}"),
     }
-    Ok(value)
 }
 
 /// SMTP from `CHELABASE_SMTP_*`, when `CHELABASE_SMTP_HOST` is set: TLS on, the password from
