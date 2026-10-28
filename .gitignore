@@ -47,8 +47,16 @@ infra/neon/.cache/
 # Claude
 .claude/settings.local.json
 
-# Cursor
-.cursor/
+# Cursor: keep local Impeccable/hooks ignored; track the harness commands, skills and auditor
+.cursor/*
+!.cursor/commands
+!.cursor/skills
+!.cursor/agents
+.cursor/skills/*
+!.cursor/skills/issue-spec
+!.cursor/skills/pr-body
+.cursor/agents/*
+!.cursor/agents/auditor.md
 # Impeccable (local hook consent and cache)
 .impeccable/config.local.json
 .impeccable/hook.cache.json

@@ -17,7 +17,8 @@ openapi/             generated OpenAPI documents (management, login, data)
 infra/compose/       metadata Postgres, NATS, Zitadel, Mailpit, Neon storage
 infra/neon/          Neon image pins and build notes
 scripts/             e2e, stack and codegen scripts
-docs/                design specs, plans, roadmap and security notes
+docs/                security notes; roadmap/superpowers are archive only
+AGENTS.md            agent workflow (epics, issues, audits)
 ```
 
 ## Prerequisites

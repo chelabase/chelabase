@@ -47,7 +47,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just workbench up [--with docs,landing]` | Start this checkout's stack: Compose services (metadata Postgres, NATS, Valkey, Zitadel, the Neon storage stack, Mailpit), the IAM bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, Studio) in containers built from your host-built binaries. Waits in line when 4 stacks already run. Prints the URLs |
+| `just workbench up [--with docs,landing]` | Start this checkout's stack: Compose services (metadata Postgres, NATS, Valkey, Zitadel, the Neon storage stack, Mailpit), the IAM bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, Studio) in containers built from your host-built binaries. Waits in line when the stack cap is reached (4 by default, `CHELABASE_WORKBENCH_SLOTS`). Prints the URLs |
 | `just workbench restart [app…]` | Rebuild and recreate the named apps (all five Rust apps when none); `studio` restarts the dev server |
 | `just workbench down` | Stop this stack and remove its computes; volumes and state stay |
 | `just workbench purge [--stack <slug>] [--yes]` | `down`, then delete the volumes, state directory and registry entry. Main is purged only when named and confirmed: `just workbench purge --stack main --yes` |
@@ -141,7 +141,7 @@ Configuration: [`infra/compose/.env.example`](infra/compose/.env.example) holds 
 
 ## Worktrees and their stacks
 
-Every checkout runs its own stack: its own Compose project, volumes, network, computes, Zitadel instance, state directory (`.chelabase/stacks/<slug>/`) and host names. Up to 4 stacks run at once; when the machine is full, `just workbench up` waits in a FIFO queue (it re-checks every few seconds, prints a status line each minute, and gives up after 45 minutes; `CHELABASE_WORKBENCH_WAIT` changes that). The main checkout stays on `main`.
+Every checkout runs its own stack: its own Compose project, volumes, network, computes, Zitadel instance, state directory (`.chelabase/stacks/<slug>/`) and host names. Up to 4 stacks run at once by default (`CHELABASE_WORKBENCH_SLOTS` sets the cap for your machine); when the cap is reached, `just workbench up` waits in a FIFO queue (it re-checks every few seconds, prints a status line each minute, and gives up after 45 minutes; `CHELABASE_WORKBENCH_WAIT` changes that). The main checkout stays on `main`.
 
 ```bash
 just wt-add my-feature          # creates .worktrees/my-feature from main, with its own build dir
@@ -220,13 +220,13 @@ Some Rust tests are `#[ignore]`d because they need the stack. Run them on your c
 ## Commits and branches
 
 - Work on a feature branch in its own worktree. Never switch branches in the main checkout; it stays on `main`.
-- Commit identity. There is no global git identity on this machine; commit with
-  `git commit`
-  (the GitHub account `<maintainer>`). The same applies to the public forks (`chelabase/neon`, `chelabase/postgres`, `chelabase/rust-postgres`).
-- Merge into `main` only when the maintainer says so, with `git merge --no-ff`, so the branch's history stays in `main`.
-- After a merge and a push of `main`, delete the branch on origin (`git push origin --delete <branch>`) and locally (`just wt-remove <branch>`, then `git branch -d <branch>`).
-- Before building on a branch, `git fetch` and check whether origin has newer commits. Push a branch after each commit (`git push -u origin <branch>` the first time) and `main` after a merge. Never force-push; if a push is rejected, fetch and integrate first.
+- Commit subjects use `type(area): summary` (for example `fix(studio): keep the query string on redirect`). Stage explicit paths only.
+- Changes land on `main` through pull requests, which a maintainer squash-merges. Without push access, fork the repo and open the PR from your fork.
+- After your PR merges, remove its worktree (`just wt-remove <branch>`) and delete the branch.
+- Before building on a branch, `git fetch` and check whether origin has newer commits. Never force-push; if a push is rejected, fetch and integrate first.
 - Never run `cargo fmt` on the workspace; rustfmt only the files you create.
 - Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key or the compute-JWT key pair.
 - Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies.
 - `tokio-postgres` is pinned to the `chelabase/rust-postgres` fork by `rev` in the workspace `Cargo.toml`; return to crates.io once the upstream change is released (https://github.com/rust-postgres/rust-postgres/pull/1391).
+
+Agent workflow (epics, issues, white-room audits): see root `AGENTS.md`.

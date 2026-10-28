@@ -1,0 +1,45 @@
+name: Chore, docs or refactor
+description: Maintenance with no user-visible behavior change
+title: ""
+labels: ["type:chore", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title: a plain imperative summary, for example `Drop the unused presence probe`.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Becomes the `area:*` label at triage.
+      options:
+        - studio
+        - gateway
+        - orchestrator
+        - worker
+        - rest
+        - auth
+        - realtime
+        - metadata
+        - neon
+        - fork
+        - docs
+        - ci
+        - deps
+        - infra
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What and why
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: Done when
+      value: |
+        - [ ]
+    validations:
+      required: true

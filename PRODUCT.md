@@ -48,7 +48,7 @@ Chelabase's designs are its own. It never mirrors Supabase (PostgREST URL gramma
 
 ## Evidence on Hand
 
-Pre-launch, private repo. No customers, testimonials, case studies or published benchmarks exist. A data-API benchmark is planned (roadmap step 6e) but has no results. Future work must not invent any of these.
+Pre-launch, private repo. No customers, testimonials, case studies or published benchmarks exist. A data-API benchmark is planned but has no results. Future work must not invent any of these.
 
 ## Product Principles
 

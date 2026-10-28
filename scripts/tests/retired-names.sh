@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 mapfile -t files < <(git ls-files ':!docs/superpowers/**' ':!docs/roadmap/**' \
-  ':!docs/landing-highlights.md' ':!scripts/tests/**' ':!apps/landing/**' ':!.gitignore' \
+  ':!docs/superpowers/landing-highlights.md' ':!scripts/tests/**' ':!apps/landing/**' ':!.gitignore' ':!.cursor/**' \
   ':!tools/cli/src/workbench/migrate.rs' ':!tools/cli/src/workbench/lifecycle_tests.rs' \
   ':!tools/cli/src/workbench/commands.rs' ':!tools/cli/src/paths.rs' ':!**/*.png' ':!**/*.lock' \
   ':!pnpm-lock.yaml')

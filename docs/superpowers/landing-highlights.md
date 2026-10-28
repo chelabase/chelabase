@@ -1,13 +1,15 @@
 # Landing-page highlights
 
-Raw notes for the landing page: what each piece of work solves, what it unlocks, and the evidence behind it. Added to as steps run (user, 2026-10-07). Not copy: wording for the page comes later, in the voice set by `PRODUCT.md`.
+> **Frozen (2026-10-28).** Historical notes only. Do not add entries. Agents never write here.
 
-Rules for entries:
+Raw notes for the landing page: what each piece of work solves, what it unlocks, and the evidence behind it. Added to as steps ran (user, 2026-10-07) until the harness refactor. Not copy: wording for the page comes later, in the voice set by `PRODUCT.md`.
+
+Rules that applied while this file was live:
 - Facts only. Each claim names its evidence (a test, a reproduced bug, a measurement). No invented numbers, customers or benchmarks (`PRODUCT.md`, "Evidence on Hand").
 - Say what's upstream and what's ours precisely. "Upstream" means the open-source Neon storage code our fork starts from, not Neon's hosted product, which we haven't tested.
 - Mark the status: **shipped** (merged into `main`), **in progress**, or **parked**.
 
-## Members hub, step 2: teams with live-linked access (2026-10-27, in progress, end-of-step pending)
+## Members hub, step 2: teams with live-linked access (2026-10-27, shipped: merged into `main` `d9cea40c`)
 
 Branch `members-hub-teams`; spec `docs/superpowers/specs/2026-10-23-members-hub-design.md` (D1-D6); plan `docs/superpowers/plans/2026-10-27-members-hub-step-2.md`. No fork change.
 
@@ -30,7 +32,7 @@ Branch `members-hub-teams`; spec `docs/superpowers/specs/2026-10-23-members-hub-
 - **Problem:** the hidden member role behind the SQL editor held every role the member could act as, Viewer-level ones included, so a role held at Viewer could be set from a Developer-only editor.
 - **What we built:** the hidden role is granted only roles held at Developer or above, and a downgrade revokes the role at once. The table editor's full-cell read as a role held below Developer goes through the data API's connection (`authenticator` + `SET ROLE`), answering 409 `data_api_disabled` when the data API is off.
 - **Evidence:** `member_roles_live` and `sql_run_live::the_sql_editor_cannot_set_a_viewer_level_role` (compiled, live run pending); `rest_live::console_cell_reads_as_the_role_and_refuses_a_column_it_lacks` (live run pending).
-- **Status:** in progress, end-of-step pending.
+- **Status:** shipped (merged `d9cea40c`). Evidence: `just check` green (Rust 4269/4269, Studio 2679/2679 then 2680 after the last Studio fix); live pass green (members_live 96, live_db 195, api 58, sql_run_live 23, rest_live 39, member_roles_live 32, personal_logins_live 7, roles_live 47); e2e green (teams, members, personal-logins, sql-editor, role, data); browser pass captures in `docs/superpowers/designs/2026-10-27-members-hub-step-2/png/`.
 
 ## Studio shell: phone navigation, breadcrumbs, no clipped content (2026-10-27, shipped: merged `5b4ab478`)
 

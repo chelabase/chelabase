@@ -10,7 +10,7 @@ allowed=(
   ':!infra/compose/docker-compose.yml'   # loopback-bound ports the host gateway reaches (W2 unpublishes them)
   ':!docs/superpowers/**'                # specs, plans and notes: history
   ':!docs/roadmap/**'
-  ':!docs/landing-highlights.md'
+  ':!docs/superpowers/landing-highlights.md'
   ':!scripts/tests/entry-urls.sh'
 )
 if hits=$(git grep -nE "$pattern" -- . "${allowed[@]}"); then

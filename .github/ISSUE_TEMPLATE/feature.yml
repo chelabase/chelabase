@@ -1,0 +1,68 @@
+name: Feature or change
+description: New behavior or a change to existing behavior
+title: ""
+labels: ["type:feat", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title: a plain imperative summary, for example `Keep the query string on redirect`.
+        The type and area are labels, so the title doesn't repeat them.
+        The bar: someone who never saw the discussion can build this from the issue alone.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Becomes the `area:*` label at triage.
+      options:
+        - studio
+        - gateway
+        - orchestrator
+        - worker
+        - rest
+        - auth
+        - realtime
+        - metadata
+        - neon
+        - fork
+        - docs
+        - ci
+        - deps
+        - infra
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is wrong or missing today, who hits it, and why it matters now.
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: What is observably true when this is done. Behavior, not a task list.
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Design sketch
+      description: Approach; types, endpoints, components or tables touched; contract changes; an alternative you rejected. Leave rough if unsure; triage will finish it.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Checkable statements, ideally Given / When / Then.
+      value: |
+        - [ ] Given ..., when ..., then ...
+    validations:
+      required: true
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of scope
+      description: Adjacent work a reader might assume is included, each with where it goes instead.
+      value: |
+        - ... -> ...

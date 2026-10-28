@@ -1,0 +1,67 @@
+name: Bug
+description: Something behaves differently from how it should
+title: ""
+labels: ["type:fix", "status:triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Title: a plain imperative summary of what should happen, for example `Keep the query string on redirect`.
+        Redact tokens and keys.
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Becomes the `area:*` label at triage.
+      options:
+        - studio
+        - gateway
+        - orchestrator
+        - worker
+        - rest
+        - auth
+        - realtime
+        - metadata
+        - neon
+        - fork
+        - docs
+        - ci
+        - deps
+        - infra
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, requests or clicks. Minimal is best.
+      value: |
+        1.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: Include the real error output or logs.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Commit SHA, image tag, or how it's deployed (Compose, local workbench).
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Suspected cause, workarounds, related issues.
