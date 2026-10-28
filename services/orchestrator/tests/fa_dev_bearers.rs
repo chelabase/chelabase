@@ -6,7 +6,8 @@
 //!
 //! Second finding in the area (app-auth was the first), so the invariant is tested for every
 //! bearer the internal listener checks: in platform mode `check_mode` refuses each development
-//! default, names its variable, and never repeats the token; self-hosted mode keeps them.
+//! default, names its variable, and never repeats the token; self-hosted mode keeps them only
+//! with `CHELABASE_DEV_DEFAULTS=1` (selfhost-install m5: the workbench's switch).
 
 use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
@@ -36,9 +37,13 @@ const BEARERS: [(&str, &str); 7] = [
 ];
 
 /// A config where every bearer is its own secret except `left` (None: all own secrets), which
-/// stays unset (its development default).
+/// stays unset (its development default). The workbench's `CHELABASE_DEV_DEFAULTS=1` is set:
+/// these tests are about platform mode, which refuses the defaults whatever it says.
 fn config_without(left: Option<&'static str>) -> InternalConfig {
     InternalConfig::from_lookup(move |name| {
+        if name == "CHELABASE_DEV_DEFAULTS" {
+            return Some("1".to_string());
+        }
         BEARERS
             .iter()
             .find(|(var, _)| *var == name && Some(*var) != left)

@@ -41,6 +41,20 @@ async fn main() -> anyhow::Result<()> {
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
     entry.check_mode(mode).map_err(anyhow::Error::new)?;
     internal_config.check_mode(&ModePolicy::new(mode))?;
+    if internal_config.dev_defaults.is_on() {
+        tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (the workbench only)");
+    }
+    // Readiness doesn't wait for the Actions key: the bootstrap needs the orchestrator up to
+    // make the Actions target, and writes the key after. The webhook answers 503 until then.
+    match &internal_config.actions_signing_key {
+        None => tracing::warn!(
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY(_FILE) is not set: the Zitadel Actions webhook answers 503"
+        ),
+        Some(key) => match key.get() {
+            Ok(_) => tracing::info!("the Actions signing key is loaded from {}", key.var()),
+            Err(e) => tracing::info!("{e}; the Actions webhook answers 503 until it is"),
+        },
+    }
     let roles = RoleSettings::from_lookup(
         mode,
         |name| std::env::var(name).ok(),

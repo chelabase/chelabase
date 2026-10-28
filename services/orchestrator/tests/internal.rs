@@ -1172,7 +1172,7 @@ async fn spawn_internal_full(
 /// The app-user parts of the state a test chooses.
 struct AppSetup {
     key: SecretKey,
-    signing_key: Option<String>,
+    signing_key: Option<chelabase_types::file_value::FileValue>,
     zitadel: Option<String>,
     jobs: FakeJobs,
     resync: FakeResync,
@@ -4085,7 +4085,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
         "http://127.0.0.1:9",
         AppSetup {
             key: world.key.clone(),
-            signing_key: signing_key.map(str::to_string),
+            signing_key: signing_key.map(Into::into),
             zitadel: zitadel.map(|z| z.base.clone()),
             jobs: jobs.clone(),
             resync: FakeResync::default(),
@@ -5799,6 +5799,57 @@ async fn a_deactivated_zitadel_user_loses_their_logins_and_the_cache_is_cleared(
         "only the tenant org's event asks for a revocation"
     );
     assert!(o.cache.sent.lock().unwrap().is_empty(), "an unknown user has no rows to clear");
+}
+
+// Selfhost-install m5 (AC 2): the orchestrator starts before the bootstrap has written the
+// Actions signing key. Until the file is there the webhook answers 503 (never an unchecked
+// pass, signed or not); once it appears, a signed `user.deactivated` is 200 and revokes the
+// member's logins, with no restart. A key file that's readable by others is refused (503).
+#[tokio::test]
+async fn webhook_picks_up_late_actions_key() {
+    use chelabase_types::file_value::{FileValue, Sensitivity};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("actions-signing-key");
+    let w = app_world();
+    let tenant = TenantId::new();
+    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
+    let app = spawn_with_app(
+        w.neon.clone(),
+        w.locator.clone(),
+        "http://127.0.0.1:9",
+        rules(Mode::SelfHosted, false),
+        FakeCache::default(),
+        "http://127.0.0.1:9",
+        AppSetup {
+            key: w.key.clone(),
+            signing_key: Some(FileValue::file(
+                "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE",
+                &path,
+                Sensitivity::Secret,
+            )),
+            ..AppSetup::default()
+        },
+    )
+    .await;
+    let body = user_event("user.deactivated", "tenant-org", "284617", chrono::Utc::now());
+    assert_eq!(app.event(&body, signed(&body)).await, 503, "no key file yet");
+    assert_eq!(app.event(&body, None).await, 503, "unsigned, no key file yet");
+    std::fs::write(&path, "").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(app.event(&body, signed(&body)).await, 503, "an empty key file");
+    std::fs::write(&path, format!("{SIGNING_KEY}\n")).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(app.event(&body, signed(&body)).await, 503, "a key file others can read");
+    assert!(w.neon.revocations.lock().unwrap().is_empty(), "nothing ran before the key");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(app.event(&body, None).await, 401, "the key is there: unsigned is refused");
+    assert_eq!(app.event(&body, signed(&body)).await, 200);
+    assert_eq!(
+        w.neon.revocations.lock().unwrap().clone(),
+        vec![(tenant, "284617".to_string())],
+        "the member's logins are revoked"
+    );
 }
 
 // P17: a revocation write that fails answers 500, so Zitadel delivers the event again, and
