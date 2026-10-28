@@ -41,7 +41,9 @@ pub struct RequestParts<'a> {
     pub path: &'a str,
     pub host: Option<&'a str>,
     pub headers: &'a HeaderMap,
-    /// The downstream socket address (never `X-Forwarded-For`).
+    /// The client's address: the downstream socket address, or, when that peer is a trusted
+    /// proxy, the client address its `X-Forwarded-For` or `Forwarded` names
+    /// ([`crate::client_addr::client_address`]). Per-IP limits key on it.
     pub client_ip: Option<IpAddr>,
 }
 

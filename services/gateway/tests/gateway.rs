@@ -590,6 +590,24 @@ async fn a_trusted_proxy_forwards_the_client_address() {
     assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "127.0.0.1");
 }
 
+// m14 (#25) N4: with trusted proxies configured, a peer that isn't one of them gets nothing
+// from a forged header (one naming a trusted hop too): the apps see the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_header_from_an_untrusted_peer_is_ignored() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")]).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "1.2.3.4, 10.0.0.2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "127.0.0.1");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_host_is_404_with_an_empty_body() {
     let stack = start_stack().await;
