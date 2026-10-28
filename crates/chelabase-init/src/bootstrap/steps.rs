@@ -1,18 +1,17 @@
 //! Idempotent bootstrap steps: each finds what exists and creates only what's missing.
 
-use crate::dev::requests::*;
-use crate::dev::zitadel::ZitadelApi;
+use super::outputs::{self, Outputs};
+use super::requests::*;
+use super::zitadel::ZitadelApi;
 use anyhow::{Context, Result, bail};
 use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
 use reqwest::Method;
 use serde_json::{Value, json};
-use std::path::Path;
 use tracing::info;
 
 const PROJECT: &str = "chelabase";
-const DEMO_USER: &str = "chelabase-demo";
-const MAILPIT: &str = "mailpit:1025";
+pub const DEMO_USER: &str = "chelabase-demo";
 const PROJECTS: &str = "zitadel.project.v2.ProjectService";
 const APPS: &str = "zitadel.application.v2.ApplicationService";
 const FEATURES: &str = "zitadel.feature.v2.FeatureService";
@@ -156,14 +155,22 @@ pub async fn ensure_studio_login(
 pub async fn ensure_zitadel_registration_off(api: &impl ZitadelApi) -> Result<()> {
     let policy = api.rest(Method::GET, LOGIN_POLICY, Value::Null).await?;
     if registration_allowed(&policy) {
-        api.rest(Method::PUT, LOGIN_POLICY, login_policy_without_registration(&policy))
-            .await?;
+        api.rest(
+            Method::PUT,
+            LOGIN_POLICY,
+            login_policy_without_registration(&policy),
+        )
+        .await?;
         info!("Zitadel's own registration is off (instance policy)");
     }
     let org = api.rest(Method::GET, ORG_LOGIN_POLICY, Value::Null).await?;
     if !policy_is_default(&org) && registration_allowed(&org) {
-        api.rest(Method::PUT, ORG_LOGIN_POLICY, login_policy_without_registration(&org))
-            .await?;
+        api.rest(
+            Method::PUT,
+            ORG_LOGIN_POLICY,
+            login_policy_without_registration(&org),
+        )
+        .await?;
         info!("Zitadel's own registration is off (the org's policy)");
     }
     Ok(())
@@ -199,10 +206,11 @@ pub async fn find_user_by_email(
     Ok(user_id_from(&listed))
 }
 
-/// Keeps `path` if it is a key for `user_id`; otherwise adds a key and writes it (0600).
-pub async fn ensure_demo_key(api: &impl ZitadelApi, user_id: &str, path: &Path) -> Result<()> {
-    if let Ok(text) = std::fs::read_to_string(path)
-        && serde_json::from_str::<Value>(&text)
+/// Keeps the output dir's `demo-sa.json` if it is a key for `user_id`; otherwise adds a key
+/// and writes it (0600). A symlink there is refused.
+pub async fn ensure_demo_key(api: &impl ZitadelApi, user_id: &str, out: &Outputs) -> Result<()> {
+    if let Some(bytes) = out.read(outputs::DEMO_KEY)?
+        && serde_json::from_slice::<Value>(&bytes)
             .ok()
             .and_then(|v| v.get("userId").cloned())
             == Some(json!(user_id))
@@ -217,27 +225,95 @@ pub async fn ensure_demo_key(api: &impl ZitadelApi, user_id: &str, path: &Path) 
         )
         .await?;
     let file = key_file_from(&created)?;
-    write_private(path, &file)?;
-    info!("wrote {}", path.display());
+    out.write_secret(outputs::DEMO_KEY, file.as_bytes())?;
+    info!("wrote {}", out.path().join(outputs::DEMO_KEY).display());
     Ok(())
 }
 
-pub async fn ensure_smtp(api: &impl ZitadelApi) -> Result<()> {
+/// The FirstInstance human's possible user names (Zitadel names it after the instance's
+/// domain): `zitadel-admin@zitadel.<auth host name>`, the pre-W1 `zitadel.localhost` form, and
+/// Zitadel's plain default.
+pub fn first_human_usernames(auth_host_name: &str) -> Vec<String> {
+    let mut names = vec![
+        format!("zitadel-admin@zitadel.{auth_host_name}"),
+        "zitadel-admin@zitadel.localhost".to_string(),
+        "zitadel-admin".to_string(),
+    ];
+    names.dedup();
+    names
+}
+
+/// Deactivates Zitadel's FirstInstance human (an IAM owner whose random password is only in
+/// the steps file), so nobody signs in as it. One already inactive is left alone; none found
+/// is fine (it was removed). Returns its id when there is one.
+pub async fn deactivate_first_human(
+    api: &impl ZitadelApi,
+    usernames: &[String],
+) -> Result<Option<String>> {
+    for name in usernames {
+        let listed = api
+            .rest(Method::POST, "/v2/users", human_username_search(name))
+            .await?;
+        let Some(id) = user_id_from(&listed) else {
+            continue;
+        };
+        if user_state_from(&listed).as_deref() == Some(USER_INACTIVE) {
+            return Ok(Some(id));
+        }
+        api.rest(
+            Method::POST,
+            &format!("/v2/users/{id}/deactivate"),
+            json!({}),
+        )
+        .await?;
+        info!("deactivated Zitadel's first human user {name} (user {id})");
+        return Ok(Some(id));
+    }
+    info!(
+        "no Zitadel first human user ({}) to deactivate",
+        usernames.join(", ")
+    );
+    Ok(None)
+}
+
+/// An SMTP configuration to keep active: Zitadel's sender for its own mail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Smtp {
+    /// `host:port`, as Zitadel lists it (the configuration is found by it).
+    pub host: String,
+    pub payload: Value,
+}
+
+impl Smtp {
+    /// The workbench's Mailpit (`--demo`).
+    pub fn mailpit() -> Self {
+        Self {
+            host: MAILPIT.to_string(),
+            payload: smtp_payload(MAILPIT),
+        }
+    }
+}
+
+const MAILPIT: &str = "mailpit:1025";
+
+/// Keeps `smtp` Zitadel's active SMTP configuration: created when no configuration has its
+/// host, activated when it isn't. An existing one is not rewritten.
+pub async fn ensure_smtp(api: &impl ZitadelApi, smtp: &Smtp) -> Result<()> {
     let listed = api
         .rest(Method::POST, "/admin/v1/smtp/_search", json!({}))
         .await?;
-    let id = match find_smtp(&listed, MAILPIT) {
+    let id = match find_smtp(&listed, &smtp.host) {
         Some((_, true)) => return Ok(()),
         Some((id, false)) => id,
         None => {
             let created = api
-                .rest(Method::POST, "/admin/v1/smtp", smtp_payload(MAILPIT))
+                .rest(Method::POST, "/admin/v1/smtp", smtp.payload.clone())
                 .await?;
             created
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .with_context(|| format!("create SMTP: {created}"))?
+                .context("create SMTP: no id in the answer")?
         }
     };
     api.rest(
@@ -246,13 +322,12 @@ pub async fn ensure_smtp(api: &impl ZitadelApi) -> Result<()> {
         json!({}),
     )
     .await?;
-    info!("Mailpit SMTP active");
+    info!("SMTP {} active", smtp.host);
     Ok(())
 }
 
 const ACTIONS_TARGET: &str = "chelabase-app-users";
 const ACTIONS_ENDPOINT: &str = "http://orchestrator:8083/internal/zitadel/events";
-const ACTIONS_KEY_VAR: &str = "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY";
 
 /// The Actions endpoint: `CHELABASE_ZITADEL_ACTIONS_ENDPOINT`'s value `v`, or the orchestrator's
 /// internal listener by service name when it is unset or blank.
@@ -265,14 +340,15 @@ pub fn actions_endpoint_from(v: Option<&str>) -> String {
 
 /// The Actions target that posts user events to `endpoint` (the orchestrator's internal
 /// listener), and the execution that routes the `user` event group to it. Zitadel shows a
-/// target's signing key only when it is created, so a target without its `actions.env` is
-/// deleted and created again; a kept target whose endpoint differs is updated in place
-/// (`POST /v2/actions/targets/{id}`), which keeps its signing key.
+/// target's signing key only when it is created, so a target without its key file in the
+/// output dir is deleted and created again; a kept target whose endpoint differs is updated in
+/// place (`POST /v2/actions/targets/{id}`), which keeps its signing key.
 pub async fn ensure_actions_target(
     api: &impl ZitadelApi,
-    env_file: &Path,
+    out: &Outputs,
     endpoint: &str,
 ) -> Result<()> {
+    let have_key = out.read_value(outputs::ACTIONS_SIGNING_KEY)?.is_some();
     let listed = api
         .rest(
             Method::POST,
@@ -282,7 +358,7 @@ pub async fn ensure_actions_target(
         .await?;
     let existing = actions_target_ids(&listed, ACTIONS_TARGET);
     let id = match existing.first() {
-        Some(id) if env_file.is_file() => {
+        Some(id) if have_key => {
             if actions_target_endpoint(&listed, id).as_deref() != Some(endpoint) {
                 api.rest(
                     Method::POST,
@@ -311,8 +387,11 @@ pub async fn ensure_actions_target(
                 )
                 .await?;
             let (id, key) = actions_target_created(&created)?;
-            write_private(env_file, &format!("{ACTIONS_KEY_VAR}={key}\n"))?;
-            info!("created Actions target {ACTIONS_TARGET}; wrote {}", env_file.display());
+            out.write_secret(outputs::ACTIONS_SIGNING_KEY, format!("{key}\n").as_bytes())?;
+            info!(
+                "created Actions target {ACTIONS_TARGET}; wrote {}",
+                out.path().join(outputs::ACTIONS_SIGNING_KEY).display()
+            );
             id
         }
     };
@@ -325,19 +404,10 @@ pub async fn ensure_actions_target(
     Ok(())
 }
 
-fn write_private(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
 #[cfg(test)]
 mod tests {
+    use super::super::requests::studio_app_config;
     use super::*;
-    use crate::dev::requests::studio_app_config;
     use chelabase_types::mode::Mode;
     use reqwest::Method;
     use serde_json::{Value, json};
@@ -345,6 +415,15 @@ mod tests {
     use std::sync::Mutex;
 
     const ORIGIN: &str = "http://studio.chelabase.localhost:8000";
+
+    /// A private temporary output dir.
+    fn out_dir() -> (tempfile::TempDir, Outputs) {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = Outputs::open(t.path()).unwrap();
+        (t, out)
+    }
 
     /// Answers by call key (`"POST /v2/organizations/_search"` or `"Service/Method"`), records
     /// calls and their bodies.
@@ -403,6 +482,9 @@ mod tests {
                 body,
             )
         }
+        async fn ready(&self) -> Result<(), crate::bootstrap::zitadel::ApiError> {
+            Ok(())
+        }
     }
 
     const GET_POLICY: &str = "GET /admin/v1/policies/login";
@@ -447,7 +529,10 @@ mod tests {
         assert_eq!(body["passwordCheckLifetime"], "864000s");
         assert_eq!(body["disableLoginWithEmail"], true);
         for read_only in ["details", "isDefault", "secondFactors", "idps"] {
-            assert!(body.get(read_only).is_none(), "{read_only} is not sent back");
+            assert!(
+                body.get(read_only).is_none(),
+                "{read_only} is not sent back"
+            );
         }
     }
 
@@ -457,7 +542,10 @@ mod tests {
             .with(GET_POLICY, login_policy(false))
             .with(GET_ORG_POLICY, org_policy(true, false));
         ensure_zitadel_registration_off(&fake).await.unwrap();
-        assert_eq!(fake.calls(), vec![GET_POLICY.to_string(), GET_ORG_POLICY.to_string()]);
+        assert_eq!(
+            fake.calls(),
+            vec![GET_POLICY.to_string(), GET_ORG_POLICY.to_string()]
+        );
     }
 
     /// The org's login policy as `GET /management/v1/policies/login` answers it.
@@ -475,7 +563,10 @@ mod tests {
             .with(GET_ORG_POLICY, org_policy(false, true))
             .with(PUT_ORG_POLICY, json!({}));
         ensure_zitadel_registration_off(&fake).await.unwrap();
-        assert_eq!(fake.calls(), vec![GET_POLICY, GET_ORG_POLICY, PUT_ORG_POLICY]);
+        assert_eq!(
+            fake.calls(),
+            vec![GET_POLICY, GET_ORG_POLICY, PUT_ORG_POLICY]
+        );
         let body = &fake.bodies(PUT_ORG_POLICY)[0];
         assert_eq!(body["allowRegister"], false);
         assert_eq!(body["allowUsernamePassword"], true);
@@ -527,10 +618,16 @@ mod tests {
             Some("u1".to_string())
         );
         let body = &fake.bodies("POST /v2/users")[0];
-        assert_eq!(body["queries"][0]["organizationIdQuery"]["organizationId"], "o1");
+        assert_eq!(
+            body["queries"][0]["organizationIdQuery"]["organizationId"],
+            "o1"
+        );
         assert_eq!(body["queries"][1]["emailQuery"]["emailAddress"], "a@b.co");
         let none = Fake::default().with("POST /v2/users", json!({"result": []}));
-        assert_eq!(find_user_by_email(&none, "o1", "a@b.co").await.unwrap(), None);
+        assert_eq!(
+            find_user_by_email(&none, "o1", "a@b.co").await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -546,7 +643,7 @@ mod tests {
             "c-spa"
         );
         assert_eq!(ensure_demo_user(&fake, "o1").await.unwrap(), "u1");
-        ensure_smtp(&fake).await.unwrap();
+        ensure_smtp(&fake, &Smtp::mailpit()).await.unwrap();
         let writes: Vec<String> = fake
             .calls()
             .into_iter()
@@ -580,7 +677,7 @@ mod tests {
         assert_eq!(ensure_project(&fake, "o1").await.unwrap(), "p1");
         assert_eq!(ensure_api_app(&fake, "p1").await.unwrap(), "c-new");
         assert_eq!(ensure_demo_user(&fake, "o1").await.unwrap(), "u9");
-        ensure_smtp(&fake).await.unwrap();
+        ensure_smtp(&fake, &Smtp::mailpit()).await.unwrap();
         let calls = fake.calls();
         for created in [
             "ProjectService/CreateProject",
@@ -752,18 +849,18 @@ mod tests {
 
     #[tokio::test]
     async fn the_demo_key_is_kept_when_its_file_matches_the_user() {
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, out) = out_dir();
         let path = dir.path().join("demo-sa.json");
         std::fs::write(&path, r#"{"keyId":"k1","key":"PEM","userId":"u1"}"#).unwrap();
         let fake = Fake::default();
-        ensure_demo_key(&fake, "u1", &path).await.unwrap();
+        ensure_demo_key(&fake, "u1", &out).await.unwrap();
         assert!(fake.calls().is_empty());
     }
 
     #[tokio::test]
     async fn a_missing_or_foreign_demo_key_is_replaced() {
         use base64::Engine;
-        let dir = tempfile::tempdir().unwrap();
+        let (dir, out) = out_dir();
         let path = dir.path().join("demo-sa.json");
         std::fs::write(
             &path,
@@ -775,7 +872,7 @@ mod tests {
             "POST /v2/users/u1/keys",
             json!({"keyId": "k1", "keyContent": base64::engine::general_purpose::STANDARD.encode(file)}),
         );
-        ensure_demo_key(&fake, "u1", &path).await.unwrap();
+        ensure_demo_key(&fake, "u1", &out).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), file);
     }
 
@@ -791,7 +888,10 @@ mod tests {
     fn actions_fake(existing: &[&str]) -> Fake {
         let mut fake = Fake::default()
             .with(TARGETS_SEARCH, target_listing(existing))
-            .with(TARGETS_CREATE, json!({"id": "t-new", "signingKey": "sk-new"}))
+            .with(
+                TARGETS_CREATE,
+                json!({"id": "t-new", "signingKey": "sk-new"}),
+            )
             .with(EXECUTIONS, json!({}));
         for id in existing {
             fake = fake.with(&format!("DELETE /v2/actions/targets/{id}"), json!({}));
@@ -801,10 +901,10 @@ mod tests {
 
     #[tokio::test]
     async fn actions_target_created_and_key_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("actions.env");
+        let (dir, out) = out_dir();
+        let file = dir.path().join("actions-signing-key");
         let fake = actions_fake(&[]);
-        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
+        ensure_actions_target(&fake, &out, ENDPOINT).await.unwrap();
         assert_eq!(
             fake.calls(),
             vec![TARGETS_SEARCH, TARGETS_CREATE, EXECUTIONS]
@@ -818,10 +918,7 @@ mod tests {
             fake.bodies(EXECUTIONS)[0],
             json!({"condition": {"event": {"group": "user"}}, "targets": ["t-new"]})
         );
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "sk-new\n");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -832,26 +929,23 @@ mod tests {
 
     #[tokio::test]
     async fn actions_target_reused_when_key_file_exists() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("actions.env");
-        std::fs::write(&file, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
+        let (dir, out) = out_dir();
+        let file = dir.path().join("actions-signing-key");
+        std::fs::write(&file, "old\n").unwrap();
         let fake = actions_fake(&["t-old"]);
-        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
+        ensure_actions_target(&fake, &out, ENDPOINT).await.unwrap();
         // Kept: no delete, no create; the execution is still PUT (idempotent) with the old id.
         assert_eq!(fake.calls(), vec![TARGETS_SEARCH, EXECUTIONS]);
         assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
     #[tokio::test]
     async fn actions_target_recreated_when_key_file_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("actions.env");
+        let (dir, out) = out_dir();
+        let file = dir.path().join("actions-signing-key");
         let fake = actions_fake(&["t-old"]);
-        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
+        ensure_actions_target(&fake, &out, ENDPOINT).await.unwrap();
         assert_eq!(
             fake.calls(),
             vec![
@@ -862,17 +956,14 @@ mod tests {
             ]
         );
         assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-new"]));
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-new\n"
-        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "sk-new\n");
     }
 
     #[tokio::test]
     async fn actions_target_moved_to_a_new_endpoint_keeps_its_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("actions.env");
-        std::fs::write(&file, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n").unwrap();
+        let (dir, out) = out_dir();
+        let file = dir.path().join("actions-signing-key");
+        std::fs::write(&file, "old\n").unwrap();
         let fake = Fake::default()
             .with(
                 TARGETS_SEARCH,
@@ -881,17 +972,17 @@ mod tests {
             )
             .with("POST /v2/actions/targets/t-old", json!({}))
             .with(EXECUTIONS, json!({}));
-        ensure_actions_target(&fake, &file, ENDPOINT).await.unwrap();
+        ensure_actions_target(&fake, &out, ENDPOINT).await.unwrap();
         assert_eq!(
             fake.calls(),
             vec![TARGETS_SEARCH, "POST /v2/actions/targets/t-old", EXECUTIONS]
         );
-        assert_eq!(fake.bodies("POST /v2/actions/targets/t-old")[0]["endpoint"], ENDPOINT);
-        assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
         assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=old\n"
+            fake.bodies("POST /v2/actions/targets/t-old")[0]["endpoint"],
+            ENDPOINT
         );
+        assert_eq!(fake.bodies(EXECUTIONS)[0]["targets"], json!(["t-old"]));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "old\n");
     }
 
     #[test]
