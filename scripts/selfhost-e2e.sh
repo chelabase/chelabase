@@ -15,7 +15,8 @@
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
 #  10. secret reads     every running service reads its mounted secrets as its own uid and groups
 #  11. rerun            a second `up --wait` changes no secret, container or log line of the code
-#  12. down -v          nothing is left behind (containers, volumes, networks)
+#  12. uninstall        the documented uninstall (computes still running) leaves no container,
+#                      volume or network
 #  13. failing install  in a second project, an SMTP host with no sender fails `up --wait` at init-bootstrap
 #
 # Images: by default `-f docker-compose.build.yml` builds them from this checkout (the cache is
@@ -25,7 +26,8 @@
 #
 # Other switches: SELFHOST_E2E_SKIP_CODE=1 stubs the code check out (step 4 expects 200 instead of
 # 403, so the script must fail there: this shows its failure path). SELFHOST_E2E_KEEP=1 leaves the
-# project up (tear it down with `docker compose -p <name> down -v`). SELFHOST_E2E_PORT picks the port.
+# project up (tear it down with the install docs' uninstall, `-p <name>` added). SELFHOST_E2E_PORT
+# picks the port.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -78,10 +80,18 @@ remove_leftovers() {
   [[ -z "$ids" ]] || docker rm -f $ids >/dev/null 2>&1 || true
 }
 
-teardown() { # teardown <project>
+# uninstall <project>: the install docs' uninstall ("Stop, tear down and uninstall"), word for
+# word but for the project flag: stop the stack, remove the computes by their label, `down -v`.
+uninstall() {
   local p="$1"
-  remove_leftovers "$p"
-  compose "$p" down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
+  compose "$p" stop --timeout 20 &&
+    docker ps -aq --filter "label=chelabase.dev/stack=$p" | xargs -r docker rm -f >/dev/null &&
+    compose "$p" down -v --timeout 20
+}
+
+teardown() { # teardown <project>: the documented uninstall, then a fallback for whatever it left
+  local p="$1"
+  uninstall "$p" >/dev/null 2>&1 || true
   remove_leftovers "$p"
   compose "$p" down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
 }
@@ -556,15 +566,14 @@ pass "no secret file, container or setup-code line changed ($(wc -l <"$tmp/after
 
 # ---- 12. teardown --------------------------------------------------------------------------------
 
-step "down -v leaves nothing behind"
-# The database's compute is the worker's, not Compose's: delete it through the API first, as an
-# operator would, then `down -v` takes the rest.
-status="$(api DELETE "/v1/databases/$db_id")"
-[[ "$status" == 200 || "$status" == 202 || "$status" == 204 ]] || say "note: DELETE /v1/databases/$db_id answered $status; removing leftovers by label"
+step "the documented uninstall leaves nothing behind"
+# The database's compute (the worker's container, not Compose's) is still running: the documented
+# commands alone must remove it, its networks and the volumes. No fallback runs before the check.
+[[ -n "$(docker ps -q --filter "label=chelabase.dev/stack=$PROJECT")" ]] || die "no compute is running before the uninstall: the check would prove little"
 if [[ "${SELFHOST_E2E_KEEP:-}" == 1 ]]; then
   say "SELFHOST_E2E_KEEP=1: skipping the teardown check"
 else
-  teardown "$PROJECT"
+  uninstall "$PROJECT" >"$tmp/uninstall.log" 2>&1 || { tail -n 20 "$tmp/uninstall.log" >&2; die "the documented uninstall failed"; }
   nothing_left "$PROJECT"
   TORN_DOWN=1
   OLD_PROJECT="$PROJECT"
@@ -584,7 +593,7 @@ grep -q 'init-bootstrap' "$tmp/$FAIL_PROJECT.up" || { tail -n 20 "$tmp/$FAIL_PRO
 exit_code="$(compose "$FAIL_PROJECT" ps -a --format json | jq -rs '.[] | select(.Service == "init-bootstrap") | .ExitCode')"
 [[ "$exit_code" == 1 ]] || die "init-bootstrap exit code is '$exit_code' (wanted 1)"
 pass "up --wait failed naming init-bootstrap (exit 1): $(grep -m1 -E "init-bootstrap.*(exit|didn)" "$tmp/$FAIL_PROJECT.up" || echo "see log")"
-teardown "$FAIL_PROJECT"
+uninstall "$FAIL_PROJECT" >"$tmp/uninstall-fail.log" 2>&1 || { tail -n 20 "$tmp/uninstall-fail.log" >&2; die "the documented uninstall failed"; }
 nothing_left "$FAIL_PROJECT"
 pass "$FAIL_PROJECT: no containers, volumes or networks left"
 FAIL_PROJECT=""
