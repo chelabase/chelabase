@@ -39,3 +39,29 @@ pub fn setup_code(dir: &Path, out: &mut dyn Write) -> Result<()> {
     out.flush()?;
     Ok(())
 }
+
+/// `chelabase-init bootstrap --out <dir> [--demo] [--admin-email <email>] [--timeout <t>]`,
+/// configured from the environment ([`crate::bootstrap::ENV_KEYS`]). Logs progress to stderr;
+/// prints no secret.
+pub fn bootstrap(
+    out: &Path,
+    demo: crate::bootstrap::Demo,
+    admin_email: Option<String>,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "chelabase_init=info".into()),
+        )
+        .with_writer(std::io::stderr)
+        .try_init();
+    let mut cfg =
+        crate::bootstrap::Config::from_lookup(|k| std::env::var(k).ok(), out.to_path_buf())?;
+    cfg.admin_email = admin_email;
+    cfg.timeout = timeout;
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(crate::bootstrap::run(&cfg, demo))
+}

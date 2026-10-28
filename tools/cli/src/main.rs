@@ -262,7 +262,8 @@ enum GenCommands {
 
 #[derive(Subcommand, Debug)]
 enum DevCommands {
-    /// Idempotent ensure: project, API app, demo machine key, tenant org bind
+    /// The current stack's bootstrap, as `workbench up` runs it: `chelabase-init bootstrap
+    /// --demo` inside the stack, then the apps' env files (idempotent)
     Bootstrap {
         /// Email of the Zitadel user to make the demo tenant's first admin (default: the dev user)
         #[arg(long)]
@@ -311,7 +312,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Commands::Dev { command } => match command {
             DevCommands::Bootstrap { admin_email } => {
-                dev::bootstrap::run(admin_email.as_deref()).await
+                workbench::commands::dev_bootstrap(admin_email.as_deref())
             }
             DevCommands::Token => dev::token::run().await,
         },
@@ -587,15 +588,5 @@ mod tests {
         assert!(env.is_empty());
         assert_eq!(script, "scripts/s.sh");
         assert_eq!(args, ["--help", "--env", "x"]);
-    }
-
-    // T5 review M5: `dev bootstrap` outside a stack's env would recreate the retired zitadel
-    // dir under `.chelabase`; it refuses and names the way in.
-    #[test]
-    fn bootstrap_needs_the_stack_env() {
-        let err = crate::dev::bootstrap::check_stack_env(None).unwrap_err().to_string();
-        assert!(err.contains("just workbench up"), "{err}");
-        assert!(crate::dev::bootstrap::check_stack_env(Some("  ")).is_err());
-        assert!(crate::dev::bootstrap::check_stack_env(Some("/m/.chelabase/stacks/main")).is_ok());
     }
 }

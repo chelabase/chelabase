@@ -21,20 +21,12 @@ default:
 workbench *args:
     cargo run -q -p chelabase -- workbench "$@"
 
-# Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
+# Rerun this stack's bootstrap as `workbench up` does: `chelabase-init bootstrap --demo` inside the
+# stack (Zitadel objects, the tenant bind, the demo tenant admin), then the apps' env files
 zitadel-bootstrap admin_email="":
     #!/usr/bin/env bash
     set -euo pipefail
-    set -a
-    # shellcheck disable=SC1090
-    . "$(cargo run -q -p chelabase -- workbench env)"
-    set +a
-    # As `workbench up` runs it: the host can't resolve `zitadel`, so Zitadel is reached through
-    # the stack's gateway, and the tenant bind's `compose exec` uses the stack's project and env.
-    export CHELABASE_ZITADEL_UPSTREAM=http://127.0.0.1:"$CHELABASE_GATEWAY_PORT"
-    export CHELABASE_ROOT="$CHELABASE_CHECKOUT"
-    export COMPOSE_FILE="$CHELABASE_CHECKOUT/infra/compose/docker-compose.yml"
-    export COMPOSE_ENV="$CHELABASE_STACK_DIR/env/stack.env"
+    cargo build -q -p init
     # No address: the stack's own `zitadel-admin@zitadel.<auth host>` (or the pre-W1 name) is used.
     cargo run -q -p chelabase -- dev bootstrap ${1:+--admin-email "$1"}
 

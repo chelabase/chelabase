@@ -11,15 +11,24 @@ base64 = { workspace = true }
 # The NATS users file holds bcrypt hashes.
 bcrypt = "0.19.3"
 chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
+chelabase-types = { workspace = true }
+chelabase-zitadel = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+urlencoding = { workspace = true }
+uuid = { workspace = true }
 
 [features]
 # The path-based generators the CLI's tests use as a baseline (`kinds::stack_secrets::ensure`,

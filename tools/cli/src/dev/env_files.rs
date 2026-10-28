@@ -1,4 +1,6 @@
-//! `demo.env` (host processes) and Studio's `.env.local`.
+//! `demo.env` (host processes), Studio's `studio.env` and the orchestrator's `actions.env`,
+//! rendered by the workbench from `chelabase-init bootstrap --demo`'s output files (until the
+//! apps read those files themselves).
 //!
 //! demo.env carries no internal bearer (RT1 T1, S27): every app reads it, so the stack mounts each
 //! generated bearer into the services that use it and sets `<NAME>_FILE` per service.
@@ -92,9 +94,30 @@ VITE_ZITADEL_ORG_ID={org_id}\nVITE_API_URL={api_url}\nVITE_STUDIO_HOST={studio_h
     )
 }
 
+/// `actions.env`: the Actions signing key as the orchestrator reads it today.
+pub fn render_actions_env(signing_key: &str) -> String {
+    format!("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY={}\n", signing_key.trim())
+}
+
+/// The key from an `actions.env` an earlier bootstrap wrote, if any.
+pub fn actions_key_from_env(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|l| l.trim().strip_prefix("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY="))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actions_env_round_trips_the_key() {
+        let text = render_actions_env("sk-1\n");
+        assert_eq!(text, "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=sk-1\n");
+        assert_eq!(actions_key_from_env(&text).as_deref(), Some("sk-1"));
+        assert_eq!(actions_key_from_env("OTHER=1\nCHELABASE_ZITADEL_ACTIONS_SIGNING_KEY=\n"), None);
+    }
 
     #[test]
     fn demo_env_names_the_auth_files() {

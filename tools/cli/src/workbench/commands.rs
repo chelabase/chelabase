@@ -934,12 +934,6 @@ fn start_stack(
         secure_pats(&pats)
     })?;
 
-    phases.run("bootstrap", || {
-        bootstrap(stack, entry, BootstrapPass::BeforeApps)
-    })?;
-    // Taken before the late apps are created: on a fresh stack they read this bootstrap's files.
-    let after_first = app_env_files(stack);
-
     let mut late: Vec<&str> = LATE_APPS.to_vec();
     let profiles: Vec<&str> = if with.is_empty() {
         Vec::new()
@@ -947,25 +941,21 @@ fn start_stack(
         late.extend(with.iter().map(|s| s.service()));
         vec!["--profile", "sites"]
     };
-    phases.run("apps", || compose_up(stack, &profiles, &late))?;
+    // Not waited on: on a fresh stack an app that needs the bootstrap's files (auth) restarts
+    // until it is recreated below with them.
+    phases.run("apps", || compose_start(stack, &profiles, &late))?;
     // After the apps: the worker that would recreate a removed compute is now the one that
     // starts computes on the compute network.
     phases.run("computes off the compute network", || {
         remove_computes_off_network(&stack.slug, &super::env::compute_network(&stack.project))
     })?;
 
-    // The Actions target, now its host (the orchestrator) resolves, and the tenant bind, now the
-    // orchestrator has migrated the metadata database it writes to.
-    phases.run("bootstrap (after the apps)", || {
-        bootstrap(stack, entry, BootstrapPass::AfterApps)
-    })?;
+    // One run, after the apps: it waits for the orchestrator (the metadata migrations, the
+    // Actions target's host) itself.
+    phases.run("bootstrap", || bootstrap(stack, None))?;
 
-    let changed = up_env_changes(
-        was_running,
-        &before_bootstrap,
-        &after_first,
-        &app_env_files(stack),
-    );
+    // Every app container predates the bootstrap's files, on a fresh stack too.
+    let changed = changed_env_users(&before_bootstrap, &app_env_files(stack));
     let stale = if was_running {
         up_recreates(
             &read_binaries(stack),
@@ -980,6 +970,8 @@ fn start_stack(
             recreate(stack, &stale)
         })?;
     }
+
+    phases.run("apps healthy", || compose_up(stack, &profiles, &late))?;
 
     phases.run("proxy CA", || {
         let to = stack.state.join("neon/proxy-ca.crt");
@@ -1028,25 +1020,6 @@ fn app_env_files(stack: &Stack) -> Vec<EnvFile> {
         (path, contents, users)
     })
     .collect()
-}
-
-/// The env-file readers `up` recreates. On a running stack every container predates both
-/// bootstraps, so any change since before the first one counts. On a fresh stack the late apps
-/// are created after the first bootstrap and the front tier needs nothing from its files
-/// (stack.env carries the machine keys), so only the second bootstrap's changes count (W2
-/// end-of-step review M4).
-fn up_env_changes(
-    was_running: bool,
-    before_bootstrap: &[EnvFile],
-    after_first: &[EnvFile],
-    after_second: &[EnvFile],
-) -> Vec<String> {
-    let since = if was_running {
-        before_bootstrap
-    } else {
-        after_first
-    };
-    changed_env_users(since, after_second)
 }
 
 /// The services reading an env file whose contents changed, in [`APPS`] order.
@@ -1113,7 +1086,8 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
         cmd.args(["-p", app]);
     }
     if cli {
-        cmd.args(["-p", "chelabase"]);
+        // `chelabase-init` too: the bootstrap runs it.
+        cmd.args(["-p", "chelabase", "-p", "init"]);
     }
     run(cmd)
 }
@@ -1123,6 +1097,16 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
 fn compose_up(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
     let mut args: Vec<&str> = profiles.to_vec();
     args.extend(["up", "-d", "--wait"]);
+    args.extend_from_slice(services);
+    stack
+        .compose_run(&args)
+        .inspect_err(|_| show_failure(stack))
+}
+
+/// `compose [profiles] up -d <services>`, not waiting for them to be healthy.
+fn compose_start(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
+    let mut args: Vec<&str> = profiles.to_vec();
+    args.extend(["up", "-d"]);
     args.extend_from_slice(services);
     stack
         .compose_run(&args)
@@ -1192,40 +1176,89 @@ fn wait_for_files(files: &[PathBuf], timeout: Duration) -> anyhow::Result<()> {
     }
 }
 
-/// Which of `up`'s two bootstraps runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BootstrapPass {
-    BeforeApps,
-    AfterApps,
+/// `chelabase-init bootstrap --demo` on the stack's network, as a one-shot container of the
+/// workbench image: the host can't reach the metadata database, and the bootstrap reaches
+/// Zitadel, the metadata database and the orchestrator by their service names. It mounts only
+/// its binary (read-only) and the output dir (the stack's `zitadel/`, where Zitadel writes the
+/// PATs); its env is the stack env's values of what it reads (`bootstrap::ENV_KEYS`). Then the
+/// apps' env files are rendered from its outputs.
+fn bootstrap(stack: &Stack, admin_email: Option<&str>) -> anyhow::Result<()> {
+    let env = crate::paths::load_dotenv_file(&stack.env_file);
+    let out = stack.state.join("zitadel");
+    crate::dev::bootstrap::adopt_actions_key(&out)?;
+    let bin = stack.checkout.join("target/debug/chelabase-init");
+    let bin = bin
+        .canonicalize()
+        .with_context(|| format!("{} isn't built (cargo build -p init)", bin.display()))?;
+    let mut cmd = Command::new("docker");
+    cmd.args(bootstrap_args(&stack.project, &env, &bin, &out, admin_email)?);
+    run(cmd)?;
+    crate::dev::bootstrap::render_workbench_files(&out, &stack.state.join("studio.env"), &env)
 }
 
-/// The extra env of a bootstrap pass: the one before the apps leaves the Actions target alone
-/// (its host, the orchestrator, doesn't resolve yet on a fresh stack; Zitadel refuses it).
-pub fn bootstrap_env(pass: BootstrapPass) -> Vec<(&'static str, &'static str)> {
-    match pass {
-        BootstrapPass::BeforeApps => vec![(crate::dev::bootstrap::SKIP_ACTIONS_VAR, "1")],
-        BootstrapPass::AfterApps => Vec::new(),
+/// `docker run …` for [`bootstrap`]: see there.
+pub fn bootstrap_args(
+    project: &str,
+    env: &HashMap<String, String>,
+    bin: &Path,
+    out: &Path,
+    admin_email: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let get = |k: &str| {
+        env.get(k)
+            .cloned()
+            .with_context(|| format!("the stack env has no {k}"))
+    };
+    let (out, bin) = (out.display().to_string(), bin.display().to_string());
+    let tool = "/usr/local/bin/chelabase-init";
+    let mut args: Vec<String> = [
+        "run",
+        "--rm",
+        "--network",
+        &format!("{project}_default"),
+        "--user",
+        &format!("{}:{}", get("CHELABASE_UID")?, get("CHELABASE_GID")?),
+        "-v",
+        &format!("{bin}:{tool}:ro"),
+        "-v",
+        &format!("{out}:{out}"),
+        "--entrypoint",
+        tool,
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let mut pairs: Vec<(String, String)> = chelabase_init::bootstrap::ENV_KEYS
+        .iter()
+        .filter(|k| **k != "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+        .filter_map(|k| env.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    pairs.push((
+        "CHELABASE_ZITADEL_ADMIN_PAT_FILE".into(),
+        format!("{out}/admin.pat"),
+    ));
+    for (k, v) in pairs {
+        args.extend(["-e".to_string(), format!("{k}={v}")]);
     }
+    args.push(get("CHELABASE_WORKBENCH_IMAGE")?);
+    args.extend(["bootstrap", "--demo", "--out", &out].map(str::to_string));
+    if let Some(email) = admin_email.map(str::trim).filter(|e| !e.is_empty()) {
+        args.extend(["--admin-email".to_string(), email.to_string()]);
+    }
+    Ok(args)
 }
 
-/// `chelabase dev bootstrap` on the host with the stack's env (P6: Zitadel through the stack's
-/// gateway, with the auth host as `Host`).
-fn bootstrap(stack: &Stack, entry: &Entry, pass: BootstrapPass) -> anyhow::Result<()> {
-    let cli = stack.checkout.join("target/debug/chelabase");
-    let mut cmd = Command::new(&cli);
-    cmd.args(["dev", "bootstrap"])
-        .current_dir(&stack.checkout)
-        .envs(crate::paths::load_dotenv_file(&stack.env_file))
-        .env_remove(crate::dev::bootstrap::SKIP_ACTIONS_VAR)
-        .envs(bootstrap_env(pass))
-        .env("CHELABASE_ROOT", &stack.checkout)
-        .env("COMPOSE_FILE", &stack.compose_file)
-        .env("COMPOSE_ENV", &stack.env_file)
-        .env(
-            "CHELABASE_ZITADEL_UPSTREAM",
-            format!("http://127.0.0.1:{}", entry.gateway_port),
+/// `chelabase dev bootstrap [--admin-email e]`: the current checkout's stack's bootstrap, as
+/// `up` runs it (`just zitadel-bootstrap`). The stack must be up.
+pub fn dev_bootstrap(admin_email: Option<&str>) -> anyhow::Result<()> {
+    let stack = current_stack()?;
+    if !stack.env_file.is_file() {
+        bail!(
+            "stack {} has no stack env ({}): bring it up with `just workbench up`",
+            stack.slug,
+            stack.env_file.display()
         );
-    run(cmd)
+    }
+    bootstrap(&stack, admin_email)
 }
 
 fn record_binaries(stack: &Stack, apps: &[&str]) -> anyhow::Result<()> {
@@ -2059,41 +2092,52 @@ mod tests {
         assert!(changed_env_users(&before, &before).is_empty());
     }
 
-    // M4: a fresh stack's first bootstrap writes demo.env before the late apps exist; only the
-    // second bootstrap's changes recreate anything. A running stack counts both.
+    // The workbench's one bootstrap: `chelabase-init bootstrap --demo` on the stack network,
+    // with its binary read-only and the output dir the only writable mount (no docker socket,
+    // no keys dir), and the env it reads taken from the stack env.
     #[test]
-    fn a_fresh_up_recreates_only_for_the_second_bootstrap() {
-        const DEMO: &[&str] = &["orchestrator", "worker", "gateway", "auth", "rest"];
-        const ACTIONS: &[&str] = &["orchestrator"];
-        let p = PathBuf::from;
-        let snap = |demo: Option<&str>, actions: Option<&str>| {
-            vec![
-                (p("demo.env"), demo.map(|s| s.as_bytes().to_vec()), DEMO),
-                (p("actions.env"), actions.map(|s| s.as_bytes().to_vec()), ACTIONS),
-            ]
-        };
-        let empty = snap(None, None);
-        let first = snap(Some("d"), None);
-        let second = snap(Some("d"), Some("a"));
-        assert_eq!(up_env_changes(false, &empty, &first, &second), ["orchestrator"]);
-        assert!(up_env_changes(false, &empty, &first, &first).is_empty());
+    fn the_bootstrap_runs_once_in_the_stack_with_only_its_output_dir() {
+        let env: HashMap<String, String> = [
+            ("CHELABASE_UID", "1000"),
+            ("CHELABASE_GID", "1001"),
+            ("CHELABASE_WORKBENCH_IMAGE", "chelabase-workbench:abc"),
+            ("CHELABASE_AUTH_HOST", "auth.x.chelabase.localhost:8100"),
+            ("CHELABASE_METADATA_DATABASE_URL", "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata"),
+            ("CHELABASE_ZITADEL_UPSTREAM", "http://zitadel:8080"),
+            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/elsewhere/admin.pat"),
+            ("CHELABASE_KEYS_DIR", "/m/.chelabase"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let args = bootstrap_args(
+            "chelabase-x",
+            &env,
+            Path::new("/c/target/debug/chelabase-init"),
+            Path::new("/s/zitadel"),
+            Some(" a@b.co "),
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(joined.starts_with("run --rm --network chelabase-x_default --user 1000:1001 "), "{joined}");
+        let volumes: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-v")
+            .map(|w| w[1].as_str())
+            .collect();
         assert_eq!(
-            up_env_changes(true, &empty, &first, &second),
-            ["orchestrator", "worker", "gateway", "auth", "rest"]
+            volumes,
+            ["/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro", "/s/zitadel:/s/zitadel"]
         );
-        assert!(up_env_changes(true, &second, &second, &second).is_empty());
-    }
-
-    // W2 live: on a fresh stack the first bootstrap runs before the orchestrator exists, and
-    // Zitadel refuses a target whose host doesn't resolve (Errors.Target.DeniedURL). Only the
-    // bootstrap after the apps creates the Actions target.
-    #[test]
-    fn only_the_bootstrap_after_the_apps_creates_the_actions_target() {
-        assert_eq!(
-            bootstrap_env(BootstrapPass::BeforeApps),
-            [("CHELABASE_BOOTSTRAP_SKIP_ACTIONS", "1")]
+        let envs: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
+        assert!(envs.contains(&"CHELABASE_ZITADEL_ADMIN_PAT_FILE=/s/zitadel/admin.pat"), "{envs:?}");
+        assert!(envs.contains(&"CHELABASE_ZITADEL_UPSTREAM=http://zitadel:8080"), "{envs:?}");
+        assert!(!envs.iter().any(|e| e.starts_with("CHELABASE_KEYS_DIR")), "{envs:?}");
+        assert!(!joined.contains("docker.sock"));
+        assert!(
+            joined.ends_with("chelabase-workbench:abc bootstrap --demo --out /s/zitadel --admin-email a@b.co"),
+            "{joined}"
         );
-        assert!(bootstrap_env(BootstrapPass::AfterApps).is_empty());
     }
 }
 
