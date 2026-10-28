@@ -8,7 +8,8 @@
 # For the default .env.example and for an https/no-port .env, the rendered base config gives
 # each of those apps CHELABASE_ZITADEL_INTERNAL_URL = the gateway's own Zitadel upstream (an
 # http:// service name, not a gateway alias), no CHELABASE_ZITADEL_JWKS_URL (which would win),
-# a network shared with Zitadel, and the public scheme and auth host the issuer comes from.
+# a network shared with Zitadel, and the public scheme and auth host the issuer comes from. The
+# workbench render (base + overlay) gives no app the in-network URL.
 #
 #   scripts/tests/compose-zitadel-internal.sh
 set -euo pipefail
@@ -84,6 +85,20 @@ CHELABASE_PUBLIC_SECURE=true
 CHELABASE_ZITADEL_TLS_MODE=external
 EOF
 check "https, no port" "$tmp/https.env" https auth.example.com
+
+# The workbench (base + overlay) replaces every app's environment with its own env files
+# (stack.env, rendered from the uncommented lines of .env.example): it doesn't get the base
+# file's in-network URL, so its apps keep calling Zitadel at the issuer (through the gateway)
+# and fetch keys at its CHELABASE_ZITADEL_JWKS_URL, as before #24.
+wb="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-zitadel-internal-wb \
+  --project-directory "$dir" -f "$dir/docker-compose.yml" -f "$dir/docker-compose.workbench.yml" \
+  --env-file "$root/scripts/tests/fixtures/workbench-stack.env" --profile sites --profile runner \
+  config --format json)" || err "workbench: rendering base + overlay failed"
+leak="$(jq -r '.services | to_entries[] | select(.value.environment.CHELABASE_ZITADEL_INTERNAL_URL != null) | .key' <<<"${wb:-"{}"}")"
+[[ -z "$leak" ]] || err "workbench: these services get CHELABASE_ZITADEL_INTERNAL_URL: $leak"
+if grep -qE '^CHELABASE_ZITADEL_INTERNAL_URL=' "$dir/.env.example"; then
+  err ".env.example sets CHELABASE_ZITADEL_INTERNAL_URL uncommented: it would reach every workbench stack.env"
+fi
 
 if ((fail)); then
   exit 1

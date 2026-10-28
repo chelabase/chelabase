@@ -617,7 +617,9 @@ async fn fetch_and_write(
         );
     }
     let key = key.trim();
+    // Never a redirect (#26): the secret data key goes to the API host only.
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(timeout)
         .build()
         .context("an HTTP client")?;

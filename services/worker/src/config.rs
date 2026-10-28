@@ -455,7 +455,9 @@ pub fn build_with(
             config.compute_ca_dir.display()
         )
     })?);
+    // Never a redirect (#26): compute_ctl's JWT goes to the compute only.
     let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
         .context("building the compute_ctl HTTP client")?;

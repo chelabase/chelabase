@@ -429,3 +429,100 @@ async fn a_zitadel_token_without_iss_aud_or_exp_is_refused() {
         assert_invalid_token_containing(verifier.verify(&mock.sign_exact(c)).await, needle);
     }
 }
+
+// m13 audit B1: `iss` is one string (RFC 7519 4.1.1). jsonwebtoken's issuer check also takes a
+// JSON array and passes it when any entry matches; a token naming the issuer among others, or
+// as a one-entry list, isn't from the issuer and is refused.
+#[tokio::test]
+async fn an_iss_list_is_refused_even_when_it_holds_the_issuer() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    for iss in [
+        json!([mock.issuer(), "https://evil.example.com"]),
+        json!(["https://evil.example.com", mock.issuer()]),
+        json!([mock.issuer()]),
+        json!([mock.issuer(), mock.issuer()]),
+        json!([]),
+    ] {
+        let token = mock.sign(json!({
+            "sub": "user-1",
+            "iss": iss,
+            "exp": now() + 300,
+            chelabase_auth::CLAIM_ORG_ID: "org-1",
+        }));
+        assert_invalid_token_containing(verifier.verify(&token).await, "InvalidIssuer");
+    }
+}
+
+// m13 audit B1, the audience side (#22): `aud` may be a string or a list (RFC 7519 4.1.3;
+// Zitadel's tokens name the project and the client). A list passes when one entry is one of our
+// audiences, whatever else it names; a list naming none of them, an empty list, or a non-string
+// `aud` is refused. Non-string entries in a list never match.
+#[tokio::test]
+async fn an_aud_list_passes_only_when_it_names_one_of_our_audiences() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec!["our-project".into(), "our-client".into()]));
+    let token = |aud: serde_json::Value| {
+        mock.sign_exact(json!({
+            "sub": "user-1",
+            "iss": mock.issuer(),
+            "aud": aud,
+            "exp": now() + 300,
+            chelabase_auth::CLAIM_ORG_ID: "org-1",
+        }))
+    };
+    for aud in [
+        json!("our-project"),
+        json!(["our-client"]),
+        json!(["someone-else", "our-project"]),
+        json!(["our-project", "our-client", "another-app"]),
+    ] {
+        verifier.verify(&token(aud.clone())).await.unwrap_or_else(|e| panic!("{aud}: {e:?}"));
+    }
+    for (aud, needle) in [
+        (json!(["someone-else", "another-app"]), "does not match"),
+        (json!("someone-else"), "does not match"),
+        (json!(["Our-Project"]), "does not match"),
+        (json!([]), "names no audience"),
+        (json!(""), "names no audience"),
+        (json!([""]), "names no audience"),
+        (json!(42), "names no audience"),
+        (json!({"aud": "our-project"}), "names no audience"),
+        (json!([42, null, {"x": "our-project"}]), "names no audience"),
+    ] {
+        assert_invalid_token_containing(verifier.verify(&token(aud.clone())).await, needle);
+    }
+}
+
+// #26: the key fetch never follows a redirect. A 3xx to a server with valid keys (here the
+// mock's own, so a followed redirect would verify) is a failed fetch: every token is refused.
+#[tokio::test]
+async fn a_redirecting_jwks_url_passes_no_token() {
+    use axum::{http::header::LOCATION, http::StatusCode, response::IntoResponse, routing::get, Router};
+    let mock = MockJwks::start().await;
+    let token = mock.token_for_org("user-1", "org-1", 300);
+    for status in [301u16, 302, 303, 307, 308] {
+        let target = mock.jwks_url().to_string();
+        let app = Router::new().route(
+            "/oauth/v2/keys",
+            get(move || {
+                let target = target.clone();
+                async move { (StatusCode::from_u16(status).unwrap(), [(LOCATION, target)]).into_response() }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for host in [None, Some("auth.example.com".to_string())] {
+            let mut config = mock.config(vec![]);
+            config.jwks_url = format!("http://{addr}/oauth/v2/keys");
+            config.jwks_host = host.clone();
+            let verifier = JwtVerifier::new(config);
+            let err = verifier.verify(&token).await.unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{status} host {host:?}: got {err:?}");
+            // Nothing was cached: the next try fails the same way.
+            let err = verifier.verify(&token).await.unwrap_err();
+            assert!(matches!(err, AuthError::Jwks(_)), "{status} host {host:?}, again: got {err:?}");
+        }
+    }
+}

@@ -173,8 +173,12 @@ fn error_text(body: Option<&Value>) -> String {
 impl Zitadel {
     pub fn new(base: &str, token: &str) -> Self {
         Self {
+            // #26: never a redirect. Zitadel answers its REST calls directly; a 3xx (a
+            // misconfigured or compromised upstream) fails the call instead of sending the
+            // token's request, with the forced Host, somewhere else.
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             base: base.trim_end_matches('/').to_string(),
@@ -213,6 +217,11 @@ impl Zitadel {
             .map_err(|e| ZError::Unavailable(e.to_string()))?;
         if status.is_server_error() {
             return Err(ZError::Unavailable(format!("{status}")));
+        }
+        // #26: a 3xx (never followed) is a failed call, not an answer: its body may be empty,
+        // which would otherwise read as success.
+        if !status.is_success() && !status.is_client_error() {
+            return Err(ZError::Unavailable(format!("{status}: Zitadel answered with no result (redirects are not followed)")));
         }
         // A proxy may answer a 4xx with HTML; the status alone is still a rejection.
         let parsed = if text.trim().is_empty() {

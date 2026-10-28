@@ -86,10 +86,13 @@ impl HttpZitadel {
     /// public auth host: no gateway is needed, so the bootstrap runs before it.
     pub fn via_upstream(upstream_url: &str, auth_host: &str, pat: &str) -> Self {
         Self {
+            // Never a redirect (#26): the admin PAT and the forced Host go to the upstream only.
+            // A 3xx is an answer, not "not ready": the step fails at once, naming it.
             http: reqwest::Client::builder()
                 .timeout(CALL_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .expect("the bootstrap's HTTP client builds"),
             base: upstream_url.trim_end_matches('/').to_string(),
             host: Some(auth_host.to_string()),
             pat: pat.to_string(),
@@ -109,6 +112,15 @@ impl HttpZitadel {
             .await
             .map_err(|e| ApiError::new(what, None, transport(&e)))?;
         let status = response.status().as_u16();
+        if response.status().is_redirection() {
+            let to = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|l| l.to_str().ok())
+                .unwrap_or("nowhere")
+                .to_string();
+            return Ok((status, format!("a redirect to {to}, not followed")));
+        }
         let text = response.text().await.unwrap_or_default();
         Ok((status, text))
     }
@@ -253,5 +265,58 @@ mod upstream_tests {
                 "{status}"
             );
         }
+    }
+
+    /// A server answering every request with `head` (no body), counting its connections.
+    async fn serve_all(head: String) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let head = head.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let _ = sock.read(&mut buf).await;
+                    let _ = sock.write_all(head.as_bytes()).await;
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    // #26 (m13 follow-up): the bootstrap carries the admin PAT and the forced Host, so it never
+    // follows a redirect. A 3xx is an answer, not "Zitadel isn't up": the step fails at once,
+    // named, and the redirect's target (another origin with a working answer) is never asked.
+    #[tokio::test]
+    async fn a_redirect_is_never_followed_and_fails_the_step() {
+        let ok = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let (target, target_hits) = serve_all(ok.to_string()).await;
+        for status in ["301 Moved Permanently", "302 Found", "303 See Other", "307 Temporary Redirect", "308 Permanent Redirect"] {
+            let head = format!(
+                "HTTP/1.1 {status}\r\nlocation: {target}/v2/users\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            let (upstream, _) = serve_all(head).await;
+            let z = HttpZitadel::via_upstream(&upstream, "auth.example.com", "the-admin-pat");
+            let code: u16 = status[..3].parse().unwrap();
+            for err in [
+                z.rest(Method::POST, "/v2/users", serde_json::json!({})).await.unwrap_err(),
+                z.connect("zitadel.org.v2.OrganizationService", "ListOrganizations", serde_json::json!({}))
+                    .await
+                    .unwrap_err(),
+            ] {
+                let api = api_error(&err).unwrap_or_else(|| panic!("{status}: not an ApiError: {err:#}"));
+                assert_eq!(api.status, Some(code), "{status}: {api}");
+                assert!(!api.unavailable(), "{status}: a redirect would be waited on as not ready");
+                assert!(!api.what.is_empty(), "{status}: the error names no call");
+            }
+            let ready = z.ready().await.unwrap_err();
+            assert_eq!(ready.status, Some(code), "{status}: {ready}");
+            // wait_for_zitadel waits only on unavailable() or a 404.
+            assert!(!ready.unavailable() && ready.status != Some(404), "{status}: readiness would wait on it");
+        }
+        assert_eq!(target_hits.load(std::sync::atomic::Ordering::SeqCst), 0, "the redirect's target was asked");
     }
 }
