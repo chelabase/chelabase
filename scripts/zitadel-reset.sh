@@ -8,12 +8,15 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="${CHELABASE_COMPOSE_PROJECT:?run through: just zitadel-reset}"
 STACK_DIR="${CHELABASE_STACK_DIR:?run through: just zitadel-reset}"
 ZDIR="${CHELABASE_ZITADEL_DIR:?run through: just zitadel-reset}"
+# The base file and the workbench overlay, as every workbench compose call passes them.
 COMPOSE_FILE="${COMPOSE_FILE:-$ROOT/infra/compose/docker-compose.yml}"
+COMPOSE_OVERLAY="${COMPOSE_OVERLAY:-$ROOT/infra/compose/docker-compose.workbench.yml}"
 # The entry values Compose interpolates (Zitadel's external domain, port, TLS mode): the stack's
 # env already holds them, entry.sh derives any that are missing.
 # shellcheck source=lib/entry.sh
 . "$ROOT/scripts/lib/entry.sh"
-compose=(docker compose -p "$CHELABASE_COMPOSE_PROJECT" -f "$COMPOSE_FILE" --env-file "$STACK_DIR/env/stack.env")
+compose=(docker compose -p "$CHELABASE_COMPOSE_PROJECT" -f "$COMPOSE_FILE" -f "$COMPOSE_OVERLAY" \
+  --env-file "$STACK_DIR/env/stack.env")
 
 echo "[zitadel-reset] stopping Zitadel services and removing ${PROJECT}_zitadel_pg_data…"
 "${compose[@]}" stop zitadel zitadel-db >/dev/null 2>&1 || true

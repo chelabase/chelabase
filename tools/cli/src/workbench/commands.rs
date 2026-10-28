@@ -84,6 +84,12 @@ const REAP_GRACE: u64 = 15 * 60;
 const PROXY_PG_PORT_INSIDE: &str = "4432";
 const PROXY_HTTP_PORT_INSIDE: &str = "4444";
 
+/// The base compose file, relative to a checkout.
+pub(crate) const COMPOSE_FILE: &str = "infra/compose/docker-compose.yml";
+/// The workbench overlay (the dev loop's images, commands, mounts, ports and dev-only services),
+/// applied on top of [`COMPOSE_FILE`] by every workbench compose call.
+pub(crate) const OVERLAY_FILE: &str = "infra/compose/docker-compose.workbench.yml";
+
 /// One stack, as seen from the checkout that runs the command.
 #[derive(Debug, Clone)]
 pub struct Stack {
@@ -97,7 +103,11 @@ pub struct Stack {
     pub stacks_dir: PathBuf,
     /// `<stacks_dir>/<slug>`.
     pub state: PathBuf,
+    /// The base compose file (`infra/compose/docker-compose.yml`).
     pub compose_file: PathBuf,
+    /// The workbench overlay on it (`infra/compose/docker-compose.workbench.yml`): every compose
+    /// call passes both, base first.
+    pub overlay_file: PathBuf,
     pub env_file: PathBuf,
 }
 
@@ -110,17 +120,18 @@ impl Stack {
             project: project_name(slug),
             checkout: checkout.to_path_buf(),
             main: main.to_path_buf(),
-            compose_file: checkout.join("infra/compose/docker-compose.yml"),
+            compose_file: checkout.join(COMPOSE_FILE),
+            overlay_file: checkout.join(OVERLAY_FILE),
             env_file: state.join("env/stack.env"),
             stacks_dir,
             state,
         }
     }
 
-    fn compose(&self) -> Compose<'_> {
+    pub(crate) fn compose(&self) -> Compose<'_> {
         Compose {
             project: &self.project,
-            file: &self.compose_file,
+            files: vec![&self.compose_file, &self.overlay_file],
             env_file: &self.env_file,
         }
     }
@@ -236,9 +247,10 @@ fn chosen_stack(here: &Stack, slug: Option<&str>) -> anyhow::Result<(Stack, Opti
         );
     };
     let mut stack = Stack::new(&slug, &entry.checkout, &here.main);
-    if !stack.compose_file.is_file() {
-        // The stack's checkout is gone: the compose file is the same everywhere.
+    if !stack.compose_file.is_file() || !stack.overlay_file.is_file() {
+        // The stack's checkout is gone: the compose files are the same everywhere.
         stack.compose_file = here.compose_file.clone();
+        stack.overlay_file = here.overlay_file.clone();
     }
     Ok((stack, Some(entry)))
 }
@@ -2050,8 +2062,13 @@ mod tests {
         );
         assert_eq!(names(&[]), Vec::<PathBuf>::new());
 
-        // The table matches the compose file: every service listing a PAT secret, and only those.
-        let compose = include_str!("../../../../infra/compose/docker-compose.yml");
+        // The table matches the compose files (the base and the workbench overlay): every service
+        // listing a PAT secret, and only those.
+        let compose = concat!(
+            include_str!("../../../../infra/compose/docker-compose.yml"),
+            "\n",
+            include_str!("../../../../infra/compose/docker-compose.workbench.yml")
+        );
         let mut mounted: Vec<(String, &str)> = Vec::new();
         let mut service = None;
         let mut in_services = false;

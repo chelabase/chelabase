@@ -12,7 +12,8 @@ fail() {
   exit 1
 }
 config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
-  -f "$root/infra/compose/docker-compose.yml" --env-file "$fixture" \
+  -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
+  --env-file "$fixture" \
   --profile sites --profile runner config --no-env-resolution --format json |
   jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" || fail "compose config failed"
 # (The rewrite lists each service's file secrets, which Docker binds read-only, among its volumes.)
