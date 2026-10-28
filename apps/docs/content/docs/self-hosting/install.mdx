@@ -85,7 +85,7 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_ZITADEL_TLS_MODE` | `disabled` | `disabled` for `http`, `external` for `https` |
 | `CHELABASE_HTTP_ADDR` | `127.0.0.1` | The host address the gateway is published on (`0.0.0.0` for every interface) |
 | `CHELABASE_HTTP_PORT` | `CHELABASE_PUBLIC_PORT` | The host port the gateway is published on |
-| `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `chelabase`, `latest` | Where the release images come from |
+| `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the release images come from. Each image is pinned by digest in the compose file; setting either variable replaces the pin (a tag alone is not verified against a digest) |
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
 | `CHELABASE_SMTP_*` | unset | Zitadel's email (below) |
 
