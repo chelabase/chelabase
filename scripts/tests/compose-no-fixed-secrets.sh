@@ -51,8 +51,11 @@ bad_env="$(jq -r '.services | to_entries[] | .key as $s | (.value.environment //
   | select((.value // "") | test("^/run/chelabase/") | not)
   | "\($s): \(.key)"' <<<"$json")"
 [[ -z "$bad_env" ]] || err "secret-named variables with a value (not a file):"$'\n'"$bad_env"
+# CHELABASE_PROXY_CA_FILE is no file a service reads: it is the name the connection details
+# give the proxy's public CA certificate on the client (sslrootcert=), so it is exempt.
 bad_file="$(jq -r '.services | to_entries[] | .key as $s | (.value.environment // {}) | to_entries[]
-  | select(.key | endswith("_FILE")) | select((.value // "") | test("^/run/chelabase/|^$") | not)
+  | select(.key | endswith("_FILE")) | select(.key != "CHELABASE_PROXY_CA_FILE")
+  | select((.value // "") | test("^/run/chelabase/|^$") | not)
   | "\($s): \(.key)=\(.value)"' <<<"$json")"
 [[ -z "$bad_file" ]] || err "*_FILE variables outside /run/chelabase/:"$'\n'"$bad_file"
 urls="$(jq -r '.services | to_entries[] | .key as $s

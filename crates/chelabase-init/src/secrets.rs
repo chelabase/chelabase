@@ -1275,10 +1275,7 @@ mod tests {
             others,
             [
                 "bootstrap",
-                "bootstrap/api-client-id",
-                "bootstrap/org-id",
-                "bootstrap/project-id",
-                "bootstrap/studio-client-id",
+                "bootstrap/ids",
                 "zitadel-config/database.yaml",
                 "zitadel-pats",
                 "zitadel-pats/admin.pat",

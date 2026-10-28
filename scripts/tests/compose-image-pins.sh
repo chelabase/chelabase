@@ -7,7 +7,7 @@
 #
 #   scripts/tests/compose-image-pins.sh [digests-file]
 #
-# Not in `just check` until the pins exist (m11 phase 2 adds it with them).
+# Part of `just check` (offline, with no digests file).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
