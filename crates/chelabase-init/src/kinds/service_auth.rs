@@ -5,13 +5,17 @@
 //! and are written 0600 into the stack's state dir. NATS and Valkey mount them read-only.
 
 use anyhow::{Context, Result};
-use chelabase_neon::jwt::{PUBLIC_PEM_FILE, StorageScope};
+#[cfg(any(test, feature = "test-support"))]
+use chelabase_neon::jwt::PUBLIC_PEM_FILE;
+use chelabase_neon::jwt::StorageScope;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::fsx::{Dir, Kind, Perm};
-use crate::kinds::stack_secrets::{NATS_USERS, VALKEY_USERS, create_private_dir, read_text};
+use crate::kinds::stack_secrets::{NATS_USERS, create_private_dir};
+#[cfg(any(test, feature = "test-support"))]
+use crate::kinds::stack_secrets::{VALKEY_USERS, read_text};
 
 /// bcrypt cost of the NATS password hashes (nats-server checks one on every connect).
 const BCRYPT_COST: u32 = 10;
@@ -224,6 +228,7 @@ fn password<'a>(passwords: &'a BTreeMap<String, String>, user: &str) -> Result<&
     Ok(pw)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// The NATS `authorization` block (included by `infra/compose/nats/nats.conf`): one user per
 /// service with a bcrypt hash of its password and its permissions. No anonymous user.
 /// (`up` renders through [`write_auth_files`], which keeps still-valid hashes.)
@@ -335,6 +340,7 @@ pub struct AuthFilesChanged {
     pub valkey: bool,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Writes `<state>/nats/auth.conf` and `<state>/valkey/users.acl` (0600) from the secret files
 /// under `keys`. A file whose contents don't change is left alone; one whose owner or mode isn't
 /// the writer's 0600 is refused.
@@ -378,6 +384,7 @@ pub const STORAGE_TOKENS: [(StorageScope, &str); 4] = [
     (StorageScope::Admin, "storcon-admin.jwt"),
 ];
 
+#[cfg(any(test, feature = "test-support"))]
 /// From the existing compute-JWT key pair in `<keys>/neon` (never created or rewritten here):
 /// its public key as SPKI PEM (`compute-jwt.pub.pem`, which the pageserver, safekeepers and
 /// storage controller verify with) and the scoped storage tokens (0600, no expiry; Ed25519 is
@@ -410,6 +417,7 @@ pub fn write_storage_auth(keys: &Path) -> Result<()> {
 /// The runner's metrics token under `<keys>/neon/storage-tokens/` (scope `metrics`, S17).
 pub const METRICS_TOKEN_FILE: &str = "metrics.token";
 
+#[cfg(any(test, feature = "test-support"))]
 fn unix_now() -> Result<u64> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -421,6 +429,7 @@ fn unix_now() -> Result<u64> {
 /// kept one (rotation; `chelabase neon mint-metrics-token`). It needs the existing compute-JWT
 /// key pair and never creates one. Returns the file it wrote (0600).
 // The CLI goes through `mint_metrics_token_in` (CHELABASE_NEON_DIR); this keys-dir form is the pinned API.
+#[cfg(any(test, feature = "test-support"))]
 pub fn mint_metrics_token(keys: &Path, now: u64) -> Result<PathBuf> {
     mint_metrics_token_in(&keys.join("neon"), now)
 }
@@ -436,6 +445,7 @@ pub fn mint_metrics_token_in(neon: &Path, now: u64) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Writes `contents` to `path` (0600) through a temporary file and a rename, so a reader never
 /// sees half a file; unchanged contents are not rewritten. An existing file whose owner or mode
 /// isn't the writer's 0600 is refused, never silently tightened (`chelabase-init`'s rule). True
@@ -444,12 +454,14 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<bool> {
     write_with_mode(path, contents, 0o600, Existing::Check)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn write_public(path: &Path, contents: &[u8]) -> Result<bool> {
     write_with_mode(path, contents, 0o644, Existing::Check)
 }
 
 /// What an existing file's owner and mode must be before it is rewritten.
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(test, feature = "test-support")), allow(dead_code))]
 enum Existing {
     /// Exactly the writer's and `mode`: anything else is refused.
     Check,
@@ -489,7 +501,8 @@ fn open_parent(path: &Path) -> Result<(Dir, &str)> {
         .file_name()
         .and_then(|n| n.to_str())
         .with_context(|| format!("{} has no file name", path.display()))?;
-    Ok((Dir::open_root(parent)?, name))
+    // These dirs may predate the check (made under the user's umask): group write is accepted.
+    Ok((Dir::open_root(parent, true)?, name))
 }
 
 fn write_with_mode(path: &Path, contents: &[u8], mode: u32, existing: Existing) -> Result<bool> {

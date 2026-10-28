@@ -41,11 +41,17 @@
 //! - A missing file is created; an existing one is never rewritten. Derived files are rendered
 //!   from the existing source files and rewritten only when that rendering differs.
 //! - Every existing entry is checked before anything is written: an empty or unreadable file,
-//!   a symlink anywhere in the layout, half a key pair, or an owner or mode other than the
-//!   ownership map's fails the run, naming the file, and nothing is changed.
+//!   a blank value, a key, certificate or setup code that doesn't parse, a symlink anywhere in
+//!   the layout, half a key pair, or an owner or mode other than the ownership map's fails the
+//!   run, naming the file. A run the check refuses writes nothing. A run that passes it can still
+//!   fail while writing (an I/O error); the files written so far stay, and a rerun completes
+//!   them. The setup code is the last file written, and a code that was written is printed even
+//!   if the run then fails.
+//! - Each root must belong to the writer (or root) and not be writable by group or others (the
+//!   workbench accepts group write on its umask-made dirs, never world write).
 //! - Owners and modes come from [`LAYOUT`]'s `spec` column ([`OwnershipMap`] for overrides). A
-//!   directory is 0750 with a consumer group when files below it are readable by one group,
-//!   else 0700.
+//!   directory is 0750 with a consumer group when the files below it in the same physical root
+//!   (both parts, self-hosted) are readable by one group, else 0700.
 //! - Runs on the same root are serialised by a lock file (`.chelabase-init.lock`).
 //! - Nothing here prints or logs a secret: the report carries file paths and the setup code only.
 
@@ -389,12 +395,20 @@ pub struct Report {
 
 /// Creates what is missing under `dir` (see the module doc).
 pub fn ensure_secrets(dir: &Path, opts: &InitSecrets) -> Result<Report> {
-    let machine = Dir::open_root(dir)?;
+    let mut report = Report::default();
+    ensure_secrets_into(dir, opts, &mut report)?;
+    Ok(report)
+}
+
+/// [`ensure_secrets`], filling `report` as it goes, so a caller still sees what a failed run
+/// wrote (a setup code above all).
+pub fn ensure_secrets_into(dir: &Path, opts: &InitSecrets, report: &mut Report) -> Result<()> {
+    let machine = Dir::open_root(dir, opts.legacy_modes)?;
     let machine_path = dir
         .canonicalize()
         .with_context(|| format!("resolving {}", dir.display()))?;
     let install_given = opts.install_dir.as_deref().unwrap_or(dir);
-    let install = Dir::open_root(install_given)?;
+    let install = Dir::open_root(install_given, opts.legacy_modes)?;
     let install_path = install_given
         .canonicalize()
         .with_context(|| format!("resolving {}", install_given.display()))?;
@@ -409,18 +423,21 @@ pub fn ensure_secrets(dir: &Path, opts: &InitSecrets) -> Result<Report> {
         opts,
         roots: [(machine, machine_path), (install, install_path)],
         have: BTreeMap::new(),
-        report: Report::default(),
+        report,
     };
+    // Every check, contents included, comes before the first write; the setup code is the
+    // last write.
     run.check()?;
     run.create_sources()?;
     run.client_pairs()?;
     run.derive()?;
-    Ok(run.report)
+    run.setup_code()
 }
 
 /// The setup code stored under `dir` (the install root).
 pub fn read_setup_code(dir: &Path) -> Result<SetupCode> {
-    let root = Dir::open_root(dir)?;
+    // Reading only: a group-writable (umask-made) root is accepted, a world-writable one isn't.
+    let root = Dir::open_root(dir, true)?;
     let setup = root.open_dir("setup")?;
     let bytes = setup.read("setup.code")?;
     let code = String::from_utf8(bytes).ok().map(|s| s.trim().to_string());
@@ -430,6 +447,68 @@ pub fn read_setup_code(dir: &Path) -> Result<SetupCode> {
             "{} does not hold a setup code",
             setup.child("setup.code").display()
         ),
+    }
+}
+
+/// Whether an existing file's contents can be used: a blank value, a key that doesn't parse or
+/// a corrupt setup code is refused (by `check`, before anything is written).
+fn check_content(entry: &Entry, bytes: &[u8]) -> std::result::Result<(), String> {
+    let text = || std::str::from_utf8(bytes).map_err(|_| "not UTF-8 text".to_string());
+    let blank = |t: &str| {
+        if t.trim().is_empty() {
+            Err("blank (only whitespace)".to_string())
+        } else {
+            Ok(())
+        }
+    };
+    match entry.make {
+        Gen::Raw32 if bytes.len() == 32 => Ok(()),
+        Gen::Raw32 => Err(format!("holds {} bytes, not 32", bytes.len())),
+        Gen::SecretKey => chelabase_secrets::SecretKey::from_base64(text()?)
+            .map(|_| ())
+            .map_err(|_| "not a base64 32-byte key".to_string()),
+        Gen::SetupCode if is_setup_code(text()?.trim()) => Ok(()),
+        Gen::SetupCode => Err("not a setup code (XXXX-XXXX-XXXX-XXXX-XXXX)".to_string()),
+        Gen::Text32 | Gen::Password { .. } | Gen::Alnum { .. } | Gen::Steps => blank(text()?),
+        Gen::Pair {
+            pair: Pair::Internal | Pair::AppJwt,
+            private,
+        } => {
+            let ok = if private {
+                chelabase_auth::internal::InternalSigner::from_pem(bytes).is_ok()
+            } else {
+                chelabase_auth::internal::InternalVerifier::from_pem(bytes).is_ok()
+            };
+            if ok {
+                Ok(())
+            } else {
+                Err("not a usable Ed25519 PEM key".to_string())
+            }
+        }
+        // Parsed together, in `check_pair`.
+        Gen::Pair { .. } => blank(text()?),
+        // Kept as it is: it carries the clock.
+        Gen::Derived(Derived::MetricsToken) => blank(text()?),
+        // Re-rendered from their sources whatever they hold.
+        Gen::Derived(_) => Ok(()),
+    }
+}
+
+/// Whether a pair whose halves parse each on its own also loads as one.
+fn check_pair(pair: Pair, private: &[u8], public: &[u8]) -> std::result::Result<(), String> {
+    let (k, p) = (
+        String::from_utf8_lossy(private),
+        String::from_utf8_lossy(public),
+    );
+    let ok = match pair {
+        Pair::Internal | Pair::AppJwt => true,
+        Pair::ComputeJwt => chelabase_neon::ComputeSigner::new(&k, &p).is_ok(),
+        Pair::ComputeCa => chelabase_neon::compute_tls::ComputeCa::from_pem(&p, &k).is_ok(),
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err("not a usable key pair".to_string())
     }
 }
 
@@ -471,7 +550,7 @@ struct Run<'a> {
     roots: [(Dir, PathBuf); 2],
     /// The bytes of every layout file that exists (read in the check, or written by this run).
     have: BTreeMap<&'static str, Vec<u8>>,
-    report: Report,
+    report: &'a mut Report,
 }
 
 fn part_index(part: Part) -> usize {
@@ -519,14 +598,21 @@ impl Run<'_> {
         self.opts.owners.spec(rel).resolve()
     }
 
-    /// A directory's owner and mode, from the files below it: 0750 with their group when the
-    /// group-readable ones share one, else 0700.
+    /// Whether both parts live in one directory (self-hosted).
+    fn one_root(&self) -> bool {
+        self.roots[0].1 == self.roots[1].1
+    }
+
+    /// A directory's owner and mode, from every layout file below it in the same physical root
+    /// (both parts when they share one): 0750 with their group when the group-readable ones
+    /// share one, else 0700.
     fn dir_perm(&self, part: Part, rel: &str) -> Perm {
         let (wuid, wgid) = crate::fsx::writer();
         let prefix = format!("{rel}/");
+        let one_root = self.one_root();
         let files: Vec<Perm> = LAYOUT
             .iter()
-            .filter(|e| e.part == part && e.path.starts_with(&prefix))
+            .filter(|e| (e.part == part || one_root) && e.path.starts_with(&prefix))
             .map(|e| self.perm(e.path))
             .collect();
         let shared = |f: fn(&Perm) -> u32, own: u32| {
@@ -623,10 +709,21 @@ impl Run<'_> {
         let describe = |path: &Path, what: &str, want: Perm, found: Perm| {
             format!("{}: {what}; expected {want}, found {found}", path.display())
         };
+        // Each physical directory once: with one root, the install part's dirs are the
+        // machine part's too.
+        let one_root = self.one_root();
         for part in [Part::Machine, Part::Install] {
+            if part == Part::Install && one_root {
+                continue;
+            }
             let mut dirs = layout_dirs(part);
             if part == Part::Machine {
+                if one_root {
+                    dirs.extend(layout_dirs(Part::Install));
+                }
                 dirs.extend(CLIENT_PAIRS.iter().map(|(d, _)| d.to_string()));
+                dirs.sort_by_key(|d| (d.matches('/').count(), d.clone()));
+                dirs.dedup();
             }
             for rel in dirs {
                 let path = self.abs(part, &rel);
@@ -713,6 +810,10 @@ impl Run<'_> {
             }
             match parent.read(name) {
                 Ok(bytes) if !bytes.is_empty() => {
+                    if let Err(what) = check_content(entry, &bytes) {
+                        problems.push(format!("{}: {what}", path.display()));
+                        continue;
+                    }
                     self.have.insert(entry.path, bytes);
                 }
                 Ok(_) => problems.push(describe(&path, "empty", want, st.perm)),
@@ -745,6 +846,15 @@ impl Run<'_> {
             Pair::ComputeCa,
         ] {
             let (private, public) = pair_paths(pair);
+            if let (Some(k), Some(p)) = (self.have.get(private), self.have.get(public))
+                && let Err(what) = check_pair(pair, k, p)
+            {
+                problems.push(format!(
+                    "{} / {}: {what}",
+                    self.abs(Part::Machine, private).display(),
+                    self.abs(Part::Machine, public).display()
+                ));
+            }
             if self.have.contains_key(private) != self.have.contains_key(public) {
                 let path = self.abs(Part::Machine, private);
                 problems.push(format!(
@@ -802,12 +912,8 @@ impl Run<'_> {
                     crate::random::from_alphabet(crate::random::ALPHANUMERIC, len).into_bytes()
                 }
                 Gen::Steps => render_steps().into_bytes(),
-                Gen::SetupCode => {
-                    let code = new_setup_code();
-                    self.put_new(entry, code.as_str().as_bytes().to_vec())?;
-                    self.report.setup_code = Some(code);
-                    continue;
-                }
+                // Written last, by `setup_code`.
+                Gen::SetupCode => continue,
                 Gen::Pair {
                     pair,
                     private: true,
@@ -820,6 +926,19 @@ impl Run<'_> {
             };
             self.put_new(entry, bytes)?;
         }
+        Ok(())
+    }
+
+    /// The setup code, when missing: the run's last write, so no later step can fail and leave a
+    /// code that was never shown.
+    fn setup_code(&mut self) -> Result<()> {
+        let entry = Self::entry("setup/setup.code");
+        if self.have.contains_key(entry.path) {
+            return Ok(());
+        }
+        let code = new_setup_code();
+        self.put_new(entry, code.as_str().as_bytes().to_vec())?;
+        self.report.setup_code = Some(code);
         Ok(())
     }
 
@@ -985,6 +1104,15 @@ mod tests {
         InitSecrets::self_hosted(OwnershipMap::default().with_all(Id::Writer, Id::Writer))
     }
 
+    /// A temporary dir that is the writer's alone (tempfile follows the umask, which may give
+    /// the group write; such a root is refused).
+    fn tmp() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        t
+    }
+
     fn me() -> (u32, u32) {
         crate::fsx::writer()
     }
@@ -1061,7 +1189,7 @@ mod tests {
 
     #[test]
     fn creates_full_layout() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let o = opts();
         let report = ensure_secrets(t.path(), &o).unwrap();
         for file in compose_secret_files() {
@@ -1117,12 +1245,12 @@ mod tests {
         let code = report.setup_code.expect("created on this run");
         assert_eq!(read("setup/setup.code"), code.as_str());
         assert!(report.auth_files.nats && report.auth_files.valkey);
-        assert!(!t.path().join("nats/auth.conf").read_link().is_ok());
+        assert!(t.path().join("nats/auth.conf").read_link().is_err());
     }
 
     #[test]
     fn rerun_changes_nothing() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
         let before = snapshot(t.path());
         let again = ensure_secrets(t.path(), &opts()).unwrap();
@@ -1137,7 +1265,7 @@ mod tests {
 
     #[test]
     fn fills_only_missing() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
         let before = snapshot(t.path());
 
@@ -1192,7 +1320,7 @@ mod tests {
 
     #[test]
     fn refuses_empty_or_loose_file() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
         let (uid, gid) = me();
         type Spoil = Box<dyn Fn(&Path)>;
@@ -1256,7 +1384,7 @@ mod tests {
 
     #[test]
     fn ownership_map_applied() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let (uid, gid) = me();
         let owners = t.path().join("owners.json");
         std::fs::write(
@@ -1299,7 +1427,7 @@ mod tests {
         if crate::fsx::writer().0 == 0 {
             return; // root can give any owner
         }
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let root = t.path().join("root");
         let map = OwnershipMap::default().with_all(Id::Is(crate::fsx::writer().0 + 1), Id::Writer);
         let err = format!(
@@ -1320,9 +1448,9 @@ mod tests {
 
     #[test]
     fn refuses_symlinks() {
-        let elsewhere = tempfile::tempdir().unwrap();
+        let elsewhere = tmp();
         // A symlink in place of a file.
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         ensure_secrets(t.path(), &opts()).unwrap();
         let file = t.path().join("tokens/app-auth.token");
         std::fs::remove_file(&file).unwrap();
@@ -1339,8 +1467,8 @@ mod tests {
 
         // A symlink in place of a directory, on a fresh root.
         for dir in ["db", "neon", "orchestrator-tls", "setup"] {
-            let t = tempfile::tempdir().unwrap();
-            let target = tempfile::tempdir().unwrap();
+            let t = tmp();
+            let target = tmp();
             std::os::unix::fs::symlink(target.path(), t.path().join(dir)).unwrap();
             let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
             assert!(err.contains("symlink"), "{dir}: {err}");
@@ -1356,7 +1484,7 @@ mod tests {
         }
 
         // The root itself.
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let link = t.path().join("link");
         std::os::unix::fs::symlink(elsewhere.path(), &link).unwrap();
         assert!(ensure_secrets(&link, &opts()).is_err());
@@ -1365,7 +1493,7 @@ mod tests {
 
     #[test]
     fn setup_code_reprint() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let code = ensure_secrets(t.path(), &opts())
             .unwrap()
             .setup_code
@@ -1384,12 +1512,12 @@ mod tests {
             assert!(!SETUP_ALPHABET.contains(&(lookalike as u8)));
         }
         assert_eq!(format!("{code:?}"), "SetupCode(..)");
-        assert!(read_setup_code(tempfile::tempdir().unwrap().path()).is_err());
+        assert!(read_setup_code(tmp().path()).is_err());
     }
 
     #[test]
     fn workbench_stacks_get_own_setup_code() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let keys = t.path().join("keys");
         let (a, b) = (t.path().join("stacks/a"), t.path().join("stacks/b"));
         let ra = ensure_secrets(&keys, &InitSecrets::workbench(&a)).unwrap();
@@ -1423,7 +1551,7 @@ mod tests {
     #[test]
     fn workbench_accepts_its_umask_made_keys_dir() {
         // The shared keys dir from before: public files and dirs made under umask 002.
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let (keys, state) = (t.path().join("keys"), t.path().join("state"));
         ensure_secrets(&keys, &InitSecrets::workbench(&state)).unwrap();
         for p in ["auth", "gateway", "neon", "secrets"] {
@@ -1473,7 +1601,7 @@ mod tests {
     #[test]
     fn concurrent_runs_leave_one_set() {
         for _ in 0..3 {
-            let t = tempfile::tempdir().unwrap();
+            let t = tmp();
             let root = t.path().to_path_buf();
             let runs: Vec<_> = (0..2)
                 .map(|_| {
@@ -1518,7 +1646,7 @@ mod tests {
 
     #[test]
     fn setup_code_printed_once() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap();
         let code = read_setup_code(t.path()).unwrap();
@@ -1540,7 +1668,7 @@ mod tests {
 
     #[test]
     fn output_has_no_secrets() {
-        let t = tempfile::tempdir().unwrap();
+        let t = tmp();
         let (mut out, mut err) = (Vec::new(), Vec::new());
         crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap();
         std::fs::remove_file(t.path().join("valkey/proxy.password")).unwrap();
@@ -1581,5 +1709,215 @@ mod tests {
         for (path, v) in values {
             assert!(!text.contains(&v), "{} leaked: {text}", path.display());
         }
+    }
+
+    /// A supplementary group of the test user other than its own, if it has one.
+    fn other_group() -> Option<u32> {
+        let (_, egid) = me();
+        let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+        let mut groups = vec![0 as libc::gid_t; n.max(0) as usize];
+        let n = unsafe { libc::getgroups(n, groups.as_mut_ptr()) };
+        groups.truncate(n.max(0) as usize);
+        groups.into_iter().find(|g| *g != egid)
+    }
+
+    // Audit B1: self-hosted, `nats/` and `valkey/` hold both machine and install files in one
+    // root; an override that gives one of them a group must not break the next run.
+    #[test]
+    fn an_owners_override_survives_reruns() {
+        let (uid, gid) = me();
+        let mut overrides = vec![format!(
+            r#""nats/auth.conf": {{"gid": {gid}, "mode": "0640"}}"#
+        )];
+        if let Some(other) = other_group() {
+            overrides.push(format!(
+                r#""valkey/users.acl": {{"gid": {other}, "mode": "0640"}}"#
+            ));
+        }
+        for files in overrides {
+            let t = tmp();
+            let json =
+                format!(r#"{{"all": {{"uid": {uid}, "gid": {gid}}}, "files": {{{files}}}}}"#);
+            let map = OwnershipMap::from_override_json(&json).unwrap();
+            let root = t.path().join("root");
+            ensure_secrets(&root, &InitSecrets::self_hosted(map.clone())).unwrap();
+            let before = snapshot(&root);
+            let again = ensure_secrets(&root, &InitSecrets::self_hosted(map));
+            assert!(again.is_ok(), "{files}: {:#}", again.unwrap_err());
+            assert_eq!(snapshot(&root), before, "{files}");
+        }
+    }
+
+    /// A populated root with its setup code and one plain secret removed, so a run that wrote
+    /// anything would show it.
+    fn populated_with_two_missing() -> tempfile::TempDir {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        std::fs::remove_file(t.path().join("setup/setup.code")).unwrap();
+        std::fs::remove_file(t.path().join("db/storcon.password")).unwrap();
+        t
+    }
+
+    // Audit B2: a source whose content is unusable is refused in the check, naming the file,
+    // before anything (the setup code included) is written.
+    #[test]
+    fn an_unusable_source_refuses_and_writes_nothing() {
+        let cases: &[(&str, &[u8])] = &[
+            ("valkey/proxy.password", b"\n"),
+            ("nats/worker.password", b"  \n"),
+            ("db/metadata.password", b"\n"),
+            ("neon/compute-jwt.pem", b"garbage"),
+            ("neon/compute-jwt.pub", b"garbage\n"),
+            ("compute-ca/ca.crt", b"garbage"),
+            ("compute-ca/ca.key", b"garbage"),
+            ("gateway/internal-signing.pem", b"garbage"),
+            ("gateway/internal-verify.pem", b"garbage"),
+            ("auth/app-jwt.key", b"garbage"),
+            ("auth/app-jwt.pub", b"garbage"),
+            ("secrets/secrets.key", b"garbage"),
+            ("auth/cookie.key", b"garbage"),
+            ("realtime/ticket.key", b"short"),
+            ("zitadel/masterkey", b"\n"),
+            ("neon/storage-tokens/metrics.token", b"\n"),
+        ];
+        for (file, bad) in cases {
+            let t = populated_with_two_missing();
+            std::fs::write(t.path().join(file), bad).unwrap();
+            let before = snapshot(t.path());
+            let err = match ensure_secrets(t.path(), &opts()) {
+                Ok(_) => panic!("{file}: accepted"),
+                Err(e) => format!("{e:#}"),
+            };
+            assert!(
+                err.contains(&t.path().join(file).display().to_string()),
+                "{file}: {err}"
+            );
+            assert_eq!(
+                snapshot(t.path()),
+                before,
+                "{file}: the refused run wrote something"
+            );
+            assert!(!t.path().join("setup/setup.code").exists(), "{file}");
+            assert!(!t.path().join("db/storcon.password").exists(), "{file}");
+        }
+    }
+
+    // Audit B2: the setup code is the last file a run writes, so no later step can fail after it
+    // and leave a code nobody saw.
+    #[test]
+    fn the_setup_code_is_written_last() {
+        let t = tmp();
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(
+            r.created.last(),
+            Some(&t.path().join("setup/setup.code")),
+            "{r:?}"
+        );
+        let t = populated_with_two_missing();
+        std::fs::remove_file(t.path().join("nats/auth.conf")).unwrap();
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(
+            r.created.last(),
+            Some(&t.path().join("setup/setup.code")),
+            "{r:?}"
+        );
+    }
+
+    // Audit N1: a corrupt setup code is refused by the check, naming the file.
+    #[test]
+    fn a_corrupt_setup_code_is_refused() {
+        for bad in [
+            "hello",
+            "ABCD-EFGH-JKMN-PQRS-TUV0",
+            "ABCDEFGHJKMNPQRSTUVWXYZ2",
+        ] {
+            let t = tmp();
+            ensure_secrets(t.path(), &opts()).unwrap();
+            let path = t.path().join("setup/setup.code");
+            std::fs::write(&path, bad).unwrap();
+            let before = snapshot(t.path());
+            let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
+            assert!(err.contains(&path.display().to_string()), "{bad}: {err}");
+            assert_eq!(snapshot(t.path()), before);
+        }
+    }
+
+    // Audit S1: the root itself must be the writer's and not writable by others (group write
+    // only under the workbench's legacy modes).
+    #[test]
+    fn refuses_a_root_others_can_write() {
+        let set = |p: &Path, m: u32| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        let t = tmp();
+        let root = t.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        for m in [0o777, 0o770, 0o702] {
+            set(&root, m);
+            let err = format!("{:#}", ensure_secrets(&root, &opts()).unwrap_err());
+            assert!(
+                err.contains(&root.display().to_string()) && err.contains("writable"),
+                "{m:o}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_dir(&root).unwrap().count(),
+                0,
+                "{m:o}: nothing written"
+            );
+        }
+        // The workbench's umask-made roots are group-writable; never world-writable.
+        let state = t.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        set(&root, 0o775);
+        set(&state, 0o775);
+        ensure_secrets(&root, &InitSecrets::workbench(&state)).unwrap();
+        set(&state, 0o777);
+        assert!(ensure_secrets(&root, &InitSecrets::workbench(&state)).is_err());
+        set(&state, 0o775);
+        set(&root, 0o777);
+        assert!(ensure_secrets(&root, &InitSecrets::workbench(&state)).is_err());
+    }
+
+    // Audit S2: the per-kind generators `dev bootstrap` still runs (and the compatibility ones
+    // the CLI's tests use) make exactly the layout's files, with the same kinds.
+    #[test]
+    fn the_legacy_generators_match_the_layout() {
+        use crate::kinds::stack_secrets::{Kind as Legacy, SECRET_FILES};
+        for (file, kind) in SECRET_FILES {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == *file)
+                .unwrap_or_else(|| panic!("{file}"));
+            let want = match kind {
+                Legacy::Text => Gen::Text32,
+                Legacy::RawKey => Gen::Raw32,
+            };
+            assert_eq!(entry.make, want, "{file}");
+        }
+        let t = tmp();
+        let k = t.path();
+        crate::kinds::internal_keys::ensure(&k.join("gateway")).unwrap();
+        crate::kinds::secrets_key::ensure(&k.join("secrets")).unwrap();
+        crate::kinds::secrets_key::ensure_file(
+            &k.join("auth"),
+            crate::kinds::secrets_key::COOKIE_KEY_FILE,
+        )
+        .unwrap();
+        crate::kinds::app_keys::ensure(&k.join("auth")).unwrap();
+        crate::kinds::compute_jwt::ensure(&k.join("neon")).unwrap();
+        crate::kinds::compute_ca::ensure(&k.join("compute-ca")).unwrap();
+        crate::kinds::stack_secrets::ensure(k).unwrap();
+        crate::kinds::service_auth::write_storage_auth(k).unwrap();
+        crate::kinds::service_auth::write_auth_files(k, k).unwrap();
+        let made: std::collections::BTreeSet<String> = snapshot(k)
+            .into_keys()
+            .map(|p| p.display().to_string())
+            .collect();
+        let layout: std::collections::BTreeSet<String> = LAYOUT
+            .iter()
+            .filter(|e| e.part == Part::Machine || matches!(e.make, Gen::Derived(_)))
+            .map(|e| e.path.to_string())
+            .collect();
+        assert_eq!(made, layout);
     }
 }

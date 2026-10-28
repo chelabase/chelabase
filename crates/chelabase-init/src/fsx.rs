@@ -102,7 +102,9 @@ pub fn can_own(uid: u32, gid: u32) -> bool {
 impl Dir {
     /// Opens `path` as the root of a layout, creating it (and its missing parents) 0700 when it
     /// doesn't exist. `path` itself must not be a symlink; its parents are taken as they are.
-    pub fn open_root(path: &Path) -> Result<Dir> {
+    /// The root must belong to the writer (or root) and must not be writable by others; group
+    /// write is accepted only with `allow_group_write` (the workbench's umask-made dirs).
+    pub fn open_root(path: &Path, allow_group_write: bool) -> Result<Dir> {
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 bail!("refusing {}: it is a symlink", path.display())
@@ -134,11 +136,36 @@ impl Dir {
             }
             return Err(e).with_context(|| format!("opening {}", path.display()));
         }
-        Ok(Dir {
+        let dir = Dir {
             // SAFETY: `fd` is a fresh, owned descriptor.
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             path: path.to_path_buf(),
-        })
+        };
+        // Checked on the open descriptor: what is checked is what is used.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid fd and out-pointer.
+        if unsafe { libc::fstat(dir.fd.as_raw_fd(), &mut st) } != 0 {
+            return Err(last_os_error()).with_context(|| format!("reading {}", path.display()));
+        }
+        let (euid, _) = writer();
+        let forbidden = if allow_group_write { 0o002 } else { 0o022 };
+        let perm = Perm {
+            uid: st.st_uid,
+            gid: st.st_gid,
+            mode: st.st_mode & 0o7777,
+        };
+        if (perm.uid != euid && perm.uid != 0) || perm.mode & forbidden != 0 {
+            bail!(
+                "refusing {}: {perm}; it must belong to uid {euid} (or root) and not be writable by {}",
+                path.display(),
+                if allow_group_write {
+                    "others"
+                } else {
+                    "its group or others"
+                }
+            );
+        }
+        Ok(dir)
     }
 
     pub fn path(&self) -> &Path {
@@ -431,6 +458,15 @@ fn set_perm(fd: &OwnedFd, perm: Perm) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// A temporary dir that is the writer's alone (tempfile follows the umask, which may give
+    /// the group write; such a root is refused).
+    fn tmp() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let t = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        t
+    }
+
     fn me(mode: u32) -> Perm {
         let (uid, gid) = writer();
         Perm { uid, gid, mode }
@@ -438,8 +474,8 @@ mod tests {
 
     #[test]
     fn create_new_never_replaces_and_ignores_the_umask() {
-        let t = tempfile::tempdir().unwrap();
-        let d = Dir::open_root(t.path()).unwrap();
+        let t = tmp();
+        let d = Dir::open_root(t.path(), false).unwrap();
         assert!(d.create_new("a", b"one", me(0o640)).unwrap());
         assert!(!d.create_new("a", b"two", me(0o600)).unwrap());
         assert_eq!(d.read("a").unwrap(), b"one");
@@ -450,15 +486,15 @@ mod tests {
 
     #[test]
     fn symlinks_are_refused_not_followed() {
-        let t = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
+        let t = tmp();
+        let target = tmp();
         std::os::unix::fs::symlink(target.path(), t.path().join("sub")).unwrap();
         std::os::unix::fs::symlink(target.path().join("f"), t.path().join("f")).unwrap();
-        let d = Dir::open_root(t.path()).unwrap();
+        let d = Dir::open_root(t.path(), false).unwrap();
         assert!(d.open_dir("sub").is_err());
         assert!(d.read("f").is_err());
         assert!(!d.create_new("f", b"x", me(0o600)).unwrap());
         assert!(!target.path().join("f").exists());
-        assert!(Dir::open_root(&t.path().join("sub")).is_err());
+        assert!(Dir::open_root(&t.path().join("sub"), false).is_err());
     }
 }
