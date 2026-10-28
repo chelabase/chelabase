@@ -135,6 +135,4 @@ dev_hits="$(grep -nE 'chelabase-dev-[a-z]' "${scripts[@]}" | grep -v '^scripts/c
 [[ -z "$dev_hits" ]] || fail "scripts fall back to a public development bearer:
 $dev_hits"
 just --show check | gq 'scripts/tests/compose-secret-argv.sh' || fail "just check runs compose-secret-argv.sh"
-just --show rename-test | gq 'scripts/tests/rename-chelabase-isolation.sh' ||
-  fail "just rename-test runs rename-chelabase-isolation.sh"
 echo "workbench-recipes: ok"

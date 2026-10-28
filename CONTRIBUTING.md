@@ -169,7 +169,6 @@ Offline checks need no stack:
 - `just test`: Rust tests with nextest (one process per test), then doctests, which nextest doesn't run. Dev builds carry line tables only (no full debug info), which keeps test binaries small.
 - `just check`: the typechecks, generated-code freshness and TypeScript tests, plus the docs site.
 - `just neon-test`: the Neon build scripts, Compose services and neon scripts.
-- `just rename-test`: the old-name rename script.
 
 The live recipes run against your checkout's own stack: each is `just workbench run scripts/<name>.sh` in the stack's runner container, so they start (or update) the stack first and need no queue. Run them from the checkout you are working in, for example `just neon-e2e`; two checkouts can run theirs at the same time. Most scripts honour `KEEP=1`, which leaves the database in place.
 

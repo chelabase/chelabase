@@ -21,11 +21,6 @@ default:
 workbench *args:
     cargo run -q -p chelabase -- workbench "$@"
 
-# Offline tests for the old-name -> Chelabase rename script (scripts/rename-chelabase.sh)
-rename-test:
-    scripts/tests/rename-chelabase.sh
-    scripts/tests/rename-chelabase-isolation.sh
-
 # Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
 zitadel-bootstrap admin_email="":
     #!/usr/bin/env bash

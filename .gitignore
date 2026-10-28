@@ -30,8 +30,6 @@ apps/studio/.tanstack/
 
 # Local detached-dev state (just dev PIDs / logs)
 /.chelabase
-# Old state folder, parked until the rename's final cleanup (T10)
-/.cheladb
 # Local agent scratch
 /.superpowers/
 
