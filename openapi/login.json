@@ -1640,6 +1640,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The instance isn't set up yet (its org id isn't written): `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -2037,6 +2047,47 @@
           },
           "503": {
             "description": "Zitadel or the sign-up gate is unavailable: `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/v1/studio-config": {
+      "get": {
+        "tags": [
+          "login"
+        ],
+        "description": "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+        "operationId": "getStudioConfig",
+        "responses": {
+          "200": {
+            "description": "The config (`Cache-Control: public, max-age=60`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StudioConfig"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The bootstrap hasn't written the ids yet: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2827,6 +2878,44 @@
           },
           "redirect": {
             "type": "string"
+          }
+        }
+      },
+      "StudioConfig": {
+        "type": "object",
+        "description": "Studio's runtime config: the six public values it signs in with. Nothing else is here (no\nPAT, key or secret): it is public and cached.",
+        "required": [
+          "issuer",
+          "clientId",
+          "projectId",
+          "orgId",
+          "apiUrl",
+          "studioHost"
+        ],
+        "properties": {
+          "apiUrl": {
+            "type": "string",
+            "description": "The public API base URL."
+          },
+          "clientId": {
+            "type": "string",
+            "description": "Studio's OIDC client id."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "Zitadel's issuer URL (the OIDC authority)."
+          },
+          "orgId": {
+            "type": "string",
+            "description": "The platform org's id."
+          },
+          "projectId": {
+            "type": "string",
+            "description": "The `chelabase` project id (the API audience Studio asks for)."
+          },
+          "studioHost": {
+            "type": "string",
+            "description": "Studio's public host."
           }
         }
       }

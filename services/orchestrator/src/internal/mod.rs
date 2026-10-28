@@ -504,8 +504,9 @@ pub struct InternalState<M, L> {
     pub app_sessions_token: String,
     /// How much longer a refresh keeps an app session alive (capped at 90 days by creation).
     pub app_refresh_ttl: std::time::Duration,
-    /// Checks the Zitadel Actions webhook; `None` makes it answer 503.
-    pub actions_signing_key: Option<String>,
+    /// Checks the Zitadel Actions webhook; `None`, or a key file not written yet (m5: the
+    /// bootstrap writes it after the orchestrator starts), makes it answer 503.
+    pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
     /// Admin access to Zitadel, to delete its sessions (best effort); `None` skips that.
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// Publishes app-user sync jobs.

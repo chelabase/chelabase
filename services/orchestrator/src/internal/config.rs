@@ -46,9 +46,14 @@ pub struct InternalConfig {
     pub app_sessions_token: String,
     /// `CHELABASE_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
     pub app_refresh_ttl: Duration,
-    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`: checks the Actions webhook's signature; without
-    /// it the webhook answers 503.
-    pub actions_signing_key: Option<String>,
+    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`, or the file `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE`
+    /// names (the bootstrap's `actions-signing-key`, 0600), read when the webhook first needs
+    /// it: checks the Actions webhook's signature. Unset, or the file not written yet, the
+    /// webhook answers 503.
+    pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
+    /// `CHELABASE_DEV_DEFAULTS=1` (the workbench only): a self-hosted instance may start with
+    /// the development bearers ([`Self::check_mode`]).
+    pub dev_defaults: chelabase_types::dev_defaults::DevDefaults,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
     pub zitadel_admin_pat_file: Option<PathBuf>,
     /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
@@ -126,8 +131,14 @@ impl InternalConfig {
             app_auth_token: secret(DEV_BEARERS[5].0, DEV_BEARERS[5].1)?,
             app_sessions_token: secret(DEV_BEARERS[6].0, DEV_BEARERS[6].1)?,
             app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
-            actions_signing_key: get("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY")
-                .filter(|v| !v.trim().is_empty()),
+            actions_signing_key: chelabase_types::file_value::FileValue::from_lookup(
+                &get,
+                "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY",
+                chelabase_types::file_value::Sensitivity::Secret,
+            )
+            .map_err(|e| anyhow!(e))?,
+            dev_defaults: chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
+                .map_err(|e| anyhow!(e))?,
             zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
@@ -136,14 +147,15 @@ impl InternalConfig {
         })
     }
 
-    /// Startup refusals that depend on the mode (M9): a platform instance runs with none of the
-    /// internal listener's development bearers (each is public), whether its variable is unset
-    /// or set to one of them. The error names the variable, never the token.
+    /// Startup refusals that depend on the mode (M9): the internal listener runs with none of
+    /// its development bearers (each is public), whether its variable is unset or set to one of
+    /// them: never in platform mode, and in self-hosted mode only with `CHELABASE_DEV_DEFAULTS=1`
+    /// (the workbench, m5). The error names the variable, never the token.
     pub fn check_mode(&self, policy: &chelabase_types::mode_policy::ModePolicy) -> Result<()> {
         let dev_values: Vec<&str> = DEV_BEARERS.iter().map(|(_, value)| *value).collect();
         for (var, token) in self.bearers() {
-            policy
-                .check_dev_bearer(var, token, &dev_values)
+            self.dev_defaults
+                .check_bearer(policy, var, token, &dev_values)
                 .map_err(|e| anyhow!(e))?;
         }
         Ok(())
@@ -284,8 +296,9 @@ impl std::fmt::Debug for InternalConfig {
             .field("app_refresh_ttl", &self.app_refresh_ttl)
             .field(
                 "actions_signing_key",
-                &self.actions_signing_key.as_ref().map(|_| "<redacted>"),
+                &self.actions_signing_key.as_ref().map(|k| k.var().to_string()),
             )
+            .field("dev_defaults", &self.dev_defaults)
             .field("zitadel_admin_pat_file", &self.zitadel_admin_pat_file)
             .field("zitadel_issuer", &self.zitadel_issuer)
             .finish()
@@ -451,7 +464,7 @@ mod tests {
         assert_eq!(c.app_auth_token, "chelabase-dev-app-auth");
         assert_eq!(c.app_sessions_token, "chelabase-dev-app-sessions");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(2_592_000));
-        assert_eq!(c.actions_signing_key, None);
+        assert!(c.actions_signing_key.is_none());
         assert_eq!(c.zitadel_admin_pat_file, None);
         assert_eq!(c.zitadel_issuer, None);
     }
@@ -471,7 +484,14 @@ mod tests {
         })
         .unwrap();
         let (sh, pf) = (ModePolicy::new(Mode::SelfHosted), ModePolicy::new(Mode::Platform));
-        assert!(default.check_mode(&sh).is_ok());
+        // m5: self-hosted keeps the defaults only with CHELABASE_DEV_DEFAULTS=1.
+        let dev = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_DEV_DEFAULTS").then(|| "1".to_string())
+        })
+        .unwrap();
+        assert!(dev.check_mode(&sh).is_ok());
+        assert!(dev.check_mode(&pf).is_err());
+        assert!(default.check_mode(&sh).is_err());
         assert!(default.check_mode(&pf).is_err());
         assert!(own.check_mode(&sh).is_ok() && own.check_mode(&pf).is_ok());
     }
@@ -492,7 +512,7 @@ mod tests {
         assert_eq!(c.app_auth_token, "auth-tok");
         assert_eq!(c.app_sessions_token, "gw-tok");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(3600));
-        assert_eq!(c.actions_signing_key.as_deref(), Some("sign-key"));
+        assert_eq!(c.actions_signing_key.as_ref().map(|k| k.get().unwrap()), Some("sign-key"));
         assert_eq!(
             c.zitadel_admin_pat_file,
             Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
@@ -502,7 +522,88 @@ mod tests {
             (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
         })
         .unwrap();
-        assert_eq!(blank.actions_signing_key, None);
+        assert!(blank.actions_signing_key.is_none());
+    }
+
+    // m5 (AC 3): the Actions signing key is the variable or the file it names, not both; the
+    // error names the variable and never the key.
+    #[test]
+    fn config_refuses_env_and_file_both() {
+        let err = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE" => Some("/out/actions-signing-key".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY ") && msg.contains("not both"), "{msg}");
+        assert!(!msg.contains("sign-key-secret"), "{msg}");
+    }
+
+    // m5: the key file is read when the webhook first needs it, not at startup: a missing file
+    // starts the orchestrator (its readiness doesn't wait for the key) and is "not yet".
+    #[test]
+    fn the_actions_key_file_is_read_late() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions-signing-key");
+        let p = path.to_str().unwrap().to_string();
+        let c = InternalConfig::from_lookup(move |name| {
+            (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE").then(|| p.clone())
+        })
+        .unwrap();
+        let key = c.actions_signing_key.clone().expect("configured");
+        assert!(key.get().is_err(), "not written yet");
+        std::fs::write(&path, "late-key\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(key.get(), Ok("late-key"));
+        assert!(!format!("{c:?}").contains("late-key"));
+    }
+
+    // m5 (AC 4): self-hosted without CHELABASE_DEV_DEFAULTS=1 refuses every bearer that is
+    // unset or set to a development default, naming the variable; with it, today's behaviour.
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        use chelabase_types::mode::Mode;
+        use chelabase_types::mode_policy::ModePolicy;
+        let sh = ModePolicy::new(Mode::SelfHosted);
+        for (var, dev) in DEV_BEARERS {
+            for (how, value) in [("unset", None), ("set to the default", Some(dev))] {
+                let lookup = |dev_defaults: Option<&'static str>| {
+                    let value = value.map(str::to_string);
+                    move |name: &str| {
+                        if name == "CHELABASE_DEV_DEFAULTS" {
+                            return dev_defaults.map(str::to_string);
+                        }
+                        if name == var {
+                            return value.clone();
+                        }
+                        DEV_BEARERS
+                            .iter()
+                            .any(|(v, _)| *v == name)
+                            .then(|| format!("generated-secret-for-{name}"))
+                    }
+                };
+                let c = InternalConfig::from_lookup(lookup(None)).unwrap();
+                let msg = format!("{:#}", c.check_mode(&sh).expect_err(var));
+                assert!(msg.contains(var), "{var} {how}: {msg}");
+                assert!(!msg.contains(dev), "{var} {how}: the message repeats the token: {msg}");
+                let c = InternalConfig::from_lookup(lookup(Some("0"))).unwrap();
+                assert!(c.check_mode(&sh).is_err(), "{var} {how}: 0 is off");
+                let c = InternalConfig::from_lookup(lookup(Some("1"))).unwrap();
+                assert!(c.check_mode(&sh).is_ok(), "{var} {how}: the workbench keeps it");
+            }
+        }
+        // Every bearer generated: no switch needed.
+        let own = InternalConfig::from_lookup(|name| {
+            DEV_BEARERS.iter().any(|(v, _)| *v == name).then(|| format!("generated-{name}"))
+        })
+        .unwrap();
+        assert!(own.check_mode(&sh).is_ok());
+        let typo = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_DEV_DEFAULTS").then(|| "true".to_string())
+        });
+        assert!(format!("{:#}", typo.unwrap_err()).contains("CHELABASE_DEV_DEFAULTS"));
     }
 
     #[test]

@@ -39,3 +39,4 @@ export * from './nextStep.ts';
 export * from './signedIn.ts';
 export * from './signInBody.ts';
 export * from './signUpBody.ts';
+export * from './studioConfig.ts';

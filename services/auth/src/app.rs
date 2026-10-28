@@ -71,6 +71,7 @@ fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(auth_request))
         .routes(routes!(instance))
+        .routes(routes!(studio_config))
         .routes(routes!(sign_in))
         .routes(routes!(sign_up))
         .routes(routes!(accept_invite))
@@ -88,6 +89,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let (platform, _) = platform_router().split_for_parts();
     let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
     platform
+        // Readiness for compose `--wait` and k8s: not ready until the bootstrap's ids are there.
+        .route("/health", axum::routing::get(health))
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
         // Sign-up's `data` may carry a few columns' values.
@@ -174,6 +177,104 @@ struct AuthRequestInfo {
     sign_up_allowed: bool,
 }
 
+/// Studio's runtime config: the six public values it signs in with. Nothing else is here (no
+/// PAT, key or secret): it is public and cached.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioConfig {
+    /// Zitadel's issuer URL (the OIDC authority).
+    issuer: String,
+    /// Studio's OIDC client id.
+    client_id: String,
+    /// The `chelabase` project id (the API audience Studio asks for).
+    project_id: String,
+    /// The platform org's id.
+    org_id: String,
+    /// The public API base URL.
+    api_url: String,
+    /// Studio's public host.
+    studio_host: String,
+}
+
+/// Every bootstrap output auth waits for, with why it isn't usable yet (`Ok` when it is).
+fn bootstrap_outputs(s: &AppState) -> Vec<Result<&str, chelabase_types::file_value::Unavailable>> {
+    std::iter::once(&s.config.org_id)
+        .chain(s.config.studio.client_id.as_ref())
+        .chain(s.config.studio.project_id.as_ref())
+        .map(|v| v.get())
+        .collect()
+}
+
+/// 200 once every bootstrap output auth reads is there, else 503 naming the variables that
+/// wait (never a value).
+async fn health(State(s): S) -> Response {
+    let waiting: Vec<String> = bootstrap_outputs(&s)
+        .into_iter()
+        .filter_map(|r| r.err())
+        .map(|e| {
+            not_ready(&e);
+            e.to_string()
+        })
+        .collect();
+    if waiting.is_empty() {
+        return reply(StatusCode::OK, json!({"status": "ok"}), Vec::new());
+    }
+    reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"status": "waiting for the bootstrap", "waiting": waiting}),
+        Vec::new(),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/v1/studio-config",
+    operation_id = "getStudioConfig",
+    tag = "login",
+    description = "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+    responses(
+        (status = 200, description = "The config (`Cache-Control: public, max-age=60`)", body = StudioConfig),
+        (status = 404, description = "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`", body = ErrorEnvelope),
+        (status = 503, description = "The bootstrap hasn't written the ids yet: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn studio_config(State(s): S) -> Response {
+    let no_store = |mut r: Response| {
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+        r
+    };
+    let studio = &s.config.studio;
+    let (Some(client_id), Some(project_id)) = (&studio.client_id, &studio.project_id) else {
+        return no_store(error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "Studio's runtime config isn't set up on this instance",
+        ));
+    };
+    let values = (s.config.org_id.get(), client_id.get(), project_id.get());
+    let (Ok(org_id), Ok(client_id), Ok(project_id)) = values else {
+        for e in [values.0.err(), values.1.err(), values.2.err()].into_iter().flatten() {
+            not_ready(&e);
+        }
+        return no_store(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+    };
+    let body = StudioConfig {
+        issuer: s.config.issuer.clone(),
+        client_id: client_id.to_string(),
+        project_id: project_id.to_string(),
+        org_id: org_id.to_string(),
+        api_url: studio.api_url.clone(),
+        studio_host: studio.studio_host.clone(),
+    };
+    let mut r = reply(StatusCode::OK, json!(body), Vec::new());
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=60"),
+    );
+    r
+}
+
 /// What the sign-up page needs to know about this instance.
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -221,6 +322,27 @@ fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
 
 fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     ApiError::new(status.as_u16(), code, message).into_response()
+}
+
+/// The platform org's id, or the 503 `unavailable` every route that needs it answers while
+/// the bootstrap hasn't written it (m5: `CHELABASE_ZITADEL_ORG_ID_FILE` may appear after auth
+/// starts). Nothing runs against a missing org: `None` is answered with [`no_org`].
+fn org_id(s: &AppState) -> Option<&str> {
+    s.config.org_id.get().map_err(|e| not_ready(&e)).ok()
+}
+
+fn no_org() -> Response {
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+}
+
+/// Logs why a bootstrap output isn't usable yet: the path, never a value.
+fn not_ready(e: &chelabase_types::file_value::Unavailable) {
+    match e {
+        chelabase_types::file_value::Unavailable::NotYet { .. } => {
+            info!("waiting for the bootstrap: {e}")
+        }
+        chelabase_types::file_value::Unavailable::Refused { .. } => warn!("{e}"),
+    }
 }
 
 fn unavailable(e: &ZError) -> Response {
@@ -433,10 +555,13 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     if !is_auth_request_id(&b.auth_request) {
         return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
     }
-    let user_id = match s.zitadel.find_user_by_email(&s.config.org_id, &email).await {
+    let user_id = match s.zitadel.find_user_by_email(org, &email).await {
         Ok(Some(id)) => id,
         Ok(None) => return refused(),
         Err(e) => return unavailable(&e),
@@ -523,6 +648,9 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if !strong_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
     }
@@ -539,14 +667,14 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     // Zitadel checks usernames, not emails, for uniqueness: never make a second account
     // for an email that already has one.
     // Two accounts already sharing the email (made outside this check) count as taken too.
-    match s.zitadel.find_user_in_org(&s.config.org_id, &email).await {
+    match s.zitadel.find_user_in_org(org, &email).await {
         Ok(crate::zitadel::EmailMatch::None) => {}
         Ok(_) => return taken(s, &email, b.auth_request),
         Err(e) => return unavailable(&e),
     }
     let template = verify_template(s);
     let new = NewUser {
-        org_id: &s.config.org_id,
+        org_id: org,
         email: &email,
         given_name: b.given_name.trim(),
         family_name: b.family_name.trim(),
@@ -566,7 +694,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         Err(e) => return unavailable(&e),
     };
     if let Some(nonce) = &nonce
-        && let Some(refused) = bind_claim(s, &user_id, nonce).await
+        && let Some(refused) = bind_claim(s, org, &user_id, nonce).await
     {
         return refused.response();
     }
@@ -623,7 +751,11 @@ async fn gate(
         warn!("no sign-up gate is configured");
         return Err(Refusal::Unavailable);
     };
-    gate.signup_check(&s.config.org_id, setup_code).await.map_err(|e| {
+    let org = s.config.org_id.get().map_err(|e| {
+        not_ready(&e);
+        Refusal::Unavailable
+    })?;
+    gate.signup_check(org, setup_code).await.map_err(|e| {
         warn!(error = %e, "the sign-up gate failed");
         Refusal::Unavailable
     })
@@ -662,11 +794,12 @@ async fn sign_up_gate(
 /// answer is `setup_code_invalid` (refused) or `unavailable`.
 async fn bind_claim(
     s: &AppState,
+    org: &str,
     user_id: &str,
     nonce: &crate::app_users::internal::ClaimNonce,
 ) -> Option<Refusal> {
     let failed = match &s.signup_gate {
-        Some(gate) => match gate.signup_claimed(&s.config.org_id, user_id, nonce).await {
+        Some(gate) => match gate.signup_claimed(org, user_id, nonce).await {
             Ok(bound) => {
                 info!(user_id, bound, "fresh-install claim");
                 return None;
@@ -890,6 +1023,9 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         warn!("accept-invite needs CHELABASE_ZITADEL_ADMIN_PAT_FILE");
         return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     };
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     // Only failed code attempts count against a user, so a typo'd password or a retry never
     // locks the invitee out.
     let user_key = format!("accept-invite:user:{}", b.user);
@@ -902,7 +1038,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         Err(e) => return unavailable(&e),
     };
     // An invite code for a user of another organization never signs into the platform.
-    if user.org_id != s.config.org_id {
+    if user.org_id != org {
         warn!("accept-invite for a user outside the platform org");
         s.limiter.hit(&user_key, HOUR);
         return bad();
@@ -1187,6 +1323,7 @@ struct EmailBody {
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The instance isn't set up yet (its org id isn't written): `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<EmailBody>) -> Response {
@@ -1201,6 +1338,11 @@ async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Ema
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
+    // Answered the same whether or not the account exists, but never "sent" when the org
+    // (and so the lookup) isn't there yet.
+    if org_id(&s).is_none() {
+        return no_org();
+    }
     spawn_reset_email(&s, email);
     reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
@@ -1214,11 +1356,12 @@ fn spawn_reset_email(s: &Arc<AppState>, email: String) {
             "{}/password-reset?userId={{{{.UserID}}}}&code={{{{.Code}}}}",
             s2.config.studio_url
         );
-        match s2
-            .zitadel
-            .find_user_by_email(&s2.config.org_id, &email)
-            .await
-        {
+        // Every caller has the org already (it is cached once read).
+        let Ok(org) = s2.config.org_id.get() else {
+            warn!("password reset without the org id; nothing sent");
+            return;
+        };
+        match s2.zitadel.find_user_by_email(org, &email).await {
             Ok(Some(user_id)) => {
                 if let Err(e) = s2.zitadel.send_password_reset(&user_id, &template).await {
                     warn!(error = %e, "sending the password reset failed");
