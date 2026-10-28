@@ -135,6 +135,11 @@ test:
     cargo nextest run --workspace
     cargo test --workspace --doc
 
+# Build every release image (per-app, chelabase/server, chelabase/studio) from one cargo build.
+# Separate from the workbench, which runs host-built debug binaries. Smoke: scripts/tests/images-smoke.sh
+images:
+    docker buildx bake -f infra/images/docker-bake.hcl
+
 # Delete build artifacts older than `days` from the main checkout's target/ and every worktree's
 # (needs cargo-sweep: cargo install cargo-sweep --locked)
 sweep-builds days="14":

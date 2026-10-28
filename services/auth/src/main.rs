@@ -8,6 +8,7 @@ use auth::zitadel::Zitadel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("auth", "The Chelabase auth service: sign-in and app-user flows.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(

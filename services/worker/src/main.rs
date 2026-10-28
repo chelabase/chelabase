@@ -41,6 +41,7 @@ const RESET_QUEUE_GROUP: &str = "chelabase-worker";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("worker", "The Chelabase worker: background jobs for provisioning, branches, merges and roles.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(

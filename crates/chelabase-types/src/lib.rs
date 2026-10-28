@@ -1,5 +1,6 @@
 //! Shared domain identifiers for Chelabase control plane.
 
+pub mod cli;
 pub mod data_api_schema;
 pub mod data_key;
 pub mod role_name;
