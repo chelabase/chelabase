@@ -67,29 +67,16 @@ pub struct MetadataConfig {
     pub database_url: String,
 }
 
-/// The URL without its password (it may carry one, from `CHELABASE_METADATA_DATABASE_PASSWORD_FILE`).
+/// The URL without its passwords (the user info's, from `CHELABASE_METADATA_DATABASE_PASSWORD_FILE`,
+/// and any `password` query parameter's).
 impl std::fmt::Debug for MetadataConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetadataConfig")
-            .field("database_url", &redact_password(&self.database_url))
+            .field("database_url", &chelabase_types::secret_env::redact_url_passwords(&self.database_url))
             .finish()
     }
 }
 
-/// `scheme://user:<redacted>@rest` for a URL with a password; otherwise the URL.
-fn redact_password(url: &str) -> String {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return "<redacted>".into();
-    };
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_end].rfind('@') {
-        Some(at) if rest[..at].contains(':') => {
-            let user = rest[..at].split(':').next().unwrap_or_default();
-            format!("{scheme}://{user}:<redacted>{}", &rest[at..])
-        }
-        _ => url.to_string(),
-    }
-}
 
 impl MetadataConfig {
     pub fn from_env() -> Result<Self, MetadataError> {
@@ -860,6 +847,31 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // m5 re-audit S2: `Debug` hides a password in the user info and in a `password` query
+    // parameter (any position, a percent-encoded key too), and keeps everything else.
+    #[test]
+    fn debug_hides_every_url_password() {
+        for (url, shown) in [
+            ("postgres://u:in-url-pw@db:5432/m", "postgres://u:<redacted>@db:5432/m"),
+            ("postgres://u@db:5432/m?password=in-url-pw", "postgres://u@db:5432/m?password=<redacted>"),
+            (
+                "postgres://u@db/m?sslmode=disable&password=in-url-pw&application_name=x",
+                "postgres://u@db/m?sslmode=disable&password=<redacted>&application_name=x",
+            ),
+            ("postgres://u@db/m?%70assword=in-url-pw#f", "postgres://u@db/m?%70assword=<redacted>#f"),
+            (
+                "postgres://u:a@db/m?PASSWORD=in-url-pw",
+                "postgres://u:<redacted>@db/m?PASSWORD=<redacted>",
+            ),
+            ("postgres://u@db/m?passwordless=1", "postgres://u@db/m?passwordless=1"),
+        ] {
+            let c = MetadataConfig { database_url: url.into() };
+            let got = format!("{c:?}");
+            assert_eq!(got, format!("MetadataConfig {{ database_url: {shown:?} }}"), "{url}");
+            assert!(!got.contains("in-url-pw"), "{got}");
+        }
+    }
 
     fn record(project_id: ProjectId, name: &str) -> DatabaseRecord {
         DatabaseRecord {

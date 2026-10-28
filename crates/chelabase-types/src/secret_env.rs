@@ -58,7 +58,9 @@ pub fn url_with_password_file(
         return Err(format!("{url_var} names no user for the password in {file_var}"));
     };
     let user = &rest[..at];
-    if user.contains(':') {
+    // A password in the user info, or in a `password` query parameter (which sqlx and libpq
+    // take over the user info): either would silently win over, or sit beside, the file.
+    if user.contains(':') || query_pairs(rest).any(|(key, _)| is_password_key(key)) {
         return Err(format!(
             "{url_var} carries a password and {file_var} is set: give the password in one of them"
         ));
@@ -71,6 +73,80 @@ pub fn url_with_password_file(
         Err(e) => return Err(e.to_string()),
     };
     Ok(Some(format!("{scheme}://{user}:{}{}", percent_encode(&password), &rest[at..])))
+}
+
+/// The `key=value` pairs of a URL's query (`rest` is the URL after `scheme://`), raw.
+fn query_pairs(rest: &str) -> impl Iterator<Item = (&str, &str)> {
+    let query = rest.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let query = query.split('#').next().unwrap_or("");
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
+}
+
+/// Whether a raw query key is `password` (percent-decoded, any case).
+fn is_password_key(raw: &str) -> bool {
+    percent_decode(raw).eq_ignore_ascii_case("password")
+}
+
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (bytes[i], bytes.get(i + 1).copied().and_then(hex), bytes.get(i + 2).copied().and_then(hex)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (b'+', ..) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (b, ..) => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `url` for a log or `Debug`: the password in its user info and the value of any `password`
+/// query parameter become `<redacted>`; everything else is kept.
+pub fn redact_url_passwords(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return "<redacted>".into();
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    let authority = match authority.rfind('@') {
+        Some(at) if authority[..at].contains(':') => {
+            let user = authority[..at].split(':').next().unwrap_or_default();
+            format!("{user}:<redacted>{}", &authority[at..])
+        }
+        _ => authority.to_string(),
+    };
+    let (before_fragment, fragment) = match tail.find('#') {
+        Some(i) => tail.split_at(i),
+        None => (tail, ""),
+    };
+    let tail = match before_fragment.split_once('?') {
+        Some((path, query)) => {
+            let query: Vec<String> = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((key, _)) if is_password_key(key) => format!("{key}=<redacted>"),
+                    _ => pair.to_string(),
+                })
+                .collect();
+            format!("{path}?{}", query.join("&"))
+        }
+        None => before_fragment.to_string(),
+    };
+    format!("{scheme}://{authority}{tail}{fragment}")
 }
 
 /// Every byte but the unreserved ones (`A-Z a-z 0-9 - . _ ~`) as `%XX`, as the bootstrap's
@@ -112,6 +188,39 @@ mod tests {
         let path = dir.join("token");
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    // m5 re-audit S2: a `password` query parameter (sqlx and libpq take it, and it wins over
+    // the user info) is a password in the URL too: with the file set it is refused, naming
+    // both variables and never the password. Any spelling, any position, percent-encoded keys.
+    #[test]
+    fn a_query_password_and_the_file_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = file("from-file\n");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let path = path.to_str().unwrap().to_string();
+        for url in [
+            "postgres://chelabase@db:5432/m?password=in-url-pw",
+            "postgres://chelabase@db:5432/m?sslmode=disable&password=in-url-pw",
+            "postgres://chelabase@db:5432/m?%70assword=in-url-pw",
+            "postgres://chelabase@db/m?application_name=x&password=in-url-pw#frag",
+        ] {
+            let got = url_with_password_file(vars(&[("U", url), ("F", &path)]), "U", "F");
+            let err = match got {
+                Err(e) => e,
+                Ok(v) => panic!("{url}: accepted a URL with a query password and the file: {v:?}"),
+            };
+            assert!(err.contains("U ") && err.contains("F"), "{url}: {err}");
+            assert!(!err.contains("in-url-pw") && !err.contains("from-file"), "{url}: {err}");
+        }
+        // Another key that merely contains the word is fine.
+        let ok = url_with_password_file(
+            vars(&[("U", "postgres://chelabase@db/m?passwordless=1"), ("F", &path)]),
+            "U",
+            "F",
+        )
+        .unwrap();
+        assert_eq!(ok.as_deref(), Some("postgres://chelabase:from-file@db/m?passwordless=1"));
     }
 
     #[test]
