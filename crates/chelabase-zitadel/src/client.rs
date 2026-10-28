@@ -491,6 +491,23 @@ impl Zitadel {
         }
     }
 
+    /// Whether Zitadel definitely has no user with this id: `true` only on a 404. An answer
+    /// that can't be read as a user is `Unavailable`, never "gone" (unlike [`Zitadel::get_user`],
+    /// whose `None` covers both), so a caller acting on "gone" fails closed.
+    pub async fn user_is_gone(&self, user_id: &str) -> Result<bool, ZError> {
+        match self
+            .call(Method::GET, &format!("/v2/users/{user_id}"), None)
+            .await
+        {
+            Ok(answer) => match answer.get("user").and_then(parse_user) {
+                Some(_) => Ok(false),
+                None => Err(ZError::Unavailable("the user answer can't be read".into())),
+            },
+            Err(ZError::Rejected { status: 404, .. }) => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
     pub async fn find_user_in_org(
         &self,
         org_id: &str,

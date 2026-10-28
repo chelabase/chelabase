@@ -742,7 +742,7 @@ async fn a_recreated_personal_login_is_marked_again() {
         // the API writes it). Undone at the end, pass or fail: the demo project is shared.
         let member = db
             .metadata
-            .ensure_member(
+            .ensure_member_first_comer_for_tests(
                 DEMO_TENANT_ID.into(),
                 &format!("z-c3-{}", uuid::Uuid::new_v4()),
                 "c3@personal.live",

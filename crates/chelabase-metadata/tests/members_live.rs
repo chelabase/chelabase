@@ -241,7 +241,7 @@ async fn first_claim_is_atomic() {
     for i in 0..20 {
         let c = s.client.clone();
         set.spawn(async move {
-            c.ensure_member(t, &format!("z{i}"), &format!("  User{i}@Example.COM "), "N", Admission::Active)
+            c.ensure_member_first_comer_for_tests(t, &format!("z{i}"), &format!("  User{i}@Example.COM "), "N", Admission::Active)
                 .await
                 .unwrap()
         });
@@ -289,12 +289,12 @@ async fn concurrent_demotions_keep_an_admin() {
     let t = s.tenant().await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let b = s
         .client
-        .ensure_member(t, "b", "b@x.com", "B", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", Admission::Active)
         .await
         .unwrap();
     assert!(a.tenant_admin && !b.tenant_admin);
@@ -394,7 +394,7 @@ async fn run_model(s: &Scratch, steps: Vec<Vec<Op>>) -> Result<(), String> {
                 let email = format!("{zid}@x.com");
                 let result: Result<(), AccessWriteError> = match op {
                     (Op::Claim, _) => c
-                        .ensure_member(t, &zid, &email, "n", Admission::Active)
+                        .ensure_member_first_comer_for_tests(t, &zid, &email, "n", Admission::Active)
                         .await
                         .map(|_| ())
                         .map_err(|e| AccessWriteError::Conflict(format!("ensure_member: {e}"))),
@@ -404,7 +404,7 @@ async fn run_model(s: &Scratch, steps: Vec<Vec<Op>>) -> Result<(), String> {
                             .await
                         {
                             Ok(_) => c
-                                .ensure_member(t, &zid, &email, "n", Admission::Active)
+                                .ensure_member_first_comer_for_tests(t, &zid, &email, "n", Admission::Active)
                                 .await
                                 .map(|_| ())
                                 .map_err(|e| {
@@ -472,7 +472,7 @@ async fn access_events_are_append_only() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
     s.client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     assert_eq!(s.event_count(t).await, 1);
@@ -507,12 +507,12 @@ async fn owner_is_never_stored() {
     let d = s.database(t, p).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     let before = s.event_count(t).await;
@@ -622,7 +622,7 @@ async fn invited_becomes_active_on_ensure() {
     let p = s.project(t).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let g = grant(PlatformRole::Developer, &["app"]);
@@ -639,7 +639,7 @@ async fn invited_becomes_active_on_ensure() {
 
     let active = s
         .client
-        .ensure_member(t, "zi", "inv@x.com", "Inv", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "zi", "inv@x.com", "Inv", Admission::Active)
         .await
         .unwrap();
     assert_eq!(active.id, m.id);
@@ -657,7 +657,7 @@ async fn invited_becomes_active_on_ensure() {
     // The fast path: nothing changed, nothing written.
     let events = s.event_count(t).await;
     s.client
-        .ensure_member(t, "zi", "inv@x.com", "Inv", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "zi", "inv@x.com", "Inv", Admission::Active)
         .await
         .unwrap();
     assert_eq!(s.event_count(t).await, events);
@@ -683,7 +683,7 @@ async fn expired_invite_does_not_activate() {
     let t = s.tenant().await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let (m, invite) = s
@@ -699,7 +699,7 @@ async fn expired_invite_does_not_activate() {
     let events = s.event_count(t).await;
     let seen = s
         .client
-        .ensure_member(t, "zi", "inv@x.com", "Inv", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "zi", "inv@x.com", "Inv", Admission::Active)
         .await
         .unwrap();
     assert_eq!((seen.id, seen.status), (m.id, MemberStatus::Invited));
@@ -710,7 +710,7 @@ async fn expired_invite_does_not_activate() {
     s.client.resend_invite(a.id, invite, week(), TOKEN).await.unwrap();
     let active = s
         .client
-        .ensure_member(t, "zi", "inv@x.com", "Inv", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "zi", "inv@x.com", "Inv", Admission::Active)
         .await
         .unwrap();
     assert_eq!(active.status, MemberStatus::Active);
@@ -726,7 +726,7 @@ async fn admin_claimed_since_reads_the_claim_event() {
     let hour_ago = Utc::now() - Duration::hours(1);
     let claimed = s.tenant().await;
     assert!(!s.client.admin_claimed_since(claimed, hour_ago).await.unwrap());
-    s.client.ensure_member(claimed, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
+    s.client.ensure_member_first_comer_for_tests(claimed, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
     assert!(s.client.admin_claimed_since(claimed, hour_ago).await.unwrap());
     assert!(!s.client.admin_claimed_since(claimed, Utc::now() + Duration::minutes(1)).await.unwrap());
     let bootstrapped = s.tenant().await;
@@ -745,8 +745,8 @@ async fn grant_and_override_race_keeps_the_invariant() {
     let t = s.tenant().await;
     let p = s.project(t).await;
     let d = s.database(t, p).await;
-    let a = s.client.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-    let m = s.client.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
+    let a = s.client.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let m = s.client.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
     let observe = || async { s.client.project_access(p).await.unwrap().observed(p, m.id) };
 
     // A stale observation is refused, and nothing is written.
@@ -821,12 +821,12 @@ async fn removed_stays_removed() {
     let d = s.database(t, p).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     s.client
@@ -863,7 +863,7 @@ async fn removed_stays_removed() {
     let events = s.event_count(t).await;
     let again = s
         .client
-        .ensure_member(t, "m", "new@x.com", "New", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "new@x.com", "New", Admission::Active)
         .await
         .unwrap();
     assert_eq!(again.id, m.id);
@@ -921,12 +921,12 @@ async fn override_unique_per_member_and_database() {
     let d = s.database(t, p).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     let insert =
@@ -1051,19 +1051,19 @@ async fn every_write_logs_one_event() {
 
     let a = one_event!(
         "admin_claimed",
-        c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap()
+        c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap()
     );
     let m = one_event!(
         "member_joined",
-        c.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap()
+        c.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap()
     );
     no_event!(
         "unchanged claims",
-        c.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap()
+        c.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap()
     );
     let refreshed = no_event!(
         "changed claims",
-        c.ensure_member(t, "m", " M2@x.com", "M2", Admission::Active).await.unwrap()
+        c.ensure_member_first_comer_for_tests(t, "m", " M2@x.com", "M2", Admission::Active).await.unwrap()
     );
     assert_eq!(
         (refreshed.email.as_deref(), refreshed.display_name.as_str()),
@@ -1143,7 +1143,7 @@ async fn every_write_logs_one_event() {
     );
     one_event!(
         "invite_accepted",
-        c.ensure_member(t, "zj", "j@x.com", "J", Admission::Active).await.unwrap()
+        c.ensure_member_first_comer_for_tests(t, "zj", "j@x.com", "J", Admission::Active).await.unwrap()
     );
     assert!(c.invite(invite2).await.unwrap().unwrap().3.is_some());
     assert!(!c.open_signup(t).await.unwrap());
@@ -1236,7 +1236,7 @@ async fn branch_roles_and_project_branches() {
     let d2 = s.database(t, p).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let mut branches = s.client.project_branches(p).await.unwrap();
@@ -1275,7 +1275,7 @@ async fn branch_roles_and_project_branches() {
     // A tenant admin's touched projects include those it has member roles in.
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     s.client
@@ -1309,10 +1309,10 @@ async fn reconciler_reads_grants_branches_and_forgets_rows() {
     let p = s.project(t).await;
     let d1 = s.database(t, p).await;
     let d2 = s.database(t, p).await;
-    let a = s.client.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-    let m = s.client.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
-    let o = s.client.ensure_member(t, "o", "o@x.com", "O", Admission::Active).await.unwrap();
-    let _idle = s.client.ensure_member(t, "i", "i@x.com", "I", Admission::Active).await.unwrap();
+    let a = s.client.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let m = s.client.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
+    let o = s.client.ensure_member_first_comer_for_tests(t, "o", "o@x.com", "O", Admission::Active).await.unwrap();
+    let _idle = s.client.ensure_member_first_comer_for_tests(t, "i", "i@x.com", "I", Admission::Active).await.unwrap();
     let dev = |roles: &[&str]| GrantRow {
         platform_role: PlatformRole::Developer,
         pg_roles: roles.iter().map(|r| r.to_string()).collect(),
@@ -1383,7 +1383,7 @@ async fn newest_email_claim_wins() {
     let t = s.tenant().await;
     let a = s
         .client
-        .ensure_member(t, "a", "x@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "x@x.com", "A", Admission::Active)
         .await
         .unwrap();
     assert_eq!(a.email.as_deref(), Some("x@x.com"));
@@ -1391,7 +1391,7 @@ async fn newest_email_claim_wins() {
     let events = s.event_count(t).await;
     let z2 = s
         .client
-        .ensure_member(t, "z2", " X@x.com", "Z2", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "z2", " X@x.com", "Z2", Admission::Active)
         .await
         .unwrap();
     assert_eq!(z2.email.as_deref(), Some("x@x.com"));
@@ -1401,13 +1401,13 @@ async fn newest_email_claim_wins() {
     // A's next request brings its new email.
     let a = s
         .client
-        .ensure_member(t, "a", "a2@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a2@x.com", "A", Admission::Active)
         .await
         .unwrap();
     assert_eq!(a.email.as_deref(), Some("a2@x.com"));
     assert_eq!(email_of(&s, t, "z2").await.as_deref(), Some("x@x.com"));
     // An empty claim is unknown: stored NULL, nobody else touched.
-    let e = s.client.ensure_member(t, "e", "  ", "E", Admission::Active).await.unwrap();
+    let e = s.client.ensure_member_first_comer_for_tests(t, "e", "  ", "E", Admission::Active).await.unwrap();
     assert_eq!(e.email, None);
     assert_eq!(email_of(&s, t, "a").await.as_deref(), Some("a2@x.com"));
     s.finish().await;
@@ -1422,17 +1422,17 @@ async fn refresh_takes_email_from_stale_holder() {
     let t = s.tenant().await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     s.client
-        .ensure_member(t, "b", "b@x.com", "B", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", Admission::Active)
         .await
         .unwrap();
     let events = s.event_count(t).await;
     let b = s
         .client
-        .ensure_member(t, "b", "A@x.com ", "B2", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "b", "A@x.com ", "B2", Admission::Active)
         .await
         .unwrap();
     assert_eq!(
@@ -1441,7 +1441,7 @@ async fn refresh_takes_email_from_stale_holder() {
     );
     assert_eq!(email_of(&s, t, "a").await, None);
     // A name-only change refreshes the name and leaves the emails alone.
-    let a2 = s.client.ensure_member(t, "a", "", "A2", Admission::Active).await;
+    let a2 = s.client.ensure_member_first_comer_for_tests(t, "a", "", "A2", Admission::Active).await;
     assert_eq!(a2.unwrap().display_name, "A2");
     assert_eq!(email_of(&s, t, "b").await.as_deref(), Some("a@x.com"));
     // Activation takes the email too.
@@ -1452,14 +1452,14 @@ async fn refresh_takes_email_from_stale_holder() {
         .unwrap();
     let c = s
         .client
-        .ensure_member(t, "c", "i@x.com", "C", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "c", "i@x.com", "C", Admission::Active)
         .await
         .unwrap();
     assert_eq!(c.email.as_deref(), Some("i@x.com"));
     assert_eq!(email_of(&s, t, "zi").await, None);
     let i = s
         .client
-        .ensure_member(t, "zi", "i@x.com", "I", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "zi", "i@x.com", "I", Admission::Active)
         .await
         .unwrap();
     assert_eq!(
@@ -1492,7 +1492,7 @@ async fn concurrent_email_claims_leave_one_holder() {
     let t = s.tenant().await;
     for zid in ["e1", "e2"] {
         s.client
-            .ensure_member(t, zid, &format!("{zid}@x.com"), "E", Admission::Active)
+            .ensure_member_first_comer_for_tests(t, zid, &format!("{zid}@x.com"), "E", Admission::Active)
             .await
             .unwrap();
     }
@@ -1500,7 +1500,7 @@ async fn concurrent_email_claims_leave_one_holder() {
     let mut set = tokio::task::JoinSet::new();
     for zid in ["e1", "e2", "n1", "n2", "n3", "n4"] {
         let c = s.client.clone();
-        set.spawn(async move { c.ensure_member(t, zid, "Same@x.com", "S", Admission::Active).await });
+        set.spawn(async move { c.ensure_member_first_comer_for_tests(t, zid, "Same@x.com", "S", Admission::Active).await });
     }
     s.wait_for_lock_waiters(6).await;
     hold.rollback().await.unwrap();
@@ -1528,7 +1528,7 @@ async fn reinvite_reuses_a_removed_row() {
     let p = s.project(t).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let g = grant(PlatformRole::Developer, &["app"]);
@@ -1554,7 +1554,7 @@ async fn reinvite_reuses_a_removed_row() {
     // A removed former admin comes back invited, not admin, with its old grants gone.
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     s.client
@@ -1595,12 +1595,12 @@ async fn tenant_isolation_is_not_found() {
     let d2 = s.database(other, p2).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     let events = s.event_count(t).await;
@@ -1642,7 +1642,7 @@ async fn bootstrap_activates_an_invited_member() {
     let t = s.tenant().await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let (i, invite) = s
@@ -1681,12 +1681,12 @@ async fn concurrent_first_puts_log_one_event() {
     let d = s.database(t, p).await;
     let a = s
         .client
-        .ensure_member(t, "a", "a@x.com", "A", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active)
         .await
         .unwrap();
     let m = s
         .client
-        .ensure_member(t, "m", "m@x.com", "M", Admission::Active)
+        .ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active)
         .await
         .unwrap();
     let g = grant(PlatformRole::Developer, &["app"]);
@@ -1738,9 +1738,9 @@ async fn member_api_reads() {
     let p2 = s.project(t).await;
     let d = s.database(t, p).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-    let m = c.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
-    c.ensure_member(other, "o", "o@x.com", "O", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let m = c.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
+    c.ensure_member_first_comer_for_tests(other, "o", "o@x.com", "O", Admission::Active).await.unwrap();
 
     assert_eq!(c.member(m.id).await.unwrap().map(|r| r.id), Some(m.id));
     assert_eq!(c.member(Uuid::new_v4()).await.unwrap(), None);
@@ -1800,8 +1800,8 @@ async fn existing_user_is_added_active() {
     let t = s.tenant().await;
     let p = s.project(t).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-    let stale = c.ensure_member(t, "s", "u@x.com", "S", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let stale = c.ensure_member_first_comer_for_tests(t, "s", "u@x.com", "S", Admission::Active).await.unwrap();
     let g = grant(PlatformRole::Developer, &["app"]);
     let events = s.event_count(t).await;
     let u = c
@@ -1860,8 +1860,8 @@ async fn put_grants_is_all_or_nothing() {
     let foreign = s.project(s.tenant().await).await;
     let d = s.database(t, p).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-    let m = c.ensure_member(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let m = c.ensure_member_first_comer_for_tests(t, "m", "m@x.com", "M", Admission::Active).await.unwrap();
     let g = grant(PlatformRole::Developer, &["app"]);
     let events = s.event_count(t).await;
     assert!(matches!(
@@ -1897,7 +1897,7 @@ async fn promoting_an_invited_member_conflicts() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let (i, _) = c
         .create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[]))
         .await
@@ -1921,7 +1921,7 @@ async fn project_events_include_listed_grants() {
     let p = s.project(t).await;
     let p2 = s.project(t).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let g = grant(PlatformRole::Viewer, &[]);
     c.create_invited_member(a.id, t, new_invite("z1", "one@x.com", &[(p, g.clone())]))
         .await
@@ -1961,7 +1961,7 @@ async fn access_events_join_names() {
     let t = s.tenant().await;
     let p = s.project(t).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     let (m, _) = c
         .create_invited_member(a.id, t, new_invite("zm", "m@x.com", &[]))
         .await
@@ -1977,7 +1977,7 @@ async fn access_events_join_names() {
     assert_eq!(ev.project_name.as_deref(), Some(format!("p-{p}").as_str()));
 
     // The target is removed, the project soft-deleted: both still resolve.
-    c.ensure_member(t, "zm", "m@x.com", "M", Admission::Active).await.unwrap();
+    c.ensure_member_first_comer_for_tests(t, "zm", "m@x.com", "M", Admission::Active).await.unwrap();
     c.remove_member(a.id, m.id).await.unwrap();
     sqlx::query("UPDATE projects SET status = 'deleted' WHERE id = $1")
         .bind(p)
@@ -2014,7 +2014,7 @@ async fn member_listings_report_has_access() {
     let p = s.project(t).await;
     let d = s.database(t, p).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     assert!(a.tenant_admin);
     let granted = c.add_existing_user(a.id, t, "zg", "g@x.com", "G", &[(p, grant(PlatformRole::Viewer, &[]))], &[]).await.unwrap();
     let bare = c.add_existing_user(a.id, t, "zb", "b@x.com", "B", &[], &[]).await.unwrap();
@@ -2064,7 +2064,7 @@ async fn invite_description_follows_the_open_invite() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
     assert!(c.open_invite_for_user("zi").await.unwrap().is_none());
     let (_, invite) = c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[])).await.unwrap();
     let d = c.open_invite_for_user("zi").await.unwrap().unwrap();
@@ -2095,7 +2095,7 @@ async fn tenant_display_name_round_trip() {
     let s = Scratch::new().await;
     let t = s.tenant().await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
     let name = || async { c.tenant_overview(t).await.unwrap().unwrap().display_name };
     assert_eq!(name().await, None);
     c.set_tenant_display_name(a.id, t, Some("Acme Corp")).await.unwrap();
@@ -2141,7 +2141,7 @@ async fn pending_member_lifecycle() {
     let t = s.tenant().await;
     let p = s.project(t).await;
     let c = &s.client;
-    let a = c.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
     assert!(a.tenant_admin);
     let actions = |t: TenantId| async move {
         c.access_events(t, None, None, None, 100).await.unwrap().into_iter().rev().map(|e| e.action).collect::<Vec<_>>()
@@ -2149,16 +2149,16 @@ async fn pending_member_lifecycle() {
 
     // Closed: no row, no event. Pending: a pending row and a `member_joined` event.
     let before = s.event_count(t).await;
-    let closed = c.ensure_member(t, "c", "c@x.com", "C", Admission::Closed).await;
+    let closed = c.ensure_member_first_comer_for_tests(t, "c", "c@x.com", "C", Admission::Closed).await;
     assert!(matches!(closed, Err(chelabase_metadata::MetadataError::NotAdmitted(_))), "{closed:?}");
     assert!(c.member_by_zitadel(t, "c").await.unwrap().is_none());
     assert_eq!(s.event_count(t).await, before);
-    let b = c.ensure_member(t, "b", "b@x.com", "B", Admission::Pending).await.unwrap();
+    let b = c.ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", Admission::Pending).await.unwrap();
     assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false));
     assert_eq!(actions(t).await.last().map(String::as_str), Some("member_joined"));
     // It stays pending whatever it asks for later, and is listed.
     for admission in [Admission::Active, Admission::Pending, Admission::Closed] {
-        let again = c.ensure_member(t, "b", "b@x.com", "B", admission).await.unwrap();
+        let again = c.ensure_member_first_comer_for_tests(t, "b", "b@x.com", "B", admission).await.unwrap();
         assert_eq!(again.status, MemberStatus::Pending);
     }
     let listed = c.list_members(t).await.unwrap();
@@ -2184,7 +2184,7 @@ async fn pending_member_lifecycle() {
     assert!(matches!(c.approve_member(a.id, b.id, &[], &[]).await, Err(AccessWriteError::Conflict(_))));
 
     // A grant naming the owner, or a project of another tenant, writes nothing.
-    let d = c.ensure_member(t, "d", "d@x.com", "D", Admission::Pending).await.unwrap();
+    let d = c.ensure_member_first_comer_for_tests(t, "d", "d@x.com", "D", Admission::Pending).await.unwrap();
     let events = s.event_count(t).await;
     assert!(matches!(
         c.approve_member(a.id, d.id, &[(p, grant(PlatformRole::Developer, &["owner"]))], &[]).await,
@@ -2217,10 +2217,10 @@ async fn pending_member_lifecycle() {
     .execute(c.pool())
     .await
     .unwrap();
-    let p2 = c.ensure_member(t2, "pz", "p@x.com", "P", Admission::Pending).await.unwrap();
+    let p2 = c.ensure_member_first_comer_for_tests(t2, "pz", "p@x.com", "P", Admission::Pending).await.unwrap();
     assert_eq!((p2.status, p2.tenant_admin), (MemberStatus::Pending, false));
     assert!(c.active_tenant_admins(t2).await.unwrap().is_empty());
-    let first = c.ensure_member(t2, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
+    let first = c.ensure_member_first_comer_for_tests(t2, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
     assert_eq!((first.status, first.tenant_admin), (MemberStatus::Active, true));
     assert_eq!(c.member_by_zitadel(t2, "pz").await.unwrap().unwrap().status, MemberStatus::Pending);
     s.finish().await;
@@ -2327,7 +2327,7 @@ async fn member_status_write_matrix() {
     let p = s.project(t).await;
     let db = s.database(t, p).await;
     let c = &s.client;
-    let admin = c.ensure_member(t, "admin", "admin@x.com", "Admin", Admission::Active).await.unwrap();
+    let admin = c.ensure_member_first_comer_for_tests(t, "admin", "admin@x.com", "Admin", Admission::Active).await.unwrap();
     let mut failures = Vec::new();
     let mut n = 0;
     for (status_index, status) in STATUSES.into_iter().enumerate() {
@@ -2533,7 +2533,7 @@ impl Scratch {
         let t = self.tenant().await;
         let admin = self
             .client
-            .ensure_member(t, "admin", "admin@x.com", "Admin", Admission::Active)
+            .ensure_member_first_comer_for_tests(t, "admin", "admin@x.com", "Admin", Admission::Active)
             .await
             .unwrap();
         assert!(admin.tenant_admin, "the first member claims the tenant");
@@ -2545,7 +2545,7 @@ impl Scratch {
     /// An active member (Zitadel user and display name `zid`, email `<zid>@x.com`).
     async fn active(&self, h: &Hub, zid: &str) -> Uuid {
         self.client
-            .ensure_member(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
+            .ensure_member_first_comer_for_tests(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
             .await
             .unwrap()
             .id
@@ -2941,7 +2941,7 @@ async fn run_revocation_model(s: &Scratch, steps: Vec<W>) -> Result<(), String> 
                 let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
                 match c.create_invited_member(h.admin, h.t, new_invite(&zid, &email, &grants)).await {
                     Ok(_) => c
-                        .ensure_member(h.t, &zid, &email, "n", Admission::Active)
+                        .ensure_member_first_comer_for_tests(h.t, &zid, &email, "n", Admission::Active)
                         .await
                         .map(|_| ())
                         .map_err(|e| AccessWriteError::Conflict(format!("ensure_member: {e}"))),
@@ -2952,7 +2952,7 @@ async fn run_revocation_model(s: &Scratch, steps: Vec<W>) -> Result<(), String> 
                 let zid = format!("a-{}", Uuid::new_v4().simple());
                 let email = format!("{zid}@x.com");
                 let m = c
-                    .ensure_member(h.t, &zid, &email, "n", Admission::Pending)
+                    .ensure_member_first_comer_for_tests(h.t, &zid, &email, "n", Admission::Pending)
                     .await
                     .map_err(|e| format!("step {n}: sign-up: {e}"))?;
                 let grants = [(h.p, grant(PlatformRole::Developer, &[]))];
@@ -3449,7 +3449,7 @@ async fn suspend_revokes_and_reinstate_keeps_them_revoked() {
         .create_invited_member(h.admin, h.t, new_invite("inv", "inv@x.com", &[]))
         .await
         .unwrap();
-    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    let pending = c.ensure_member_first_comer_for_tests(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
     assert_eq!(pending.status, MemberStatus::Pending);
     let removed = s.granted(&h, "gone", PlatformRole::Developer).await;
     c.remove_member(h.admin, removed).await.unwrap();
@@ -3747,9 +3747,9 @@ async fn a_suspended_member_is_never_reactivated_by_sign_in() {
     let c = &s.client;
     let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
     c.suspend_member(h.admin, alice).await.unwrap();
-    let same = c.ensure_member(h.t, "alice", "alice@x.com", "alice", Admission::Active).await.unwrap();
+    let same = c.ensure_member_first_comer_for_tests(h.t, "alice", "alice@x.com", "alice", Admission::Active).await.unwrap();
     assert_eq!((same.id, same.status), (alice, MemberStatus::Suspended));
-    let changed = c.ensure_member(h.t, "alice", "new@x.com", "New Name", Admission::Active).await.unwrap();
+    let changed = c.ensure_member_first_comer_for_tests(h.t, "alice", "new@x.com", "New Name", Admission::Active).await.unwrap();
     assert_eq!(changed.status, MemberStatus::Suspended);
     let invite = Uuid::new_v4();
     sqlx::query(
@@ -3763,7 +3763,7 @@ async fn a_suspended_member_is_never_reactivated_by_sign_in() {
     .execute(c.pool())
     .await
     .unwrap();
-    let with_invite = c.ensure_member(h.t, "alice", "other@x.com", "Other", Admission::Active).await.unwrap();
+    let with_invite = c.ensure_member_first_comer_for_tests(h.t, "alice", "other@x.com", "Other", Admission::Active).await.unwrap();
     assert_eq!(with_invite.status, MemberStatus::Suspended, "an open invite doesn't reactivate");
     assert_eq!(s.status_of(alice).await, MemberStatus::Suspended);
     let (_, _, _, accepted) = c.invite(invite).await.unwrap().unwrap();
@@ -4192,7 +4192,7 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
     c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
     let elsewhere = s.tenant().await;
     let twin = c
-        .ensure_member(elsewhere, "alice", "alice@x.com", "alice", Admission::Active)
+        .ensure_member_first_comer_for_tests(elsewhere, "alice", "alice@x.com", "alice", Admission::Active)
         .await
         .unwrap()
         .id;
@@ -4219,7 +4219,7 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
     assert_eq!(c.offboarded_members().await.unwrap(), want);
 
     // A sign-in never clears it.
-    c.ensure_member(h.t, "bob", "bob@x.com", "bob", Admission::Active).await.unwrap();
+    c.ensure_member_first_comer_for_tests(h.t, "bob", "bob@x.com", "bob", Admission::Active).await.unwrap();
     assert!(c.member(bob).await.unwrap().unwrap().offboarded, "a sign-in cleared the mark");
 
     assert!(c.clear_offboarded(h.t, "alice").await.unwrap());
@@ -4981,7 +4981,7 @@ async fn an_invite_with_teams_sees_a_team_grant_change_as_changed() {
     let x = s.raw_team(h.t, "x").await;
     s.raw_team_grant(x, h.p, &grant(PlatformRole::Viewer, &[])).await;
     let seen = [TeamSeen { team: x, grants: vec![(h.p, grant(PlatformRole::Viewer, &[]))] }];
-    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    let pending = c.ensure_member_first_comer_for_tests(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
     let bob = s.active(&h, "bob").await;
     let bob_seen = c.project_access(h.p).await.unwrap().observed(h.p, bob);
     // The team grant changes after the checks read it.
@@ -5081,7 +5081,7 @@ async fn every_team_members_writer_holds_the_tenant() {
     .await
     .unwrap();
     assert_eq!(s.memberships_of(added).await, vec![x]);
-    let pending = c.ensure_member(t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
+    let pending = c.ensure_member_first_comer_for_tests(t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
     waits_for_the_tenant(&s, t, "approve with teams", {
         let (c, seen) = (c.clone(), seen.clone());
         async move { c.approve_member(admin, pending, &[], &seen).await.map(|_| ()) }
@@ -5576,7 +5576,7 @@ async fn adding_a_pending_member_is_member_pending() {
     let u = s.hub().await;
     let c = &s.client;
     let x = s.raw_team(h.t, "x").await;
-    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
+    let pending = c.ensure_member_first_comer_for_tests(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap().id;
     let w = team_write(&s, &h, &TeamChange::AddMember { team: x, member: pending }).await;
     assert!(matches!(w, Err(TeamWriteError::MemberPending)), "pending: {w:?}");
     let removed = s.active(&h, "gone").await;
@@ -5661,7 +5661,7 @@ async fn invites_and_approvals_add_teams_in_the_same_transaction() {
     assert_eq!(joined(since, added.id).await, 2);
 
     let since = last_event_id(&s, h.t).await;
-    let pending = c.ensure_member(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
+    let pending = c.ensure_member_first_comer_for_tests(h.t, "pend", "pend@x.com", "P", Admission::Pending).await.unwrap();
     c.approve_member(h.admin, pending.id, &[], std::slice::from_ref(&sy)).await.unwrap();
     assert_eq!(s.memberships_of(pending.id).await, vec![y]);
     assert_eq!(joined(since, pending.id).await, 1);
@@ -5976,5 +5976,62 @@ async fn setup_claim_refused_once_an_admin_exists() {
     assert_eq!(setup_claim_rows(&s, t).await, 0);
     let late = s.client.admit_member(t, "late", "", "L", Admission::Active).await.unwrap();
     assert!(!late.tenant_admin);
+    s.finish().await;
+}
+
+// S1 (m3 audit): the fresh-install race window opens when the claim is bound, not only when
+// the bound user's first request claims the admin. So the race loser whose first request comes
+// first is a `pending` request through the orchestrator's `admit` (which asks
+// `admin_claimed_since`), not refused.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_opens_the_race_window() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let hour_ago = Utc::now() - Duration::hours(1);
+    assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "no claim yet");
+    let n = setup_nonce(&s, t).await;
+    s.client.claim_setup(t, n, "user-a", None).await.unwrap();
+    assert!(s.client.admin_claimed_since(t, hour_ago).await.unwrap(), "the bound claim opens it");
+    assert!(!s.client.admin_claimed_since(t, Utc::now() + Duration::minutes(1)).await.unwrap());
+    // An old claim (a stale one, say) is outside the window.
+    sqlx::query("UPDATE setup_claims SET created_at = now() - interval '2 hours' WHERE tenant_id = $1")
+        .bind(t.as_uuid())
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    assert!(!s.client.admin_claimed_since(t, hour_ago).await.unwrap());
+    s.finish().await;
+}
+
+// N3 (m3 audit), the "removed" half of AC 9: the sole admin can't be removed
+// (`last_tenant_admin`); and should their row end up removed anyway (by hand), nobody else is
+// made admin: neither an existing member nor a newcomer, and the removed admin stays removed.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_removed_admin_needs_bound_user() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let n = setup_nonce(&s, t).await;
+    s.client.claim_setup(t, n, "user-a", None).await.unwrap();
+    let a = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Closed).await.unwrap();
+    assert!(a.tenant_admin);
+    let m = s.client.add_existing_user(a.id, t, "user-m", "m@x.com", "M", &[], &[]).await.unwrap();
+    assert!(matches!(s.client.remove_member(m.id, a.id).await, Err(AccessWriteError::LastTenantAdmin)));
+    sqlx::query("UPDATE members SET status = 'removed' WHERE id = $1")
+        .bind(a.id)
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    assert!(s.client.active_tenant_admins(t).await.unwrap().is_empty());
+    let again = s.client.admit_member(t, "user-m", "m@x.com", "M", Admission::Active).await.unwrap();
+    assert_eq!((again.id, again.tenant_admin), (m.id, false));
+    for admission in [Admission::Active, Admission::Pending] {
+        let c = s.client.admit_member(t, &format!("new-{admission:?}"), "", "C", admission).await.unwrap();
+        assert!(!c.tenant_admin, "{admission:?}");
+    }
+    let back = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Active).await.unwrap();
+    assert_eq!(back.status, MemberStatus::Removed);
+    assert!(s.client.active_tenant_admins(t).await.unwrap().is_empty());
     s.finish().await;
 }

@@ -9367,6 +9367,30 @@ async fn first_member_race_loser_is_a_pending_request() {
     assert!(me["member"].is_null(), "{me}");
 }
 
+// S1 (m3 audit), AC 6 through `admit`: two code-gated sign-ups, the claim bound to A. Whichever
+// first request comes first, A becomes the admin and B a pending request (the bound claim
+// opens the race window, `admin_claimed_since`), never refused.
+#[tokio::test]
+async fn setup_race_loser_is_pending_in_either_order() {
+    for loser_first in [true, false] {
+        let w = member_world(Mode::SelfHosted).await;
+        w.metadata.members.lock().unwrap().retain(|m| m.tenant_id != w.tenant);
+        w.metadata.set_admin_claim(w.tenant, None);
+        w.metadata.set_setup_claim(w.tenant, "user-a");
+        let order = if loser_first { ["user-b", "user-a"] } else { ["user-a", "user-b"] };
+        for sub in order {
+            let me: Value = w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
+            assert!(!me["member"].is_null(), "loser_first={loser_first} {sub}: {me}");
+        }
+        let a = w.metadata.member(w.tenant, "user-a").unwrap();
+        let b = w.metadata.member(w.tenant, "user-b").unwrap();
+        assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true), "loser_first={loser_first}");
+        assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false), "loser_first={loser_first}");
+        let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
+        assert_eq!(code_of(&err), "pending_approval");
+    }
+}
+
 // R39: with open sign-up on, the same person becomes a pending member (one `member_joined`
 // event) who can do nothing yet.
 #[tokio::test]

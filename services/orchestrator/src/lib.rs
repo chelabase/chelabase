@@ -601,7 +601,7 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     /// is. A person with no row becomes what `admission` says, unless the tenant has no active
     /// admin and its fresh-install claim binds this person (then they claim it; see
     /// [`MetadataClient::admit_member`]): `Closed` writes nothing and is `NotAdmitted` (R39).
-    fn ensure_member(
+    fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1205,7 +1205,7 @@ impl MetadataPort for MetadataClient {
         MetadataClient::member_by_zitadel(self, tenant, zitadel_user_id).await
     }
 
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1952,7 +1952,7 @@ async fn resolve_member<M: MetadataPort, J>(
         ApiError::internal()
     };
     let auto_create = state.policy.auto_create_members();
-    // Both claims at hand: `ensure_member` reads, refreshes or makes the row in one go.
+    // Both claims at hand: `admit_member` reads, refreshes or makes the row in one go.
     if auto_create && let (Some(email), Some(name)) = (&caller.email, &caller.name) {
         return admit(state, tenant, &caller.sub, email, name).await.map_err(failed);
     }
@@ -2015,7 +2015,7 @@ async fn resolve_member<M: MetadataPort, J>(
 /// arrives after the first has claimed the admin. Long enough for an email verification.
 const FIRST_MEMBER_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 
-/// [`MetadataPort::ensure_member`] with the tenant's sign-up rule: asked with `Closed` first, so
+/// [`MetadataPort::admit_member`] with the tenant's sign-up rule: asked with `Closed` first, so
 /// a member who already has a row costs no extra read; only a newcomer reads `open_signup`, and
 /// is then admitted as `pending` or not at all (`None`). M7: a newcomer is also `pending` while
 /// the tenant's admin claim is within [`FIRST_MEMBER_WINDOW`], so the loser of the fresh-install
@@ -2027,11 +2027,11 @@ async fn admit<M: MetadataPort, J>(
     email: &str,
     name: &str,
 ) -> Result<Option<MemberRecord>, MetadataError> {
-    match state.metadata.ensure_member(tenant, sub, email, name, Admission::Closed).await {
+    match state.metadata.admit_member(tenant, sub, email, name, Admission::Closed).await {
         Err(MetadataError::NotAdmitted(_)) => {
             let race = || state.metadata.admin_claimed_since(tenant, chrono::Utc::now() - FIRST_MEMBER_WINDOW);
             if state.metadata.open_signup(tenant).await? || race().await? {
-                state.metadata.ensure_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
+                state.metadata.admit_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
             } else {
                 Ok(None)
             }

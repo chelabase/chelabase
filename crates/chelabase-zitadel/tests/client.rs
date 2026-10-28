@@ -651,3 +651,21 @@ async fn lock_and_unlock_are_idempotent() {
     assert!(z.lock_user(&id).await.is_err());
     assert!(!mock.user_by_id(&id).unwrap().locked);
 }
+
+// m3 audit N1: "gone" is a definite 404 only. An answer that can't be read as a user is an
+// error, never "gone" (it lets a stale fresh-install claim be replaced).
+#[tokio::test]
+async fn user_is_gone_only_on_not_found() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user("ada@example.com", "Secret-pass1", true);
+    assert!(!z.user_is_gone(&id).await.unwrap());
+    mock.remove_user(&id);
+    assert!(z.user_is_gone(&id).await.unwrap());
+    let other = mock.add_user("bea@example.com", "Secret-pass1", true);
+    mock.fail(&format!("GET /v2/users/{other}"), 200, "Odd.Answer", 1);
+    assert!(matches!(z.user_is_gone(&other).await, Err(ZError::Unavailable(_))));
+    mock.fail(&format!("GET /v2/users/{other}"), 403, "Errors.Denied", 1);
+    assert!(matches!(z.user_is_gone(&other).await, Err(ZError::Rejected { status: 403, .. })));
+    mock.set_down(true);
+    assert!(z.user_is_gone(&other).await.is_err());
+}

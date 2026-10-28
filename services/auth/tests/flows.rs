@@ -2297,20 +2297,22 @@ async fn instance_says_whether_setup_is_required() {
     assert!(p.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
-// Guessing the code is capped across every client, not only per IP and email.
+// B1 (m3 audit): there is no global setup-code bucket to drain. 300 junk sign-ups with a code
+// from 15 addresses (each under its own limit) leave the operator's right-code sign-up alone;
+// the per-address and per-email limits still apply. The code's ~98 bits need no global cap.
 #[tokio::test]
-async fn setup_code_guesses_are_capped_globally() {
+async fn junk_setup_sign_ups_never_lock_out_the_code() {
     let h = harness().await;
     h.internal.set_setup_code(SETUP_CODE);
-    let total = auth::app::SETUP_CODE_TRIES_PER_HOUR as usize + 1;
     let mut set = tokio::task::JoinSet::new();
-    for i in 0..total {
+    for i in 0..300 {
         let (http, base) = (h.http.clone(), h.base.clone());
-        let body = signup_with_code(&h.mock.add_auth_request(true), &format!("guess{i}@example.com"), Some("WRONG-CODE"));
+        let ar = if i % 2 == 0 { "junk".to_string() } else { h.mock.add_auth_request(true) };
+        let body = signup_with_code(&ar, &format!("junk{i}@example.com"), Some("X"));
         set.spawn(async move {
             http.post(format!("{base}/auth/v1/sign-up"))
                 .json(&body)
-                .header("x-forwarded-for", format!("9.9.9.9, 10.0.0.{}", i % 20))
+                .header("x-forwarded-for", format!("9.9.9.9, 10.0.1.{}", i % 15))
                 .send()
                 .await
                 .unwrap()
@@ -2318,9 +2320,20 @@ async fn setup_code_guesses_are_capped_globally() {
         });
     }
     let statuses = set.join_all().await;
-    let limited = statuses.iter().filter(|s| **s == StatusCode::TOO_MANY_REQUESTS).count();
-    assert_eq!(limited, 1, "{statuses:?}");
-    assert_eq!(statuses.iter().filter(|s| **s == StatusCode::FORBIDDEN).count(), total - 1);
+    assert!(statuses.iter().all(|s| *s != StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "owner@example.com", Some(SETUP_CODE)), None, "7.7.7.7")
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "the operator's right-code sign-up: {}", a.body);
+    // The per-address limit still holds for code guesses.
+    for i in 0..20 {
+        let ar = h.mock.add_auth_request(true);
+        let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, &format!("g{i}@example.com"), Some("X")), None, "8.8.8.8").await;
+        assert_eq!(a.status, StatusCode::FORBIDDEN, "{i}");
+    }
+    let ar = h.mock.add_auth_request(true);
+    let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, "g20@example.com", Some("X")), None, "8.8.8.8").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 /// Every log line written on this thread while the guard lives (the test's current-thread
