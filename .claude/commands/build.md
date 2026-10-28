@@ -18,7 +18,7 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md`, `issue-spec` and `pr-b
    `epic/<slug>`. Read each open milestone's body and `epic-meta`.
 2. Ready = `status:ready` (or landed with `status:changes-requested` for a fix), dependencies
    integrated, and (for whiteroom deps) audited. Optionally build only milestone `n`.
-3. Ensure the epic worktree exists (`just wt-add epic-<slug>` if needed). Bring its stack up
+3. Ensure the epic worktree exists (`just wt-add epic/<slug>` if needed). Bring its stack up
    (`just workbench up` in the epic worktree) only when a milestone's Verification has live
    tests; task worktrees reuse it via `.workbench-stack`. Builders and the auditor never run
    `workbench up`/`down`. `just wt-remove epic-<slug>` purges it after the human merges.
