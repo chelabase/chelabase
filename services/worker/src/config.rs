@@ -426,7 +426,7 @@ pub fn build_with(
     attach: AttachSource,
     connect: impl FnOnce(ComputeSettings, DockerSettings) -> anyhow::Result<Backend>,
 ) -> anyhow::Result<RealWorker> {
-    // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
+    // First, so a missing key pair names its fix (`init-secrets` or `just zitadel-bootstrap`) before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
     let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {
         anyhow!(
@@ -437,7 +437,8 @@ pub fn build_with(
     let realtime_logins = config.realtime_logins()?;
     let ca = Arc::new(ComputeCa::load(&config.compute_ca_dir).with_context(|| {
         format!(
-            "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; `just zitadel-bootstrap` creates it)",
+            "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; self-hosted: `init-secrets` creates it, see `docker compose logs init-secrets`; \
+             workbench: `just zitadel-bootstrap`)",
             config.compute_ca_dir.display()
         )
     })?);
@@ -1073,6 +1074,7 @@ mod tests {
             Ok(_) => panic!("build succeeded without JWT keys"),
             Err(err) => format!("{err:#}"),
         };
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 

@@ -780,6 +780,7 @@ mod tests {
             ..InternalConfig::from_lookup(|_| None).unwrap()
         };
         let err = format!("{:#}", c.load_signer().err().expect("no keys"));
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 
@@ -794,6 +795,7 @@ mod tests {
         };
         let err = format!("{:#}", c.load_signer().err().expect("corrupt keys"));
         assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 

@@ -2124,7 +2124,7 @@ fn tenant_not_bound() -> ApiError {
     ApiError::new(
         403,
         ErrorCode::TenantNotBound,
-        "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
+        "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
     )
 }
 
@@ -2147,7 +2147,7 @@ where
                 ApiError::new(
                     403,
                     ErrorCode::TenantNotBound,
-                    "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
+                    "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
                 )
             })?;
 
