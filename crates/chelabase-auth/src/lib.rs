@@ -266,6 +266,11 @@ impl JwtVerifier {
             _ => AuthError::InvalidToken(e.to_string()),
         })?;
 
+        // m13 audit B1: jsonwebtoken's issuer check also passes a JSON list naming the issuer
+        // among others. `iss` is one string, and it must be the issuer exactly.
+        if data.claims.get("iss").and_then(Value::as_str) != Some(self.config.issuer.as_str()) {
+            return Err(AuthError::InvalidToken("InvalidIssuer: iss must be the issuer, as one string".into()));
+        }
         check_audience(&data.claims, &audiences)?;
         build_claims(&data.claims)
     }

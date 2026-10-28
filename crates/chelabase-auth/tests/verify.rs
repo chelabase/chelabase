@@ -429,3 +429,68 @@ async fn a_zitadel_token_without_iss_aud_or_exp_is_refused() {
         assert_invalid_token_containing(verifier.verify(&mock.sign_exact(c)).await, needle);
     }
 }
+
+// m13 audit B1: `iss` is one string (RFC 7519 4.1.1). jsonwebtoken's issuer check also takes a
+// JSON array and passes it when any entry matches; a token naming the issuer among others, or
+// as a one-entry list, isn't from the issuer and is refused.
+#[tokio::test]
+async fn an_iss_list_is_refused_even_when_it_holds_the_issuer() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    for iss in [
+        json!([mock.issuer(), "https://evil.example.com"]),
+        json!(["https://evil.example.com", mock.issuer()]),
+        json!([mock.issuer()]),
+        json!([mock.issuer(), mock.issuer()]),
+        json!([]),
+    ] {
+        let token = mock.sign(json!({
+            "sub": "user-1",
+            "iss": iss,
+            "exp": now() + 300,
+            chelabase_auth::CLAIM_ORG_ID: "org-1",
+        }));
+        assert_invalid_token_containing(verifier.verify(&token).await, "InvalidIssuer");
+    }
+}
+
+// m13 audit B1, the audience side (#22): `aud` may be a string or a list (RFC 7519 4.1.3;
+// Zitadel's tokens name the project and the client). A list passes when one entry is one of our
+// audiences, whatever else it names; a list naming none of them, an empty list, or a non-string
+// `aud` is refused. Non-string entries in a list never match.
+#[tokio::test]
+async fn an_aud_list_passes_only_when_it_names_one_of_our_audiences() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec!["our-project".into(), "our-client".into()]));
+    let token = |aud: serde_json::Value| {
+        mock.sign_exact(json!({
+            "sub": "user-1",
+            "iss": mock.issuer(),
+            "aud": aud,
+            "exp": now() + 300,
+            chelabase_auth::CLAIM_ORG_ID: "org-1",
+        }))
+    };
+    for aud in [
+        json!("our-project"),
+        json!(["our-client"]),
+        json!(["someone-else", "our-project"]),
+        json!(["our-project", "our-client", "another-app"]),
+    ] {
+        verifier.verify(&token(aud.clone())).await.unwrap_or_else(|e| panic!("{aud}: {e:?}"));
+    }
+    for (aud, needle) in [
+        (json!(["someone-else", "another-app"]), "does not match"),
+        (json!("someone-else"), "does not match"),
+        (json!(["Our-Project"]), "does not match"),
+        (json!([]), "names no audience"),
+        (json!(""), "names no audience"),
+        (json!([""]), "names no audience"),
+        (json!(42), "names no audience"),
+        (json!({"aud": "our-project"}), "names no audience"),
+        (json!([42, null, {"x": "our-project"}]), "names no audience"),
+    ] {
+        assert_invalid_token_containing(verifier.verify(&token(aud.clone())).await, needle);
+    }
+}
+
