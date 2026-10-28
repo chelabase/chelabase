@@ -77,8 +77,7 @@ pub async fn run() -> Result<()> {
     );
 
     // Never a redirect (#26): the signed assertion goes to the issuer only.
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
+    let client = chelabase_http::client_builder()
         .build()
         .context("an HTTP client")?;
     let resp = client

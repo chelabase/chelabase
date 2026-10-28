@@ -183,8 +183,7 @@ impl OrchestratorClient {
     pub fn new(base_url: &str, internal_url: &str, token: &str) -> Self {
         Self {
             // Never follow a redirect: the bearer goes to the configured host only.
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+            http: chelabase_http::client_builder()
                 .build()
                 .expect("realtime's HTTP client builds"),
             base_url: base_url.trim_end_matches('/').to_string(),

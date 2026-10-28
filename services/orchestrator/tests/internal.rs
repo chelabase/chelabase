@@ -2,6 +2,9 @@
 //! metadata, a fake compute locator, and in-process stand-ins for the storage controller and
 //! computes.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use axum::Router;
 use axum::http::StatusCode as AxumStatus;
 use axum::routing::get;

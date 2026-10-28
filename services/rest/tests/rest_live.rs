@@ -16,6 +16,9 @@
 //! The runner carries the stack's env (stack.env and the bootstrap's demo.env) and the compute
 //! image.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;

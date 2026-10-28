@@ -2,6 +2,9 @@
 //! `convert_keys` beside a check, validated like `keys` (the cap, one width per list, strings
 //! only), never with the convert mode; past validation the call reaches the compute (not
 //! running here: 503). The same-session behaviour is the live suites'.
+
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
 #![allow(dead_code, unused_imports)]
 
 include!("common/fakes.rs");

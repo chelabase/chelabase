@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
 chelabase-metadata = { workspace = true, features = ["openapi"] }
 chelabase-nats = { workspace = true }
 chelabase-query = { workspace = true }

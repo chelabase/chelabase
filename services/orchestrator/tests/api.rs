@@ -1,3 +1,6 @@
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 // The fakes and the test app, shared with `access_walk.rs`.
 include!("common/fakes.rs");
 

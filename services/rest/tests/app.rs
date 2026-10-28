@@ -1,6 +1,9 @@
 //! The HTTP edge without a database: identity, the schema route's key check, connection
 //! errors and the body cap. The connection source is a fake; nothing here reaches Postgres.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

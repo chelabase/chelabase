@@ -88,9 +88,8 @@ impl HttpZitadel {
         Self {
             // Never a redirect (#26): the admin PAT and the forced Host go to the upstream only.
             // A 3xx is an answer, not "not ready": the step fails at once, naming it.
-            http: reqwest::Client::builder()
+            http: chelabase_http::client_builder()
                 .timeout(CALL_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("the bootstrap's HTTP client builds"),
             base: upstream_url.trim_end_matches('/').to_string(),

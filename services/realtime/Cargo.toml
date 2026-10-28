@@ -23,6 +23,7 @@ axum = { workspace = true, features = ["ws"] }
 base64 = { workspace = true }
 bytes = { workspace = true }
 chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
 chelabase-nats = { workspace = true }
 # T8: the check SQL (`realtime`), `console_session` and `OWNER_LEVEL_SQL`.
 chelabase-query = { workspace = true }

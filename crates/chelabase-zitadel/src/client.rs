@@ -176,9 +176,8 @@ impl Zitadel {
             // #26: never a redirect. Zitadel answers its REST calls directly; a 3xx (a
             // misconfigured or compromised upstream) fails the call instead of sending the
             // token's request, with the forced Host, somewhere else.
-            http: reqwest::Client::builder()
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("reqwest client"),
             base: base.trim_end_matches('/').to_string(),

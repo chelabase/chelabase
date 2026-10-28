@@ -2646,6 +2646,7 @@ impl TestApp {
     }
 
     /// Sends a request with this identity.
+    #[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
     async fn send_identity(&self, identity: &Identity, method: Method, path: &str) -> reqwest::Response {
         let token = self.signer.sign(Service::Orchestrator.name(), identity).unwrap();
         reqwest::Client::new()
@@ -2657,6 +2658,7 @@ impl TestApp {
     }
 
     /// Sends a request as person `sub` in `org_id`, with an optional JSON body.
+    #[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
     async fn send_as(&self, sub: &str, org_id: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
         let mut req = reqwest::Client::new()
             .request(method, format!("{}{path}", self.base))
@@ -2793,7 +2795,7 @@ async fn spawn_app_oidc(
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::disallowed_methods)] // test code: a plain client
 async fn spawn_app_core(
     metadata: FakeMetadata,
     jobs: FakeJobs,
@@ -2873,6 +2875,7 @@ fn create_body(tenant_id: TenantId) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
 async fn post_create(app: &TestApp, identity_header: Option<&str>, body: serde_json::Value) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("{}/v1/databases", app.base))
