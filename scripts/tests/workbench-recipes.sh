@@ -109,10 +109,12 @@ grep -q 'CHELABASE_ENTRY_API_URL' packages/client/scripts/e2e.mjs || fail "clien
 # (CHELABASE_PROXY_PG_PORT). A script that checks a handed-out URI compares with the host port.
 grep -q 'CHELABASE_PROXY_PORT' scripts/neon-e2e.sh ||
   fail "neon-e2e checks handed-out URIs against the stack's host proxy port (CHELABASE_PROXY_PORT)"
-# End-of-step review I2: the host can't resolve `zitadel`; host-side bootstrap goes through the
-# stack's gateway, as `up` does (P6).
-just --show zitadel-bootstrap | gq 'CHELABASE_ZITADEL_UPSTREAM=http://127.0.0.1:' ||
-  fail "zitadel-bootstrap reaches Zitadel through the stack's gateway (CHELABASE_ZITADEL_UPSTREAM)"
+# m4 (#11): the bootstrap runs `chelabase-init bootstrap` in a container on the stack's compose
+# network (the CLI's `dev bootstrap`), so the host needs no route to Zitadel and the recipe only
+# builds the tool and calls the CLI; the CLI loads the stack env and writes the Zitadel files.
+just --show zitadel-bootstrap | gq 'cargo build -q -p init' || fail "zitadel-bootstrap builds chelabase-init first"
+just --show zitadel-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
+  fail "zitadel-bootstrap runs the CLI's dev bootstrap"
 just --show check | gq 'scripts/tests/retired-names.sh' || fail "just check runs retired-names.sh"
 # W2 live: the worker's live tests share the stack (branch_live restarts its pageserver, roles_live
 # recreates its orchestrator, caps count every database), so they run one at a time, as the
