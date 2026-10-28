@@ -6,16 +6,23 @@ use anyhow::Result;
 use std::io::Write;
 use std::path::Path;
 
-use crate::secrets::{InitSecrets, ensure_secrets, read_setup_code};
+use crate::secrets::{InitSecrets, Report, ensure_secrets_into, read_setup_code};
 
-/// `chelabase-init secrets --dir <dir>`.
+/// `chelabase-init secrets --dir <dir>`. A setup code the run created is printed even when a
+/// later step fails (it is written last, so none should).
 pub fn secrets(
     dir: &Path,
     opts: &InitSecrets,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> Result<()> {
-    let report = ensure_secrets(dir, opts)?;
+    let mut report = Report::default();
+    let result = ensure_secrets_into(dir, opts, &mut report);
+    if let Some(code) = &report.setup_code {
+        writeln!(out, "Setup code: {code}")?;
+        out.flush()?;
+    }
+    result?;
     writeln!(
         err,
         "chelabase-init: {} created, {} re-rendered, in {}",
@@ -23,10 +30,6 @@ pub fn secrets(
         report.rewritten.len(),
         dir.display()
     )?;
-    if let Some(code) = &report.setup_code {
-        writeln!(out, "Setup code: {code}")?;
-    }
-    out.flush()?;
     Ok(())
 }
 

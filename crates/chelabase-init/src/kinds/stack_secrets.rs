@@ -5,11 +5,15 @@
 //! stack of the machine, and is mounted only into the services that read it. A file is created
 //! once and never rewritten: a running service (or a computed hash) may hold the old value. An
 //! existing empty file is an error, never silently replaced.
+//!
+//! `chelabase_init::ensure_secrets` makes these files now ([`crate::secrets::LAYOUT`]). The
+//! path-based [`ensure`] and [`SECRET_FILES`] stay only as the baseline the tests compare with
+//! (feature `test-support`); `the_legacy_generators_match_the_layout` keeps them in step.
 
 use anyhow::{Context, Result};
-use std::io::Write;
 use std::path::Path;
 
+#[cfg(any(test, feature = "test-support"))]
 /// What a secret file holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -19,6 +23,7 @@ pub enum Kind {
     RawKey,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Every secret file, relative to the keys dir.
 pub const SECRET_FILES: &[(&str, Kind)] = &[
     ("nats/orchestrator.password", Kind::Text),
@@ -48,6 +53,7 @@ pub const NATS_USERS: [&str; 4] = ["orchestrator", "worker", "realtime", "runner
 /// test runner and the healthcheck.
 pub const VALKEY_USERS: [&str; 5] = ["proxy", "control", "realtime", "runner", "health"];
 
+#[cfg(any(test, feature = "test-support"))]
 /// Creates every missing secret under `keys`; keeps the others as they are. Refuses an existing
 /// empty file (naming it) and leaves it untouched.
 pub fn ensure(keys: &Path) -> Result<()> {
@@ -57,6 +63,7 @@ pub fn ensure(keys: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn ensure_one(path: &Path, kind: Kind) -> Result<()> {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() && meta.len() > 0 => return Ok(()),
@@ -95,6 +102,7 @@ fn ensure_one(path: &Path, kind: Kind) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("creating {}", path.display())),
     };
+    use std::io::Write;
     if let Err(e) = file.write_all(&contents).and_then(|_| file.sync_all()) {
         // Never leave a half-written or empty secret behind.
         let _ = std::fs::remove_file(path);
@@ -121,6 +129,7 @@ pub fn create_private_dir(dir: &Path) -> Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// 32 bytes from the OS random number generator (through the secrets key generator, so the CLI
 /// needs no RNG crate of its own).
 fn random_32() -> [u8; 32] {
@@ -133,6 +142,7 @@ fn random_32() -> [u8; 32] {
         .expect("an AES-256 key is 32 bytes")
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// A text secret's value: the file without its trailing line break; empty is an error.
 pub fn read_text(keys: &Path, file: &str) -> Result<String> {
     let path = keys.join(file);

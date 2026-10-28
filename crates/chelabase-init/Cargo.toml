@@ -21,5 +21,10 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 
+[features]
+# The path-based generators the CLI's tests use as a baseline (`kinds::stack_secrets::ensure`,
+# `kinds::service_auth::{write_auth_files, write_storage_auth}`); nothing else calls them.
+test-support = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
