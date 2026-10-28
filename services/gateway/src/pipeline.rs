@@ -106,7 +106,14 @@ pub struct Pipeline {
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
     users: Arc<UserTokens>,
+    /// The last readiness `/_gateway/ready` answered ([`READY_UNKNOWN`] before the first), so
+    /// its reason is logged once per change, not per probe.
+    ready_seen: std::sync::atomic::AtomicU8,
 }
+
+const READY_UNKNOWN: u8 = 0;
+const READY_YES: u8 = 1;
+const READY_NO: u8 = 2;
 
 impl Pipeline {
     pub fn new(
@@ -124,6 +131,7 @@ impl Pipeline {
             signer,
             keys,
             users,
+            ready_seen: std::sync::atomic::AtomicU8::new(READY_UNKNOWN),
         }
     }
 
@@ -141,9 +149,26 @@ impl Pipeline {
             return respond(200, Vec::new(), json!({ "status": "ok" }));
         }
         if req.method == "GET" && req.path == GATEWAY_READY_PATH {
-            return match self.verifier.config().audiences.current() {
-                Ok(_) => respond(200, Vec::new(), json!({ "status": "ok" })),
-                Err(e) => respond(503, Vec::new(), json!({ "status": "waiting", "reason": e.to_string() })),
+            // Answered on any host: the body never says why (a variable, a path, a mode). The
+            // reason is logged once each time readiness changes.
+            let ready = self.verifier.config().audiences.current();
+            let was = self.ready_seen.swap(
+                if ready.is_ok() { READY_YES } else { READY_NO },
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            return match ready {
+                Ok(_) => {
+                    if was != READY_YES {
+                        tracing::info!("the gateway is ready: its token audiences are there");
+                    }
+                    respond(200, Vec::new(), json!({ "status": "ok" }))
+                }
+                Err(e) => {
+                    if was != READY_NO {
+                        tracing::warn!("the gateway isn't ready: {e}");
+                    }
+                    respond(503, Vec::new(), json!({ "status": "waiting" }))
+                }
             };
         }
 
@@ -718,6 +743,35 @@ mod tests {
             run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token("someone-else"))]).await.outcome,
         );
         assert_eq!(resp.status, 401);
+    }
+
+    // m5 re-audit N5: `/_gateway/ready` is answered on any host, so while it waits its body says
+    // only that: no variable, no path inside the container, no mode.
+    #[tokio::test]
+    async fn ready_says_nothing_about_the_files() {
+        use chelabase_auth::Audiences;
+        use chelabase_types::file_value::{FileValue, Sensitivity};
+        use std::os::unix::fs::PermissionsExt;
+        let jwks = MockJwks::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("api-client-id");
+        std::fs::write(&file, "c-api\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let missing = dir.path().join("project-id");
+        let mut config = jwks.config(vec![]);
+        config.audiences = Audiences::Ids(vec![
+            FileValue::file("CHELABASE_ZITADEL_API_CLIENT_ID_FILE", &file, Sensitivity::Public),
+            FileValue::file("CHELABASE_ZITADEL_PROJECT_ID_FILE", &missing, Sensitivity::Public),
+        ]);
+        let (pipeline, _) = pipeline_with(&[API], JwtVerifier::new(config));
+        for _ in 0..2 {
+            let resp = expect_response(run(&pipeline, "GET", GATEWAY_READY_PATH, Some("anyone.example"), &[]).await.outcome);
+            assert_eq!((resp.status, resp.body.clone()), (503, Some(json!({ "status": "waiting" }))));
+        }
+        let empty = JwtVerifier::new(ZitadelAuthConfig { audiences: Vec::<String>::new().into(), ..jwks.config(vec![]) });
+        let (pipeline, _) = pipeline_with(&[API], empty);
+        let resp = expect_response(run(&pipeline, "GET", GATEWAY_READY_PATH, None, &[]).await.outcome);
+        assert_eq!((resp.status, resp.body), (503, Some(json!({ "status": "waiting" }))));
     }
 
     #[tokio::test]
