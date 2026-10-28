@@ -108,6 +108,7 @@ check:
     scripts/tests/compose-overlay-equiv.sh
     scripts/tests/compose-secret-boundary.sh
     scripts/tests/compose-no-fixed-secrets.sh
+    scripts/tests/compose-zitadel-internal.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     just deny

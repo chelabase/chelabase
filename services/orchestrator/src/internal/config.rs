@@ -58,6 +58,9 @@ pub struct InternalConfig {
     pub zitadel_admin_pat_file: Option<PathBuf>,
     /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
+    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
+    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
+    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
 }
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
@@ -85,6 +88,7 @@ impl InternalConfig {
                 .map_err(|e| anyhow!(e))?
                 .unwrap_or_else(|| default.to_string()))
         };
+        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
         Ok(Self {
             addr: or("CHELABASE_INTERNAL_ADDR", "127.0.0.1:8083")
                 .parse()
@@ -134,8 +138,12 @@ impl InternalConfig {
             zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
-            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
+            zitadel_at: zitadel_issuer
+                .as_deref()
+                .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
+                .transpose()
                 .map_err(anyhow::Error::new)?,
+            zitadel_issuer,
         })
     }
 
@@ -180,7 +188,11 @@ impl InternalConfig {
         };
         match std::fs::read_to_string(file) {
             Ok(pat) if !pat.trim().is_empty() => {
-                Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim()))
+                let at = self.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
+                    base: issuer.clone(),
+                    host: None,
+                });
+                Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
             }
             Ok(_) => {
                 tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty");
@@ -293,6 +305,7 @@ impl std::fmt::Debug for InternalConfig {
             .field("dev_defaults", &self.dev_defaults)
             .field("zitadel_admin_pat_file", &self.zitadel_admin_pat_file)
             .field("zitadel_issuer", &self.zitadel_issuer)
+            .field("zitadel_at", &self.zitadel_at)
             .finish()
     }
 }
@@ -810,6 +823,35 @@ mod tests {
             ..InternalConfig::from_lookup(|_| None).unwrap()
         };
         assert!(c.load_signer().is_ok());
+    }
+
+    // #24: the session-deleting client goes in-network with the auth host as Host; the
+    // issuer stays the public one.
+    #[test]
+    fn zitadel_is_reached_at_the_in_network_url() {
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_PUBLIC_SCHEME" => Some("https".into()),
+            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
+            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(
+            c.zitadel_at,
+            Some(chelabase_types::entry::ZitadelAt {
+                base: "http://zitadel:8080".into(),
+                host: Some("auth.example.com".into()),
+            })
+        );
+        let err = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
+            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080/x".into()),
+            _ => None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
     }
 
     #[test]

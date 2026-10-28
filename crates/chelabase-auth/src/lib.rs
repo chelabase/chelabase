@@ -76,8 +76,12 @@ impl Audiences {
 pub struct ZitadelAuthConfig {
     /// OIDC issuer URL, e.g. `http://auth.chelabase.localhost:8000`.
     pub issuer: String,
-    /// JWKS URL (usually `{issuer}/oauth/v2/keys`).
+    /// JWKS URL (usually `{issuer}/oauth/v2/keys`). Only where the keys are fetched: a token's
+    /// `iss` is always checked against [`Self::issuer`].
     pub jwks_url: String,
+    /// The `Host` the key fetch carries, when `jwks_url` is Zitadel's in-network address
+    /// (`CHELABASE_ZITADEL_INTERNAL_URL`, #24): the public auth host. `None`: the URL's own.
+    pub jwks_host: Option<String>,
     /// The audiences a token must name one of (the project id and the API app's client id).
     pub audiences: Audiences,
 }
@@ -87,20 +91,29 @@ impl ZitadelAuthConfig {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    /// The issuer comes from `CHELABASE_AUTH_HOST` (and the public scheme); the JWKS URL from
-    /// `CHELABASE_ZITADEL_JWKS_URL`, else `{issuer}/oauth/v2/keys`.
+    /// The issuer comes from `CHELABASE_AUTH_HOST` (and the public scheme), and nothing else.
+    /// The JWKS URL: `CHELABASE_ZITADEL_JWKS_URL` (fetched as it is), else
+    /// `{CHELABASE_ZITADEL_INTERNAL_URL}/oauth/v2/keys` with the auth host as `Host` (#24: behind
+    /// a TLS proxy the public URL isn't reachable inside the network), else
+    /// `{issuer}/oauth/v2/keys`. A malformed internal URL refuses the config.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, AuthError> {
         let issuer = chelabase_types::entry::issuer_from_lookup(&get)
             .map_err(|e| AuthError::Config(e.to_string()))?
             .ok_or_else(|| AuthError::Config("CHELABASE_AUTH_HOST is not set".into()))?;
-        let jwks_url = get("CHELABASE_ZITADEL_JWKS_URL")
+        let zitadel = chelabase_types::entry::zitadel_at(&get, &issuer)
+            .map_err(|e| AuthError::Config(e.to_string()))?;
+        let (jwks_url, jwks_host) = match get("CHELABASE_ZITADEL_JWKS_URL")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| format!("{issuer}/oauth/v2/keys"));
+        {
+            Some(url) => (url, None),
+            None => (format!("{}/oauth/v2/keys", zitadel.base), zitadel.host),
+        };
         let audiences = audiences_from_lookup(&get)?;
         Ok(Self {
             issuer,
             jwks_url,
+            jwks_host,
             audiences,
         })
     }
@@ -243,6 +256,8 @@ impl JwtVerifier {
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_issuer(std::slice::from_ref(&self.config.issuer));
+        // `set_issuer` only checks an `iss` that is there: a token must carry one (#24).
+        validation.set_required_spec_claims(&["exp", "iss"]);
         validation.validate_aud = false;
         validation.leeway = 60;
 
@@ -275,9 +290,11 @@ impl JwtVerifier {
     }
 
     async fn refresh_jwks(&self) -> Result<(), AuthError> {
-        let body: JwksResponse = self
-            .http
-            .get(&self.config.jwks_url)
+        let mut request = self.http.get(&self.config.jwks_url);
+        if let Some(host) = &self.config.jwks_host {
+            request = request.header(reqwest::header::HOST, host);
+        }
+        let body: JwksResponse = request
             .send()
             .await
             .map_err(|e| AuthError::Jwks(e.to_string()))?
@@ -611,6 +628,7 @@ pub mod test_support {
             ZitadelAuthConfig {
                 issuer: self.issuer.clone(),
                 jwks_url: self.jwks_url.clone(),
+                jwks_host: None,
                 audiences: audiences.into(),
             }
         }

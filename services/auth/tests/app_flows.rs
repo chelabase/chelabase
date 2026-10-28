@@ -185,6 +185,7 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
     let config = Config {
         listen: String::new(),
         issuer: mock.base.clone(),
+        zitadel: chelabase_types::entry::ZitadelAt { base: mock.base.clone(), host: None },
         token: TOKEN.into(),
         cookie_key: SecretKey::generate(),
         org_id: "o1".into(),

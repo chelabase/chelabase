@@ -40,6 +40,14 @@ CHELABASE_PUBLIC_SCHEME=https
 
 `CHELABASE_PUBLIC_SCHEME` is `http` or `https` (case does not matter) and defaults to `https`; a blank value is `https` too. It decides the scheme of every URL Chelabase builds (Studio's origin, the API base, the issuer) and the `X-Forwarded-Proto` the gateway sends to the services. Session cookies are marked Secure exactly when it is `https`, in every mode; `CHELABASE_AUTH_SECURE_COOKIES` overrides that, and auth logs a warning at startup when it turns Secure off under `https`. Use `http` only for local work: platform mode refuses to start with it.
 
+### Calls to Zitadel inside the network
+
+With TLS in front, the public auth URL (`https://auth.acme.com`) only works from outside: inside the network nothing speaks TLS. So the services never call it. The gateway, realtime and the orchestrator fetch Zitadel's signing keys, and auth, the orchestrator and the worker call its API, at `CHELABASE_ZITADEL_INTERNAL_URL` (the Compose install sets `http://zitadel:8080`), in plain HTTP with the auth host as the `Host` header, which is how Zitadel picks its instance.
+
+Where the keys come from doesn't change which tokens pass: a token's `iss` must still be the public issuer exactly (`https://auth.acme.com`), and a token without one is refused. If the keys can't be fetched, every token is refused until they can.
+
+`CHELABASE_ZITADEL_INTERNAL_URL` is an origin only, `http(s)://host[:port]`: a path, query, fragment or credentials make the service refuse to start. Unset, the services call the issuer itself, which is right when the services reach the public URL directly (local work over plain HTTP).
+
 ### Behind a reverse proxy
 
 <Callout type="warn">
@@ -64,6 +72,8 @@ What to do:
 | `CHELABASE_GATEWAY_LISTEN` | `127.0.0.1:8000` | Where the gateway listens: a comma-separated list of `ip:port` addresses, IPv6 in brackets (`127.0.0.1:8000,[::1]:8000`) |
 | `CHELABASE_STUDIO_UPSTREAM` | `http://127.0.0.1:3000` | Where the gateway reaches Studio |
 | `CHELABASE_ZITADEL_UPSTREAM` | `http://127.0.0.1:8080` | Where it reaches Zitadel |
+| `CHELABASE_ZITADEL_INTERNAL_URL` | unset (Compose: `http://zitadel:8080`) | Where the other services reach Zitadel, with the auth host as `Host` ([above](#calls-to-zitadel-inside-the-network)); unset, at the issuer |
+| `CHELABASE_ZITADEL_JWKS_URL` | unset | Fetch the signing keys from exactly this URL instead (wins over `CHELABASE_ZITADEL_INTERNAL_URL` for the keys; no `Host` is added) |
 | `CHELABASE_DOCS_UPSTREAM` | `http://127.0.0.1:3001` | The docs site (used only with a docs host) |
 | `CHELABASE_LANDING_UPSTREAM` | `http://127.0.0.1:3002` | The landing page (used only with a landing host) |
 | `CHELABASE_MAIL_UPSTREAM` | `http://127.0.0.1:8025` | Mailpit (used only with a mail host) |

@@ -64,6 +64,9 @@ pub struct WorkerConfig {
     pub roles: RoleSettings,
     /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
+    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
+    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
+    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
     /// session deletes). Read by [`build`].
     pub zitadel_admin_pat_file: Option<PathBuf>,
@@ -135,6 +138,12 @@ impl WorkerConfig {
             Some("true" | "1" | "yes")
         );
         let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
+        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
+        let zitadel_at = zitadel_issuer
+            .as_deref()
+            .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
+            .transpose()
+            .map_err(anyhow::Error::new)?;
         let config = Self {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
@@ -157,8 +166,8 @@ impl WorkerConfig {
             policy: ModePolicy::new(mode),
             owner_superuser_requested,
             roles,
-            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
-                .map_err(anyhow::Error::new)?,
+            zitadel_issuer,
+            zitadel_at,
             zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .map(PathBuf::from),
             app_users_reconcile_every: reconcile_every(
@@ -366,7 +375,11 @@ pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client
     };
     match std::fs::read_to_string(file) {
         Ok(pat) if !pat.trim().is_empty() => {
-            Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim()))
+            let at = config.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
+                base: issuer.clone(),
+                host: None,
+            });
+            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
         }
         Ok(_) => {
             tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty: app users jobs wait until it's set");
@@ -730,6 +743,7 @@ mod tests {
             owner_superuser_requested: _,
             roles: _,
             zitadel_issuer: _,
+            zitadel_at: _,
             zitadel_admin_pat_file,
             app_users_reconcile_every: _,
             member_roles_sweep_every: _,
@@ -1028,6 +1042,35 @@ mod tests {
         }
         let err = with("maybe").unwrap_err().to_string();
         assert!(err.contains(VAR), "{err}");
+    }
+
+    // #24: the app users jobs reach Zitadel in-network with the auth host as Host; the issuer
+    // stays the public one.
+    #[test]
+    fn zitadel_is_reached_at_the_in_network_url() {
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_PUBLIC_SCHEME", "https"),
+            ("CHELABASE_AUTH_HOST", "auth.example.com"),
+            ("CHELABASE_ZITADEL_INTERNAL_URL", "http://zitadel:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(
+            c.zitadel_at,
+            Some(chelabase_types::entry::ZitadelAt {
+                base: "http://zitadel:8080".into(),
+                host: Some("auth.example.com".into()),
+            })
+        );
+        let err = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_AUTH_HOST", "auth.example.com"),
+            ("CHELABASE_ZITADEL_INTERNAL_URL", "ftp://zitadel"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
     }
 
     /// Both settings and a readable file give a client; anything less gives none.

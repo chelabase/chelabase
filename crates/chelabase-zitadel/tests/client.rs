@@ -669,3 +669,30 @@ async fn user_is_gone_only_on_not_found() {
     mock.set_down(true);
     assert!(z.user_is_gone(&other).await.is_err());
 }
+
+// #24: an app reaches Zitadel at its in-network address with the public auth host as `Host`
+// (Zitadel picks its instance by Host), as the bootstrap does.
+#[tokio::test]
+async fn a_client_at_an_in_network_address_names_the_auth_host() {
+    use axum::{http::HeaderMap, http::StatusCode, Router};
+    use std::sync::{Arc, Mutex};
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |headers: HeaderMap| {
+        let record = record.clone();
+        async move {
+            let host = headers.get("host").and_then(|h| h.to_str().ok()).unwrap_or("").to_string();
+            record.lock().unwrap().push(host);
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let z = Zitadel::new(&format!("http://{addr}"), TOKEN).with_host(Some("auth.example.com"));
+    assert!(matches!(z.auth_request("V2_1").await, Err(ZError::Unavailable(_))));
+    let plain = Zitadel::new(&format!("http://{addr}"), TOKEN).with_host(None);
+    assert!(matches!(plain.auth_request("V2_1").await, Err(ZError::Unavailable(_))));
+    assert_eq!(*seen.lock().unwrap(), vec!["auth.example.com".to_string(), addr.to_string()]);
+}

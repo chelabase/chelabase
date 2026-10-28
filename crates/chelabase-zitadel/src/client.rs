@@ -84,6 +84,8 @@ const SESSION_PAGE: u32 = 100;
 pub struct Zitadel {
     http: reqwest::Client,
     base: String,
+    /// The `Host` every call carries, when `base` is Zitadel's in-network address (#24).
+    host: Option<String>,
     token: String,
 }
 
@@ -176,8 +178,17 @@ impl Zitadel {
                 .build()
                 .expect("reqwest client"),
             base: base.trim_end_matches('/').to_string(),
+            host: None,
             token: token.to_string(),
         }
+    }
+
+    /// Every call carries `host` as its `Host` (Zitadel picks its instance by Host): set when
+    /// `base` is Zitadel's in-network address rather than the public auth URL (#24, see
+    /// `chelabase_types::entry::zitadel_at`). `None` keeps the base URL's own.
+    pub fn with_host(mut self, host: Option<&str>) -> Self {
+        self.host = host.map(str::to_string);
+        self
     }
 
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, ZError> {
@@ -185,6 +196,9 @@ impl Zitadel {
             .http
             .request(method, format!("{}{path}", self.base))
             .bearer_auth(&self.token);
+        if let Some(host) = &self.host {
+            request = request.header(reqwest::header::HOST, host);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }

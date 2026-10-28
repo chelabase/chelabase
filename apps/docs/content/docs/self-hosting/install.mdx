@@ -103,7 +103,24 @@ CHELABASE_PUBLIC_PORT=9000
 
 Change the hosts before the first `up`. Zitadel's issuer is derived from the auth host and the scheme and is signed into tokens.
 
-For a real domain with TLS in front of the gateway, see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front.
+For a real domain with TLS terminated by your proxy in front of the gateway, the hosts carry no port and the public port is 443:
+
+```bash
+CHELABASE_PUBLIC_SCHEME=https
+CHELABASE_STUDIO_HOST=studio.acme.com
+CHELABASE_API_HOST=api.acme.com
+CHELABASE_AUTH_HOST=auth.acme.com
+CHELABASE_STUDIO_HOST_NAME=studio.acme.com
+CHELABASE_API_HOST_NAME=api.acme.com
+CHELABASE_AUTH_HOST_NAME=auth.acme.com
+CHELABASE_PUBLIC_PORT=443
+CHELABASE_PUBLIC_SECURE=true
+CHELABASE_ZITADEL_TLS_MODE=external
+CHELABASE_HTTP_ADDR=0.0.0.0
+CHELABASE_HTTP_PORT=8000
+```
+
+Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network, they reach Zitadel directly (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
 
 ### Email (SMTP)
 
@@ -152,7 +169,6 @@ The secrets, the database volumes and the claim carry over; `init-secrets` creat
 
 ## Known limitations
 
-- **HTTPS in front with no port in the hosts.** The install does not yet cover TLS terminated by a proxy in front of the gateway when the hosts carry no port ([chelabase/chelabase#24](https://github.com/chelabase/chelabase/issues/24)). Until that is fixed, expect to set the host-related lines by hand and check the result.
 - **No secret rotation** ([chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)).
 - **Per-IP limits behind a reverse proxy** are shared by every client; see [Hosts](/docs/self-hosting/hosts#behind-a-reverse-proxy).
 - The install is Docker Compose only. Kubernetes is not covered.
