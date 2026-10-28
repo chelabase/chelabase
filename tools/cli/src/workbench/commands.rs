@@ -269,30 +269,49 @@ pub fn stale_apps(recorded: &HashMap<String, u64>, current: &HashMap<String, u64
     stale
 }
 
-/// The apps `up` recreates before the bootstrap: on a running stack, every app whose binary
-/// changed since it started (a stack that wasn't running starts them all on the current one).
+/// The apps the bootstrap waits on: the orchestrator (it applies the metadata migrations and
+/// is the Actions target's host). None of them may need a file only the bootstrap writes
+/// (the orchestrator starts without demo.env and actions.env), since they are waited on first.
+pub const BOOTSTRAP_DEPENDENCIES: &[&str] = &["orchestrator"];
+
+/// The apps `up` recreates before the bootstrap (B3, B4): on a running stack, those of
+/// [`BOOTSTRAP_DEPENDENCIES`] whose binary changed since they started, so the bootstrap never
+/// waits on an old build. No other app: one that reads the bootstrap's files (auth needs
+/// demo.env's org id) can't become healthy before it has run, so it is recreated after it
+/// ([`recreate_after_bootstrap`]). A stack that wasn't running starts every app on its current
+/// binary.
 pub fn recreate_before_bootstrap(
     was_running: bool,
     recorded: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
 ) -> Vec<String> {
-    if was_running {
-        stale_apps(recorded, current)
-    } else {
-        Vec::new()
+    if !was_running {
+        return Vec::new();
     }
+    stale_apps(recorded, current)
+        .into_iter()
+        .filter(|a| BOOTSTRAP_DEPENDENCIES.contains(&a.as_str()))
+        .collect()
 }
 
-/// What `up` recreates on a running stack: the apps whose binary changed since their start plus
-/// the readers of changed env files, sorted and deduped (T5 review I2). `up` now recreates the
-/// two around the bootstrap ([`recreate_before_bootstrap`], then the env readers).
-#[cfg(test)]
-pub fn up_recreates(
+/// The apps `up` recreates after the bootstrap: on a running stack, every app whose binary
+/// changed and that wasn't recreated before it (`rebuilt`), and on any stack every reader of
+/// an env file the bootstrap changed (`env_changed`), sorted and deduped.
+pub fn recreate_after_bootstrap(
+    was_running: bool,
     recorded: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
+    rebuilt: &[String],
     env_changed: &[String],
 ) -> Vec<String> {
-    let mut apps = stale_apps(recorded, current);
+    let mut apps: Vec<String> = if was_running {
+        stale_apps(recorded, current)
+            .into_iter()
+            .filter(|a| !rebuilt.contains(a))
+            .collect()
+    } else {
+        Vec::new()
+    };
     apps.extend(env_changed.iter().cloned());
     apps.sort();
     apps.dedup();
@@ -966,13 +985,10 @@ fn start_stack(
         remove_computes_off_network(&stack.slug, &super::env::compute_network(&stack.project))
     })?;
 
-    // An app on its old binary (compose leaves a running container as it is) must not be what
-    // the bootstrap waits on: an old orchestrator never applies a new migration (B3).
-    let rebuilt = recreate_before_bootstrap(
-        was_running,
-        &read_binaries(stack),
-        &current_binaries(stack, &RUST_APPS),
-    );
+    // What the bootstrap waits on must not run an old binary: an old orchestrator never
+    // applies a new migration (B3). Only that: the rest may need the bootstrap's files (B4).
+    let (recorded, current) = (read_binaries(stack), current_binaries(stack, &RUST_APPS));
+    let rebuilt = recreate_before_bootstrap(was_running, &recorded, &current);
     if !rebuilt.is_empty() {
         phases.run(&format!("recreating {} (new binaries)", rebuilt.join(", ")), || {
             recreate(stack, &rebuilt)
@@ -983,8 +999,15 @@ fn start_stack(
     // Actions target's host) itself.
     phases.run("bootstrap", || bootstrap(stack, None))?;
 
-    // Then only what the bootstrap's files changed: every app container predates them.
-    let stale = changed_env_users(&before_bootstrap, &app_env_files(stack));
+    // Then every other app on a new binary, and the readers of the files the bootstrap changed
+    // (every app container predates them).
+    let stale = recreate_after_bootstrap(
+        was_running,
+        &recorded,
+        &current,
+        &rebuilt,
+        &changed_env_users(&before_bootstrap, &app_env_files(stack)),
+    );
     if !stale.is_empty() {
         phases.run(&format!("recreating {}", stale.join(", ")), || {
             recreate(stack, &stale)
@@ -1112,15 +1135,52 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
     run(cmd)
 }
 
-/// `compose [profiles] up -d --wait <services>`; on failure shows `ps` and the failing
-/// services' last 50 log lines.
+/// How long any `compose up --wait` in `up` waits for its services to be healthy.
+pub const WAIT_SECS: u64 = 600;
+
+/// `--wait --wait-timeout <WAIT_SECS>`: no wait in `up` is unbounded.
+pub fn wait_args() -> Vec<String> {
+    vec!["--wait".into(), "--wait-timeout".into(), WAIT_SECS.to_string()]
+}
+
+/// The error of a wait that failed or timed out, naming the services that never became healthy.
+pub fn never_healthy(services: &[String]) -> String {
+    if services.is_empty() {
+        format!("the services didn't become healthy within {WAIT_SECS}s")
+    } else {
+        format!(
+            "{} never became healthy (waited up to {WAIT_SECS}s)",
+            services.join(", ")
+        )
+    }
+}
+
+/// Runs a waiting `compose` call; on failure shows `ps` and the failing services' last 50 log
+/// lines, and names them in the error.
+fn run_waiting(stack: &Stack, args: &[String]) -> anyhow::Result<()> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    stack.compose_run(&refs).map_err(|e| {
+        show_failure(stack);
+        let failed = stack
+            .compose_output(&["--profile", "sites", "ps", "-a", "--format", "json"])
+            .map(|json| failed_services(&json))
+            .unwrap_or_default();
+        e.context(never_healthy(&failed))
+    })
+}
+
+/// `[profiles] up -d --wait --wait-timeout … <services>`.
+pub fn compose_up_args(profiles: &[&str], services: &[&str]) -> Vec<String> {
+    let mut args: Vec<String> = profiles.iter().map(|s| s.to_string()).collect();
+    args.extend(["up".to_string(), "-d".to_string()]);
+    args.extend(wait_args());
+    args.extend(services.iter().map(|s| s.to_string()));
+    args
+}
+
+/// `compose [profiles] up -d --wait <services>`, bounded by [`WAIT_SECS`].
 fn compose_up(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow::Result<()> {
-    let mut args: Vec<&str> = profiles.to_vec();
-    args.extend(["up", "-d", "--wait"]);
-    args.extend_from_slice(services);
-    stack
-        .compose_run(&args)
-        .inspect_err(|_| show_failure(stack))
+    run_waiting(stack, &compose_up_args(profiles, services))
 }
 
 /// `compose [profiles] up -d <services>`, not waiting for them to be healthy.
@@ -1133,7 +1193,7 @@ fn compose_start(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow:
         .inspect_err(|_| show_failure(stack))
 }
 
-/// `compose up -d --force-recreate --no-deps --wait <apps>`: env files are read when a container
+/// `compose up -d --force-recreate --no-deps --wait <apps>` (bounded by [`WAIT_SECS`]): env files are read when a container
 /// is created, so a restart would keep the old ones (T4 review M3). The Zitadel PATs are Compose
 /// secrets of the apps that read them: a missing one (Zitadel rewriting them after `just
 /// zitadel-reset`) would fail the create, so it first waits for them, as `up` does.
@@ -1143,19 +1203,17 @@ fn recreate(stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
         wait_for_files(&pats, Duration::from_secs(180))?;
         secure_pats(&pats)?;
     }
-    let mut args = vec![
-        "--profile",
-        "sites",
-        "up",
-        "-d",
-        "--force-recreate",
-        "--no-deps",
-        "--wait",
-    ];
-    args.extend(apps.iter().map(String::as_str));
-    stack
-        .compose_run(&args)
-        .inspect_err(|_| show_failure(stack))
+    run_waiting(stack, &recreate_args(apps))
+}
+
+/// `--profile sites up -d --force-recreate --no-deps --wait --wait-timeout … <apps>`.
+pub fn recreate_args(apps: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = ["--profile", "sites", "up", "-d", "--force-recreate", "--no-deps"]
+        .map(str::to_string)
+        .to_vec();
+    args.extend(wait_args());
+    args.extend(apps.iter().cloned());
+    args
 }
 
 fn show_failure(stack: &Stack) {
@@ -2125,23 +2183,65 @@ mod tests {
     // The workbench's one bootstrap: `chelabase-init bootstrap --demo` on the stack network,
     // with its binary read-only and the output dir the only writable mount (no docker socket,
     // no keys dir), and the env it reads taken from the stack env.
-    // B3 (live, `up` on an existing stack): an app whose binary changed is recreated before
-    // the bootstrap waits on it. An orchestrator left on its old binary never applies a new
-    // migration, and the bootstrap waited on it until its deadline.
+    // B3 (live, `up` on an existing stack): the app the bootstrap waits on is recreated on its
+    // new binary first; an orchestrator left on its old binary never applies a new migration.
+    // B4: and only that app. A fresh stack whose first `up` failed has no binaries.json, so
+    // every app is "stale"; recreating `auth` (it needs demo.env's org id) and waiting on it
+    // before the bootstrap writes demo.env never ends.
     #[test]
-    fn an_app_whose_binary_changed_is_recreated_before_the_bootstrap() {
+    fn the_pre_bootstrap_recreate_waits_on_no_bootstrap_reader() {
+        let current: HashMap<String, u64> = RUST_APPS.iter().map(|a| (a.to_string(), 2)).collect();
+        let rebuilt = recreate_before_bootstrap(true, &HashMap::new(), &current);
+        assert_eq!(rebuilt, ["orchestrator"], "recreated and waited on before demo.env: {rebuilt:?}");
         let map = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
             pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
         };
         let recorded = map(&[("orchestrator", 1), ("worker", 1), ("auth", 1)]);
-        let current = map(&[("orchestrator", 2), ("worker", 1), ("auth", 1), ("rest", 1)]);
-        assert_eq!(
-            recreate_before_bootstrap(true, &recorded, &current),
-            ["orchestrator", "rest"]
-        );
+        let changed = map(&[("orchestrator", 2), ("worker", 1), ("auth", 1), ("rest", 1)]);
+        assert_eq!(recreate_before_bootstrap(true, &recorded, &changed), ["orchestrator"]);
+        assert!(recreate_before_bootstrap(true, &map(&[("rest", 1)]), &map(&[("rest", 2)])).is_empty());
         // A stack that wasn't running starts every app on its current binary.
-        assert!(recreate_before_bootstrap(false, &recorded, &current).is_empty());
-        assert!(recreate_before_bootstrap(true, &current, &current).is_empty());
+        assert!(recreate_before_bootstrap(false, &recorded, &changed).is_empty());
+    }
+
+    // B4: after the bootstrap, every other app on a new binary, and every reader of an env file
+    // the bootstrap changed (auth once demo.env appears), the orchestrator again only when its
+    // env changed.
+    #[test]
+    fn the_bootstrap_readers_are_recreated_after_it() {
+        let current: HashMap<String, u64> = RUST_APPS.iter().map(|a| (a.to_string(), 2)).collect();
+        let rebuilt = vec!["orchestrator".to_string()];
+        let demo_readers: Vec<String> = DEMO_ENV_READERS.iter().map(|a| a.to_string()).collect();
+        let after = recreate_after_bootstrap(true, &HashMap::new(), &current, &rebuilt, &demo_readers);
+        for app in RUST_APPS {
+            assert!(after.contains(&app.to_string()), "{app} not recreated: {after:?}");
+        }
+        let after = recreate_after_bootstrap(true, &HashMap::new(), &current, &rebuilt, &[]);
+        assert!(!after.contains(&"orchestrator".to_string()), "recreated twice: {after:?}");
+        assert!(after.contains(&"auth".to_string()));
+        // A fresh stack: only what the bootstrap's files changed.
+        assert_eq!(
+            recreate_after_bootstrap(false, &HashMap::new(), &current, &[], &["studio".to_string()]),
+            ["studio"]
+        );
+    }
+
+    // B4: every wait in `up` has a deadline.
+    #[test]
+    fn every_up_wait_is_bounded() {
+        let wait = wait_args();
+        assert_eq!(wait[0], "--wait");
+        assert_eq!(wait[1], "--wait-timeout");
+        assert!(wait[2].parse::<u64>().unwrap() > 0);
+        for args in [
+            compose_up_args(&[], &["orchestrator"]),
+            recreate_args(&["auth".to_string()]),
+        ] {
+            let i = args.iter().position(|a| a == "--wait").expect("waits");
+            assert_eq!(args[i + 1], "--wait-timeout", "{args:?}");
+        }
+        let msg = never_healthy(&["auth".to_string(), "rest".to_string()]);
+        assert!(msg.contains("auth, rest") && msg.contains("never became healthy"), "{msg}");
     }
 
     // N1: no value reaches `docker run`'s argv (host `ps`, `docker inspect` of the command):

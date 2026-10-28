@@ -265,6 +265,10 @@ pub async fn deactivate_human_admins(api: &impl ZitadelApi) -> Result<Vec<String
         let user = api
             .rest(Method::GET, &format!("/v2/users/{id}"), Value::Null)
             .await?;
+        // A member whose listing gave no type: its user record says. Only a machine is kept.
+        if user.pointer("/user/machine").is_some() {
+            continue;
+        }
         let state = user.pointer("/user/state").and_then(Value::as_str);
         if state == Some(USER_INACTIVE) {
             continue;
@@ -302,7 +306,7 @@ impl Smtp {
 const MAILPIT: &str = "mailpit:1025";
 
 /// The settings an SMTP listing shows, compared with what is wanted (the password is never
-/// listed: see [`smtp_password_digest`]).
+/// listed: see [`smtp_password_record`]).
 const SMTP_FIELDS: [&str; 5] = ["senderAddress", "senderName", "user", "tls", "description"];
 
 /// The fields of `listed` (one listed configuration) that differ from `payload`. Zitadel
@@ -319,11 +323,30 @@ pub fn smtp_drift(listed: &Value, payload: &Value) -> Vec<&'static str> {
         .collect()
 }
 
-/// What the output dir keeps of the SMTP password last sent to configuration `id`: a digest,
-/// never the password.
-pub fn smtp_password_digest(id: &str, password: &str) -> String {
+/// What the output dir keeps of the SMTP password last sent to configuration `id`: never the
+/// password, but `<salt>:<SHA-256 of salt, id and password>`, with a random 32-byte salt per
+/// install, made when the file is first written and kept in the same 0600 file. A salt (rather
+/// than an HMAC keyed by an m1 secret) because the bootstrap reads no m1 secret and this needs
+/// none: the record only tells "same password as last time". It still lets whoever reads the
+/// file test guesses against a weak password, one install at a time.
+pub fn smtp_password_record(salt: &str, id: &str, password: &str) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(format!("chelabase-smtp\0{id}\0{password}")))
+    let digest = hex::encode(Sha256::digest(format!(
+        "chelabase-smtp\0{salt}\0{id}\0{password}"
+    )));
+    format!("{salt}:{digest}")
+}
+
+/// The record for `password` with this install's salt: the stored one's, or a new one.
+fn smtp_record_for(out: &Outputs, id: &str, password: &str) -> Result<(String, Option<String>)> {
+    let stored = out.read_value(outputs::SMTP_PASSWORD_DIGEST)?;
+    let salt = stored
+        .as_deref()
+        .and_then(|r| r.split_once(':'))
+        .map(|(salt, _)| salt.to_string())
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+        .unwrap_or_else(|| hex::encode(crate::random::bytes::<32>()));
+    Ok((smtp_password_record(&salt, id, password), stored))
 }
 
 /// Keeps `smtp` Zitadel's active SMTP configuration: created when no configuration has its
@@ -364,8 +387,8 @@ pub async fn ensure_smtp(api: &impl ZitadelApi, smtp: &Smtp, out: &Outputs) -> R
                     .await?;
                 info!(?drift, "updated SMTP {}", smtp.host);
             }
-            let digest = smtp_password_digest(&id, &password);
-            if out.read_value(outputs::SMTP_PASSWORD_DIGEST)?.as_deref() != Some(digest.as_str()) {
+            let (digest, stored) = smtp_record_for(out, &id, &password)?;
+            if stored.as_deref() != Some(digest.as_str()) {
                 api.rest(
                     Method::PUT,
                     &format!("/admin/v1/smtp/{id}/password"),
@@ -390,7 +413,7 @@ pub async fn ensure_smtp(api: &impl ZitadelApi, smtp: &Smtp, out: &Outputs) -> R
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .context("create SMTP: no id in the answer")?;
-            let digest = smtp_password_digest(&id, &password);
+            let (digest, _) = smtp_record_for(out, &id, &password)?;
             out.write_secret(
                 outputs::SMTP_PASSWORD_DIGEST,
                 format!("{digest}\n").as_bytes(),
@@ -732,7 +755,7 @@ mod tests {
         let (_dir, out) = out_dir();
         out.write_secret(
             outputs::SMTP_PASSWORD_DIGEST,
-            format!("{}\n", smtp_password_digest("s1", "chelabase")).as_bytes(),
+            format!("{}\n", smtp_password_record(&"a".repeat(64), "s1", "chelabase")).as_bytes(),
         )
         .unwrap();
         ensure_smtp(&fake, &Smtp::mailpit(), &out).await.unwrap();
@@ -938,6 +961,26 @@ mod tests {
             .await
             .unwrap();
         assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    // N5: the stored SMTP password digest is salted per install: the same password and
+    // configuration id give different files, and neither is the bare SHA-256.
+    #[tokio::test]
+    async fn the_smtp_password_digest_is_salted_per_install() {
+        use sha2::{Digest, Sha256};
+        let mut files = Vec::new();
+        for _ in 0..2 {
+            let fake = Fake::default()
+                .with("POST /admin/v1/smtp/_search", json!({"result": []}))
+                .with("POST /admin/v1/smtp", json!({"id": "s9"}))
+                .with("POST /admin/v1/smtp/s9/_activate", json!({}));
+            let (dir, out) = out_dir();
+            ensure_smtp(&fake, &Smtp::mailpit(), &out).await.unwrap();
+            files.push(std::fs::read_to_string(dir.path().join(outputs::SMTP_PASSWORD_DIGEST)).unwrap());
+        }
+        assert_ne!(files[0], files[1], "unsalted: {files:?}");
+        let bare = hex::encode(Sha256::digest("chelabase-smtp\0s9\0chelabase"));
+        assert!(!files.iter().any(|f| f.contains(&bare)), "{files:?}");
     }
 
     #[tokio::test]

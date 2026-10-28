@@ -254,8 +254,9 @@ pub fn machine_user_search(username: &str) -> Value {
     json!({"queries": [{"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
 }
 
-/// The human members of an IAM member listing (`POST /admin/v1/members/_search`), how many
-/// members it listed, and how many it says exist.
+/// The members of an IAM member listing (`POST /admin/v1/members/_search`) that may be human:
+/// all but an explicit `TYPE_MACHINE` (a missing or unknown type is checked, not skipped: the
+/// caller reads the user to tell), how many members it listed, and how many it says exist.
 pub fn iam_humans_from(listed: &Value) -> (Vec<String>, u64, u64) {
     let members: Vec<&Value> = listed
         .get("result")
@@ -265,7 +266,7 @@ pub fn iam_humans_from(listed: &Value) -> (Vec<String>, u64, u64) {
         .collect();
     let humans = members
         .iter()
-        .filter(|m| m.get("userType").and_then(Value::as_str) == Some("TYPE_HUMAN"))
+        .filter(|m| m.get("userType").and_then(Value::as_str) != Some("TYPE_MACHINE"))
         .filter_map(|m| m.get("userId").and_then(Value::as_str).map(str::to_string))
         .collect();
     let count = members.len() as u64;

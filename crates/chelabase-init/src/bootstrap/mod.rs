@@ -45,7 +45,7 @@
 //! | `actions-signing-key` | the Actions webhook's signing key | 0600 |
 //! | `demo-user-id` | `--demo`: the demo machine user | 0644 |
 //! | `demo-sa.json` | `--demo`: the demo machine user's key file | 0600 |
-//! | `smtp-password.sha256` | a digest of the SMTP password last sent (never the password) | 0600 |
+//! | `smtp-password.sha256` | a salted digest of the SMTP password last sent (never the password) | 0600 |
 //!
 //! It never creates a key or a secret of its own: `chelabase-init secrets` makes those.
 //!
