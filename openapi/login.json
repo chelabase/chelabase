@@ -1360,6 +1360,47 @@
         }
       }
     },
+    "/auth/v1/instance": {
+      "get": {
+        "tags": [
+          "login"
+        ],
+        "description": "Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.",
+        "operationId": "getInstance",
+        "responses": {
+          "200": {
+            "description": "The instance's sign-up state",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstanceInfo"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too many attempts: `rate_limited`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The sign-up gate is unavailable: `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/auth/v1/invite": {
       "post": {
         "tags": [
@@ -1925,7 +1966,7 @@
             }
           },
           "403": {
-            "description": "Sign-up is closed for this instance (`sign_up_closed`), or not available in platform mode (`not_available_in_platform_mode`)",
+            "description": "Sign-up is closed for this instance (`sign_up_closed`), the unclaimed instance needs its setup code and it is missing or wrong (`setup_code_invalid`; no account is created), or not available in platform mode (`not_available_in_platform_mode`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2431,7 +2472,7 @@
           },
           "signUpAllowed": {
             "type": "boolean",
-            "description": "This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the\nsign-in page may offer \"Create account\". Always `false` in platform mode."
+            "description": "This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a\nsetup code is configured): the sign-in page may offer \"Create account\". Always `false`\nin platform mode."
           }
         }
       },
@@ -2601,6 +2642,7 @@
           "no_access_yet",
           "not_available_in_platform_mode",
           "sign_up_closed",
+          "setup_code_invalid",
           "pending_approval",
           "last_tenant_admin",
           "invite_expired",
@@ -2639,6 +2681,19 @@
         "properties": {
           "error": {
             "$ref": "#/components/schemas/ErrorBody"
+          }
+        }
+      },
+      "InstanceInfo": {
+        "type": "object",
+        "description": "What the sign-up page needs to know about this instance.",
+        "required": [
+          "setupRequired"
+        ],
+        "properties": {
+          "setupRequired": {
+            "type": "boolean",
+            "description": "The instance is unclaimed (its tenant has no member yet): the first sign-up needs the\nsetup code that `chelabase-init secrets` printed. `false` once anyone is in, without a\nconfigured code (then no first sign-up is taken at all), and in platform mode."
           }
         }
       },
@@ -2749,6 +2804,13 @@
           },
           "password": {
             "type": "string"
+          },
+          "setupCode": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The setup code that `chelabase-init secrets` printed: the first sign-up of an unclaimed\ninstance needs it (case and dashes don't matter). Ignored once the instance is claimed."
           }
         }
       },

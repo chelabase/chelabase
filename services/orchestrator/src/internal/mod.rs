@@ -13,6 +13,8 @@ pub mod realtime;
 mod signup;
 mod spec;
 
+pub use signup::{SETUP_NONCE_TTL, SetupCode, load_setup_code};
+
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::http::header::AUTHORIZATION;
@@ -187,6 +189,31 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         zitadel_org_id: &str,
     ) -> impl Future<Output = Result<Option<SignUpFacts>, MetadataError>> + Send;
 
+    /// Stores a claim nonce's SHA-256 for the tenant of this Zitadel org, live for `ttl`;
+    /// `false` when no tenant has the org.
+    fn insert_setup_nonce(
+        &self,
+        zitadel_org_id: &str,
+        nonce_hash: [u8; 32],
+        ttl: std::time::Duration,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// The fresh-install claim of the tenant of this Zitadel org (`None`: no claim, or no
+    /// tenant).
+    fn setup_claim(
+        &self,
+        zitadel_org_id: &str,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::members::SetupClaim>, MetadataError>> + Send;
+
+    /// [`MetadataClient::claim_setup`] for the tenant of this Zitadel org (`None`: no tenant).
+    fn claim_setup(
+        &self,
+        zitadel_org_id: &str,
+        nonce_hash: [u8; 32],
+        zitadel_user_id: &str,
+        replace_stale: Option<&str>,
+    ) -> impl Future<Output = Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError>> + Send;
+
     /// What the open invite of this Zitadel user shows (`None` when it has none).
     fn open_invite_for_user(
         &self,
@@ -224,7 +251,8 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
 pub struct SignUpFacts {
     /// The tenant's open sign-up switch.
     pub open: bool,
-    /// Whether it has an invited or active member.
+    /// Whether it has a member that isn't removed (invited, pending, active or suspended):
+    /// once it has, the fresh-install claim is over.
     pub has_members: bool,
 }
 
@@ -381,6 +409,41 @@ impl NeonMetadataPort for MetadataClient {
             has_members: MetadataClient::tenant_has_members(self, tenant).await?,
         }))
     }
+    async fn insert_setup_nonce(
+        &self,
+        zitadel_org_id: &str,
+        nonce_hash: [u8; 32],
+        ttl: std::time::Duration,
+    ) -> Result<bool, MetadataError> {
+        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+            return Ok(false);
+        };
+        MetadataClient::insert_setup_nonce(self, tenant, nonce_hash, ttl).await?;
+        Ok(true)
+    }
+    async fn setup_claim(
+        &self,
+        zitadel_org_id: &str,
+    ) -> Result<Option<chelabase_metadata::members::SetupClaim>, MetadataError> {
+        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+            return Ok(None);
+        };
+        MetadataClient::setup_claim(self, tenant).await
+    }
+    async fn claim_setup(
+        &self,
+        zitadel_org_id: &str,
+        nonce_hash: [u8; 32],
+        zitadel_user_id: &str,
+        replace_stale: Option<&str>,
+    ) -> Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError> {
+        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+            return Ok(None);
+        };
+        MetadataClient::claim_setup(self, tenant, nonce_hash, zitadel_user_id, replace_stale)
+            .await
+            .map(Some)
+    }
     async fn tenant_by_org(
         &self,
         zitadel_org_id: &str,
@@ -449,6 +512,9 @@ pub struct InternalState<M, L> {
     pub app_jobs: Arc<dyn app::AppJobPort>,
     /// What the mode allows (the sign-up gate answers `platform` when it refuses).
     pub policy: chelabase_types::mode_policy::ModePolicy,
+    /// The setup code a fresh install's first sign-up needs (`CHELABASE_SETUP_CODE_FILE`,
+    /// [`load_setup_code`]); `None` takes no first-member sign-up and binds no claim.
+    pub setup_code: Option<SetupCode>,
     /// Where member logins may come from and which client certificates they present: the
     /// `member_logins` of every compute spec served.
     pub member_logins: chelabase_neon::spec::MemberLogins,
@@ -500,7 +566,8 @@ where
         ));
     let signup_token: Arc<str> = state.app_auth_token.as_str().into();
     let signup = Router::new()
-        .route("/internal/signup/allowed", get(signup::allowed::<M, L>))
+        .route("/internal/signup/check", post(signup::check::<M, L>))
+        .route("/internal/signup/claimed", post(signup::claimed::<M, L>))
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
     let rest_tokens: Arc<[Arc<str>]> =

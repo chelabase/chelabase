@@ -5859,3 +5859,220 @@ async fn deleting_a_team_cascades_and_logs_one_event() {
     assert_eq!(e.target_member_id, None);
     s.finish().await;
 }
+
+// Selfhost-install m3: the fresh-install claim is bound to the account a sign-up with the
+// setup code created (`setup_claims`); `admit_member` is what the orchestrator runs.
+
+/// A fresh setup-claim nonce hash for `t`, live for five minutes.
+async fn setup_nonce(s: &Scratch, t: TenantId) -> [u8; 32] {
+    let hash = *Uuid::new_v4().as_bytes();
+    let mut h = [0u8; 32];
+    h[..16].copy_from_slice(&hash);
+    h[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    s.client
+        .insert_setup_nonce(t, h, std::time::Duration::from_secs(300))
+        .await
+        .unwrap();
+    h
+}
+
+async fn setup_claim_rows(s: &Scratch, t: TenantId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM setup_claims WHERE tenant_id = $1")
+        .bind(t.as_uuid())
+        .fetch_one(s.client.pool())
+        .await
+        .unwrap()
+}
+
+fn not_admitted(r: Result<chelabase_metadata::members::MemberRecord, chelabase_metadata::MetadataError>) -> bool {
+    matches!(r, Err(chelabase_metadata::MetadataError::NotAdmitted(_)))
+}
+
+// AC 5 (metadata side): without a claim row, nobody claims the admin of a member-less tenant.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_none_means_no_admin() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    assert!(not_admitted(s.client.admit_member(t, "first", "f@x.com", "F", Admission::Closed).await));
+    let p = s.client.admit_member(t, "second", "s@x.com", "S", Admission::Pending).await.unwrap();
+    assert_eq!((p.status, p.tenant_admin), (MemberStatus::Pending, false));
+    let a = s.client.admit_member(t, "third", "t@x.com", "T", Admission::Active).await.unwrap();
+    assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, false));
+    assert!(s.client.active_tenant_admins(t).await.unwrap().is_empty());
+    assert!(s.client.access_events(t, None, None, None, 10).await.unwrap().iter().all(|e| e.action != "admin_claimed"));
+    s.finish().await;
+}
+
+// AC 3: B, another user of the org, asks first: not admin; A, the claim's user, still is.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_admit_bound_to_setup_claim_user() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(
+        s.client.claim_setup(t, n, "user-a", None).await.unwrap(),
+        chelabase_metadata::members::SetupClaimOutcome::Bound
+    );
+    assert!(not_admitted(s.client.admit_member(t, "user-b", "b@x.com", "B", Admission::Closed).await));
+    let b = s.client.admit_member(t, "user-b", "b@x.com", "B", Admission::Pending).await.unwrap();
+    assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false));
+    let c = s.client.admit_member(t, "machine", "", "M", Admission::Active).await.unwrap();
+    assert!(!c.tenant_admin, "an Active admission is no claim either");
+    let a = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Closed).await.unwrap();
+    assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true));
+    assert_eq!(s.last_action(t).await, "admin_claimed");
+    let admins = s.client.active_tenant_admins(t).await.unwrap();
+    assert_eq!(admins.iter().map(|m| m.zitadel_user_id.as_str()).collect::<Vec<_>>(), vec!["user-a"]);
+    s.finish().await;
+}
+
+// AC 9: a claimed tenant whose only active admin is suspended: nobody else is made admin, an
+// existing member or a newcomer; the claim's own user (suspended) stays suspended.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_no_active_admin_requires_bound_user() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let n = setup_nonce(&s, t).await;
+    s.client.claim_setup(t, n, "user-a", None).await.unwrap();
+    let a = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Closed).await.unwrap();
+    assert!(a.tenant_admin);
+    let m = s.client.add_existing_user(a.id, t, "user-m", "m@x.com", "M", &[], &[]).await.unwrap();
+    sqlx::query("UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1")
+        .bind(a.id)
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    assert!(s.client.active_tenant_admins(t).await.unwrap().is_empty());
+    let again = s.client.admit_member(t, "user-m", "m2@x.com", "M2", Admission::Active).await.unwrap();
+    assert_eq!((again.id, again.tenant_admin), (m.id, false));
+    for admission in [Admission::Active, Admission::Pending] {
+        let c = s.client.admit_member(t, &format!("new-{admission:?}"), "", "C", admission).await.unwrap();
+        assert!(!c.tenant_admin, "{admission:?}");
+    }
+    assert!(not_admitted(s.client.admit_member(t, "new-closed", "", "C", Admission::Closed).await));
+    let back = s.client.admit_member(t, "user-a", "a@x.com", "A", Admission::Active).await.unwrap();
+    assert_eq!((back.status, back.tenant_admin), (MemberStatus::Suspended, true));
+    assert!(s.client.active_tenant_admins(t).await.unwrap().is_empty());
+    s.finish().await;
+}
+
+// The nonce AC (metadata side): no nonce, another tenant's, an expired one and a reused one
+// are refused and write no claim.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_nonce_refusals() {
+    use chelabase_metadata::members::SetupClaimOutcome::{Bound, Refused};
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let other = s.tenant().await;
+    assert_eq!(s.client.claim_setup(t, [9; 32], "u1", None).await.unwrap(), Refused);
+    let foreign = setup_nonce(&s, other).await;
+    assert_eq!(s.client.claim_setup(t, foreign, "u1", None).await.unwrap(), Refused);
+    let expired = setup_nonce(&s, t).await;
+    sqlx::query("UPDATE setup_claim_nonces SET created_at = now() - interval '10 minutes', expires_at = now() - interval '1 second' WHERE nonce_hash = $1")
+        .bind(&expired[..])
+        .execute(s.client.pool())
+        .await
+        .unwrap();
+    assert_eq!(s.client.claim_setup(t, expired, "u1", None).await.unwrap(), Refused);
+    assert_eq!(setup_claim_rows(&s, t).await, 0);
+    assert_eq!(setup_claim_rows(&s, other).await, 0);
+    // The other tenant's nonce is still its own.
+    assert_eq!(s.client.claim_setup(other, foreign, "o1", None).await.unwrap(), Bound);
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(s.client.claim_setup(t, n, "u1", None).await.unwrap(), Bound);
+    assert_eq!(s.client.claim_setup(t, n, "u2", None).await.unwrap(), Refused, "reused");
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "u1");
+    assert_eq!(setup_claim_rows(&s, t).await, 1);
+    s.finish().await;
+}
+
+// AC 6: two sign-ups with the right code at once: exactly one claim row; whichever order the
+// first requests come in, only the bound user is admin and the other waits as pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_race() {
+    use chelabase_metadata::members::SetupClaimOutcome::{AlreadyClaimed, Bound};
+    let s = Scratch::new().await;
+    for round in 0..8 {
+        let t = s.tenant().await;
+        let (na, nb) = (setup_nonce(&s, t).await, setup_nonce(&s, t).await);
+        let (ca, cb) = (s.client.clone(), s.client.clone());
+        let ja = tokio::spawn(async move { ca.claim_setup(t, na, "user-a", None).await.unwrap() });
+        let jb = tokio::spawn(async move { cb.claim_setup(t, nb, "user-b", None).await.unwrap() });
+        let (oa, ob) = (ja.await.unwrap(), jb.await.unwrap());
+        let mut outcomes = vec![oa, ob];
+        outcomes.sort_by_key(|o| *o == Bound);
+        assert_eq!(outcomes, vec![AlreadyClaimed, Bound], "round {round}");
+        assert_eq!(setup_claim_rows(&s, t).await, 1);
+        let winner = if oa == Bound { "user-a" } else { "user-b" };
+        assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, winner);
+        let (ma, mb) = (s.client.clone(), s.client.clone());
+        let ra = tokio::spawn(async move { ma.admit_member(t, "user-a", "a@x.com", "A", Admission::Pending).await.unwrap() });
+        let rb = tokio::spawn(async move { mb.admit_member(t, "user-b", "b@x.com", "B", Admission::Pending).await.unwrap() });
+        let members = [ra.await.unwrap(), rb.await.unwrap()];
+        for m in &members {
+            let bound = m.zitadel_user_id == winner;
+            assert_eq!(m.tenant_admin, bound, "round {round}: {m:?}");
+            let want = if bound { MemberStatus::Active } else { MemberStatus::Pending };
+            assert_eq!(m.status, want, "round {round}");
+        }
+    }
+    s.finish().await;
+}
+
+// AC 11: a claim whose user is gone (no member row; Zitadel checked by the caller) is rebound
+// by a new code-gated sign-up, which then becomes admin. A claim whose user has a member row,
+// or another user than the caller checked, is not replaced.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_stale_replaced() {
+    use chelabase_metadata::members::SetupClaimOutcome::{AlreadyClaimed, Bound};
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(s.client.claim_setup(t, n, "gone", None).await.unwrap(), Bound);
+    let claim = s.client.setup_claim(t).await.unwrap().unwrap();
+    assert_eq!((claim.zitadel_user_id.as_str(), claim.has_member_row), ("gone", false));
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(s.client.claim_setup(t, n, "new", Some("someone-else")).await.unwrap(), AlreadyClaimed);
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(s.client.claim_setup(t, n, "new", Some("gone")).await.unwrap(), Bound);
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "new");
+    let replaced: Option<String> = sqlx::query_scalar("SELECT replaced_user_id FROM setup_claims WHERE tenant_id = $1")
+        .bind(t.as_uuid())
+        .fetch_one(s.client.pool())
+        .await
+        .unwrap();
+    assert_eq!(replaced.as_deref(), Some("gone"));
+    assert!(not_admitted(s.client.admit_member(t, "gone", "", "G", Admission::Closed).await));
+    let m = s.client.admit_member(t, "new", "n@x.com", "N", Admission::Closed).await.unwrap();
+    assert!(m.tenant_admin);
+    // Now the bound user has a row (and is admin): nothing replaces the claim.
+    assert!(s.client.setup_claim(t).await.unwrap().unwrap().has_member_row);
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(s.client.claim_setup(t, n, "third", Some("new")).await.unwrap(), AlreadyClaimed);
+    assert_eq!(s.client.setup_claim(t).await.unwrap().unwrap().zitadel_user_id, "new");
+    s.finish().await;
+}
+
+// A tenant that already has an active admin (bootstrapped, say) takes no claim at all.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn setup_claim_refused_once_an_admin_exists() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    s.client.bootstrap_admin(t, "boot", "boot@x.com").await.unwrap();
+    let n = setup_nonce(&s, t).await;
+    assert_eq!(
+        s.client.claim_setup(t, n, "late", None).await.unwrap(),
+        chelabase_metadata::members::SetupClaimOutcome::AlreadyClaimed
+    );
+    assert_eq!(setup_claim_rows(&s, t).await, 0);
+    let late = s.client.admit_member(t, "late", "", "L", Admission::Active).await.unwrap();
+    assert!(!late.tenant_admin);
+    s.finish().await;
+}

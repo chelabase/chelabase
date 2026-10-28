@@ -16,8 +16,9 @@ export interface AuthRequestInfo {
      */
   signUp: boolean;
   /**
-     * This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the
-     * sign-in page may offer "Create account". Always `false` in platform mode.
+     * This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a
+     * setup code is configured): the sign-in page may offer "Create account". Always `false`
+     * in platform mode.
      */
   signUpAllowed: boolean;
 }

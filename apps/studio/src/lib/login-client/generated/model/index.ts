@@ -33,6 +33,7 @@ export * from './emptyResponse.ts';
 export * from './errorBody.ts';
 export * from './errorCode.ts';
 export * from './errorEnvelope.ts';
+export * from './instanceInfo.ts';
 export * from './inviteDescription.ts';
 export * from './nextStep.ts';
 export * from './signedIn.ts';

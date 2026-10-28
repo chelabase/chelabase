@@ -87,12 +87,36 @@ pub struct InviteDescription {
     pub tenant_name: String,
 }
 
-/// The sign-up gate's answer (`GET /internal/signup/allowed`).
+/// The sign-up gate's answer (`POST /internal/signup/check`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SignUpAnswer {
     pub allowed: bool,
-    /// `open`, `first_member`, `closed` or `platform`.
+    /// `open`, `first_member`, `closed`, `setup_code_invalid` or `platform`.
     pub reason: String,
+    /// A fresh install waits for its setup code.
+    #[serde(default)]
+    pub setup_required: bool,
+    /// With `first_member`: what binds the fresh-install claim to the account this sign-up
+    /// creates (`claimed`).
+    #[serde(default)]
+    pub claim_nonce: Option<ClaimNonce>,
+}
+
+/// A one-time claim nonce. `Debug` shows nothing.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct ClaimNonce(String);
+
+impl ClaimNonce {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClaimNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClaimNonce(..)")
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -176,14 +200,41 @@ impl InternalClient {
             .map_err(|e| InternalError::Unavailable(format!("bad answer: {e}")))
     }
 
-    /// Whether the tenant of this Zitadel org lets a visitor create an account.
-    pub async fn signup_allowed(&self, org_id: &str) -> Result<SignUpAnswer, InternalError> {
-        self.json(
-            Method::GET,
-            &format!("/internal/signup/allowed?org={}", percent_encode(org_id)),
-            None,
-        )
-        .await
+    /// Whether the tenant of this Zitadel org lets a visitor create an account, with the setup
+    /// code they gave (a body, never a URL).
+    pub async fn signup_check(
+        &self,
+        org_id: &str,
+        setup_code: Option<&str>,
+    ) -> Result<SignUpAnswer, InternalError> {
+        let mut body = serde_json::json!({ "org": org_id });
+        if let Some(code) = setup_code {
+            body["setup_code"] = Value::from(code);
+        }
+        self.json(Method::POST, "/internal/signup/check", Some(body)).await
+    }
+
+    /// Binds the fresh-install claim to the account just created: `true` when bound, `false`
+    /// when the tenant was already claimed (the account stays, as a newcomer). Any error means
+    /// no claim: the caller deletes the account.
+    pub async fn signup_claimed(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        nonce: &ClaimNonce,
+    ) -> Result<bool, InternalError> {
+        #[derive(Deserialize)]
+        struct Claimed {
+            bound: bool,
+        }
+        let answer: Claimed = self
+            .json(
+                Method::POST,
+                "/internal/signup/claimed",
+                Some(serde_json::json!({ "org": org_id, "user_id": user_id, "nonce": nonce.0 })),
+            )
+            .await?;
+        Ok(answer.bound)
     }
 
     /// The open invite of this Zitadel user whose token hashes to `token_hash` (hex SHA-256);
@@ -287,30 +338,6 @@ impl InternalClient {
     }
 }
 
-/// Everything but RFC 3986 unreserved characters, as `%XX`.
-fn percent_encode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 fn v<T: Serialize>(body: &T) -> Value {
     serde_json::to_value(body).expect("request body serialises")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::percent_encode;
-
-    #[test]
-    fn org_ids_are_percent_encoded() {
-        assert_eq!(percent_encode("2999"), "2999");
-        assert_eq!(percent_encode("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
-    }
 }

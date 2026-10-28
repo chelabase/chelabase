@@ -599,7 +599,8 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     /// The caller's member row, made (or an invited one activated) on its first request, with
     /// the email and name refreshed from the claims; a removed or pending member comes back as
     /// is. A person with no row becomes what `admission` says, unless the tenant has no active
-    /// admin yet (then they claim it): `Closed` writes nothing and is `NotAdmitted` (R39).
+    /// admin and its fresh-install claim binds this person (then they claim it; see
+    /// [`MetadataClient::admit_member`]): `Closed` writes nothing and is `NotAdmitted` (R39).
     fn ensure_member(
         &self,
         tenant: TenantId,
@@ -1212,7 +1213,8 @@ impl MetadataPort for MetadataClient {
         name: &str,
         admission: Admission,
     ) -> Result<MemberRecord, MetadataError> {
-        MetadataClient::ensure_member(self, tenant, zitadel_user_id, email, name, admission).await
+        // The setup-bound claim: only the account a code-gated sign-up bound claims the admin.
+        MetadataClient::admit_member(self, tenant, zitadel_user_id, email, name, admission).await
     }
 
     async fn grant_sources(
@@ -1930,10 +1932,11 @@ pub struct AuthPrincipal {
 /// The caller's member row in `tenant`, read once per request in the common case.
 ///
 /// - Self-hosted (`ModePolicy::auto_create_members`), a person in the tenant's org who has no
-///   row yet is admitted on their first request (R39): the first one claims the tenant's admin;
-///   an invited one is activated; anyone else becomes `pending` when the tenant's open sign-up
-///   is on, and otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no
-///   members and only refreshes existing ones.
+///   row yet is admitted on their first request (R39): the account a code-gated sign-up bound
+///   (`setup_claims`) claims the tenant admin while there is none; an invited one is
+///   activated; anyone else becomes `pending` when the tenant's open sign-up is on, and
+///   otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no members and
+///   only refreshes existing ones.
 /// - The email and name come from the token's claims. A claim the token lacks keeps the stored
 ///   value; when there is none (a new member, or one with no email or name stored), the user is
 ///   read once through the admin Zitadel client (ruling R18). A Zitadel failure isn't fatal:
@@ -2006,8 +2009,9 @@ async fn resolve_member<M: MetadataPort, J>(
 }
 
 /// How long after a tenant's admin claim a person with no row is still taken as the other half of
-/// the fresh-install race (R41, M7): the sign-up gate lets everyone in while the tenant has no
-/// member, so two concurrent sign-ups both get accounts, and the second one's first request
+/// the fresh-install race (R41, M7): the sign-up gate lets everyone with the setup code in while
+/// the tenant has no member, so two concurrent sign-ups both get accounts (only one binds the
+/// claim), and the second one's first request
 /// arrives after the first has claimed the admin. Long enough for an email verification.
 const FIRST_MEMBER_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 

@@ -112,6 +112,9 @@ async fn main() -> anyhow::Result<()> {
         zitadel: internal_config.load_zitadel(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
+        setup_code: orchestrator::internal::load_setup_code(
+            std::env::var("CHELABASE_SETUP_CODE_FILE").ok().as_deref(),
+        ),
         member_logins,
         realtime_logins,
         control_locator: DockerLocator::connect(
