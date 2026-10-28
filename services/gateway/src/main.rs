@@ -59,7 +59,8 @@ fn main() -> anyhow::Result<()> {
             config.upstreams.clone(),
             config.upstream_timeout,
             config.entry.scheme(),
-        ),
+        )
+        .with_trusted_proxies(config.trusted_proxies.clone()),
     );
     for addr in &config.listen {
         service.add_tcp(addr);

@@ -562,6 +562,34 @@ async fn forwarded_headers_are_replaced_not_trusted() {
     assert_eq!(seen["x-forwarded-host"], stack.base.trim_start_matches("http://"));
 }
 
+// m14 (#25): from a trusted proxy (here loopback), the apps see the right-most untrusted
+// `X-Forwarded-For` address, one address only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_proxy_forwards_the_client_address() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8, ::1")]).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "6.6.6.6, 203.0.113.9, 127.0.0.5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "203.0.113.9");
+    // A malformed header falls back to the peer and still answers.
+    let resp = client
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "203.0.113.9, garbage")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "127.0.0.1");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_host_is_404_with_an_empty_body() {
     let stack = start_stack().await;
