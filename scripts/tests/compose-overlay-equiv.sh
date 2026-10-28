@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Offline check that the workbench overlay changes nothing (epic selfhost-install, m7): the base
-# file plus docker-compose.workbench.yml renders the same stack as the single docker-compose.yml
-# did before the split (the file at REV, default the last commit that had only the one file).
+# Offline check that the workbench stack doesn't change (epic selfhost-install, m7 and m8): the
+# base file plus docker-compose.workbench.yml renders the same stack as the compose files at REV.
+# m7 split the one file in two (REV was 2a4d327e, the last single-file commit); m8 made the base
+# file the self-hosted install, and the overlay sets back every key it changed, so REV is now the
+# commit m8 started from (ca3b59c4). At a REV with only docker-compose.yml, that file alone is
+# the reference.
 #
 #   scripts/tests/compose-overlay-equiv.sh [--env-file <stack.env>] [--rev <git rev>]
 #
@@ -19,8 +22,8 @@
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
-# The epic branch's last single-file commit (m6 merged): the shape this split must keep.
-rev=2a4d327e
+# The commit m8 started from (m1-m7 and m12 merged): the workbench shape m8 must keep.
+rev=ca3b59c4
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;
@@ -42,6 +45,11 @@ trap 'rm -rf "$tmp"' EXIT
 git -C "$root" cat-file -e "$rev:infra/compose/docker-compose.yml" 2>/dev/null ||
   fail "git has no infra/compose/docker-compose.yml at $rev (a shallow clone? fetch the history)"
 git -C "$root" show "$rev:infra/compose/docker-compose.yml" >"$tmp/single.yml"
+ref=(-f "$tmp/single.yml")
+if git -C "$root" cat-file -e "$rev:infra/compose/docker-compose.workbench.yml" 2>/dev/null; then
+  git -C "$root" show "$rev:infra/compose/docker-compose.workbench.yml" >"$tmp/overlay.yml"
+  ref+=(-f "$tmp/overlay.yml")
+fi
 
 project="$(sed -n 's/^CHELABASE_COMPOSE_PROJECT=//p' "$env_file")"
 project="${project:-chelabase-feat-x}"
@@ -57,15 +65,15 @@ hashes() { # hashes <-f args…>
   compose "$@" --env-file "$env_file" --profile sites --profile runner config --hash '*' | sort
 }
 
-render -f "$tmp/single.yml" >"$tmp/single.json" || fail "rendering the single file at $rev failed"
+render "${ref[@]}" >"$tmp/single.json" || fail "rendering the compose files at $rev failed"
 render -f "$base" -f "$overlay" >"$tmp/split.json" || fail "rendering base + overlay failed"
-diff -u --label "single ($rev)" --label "base + overlay" "$tmp/single.json" "$tmp/split.json" >&2 ||
-  fail "base + overlay renders a different config than the single file at $rev"
+diff -u --label "at $rev" --label "base + overlay" "$tmp/single.json" "$tmp/split.json" >&2 ||
+  fail "base + overlay renders a different config than the compose files at $rev"
 
-hashes -f "$tmp/single.yml" >"$tmp/single.hash" || fail "hashing the single file at $rev failed"
+hashes "${ref[@]}" >"$tmp/single.hash" || fail "hashing the compose files at $rev failed"
 hashes -f "$base" -f "$overlay" >"$tmp/split.hash" || fail "hashing base + overlay failed"
 [[ "$(wc -l <"$tmp/split.hash")" -gt 20 ]] || fail "expected a hash per service, got: $(cat "$tmp/split.hash")"
-diff -u --label "single ($rev)" --label "base + overlay" "$tmp/single.hash" "$tmp/split.hash" >&2 ||
+diff -u --label "at $rev" --label "base + overlay" "$tmp/single.hash" "$tmp/split.hash" >&2 ||
   fail "a service's config hash differs: up would recreate its container"
 
 echo "compose-overlay-equiv: ok ($(jq '.services | length' "$tmp/split.json") services, $(basename "$env_file"))"
