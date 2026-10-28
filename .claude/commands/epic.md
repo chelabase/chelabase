@@ -26,7 +26,7 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
    Two milestones whose live tests are marked
    `shared-state` (see `issue-spec` Verification) never share a wave.
 5. Write draft issue bodies (`m1.md`, …) and a short `plan.md` (outcome, non-goals, risks,
-   waves, milestone table) under `/tmp/chelabase-epic-<slug>/`. Bodies follow `issue-spec`.
+   waves, milestone table) under `.claude/.cache/epics/<slug>/` (git-ignored). Bodies follow `issue-spec`.
 6. **Red-team** (only when a milestone is `whiteroom`): one opus agent reads `plan.md`, the
    whiteroom bodies and the code they touch, and attacks them: bypasses, races, privilege
    paths, fail-open errors, and how the change interacts with the subsystems around it.
@@ -37,10 +37,10 @@ Use `gh -R chelabase/chelabase`. Follow root `AGENTS.md` and the `issue-spec` / 
 
 ## Mode B — apply (`APPROVED <slug>`)
 
-Work from the draft as it is; don't re-plan. If the draft is missing, stop.
+Work from the draft in `.claude/.cache/epics/<slug>/` as it is; don't re-plan. If it is missing, stop.
 
 1. Create label `epic:<slug>` (`gh label create --force`).
-2. Worktree: `just wt-add epic-<slug>` from the main checkout (branch `epic/<slug>`). Empty
+2. Worktree: `just wt-add epic/<slug>` from the main checkout (directory `.worktrees/epic-<slug>`). Empty
    commit `chore: open epic <slug>`, push `-u`.
 3. Create milestone issues in order from the draft bodies, with labels
    `epic:<slug>`, `type:<type>`, `area:<scope>`, `status:ready`, plus `review:whiteroom` when
