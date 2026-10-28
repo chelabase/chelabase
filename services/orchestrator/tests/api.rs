@@ -100,7 +100,9 @@ async fn unbound_org_is_tenant_not_bound() {
     assert_eq!(resp.status(), 403);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(code_of(&body), "tenant_not_bound");
-    assert!(message_of(&body).contains("zitadel-bootstrap"));
+    let message = message_of(&body);
+    assert!(message.contains("init-bootstrap"), "{message}");
+    assert!(message.contains("just zitadel-bootstrap"), "{message}");
 }
 
 #[tokio::test]
