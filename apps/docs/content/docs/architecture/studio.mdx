@@ -27,7 +27,7 @@ Everyone who joins (by invite, or by sign-up when it is open) is in the same org
 
 ## Local sign-in flow
 
-1. `just workbench up`, then open `http://studio.chelabase.localhost:8000` and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` makes `zitadel-admin@zitadel.<auth host>`, or the email you pass it, `just zitadel-bootstrap you@example.com`, the tenant admin).
+1. Install Chelabase ([Install](/docs/self-hosting/install)), open Studio (`http://studio.chelabase.localhost:8000` by default), choose **Sign in** and then **Create account**, and enter the setup code from `docker compose logs init-secrets`. The first account claims the instance and is the tenant admin. (On a workbench stack, `just workbench up` is the development loop.)
 2. Emails such as invites and password resets land in Mailpit at `http://mail.chelabase.localhost:8000`. Without an email provider, invite by link instead.
 3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your Zitadel token.
 
