@@ -284,10 +284,12 @@ pub struct HttpProbe {
 impl HttpProbe {
     pub fn new(what: &str, url: &str) -> Self {
         Self {
+            // Readiness of this URL, not of wherever it redirects (#26): a 3xx fails the probe.
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .expect("the probe's HTTP client builds"),
             url: url.to_string(),
             what: what.to_string(),
         }

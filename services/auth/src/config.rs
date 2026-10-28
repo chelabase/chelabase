@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
 use chelabase_types::dev_defaults::DevDefaults;
-use chelabase_types::entry::Scheme;
+use chelabase_types::entry::{Scheme, ZitadelAt};
 use chelabase_types::file_value::{FileValue, Sensitivity};
 pub use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
@@ -18,7 +18,11 @@ pub const DEFAULT_MIN_RESPONSE_MS: u64 = 1500;
 #[derive(Clone)]
 pub struct Config {
     pub listen: String,
+    /// The public issuer (what Studio is told; a token's `iss`).
     pub issuer: String,
+    /// Where auth's calls to Zitadel go: `CHELABASE_ZITADEL_INTERNAL_URL` with the auth host as
+    /// `Host`, else the issuer (#24).
+    pub zitadel: ZitadelAt,
     pub token: String,
     pub cookie_key: SecretKey,
     /// `CHELABASE_ZITADEL_ORG_ID`, or the file `CHELABASE_ZITADEL_ORG_ID_FILE` names (the
@@ -151,6 +155,12 @@ fn warn_if_open(path: &str) {
     let _ = path;
 }
 
+/// Where auth's Zitadel calls go ([`Config::zitadel`]): `CHELABASE_ZITADEL_INTERNAL_URL` with
+/// the auth host as `Host`, else the issuer; a malformed internal URL stops auth (#24).
+pub fn zitadel_from_lookup(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt> {
+    chelabase_types::entry::zitadel_at(get, issuer).map_err(anyhow::Error::new)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
@@ -188,9 +198,11 @@ impl Config {
         .map_err(anyhow::Error::msg)?;
         check_listen(&listen, !trusted_proxies.is_empty())?;
         let ids = ZitadelIds::from_lookup(|name| std::env::var(name).ok())?;
+        let zitadel = zitadel_from_lookup(|name| std::env::var(name).ok(), &entry.issuer())?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
+            zitadel,
             token: token.trim().to_string(),
             cookie_key,
             org_id: ids.org_id,
@@ -281,7 +293,7 @@ impl AppConfig {
 
     /// The admin Zitadel client from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`, independent of the app
     /// keys; `None` (with a warning) when the variable is unset. Accept-invite needs it.
-    pub fn admin_from_env(issuer: &str) -> Result<Option<crate::zitadel::Zitadel>> {
+    pub fn admin_from_env(at: &ZitadelAt) -> Result<Option<crate::zitadel::Zitadel>> {
         let Some(path) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
             .ok()
             .map(|v| v.trim().to_string())
@@ -293,7 +305,7 @@ impl AppConfig {
             return Ok(None);
         };
         let pat = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        Ok(Some(crate::zitadel::Zitadel::new(issuer, pat.trim())))
+        Ok(Some(crate::zitadel::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref())))
     }
 
     pub fn from_env() -> Result<Option<Self>> {
@@ -358,6 +370,25 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // m13 audit N2: how auth builds `Config.zitadel` (sign-in, invites, app users' admin calls).
+    #[test]
+    fn zitadel_is_reached_at_the_internal_url_else_the_issuer() {
+        let lookup = |v: Option<&'static str>| {
+            move |k: &str| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.map(str::to_string)).flatten()
+        };
+        let set = zitadel_from_lookup(lookup(Some("http://zitadel:8080")), "https://auth.example.com").unwrap();
+        assert_eq!(set.base, "http://zitadel:8080");
+        assert_eq!(set.host.as_deref(), Some("auth.example.com"));
+        for unset in [None, Some(""), Some("  ")] {
+            let at = zitadel_from_lookup(lookup(unset), "http://auth.chelabase.localhost:8000").unwrap();
+            assert_eq!((at.base.as_str(), at.host), ("http://auth.chelabase.localhost:8000", None), "{unset:?}");
+        }
+        for bad in ["zitadel:8080", "http://zitadel:8080/x", "http://u@zitadel"] {
+            let err = zitadel_from_lookup(lookup(Some(bad)), "https://auth.example.com").unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {err}");
+        }
+    }
 
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: std::collections::HashMap<String, String> = pairs

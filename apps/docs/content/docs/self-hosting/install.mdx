@@ -103,7 +103,26 @@ CHELABASE_PUBLIC_PORT=9000
 
 Change the hosts before the first `up`. Zitadel's issuer is derived from the auth host and the scheme and is signed into tokens.
 
-For a real domain with TLS in front of the gateway, see [Hosts](/docs/self-hosting/hosts#tls), including `CHELABASE_GATEWAY_TRUSTED_PROXIES`, which a reverse proxy in front needs so that per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
+For a real domain with TLS terminated by your proxy in front of the gateway, the hosts carry no port and the public port is 443:
+
+```bash
+CHELABASE_PUBLIC_SCHEME=https
+CHELABASE_STUDIO_HOST=studio.acme.com
+CHELABASE_API_HOST=api.acme.com
+CHELABASE_AUTH_HOST=auth.acme.com
+CHELABASE_STUDIO_HOST_NAME=studio.acme.com
+CHELABASE_API_HOST_NAME=api.acme.com
+CHELABASE_AUTH_HOST_NAME=auth.acme.com
+CHELABASE_PUBLIC_PORT=443
+CHELABASE_PUBLIC_SECURE=true
+CHELABASE_ZITADEL_TLS_MODE=external
+CHELABASE_HTTP_ADDR=127.0.0.1
+CHELABASE_HTTP_PORT=8000
+```
+
+Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network, they reach Zitadel directly (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
+
+Set `CHELABASE_GATEWAY_TRUSTED_PROXIES` to your proxy's address too, so per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
 
 ### Email (SMTP)
 
@@ -170,6 +189,5 @@ Each database runs in a compute container that the worker starts. Computes are n
 
 ## Known limitations
 
-- **HTTPS in front with no port in the hosts.** The install does not yet cover TLS terminated by a proxy in front of the gateway when the hosts carry no port ([chelabase/chelabase#24](https://github.com/chelabase/chelabase/issues/24)). Until that is fixed, expect to set the host-related lines by hand and check the result.
 - **No secret rotation** ([chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)).
 - The install is Docker Compose only. Kubernetes is not covered.

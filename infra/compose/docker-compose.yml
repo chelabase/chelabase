@@ -84,6 +84,11 @@ x-app-env: &app-env
   CHELABASE_REALTIME_URL: http://realtime:8087
   CHELABASE_STUDIO_UPSTREAM: http://studio:3000
   CHELABASE_ZITADEL_UPSTREAM: http://zitadel:8080
+  # #24: the apps' calls to Zitadel (keys, sessions, management) go here, in plain HTTP with the
+  # auth host as Host, never to the public auth URL: behind a TLS proxy with no port in the hosts
+  # (https://auth.example.com) that URL reaches the gateway's alias on 443 in plain HTTP and
+  # fails. A token's iss is still checked against the public issuer.
+  CHELABASE_ZITADEL_INTERNAL_URL: http://zitadel:8080
   CHELABASE_ORCHESTRATOR_ADDR: 0.0.0.0:8081
   CHELABASE_WORKER_HEALTH_ADDR: 0.0.0.0:8082
   CHELABASE_INTERNAL_ADDR: 0.0.0.0:8083
@@ -990,7 +995,8 @@ services:
 
   # The front door, published on CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT. It listens on the
   # public port inside too and answers every host on the network (the aliases), so one URL works
-  # from the host and from an app container (the apps fetch Zitadel's keys at the auth host).
+  # from the host and from a container when the hosts are plain http. The apps reach Zitadel
+  # directly (CHELABASE_ZITADEL_INTERNAL_URL), never through these aliases.
   # Liveness only in its healthcheck (`/_gateway/ready` waits for its backends).
   gateway:
     image: ${CHELABASE_IMAGE_REPO:-chelabase}/gateway:${CHELABASE_IMAGE_TAG:-latest}

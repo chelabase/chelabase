@@ -108,6 +108,8 @@ check:
     scripts/tests/compose-overlay-equiv.sh
     scripts/tests/compose-secret-boundary.sh
     scripts/tests/compose-no-fixed-secrets.sh
+    scripts/tests/compose-zitadel-internal.sh
+    scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     just deny
@@ -316,3 +318,9 @@ auth-e2e:
 # Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
 selfhost-e2e:
     scripts/selfhost-e2e.sh
+
+# The self-hosted install behind a TLS proxy with no port in the hosts (#24): nginx with a
+# throwaway CA in front of a throwaway project, on the local release images (`just images`;
+# CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG pick others). Needs node for its socket client.
+selfhost-tls-e2e:
+    scripts/selfhost-tls-e2e.sh

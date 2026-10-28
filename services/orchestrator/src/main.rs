@@ -86,7 +86,10 @@ async fn main() -> anyhow::Result<()> {
     let rest = RestInternal {
         url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),
-        http: reqwest::Client::new(),
+        // Never a redirect (#26): the rest internal bearer goes to rest only.
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
     };
 
     // The storage controller runs without --dev: an admin-scoped NeonJWT from the compute-JWT key.
@@ -104,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
             .with_timeout(Duration::from_secs(10))
             .with_token(storcon_admin),
         signer,
+        // Never a redirect (#26): compute_ctl's JWT and the bearers go to the configured hosts.
         http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()?,
         proxy_token: internal_config.proxy_token.clone(),
@@ -169,7 +174,10 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.stack,
         )?),
         console: Console::default(),
-        zitadel: zitadel_admin(&entry.issuer()),
+        zitadel: zitadel_admin(
+            &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
+                .map_err(anyhow::Error::new)?,
+        ),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
@@ -216,9 +224,10 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
     }
 }
 
-/// Zitadel's admin API (at `issuer`) with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`;
-/// `None` (warned) when that is unset or the file can't be read.
-fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
+/// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from
+/// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None` (warned) when that is unset or the file can't be
+/// read.
+fn zitadel_admin(at: &chelabase_types::entry::ZitadelAt) -> Option<chelabase_zitadel::client::Zitadel> {
     let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -228,7 +237,9 @@ fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
         return None;
     };
     match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim())),
+        Ok(pat) if !pat.trim().is_empty() => {
+            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
+        }
         Ok(_) => {
             warn!("{file} is empty; app users can't be enabled");
             None

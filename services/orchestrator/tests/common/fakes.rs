@@ -2607,6 +2607,7 @@ fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
     chelabase_auth::ZitadelAuthConfig {
         issuer: "http://issuer.invalid".into(),
         jwks_url: "http://127.0.0.1:9/oauth/v2/keys".into(),
+        jwks_host: None,
         audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     }
 }
