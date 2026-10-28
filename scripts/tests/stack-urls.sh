@@ -30,10 +30,11 @@ grep -qE 'metadata-db:5432' "${files[@]}" ||
 mapfile -t tests < <(printf '%s\n' "${files[@]}" | grep -v '^services/rest/src/conn\.rs$')
 # Loopback that is a test's own fixture, not a host-only dependency: realtime's c4_* tests run a
 # fake compute in the test process and dial it, and the orchestrator's route tests assert the
-# fake locator's address in a response body.
+# fake locator's address in a response body, and the gateway's tests assert that the
+# `x-forwarded-for` an in-process upstream sees is the loopback peer.
 # The exemption covers only the `"127.0.0.1"` rule, and the c4_* files only while none of them is
 # a live test (no `#[ignore`): a live test dialling loopback is still caught.
-in_process='^(services/realtime/tests/c4_[a-z_]*\.rs:[0-9]+:|services/orchestrator/tests/internal\.rs:[0-9]+:.*body\["host"\], "127\.0\.0\.1")'
+in_process='^(services/realtime/tests/c4_[a-z_]*\.rs:[0-9]+:|services/orchestrator/tests/internal\.rs:[0-9]+:.*body\["host"\], "127\.0\.0\.1"|services/gateway/tests/gateway\.rs:[0-9]+:.*\["x-forwarded-for"\], "127\.0\.0\.1")'
 if grep -nE '#\[ignore' services/realtime/tests/c4_*.rs >&2; then
   echo "stack-urls: a c4_* test is live, so its loopback lines are no longer exempt" >&2
   bad=1

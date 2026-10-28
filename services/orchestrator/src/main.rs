@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
     entry.check_mode(mode).map_err(anyhow::Error::new)?;
     internal_config.check_mode(&ModePolicy::new(mode))?;
     if internal_config.dev_defaults.is_on() {
-        tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (the workbench only)");
+        tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (explicit opt-in)");
     }
     // Readiness doesn't wait for the Actions key: the bootstrap needs the orchestrator up to
     // make the Actions target, and writes the key after. The webhook answers 503 until then.

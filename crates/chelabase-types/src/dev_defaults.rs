@@ -1,14 +1,16 @@
-//! `CHELABASE_DEV_DEFAULTS=1`: the workbench's switch that lets a self-hosted service start
+//! `CHELABASE_DEV_DEFAULTS=1`: an explicit opt-in that lets a self-hosted service start
 //! with the public development bearers (the fixed `chelabase-dev-*` values in the repository).
 //! Without it, a self-hosted service refuses them at startup like a platform one does: one
 //! wiring slip in compose or k8s would otherwise leave the internal API open to anyone who
-//! read the source. Platform mode refuses them whatever this says.
+//! read the source. Platform mode refuses them whatever this says. Nothing in the repository
+//! sets it (the workbench passes real `_FILE` bearers): it is for running one service by hand,
+//! e.g. a local `cargo run`.
 
 use crate::mode_policy::ModePolicy;
 
 /// Every public development bearer, by its variable: what a service uses when the variable
 /// (and its `_FILE`) is unset. The values are in this repository, so each is refused outside
-/// the workbench ([`DevDefaults::check_bearers`]).
+/// an explicit `CHELABASE_DEV_DEFAULTS=1` ([`DevDefaults::check_bearers`]).
 pub const DEV_BEARERS: [(&str, &str); 7] = [
     ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
     ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
@@ -37,7 +39,7 @@ pub struct DevDefaults(bool);
 
 impl DevDefaults {
     pub const ENV: &'static str = "CHELABASE_DEV_DEFAULTS";
-    /// Only the workbench overlay sets this.
+    /// An explicit opt-in (e.g. a local `cargo run`); nothing in the repository sets it.
     pub const ON: Self = Self(true);
     pub const OFF: Self = Self(false);
 
@@ -87,8 +89,9 @@ impl DevDefaults {
         if !self.0 && dev_values.contains(&token) {
             return Err(format!(
                 "{var} is unset or a development default, which is public: set it (or \
-                 {var}_FILE) to a generated secret (`chelabase-init secrets` makes one). Only the \
-                 workbench sets {}=1 to allow the development defaults",
+                 {var}_FILE) to a generated secret (`chelabase-init secrets` makes one). To run \
+                 with the public development defaults anyway (e.g. a local `cargo run`), opt in \
+                 explicitly with {}=1",
                 Self::ENV
             ));
         }

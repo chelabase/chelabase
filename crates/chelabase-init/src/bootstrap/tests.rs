@@ -971,20 +971,74 @@ async fn outputs_refuse_symlinks() {
     assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
 }
 
-// The metadata password comes from its file into the URL's user info, percent-encoded; a URL
-// that already has one is refused rather than silently overridden.
+// The metadata password comes from its file into the URL's user info, percent-encoded, through
+// the shared helper (so it has its password-query, symlink and mode checks).
+fn metadata_config(url: &str, pw: &Path) -> Result<Config> {
+    let env: HashMap<String, String> = [
+        ("CHELABASE_STUDIO_HOST", "studio.example.com".to_string()),
+        ("CHELABASE_API_HOST", "api.example.com".to_string()),
+        ("CHELABASE_AUTH_HOST", "auth.example.com".to_string()),
+        ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/pat".to_string()),
+        ("CHELABASE_METADATA_DATABASE_URL", url.to_string()),
+        ("CHELABASE_METADATA_DATABASE_PASSWORD_FILE", pw.display().to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    Config::from_lookup(move |k| env.get(k).cloned(), PathBuf::from("/out"))
+}
+
+fn password_file(dir: &Path, mode: u32, text: &str) -> PathBuf {
+    let path = dir.join("metadata.password");
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    path
+}
+
 #[test]
 fn the_metadata_password_file_fills_the_url() {
+    let t = tempfile::tempdir().unwrap();
+    // 0640: what self-host's layout gives it (owner and the postgres group).
+    let pw = password_file(t.path(), 0o640, "p@ss/w:rd\n");
+    let cfg = metadata_config("postgres://chelabase@metadata-db:5432/m?sslmode=disable", &pw).unwrap();
     assert_eq!(
-        with_password(
-            "postgres://chelabase@metadata-db:5432/m?sslmode=disable",
-            "p@ss/w:rd"
-        )
-        .unwrap(),
+        cfg.metadata_url,
         "postgres://chelabase:p%40ss%2Fw%3Ard@metadata-db:5432/m?sslmode=disable"
     );
-    assert!(with_password("postgres://chelabase:x@db/m", "p").is_err());
-    assert!(with_password("postgres://db/m", "p").is_err());
+    assert!(metadata_config("postgres://chelabase:x@db/m", &pw).is_err());
+    assert!(metadata_config("postgres://db/m", &pw).is_err());
+}
+
+// m5's checks on the shared helper reach the bootstrap too: a `password=` query beside the
+// file, a symlinked file and a world-readable file are all refused, never echoing the password.
+#[test]
+fn a_password_query_beside_the_metadata_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = password_file(t.path(), 0o640, "hunter2-secret\n");
+    let err = format!(
+        "{:#}",
+        metadata_config("postgres://chelabase@db/m?password=other", &pw).err().unwrap()
+    );
+    assert!(err.contains("carries a password"), "{err}");
+}
+
+#[test]
+fn a_symlinked_metadata_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = password_file(t.path(), 0o640, "hunter2-secret\n");
+    let link = t.path().join("link.password");
+    std::os::unix::fs::symlink(&pw, &link).unwrap();
+    let err = format!("{:#}", metadata_config("postgres://chelabase@db/m", &link).err().unwrap());
+    assert!(err.contains("symlink"), "{err}");
+}
+
+#[test]
+fn a_world_readable_metadata_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = password_file(t.path(), 0o644, "hunter2-secret\n");
+    let err = format!("{:#}", metadata_config("postgres://chelabase@db/m", &pw).err().unwrap());
+    assert!(err.contains("CHELABASE_METADATA_DATABASE_PASSWORD_FILE"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
 }
 
 // SMTP comes from CHELABASE_SMTP_* with the password from a file only; none when unset.
@@ -993,6 +1047,8 @@ fn smtp_comes_from_the_env_with_a_password_file() {
     let t = tempfile::tempdir().unwrap();
     let pw = t.path().join("smtp.password");
     std::fs::write(&pw, "secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let pw_path = pw.clone();
     let pw = pw.display().to_string();
     let env = |pairs: &[(&str, &str)]| -> HashMap<String, String> {
         pairs
@@ -1024,6 +1080,47 @@ fn smtp_comes_from_the_env_with_a_password_file() {
     let mut no_from = full.clone();
     no_from.remove("CHELABASE_SMTP_FROM");
     assert!(smtp_from(&lookup(&no_from)).is_err());
+    // 0400 and 0640 are fine too.
+    for mode in [0o400, 0o640] {
+        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(smtp_from(&lookup(&full)).is_ok(), "{mode:o}");
+    }
+}
+
+fn smtp_env(pw: &Path) -> impl Fn(&str) -> Option<String> {
+    let m: HashMap<String, String> = [
+        ("CHELABASE_SMTP_HOST", "smtp.example.com".to_string()),
+        ("CHELABASE_SMTP_USER", "u".to_string()),
+        ("CHELABASE_SMTP_PASSWORD_FILE", pw.display().to_string()),
+        ("CHELABASE_SMTP_FROM", "noreply@example.com".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    move |k: &str| m.get(k).cloned()
+}
+
+#[test]
+fn a_world_readable_smtp_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = t.path().join("smtp.password");
+    std::fs::write(&pw, "hunter2-secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let err = format!("{:#}", smtp_from(&smtp_env(&pw)).err().unwrap());
+    assert!(err.contains("CHELABASE_SMTP_PASSWORD_FILE"), "{err}");
+    assert!(!err.contains("hunter2"), "{err}");
+}
+
+#[test]
+fn a_symlinked_smtp_password_file_is_refused() {
+    let t = tempfile::tempdir().unwrap();
+    let pw = t.path().join("smtp.password");
+    std::fs::write(&pw, "hunter2-secret\n").unwrap();
+    std::fs::set_permissions(&pw, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let link = t.path().join("link.password");
+    std::os::unix::fs::symlink(&pw, &link).unwrap();
+    let err = format!("{:#}", smtp_from(&smtp_env(&link)).err().unwrap());
+    assert!(err.contains("symlink"), "{err}");
 }
 
 #[test]
