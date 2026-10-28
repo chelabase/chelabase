@@ -31,7 +31,21 @@ AGENTS.md            agent workflow (epics, issues, audits)
 - sccache as the Rust compiler wrapper: proto installs it, but the global registration and the `rustc-wrapper = "sccache"` line in `~/.cargo/config.toml` are one-time machine setup (see CONTRIBUTING.md, "Machine setup")
 - [cargo-nextest](https://nexte.st), the Rust test runner behind `just test`: `cargo install --locked cargo-nextest`
 
-## Quickstart
+## Install
+
+To run Chelabase, use Docker Compose (Docker with Compose 2.30 or newer):
+
+```bash
+cd infra/compose
+cp .env.example .env
+docker compose up -d --wait
+```
+
+Then read the setup code with `docker compose logs init-secrets` and claim the instance at http://studio.chelabase.localhost:8000. Claim it before you expose the host. The full guide (settings, choosing your own secrets, SMTP, upgrades) is the Install page of the docs, `apps/docs/content/docs/self-hosting/install.mdx`.
+
+## Development quickstart
+
+The workbench is for developing Chelabase, not for running it. Self-hosters should use the install above.
 
 ```bash
 git clone https://github.com/chelabase/chelabase.git
@@ -43,7 +57,7 @@ just workbench up
 
 `just workbench up` builds the Rust services on the host, starts the Compose dependencies, bootstraps Zitadel, then runs the services and Studio in containers, and prints the URLs. The first run builds a lot and takes a while.
 
-Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://mail.chelabase.localhost:8000.
+Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it, workbench only). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://mail.chelabase.localhost:8000.
 
 Stop everything with `just workbench down`. `just` lists every recipe.
 

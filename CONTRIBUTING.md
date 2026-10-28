@@ -1,6 +1,6 @@
 # Contributing
 
-How to set up a machine, run the stack, test, and commit. For what the system is and how it works, run `just workbench up --with docs` and open the docs URL it prints (on main: http://docs.chelabase.localhost:8000/docs/architecture; the docs host is reached through the gateway).
+How to set up a machine, run the development stack (the workbench), test, and commit. The workbench is for developing Chelabase only; to run Chelabase yourself, follow the Install page (`apps/docs/content/docs/self-hosting/install.mdx`). For what the system is and how it works, run `just workbench up --with docs` and open the docs URL it prints (on main: http://docs.chelabase.localhost:8000/docs/architecture; the docs host is reached through the gateway).
 
 ## Prerequisites
 
@@ -57,7 +57,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 | `just workbench exec <service> <cmd…>` | A command in one of the stack's containers |
 | `just workbench test [selection…] [-- run-args…]` | Live Rust tests: archive on the host, run in the stack's runner container (see [Live Rust tests](#live-rust-tests)) |
 | `just workbench run <script> [args…]` | A repo script in the runner, on the stack's network (the e2e recipes use it) |
-| `just zitadel-bootstrap` | `chelabase dev bootstrap` against this stack (idempotent) |
+| `just zitadel-bootstrap` | `chelabase dev bootstrap` against this workbench stack (idempotent; development only, not part of the self-hosted install) |
 | `just auth-token` | Mint a demo JWT access token (stdout) |
 | `just zitadel-reset` | Wipe only this stack's Zitadel volume so FirstInstance rewrites `admin.pat` |
 | `just create-db-demo [name]` | Authenticated `POST /v1/databases` through this stack's gateway; `name` defaults to `demo1` |

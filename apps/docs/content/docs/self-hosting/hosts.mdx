@@ -40,6 +40,20 @@ CHELABASE_PUBLIC_SCHEME=https
 
 `CHELABASE_PUBLIC_SCHEME` is `http` or `https` (case does not matter) and defaults to `https`; a blank value is `https` too. It decides the scheme of every URL Chelabase builds (Studio's origin, the API base, the issuer) and the `X-Forwarded-Proto` the gateway sends to the services. Session cookies are marked Secure exactly when it is `https`, in every mode; `CHELABASE_AUTH_SECURE_COOKIES` overrides that, and auth logs a warning at startup when it turns Secure off under `https`. Use `http` only for local work: platform mode refuses to start with it.
 
+### Behind a reverse proxy
+
+<Callout type="warn">
+The gateway does not read a forwarded address from the proxy in front of it. It takes the client's address from the TCP connection and sets `X-Forwarded-For` to that address alone, replacing whatever the client sent. There is no setting that makes the gateway trust your proxy's `X-Forwarded-For`. Behind a reverse proxy, the gateway sees the proxy's address for every request.
+</Callout>
+
+What goes wrong: sign-up is limited per client IP (20 sign-ups an hour), and the limit is applied to the address the gateway saw. With a proxy in front, every client shares one bucket, so one noisy client, or junk requests, can use up the hour's sign-ups for everybody. This matters most while the instance is unclaimed, because the claim is a sign-up. The setup code itself is not weakened, since its entropy makes guessing impractical, but you could be locked out of the claim until the hour passes.
+
+What to do:
+
+- Claim the instance before the proxy is public (the install page's [claim step](/docs/self-hosting/install#claim-the-instance)). Once the first admin exists, sign-up is closed by default and the shared bucket costs you nothing.
+- Rate-limit and filter requests to the auth host's sign-up routes at the proxy, where the real client address is visible.
+- Keep `CHELABASE_AUTH_TRUSTED_PROXY=gateway` as the install sets it. Auth then believes the `X-Forwarded-For` the gateway appended and nobody else's.
+
 ## Settings
 
 | Setting | Default | What it is |
