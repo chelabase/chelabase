@@ -308,12 +308,12 @@ fn write_auth_files_reports_whether_the_nats_file_changed() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        // A loose mode is refused, never silently tightened (selfhost-install m1).
         std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(
-            !write_auth_files(&keys, &state).unwrap().nats,
-            "only the mode was fixed"
-        );
-        assert_eq!(mode(&auth), 0o600);
+        assert!(write_auth_files(&keys, &state).is_err(), "a loose auth.conf is refused");
+        assert_eq!(mode(&auth), 0o644);
+        std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(!write_auth_files(&keys, &state).unwrap().nats);
     }
 
     // Valkey's file changes; NATS's doesn't.

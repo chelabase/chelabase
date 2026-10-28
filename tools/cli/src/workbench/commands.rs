@@ -341,6 +341,29 @@ pub fn prepare_zitadel_dir(dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("making {} private", dir.display()))
 }
 
+/// `up`'s key phase, before any container mounts the files: every key, secret and auth file
+/// through `chelabase_init::ensure_secrets` (created once, never overwritten). The machine part
+/// goes to the shared keys dir (`<main>/.chelabase`), the stack's own part (the NATS and Valkey
+/// auth files, the database passwords, the Zitadel files, the setup code) to its state dir.
+/// Reports which auth file changed: a running NATS or Valkey must restart to read it (R9).
+pub fn ensure_stack_secrets(
+    main: &Path,
+    state: &Path,
+) -> anyhow::Result<chelabase_init::kinds::service_auth::AuthFilesChanged> {
+    crate::paths::migrate_auth_dir(main).context("moving .chelabase/ui-auth to .chelabase/auth")?;
+    let report = chelabase_init::ensure_secrets(
+        &main.join(".chelabase"),
+        &chelabase_init::InitSecrets::workbench(state),
+    )?;
+    if report.setup_code.is_some() {
+        eprintln!(
+            "[workbench] the stack's setup code is in {}",
+            state.join("setup/setup.code").display()
+        );
+    }
+    Ok(report.auth_files)
+}
+
 /// Sets each PAT file to 0600; a missing file is an error.
 pub fn secure_pats(paths: &[PathBuf]) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -803,7 +826,6 @@ fn start_stack(
     with: &[Site],
     phases: &Phases,
 ) -> anyhow::Result<()> {
-    let keys = stack.main.join(".chelabase");
     phases.run("control network", || {
         let slot = entry
             .control_slot
@@ -863,23 +885,7 @@ fn start_stack(
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
 
     let auth_changed = phases.run("machine keys", || {
-        let auth = crate::paths::migrate_auth_dir(&stack.main)
-            .context("moving .chelabase/ui-auth to .chelabase/auth")?;
-        crate::dev::bootstrap::ensure_machine_keys(
-            &keys.join("gateway"),
-            &keys.join("secrets"),
-            &auth,
-            &keys.join("neon"),
-            &keys.join("compute-ca"),
-            &keys.join("orchestrator-tls"),
-            &keys.join("realtime-tls"),
-        )?;
-        // RT1 T1 (R11, S1, S27): the service secrets (created once, never overwritten), the
-        // NATS and Valkey auth files rendered from them, and the storage NeonJWTs derived from
-        // the compute-JWT key pair. Before any container starts: compose mounts them.
-        crate::dev::stack_secrets::ensure(&keys)?;
-        super::service_auth::write_storage_auth(&keys)?;
-        let auth_changed = super::service_auth::write_auth_files(&keys, &stack.state)?;
+        let auth_changed = ensure_stack_secrets(&stack.main, &stack.state)?;
         // A demo.env from before still names the public bearers, which the apps would now
         // refuse next to their <NAME>_FILE: drop them before the front tier is created.
         let demo = stack.state.join("zitadel/demo.env");
@@ -2088,5 +2094,88 @@ mod tests {
             [("CHELABASE_BOOTSTRAP_SKIP_ACTIONS", "1")]
         );
         assert!(bootstrap_env(BootstrapPass::AfterApps).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod key_phase_tests {
+    use super::ensure_stack_secrets;
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::path::{Path, PathBuf};
+
+    /// Every regular file below `root` (but `skip` and the lock file): bytes, mtime and mode.
+    fn snapshot(root: &Path, skip: &Path) -> BTreeMap<PathBuf, (Vec<u8>, i64, i64, u32)> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let p = entry.unwrap().path();
+                let meta = std::fs::symlink_metadata(&p).unwrap();
+                if p == skip || p.ends_with(chelabase_init::secrets::LOCK_FILE) {
+                    continue;
+                }
+                if meta.is_dir() {
+                    stack.push(p);
+                } else if meta.is_file() {
+                    let bytes = std::fs::read(&p).unwrap();
+                    out.insert(p, (bytes, meta.mtime(), meta.mtime_nsec(), meta.mode()));
+                }
+            }
+        }
+        out
+    }
+
+    // AC 7: a stack whose keys the old key phase made (under umask 002, like the real shared keys
+    // dir) starts with the same files and values; only the stack's new files are added.
+    #[test]
+    fn the_key_phase_keeps_what_the_old_one_made() {
+        let t = tempfile::tempdir().unwrap();
+        let main = t.path().join("main");
+        let keys = main.join(".chelabase");
+        let state = keys.join("stacks/x");
+        crate::dev::bootstrap::ensure_machine_keys(
+            &keys.join("gateway"),
+            &keys.join("secrets"),
+            &keys.join("auth"),
+            &keys.join("neon"),
+            &keys.join("compute-ca"),
+            &keys.join("orchestrator-tls"),
+            &keys.join("realtime-tls"),
+        )
+        .unwrap();
+        crate::dev::stack_secrets::ensure(&keys).unwrap();
+        super::super::service_auth::write_storage_auth(&keys).unwrap();
+        super::super::service_auth::write_auth_files(&keys, &state).unwrap();
+        for d in ["auth", "gateway", "neon", "secrets", "orchestrator-tls"] {
+            std::fs::set_permissions(keys.join(d), std::fs::Permissions::from_mode(0o775)).unwrap();
+        }
+        for f in ["compute-ca/ca.crt", "neon/compute-jwt.pub", "gateway/internal-verify.pem"] {
+            std::fs::set_permissions(keys.join(f), std::fs::Permissions::from_mode(0o664)).unwrap();
+        }
+        let (keys_before, state_before) = (snapshot(&keys, &state), snapshot(&state, &state.join("none")));
+
+        let changed = ensure_stack_secrets(&main, &state).unwrap();
+        assert!(!changed.nats && !changed.valkey, "{changed:?}");
+        assert_eq!(snapshot(&keys, &state), keys_before, "the shared keys dir is untouched");
+        let state_after = snapshot(&state, &state.join("none"));
+        for (p, v) in &state_before {
+            assert_eq!(state_after.get(p), Some(v), "{}", p.display());
+        }
+        // The stack's own new files, with the fixed dev values its volumes were made with.
+        let read = |p: &str| std::fs::read_to_string(state.join(p)).unwrap();
+        assert_eq!(read("db/metadata.password"), "chelabase");
+        assert_eq!(read("db/zitadel-admin.password"), "postgres");
+        assert_eq!(read("db/zitadel-user.password"), "zitadel");
+        assert_eq!(read("db/storcon.password"), "storcon");
+        assert_eq!(read("s3/access-key"), "chelabase-dev");
+        assert_eq!(read("zitadel/masterkey"), "MasterkeyNeedsToHave32Characters");
+        assert!(chelabase_init::read_setup_code(&state).is_ok());
+
+        // And a second `up` changes nothing at all.
+        let (k, s) = (snapshot(&keys, &state), snapshot(&state, &state.join("none")));
+        let changed = ensure_stack_secrets(&main, &state).unwrap();
+        assert!(!changed.nats && !changed.valkey);
+        assert_eq!((snapshot(&keys, &state), snapshot(&state, &state.join("none"))), (k, s));
     }
 }

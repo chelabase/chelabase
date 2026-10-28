@@ -713,6 +713,7 @@ dependencies = [
  "base64 0.23.1",
  "bcrypt",
  "chelabase-auth",
+ "chelabase-init",
  "chelabase-neon",
  "chelabase-secrets",
  "chelabase-types",
@@ -753,6 +754,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "chelabase-init"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bcrypt",
+ "chelabase-auth",
+ "chelabase-neon",
+ "chelabase-secrets",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tracing",
 ]
 
 [[package]]
@@ -2234,6 +2255,16 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chelabase-init",
+ "clap",
+ "tempfile",
 ]
 
 [[package]]
