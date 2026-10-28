@@ -28,10 +28,10 @@ Each database gets a Neon tenant and timeline on the storage controller, plus on
 
 Clients connect through Neon's proxy, never straight to a compute:
 
-- Postgres wire at `<endpoint>.localtest.me:4432`.
-- SQL over HTTP and WebSocket at `https://<endpoint>.localtest.me:4444/sql`.
+- Postgres wire at `<endpoint>.localtest.me:5432` (a self-hosted install; 4432 on a workbench stack).
+- SQL over HTTP and WebSocket at `https://<endpoint>.localtest.me:4444/sql` (a self-hosted install; a workbench stack serves it inside its network only).
 
-Use `sslrootcert=.chelabase/neon/proxy-ca.crt`; if `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The ports can be changed with `CHELABASE_PROXY_PG_PORT` and `CHELABASE_PROXY_HTTP_PORT`.
+Verify the proxy with its CA: a self-hosted install's is fetched with `docker compose cp proxy:/tls/ca.crt proxy-ca.crt` (`sslrootcert=proxy-ca.crt`), a workbench stack's is `.chelabase/neon/proxy-ca.crt`. If `localtest.me` resolves to `::1` first, also add `hostaddr=127.0.0.1`. The domain and ports are the install's settings (`CHELABASE_PROXY_DOMAIN`, `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT`): see [Install: connect to databases](/docs/self-hosting/install#connect-to-databases).
 
 The main Postgres database is named after the database, with every character outside `[A-Za-z0-9_]` turned into `_`: "web-1 prod" gets `web_1_prod`. A database's `postgres_database` (in `GET /v1/databases/{id}`, and in each project's `databases` in `GET /v1/me`) gives that name; schema merges and the SQL tools name the Postgres database, not the display name.
 

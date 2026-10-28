@@ -7,7 +7,7 @@ This page installs Chelabase from its release images with Docker Compose. It is 
 
 ## Requirements
 
-- Docker with Compose 2.30 or newer (the stack mounts a volume sub-path). Check with `docker compose version`.
+- Docker Engine 26.0 or newer and Compose 2.30 or newer: the stack mounts volume sub-paths, which both need. Check with `docker version` and `docker compose version`.
 - A machine that can run about 26 containers. The worker starts each database's compute as a further container, so it needs the Docker socket.
 - The repository checkout, for `infra/compose`.
 
@@ -23,7 +23,7 @@ cp .env.example .env
 docker compose up -d --wait
 ```
 
-`.env` is required. Every setting has a default, so the copy runs as it is on one machine and serves Studio at `http://studio.chelabase.localhost:8000`. A fresh project is healthy in under a minute once the images are pulled.
+`.env` is required. Every setting has a default, so the copy runs as it is on one machine and serves Studio at `http://studio.chelabase.localhost:8000`, and databases on `127.0.0.1:5432` (see [Connect to databases](#connect-to-databases)). A fresh project is healthy in under a minute once the images are pulled.
 
 Two one-shot containers do the setup, and both must exit 0:
 
@@ -85,7 +85,10 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_ZITADEL_TLS_MODE` | `disabled` | `disabled` for `http`, `external` for `https` |
 | `CHELABASE_HTTP_ADDR` | `127.0.0.1` | The host address the gateway is published on (`0.0.0.0` for every interface) |
 | `CHELABASE_HTTP_PORT` | `CHELABASE_PUBLIC_PORT` | The host port the gateway is published on |
-| `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the release images come from. Each image is pinned by digest in the compose file; setting either variable replaces the pin (a tag alone is not verified against a digest) |
+| `CHELABASE_PROXY_DOMAIN` | `localtest.me` | The domain of database hosts, `<endpoint>.<domain>` (see [Connect to databases](#connect-to-databases)) |
+| `CHELABASE_PROXY_ADDR` | `127.0.0.1` | The host address the proxy (Postgres and SQL over HTTP) is published on |
+| `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT` | `5432`, `4444` | The host ports of the proxy's Postgres and SQL-over-HTTP listeners |
+| `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the images come from. The compose file pins each release image by digest. Setting either variable replaces every pin: one tag for all images, with no digest check. For testing or images you built only (see [Upgrade](#upgrade)) |
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
 | `CHELABASE_SMTP_*` | unset | Zitadel's email (below) |
 
@@ -136,7 +139,40 @@ CHELABASE_SMTP_USER=chelabase
 CHELABASE_SMTP_PASSWORD_PATH=/etc/chelabase/smtp.password
 ```
 
-The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into `init-bootstrap` only. `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM` makes `init-bootstrap` exit 1, and `docker compose up --wait` fails. A changed SMTP setting or password is applied by the next `docker compose up`.
+The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into `init-bootstrap` only. `init-bootstrap` runs as uid 10001 (groups 10001 and 70), so the file must be owned by uid 10001 at mode 0600:
+
+```bash
+sudo install -d /etc/chelabase
+sudo install -m 0600 -o 10001 /dev/null /etc/chelabase/smtp.password
+sudo sh -c 'cat > /etc/chelabase/smtp.password'   # paste the password, then Ctrl-D
+```
+
+Mode 0640 with group 10001 or 70 works too (`sudo chgrp 10001 <file> && sudo chmod 640 <file>`), and keeps the file yours. A looser file (group-writable, readable by others, or a symlink), or one uid 10001 can't read (a root-owned 0600 file, say), makes `init-bootstrap` fail with an error naming the file. `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM` makes `init-bootstrap` exit 1 too, and `docker compose up --wait` fails. A changed SMTP setting or password is applied by the next `docker compose up`.
+
+## Connect to databases
+
+Apps use the [data API](/docs/using/data-api) through the gateway. Postgres clients (migrations, ORMs, admin tools, `psql`) connect through Neon's proxy, which the install publishes on `CHELABASE_PROXY_ADDR` (default `127.0.0.1`): Postgres on `CHELABASE_PROXY_PORT` (default `5432`, the Postgres default, so clients need no port; change it if the host runs its own Postgres) and SQL over HTTP on `CHELABASE_PROXY_HTTP_PORT` (default `4444`). Connection details in Studio and the API name the same host and ports.
+
+The proxy picks the database by the host name a client connects to (its TLS server name): `<endpoint>.CHELABASE_PROXY_DOMAIN`. So every such name must reach the proxy:
+
+- **On one machine**, keep the default `localtest.me`: every `*.localtest.me` name resolves to `127.0.0.1` in public DNS, so `ep-….localtest.me:5432` reaches the published port with nothing to set up.
+- **On a server**, use a domain of yours with a wildcard DNS record pointing at the server, and publish the proxy on its address. For `*.db.example.com`:
+
+  ```bash
+  CHELABASE_PROXY_DOMAIN=db.example.com
+  CHELABASE_PROXY_ADDR=0.0.0.0
+  ```
+
+  Connection details then name `ep-….db.example.com:5432`. The proxy's port is not behind the gateway or your HTTPS proxy: open it in your firewall only to the clients that need it. Every connection is TLS and needs the database's password.
+
+`proxy-tls` issues the proxy's certificate for `*.<CHELABASE_PROXY_DOMAIN>` from a CA the install makes once and keeps in the `neon_proxy_tls` volume. A changed domain gets a new certificate from the same CA at the next `docker compose up` (then `docker compose restart proxy`). Clients verify the certificate against that CA. Fetch it once, in `infra/compose`, under the name the connection details give as `ca_file` (`proxy-ca.crt`; `CHELABASE_PROXY_CA_FILE` changes the name they report):
+
+```bash
+docker compose cp proxy:/tls/ca.crt proxy-ca.crt
+psql "postgresql://postgres:…@ep-….localtest.me:5432/<db>?sslmode=verify-full&sslrootcert=proxy-ca.crt"
+```
+
+With `sslmode=verify-full` the client checks both the CA and the host name. The CA is a public certificate, not a secret; its key never leaves the volume.
 
 ## Administering Zitadel
 
@@ -159,15 +195,18 @@ This builds one all-in-one image, `chelabase/server:local`, that runs every Rust
 
 ## Upgrade
 
-Pull the new images and recreate what changed:
+A release is a commit of the repository: its `docker-compose.yml` pins each image by digest. Update the checkout to get the new pins, then pull those images and recreate what changed:
 
 ```bash
 cd infra/compose
+git pull
 docker compose pull
 docker compose up -d --wait
 ```
 
-The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. To pin a release, set `CHELABASE_IMAGE_TAG` in `.env` to that tag before you pull. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+
+`CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
 
 ## Stop, tear down and uninstall
 
