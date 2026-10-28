@@ -4,7 +4,7 @@
 use chelabase_metadata::{DatabaseStatus, NewEndpoint};
 use anyhow::anyhow;
 use chelabase_neon::reconfigure::ComputeCtlStatus;
-use chelabase_neon::{ComputeBackend, ComputeStatus, NeonId};
+use chelabase_neon::{ComputeBackend, ComputeStatus, NeonId, NotRunning};
 use chelabase_secrets::{Purpose, seal_credential};
 use chelabase_types::{BranchId, DatabaseId};
 use sha2::{Digest, Sha256};
@@ -365,8 +365,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                         "waiting for the compute: its container no longer exists: {err:#}"
                     ));
                 }
-                Ok(Some(ComputeStatus::NotRunning(state)))
-                    if matches!(state.as_str(), "exited" | "dead") =>
+                Ok(Some(ComputeStatus::NotRunning(
+                    state @ (NotRunning::Exited | NotRunning::Crashed),
+                ))) =>
                 {
                     return Err(format!(
                         "waiting for the compute: its container {state}: {err:#}"

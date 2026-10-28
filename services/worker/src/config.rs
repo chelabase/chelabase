@@ -11,7 +11,9 @@ use chelabase_neon::compute_tls::ComputeCa;
 use chelabase_neon::jwt::StorageScope;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
-use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
+use chelabase_neon::{
+    Backend, BackendKind, ComputeSettings, DockerSettings, StorconClient,
+};
 use chelabase_secrets::SecretKey;
 use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
@@ -30,7 +32,7 @@ pub const DEFAULT_CLAIM_REFRESH: Duration = Duration::from_secs(60);
 pub type RealWorker = Worker<
     PublishingMetadata<MetadataClient>,
     RealStorage,
-    StoppingBackend<DockerBackend, MetadataClient>,
+    StoppingBackend<Backend, MetadataClient>,
     ProxyCache,
     HttpPusher,
 >;
@@ -407,10 +409,13 @@ pub fn build(
     publisher: Arc<dyn RtPublisher>,
     attach: AttachSource,
 ) -> anyhow::Result<RealWorker> {
-    build_with(config, metadata, key, publisher, attach, DockerBackend::connect)
+    let kind = BackendKind::from_env()?;
+    build_with(config, metadata, key, publisher, attach, |settings, docker| {
+        Backend::connect(kind, settings, docker)
+    })
 }
 
-/// [`build`] with the Docker backend's constructor given. The real one needs the engine's
+/// [`build`] with the backend's constructor given. The real one needs the engine's
 /// socket file to exist (so `build` fails while Docker is restarting); tests that don't
 /// exercise Docker pass a backend over an unreachable engine instead.
 pub fn build_with(
@@ -419,7 +424,7 @@ pub fn build_with(
     key: SecretKey,
     publisher: Arc<dyn RtPublisher>,
     attach: AttachSource,
-    connect: impl FnOnce(ComputeSettings) -> anyhow::Result<DockerBackend>,
+    connect: impl FnOnce(ComputeSettings, DockerSettings) -> anyhow::Result<Backend>,
 ) -> anyhow::Result<RealWorker> {
     // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
@@ -479,14 +484,18 @@ pub fn build_with(
             attach,
         },
         computes: StoppingBackend::new(
-            connect(ComputeSettings {
-                image: config.compute_image.clone(),
-                network: config.compute_network.clone(),
-                control_plane_uri: config.control_plane_uri.clone(),
-                stack: config.stack.clone(),
-                control_network: config.compute_control_network.clone(),
-                ca: Some(ca.clone()),
-            })?,
+            connect(
+                ComputeSettings {
+                    image: config.compute_image.clone(),
+                    control_plane_uri: config.control_plane_uri.clone(),
+                    stack: config.stack.clone(),
+                    ca: Some(ca.clone()),
+                },
+                DockerSettings {
+                    network: config.compute_network.clone(),
+                    control_network: config.compute_control_network.clone(),
+                },
+            )?,
             metadata,
             publisher,
         ),
