@@ -233,6 +233,11 @@ async fn verify(verifier: &JwtVerifier, token: &str) -> Result<VerifiedClaims, R
             error!("realtime: the OIDC verifier is misconfigured: {e}");
             Refusal::Unavailable
         }
+        // #22: the audiences aren't written yet: refused, never checked without them.
+        AuthError::NotReady(e) => {
+            warn!("realtime: the member token can't be checked yet: {e}");
+            Refusal::Unavailable
+        }
         AuthError::Unauthorized | AuthError::InvalidToken(_) => Refusal::Forbidden,
     })
 }

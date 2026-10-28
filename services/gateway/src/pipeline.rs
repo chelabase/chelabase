@@ -21,6 +21,10 @@ use uuid::Uuid;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 /// The gateway's own liveness check; answered before host or route checks.
 pub const GATEWAY_HEALTH_PATH: &str = "/_gateway/health";
+/// Readiness (#22): 200 once the gateway can check Zitadel tokens (its audiences are there,
+/// they may come late from the bootstrap's files), else 503. `GATEWAY_HEALTH_PATH` stays
+/// liveness: the bootstrap reaches Zitadel through the gateway before it writes the audiences.
+pub const GATEWAY_READY_PATH: &str = "/_gateway/ready";
 const MAX_REQUEST_ID_LEN: usize = 128;
 /// Client headers never forwarded upstream: upstreams only ever see the
 /// gateway-minted identity.
@@ -135,6 +139,12 @@ impl Pipeline {
     async fn route(&self, req: &RequestParts<'_>, request_id: &str) -> Outcome {
         if req.method == "GET" && req.path == GATEWAY_HEALTH_PATH {
             return respond(200, Vec::new(), json!({ "status": "ok" }));
+        }
+        if req.method == "GET" && req.path == GATEWAY_READY_PATH {
+            return match self.verifier.config().audiences.current() {
+                Ok(_) => respond(200, Vec::new(), json!({ "status": "ok" })),
+                Err(e) => respond(503, Vec::new(), json!({ "status": "waiting", "reason": e.to_string() })),
+            };
         }
 
         if req.host.is_none() {
@@ -383,6 +393,11 @@ impl Pipeline {
             AuthError::Unauthorized | AuthError::InvalidToken(_) | AuthError::Expired => unauthorized(&err),
             AuthError::Jwks(_) | AuthError::Config(_) => {
                 error!("auth infrastructure error: {err}");
+                json_response(503, error_json("unavailable", "auth unavailable"))
+            }
+            // #22: the audiences aren't written yet; no token is let through unchecked.
+            AuthError::NotReady(_) => {
+                tracing::info!("{err}");
                 json_response(503, error_json("unavailable", "auth unavailable"))
             }
         })?;
@@ -645,6 +660,66 @@ mod tests {
         assert!(Uuid::parse_str(&request_id(&HeaderMap::new())).is_ok());
     }
 
+    // #22 AC 1: the gateway starts before the bootstrap has written its audiences. Until both
+    // files are there a Zitadel bearer is 503 (never proxied, whatever its audience) and
+    // `/_gateway/ready` is 503; once they appear, the right audience is proxied and another is
+    // 401, without a restart. A refused file (group-writable) is 503 too.
+    #[tokio::test]
+    async fn zitadel_bearer_refused_until_audiences() {
+        use chelabase_auth::Audiences;
+        use chelabase_types::file_value::{FileValue, Sensitivity};
+        use std::os::unix::fs::PermissionsExt;
+        let jwks = MockJwks::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (project, client) = (dir.path().join("project-id"), dir.path().join("api-client-id"));
+        let mut config = jwks.config(vec![]);
+        config.audiences = Audiences::Ids(vec![
+            FileValue::file("CHELABASE_ZITADEL_PROJECT_ID_FILE", &project, Sensitivity::Public),
+            FileValue::file("CHELABASE_ZITADEL_API_CLIENT_ID_FILE", &client, Sensitivity::Public),
+        ]);
+        let (pipeline, _) = pipeline_with(&[API], JwtVerifier::new(config));
+        let token = |aud: &str| {
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+            format!(
+                "Bearer {}",
+                jwks.sign(json!({
+                    "sub": "user-1", "iss": jwks.issuer(), "exp": now + 300, "aud": aud,
+                    chelabase_auth::CLAIM_ORG_ID: "org-1",
+                }))
+            )
+        };
+        let write = |path: &std::path::Path, value: &str, mode: u32| {
+            std::fs::write(path, value).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        async fn ready(p: &Pipeline) -> u16 {
+            expect_response(run(p, "GET", GATEWAY_READY_PATH, None, &[]).await.outcome).status
+        }
+        for (step, files) in [("absent", 0), ("one of two", 1), ("a group-writable file", 2)] {
+            if files >= 1 {
+                write(&project, "p1\n", 0o644);
+            }
+            if files == 2 {
+                write(&client, "c-api\n", 0o664);
+            }
+            for aud in ["p1", "c-api", "anything"] {
+                let resp = expect_response(
+                    run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token(aud))]).await.outcome,
+                );
+                assert_eq!(resp.status, 503, "{step}, aud {aud}");
+            }
+            assert_eq!(ready(&pipeline).await, 503, "{step}");
+        }
+        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(ready(&pipeline).await, 200);
+        let plan = expect_plan(run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token("p1"))]).await.outcome);
+        assert_eq!(plan.endpoint.service, Service::Orchestrator);
+        let resp = expect_response(
+            run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token("someone-else"))]).await.outcome,
+        );
+        assert_eq!(resp.status, 401);
+    }
+
     #[tokio::test]
     async fn gateway_health_is_answered_before_host_checks() {
         let h = harness(&["api.example.com"]).await;
@@ -875,7 +950,7 @@ mod tests {
         let verifier = JwtVerifier::new(ZitadelAuthConfig {
             issuer: "http://irrelevant-issuer".into(),
             jwks_url: broken.jwks_url().to_string(),
-            audiences: vec![],
+            audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
         });
         let (pipeline, _) = pipeline_with(&[API], verifier);
         // Any well-formed JWT with a kid triggers a JWKS fetch, which fails.

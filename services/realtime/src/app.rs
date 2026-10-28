@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use axum::Router;
+use axum::extract::State;
 use axum::routing::{get, post};
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_nats::rt::{ACCESS, AccessEvent, PRESENCE, PROJECT, ProjectEvent};
@@ -437,7 +438,19 @@ pub async fn build_with(config: Config, deps: Deps) -> anyhow::Result<Realtime> 
         .route(TICKETS_PATH, post(socket::tickets))
         .route(SOCKET_PATH, get(socket::upgrade))
         .with_state(shared.clone());
-    let internal_app = Router::new().route(HEALTH_PATH, get(|| async { "ok" }));
+    // Readiness too (#22): 503 while member tokens can't be checked yet.
+    let internal_app = Router::new()
+        .route(
+            HEALTH_PATH,
+            get(|State(shared): State<Arc<Shared>>| async move {
+                if shared.verifier.is_ready() {
+                    (axum::http::StatusCode::OK, "ok")
+                } else {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "waiting for the token audiences")
+                }
+            }),
+        )
+        .with_state(shared.clone());
     let listeners = vec![
         tokio::spawn(serve(public, public_app, shared.shutdown.subscribe())),
         tokio::spawn(serve(internal, internal_app, shared.shutdown.subscribe())),

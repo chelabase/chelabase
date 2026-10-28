@@ -38,6 +38,12 @@ pub enum TokenError {
 #[async_trait]
 pub trait TokenVerifier: Send + Sync + 'static {
     async fn verify(&self, token: &str) -> Result<MemberToken, TokenError>;
+
+    /// Whether tokens can be checked now (#22: the audiences may come late from the
+    /// bootstrap's files); the internal `/health` reports it.
+    fn is_ready(&self) -> bool {
+        true
+    }
 }
 
 /// The production verifier: `chelabase_auth::JwtVerifier` with the gateway's settings.
@@ -66,8 +72,21 @@ impl TokenVerifier for OidcVerifier {
             }),
             Err(AuthError::Expired) => Err(TokenError::Expired),
             Err(AuthError::Unauthorized | AuthError::InvalidToken(_)) => Err(TokenError::Invalid),
-            Err(AuthError::Jwks(_) | AuthError::Config(_)) => Err(TokenError::Unavailable),
+            Err(AuthError::Jwks(_) | AuthError::Config(_) | AuthError::NotReady(_)) => {
+                Err(TokenError::Unavailable)
+            }
         }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.inner.config().audiences.is_ready()
+    }
+}
+
+impl OidcVerifier {
+    /// [`TokenVerifier::is_ready`], callable without the trait in scope.
+    pub fn is_ready(&self) -> bool {
+        TokenVerifier::is_ready(self)
     }
 }
 
@@ -109,6 +128,7 @@ pub mod fake {
     #[derive(Default)]
     pub struct FakeVerifier {
         unavailable: AtomicBool,
+        not_ready: AtomicBool,
     }
 
     impl FakeVerifier {
@@ -127,6 +147,10 @@ pub mod fake {
         pub fn set_unavailable(&self, on: bool) {
             self.unavailable.store(on, Ordering::SeqCst);
         }
+        /// What [`TokenVerifier::is_ready`] answers (ready unless set).
+        pub fn set_not_ready(&self, on: bool) {
+            self.not_ready.store(on, Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -136,6 +160,10 @@ pub mod fake {
                 return Err(TokenError::Unavailable);
             }
             Self::decode(token).ok_or(TokenError::Invalid)
+        }
+
+        fn is_ready(&self) -> bool {
+            !self.not_ready.load(Ordering::SeqCst)
         }
     }
 }

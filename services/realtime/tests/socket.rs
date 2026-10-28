@@ -179,6 +179,18 @@ async fn valkey_down_means_503_for_the_upgrade() {
     );
 }
 
+// #22: the internal health check is readiness too: 503 while the OIDC verifier can't check
+// tokens (its audiences aren't written yet), 200 once it can.
+#[tokio::test]
+async fn health_waits_for_the_token_audiences() {
+    let h = Harness::start().await;
+    let url = format!("http://{}/health", h.rt().internal_addr());
+    h.verifier.set_not_ready(true);
+    assert_eq!(reqwest::get(&url).await.unwrap().status().as_u16(), 503);
+    h.verifier.set_not_ready(false);
+    assert_eq!(reqwest::get(&url).await.unwrap().status().as_u16(), 200);
+}
+
 #[tokio::test]
 async fn the_internal_listener_serves_health_only() {
     let h = Harness::start().await;

@@ -140,7 +140,9 @@ async fn spawn_gateway_with(
             .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
             .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
             .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
-            .env("CHELABASE_ZITADEL_AUDIENCES", "")
+            .env("CHELABASE_ZITADEL_AUDIENCES", chelabase_auth::test_support::MOCK_AUDIENCE)
+            // The development bearers (this test stands in for the workbench).
+            .env("CHELABASE_DEV_DEFAULTS", "1")
             .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
             .env("RUST_LOG", "warn")
             .envs(extra_env.iter().copied())
