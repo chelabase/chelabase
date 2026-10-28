@@ -142,6 +142,10 @@ impl Pipeline {
         }
         match self.registry.load().target_for(req.host) {
             None => return empty_response(404),
+            // Studio reads its runtime config from its own origin (it doesn't know the API's
+            // yet): that one public GET is routed as on the API host.
+            Some(Target::Site(Site::Studio))
+                if req.method == "GET" && req.path == chelabase_routes::auth::STUDIO_CONFIG.path => {}
             Some(Target::Site(site)) => return Outcome::Site(site),
             Some(Target::Api) => {}
         }
@@ -676,6 +680,32 @@ mod tests {
             .with_site("auth.test:8000", Site::Auth);
         let (pipeline, verify) = pipeline_with_registry(registry, JwtVerifier::new(jwks.config(vec![])));
         Harness { pipeline, jwks, verify }
+    }
+
+    // Selfhost-install m5: Studio reads its runtime config from its own origin before it knows
+    // the API's, so `GET /auth/v1/studio-config` on Studio's host goes to auth like on the API
+    // host. Only that one public GET: everything else there is Studio's.
+    #[tokio::test]
+    async fn studio_config_is_served_on_studio_host() {
+        let h = site_harness().await;
+        for host in ["studio.test", "studio.test:8000"] {
+            let plan = expect_plan(run(&h.pipeline, "GET", "/auth/v1/studio-config", Some(host), &[]).await.outcome);
+            assert_eq!(plan.endpoint.service, Service::Auth, "{host}");
+            assert_eq!(plan.endpoint.path, "/auth/v1/studio-config");
+            assert_eq!(plan.identity, None);
+            for (method, path) in [
+                ("POST", "/auth/v1/studio-config"),
+                ("GET", "/auth/v1/instance"),
+                ("POST", "/auth/v1/sign-in"),
+                ("GET", "/auth/v1/studio-config/x"),
+            ] {
+                let handled = run(&h.pipeline, method, path, Some(host), &[]).await;
+                assert!(matches!(handled.outcome, Outcome::Site(Site::Studio)), "{host} {method} {path}");
+            }
+        }
+        // Not on another site's host.
+        let handled = run(&h.pipeline, "GET", "/auth/v1/studio-config", Some("auth.test:8000"), &[]).await;
+        assert!(matches!(handled.outcome, Outcome::Site(Site::Auth)));
     }
 
     #[tokio::test]
