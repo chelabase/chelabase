@@ -53,6 +53,7 @@ pub async fn harness_tweaked(
     let mut config = Config {
         listen: String::new(),
         issuer: mock.base.clone(),
+        zitadel: chelabase_types::entry::ZitadelAt { base: mock.base.clone(), host: None },
         token: TOKEN.into(),
         cookie_key: cookie_key.clone(),
         org_id: "o1".into(),

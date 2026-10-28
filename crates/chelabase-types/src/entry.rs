@@ -18,6 +18,49 @@ pub fn zitadel_upstream(get: impl Fn(&str) -> Option<String>) -> String {
     value(&get, "CHELABASE_ZITADEL_UPSTREAM").unwrap_or_else(|| DEFAULT_ZITADEL_UPSTREAM.to_string())
 }
 
+/// Where an app sends its calls to Zitadel (keys and API) (#24).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZitadelAt {
+    /// The URL calls go to, no trailing slash: `CHELABASE_ZITADEL_INTERNAL_URL`, else the issuer.
+    pub base: String,
+    /// The `Host` they carry when `base` is the in-network URL: the public auth host (Zitadel
+    /// picks its instance by Host). `None` when `base` is the issuer itself.
+    pub host: Option<String>,
+}
+
+/// `CHELABASE_ZITADEL_INTERNAL_URL` (blank = unset): Zitadel's address inside the network, an
+/// `http(s)://host[:port]` origin and nothing else (no path, query, fragment or credentials).
+/// The self-hosted install sets it, because behind a TLS proxy with no port in the hosts the
+/// public `https://auth…` URL doesn't reach Zitadel from inside the network. Calls to it carry
+/// the auth host (the issuer's authority) as `Host`. Unset: calls go to the issuer, as before.
+/// The issuer itself (what a token's `iss` must be) never comes from it.
+pub fn zitadel_at(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt, EntryError> {
+    const NAME: &str = "CHELABASE_ZITADEL_INTERNAL_URL";
+    let Some(raw) = value(&get, NAME) else {
+        return Ok(ZitadelAt { base: issuer.trim_end_matches('/').to_string(), host: None });
+    };
+    let bad = |why: &str| EntryError(format!("{NAME} {raw:?} {why}"));
+    let authority = raw
+        .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
+        .ok_or_else(|| bad("must start with http:// or https://"))?;
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.is_empty() {
+        return Err(bad("has no host"));
+    }
+    validate_host(authority)
+        .map_err(|e| bad(&format!("must be an origin, scheme://host[:port], with no path, query or credentials ({e})")))?;
+    let host = issuer
+        .split_once("://")
+        .map(|(_, rest)| rest.trim_end_matches('/'))
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| EntryError(format!("the issuer {issuer:?} has no host")))?;
+    Ok(ZitadelAt {
+        base: raw.strip_suffix('/').unwrap_or(&raw).to_string(),
+        host: Some(host.to_string()),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
     Http,

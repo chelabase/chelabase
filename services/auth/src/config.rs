@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
 use chelabase_types::dev_defaults::DevDefaults;
-use chelabase_types::entry::Scheme;
+use chelabase_types::entry::{Scheme, ZitadelAt};
 use chelabase_types::file_value::{FileValue, Sensitivity};
 pub use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
@@ -18,7 +18,11 @@ pub const DEFAULT_MIN_RESPONSE_MS: u64 = 1500;
 #[derive(Clone)]
 pub struct Config {
     pub listen: String,
+    /// The public issuer (what Studio is told; a token's `iss`).
     pub issuer: String,
+    /// Where auth's calls to Zitadel go: `CHELABASE_ZITADEL_INTERNAL_URL` with the auth host as
+    /// `Host`, else the issuer (#24).
+    pub zitadel: ZitadelAt,
     pub token: String,
     pub cookie_key: SecretKey,
     /// `CHELABASE_ZITADEL_ORG_ID`, or the file `CHELABASE_ZITADEL_ORG_ID_FILE` names (the
@@ -188,9 +192,12 @@ impl Config {
         .map_err(anyhow::Error::msg)?;
         check_listen(&listen, !trusted_proxies.is_empty())?;
         let ids = ZitadelIds::from_lookup(|name| std::env::var(name).ok())?;
+        let zitadel = chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
+            .map_err(anyhow::Error::new)?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
+            zitadel,
             token: token.trim().to_string(),
             cookie_key,
             org_id: ids.org_id,
@@ -281,7 +288,7 @@ impl AppConfig {
 
     /// The admin Zitadel client from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`, independent of the app
     /// keys; `None` (with a warning) when the variable is unset. Accept-invite needs it.
-    pub fn admin_from_env(issuer: &str) -> Result<Option<crate::zitadel::Zitadel>> {
+    pub fn admin_from_env(at: &ZitadelAt) -> Result<Option<crate::zitadel::Zitadel>> {
         let Some(path) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
             .ok()
             .map(|v| v.trim().to_string())
@@ -293,7 +300,7 @@ impl AppConfig {
             return Ok(None);
         };
         let pat = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        Ok(Some(crate::zitadel::Zitadel::new(issuer, pat.trim())))
+        Ok(Some(crate::zitadel::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref())))
     }
 
     pub fn from_env() -> Result<Option<Self>> {

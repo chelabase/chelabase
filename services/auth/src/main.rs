@@ -33,7 +33,7 @@ async fn main() -> anyhow::Result<()> {
         Some(c) => {
             AppConfig::check_internal_token(config.mode, dev, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
-            Some(AppUsers::from_config(&c, &config.issuer)?)
+            Some(AppUsers::from_config(&c, &config.zitadel)?)
         }
         None => None,
     };
@@ -46,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
         app,
         signup_gate: Some(signup_gate),
         used_tickets: Default::default(),
-        admin: AppConfig::admin_from_env(&config.issuer)?,
-        zitadel: Zitadel::new(&config.issuer, &config.token),
+        admin: AppConfig::admin_from_env(&config.zitadel)?,
+        zitadel: Zitadel::new(&config.zitadel.base, &config.token).with_host(config.zitadel.host.as_deref()),
         config,
         limiter: RateLimiter::default(),
     });

@@ -169,7 +169,10 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.stack,
         )?),
         console: Console::default(),
-        zitadel: zitadel_admin(&entry.issuer()),
+        zitadel: zitadel_admin(
+            &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
+                .map_err(anyhow::Error::new)?,
+        ),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
@@ -216,9 +219,10 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
     }
 }
 
-/// Zitadel's admin API (at `issuer`) with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`;
-/// `None` (warned) when that is unset or the file can't be read.
-fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
+/// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from
+/// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None` (warned) when that is unset or the file can't be
+/// read.
+fn zitadel_admin(at: &chelabase_types::entry::ZitadelAt) -> Option<chelabase_zitadel::client::Zitadel> {
     let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -228,7 +232,9 @@ fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
         return None;
     };
     match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim())),
+        Ok(pat) if !pat.trim().is_empty() => {
+            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
+        }
         Ok(_) => {
             warn!("{file} is empty; app users can't be enabled");
             None

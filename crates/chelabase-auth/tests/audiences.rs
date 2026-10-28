@@ -86,6 +86,7 @@ async fn an_empty_audience_list_never_accepts_a_token() {
     let verifier = JwtVerifier::new(ZitadelAuthConfig {
         issuer: mock.issuer().into(),
         jwks_url: mock.jwks_url().into(),
+        jwks_host: None,
         audiences: Vec::<String>::new().into(),
     });
     for aud in [json!("anyone"), json!(["a", "b"]), json!(null)] {

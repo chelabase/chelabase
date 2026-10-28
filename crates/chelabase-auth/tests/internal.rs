@@ -264,3 +264,34 @@ fn old_identity_tokens_without_project_parse() {
     let back: DataIdentity = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
     assert_eq!(back, with);
 }
+
+// #24 follow-up: the claims the verifier checks are required, so a token missing `iss` or
+// `aud` (or `exp`), signed with the right key, is refused rather than passing unchecked.
+#[test]
+fn a_token_without_iss_or_aud_is_refused() {
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let verifier = InternalVerifier::from_pem(public_pem.as_bytes()).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+    for missing in ["iss", "aud", "exp"] {
+        let mut claims = serde_json::json!({
+            "iss": INTERNAL_ISSUER,
+            "aud": "orchestrator",
+            "iat": now(),
+            "exp": now() + 60,
+            "sub": "user-1",
+            "org_id": "org-1",
+            "auth": "management_jwt",
+            "rid": "rid-1",
+        });
+        claims.as_object_mut().unwrap().remove(missing);
+        let token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA),
+            &claims,
+            &key,
+        )
+        .unwrap();
+        // Refused by the required claims or, first, by the claims type's own required fields.
+        let result = verifier.verify(&token, "orchestrator");
+        assert!(matches!(result, Err(AuthError::InvalidToken(_))), "a token without {missing}: {result:?}");
+    }
+}

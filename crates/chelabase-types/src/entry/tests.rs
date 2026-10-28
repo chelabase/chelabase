@@ -297,3 +297,53 @@ fn platform_mode_refuses_an_http_entry() {
     let https = Entry::from_lookup(env(&[("CHELABASE_PUBLIC_SCHEME", "https")])).unwrap();
     assert!(https.check_mode(Mode::Platform).is_ok());
 }
+
+// #24: the apps reach Zitadel at CHELABASE_ZITADEL_INTERNAL_URL with the auth host as Host,
+// else at the issuer; the issuer is never taken from it.
+#[test]
+fn zitadel_is_reached_in_network_with_the_auth_host_or_at_the_issuer() {
+    let at = |v: Option<&str>, issuer: &str| {
+        let v = v.map(str::to_string);
+        zitadel_at(move |k| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.clone()).flatten(), issuer)
+    };
+    assert_eq!(
+        at(None, "https://auth.example.com").unwrap(),
+        ZitadelAt { base: "https://auth.example.com".into(), host: None }
+    );
+    assert_eq!(at(Some("  "), "http://auth.chelabase.localhost:8000").unwrap().host, None);
+    for (raw, base) in [
+        ("http://zitadel:8080", "http://zitadel:8080"),
+        ("http://zitadel:8080/", "http://zitadel:8080"),
+        ("https://10.0.0.5", "https://10.0.0.5"),
+        ("http://[fd00::5]:8080", "http://[fd00::5]:8080"),
+    ] {
+        assert_eq!(
+            at(Some(raw), "https://auth.example.com").unwrap(),
+            ZitadelAt { base: base.into(), host: Some("auth.example.com".into()) },
+            "{raw}"
+        );
+    }
+    assert_eq!(
+        at(Some("http://zitadel:8080"), "http://auth.chelabase.localhost:8000").unwrap().host.as_deref(),
+        Some("auth.chelabase.localhost:8000")
+    );
+    for bad in [
+        "zitadel:8080",
+        "HTTP://zitadel:8080",
+        "ftp://zitadel",
+        "http://",
+        "http:///",
+        "http://zitadel:8080/oauth/v2/keys",
+        "http://zitadel/evil",
+        "http://zitadel:8080?x",
+        "http://zitadel:8080#x",
+        "http://u:p@zitadel:8080",
+        "http://u@zitadel",
+        "http://zitadel:0",
+        "http://zitadel:65536",
+        "http://zit_adel",
+    ] {
+        let e = at(Some(bad), "https://auth.example.com").unwrap_err().to_string();
+        assert!(e.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {e}");
+    }
+}

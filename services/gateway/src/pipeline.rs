@@ -1004,6 +1004,7 @@ mod tests {
         let verifier = JwtVerifier::new(ZitadelAuthConfig {
             issuer: "http://irrelevant-issuer".into(),
             jwks_url: broken.jwks_url().to_string(),
+            jwks_host: None,
             audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
         });
         let (pipeline, _) = pipeline_with(&[API], verifier);

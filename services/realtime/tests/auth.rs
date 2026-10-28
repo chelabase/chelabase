@@ -168,6 +168,7 @@ async fn jwks_down_is_unavailable() {
     let config = ZitadelAuthConfig {
         issuer: jwks.issuer().into(),
         jwks_url: broken.jwks_url().into(),
+        jwks_host: None,
         audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     };
     let v = OidcVerifier::new(config);

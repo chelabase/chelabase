@@ -573,6 +573,7 @@ async fn jwks_down_is_unavailable() {
     let oidc = chelabase_auth::ZitadelAuthConfig {
         issuer: signer.issuer().to_string(),
         jwks_url: broken.jwks_url().to_string(),
+        jwks_host: None,
         audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     };
     let app = spawn_app_oidc(
