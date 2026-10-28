@@ -160,7 +160,7 @@ impl ConnLookup {
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(LOOKUP_TIMEOUT)
                 .build()
-                .unwrap_or_default(),
+                .expect("realtime's HTTP client builds"),
             base: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             cache: Mutex::new(HashMap::new()),

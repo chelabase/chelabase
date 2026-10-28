@@ -171,7 +171,7 @@ impl OwnerClient {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .expect("realtime's HTTP client builds"),
             url: format!("{}{VISIBLE_PATH}", base_url.trim_end_matches('/')),
             bearer: bearer.to_string(),
             timeout: VISIBLE_TIMEOUT,

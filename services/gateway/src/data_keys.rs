@@ -70,7 +70,9 @@ impl DataKeyResolver {
         ttl: Duration,
         misses_per_sec: u32,
     ) -> Self {
+        // Never a redirect (#26): the internal bearer goes to the orchestrator only.
         let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(LOOKUP_TIMEOUT)
             .build()
             .expect("build the key lookup HTTP client");

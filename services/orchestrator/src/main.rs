@@ -86,7 +86,10 @@ async fn main() -> anyhow::Result<()> {
     let rest = RestInternal {
         url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),
-        http: reqwest::Client::new(),
+        // Never a redirect (#26): the rest internal bearer goes to rest only.
+        http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?,
     };
 
     // The storage controller runs without --dev: an admin-scoped NeonJWT from the compute-JWT key.
@@ -104,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
             .with_timeout(Duration::from_secs(10))
             .with_token(storcon_admin),
         signer,
+        // Never a redirect (#26): compute_ctl's JWT and the bearers go to the configured hosts.
         http: reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()?,
         proxy_token: internal_config.proxy_token.clone(),

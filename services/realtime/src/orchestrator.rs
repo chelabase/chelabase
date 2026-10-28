@@ -186,7 +186,7 @@ impl OrchestratorClient {
             http: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
-                .unwrap_or_default(),
+                .expect("realtime's HTTP client builds"),
             base_url: base_url.trim_end_matches('/').to_string(),
             internal_url: internal_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
