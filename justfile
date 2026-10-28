@@ -311,3 +311,8 @@ neon-test:
 # Live sign-up/sign-in/reset/logout through the gateway and auth
 auth-e2e:
     cargo run -q -p chelabase -- workbench run scripts/auth-e2e.sh
+
+# The self-hosted install end to end, on a throwaway Compose project of its own (no workbench).
+# Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
+selfhost-e2e:
+    scripts/selfhost-e2e.sh
