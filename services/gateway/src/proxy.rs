@@ -1,6 +1,7 @@
 //! Pingora adapter. Only this module and `main.rs` touch Pingora types; the
 //! decisions live in `pipeline`.
 
+use crate::client_addr::{client_address, TrustedProxies};
 use crate::pipeline::{error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, REQUEST_ID_HEADER};
 use crate::registry::Site;
 use crate::upstreams::Upstreams;
@@ -11,7 +12,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_error::{Error, ErrorSource, ErrorType, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tracing::info;
 
@@ -29,6 +30,8 @@ pub struct Gateway {
     read_timeout: Duration,
     /// `X-Forwarded-Proto`: the public scheme (`CHELABASE_PUBLIC_SCHEME`), never the client's.
     forwarded_proto: &'static str,
+    /// Peers whose forwarded client address is believed (`CHELABASE_GATEWAY_TRUSTED_PROXIES`).
+    trusted_proxies: TrustedProxies,
 }
 
 impl Gateway {
@@ -41,7 +44,14 @@ impl Gateway {
                 Scheme::Http => "http",
                 Scheme::Https => "https",
             },
+            trusted_proxies: TrustedProxies::default(),
         }
+    }
+
+    /// Believe the forwarded client address from these peers (none by default).
+    pub fn with_trusted_proxies(mut self, trusted_proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = trusted_proxies;
+        self
     }
 }
 
@@ -55,6 +65,8 @@ pub struct RequestCtx {
     /// Resolved upstream addresses, and the one currently being tried.
     candidates: Vec<SocketAddr>,
     attempt: usize,
+    /// The client's address ([`client_address`]), set by `request_filter`.
+    client_ip: Option<IpAddr>,
 }
 
 #[async_trait]
@@ -70,6 +82,7 @@ impl ProxyHttp for Gateway {
             site: None,
             candidates: Vec::new(),
             attempt: 0,
+            client_ip: None,
         }
     }
 
@@ -81,10 +94,13 @@ impl ProxyHttp for Gateway {
         let headers = req.headers.clone();
         let host = request_host(req);
 
-        let client_ip = session
+        // The TCP peer, or the address a trusted reverse proxy forwarded for it.
+        let peer = session
             .client_addr()
             .and_then(|addr| addr.as_inet())
             .map(|inet| inet.ip());
+        let client_ip = client_address(peer, &self.trusted_proxies, &headers);
+        ctx.client_ip = client_ip;
 
         let handled = self
             .pipeline
@@ -213,7 +229,7 @@ impl ProxyHttp for Gateway {
 
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream: &mut RequestHeader,
         ctx: &mut RequestCtx,
     ) -> Result<()> {
@@ -233,12 +249,9 @@ impl ProxyHttp for Gateway {
             }
         }
 
-        // P4, on every target: the forwarded headers are the gateway's own, never the client's.
-        let client_ip = session
-            .client_addr()
-            .and_then(|a| a.as_inet())
-            .map(|a| a.ip().to_string());
-        for (name, value) in forwarded_headers(self.forwarded_proto, client_ip, ctx.host.as_deref()) {
+        // P4, on every target: the forwarded headers are the gateway's own, never the client's
+        // (`X-Forwarded-For` is the one address `request_filter` settled on).
+        for (name, value) in forwarded_headers(self.forwarded_proto, ctx.client_ip, ctx.host.as_deref()) {
             match value {
                 Some(value) => upstream.insert_header(name, value)?,
                 None => {
@@ -418,16 +431,17 @@ fn plain_error_body(status: u16) -> String {
     format!("{status} {reason}\n")
 }
 
-/// P4: `X-Forwarded-Proto` (the public scheme), `-For` (the client's address only) and `-Host`
-/// (the request's `Host`), each replacing whatever the client sent; None removes the header.
+/// P4: `X-Forwarded-Proto` (the public scheme), `-For` (the client's address only, see
+/// [`client_address`]) and `-Host` (the request's `Host`), each replacing whatever the client
+/// sent; None removes the header.
 fn forwarded_headers(
     proto: &'static str,
-    client_ip: Option<String>,
+    client_ip: Option<IpAddr>,
     host: Option<&str>,
 ) -> [(&'static str, Option<String>); 3] {
     [
         ("x-forwarded-proto", Some(proto.to_string())),
-        ("x-forwarded-for", client_ip),
+        ("x-forwarded-for", client_ip.map(|ip| ip.to_string())),
         ("x-forwarded-host", host.map(str::to_string)),
     ]
 }
@@ -488,6 +502,7 @@ fn failure_status(source: &ErrorSource, etype: &ErrorType) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client_addr::{client_address, TrustedProxies, MAX_FORWARDED_BYTES, MAX_FORWARDED_HOPS};
 
     fn upgrade_headers(values: &[&str]) -> http::HeaderMap {
         let mut h = http::HeaderMap::new();
@@ -571,7 +586,7 @@ mod tests {
 
     #[test]
     fn forwarded_headers_are_the_gateways_own() {
-        let set = forwarded_headers("https", Some("10.0.0.7".into()), Some("studio.acme.com"));
+        let set = forwarded_headers("https", Some("10.0.0.7".parse().unwrap()), Some("studio.acme.com"));
         assert_eq!(
             set,
             [
@@ -583,6 +598,263 @@ mod tests {
         // Unknown values remove the client's rather than keep them.
         let unset = forwarded_headers("http", None, None);
         assert_eq!((unset[1].1.as_deref(), unset[2].1.as_deref()), (None, None));
+    }
+
+    // ---- m14 (#25): a trusted reverse proxy's forwarded client address ----
+
+    fn trust(raw: &str) -> TrustedProxies {
+        TrustedProxies::parse(raw).unwrap()
+    }
+
+    /// The `X-Forwarded-For` the apps see for a request from `peer` carrying `headers`.
+    fn apps_see(peer: &str, trusted: &TrustedProxies, headers: &[(&str, &[u8])]) -> Option<String> {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                http::HeaderValue::from_bytes(value).unwrap(),
+            );
+        }
+        let client = client_address(Some(peer.parse().unwrap()), trusted, &map);
+        let set = forwarded_headers("https", client, Some("api.acme.com"));
+        assert_eq!(set[1].0, "x-forwarded-for");
+        set[1].1.clone()
+    }
+
+    fn xff(value: &str) -> (&'static str, &[u8]) {
+        ("x-forwarded-for", value.as_bytes())
+    }
+
+    fn fwd(value: &str) -> (&'static str, &[u8]) {
+        ("forwarded", value.as_bytes())
+    }
+
+    fn seen(ip: &str) -> Option<String> {
+        Some(ip.to_string())
+    }
+
+    #[test]
+    fn no_trusted_proxies_is_todays_behaviour() {
+        let none = TrustedProxies::default();
+        assert!(none.is_empty());
+        for headers in [
+            &[][..],
+            &[xff("1.2.3.4")],
+            &[xff("1.2.3.4, 10.0.0.2")],
+            &[fwd("for=1.2.3.4")],
+            &[xff("1.2.3.4"), fwd("for=5.6.7.8")],
+        ] {
+            assert_eq!(apps_see("10.0.0.2", &none, headers), seen("10.0.0.2"), "{headers:?}");
+            assert_eq!(apps_see("2001:db8::9", &none, headers), seen("2001:db8::9"), "{headers:?}");
+        }
+        // The peer itself, exactly one address, even with no header at all.
+        assert_eq!(apps_see("203.0.113.5", &none, &[]), seen("203.0.113.5"));
+    }
+
+    #[test]
+    fn a_trusted_proxy_forwards_the_client_address() {
+        let t = trust("10.0.0.0/8");
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("1.2.3.4, 10.0.0.2")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("1.2.3.4")]), seen("1.2.3.4"));
+        // OWS and tabs around entries.
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("  1.2.3.4\t,\t10.0.0.3 ")]), seen("1.2.3.4"));
+        // A bare IP entry trusts exactly that address.
+        let one = trust("192.168.1.5");
+        assert_eq!(apps_see("192.168.1.5", &one, &[xff("1.2.3.4")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("192.168.1.6", &one, &[xff("1.2.3.4")]), seen("192.168.1.6"));
+    }
+
+    #[test]
+    fn the_right_most_untrusted_address_wins_over_what_the_client_wrote() {
+        let t = trust("10.0.0.0/8");
+        // The client's own claim is left of what the proxy appended.
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("6.6.6.6, 1.2.3.4")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("6.6.6.6, 7.7.7.7, 1.2.3.4, 10.0.0.9")]), seen("1.2.3.4"));
+        // Several header lines are one list, in order.
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("6.6.6.6"), xff("1.2.3.4")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("6.6.6.6, 1.2.3.4"), xff("10.0.0.7")]), seen("1.2.3.4"));
+        // Junk the client put left of the proxy's entry is never read.
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("not-an-ip, 1.2.3.4")]), seen("1.2.3.4"));
+    }
+
+    #[test]
+    fn a_chain_of_trusted_proxies_is_walked() {
+        let t = trust("10.0.0.0/8, 192.168.1.5, fd00::/8");
+        assert_eq!(
+            apps_see("10.0.0.2", &t, &[xff("6.6.6.6, 1.2.3.4, 192.168.1.5, fd00::3, 10.0.0.9")]),
+            seen("1.2.3.4")
+        );
+        // An untrusted hop in the middle stops the walk there.
+        assert_eq!(
+            apps_see("10.0.0.2", &t, &[xff("1.2.3.4, 198.51.100.7, 10.0.0.9")]),
+            seen("198.51.100.7")
+        );
+        // Every hop trusted: the furthest one (the left-most) is the client.
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("10.0.0.5, 10.0.0.6")]), seen("10.0.0.5"));
+    }
+
+    #[test]
+    fn ipv6_peers_and_clients() {
+        let t = trust("fd00::/8, 2001:db8:aa::/48");
+        assert_eq!(apps_see("fd00::1", &t, &[xff("2001:db8::7, fd00::2")]), seen("2001:db8::7"));
+        assert_eq!(apps_see("2001:db8:aa::1", &t, &[xff("[2001:db8::7]")]), seen("2001:db8::7"));
+        assert_eq!(apps_see("fd00::1", &t, &[xff("[2001:db8::7]:443")]), seen("2001:db8::7"));
+        assert_eq!(apps_see("fd00::1", &t, &[xff("1.2.3.4")]), seen("1.2.3.4"));
+        // Untrusted IPv6 peer.
+        assert_eq!(apps_see("2001:db8:bb::1", &t, &[xff("1.2.3.4")]), seen("2001:db8:bb::1"));
+        // A dual-stack socket's IPv4-mapped peer matches its IPv4 network, and a mapped client
+        // is reported as IPv4.
+        let v4 = trust("10.0.0.0/8");
+        assert_eq!(apps_see("::ffff:10.0.0.2", &v4, &[xff("1.2.3.4")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &v4, &[xff("::ffff:1.2.3.4")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &v4, &[xff("1.2.3.4, ::ffff:10.0.0.3")]), seen("1.2.3.4"));
+    }
+
+    #[test]
+    fn ports_on_forwarded_entries_are_dropped() {
+        let t = trust("10.0.0.0/8");
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("1.2.3.4:5555")]), seen("1.2.3.4"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("1.2.3.4, 10.0.0.3:80")]), seen("1.2.3.4"));
+    }
+
+    #[test]
+    fn the_forwarded_header_is_read_too() {
+        let t = trust("10.0.0.0/8");
+        for value in [
+            "for=1.2.3.4",
+            "For=1.2.3.4",
+            "for=\"1.2.3.4\"",
+            "for=\"1.2.3.4:4711\"",
+            "for=1.2.3.4;proto=https;by=10.0.0.2",
+            "proto=https; for=1.2.3.4",
+            "for=6.6.6.6, for=1.2.3.4",
+            "for=1.2.3.4, for=10.0.0.3",
+            "for=6.6.6.6,for=1.2.3.4 , for=\"10.0.0.3:80\"",
+        ] {
+            assert_eq!(apps_see("10.0.0.2", &t, &[fwd(value)]), seen("1.2.3.4"), "{value}");
+        }
+        for value in ["for=\"[2001:db8::7]\"", "for=\"[2001:db8::7]:4711\"", "for=1.2.3.4, for=\"[2001:db8::7]\""] {
+            assert_eq!(apps_see("10.0.0.2", &t, &[fwd(value)]), seen("2001:db8::7"), "{value}");
+        }
+        assert_eq!(apps_see("10.0.0.2", &t, &[fwd("for=6.6.6.6"), fwd("for=1.2.3.4")]), seen("1.2.3.4"));
+    }
+
+    #[test]
+    fn a_spoofed_header_from_an_untrusted_peer_changes_nothing() {
+        let t = trust("10.0.0.0/8, fd00::/8");
+        for headers in [
+            &[xff("1.2.3.4, 10.0.0.2")][..],
+            &[xff("1.2.3.4")],
+            &[xff("10.0.0.5")],
+            &[fwd("for=1.2.3.4")],
+            &[xff("1.2.3.4"), xff("10.0.0.9")],
+        ] {
+            assert_eq!(apps_see("203.0.113.5", &t, headers), seen("203.0.113.5"), "{headers:?}");
+            assert_eq!(apps_see("2001:db8::9", &t, headers), seen("2001:db8::9"), "{headers:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_header_from_a_trusted_peer_falls_back_to_the_peer() {
+        let t = trust("10.0.0.0/8");
+        let peer = seen("10.0.0.2");
+        for value in [
+            "",
+            " ",
+            ",",
+            "1.2.3.4,",
+            "1.2.3.4, ,10.0.0.3",
+            "unknown",
+            "garbage",
+            "1.2.3.4 5.6.7.8",
+            "1.2.3.256",
+            "01.2.3.4",
+            "fe80::1%eth0",
+            "2001:db8::7]:443",
+            "[2001:db8::7",
+            "[1.2.3.4]",
+            "[1.2.3.4]:80",
+            "1.2.3.4:",
+            "1.2.3.4:99999",
+            "1.2.3.4:http",
+            "\"1.2.3.4\"",
+            "for=1.2.3.4",
+            "1.2.3.4;10.0.0.3",
+        ] {
+            assert_eq!(apps_see("10.0.0.2", &t, &[xff(value)]), peer, "x-forwarded-for: {value:?}");
+        }
+        for value in [
+            "",
+            "for=",
+            "for=\"\"",
+            "for=unknown",
+            "for=_hidden",
+            "for=\"_hidden:4711\"",
+            "proto=https",
+            "for=1.2.3.4;for=5.6.7.8",
+            "for=\"1.2.3.4",
+            "for=1.2.3.4\"",
+            "for=\"1.2.\\3.4\"",
+            "for=\"1.2.3.4\"x",
+            "for=1.2.3.4,",
+            "for=1.2.3.4, , for=10.0.0.3",
+            "for=1.2.3.4;",
+            "for 1.2.3.4",
+            "=1.2.3.4",
+            "for=[2001:db8::7]",
+            "for=2001:db8::7",
+            "for=\"2001:db8::7\"",
+            "for=\"1.2.3.4, for=6.6.6.6\"",
+        ] {
+            assert_eq!(apps_see("10.0.0.2", &t, &[fwd(value)]), peer, "forwarded: {value:?}");
+        }
+        // Bytes that are not visible ASCII.
+        assert_eq!(apps_see("10.0.0.2", &t, &[("x-forwarded-for", b"1.2.3.4\xff")]), peer);
+        assert_eq!(apps_see("10.0.0.2", &t, &[("forwarded", b"for=\"1.2.3.4\xe9\"")]), peer);
+    }
+
+    #[test]
+    fn both_forwarding_headers_from_a_trusted_peer_fall_back_to_the_peer() {
+        // Which one the proxy wrote can't be told apart from which one the client sent.
+        let t = trust("10.0.0.0/8");
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff("1.2.3.4"), fwd("for=1.2.3.4")]), seen("10.0.0.2"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[fwd("for=6.6.6.6"), xff("1.2.3.4")]), seen("10.0.0.2"));
+    }
+
+    #[test]
+    fn a_trusted_peer_without_a_forwarding_header_is_the_client() {
+        let t = trust("10.0.0.0/8");
+        assert_eq!(apps_see("10.0.0.2", &t, &[]), seen("10.0.0.2"));
+        assert_eq!(apps_see("10.0.0.2", &t, &[("x-real-ip", b"1.2.3.4")]), seen("10.0.0.2"));
+    }
+
+    #[test]
+    fn an_overlong_header_from_a_trusted_peer_falls_back_to_the_peer() {
+        let t = trust("10.0.0.0/8");
+        let peer = seen("10.0.0.2");
+        // Too many hops, even when every one parses.
+        let hops = vec!["10.0.0.9"; MAX_FORWARDED_HOPS].join(", ");
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff(&format!("1.2.3.4, {hops}"))]), peer);
+        let within = vec!["10.0.0.9"; MAX_FORWARDED_HOPS - 1].join(", ");
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff(&format!("1.2.3.4, {within}"))]), seen("1.2.3.4"));
+        // Too many bytes, split over lines or not.
+        let long = format!("{}1.2.3.4", " ".repeat(MAX_FORWARDED_BYTES));
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff(&long)]), peer);
+        let half = " ".repeat(MAX_FORWARDED_BYTES / 2);
+        assert_eq!(apps_see("10.0.0.2", &t, &[xff(&half), xff(&half), xff("1.2.3.4")]), peer);
+        let fwd_hops = vec!["for=10.0.0.9"; MAX_FORWARDED_HOPS].join(", ");
+        assert_eq!(apps_see("10.0.0.2", &t, &[fwd(&format!("for=1.2.3.4, {fwd_hops}"))]), peer);
+        // A huge number of header lines.
+        let many: Vec<_> = (0..200).map(|_| xff("10.0.0.9")).collect();
+        assert_eq!(apps_see("10.0.0.2", &t, &many), peer);
+    }
+
+    #[test]
+    fn an_unknown_peer_stays_unknown() {
+        let t = trust("10.0.0.0/8");
+        let mut map = http::HeaderMap::new();
+        map.insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(client_address(None, &t, &map), None);
     }
 
     fn accept(values: &[&str]) -> http::HeaderMap {

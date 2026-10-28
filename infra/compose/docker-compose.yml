@@ -992,6 +992,7 @@ services:
     environment:
       <<: *app-env
       CHELABASE_GATEWAY_LISTEN: 0.0.0.0:${CHELABASE_PUBLIC_PORT:-8000}
+      CHELABASE_GATEWAY_TRUSTED_PROXIES: ${CHELABASE_GATEWAY_TRUSTED_PROXIES:-}
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
       CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/project-id

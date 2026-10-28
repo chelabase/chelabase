@@ -1,5 +1,6 @@
 //! Gateway settings from the environment.
 
+use crate::client_addr::TrustedProxies;
 use crate::registry::Site;
 use crate::upstreams::Upstreams;
 use chelabase_types::entry::{
@@ -32,6 +33,9 @@ pub struct GatewayConfig {
     pub app_sessions_token: String,
     /// Upstream read timeout (`CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS`, default 60).
     pub upstream_timeout: Duration,
+    /// Reverse proxies whose forwarded client address is believed
+    /// (`CHELABASE_GATEWAY_TRUSTED_PROXIES`, comma-separated CIDRs or addresses, default none).
+    pub trusted_proxies: TrustedProxies,
 }
 
 /// Everything but the token.
@@ -46,6 +50,7 @@ impl std::fmt::Debug for GatewayConfig {
             .field("app_jwt_public_key", &self.app_jwt_public_key)
             .field("app_sessions_token", &"<redacted>")
             .field("upstream_timeout", &self.upstream_timeout)
+            .field("trusted_proxies", &self.trusted_proxies)
             .finish()
     }
 }
@@ -128,6 +133,7 @@ impl GatewayConfig {
             app_sessions_token,
             upstream_timeout: parse_timeout_secs(&or("CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS", "60"))
                 .map_err(anyhow::Error::msg)?,
+            trusted_proxies: parse_trusted_proxies(&or(TRUSTED_PROXIES_ENV, ""))?,
         })
     }
 }
@@ -152,6 +158,15 @@ fn parse_listen(raw: &str) -> anyhow::Result<Vec<String>> {
         seen.push(parsed);
     }
     Ok(listen)
+}
+
+/// The variable naming the reverse proxies the gateway trusts.
+pub const TRUSTED_PROXIES_ENV: &str = "CHELABASE_GATEWAY_TRUSTED_PROXIES";
+
+/// `CHELABASE_GATEWAY_TRUSTED_PROXIES`: comma-separated CIDRs (`10.0.0.0/8`, `fd00::/8`) or
+/// single addresses; blank trusts no proxy. Anything else refuses startup, naming the variable.
+fn parse_trusted_proxies(raw: &str) -> anyhow::Result<TrustedProxies> {
+    TrustedProxies::parse(raw).map_err(|e| anyhow::anyhow!("{TRUSTED_PROXIES_ENV}: {e}"))
 }
 
 /// `"a, b,,c "` → `["a", "b", "c"]`.
@@ -346,6 +361,56 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(msg.contains("CHELABASE_GATEWAY_LISTEN"), "{msg}");
+    }
+
+    // ---- m14 (#25): trusted reverse proxies ----
+
+    #[test]
+    fn no_trusted_proxies_by_default() {
+        assert!(GatewayConfig::from_lookup(with(&[])).unwrap().trusted_proxies.is_empty());
+        let blank = GatewayConfig::from_lookup(with(&[(TRUSTED_PROXIES_ENV, " , ")])).unwrap();
+        assert!(blank.trusted_proxies.is_empty());
+    }
+
+    #[test]
+    fn trusted_proxies_take_cidrs_and_addresses() {
+        let c = GatewayConfig::from_lookup(with(&[(TRUSTED_PROXIES_ENV, "10.0.0.0/8, fd00::/8 ,192.168.1.5,::1")])).unwrap();
+        let t = &c.trusted_proxies;
+        for ip in ["10.1.2.3", "fd12::1", "192.168.1.5", "::1"] {
+            assert!(t.contains(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["11.0.0.1", "fe80::1", "192.168.1.6", "::2", "127.0.0.1"] {
+            assert!(!t.contains(ip.parse().unwrap()), "{ip}");
+        }
+        assert!(format!("{c:?}").contains("trusted_proxies"));
+    }
+
+    #[test]
+    fn an_invalid_trusted_proxy_refuses_startup_naming_the_variable() {
+        for bad in [
+            "nope",
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/+8",
+            "10.0.0.0/-1",
+            "10.0.0.0/8/8",
+            "10.0.0.1/8",
+            "fd00::1/8",
+            "0.0.0.0/0",
+            "::/0",
+            "10.0.0.0/8, nope",
+            "[::1]",
+            "10.0.0.1:80",
+            "localhost",
+        ] {
+            let msg = match GatewayConfig::from_lookup(with(&[(TRUSTED_PROXIES_ENV, bad)])) {
+                Err(e) => format!("{e:#}"),
+                Ok(_) => panic!("{bad:?} was accepted"),
+            };
+            assert!(msg.contains(TRUSTED_PROXIES_ENV), "{bad}: {msg}");
+        }
     }
 
     // ---- RT1 T3 (S18): the realtime upstream ----
