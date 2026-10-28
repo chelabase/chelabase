@@ -321,7 +321,8 @@ fn the_auth_files_are_rendered_owner_only_from_the_secret_files() {
     let keys = t.path().join("keys");
     let state = t.path().join("state");
     stack_secrets::ensure(&keys).unwrap();
-    // A file left by an older render with a loose mode is tightened, not kept.
+    // A file left by an older render with a loose mode is refused, not silently tightened
+    // (selfhost-install m1); a stale one at the right mode is rewritten.
     std::fs::create_dir_all(state.join("valkey")).unwrap();
     std::fs::write(state.join("valkey/users.acl"), "stale").unwrap();
     #[cfg(unix)]
@@ -330,6 +331,13 @@ fn the_auth_files_are_rendered_owner_only_from_the_secret_files() {
         std::fs::set_permissions(
             state.join("valkey/users.acl"),
             std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert!(write_auth_files(&keys, &state).is_err(), "a loose users.acl is refused");
+        assert_eq!(std::fs::read_to_string(state.join("valkey/users.acl")).unwrap(), "stale");
+        std::fs::set_permissions(
+            state.join("valkey/users.acl"),
+            std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
     }

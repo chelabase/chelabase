@@ -12,10 +12,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 base64 = { workspace = true }
-# RT1 T1 ruling (b): the NATS users file holds bcrypt hashes (tools/cli only).
-bcrypt = "0.19.3"
 chrono = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-init = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }
@@ -32,5 +31,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+# The NATS users file's hashes are checked against the passwords.
+bcrypt = "0.19.3"
 tempfile = { workspace = true }
 axum = { workspace = true }
