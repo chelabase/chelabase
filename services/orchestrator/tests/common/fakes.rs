@@ -2795,7 +2795,7 @@ async fn spawn_app_oidc(
     .await
 }
 
-#[allow(clippy::too_many_arguments, clippy::disallowed_methods)] // test code: a plain client
+#[allow(clippy::too_many_arguments)]
 async fn spawn_app_core(
     metadata: FakeMetadata,
     jobs: FakeJobs,
@@ -2824,7 +2824,8 @@ async fn spawn_app_core(
         rest: RestInternal {
             url: rest_url.into(),
             token: REST_TOKEN.into(),
-            http: reqwest::Client::new(),
+            // The production client (no redirects), so tests see what production sees.
+            http: chelabase_http::client_builder().build().unwrap(),
         },
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
         operator_org: operator_org.map(str::to_string),

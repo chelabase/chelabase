@@ -1352,7 +1352,8 @@ async fn spawn_with_app(
         locator,
         storcon: StorconClient::new(storcon_base, 0),
         signer: ComputeSigner::new(&pem, &x).unwrap(),
-        http: reqwest::Client::new(),
+        // The production clients (no redirects), so tests see what production sees.
+        http: chelabase_http::client_builder().build().unwrap(),
         proxy_token: PROXY_TOKEN.into(),
         storcon_token: STORCON_TOKEN.into(),
         data_keys_token: DATA_KEYS_TOKEN.into(),
@@ -1367,7 +1368,7 @@ async fn spawn_with_app(
         rest: orchestrator::RestInternal {
             url: rest_url.into(),
             token: REST_TOKEN.into(),
-            http: reqwest::Client::new(),
+            http: chelabase_http::client_builder().build().unwrap(),
         },
         app_auth_token: APP_AUTH_TOKEN.into(),
         app_sessions_token: APP_SESSIONS_TOKEN.into(),
