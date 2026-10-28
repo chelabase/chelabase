@@ -554,6 +554,29 @@ mod tests {
 
     const IMAGE: (&str, &str) = ("CHELABASE_COMPUTE_IMAGE", "chelabase/compute-node-v17:test");
 
+    // Selfhost-install m5 (AC 4): a service with an internal bearer at its development default
+    // refuses to start outside the workbench. The worker holds none (it signs storage JWTs
+    // with its key pair and reaches NATS with its own password, which has no default), so
+    // there is nothing to refuse. This pins that: a bearer added to its config must get the
+    // `DevDefaults::check_bearer` startup check the orchestrator and auth have.
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let get = lookup(&[IMAGE]);
+        WorkerConfig::from_lookup(|name| {
+            asked.borrow_mut().push(name.to_string());
+            get(name)
+        })
+        .unwrap();
+        let asked = asked.into_inner();
+        assert!(asked.iter().any(|n| n == "CHELABASE_COMPUTE_IMAGE"), "{asked:?}");
+        let bearers: Vec<&String> = asked
+            .iter()
+            .filter(|n| n.ends_with("_TOKEN") || n.ends_with("_TOKEN_FILE"))
+            .collect();
+        assert!(bearers.is_empty(), "the worker reads a bearer without the dev-default check: {bearers:?}");
+    }
+
     #[test]
     fn defaults_are_for_local_dev() {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
