@@ -53,6 +53,10 @@
 //!   directory is 0750 with a consumer group when the files below it in the same physical root
 //!   (both parts, self-hosted) are readable by one group, else 0700.
 //! - Runs on the same root are serialised by a lock file (`.chelabase-init.lock`).
+//! - Seeds ([`InitSecrets::seeds`], [`crate::seed`]): a missing plain value with a seed is
+//!   written from it, through the same write path (mode, owner, atomic publish) as a generated
+//!   one, and derived files are rendered from it. An existing file whose value differs from its
+//!   seed fails the check, naming the key and file, so a run never silently ignores a seed.
 //! - Nothing here prints or logs a secret: the report carries file paths and the setup code only.
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +68,7 @@ use crate::fsx::{Dir, Kind, Perm};
 
 use crate::kinds::service_auth::AuthFilesChanged;
 pub use crate::owners::{Id, OwnershipMap, Spec};
+pub use crate::seed::Seeds;
 
 /// Which root an entry lives under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +341,9 @@ pub struct InitSecrets {
     /// map's (never world-writable, executable or set-id), as the workbench's shared keys dir
     /// has them from before this check (made under the user's umask). Secrets stay exact.
     pub legacy_modes: bool,
+    /// Chosen values for plain generated files ([`crate::seed`]), written instead of a generated
+    /// value when the file is missing. Empty: everything is generated.
+    pub seeds: Seeds,
 }
 
 impl InitSecrets {
@@ -346,6 +354,7 @@ impl InitSecrets {
             install_dir: None,
             owners,
             legacy_modes: false,
+            seeds: Seeds::default(),
         }
     }
 
@@ -357,6 +366,7 @@ impl InitSecrets {
             install_dir: Some(stack_state.to_path_buf()),
             owners: OwnershipMap::writer_only(),
             legacy_modes: true,
+            seeds: Seeds::default(),
         }
     }
 }
@@ -386,7 +396,12 @@ impl std::fmt::Debug for SetupCode {
 /// What a run did. File paths only, and the setup code when this run created it.
 #[derive(Debug, Default)]
 pub struct Report {
+    /// Files this run generated.
     pub created: Vec<PathBuf>,
+    /// Files this run wrote from a seed ([`InitSecrets::seeds`]); not in `created`.
+    pub seeded: Vec<PathBuf>,
+    /// Layout files that existed and were left as they were.
+    pub kept: Vec<PathBuf>,
     pub rewritten: Vec<PathBuf>,
     pub setup_code: Option<SetupCode>,
     /// Whether `nats/auth.conf` or `valkey/users.acl` changed (a running server must restart).
@@ -863,6 +878,25 @@ impl Run<'_> {
                 ));
             }
         }
+        // A seed applies on first creation only: an existing file with another value fails the
+        // run (naming the key and file, never either value) rather than doing nothing silently.
+        for entry in LAYOUT {
+            let (Some((seed, value)), Some(bytes)) =
+                (self.opts.seeds.get(entry.path), self.have.get(entry.path))
+            else {
+                continue;
+            };
+            if !crate::seed::same_value(bytes, value) {
+                problems.push(format!(
+                    "{}: {} differs from what the file holds. Seeds apply only when a file is \
+                     first created; to keep the file, remove the {} line from the seeds file \
+                     (.env); changing a value is a key rotation (chelabase/chelabase#6)",
+                    self.abs(entry.part, entry.path).display(),
+                    seed.key,
+                    seed.key
+                ));
+            }
+        }
         problems.dedup();
         if !problems.is_empty() {
             bail!(
@@ -870,20 +904,36 @@ impl Run<'_> {
                 problems.join("\n  ")
             );
         }
+        for entry in LAYOUT.iter().filter(|e| self.have.contains_key(e.path)) {
+            let path = self.abs(entry.part, entry.path);
+            self.report.kept.push(path);
+        }
         Ok(())
     }
 
     /// Writes `rel` as a new file at its map entry; one that appears meanwhile is an error.
     fn put_new(&mut self, entry: &Entry, bytes: Vec<u8>) -> Result<()> {
+        let path = self.put_new_file(entry, bytes)?;
+        self.report.created.push(path);
+        Ok(())
+    }
+
+    /// [`Run::put_new`] for a seed: the same write path, reported under `seeded`.
+    fn put_seeded(&mut self, entry: &Entry, bytes: Vec<u8>) -> Result<()> {
+        let path = self.put_new_file(entry, bytes)?;
+        self.report.seeded.push(path);
+        Ok(())
+    }
+
+    fn put_new_file(&mut self, entry: &Entry, bytes: Vec<u8>) -> Result<PathBuf> {
         let dir = self.parent_created(entry.part, entry.path)?;
         let (_, name) = split(entry.path);
         let path = self.abs(entry.part, entry.path);
         if !dir.create_new(name, &bytes, self.perm(entry.path))? {
             bail!("{} appeared during the run; run it again", path.display());
         }
-        self.report.created.push(path);
         self.have.insert(entry.path, bytes);
-        Ok(())
+        Ok(path)
     }
 
     fn entry(path: &str) -> &'static Entry {
@@ -897,6 +947,12 @@ impl Run<'_> {
         let dev = self.opts.dev_fixed;
         for entry in LAYOUT {
             if self.have.contains_key(entry.path) {
+                continue;
+            }
+            // `crate::seed::SEED_KEYS` names plain generated values only (its tests pin that).
+            if let Some((_, value)) = self.opts.seeds.get(entry.path) {
+                let bytes = value.as_bytes().to_vec();
+                self.put_seeded(entry, bytes)?;
                 continue;
             }
             let bytes = match entry.make {
@@ -1041,7 +1097,9 @@ impl Run<'_> {
                         rendered.as_bytes(),
                         self.perm(entry.path),
                     )?;
-                    self.report.rewritten.push(self.abs(entry.part, entry.path));
+                    let path = self.abs(entry.part, entry.path);
+                    self.report.kept.retain(|p| *p != path);
+                    self.report.rewritten.push(path);
                     self.have.insert(entry.path, rendered.into_bytes());
                     true
                 }
@@ -1648,12 +1706,12 @@ mod tests {
     fn setup_code_printed_once() {
         let t = tmp();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap();
+        crate::cli::secrets(t.path(), &opts(), None, &mut out, &mut err).unwrap();
         let code = read_setup_code(t.path()).unwrap();
         let out1 = String::from_utf8(out).unwrap();
         assert_eq!(out1, format!("Setup code: {code}\n"));
         let (mut out, mut err2) = (Vec::new(), Vec::new());
-        crate::cli::secrets(t.path(), &opts(), &mut out, &mut err2).unwrap();
+        crate::cli::secrets(t.path(), &opts(), None, &mut out, &mut err2).unwrap();
         assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
         assert!(!String::from_utf8_lossy(&err2).contains(code.as_str()));
         let mut out = Vec::new();
@@ -1670,14 +1728,14 @@ mod tests {
     fn output_has_no_secrets() {
         let t = tmp();
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap();
+        crate::cli::secrets(t.path(), &opts(), None, &mut out, &mut err).unwrap();
         std::fs::remove_file(t.path().join("valkey/proxy.password")).unwrap();
-        crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap();
+        crate::cli::secrets(t.path(), &opts(), None, &mut out, &mut err).unwrap();
         // A failing run's message too.
         std::fs::write(t.path().join("tokens/app-auth.token"), "").unwrap();
         let failure = format!(
             "{:#}",
-            crate::cli::secrets(t.path(), &opts(), &mut out, &mut err).unwrap_err()
+            crate::cli::secrets(t.path(), &opts(), None, &mut out, &mut err).unwrap_err()
         );
         let code = read_setup_code(t.path()).unwrap();
         let mut text =
@@ -1919,5 +1977,386 @@ mod tests {
             .map(|e| e.path.to_string())
             .collect();
         assert_eq!(made, layout);
+    }
+
+    // m12 (#23): seeds from the compose .env.
+
+    fn seeded(text: &str) -> InitSecrets {
+        InitSecrets {
+            seeds: Seeds::parse(text).unwrap(),
+            ..opts()
+        }
+    }
+
+    /// A seeds file at `name` in `dir` with `text`, at `mode`.
+    fn seeds_file(dir: &Path, name: &str, text: &str, mode: u32) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, text).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+        p
+    }
+
+    #[test]
+    fn seeded_value_is_written_at_layout_mode() {
+        let t = tmp();
+        let value = "Chosen-Metadata-Password-0001";
+        let o = seeded(&format!("CHELABASE_SEED_METADATA_DB_PASSWORD={value}\n"));
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        let path = t.path().join("db/metadata.password");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), value);
+        let want = o.owners.spec("db/metadata.password").resolve();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(
+            (meta.uid(), meta.gid(), mode(&path)),
+            (want.uid, want.gid, want.mode)
+        );
+        assert_eq!(want.mode, 0o640, "the layout's group-readable mode");
+        assert_eq!(report.seeded, std::slice::from_ref(&path));
+        assert!(!report.created.contains(&path), "{report:?}");
+        // Every other file is generated, as without seeds.
+        for entry in LAYOUT.iter().filter(|e| e.path != "db/metadata.password") {
+            let p = t.path().join(entry.path);
+            assert!(p.is_file(), "{}", entry.path);
+            assert_ne!(
+                std::fs::read(&p).unwrap(),
+                value.as_bytes(),
+                "{}",
+                entry.path
+            );
+            assert!(report.created.contains(&p), "{}", entry.path);
+        }
+        assert!(report.setup_code.is_some());
+        let tmps: Vec<_> = snapshot(t.path())
+            .into_keys()
+            .filter(|p| p.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(tmps.is_empty(), "{tmps:?}");
+    }
+
+    #[test]
+    fn seeded_password_reaches_derived_files() {
+        use sha2::Digest;
+        let t = tmp();
+        let (nats, valkey) = ("Chosen-Nats-Worker-0001", "Chosen-Valkey-Proxy-0001");
+        let o = seeded(&format!(
+            "CHELABASE_SEED_NATS_WORKER_PASSWORD={nats}\n\
+             CHELABASE_SEED_VALKEY_PROXY_PASSWORD={valkey}\n"
+        ));
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        assert_eq!(report.seeded.len(), 2, "{report:?}");
+        let read = |p: &str| std::fs::read_to_string(t.path().join(p)).unwrap();
+        assert_eq!(read("nats/worker.password"), nats);
+        assert_eq!(read("valkey/proxy.password"), valkey);
+        let hashes = crate::kinds::service_auth::previous_nats_hashes(&read("nats/auth.conf"));
+        assert!(bcrypt::verify(nats, &hashes["worker"]).unwrap());
+        let acl = read("valkey/users.acl");
+        let proxy = acl.lines().find(|l| l.starts_with("user proxy ")).unwrap();
+        let hash = hex::encode(sha2::Sha256::digest(valkey.as_bytes()));
+        assert!(proxy.contains(&format!("#{hash} ")), "{proxy}");
+        assert!(!acl.contains(valkey) && !read("nats/auth.conf").contains(nats));
+    }
+
+    #[test]
+    fn seed_rerun_changes_nothing() {
+        let t = tmp();
+        let text = "CHELABASE_SEED_METADATA_DB_PASSWORD=Chosen-Metadata-0001\n\
+                    CHELABASE_SEED_ZITADEL_MASTERKEY=ABCDEFGHJKMNPQRSTUVWXYZ234567890\n\
+                    CHELABASE_SEED_NATS_RUNNER_PASSWORD=Chosen-Nats-Runner-0001\n";
+        ensure_secrets(t.path(), &seeded(text)).unwrap();
+        let before = snapshot(t.path());
+        let again = ensure_secrets(t.path(), &seeded(text)).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+        assert!(
+            again.created.is_empty() && again.seeded.is_empty() && again.rewritten.is_empty(),
+            "{again:?}"
+        );
+        assert!(again.setup_code.is_none());
+        assert!(!again.auth_files.nats && !again.auth_files.valkey);
+        assert!(again.kept.contains(&t.path().join("db/metadata.password")));
+        assert_eq!(again.kept.len(), LAYOUT.len(), "{again:?}");
+        // And a run without the seeds keeps them too (m1's rerun rule).
+        ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+        // A seeded file an operator rewrote with a trailing line break still matches.
+        let p = t.path().join("db/metadata.password");
+        std::fs::write(&p, "Chosen-Metadata-0001\n").unwrap();
+        let before = snapshot(t.path());
+        ensure_secrets(t.path(), &seeded(text)).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+    }
+
+    #[test]
+    fn changed_seed_refuses_and_writes_nothing() {
+        let t = populated_with_two_missing();
+        let existing = std::fs::read_to_string(t.path().join("db/metadata.password")).unwrap();
+        let value = "Changed-Metadata-Value-0001";
+        let o = seeded(&format!(
+            "CHELABASE_SEED_METADATA_DB_PASSWORD={value}\n\
+             CHELABASE_SEED_STORCON_DB_PASSWORD=Would-Be-Seeded-0001\n"
+        ));
+        let before = snapshot(t.path());
+        let err = format!("{:#}", ensure_secrets(t.path(), &o).unwrap_err());
+        assert!(err.contains("CHELABASE_SEED_METADATA_DB_PASSWORD"), "{err}");
+        assert!(
+            err.contains(&t.path().join("db/metadata.password").display().to_string()),
+            "{err}"
+        );
+        assert!(err.contains("first created") && err.contains("#6"), "{err}");
+        assert!(
+            !err.contains(value) && !err.contains(existing.trim()),
+            "{err}"
+        );
+        assert_eq!(
+            snapshot(t.path()),
+            before,
+            "the refused run wrote something"
+        );
+        assert!(!t.path().join("setup/setup.code").exists());
+        assert!(!t.path().join("db/storcon.password").exists());
+        // A derived file's source too: a changed NATS seed doesn't re-render auth.conf.
+        let o = seeded("CHELABASE_SEED_NATS_WORKER_PASSWORD=Changed-Nats-Worker-0001\n");
+        let err = format!("{:#}", ensure_secrets(t.path(), &o).unwrap_err());
+        assert!(err.contains("CHELABASE_SEED_NATS_WORKER_PASSWORD"), "{err}");
+        assert_eq!(snapshot(t.path()), before);
+    }
+
+    #[test]
+    fn invalid_seeds_refuse_and_write_nothing() {
+        let short = "CHELABASE_SEED_APP_AUTH_TOKEN=too-short\n";
+        let cases: Vec<(String, &str)> = vec![
+            (
+                "CHELABASE_SEED_UNKNOWN_THING=0123456789abcdefgh\n".into(),
+                "CHELABASE_SEED_UNKNOWN_THING",
+            ),
+            (
+                "CHELABASE_SEED_METADATA_DB_PASSWORD=\n".into(),
+                "CHELABASE_SEED_METADATA_DB_PASSWORD",
+            ),
+            (short.into(), "CHELABASE_SEED_APP_AUTH_TOKEN"),
+            (
+                format!("CHELABASE_SEED_ZITADEL_MASTERKEY={}\n", "K".repeat(31)),
+                "CHELABASE_SEED_ZITADEL_MASTERKEY",
+            ),
+            (
+                "CHELABASE_SEED_DATA_KEYS_TOKEN=\"line-one-0123456\nline-two\"\n".into(),
+                "CHELABASE_SEED_DATA_KEYS_TOKEN",
+            ),
+            (
+                "CHELABASE_SEED_DATA_KEYS_TOKEN=first-0123456789ab\n\
+                 CHELABASE_SEED_DATA_KEYS_TOKEN=second-0123456789ab\n"
+                    .into(),
+                "CHELABASE_SEED_DATA_KEYS_TOKEN",
+            ),
+        ];
+        for (text, key) in cases {
+            // Through the CLI, on a fresh root and on a populated one.
+            let t = tmp();
+            let file = seeds_file(t.path(), ".env", &text, 0o600);
+            let fresh = t.path().join("fresh");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let e =
+                crate::cli::secrets(&fresh, &opts(), Some(&file), &mut out, &mut err).unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains(key), "{text:?}: {e}");
+            assert!(!fresh.exists(), "{text:?}: the root was made");
+            assert!(out.is_empty(), "{text:?}");
+
+            let populated = populated_with_two_missing();
+            let before = snapshot(populated.path());
+            let e = crate::cli::secrets(populated.path(), &opts(), Some(&file), &mut out, &mut err)
+                .unwrap_err();
+            assert!(format!("{e:#}").contains(key), "{text:?}: {e:#}");
+            assert_eq!(snapshot(populated.path()), before, "{text:?}");
+            assert!(out.is_empty(), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn seeds_file_symlink_refused_and_loose_mode_warns() {
+        let t = tmp();
+        let text = "CHELABASE_SEED_APP_AUTH_TOKEN=Chosen-App-Auth-0001\n";
+        let real = seeds_file(t.path(), "real.env", text, 0o600);
+        let link = t.path().join("link.env");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let dir = t.path().join("a-dir.env");
+        std::fs::create_dir(&dir).unwrap();
+        let fifo = t.path().join("fifo.env");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        for (path, what) in [
+            (&link, "symlink"),
+            (&dir, "not a regular file"),
+            (&fifo, "not a regular file"),
+            (&t.path().join("missing.env"), "missing.env"),
+        ] {
+            let root = t.path().join("root");
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let e =
+                crate::cli::secrets(&root, &opts(), Some(path), &mut out, &mut err).unwrap_err();
+            let e = format!("{e:#}");
+            assert!(e.contains(what), "{}: {e}", path.display());
+            assert!(!root.exists(), "{}: the root was made", path.display());
+        }
+        // A tight file: no warning.
+        let root = t.path().join("tight");
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        crate::cli::secrets(&root, &opts(), Some(&real), &mut out, &mut err).unwrap();
+        let err = String::from_utf8(err).unwrap();
+        assert!(!err.contains("warning"), "{err}");
+        assert!(err.contains("seeded"), "{err}");
+        // Group- or world-readable: it runs, with a warning to chmod 600.
+        for m in [0o640, 0o604, 0o644] {
+            let loose = seeds_file(t.path(), &format!("loose-{m:o}.env"), text, m);
+            let root = t.path().join(format!("loose-{m:o}"));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            crate::cli::secrets(&root, &opts(), Some(&loose), &mut out, &mut err).unwrap();
+            let err = String::from_utf8(err).unwrap();
+            assert!(
+                err.contains("warning") && err.contains("chmod 600"),
+                "{m:o}: {err}"
+            );
+            assert!(err.contains(&loose.display().to_string()), "{m:o}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(root.join("tokens/app-auth.token")).unwrap(),
+                "Chosen-App-Auth-0001"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_values_never_leak() {
+        // A distinct sentinel per key, each one a valid value for its rule.
+        let sentinel = |k: &crate::seed::SeedKey, n: u32| -> String {
+            let base = format!("Sntl9Q{n}x{}", k.path.replace(['/', '.', '-'], "x"));
+            match k.rule {
+                crate::seed::Rule::Masterkey => format!("{base:Q<32}")[..32].to_string(),
+                _ => format!("{base:Q<20}"),
+            }
+        };
+        let all = |n: u32| -> (String, Vec<String>) {
+            let mut text = String::from("# sentinels\n");
+            let mut values = Vec::new();
+            for k in crate::seed::SEED_KEYS {
+                let v = sentinel(k, n);
+                text.push_str(&format!("{}={v}\n", k.key));
+                values.push(v);
+            }
+            (text, values)
+        };
+        let t = tmp();
+        let root = t.path().join("root");
+        let (first, mut values) = all(1);
+        let (changed, more) = all(2);
+        values.extend(more);
+        // Failing inputs carry sentinels too.
+        let invalid = [
+            "CHELABASE_SEED_NOT_A_KEY=Sntl9QUnknownKeyValue0001\n".to_string(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QShort\n".to_string(),
+            format!(
+                "CHELABASE_SEED_ZITADEL_MASTERKEY={}\n",
+                &"Sntl9QMk".repeat(4)[..31]
+            ),
+            "CHELABASE_SEED_APP_AUTH_TOKEN=\"Sntl9QMultiLine000001\nSntl9QSecondLine00001\"\n"
+                .into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QDuplicateOne0001\n\
+             CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QDuplicateTwo0001\n"
+                .into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QDollar$Interp0001\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN='Sntl9QUnterminated0001\n".into(),
+            // Typos that put the value into what looks like the key.
+            "CHELABASE_SEED_APP_AUTH_TOKEN Sntl9QNoEquals0001\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN:Sntl9QColon0001\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN Sntl9QSpaceKey0001=x\n".into(),
+            "CHELABASE_SEED_APP_AUTH_TOKEN-Sntl9QDash0001=0123456789abcdef\n".into(),
+            "my Sntl9QNotAKey0001 ='never closed\n".into(),
+        ];
+        values.extend([
+            "Sntl9QUnknownKeyValue0001".into(),
+            "Sntl9QShort".into(),
+            "Sntl9QMk".repeat(4)[..31].to_string(),
+            "Sntl9QMultiLine000001".into(),
+            "Sntl9QSecondLine00001".into(),
+            "Sntl9QDuplicateOne0001".into(),
+            "Sntl9QDuplicateTwo0001".into(),
+            "Sntl9QDollar".into(),
+            "Sntl9QUnterminated0001".into(),
+            "Sntl9QNoEquals0001".into(),
+            "Sntl9QColon0001".into(),
+            "Sntl9QSpaceKey0001".into(),
+            "Sntl9QDash0001".into(),
+            "Sntl9QNotAKey0001".into(),
+        ]);
+
+        let mut printed = String::new();
+        let shown = |out: Vec<u8>, err: Vec<u8>, printed: &mut String| {
+            printed.push_str(&String::from_utf8(out).unwrap());
+            printed.push_str(&String::from_utf8(err).unwrap());
+        };
+        // The first run (loose mode, so the warning is printed too), a rerun, a changed seed,
+        // then every invalid file.
+        let file = seeds_file(t.path(), ".env", &first, 0o644);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        crate::cli::secrets(&root, &opts(), Some(&file), &mut out, &mut err).unwrap();
+        let code = read_setup_code(&root).unwrap();
+        let out = String::from_utf8(out)
+            .unwrap()
+            .replacen(&format!("Setup code: {code}\n"), "", 1)
+            .into_bytes();
+        shown(out, err, &mut printed);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        crate::cli::secrets(&root, &opts(), Some(&file), &mut out, &mut err).unwrap();
+        shown(out, err, &mut printed);
+        let file = seeds_file(t.path(), ".env", &changed, 0o600);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let e = crate::cli::secrets(&root, &opts(), Some(&file), &mut out, &mut err).unwrap_err();
+        printed.push_str(&format!("{e:#}\n{e:?}\n"));
+        shown(out, err, &mut printed);
+        for text in &invalid {
+            let file = seeds_file(t.path(), ".env", text, 0o600);
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let e =
+                crate::cli::secrets(&root, &opts(), Some(&file), &mut out, &mut err).unwrap_err();
+            printed.push_str(&format!("{e:#}\n{e:?}\n"));
+            shown(out, err, &mut printed);
+            let e = Seeds::parse(text).unwrap_err();
+            printed.push_str(&format!("{e:#}\n{e:?}\n"));
+        }
+        // Debug of everything that holds seeds or a report.
+        let o = seeded(&first);
+        printed.push_str(&format!("{o:?}\n{o:#?}\n{:?}\n", o.seeds));
+        let report = ensure_secrets(&root, &o).unwrap();
+        printed.push_str(&format!("{report:?}\n{report:#?}\n"));
+        let fresh = t.path().join("fresh");
+        let report = ensure_secrets(&fresh, &o).unwrap();
+        printed.push_str(&format!("{report:?}\n{report:#?}\n"));
+        assert_eq!(report.seeded.len(), crate::seed::SEED_KEYS.len());
+        let loaded = Seeds::load(&seeds_file(t.path(), "dbg.env", &first, 0o644)).unwrap();
+        printed.push_str(&format!("{loaded:?}\n"));
+
+        // The checks saw real output (keys and paths), and no sentinel anywhere.
+        assert!(
+            printed.contains("CHELABASE_SEED_APP_AUTH_TOKEN"),
+            "{printed}"
+        );
+        assert!(printed.contains("chmod 600"), "{printed}");
+        assert!(printed.contains("tokens/app-auth.token"), "{printed}");
+        assert!(!printed.contains(code.as_str()));
+        assert!(!printed.contains("Sntl9Q"), "a sentinel leaked: {printed}");
+        for v in &values {
+            assert!(
+                v.starts_with("Sntl9Q") && !printed.contains(v.as_str()),
+                "{v}"
+            );
+        }
+        // The values did reach their files.
+        for k in crate::seed::SEED_KEYS {
+            assert_eq!(
+                std::fs::read_to_string(root.join(k.path)).unwrap(),
+                sentinel(k, 1),
+                "{}",
+                k.key
+            );
+        }
     }
 }

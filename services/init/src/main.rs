@@ -1,8 +1,11 @@
 //! `chelabase-init`: a self-hosted stack's one-shot setup.
 //!
-//! - `chelabase-init secrets --dir <dir> [--owners <file>]` makes every key, secret and auth file
-//!   the stack's services read (never overwriting one) and prints `Setup code: …` on the run
-//!   that creates the setup code. It prints no other secret.
+//! - `chelabase-init secrets --dir <dir> [--owners <file>] [--seeds <file>]` makes every key,
+//!   secret and auth file the stack's services read (never overwriting one) and prints
+//!   `Setup code: …` on the run that creates the setup code. It prints no other secret.
+//!   `--seeds` reads chosen values from a dotenv file (the compose `.env`): each
+//!   `CHELABASE_SEED_*` line is written as its file, instead of a generated value, on the run
+//!   that creates that file (see `chelabase_init::seed`).
 //! - `chelabase-init setup-code --dir <dir>` prints the stored setup code again.
 //! - `chelabase-init bootstrap --out <dir> [--demo]` makes the product's Zitadel objects and
 //!   binds the seeded tenant, waiting for Zitadel, the metadata migrations and the orchestrator
@@ -36,6 +39,11 @@ enum Command {
         /// A JSON file overriding the default owners and modes.
         #[arg(long)]
         owners: Option<PathBuf>,
+        /// A dotenv file (the compose .env) whose CHELABASE_SEED_* lines give chosen values for
+        /// the files this run creates. A file that already exists with another value fails the
+        /// run. Values are never printed.
+        #[arg(long)]
+        seeds: Option<PathBuf>,
     },
     /// Make the product's Zitadel objects and bind the seeded tenant (idempotent).
     Bootstrap {
@@ -65,7 +73,7 @@ enum Command {
 fn run(args: Args) -> anyhow::Result<()> {
     let (mut out, mut err) = (std::io::stdout().lock(), std::io::stderr().lock());
     match args.command {
-        Command::Secrets { dir, owners } => {
+        Command::Secrets { dir, owners, seeds } => {
             let map = match owners {
                 Some(path) => {
                     let text = std::fs::read_to_string(&path)
@@ -75,7 +83,13 @@ fn run(args: Args) -> anyhow::Result<()> {
                 }
                 None => OwnershipMap::default(),
             };
-            cli::secrets(&dir, &InitSecrets::self_hosted(map), &mut out, &mut err)
+            cli::secrets(
+                &dir,
+                &InitSecrets::self_hosted(map),
+                seeds.as_deref(),
+                &mut out,
+                &mut err,
+            )
         }
         Command::SetupCode { dir } => cli::setup_code(&dir, &mut out),
         Command::Bootstrap {
