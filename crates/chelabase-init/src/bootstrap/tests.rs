@@ -1259,6 +1259,36 @@ async fn the_orchestrator_probe_fails_on_a_500() {
             "{status}"
         );
     }
+    // #26: a 3xx is an answer too, and is never followed: here it points at a ready server,
+    // so a followed redirect would read as ready. It fails at once, naming the status.
+    async fn redirecting(status: &'static str, location: String) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/health", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+        });
+        url
+    }
+    for status in [
+        "301 Moved Permanently",
+        "302 Found",
+        "303 See Other",
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+    ] {
+        let ready = answering("200 OK").await;
+        let probe = HttpProbe::new("the orchestrator", &redirecting(status, ready).await);
+        let err = probe.check().await.err().unwrap_or_else(|| panic!("a {status} is an answer, not a wait or ready"));
+        assert!(err.to_string().contains(&status[..3]), "{status}: {err}");
+    }
 }
 
 // N3: a second run behind a held output-dir lock waits only until the deadline, naming it.
