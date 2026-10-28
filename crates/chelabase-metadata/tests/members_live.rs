@@ -2226,14 +2226,15 @@ async fn pending_member_lifecycle() {
     s.finish().await;
 }
 
-// M2: the bootstrap's `NAME_SQL` (psql variables swapped for bind parameters) names a tenant
+// M2: the bootstrap's `NAME_SQL` (`chelabase-init`'s `tenant_name.sql`) names a tenant
 // once, trimmed and cut to the column's rules, and logs one event.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn bootstrap_names_the_tenant_once() {
-    const NAME_SQL: &str = include_str!("../../../tools/cli/src/dev/tenant_name.sql");
+    const NAME_SQL: &str = include_str!("../../chelabase-init/src/bootstrap/tenant_name.sql");
     let s = Scratch::new().await;
-    let sql = NAME_SQL.replace(":'tenant'", "$1").replace(":'name'", "$2");
+    // The bootstrap's own SQL (`chelabase_init::bootstrap::tenant`), already `$1`/`$2`.
+    let sql = NAME_SQL.to_string();
     let run = |t: TenantId, name: &str| {
         let (sql, name, pool) = (sql.clone(), name.to_string(), s.client.pool().clone());
         async move {
@@ -2267,105 +2268,6 @@ async fn bootstrap_names_the_tenant_once() {
     run(blank, "   ").await;
     assert_eq!(name_of(blank).await, None);
     assert_eq!(s.event_count(blank).await, 0);
-    s.finish().await;
-}
-
-// M5: the CLI's bootstrap SQL (`tenant_admin.sql`, psql variables replaced by quoted literals)
-// writes exactly what `bootstrap_admin` writes, on every starting state: members and events
-// alike (ids and times aside), and a repeat writes nothing.
-#[tokio::test]
-#[ignore = "needs the workbench stack's metadata Postgres"]
-async fn bootstrap_admin_sql_matches_the_metadata_crate() {
-    const ADMIN_SQL: &str = include_str!("../../../tools/cli/src/dev/tenant_admin.sql");
-    let s = Scratch::new().await;
-    let quote = |v: &str| format!("'{}'", v.replace('\'', "''"));
-    let run_sql = |t: TenantId, zuid: &str, email: &str| {
-        let sql = ADMIN_SQL
-            .replace(":'tenant'", &quote(&t.as_uuid().to_string()))
-            .replace(":'zuid'", &quote(zuid))
-            .replace(":'email'", &quote(email));
-        let pool = s.client.pool().clone();
-        async move {
-            sqlx::raw_sql(AssertSqlSafe(format!("BEGIN;\n{sql}\nCOMMIT;"))).execute(&pool).await.unwrap();
-        }
-    };
-    type Snapshot = (Vec<(String, String, bool, Option<String>, bool)>, Vec<(String, bool, Option<Value>, Option<Value>)>);
-    let snapshot = |t: TenantId| {
-        let pool = s.client.pool().clone();
-        async move {
-            let members = sqlx::query_as::<_, (String, String, bool, Option<String>, bool)>(
-                "SELECT zitadel_user_id, status, tenant_admin, email, accepted_at IS NOT NULL
-                 FROM members WHERE tenant_id = $1 ORDER BY zitadel_user_id",
-            )
-            .bind(t.as_uuid())
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-            let events = sqlx::query_as::<_, (String, bool, Option<Value>, Option<Value>)>(
-                // Each tenant's setup minted its invite at its own instant: `expires_at` differs.
-                "SELECT action, actor_member_id IS NULL, before - 'expires_at', after - 'expires_at'
-                 FROM access_events WHERE tenant_id = $1 ORDER BY id",
-            )
-            .bind(t.as_uuid())
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-            let open_invites: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM invites i JOIN members m ON m.id = i.member_id
-                 WHERE m.tenant_id = $1 AND i.accepted_at IS NULL AND i.revoked_at IS NULL",
-            )
-            .bind(t.as_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            let snap: Snapshot = (members, events);
-            (snap, open_invites)
-        }
-    };
-    use serde_json::Value;
-    // Each starting state is made twice, in two tenants: one for each path.
-    type Setup = for<'a> fn(&'a Scratch, TenantId) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
-    let setups: Vec<(&str, Setup)> = vec![
-        ("empty tenant", |_, _| Box::pin(async {})),
-        ("invited with an open invite", |s, t| {
-            Box::pin(async move {
-                let a = s.client.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-                s.client.create_invited_member(a.id, t, new_invite("boss", "boss@x.com", &[])).await.unwrap();
-            })
-        }),
-        ("removed", |s, t| {
-            Box::pin(async move {
-                let a = s.client.ensure_member(t, "a", "a@x.com", "A", Admission::Active).await.unwrap();
-                s.client.ensure_member(t, "boss", "boss@x.com", "B", Admission::Active).await.unwrap();
-                let b = s.client.member_by_zitadel(t, "boss").await.unwrap().unwrap();
-                s.client.remove_member(a.id, b.id).await.unwrap();
-            })
-        }),
-        ("the email held by another member", |s, t| {
-            Box::pin(async move {
-                s.client.ensure_member(t, "a", "boss@x.com", "A", Admission::Active).await.unwrap();
-            })
-        }),
-        ("already the admin", |s, t| {
-            Box::pin(async move {
-                s.client.bootstrap_admin(t, "boss", "boss@x.com").await.unwrap();
-            })
-        }),
-    ];
-    for (name, setup) in setups {
-        let (by_sql, by_crate) = (s.tenant().await, s.tenant().await);
-        setup(&s, by_sql).await;
-        setup(&s, by_crate).await;
-        run_sql(by_sql, "boss", " Boss@X.com ").await;
-        s.client.bootstrap_admin(by_crate, "boss", " Boss@X.com ").await.unwrap();
-        assert_eq!(snapshot(by_sql).await, snapshot(by_crate).await, "{name}");
-        // A repeat writes nothing, on either path.
-        let events = snapshot(by_sql).await.0.1.len();
-        run_sql(by_sql, "boss", " Boss@X.com ").await;
-        s.client.bootstrap_admin(by_crate, "boss", " Boss@X.com ").await.unwrap();
-        assert_eq!(snapshot(by_sql).await, snapshot(by_crate).await, "{name}: repeat");
-        assert_eq!(snapshot(by_sql).await.0.1.len(), events, "{name}: the repeat wrote an event");
-    }
     s.finish().await;
 }
 

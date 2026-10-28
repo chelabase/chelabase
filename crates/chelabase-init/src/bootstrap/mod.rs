@@ -3,21 +3,27 @@
 //!
 //! # Order
 //!
-//! 1. Wait for the admin PAT file and for Zitadel (`/debug/ready`, then the first API call).
-//! 2. Without `--demo`: deactivate Zitadel's FirstInstance human (an IAM owner whose random
-//!    password is only in `chelabase-init secrets`' `zitadel/steps.yaml`), before any wait on
-//!    the orchestrator. With `--demo` it stays: it is the workbench's sign-in.
-//! 3. The default org, the `chelabase` project, the API app, the Studio app and its login,
-//!    Zitadel's own registration off.
-//! 4. `--demo` only: the demo machine user and its key (`demo-sa.json`), Mailpit as SMTP.
-//!    SMTP from `CHELABASE_SMTP_*` when set (either mode); otherwise none.
+//! 1. Take the output dir's lock (waiting at most until the deadline).
+//! 2. Wait for the admin PAT file and for Zitadel (`/debug/ready`, then the first API call).
+//! 3. Without `--demo`: deactivate every human among the instance's IAM members (Zitadel's
+//!    FirstInstance human, an IAM owner whose random password is only in `chelabase-init
+//!    secrets`' `zitadel/steps.yaml`, however it is named), before any wait on the
+//!    orchestrator. A human member it can't deactivate fails the run. With `--demo` they stay:
+//!    the first human is the workbench's sign-in.
+//! 4. `--demo` only: look up the tenant admin (read only).
 //! 5. Wait for the metadata migrations (the orchestrator applies them) and the orchestrator.
 //! 6. Bind the seeded tenant to the org (only when unbound or already this org: a tenant bound
-//!    to another org fails, naming both) and name it after the org when it has no name.
-//! 7. `--demo` only: the tenant admins (the requested email, else Zitadel's first human; and
+//!    to another org fails, naming both) and name it after the org when it has no name. Nothing
+//!    is created or written before this but step 3's deactivation.
+//! 7. The `chelabase` project, the API app, the Studio app and its login, Zitadel's own
+//!    registration off.
+//! 8. `--demo` only: the demo machine user and its key (`demo-sa.json`), Mailpit as SMTP.
+//!    SMTP from `CHELABASE_SMTP_*` when set (either mode); otherwise none. A changed SMTP
+//!    setting or password is applied on the next run.
+//! 9. `--demo` only: the tenant admins (the requested email, else Zitadel's first human; and
 //!    the demo machine user in self-hosted mode). Without `--demo` no admin is set: the setup
 //!    code's claim decides it.
-//! 8. The output ids, then the Actions target last (its host, the orchestrator, must resolve).
+//! 10. The output ids, then the Actions target last (its host, the orchestrator, must resolve).
 //!
 //! Every wait shares one deadline (`--timeout`, default 10 minutes) and retries readiness
 //! only: no connection, a 502/503/504, a readiness probe's 404, an unmigrated schema, an
@@ -39,6 +45,7 @@
 //! | `actions-signing-key` | the Actions webhook's signing key | 0600 |
 //! | `demo-user-id` | `--demo`: the demo machine user | 0644 |
 //! | `demo-sa.json` | `--demo`: the demo machine user's key file | 0600 |
+//! | `smtp-password.sha256` | a digest of the SMTP password last sent (never the password) | 0600 |
 //!
 //! It never creates a key or a secret of its own: `chelabase-init secrets` makes those.
 //!
@@ -296,7 +303,9 @@ impl Probe for HttpProbe {
         match self.http.get(&self.url).send().await {
             Err(e) => Ok(Check::Wait(format!("no answer ({e})"))),
             Ok(r) if r.status().is_success() => Ok(Check::Ready(())),
-            Ok(r) if r.status().as_u16() == 404 || r.status().is_server_error() => {
+            // Readiness only: a 404 (routes not up) or a gateway's 502/503/504. A 500 is an
+            // answer and fails at once.
+            Ok(r) if matches!(r.status().as_u16(), 404 | 502..=504) => {
                 Ok(Check::Wait(format!("it answers {}", r.status())))
             }
             Ok(r) => bail!("{}: {} answers {}", self.what, self.url, r.status()),
@@ -492,16 +501,70 @@ pub async fn run_with(
 ) -> Result<()> {
     // Every output name is checked before anything else happens.
     let out = Outputs::open(&cfg.out_dir)?;
-    let _lock = out.lock()?;
     let w = Waiter::new(cfg.timeout, cfg.backoff);
+    let lock_path = out.path().join(outputs::LOCK);
+    let _lock = w
+        .until(
+            &format!("the output dir's lock {}", lock_path.display()),
+            || async {
+                Ok(match out.try_lock()? {
+                    Some(file) => Check::Ready(file),
+                    None => Check::Wait("another bootstrap holds it".into()),
+                })
+            },
+        )
+        .await?;
 
+    // Reads, and the one write AC 8 puts before any wait on the orchestrator.
     let (org, org_name) = wait_for_zitadel(&w, api).await?;
-    let usernames = steps::first_human_usernames(&cfg.auth_host_name());
     if demo == Demo::Off {
-        zitadel_step(&w, "deactivating Zitadel's first human user", || {
-            steps::deactivate_first_human(api, &usernames)
+        zitadel_step(&w, "deactivating Zitadel's human admins", || {
+            steps::deactivate_human_admins(api)
         })
         .await?;
+    }
+    let admin = match demo {
+        Demo::On => find_demo_admin(&w, cfg, api, &org).await?,
+        Demo::Off => None,
+    };
+
+    // The orchestrator migrates the metadata database and receives the Actions events.
+    w.until(
+        &format!(
+            "the metadata database's migrations, applied by {}",
+            orchestrator.name()
+        ),
+        || async {
+            Ok(match metadata.migrated().await? {
+                Check::Wait(reason) => Check::Wait(format!(
+                    "{reason}. If the orchestrator is up, it may run an older build that \
+                     doesn't know these migrations: recreate it on the current build"
+                )),
+                ready => ready,
+            })
+        },
+    )
+    .await?;
+    w.until(&orchestrator.name(), || orchestrator.check())
+        .await?;
+
+    // The bind comes before anything is created or written: a tenant bound to another org
+    // (a lost Zitadel volume) stops the run here, with nothing made in this Zitadel.
+    let tenant = cfg.tenant;
+    if metadata
+        .bind_org(tenant, &org)
+        .await
+        .context("bootstrap step: the tenant bind")?
+    {
+        info!("bound tenant {tenant} to Zitadel org {org}");
+    }
+    if let Some(name) = org_name.as_deref().and_then(tenant::tenant_name_from_org)
+        && metadata
+            .fill_display_name(tenant, &name)
+            .await
+            .context("bootstrap step: the tenant's name")?
+    {
+        info!("named tenant {tenant} {name:?} after the Zitadel org");
     }
 
     let project = zitadel_step(&w, "the project", || steps::ensure_project(api, &org)).await?;
@@ -540,35 +603,9 @@ pub async fn run_with(
         (None, Demo::Off) => None,
     };
     if let Some(smtp) = &smtp {
-        zitadel_step(&w, "SMTP", || steps::ensure_smtp(api, smtp)).await?;
+        zitadel_step(&w, "SMTP", || steps::ensure_smtp(api, smtp, &out)).await?;
     }
-    let admin = match demo {
-        Demo::On => find_demo_admin(&w, cfg, api, &org).await?,
-        Demo::Off => None,
-    };
 
-    // The orchestrator migrates the metadata database and receives the Actions events.
-    w.until("the metadata database's migrations", || metadata.migrated())
-        .await?;
-    w.until(&orchestrator.name(), || orchestrator.check())
-        .await?;
-
-    let tenant = cfg.tenant;
-    if metadata
-        .bind_org(tenant, &org)
-        .await
-        .context("bootstrap step: the tenant bind")?
-    {
-        info!("bound tenant {tenant} to Zitadel org {org}");
-    }
-    if let Some(name) = org_name.as_deref().and_then(tenant::tenant_name_from_org)
-        && metadata
-            .fill_display_name(tenant, &name)
-            .await
-            .context("bootstrap step: the tenant's name")?
-    {
-        info!("named tenant {tenant} {name:?} after the Zitadel org");
-    }
     if let Some((user, email)) = &admin {
         metadata
             .bootstrap_admin(tenant, user, Some(email))

@@ -707,28 +707,6 @@ impl MetadataClient {
         Ok(row.map(|(id,)| TenantId(id)))
     }
 
-    pub async fn set_tenant_zitadel_org_id(
-        &self,
-        tenant_id: TenantId,
-        zitadel_org_id: &str,
-    ) -> Result<(), MetadataError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE tenants
-            SET zitadel_org_id = $2
-            WHERE id = $1
-            "#,
-        )
-        .bind(tenant_id.as_uuid())
-        .bind(zitadel_org_id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(MetadataError::TenantNotFound(tenant_id));
-        }
-        Ok(())
-    }
-
     pub async fn get_database(
         &self,
         database_id: DatabaseId,

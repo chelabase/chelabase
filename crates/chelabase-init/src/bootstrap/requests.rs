@@ -254,23 +254,34 @@ pub fn machine_user_search(username: &str) -> Value {
     json!({"queries": [{"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
 }
 
-/// The human user called `username`.
-pub fn human_username_search(username: &str) -> Value {
-    json!({"queries": [
-        {"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}},
-        {"typeQuery": {"type": "TYPE_HUMAN"}}]})
+/// The human members of an IAM member listing (`POST /admin/v1/members/_search`), how many
+/// members it listed, and how many it says exist.
+pub fn iam_humans_from(listed: &Value) -> (Vec<String>, u64, u64) {
+    let members: Vec<&Value> = listed
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let humans = members
+        .iter()
+        .filter(|m| m.get("userType").and_then(Value::as_str) == Some("TYPE_HUMAN"))
+        .filter_map(|m| m.get("userId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let count = members.len() as u64;
+    let total = listed
+        .pointer("/details/totalResult")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| v.as_u64())
+        })
+        .unwrap_or(count);
+    (humans, count, total)
 }
 
 /// A deactivated user's state in a `ListUsers` result.
 pub const USER_INACTIVE: &str = "USER_STATE_INACTIVE";
-
-/// The first listed user's state.
-pub fn user_state_from(listed: &Value) -> Option<String> {
-    listed
-        .pointer("/result/0/state")?
-        .as_str()
-        .map(str::to_string)
-}
 
 /// Users of one org with this email, compared case-insensitively.
 pub fn user_email_search(org_id: &str, email: &str) -> Value {

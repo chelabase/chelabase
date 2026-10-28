@@ -243,22 +243,31 @@ pub fn first_human_usernames(auth_host_name: &str) -> Vec<String> {
     names
 }
 
-/// Deactivates Zitadel's FirstInstance human (an IAM owner whose random password is only in
-/// the steps file), so nobody signs in as it. One already inactive is left alone; none found
-/// is fine (it was removed). Returns its id when there is one.
-pub async fn deactivate_first_human(
-    api: &impl ZitadelApi,
-    usernames: &[String],
-) -> Result<Option<String>> {
-    for name in usernames {
-        let listed = api
-            .rest(Method::POST, "/v2/users", human_username_search(name))
+/// Deactivates every human among the instance's IAM members: Zitadel's FirstInstance human
+/// (an IAM owner whose random password is only in the steps file), however it is named, and
+/// any other human given an instance role. The machine members (the admin PAT's user, the login
+/// client) stay. A human already inactive is left alone, so a rerun changes nothing; no human
+/// member at all is the state this wants. A listing that doesn't hold every member fails:
+/// it can't show that no human is left. Returns the humans deactivated by this call.
+pub async fn deactivate_human_admins(api: &impl ZitadelApi) -> Result<Vec<String>> {
+    let listed = api
+        .rest(Method::POST, "/admin/v1/members/_search", json!({}))
+        .await?;
+    let (humans, listed_count, total) = iam_humans_from(&listed);
+    if total > listed_count {
+        bail!(
+            "the IAM member listing listed {listed_count} of {total} members: can't check that \
+             no human admin is left"
+        );
+    }
+    let mut deactivated = Vec::new();
+    for id in humans {
+        let user = api
+            .rest(Method::GET, &format!("/v2/users/{id}"), Value::Null)
             .await?;
-        let Some(id) = user_id_from(&listed) else {
+        let state = user.pointer("/user/state").and_then(Value::as_str);
+        if state == Some(USER_INACTIVE) {
             continue;
-        };
-        if user_state_from(&listed).as_deref() == Some(USER_INACTIVE) {
-            return Ok(Some(id));
         }
         api.rest(
             Method::POST,
@@ -266,14 +275,10 @@ pub async fn deactivate_first_human(
             json!({}),
         )
         .await?;
-        info!("deactivated Zitadel's first human user {name} (user {id})");
-        return Ok(Some(id));
+        info!("deactivated Zitadel human admin {id} (an IAM member)");
+        deactivated.push(id);
     }
-    info!(
-        "no Zitadel first human user ({}) to deactivate",
-        usernames.join(", ")
-    );
-    Ok(None)
+    Ok(deactivated)
 }
 
 /// An SMTP configuration to keep active: Zitadel's sender for its own mail.
@@ -296,33 +301,112 @@ impl Smtp {
 
 const MAILPIT: &str = "mailpit:1025";
 
+/// The settings an SMTP listing shows, compared with what is wanted (the password is never
+/// listed: see [`smtp_password_digest`]).
+const SMTP_FIELDS: [&str; 5] = ["senderAddress", "senderName", "user", "tls", "description"];
+
+/// The fields of `listed` (one listed configuration) that differ from `payload`. Zitadel
+/// leaves `tls: false` and empty strings out of a listing.
+pub fn smtp_drift(listed: &Value, payload: &Value) -> Vec<&'static str> {
+    let norm = |v: Option<&Value>, field: &str| match v {
+        None | Some(Value::Null) if field == "tls" => json!(false),
+        None | Some(Value::Null) => json!(""),
+        Some(v) => v.clone(),
+    };
+    SMTP_FIELDS
+        .into_iter()
+        .filter(|f| norm(listed.get(*f), f) != norm(payload.get(*f), f))
+        .collect()
+}
+
+/// What the output dir keeps of the SMTP password last sent to configuration `id`: a digest,
+/// never the password.
+pub fn smtp_password_digest(id: &str, password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(format!("chelabase-smtp\0{id}\0{password}")))
+}
+
 /// Keeps `smtp` Zitadel's active SMTP configuration: created when no configuration has its
-/// host, activated when it isn't. An existing one is not rewritten.
-pub async fn ensure_smtp(api: &impl ZitadelApi, smtp: &Smtp) -> Result<()> {
+/// host; its listed settings updated when they differ; its password sent again when it differs
+/// from the one last sent (a digest in the output dir); activated when it isn't. A rerun with the
+/// same settings writes nothing.
+pub async fn ensure_smtp(api: &impl ZitadelApi, smtp: &Smtp, out: &Outputs) -> Result<()> {
     let listed = api
         .rest(Method::POST, "/admin/v1/smtp/_search", json!({}))
         .await?;
-    let id = match find_smtp(&listed, &smtp.host) {
-        Some((_, true)) => return Ok(()),
-        Some((id, false)) => id,
+    let password = smtp
+        .payload
+        .get("password")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let existing = listed
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|c| c.get("host").and_then(Value::as_str) == Some(smtp.host.as_str()))
+        .cloned();
+    let (id, active) = match existing {
+        Some(config) => {
+            let id = config
+                .get("id")
+                .and_then(Value::as_str)
+                .context("SMTP listing: a configuration without an id")?
+                .to_string();
+            let drift = smtp_drift(&config, &smtp.payload);
+            if !drift.is_empty() {
+                let mut body = smtp.payload.clone();
+                if let Some(o) = body.as_object_mut() {
+                    o.remove("password");
+                }
+                api.rest(Method::PUT, &format!("/admin/v1/smtp/{id}"), body)
+                    .await?;
+                info!(?drift, "updated SMTP {}", smtp.host);
+            }
+            let digest = smtp_password_digest(&id, &password);
+            if out.read_value(outputs::SMTP_PASSWORD_DIGEST)?.as_deref() != Some(digest.as_str()) {
+                api.rest(
+                    Method::PUT,
+                    &format!("/admin/v1/smtp/{id}/password"),
+                    json!({"password": password}),
+                )
+                .await?;
+                out.write_secret(
+                    outputs::SMTP_PASSWORD_DIGEST,
+                    format!("{digest}\n").as_bytes(),
+                )?;
+                info!("sent SMTP {}'s password", smtp.host);
+            }
+            let active = config.get("state").and_then(Value::as_str) == Some("SMTP_CONFIG_ACTIVE");
+            (id, active)
+        }
         None => {
             let created = api
                 .rest(Method::POST, "/admin/v1/smtp", smtp.payload.clone())
                 .await?;
-            created
+            let id = created
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::to_string)
-                .context("create SMTP: no id in the answer")?
+                .context("create SMTP: no id in the answer")?;
+            let digest = smtp_password_digest(&id, &password);
+            out.write_secret(
+                outputs::SMTP_PASSWORD_DIGEST,
+                format!("{digest}\n").as_bytes(),
+            )?;
+            (id, false)
         }
     };
-    api.rest(
-        Method::POST,
-        &format!("/admin/v1/smtp/{id}/_activate"),
-        json!({}),
-    )
-    .await?;
-    info!("SMTP {} active", smtp.host);
+    if !active {
+        api.rest(
+            Method::POST,
+            &format!("/admin/v1/smtp/{id}/_activate"),
+            json!({}),
+        )
+        .await?;
+        info!("SMTP {} active", smtp.host);
+    }
     Ok(())
 }
 
@@ -607,7 +691,9 @@ mod tests {
                     "loginVersion": {"loginV2": {
                         "baseUri": "http://studio.chelabase.localhost:8000/"}}}}]}))
             .with("POST /v2/users", json!({"result": [{"userId": "u1"}]}))
-            .with("POST /admin/v1/smtp/_search", json!({"result": [{"id": "s1", "host": "mailpit:1025", "state": "SMTP_CONFIG_ACTIVE"}]}))
+            .with("POST /admin/v1/smtp/_search", json!({"result": [{"id": "s1", "host": "mailpit:1025", "state": "SMTP_CONFIG_ACTIVE",
+                "senderAddress": "noreply@localhost", "senderName": "Chelabase (local)",
+                "user": "chelabase", "description": "chelabase local mailpit"}]}))
     }
 
     #[tokio::test]
@@ -643,7 +729,13 @@ mod tests {
             "c-spa"
         );
         assert_eq!(ensure_demo_user(&fake, "o1").await.unwrap(), "u1");
-        ensure_smtp(&fake, &Smtp::mailpit()).await.unwrap();
+        let (_dir, out) = out_dir();
+        out.write_secret(
+            outputs::SMTP_PASSWORD_DIGEST,
+            format!("{}\n", smtp_password_digest("s1", "chelabase")).as_bytes(),
+        )
+        .unwrap();
+        ensure_smtp(&fake, &Smtp::mailpit(), &out).await.unwrap();
         let writes: Vec<String> = fake
             .calls()
             .into_iter()
@@ -677,7 +769,8 @@ mod tests {
         assert_eq!(ensure_project(&fake, "o1").await.unwrap(), "p1");
         assert_eq!(ensure_api_app(&fake, "p1").await.unwrap(), "c-new");
         assert_eq!(ensure_demo_user(&fake, "o1").await.unwrap(), "u9");
-        ensure_smtp(&fake, &Smtp::mailpit()).await.unwrap();
+        let (_dir, out) = out_dir();
+        ensure_smtp(&fake, &Smtp::mailpit(), &out).await.unwrap();
         let calls = fake.calls();
         for created in [
             "ProjectService/CreateProject",
