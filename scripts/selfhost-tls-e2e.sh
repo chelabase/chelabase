@@ -18,6 +18,10 @@
 #   6. gateway        GET /v1/me with it is 200 (tenant admin); a garbage bearer is 401
 #   7. realtime       a ticket, a socket, the token in its auth frame, a project channel joined
 #                     (realtime and the orchestrator each verify the token)
+#   7b. database      on a domain of its own (CHELABASE_PROXY_DOMAIN=db.<domain>, as with wildcard
+#                     DNS): the connection details name <ep>.db.<domain> and the published proxy
+#                     port, and psql on the host (verify-full, the CA from `docker compose cp`, the
+#                     name pinned to loopback with hostaddr) creates and reads a row
 #   8. control        realtime and the orchestrator recreated without the in-network URL: the
 #                     socket closes 1013; then the gateway too: /v1/me is 503 (auth unavailable).
 #                     No token passes when the keys can't be fetched
@@ -103,7 +107,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for tool in docker jq curl openssl ss node; do
+for tool in docker jq curl openssl ss node psql; do
   command -v "$tool" >/dev/null || die "$tool is missing"
 done
 
@@ -156,6 +160,13 @@ step "render and start a fresh project behind TLS"
 TLS_PORT="$(free_port)"
 HTTP_PORT="$(free_port)"
 [[ "$HTTP_PORT" != "$TLS_PORT" ]] || HTTP_PORT="$(free_port)"
+PROXY_PORT="$(free_port)"
+while [[ "$PROXY_PORT" == "$TLS_PORT" || "$PROXY_PORT" == "$HTTP_PORT" ]]; do PROXY_PORT="$(free_port)"; done
+PROXY_HTTP_PORT="$(free_port)"
+while [[ "$PROXY_HTTP_PORT" == "$TLS_PORT" || "$PROXY_HTTP_PORT" == "$HTTP_PORT" || "$PROXY_HTTP_PORT" == "$PROXY_PORT" ]]; do
+  PROXY_HTTP_PORT="$(free_port)"
+done
+PROXY_DOMAIN="db.$DOMAIN"
 n="$(free_octet)"
 {
   grep -vE '^(CHELABASE_PUBLIC_SCHEME|CHELABASE_(STUDIO|API|AUTH|DOCS|LANDING|MAIL)_HOST)=' "$dir/.env.example"
@@ -178,6 +189,9 @@ CHELABASE_CONTROL_SUBNET=10.$n.0.0/22
 CHELABASE_CONTROL_COMPUTE_RANGE=10.$n.2.0/23
 CHELABASE_ORCHESTRATOR_CONTROL_IP=10.$n.0.10
 CHELABASE_REALTIME_CONTROL_IP=10.$n.0.12
+CHELABASE_PROXY_DOMAIN=$PROXY_DOMAIN
+CHELABASE_PROXY_PORT=$PROXY_PORT
+CHELABASE_PROXY_HTTP_PORT=$PROXY_HTTP_PORT
 EOF
 } >"$tmp/env"
 chmod 600 "$tmp/env"
@@ -282,8 +296,8 @@ vol_cat() {
 compose logs --no-color init-secrets >"$tmp/init.log" 2>&1 || die "logs init-secrets"
 CODE="$(sed -nE 's/.*Setup code: ([A-Z0-9]{4}(-[A-Z0-9]{4}){4}).*/\1/p' "$tmp/init.log" | head -n1)"
 [[ -n "$CODE" ]] || die "no setup code in the init-secrets logs"
-PROJECT_ID="$(vol_cat bootstrap/project-id | tr -d '\r\n')"
-CLIENT="$(vol_cat bootstrap/studio-client-id | tr -d '\r\n')"
+PROJECT_ID="$(vol_cat bootstrap/ids/project-id | tr -d '\r\n')"
+CLIENT="$(vol_cat bootstrap/ids/studio-client-id | tr -d '\r\n')"
 [[ -n "$PROJECT_ID" && -n "$CLIENT" ]] || die "the bootstrap's ids are missing"
 PASSWORD="Selfhost-tls-$(openssl rand -hex 6)A!"
 EMAIL="admin-$(openssl rand -hex 3)@example.com"
@@ -404,6 +418,46 @@ status="$(ticket)"
 got="$(socket_join "$(jq -r .ticket "$tmp/body")" "project:$project")"
 [[ "$got" == joined ]] || die "the socket with the token: $got (wanted joined)"
 pass "ticket 201; the socket's auth frame verified and project:$project joined"
+
+# ---- 7b. a database on the install's own proxy domain --------------------------------------------
+
+api() { # api <method> <path> [json]: status to stdout, body in $tmp/body
+  local args=(-o "$tmp/body" -w '%{http_code}' -X "$1" "$API$2" -H "Authorization: Bearer $TOKEN")
+  [[ -z "${3:-}" ]] || args+=(-H 'content-type: application/json' -d "$3")
+  "${CURL[@]}" "${args[@]}" || echo 000
+}
+step "a database on CHELABASE_PROXY_DOMAIN=$PROXY_DOMAIN, reached from the host"
+status="$(api POST /v1/databases "$(jq -nc --arg p "$project" '{project_id: $p, name: "tls_db"}')")"
+[[ "$status" == 201 || "$status" == 202 ]] || die "POST /v1/databases: $status $(cat "$tmp/body")"
+db_id="$(jq -r .database_id "$tmp/body")"
+db_status=""
+deadline=$((SECONDS + 240))
+while ((SECONDS < deadline)); do
+  [[ "$(api GET "/v1/databases/$db_id")" == 200 ]] || die "GET /v1/databases/$db_id: $(cat "$tmp/body")"
+  db_status="$(jq -r .status "$tmp/body")"
+  [[ "$db_status" != failed ]] || die "database $db_id failed: $(jq -r .error "$tmp/body")"
+  [[ "$db_status" != ready ]] || break
+  sleep 2
+done
+[[ "$db_status" == ready ]] || die "database $db_id is still '$db_status' after 240 s"
+[[ "$(api GET "/v1/databases/$db_id/connection")" == 200 ]] || die "GET /connection: $(cat "$tmp/body")"
+pg_host="$(jq -r .host "$tmp/body")"
+pg_uri="$(jq -r .uri "$tmp/body")"
+[[ "$pg_host" == ep-*."$PROXY_DOMAIN" && "$(jq -r .port "$tmp/body")" == "$PROXY_PORT" ]] ||
+  die "the connection details name $pg_host:$(jq -r .port "$tmp/body"), not <ep>.$PROXY_DOMAIN:$PROXY_PORT"
+compose cp proxy:/tls/ca.crt "$tmp/proxy-ca.crt" >/dev/null 2>"$tmp/cp.err" || die "docker compose cp of the CA: $(cat "$tmp/cp.err")"
+# No DNS for the test domain: hostaddr stands in for the wildcard record; verify-full still checks
+# the certificate against the name.
+psql_host() { PGCONNECT_TIMEOUT=10 psql "$pg_uri&sslrootcert=$tmp/proxy-ca.crt&hostaddr=127.0.0.1" -v ON_ERROR_STOP=1 -qtAX "$@"; }
+deadline=$((SECONDS + 120))
+one=""
+while ((SECONDS < deadline)); do
+  if one="$(psql_host -c 'select 1' 2>"$tmp/psql.err")"; then break; fi
+  sleep 3
+done
+[[ "$one" == 1 ]] || die "psql on the host never reached $pg_host through the published proxy: $(cat "$tmp/psql.err")"
+[[ "$(psql_host -c 'create table t(v int); insert into t values (7); select v from t')" == 7 ]] || die "write and read through the proxy"
+pass "$pg_host:$PROXY_PORT from the host: verify-full against the install's CA, a row created and read"
 
 # ---- 8. negative control -------------------------------------------------------------------------
 
