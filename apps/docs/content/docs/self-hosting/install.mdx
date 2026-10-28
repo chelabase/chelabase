@@ -169,6 +169,24 @@ docker compose up -d --wait
 
 The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. To pin a release, set `CHELABASE_IMAGE_TAG` in `.env` to that tag before you pull. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
 
+## Stop, tear down and uninstall
+
+Each database runs in a compute container that the worker starts. Computes are not Compose services, so Compose neither stops nor removes them, and while one runs, the Docker networks it is attached to stay.
+
+- **Stop and keep everything:** `docker compose stop`, later `docker compose start` (or `up -d --wait`). Computes keep running while the rest is stopped; that is harmless. `docker compose down` without `-v` keeps the data too: it reports the networks the computes hold as still in use, and the next `up` reuses them.
+- **Uninstall, deleting every database and every secret:**
+
+  ```bash
+  cd infra/compose
+  docker compose stop
+  docker ps -aq --filter label=chelabase.dev/stack=compose | xargs -r docker rm -f
+  docker compose down -v
+  ```
+
+  `compose` in the label is the Compose project name: the directory's name, unless you set another with `-p` or `COMPOSE_PROJECT_NAME` (`docker compose ls -a` lists it). The stack is stopped first so the worker starts no compute in the meantime. A plain `docker compose down -v` without the middle line removes the services and volumes but leaves the computes and their networks behind (it reports the networks as still in use); run the middle line and `down -v` again to finish. `--remove-orphans` does not help: Compose does not count the computes as its own.
+
+  Deleting the databases in Studio first removes their computes too, but the commands above don't depend on it.
+
 ## Known limitations
 
 - **No secret rotation** ([chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)).

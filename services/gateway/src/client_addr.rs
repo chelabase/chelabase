@@ -120,8 +120,9 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// fails, when the peer sent both headers or neither, when the header is longer than
 /// [`MAX_FORWARDED_BYTES`] or has more than [`MAX_FORWARDED_HOPS`] hops, holds anything but
 /// visible ASCII, or when a hop the walk reaches doesn't parse (`unknown`, an obfuscated
-/// node, an empty entry). Hops left of the client are never read. A port is dropped, and an
-/// IPv4-mapped address is reported as IPv4.
+/// node, an empty entry). Hops left of the client are never read. In an address read from a
+/// forwarding header, a port is dropped and an IPv4-mapped address is reported as IPv4; the
+/// peer itself (untrusted, or the fallback) is returned exactly as it connected.
 pub fn client_address(
     peer: Option<IpAddr>,
     trusted: &TrustedProxies,

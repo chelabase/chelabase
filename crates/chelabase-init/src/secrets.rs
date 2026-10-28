@@ -1203,16 +1203,22 @@ mod tests {
         out
     }
 
-    /// The files compose's top-level `secrets:` block reads from `${CHELABASE_KEYS_DIR}`; the
-    /// others are Zitadel's PATs in the stack dir, which Zitadel writes.
-    fn compose_secret_files() -> Vec<String> {
-        let compose =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../infra/compose/docker-compose.yml");
-        let text = std::fs::read_to_string(compose).unwrap();
+    fn compose_file(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../infra/compose")
+            .join(name);
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// The workbench: the files the overlay's top-level `secrets:` block reads from
+    /// `${CHELABASE_KEYS_DIR}`; the others are Zitadel's PATs in the stack dir, which Zitadel
+    /// writes.
+    fn workbench_secret_files() -> Vec<String> {
+        let text = compose_file("docker-compose.workbench.yml");
         let block = text
             .split("\nsecrets:\n")
             .nth(1)
-            .expect("a top-level secrets block");
+            .expect("a top-level secrets block in the workbench overlay");
         let mut keys = Vec::new();
         let mut others = Vec::new();
         for line in block
@@ -1235,10 +1241,58 @@ mod tests {
                 "${CHELABASE_STACK_DIR}/zitadel/admin.pat",
                 "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"
             ],
-            "a compose secret outside the keys dir that chelabase-init doesn't make"
+            "a workbench secret outside the keys dir that chelabase-init doesn't make"
         );
         assert!(keys.len() > 30, "{keys:?}");
         keys
+    }
+
+    /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
+    /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
+    /// makes after it (Zitadel's PATs, the bootstrap's outputs, Zitadel's rendered config).
+    fn selfhost_secret_paths() -> Vec<String> {
+        const SCRIPT_DIRS: [&str; 3] = ["zitadel-pats", "bootstrap", "zitadel-config"];
+        let text = compose_file("docker-compose.yml");
+        let mut paths = Vec::new();
+        let mut others = Vec::new();
+        for line in text.lines().filter(|l| l.contains("source: secrets,")) {
+            let Some(rest) = line.split("subpath: ").nth(1) else {
+                continue;
+            };
+            let sub = rest.split(['}', ',', ' ']).next().unwrap().to_string();
+            let top = sub.split('/').next().unwrap();
+            let list = if SCRIPT_DIRS.contains(&top) {
+                &mut others
+            } else {
+                &mut paths
+            };
+            if !list.contains(&sub) {
+                list.push(sub);
+            }
+        }
+        others.sort();
+        assert_eq!(
+            others,
+            [
+                "bootstrap",
+                "bootstrap/api-client-id",
+                "bootstrap/org-id",
+                "bootstrap/project-id",
+                "bootstrap/studio-client-id",
+                "zitadel-config/database.yaml",
+                "zitadel-pats",
+                "zitadel-pats/admin.pat",
+                "zitadel-pats/login-client.pat",
+            ],
+            "a self-hosted mount outside chelabase-init's layout that init-secrets doesn't make"
+        );
+        let script = text.split("\n  init-secrets:\n").nth(1).unwrap();
+        assert!(
+            script.contains(&format!("for d in {}; do", SCRIPT_DIRS.join(" "))),
+            "init-secrets makes {SCRIPT_DIRS:?}"
+        );
+        assert!(paths.len() > 30, "{paths:?}");
+        paths
     }
 
     fn mode(p: &Path) -> u32 {
@@ -1250,10 +1304,21 @@ mod tests {
         let t = tmp();
         let o = opts();
         let report = ensure_secrets(t.path(), &o).unwrap();
-        for file in compose_secret_files() {
+        for file in workbench_secret_files() {
             let p = t.path().join(&file);
-            assert!(p.is_file(), "{file} (named by compose) was not created");
+            assert!(
+                p.is_file(),
+                "{file} (named by the workbench) was not created"
+            );
             assert!(std::fs::metadata(&p).unwrap().len() > 0, "{file} is empty");
+        }
+        // A subpath can be a file or a dir; a file must have a value.
+        for sub in selfhost_secret_paths() {
+            let p = t.path().join(&sub);
+            let meta = std::fs::symlink_metadata(&p).unwrap_or_else(|_| {
+                panic!("{sub} (mounted by self-hosted compose) was not created")
+            });
+            assert!(meta.is_dir() || meta.len() > 0, "{sub} is empty");
         }
         let (uid, gid) = me();
         for entry in LAYOUT {
