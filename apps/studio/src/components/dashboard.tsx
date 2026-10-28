@@ -87,7 +87,8 @@ function Workspace({ me }: { me: Me }) {
         <h1 className="text-2xl font-semibold">Your organization isn't set up yet</h1>
         <p className="text-muted-foreground">
           You're signed in (org <code>{me.user.org_id}</code>), but no Chelabase tenant is bound to that
-          organization. In this self-hosted setup, run <code>just zitadel-bootstrap</code>.
+          organization. Self-hosted: check <code>docker compose logs init-bootstrap</code> and run{" "}
+          <code>docker compose up -d</code> to run it again. Workbench: run <code>just zitadel-bootstrap</code>.
         </p>
       </section>
     );
