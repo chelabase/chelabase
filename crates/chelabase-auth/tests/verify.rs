@@ -407,3 +407,25 @@ async fn behind_tls_the_fetch_carries_the_auth_host() {
         assert!(matches!(err, AuthError::Jwks(_)), "{host:?}: got {err:?}");
     }
 }
+
+// #24 follow-up: every claim the Zitadel verifier checks is required. `iss` and `exp` through
+// jsonwebtoken's required claims, `aud` by the audience check (validate_aud is off because the
+// audiences are a runtime list): a token missing one, signed with the right key, is refused.
+#[tokio::test]
+async fn a_zitadel_token_without_iss_aud_or_exp_is_refused() {
+    let mock = MockJwks::start().await;
+    let verifier = JwtVerifier::new(mock.config(vec![]));
+    let full = json!({
+        "sub": "user-1",
+        "iss": mock.issuer(),
+        "aud": chelabase_auth::test_support::MOCK_AUDIENCE,
+        "exp": now() + 300,
+        chelabase_auth::CLAIM_ORG_ID: "org-1",
+    });
+    verifier.verify(&mock.sign_exact(full.clone())).await.expect("the full claims pass");
+    for (missing, needle) in [("iss", "Missing required claim: iss"), ("exp", "Missing required claim: exp"), ("aud", "names no audience")] {
+        let mut c = full.clone();
+        c.as_object_mut().unwrap().remove(missing);
+        assert_invalid_token_containing(verifier.verify(&mock.sign_exact(c)).await, needle);
+    }
+}
