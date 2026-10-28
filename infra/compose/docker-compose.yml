@@ -198,6 +198,13 @@ services:
         for d in zitadel-pats bootstrap zitadel-config; do
           [ -d "$$S/$$d" ] || mkdir -m 0700 "$$S/$$d"
         done
+        # Zitadel creates its PATs 0644 (a fixed mode in its FirstInstance step) but keeps the
+        # mode of a file that exists, so each is made empty at 0600 first. An existing PAT
+        # (Zitadel's 0644 from an older install, too) is set back to 0600: they are ours (10001).
+        for f in admin.pat login-client.pat; do
+          [ -e "$$S/zitadel-pats/$$f" ] || (umask 077 && : >"$$S/zitadel-pats/$$f")
+          chmod 0600 "$$S/zitadel-pats/$$f"
+        done
         # Zitadel takes its database passwords only from its environment or a config file: the
         # file, rendered from the two password files (no quote or backslash can be in them).
         umask 077

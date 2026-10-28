@@ -518,6 +518,20 @@ done
 ((checked >= 15)) || die "only $checked services with secrets were checked"
 pass "$checked running services read all their mounted secrets as their own uid and groups"
 
+step "Zitadel's PATs are 0600 and auth starts without a mode warning"
+# Zitadel creates a PAT 0644 unless the file exists; init-secrets makes them 0600 first.
+modes="$(docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s:ro" --entrypoint stat "$HELPER" \
+  -c '%a:%u %n' /s/zitadel-pats/admin.pat /s/zitadel-pats/login-client.pat)" || die "stat of the PATs failed"
+open_pats="$(grep -v '^600:10001 ' <<<"$modes" || true)"
+[[ -z "$open_pats" ]] || die "a Zitadel PAT is not 0600 and the app user's: $(tr '\n' ' ' <<<"$open_pats")"
+for f in admin.pat login-client.pat; do
+  [[ -n "$(vol_cat "zitadel-pats/$f" | tr -d '[:space:]')" ]] || die "zitadel-pats/$f is empty: Zitadel did not write it"
+done
+if compose "$PROJECT" logs --no-color auth 2>&1 | grep -F 'readable by other users'; then
+  die "auth warns that a secret it reads is readable by other users"
+fi
+pass "both PATs are 0600, owned by 10001 and written; auth logs no mode warning"
+
 # ---- 11. a rerun changes nothing -----------------------------------------------------------------
 
 snapshot() { # snapshot <name>: the secrets volume's files, the containers and the code line count
