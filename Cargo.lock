@@ -298,6 +298,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-query",
  "chelabase-routes",
  "chelabase-secrets",
@@ -713,6 +714,7 @@ dependencies = [
  "base64 0.23.1",
  "bcrypt",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-init",
  "chelabase-neon",
  "chelabase-secrets",
@@ -740,6 +742,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-types",
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -757,6 +760,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-http"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
 name = "chelabase-init"
 version = "0.1.0"
 dependencies = [
@@ -764,6 +775,7 @@ dependencies = [
  "base64 0.23.1",
  "bcrypt",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-neon",
  "chelabase-secrets",
@@ -830,6 +842,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bollard",
+ "chelabase-http",
  "chelabase-metadata",
  "chrono",
  "ed25519-dalek",
@@ -947,6 +960,7 @@ name = "chelabase-zitadel"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chelabase-http",
  "chelabase-zitadel",
  "chrono",
  "hex",
@@ -1774,6 +1788,7 @@ dependencies = [
  "axum",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-routes",
  "chelabase-types",
  "chrono",
@@ -2883,6 +2898,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
@@ -3671,6 +3687,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-nats",
  "chelabase-neon",
  "chelabase-query",
@@ -3844,6 +3861,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
@@ -5791,6 +5809,7 @@ dependencies = [
  "base64 0.23.1",
  "bollard",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",

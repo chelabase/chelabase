@@ -81,8 +81,7 @@ impl UserTokens {
         ttl: Duration,
     ) -> Self {
         // Never a redirect (#26): the internal bearer goes to the orchestrator only.
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let client = chelabase_http::client_builder()
             .timeout(LOOKUP_TIMEOUT)
             .build()
             .expect("build the session liveness HTTP client");

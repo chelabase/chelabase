@@ -6,6 +6,7 @@ license.workspace = true
 description = "Zitadel JWKS JWT verification for Chelabase"
 
 [dependencies]
+chelabase-http = { workspace = true }
 chelabase-types = { workspace = true }
 uuid = { workspace = true }
 serde = { workspace = true }

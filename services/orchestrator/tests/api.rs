@@ -1,3 +1,6 @@
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 // The fakes and the test app, shared with `access_walk.rs`.
 include!("common/fakes.rs");
 
@@ -13929,6 +13932,22 @@ async fn get_cell_through_rest_passes_its_answer_on() {
     assert!(resp.headers().contains_key("retry-after"));
     assert_eq!(code_of(&resp.json::<Value>().await.unwrap()), "unavailable");
     assert_eq!(t.compute_lookups(), 0);
+}
+
+// #26: rest's client never follows a redirect, so a 3xx from rest is no answer: it is 503
+// `unavailable`, never passed on (with no `location`, it would read as an empty success).
+#[tokio::test]
+async fn a_redirect_from_rest_is_unavailable_not_passed_on() {
+    for status in [301u16, 302, 303, 307, 308] {
+        let answer: RestAnswer =
+            Arc::new(move |_: &Value| (status, vec![("location", "http://elsewhere.invalid/")], json!({})));
+        let (t, calls) = cell_app(answer).await;
+        let main = t.main();
+        let resp = t.cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" })).await;
+        assert_eq!(resp.status(), 503, "a {status} from rest was passed on");
+        assert_eq!(code_of(&resp.json::<Value>().await.unwrap()), "unavailable", "{status}");
+        assert_eq!(calls.lock().unwrap().len(), 1, "{status}: rest asked once, nothing followed");
+    }
 }
 
 #[tokio::test]

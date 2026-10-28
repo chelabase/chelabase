@@ -249,9 +249,7 @@ pub struct StorconClient {
 /// A client sending `token` as a bearer on every request.
 pub(crate) fn http_client_with(timeout: Duration, token: Option<&str>) -> reqwest::Client {
     // Never a redirect (#26): the NeonJWT goes to the configured service only.
-    let mut builder = reqwest::Client::builder()
-        .timeout(timeout)
-        .redirect(reqwest::redirect::Policy::none());
+    let mut builder = chelabase_http::client_builder().timeout(timeout);
     if let Some(token) = token {
         let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
             .expect("a JWT is a valid header value");

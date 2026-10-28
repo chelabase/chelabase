@@ -285,9 +285,8 @@ impl HttpProbe {
     pub fn new(what: &str, url: &str) -> Self {
         Self {
             // Readiness of this URL, not of wherever it redirects (#26): a 3xx fails the probe.
-            http: reqwest::Client::builder()
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(10))
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("the probe's HTTP client builds"),
             url: url.to_string(),

@@ -2,6 +2,9 @@
 //! first `auth` frame (R9, S14), renewals (W32), frame limits, pings, sockets per member across
 //! instances (P16) and shutdown (1012). In-process realtime with fakes (`common`).
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 mod common;
 
 use std::time::{Duration, Instant};

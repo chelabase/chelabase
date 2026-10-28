@@ -1016,6 +1016,12 @@ where
                 .into_response();
         }
     };
+    // #26: rest's client never follows a redirect, so a 3xx (or a stray 1xx) is no answer to
+    // pass on: with no `location` it would read as an empty success.
+    if !(reply.status.is_success() || reply.status.is_client_error() || reply.status.is_server_error()) {
+        warn!(branch_id = %branch, status = %reply.status, "rest answered with no result (redirects are not followed)");
+        return unavailable("the data API can't be reached right now; try again").into_response();
+    }
     if reply.status == StatusCode::NOT_FOUND && is_unknown_database(&reply.body) {
         return match state.metadata.branch_databases(branch).await {
             Ok(rows) => match pick_database(rows, Some(database)) {

@@ -14,6 +14,9 @@
 //! Each test provisions its own database in its own project and deletes both afterwards, pass
 //! or fail (with the project's Zitadel org and users, when the test made them).
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::future::Future;
 use std::process::Stdio;
 use std::sync::Arc;

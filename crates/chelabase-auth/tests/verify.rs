@@ -1,3 +1,6 @@
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use chelabase_auth::test_support::{BrokenJwks, MockJwks};
 use chelabase_auth::{AuthError, JwtVerifier, VerifiedClaims};
 use serde_json::json;
@@ -496,18 +499,31 @@ async fn an_aud_list_passes_only_when_it_names_one_of_our_audiences() {
 
 // #26: the key fetch never follows a redirect. A 3xx to a server with valid keys (here the
 // mock's own, so a followed redirect would verify) is a failed fetch: every token is refused.
+// The 3xx also carries the mock's real JWKS as its body, so only the status check refuses it.
 #[tokio::test]
 async fn a_redirecting_jwks_url_passes_no_token() {
-    use axum::{http::header::LOCATION, http::StatusCode, response::IntoResponse, routing::get, Router};
+    use axum::{
+        http::header::{CONTENT_TYPE, LOCATION},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::get,
+        Router,
+    };
     let mock = MockJwks::start().await;
     let token = mock.token_for_org("user-1", "org-1", 300);
+    let keys = reqwest::get(mock.jwks_url()).await.unwrap().text().await.unwrap();
+    assert!(keys.contains("\"keys\""), "the mock's JWKS: {keys}");
     for status in [301u16, 302, 303, 307, 308] {
         let target = mock.jwks_url().to_string();
+        let keys = keys.clone();
         let app = Router::new().route(
             "/oauth/v2/keys",
             get(move || {
-                let target = target.clone();
-                async move { (StatusCode::from_u16(status).unwrap(), [(LOCATION, target)]).into_response() }
+                let (target, keys) = (target.clone(), keys.clone());
+                async move {
+                    let headers = [(LOCATION, target), (CONTENT_TYPE, "application/json".to_string())];
+                    (StatusCode::from_u16(status).unwrap(), headers, keys).into_response()
+                }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

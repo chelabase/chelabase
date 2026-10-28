@@ -21,6 +21,7 @@ members = [
     "crates/chelabase-schema",
     "crates/chelabase-zitadel",
     "crates/chelabase-init",
+    "crates/chelabase-http",
 ]
 
 [workspace.package]
@@ -38,6 +39,7 @@ chelabase-routes = { path = "crates/chelabase-routes" }
 chelabase-secrets = { path = "crates/chelabase-secrets" }
 chelabase-neon = { path = "crates/chelabase-neon" }
 chelabase-query = { path = "crates/chelabase-query" }
+chelabase-http = { path = "crates/chelabase-http" }
 chelabase-schema = { path = "crates/chelabase-schema" }
 chelabase-zitadel = { path = "crates/chelabase-zitadel" }
 chelabase-init = { path = "crates/chelabase-init" }

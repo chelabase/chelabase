@@ -3,6 +3,9 @@
 //! pair's `current` reads as absent, and `capabilities: null` is no capability. The pinned
 //! names (`ERROR_BODY_LIMIT`, `scram::is_verifier`) are in `f2_scram.rs`.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::time::SystemTime;
 

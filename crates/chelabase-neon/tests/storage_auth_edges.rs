@@ -2,6 +2,9 @@
 //! with credentials or a half-set ACL user is refused, and storage tokens never expire nor depend
 //! on when they are signed.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use axum::Router;
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};

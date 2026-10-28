@@ -220,8 +220,7 @@ impl InternalSource {
     pub fn new(base_url: &str, token: &str) -> Self {
         InternalSource {
             // Never a redirect (#26): the internal bearer goes to the orchestrator only.
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("an HTTP client"),

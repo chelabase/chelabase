@@ -12,6 +12,9 @@
 //! Each test that needs a database creates its own through the API and deletes it afterwards,
 //! pass or fail.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Stdio;

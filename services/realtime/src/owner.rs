@@ -168,8 +168,7 @@ impl OwnerClient {
     pub fn new(base_url: &str, bearer: &str) -> Self {
         Self {
             // Never follow a redirect: the bearer goes to the configured host only.
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+            http: chelabase_http::client_builder()
                 .build()
                 .expect("realtime's HTTP client builds"),
             url: format!("{}{VISIBLE_PATH}", base_url.trim_end_matches('/')),

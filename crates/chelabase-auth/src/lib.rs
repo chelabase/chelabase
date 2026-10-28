@@ -223,9 +223,8 @@ impl JwtVerifier {
             // #26: never a redirect: a 3xx is a failed fetch, not keys from wherever it points.
             // The builder can't fail with these settings; if it did, the default client would
             // follow redirects, so building it is not allowed to fall back.
-            http: reqwest::Client::builder()
+            http: chelabase_http::client_builder()
                 .timeout(JWKS_FETCH_TIMEOUT)
-                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .expect("the JWKS client builds"),
             cache: Arc::new(RwLock::new(None)),

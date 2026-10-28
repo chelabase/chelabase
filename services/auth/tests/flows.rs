@@ -1,3 +1,6 @@
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use chelabase_secrets::SecretKey;

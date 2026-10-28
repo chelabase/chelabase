@@ -3,6 +3,9 @@
 //! gateway identity signer of the test's own and a fake orchestrator serving T6's
 //! `/internal/realtime/{authorize,projects}` answers. Several instances share the store, the bus
 //! and the orchestrator, as instances share Valkey, NATS and the orchestrator.
+
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
 #![allow(dead_code)]
 
 use std::net::{Ipv4Addr, SocketAddr};

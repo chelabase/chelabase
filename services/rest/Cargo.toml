@@ -17,6 +17,7 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
 chelabase-query = { workspace = true, features = ["openapi"] }
 # The full-cell read's shared code (`cell`, `catalog`, P40).
 chelabase-schema = { workspace = true }

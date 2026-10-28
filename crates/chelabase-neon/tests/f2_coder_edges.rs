@@ -1,6 +1,9 @@
 //! Fork round 4, final fix round (F2): the coder's edge cases beyond the RED set: the error-body
 //! cap on bodies that aren't text or are empty, and verifier spellings we refuse.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 
 use axum::Router;

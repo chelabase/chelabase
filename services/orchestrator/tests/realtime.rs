@@ -9,6 +9,9 @@
 //! - Live (`#[ignore]`): authorize for a member and `/visible` on the owner pool against a real
 //!   Postgres (the dev metadata Postgres stands in for a compute, as `api.rs` does):
 //!   just workbench test -p orchestrator --test realtime -- --run-ignored only
+
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
 #![allow(dead_code, unused_imports)]
 
 include!("common/fakes.rs");

@@ -18,6 +18,7 @@ path = "src/main.rs"
 test-support = []
 
 [dependencies]
+chelabase-http = { workspace = true }
 chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true, features = ["metadata"] }
 chelabase-nats = { workspace = true }

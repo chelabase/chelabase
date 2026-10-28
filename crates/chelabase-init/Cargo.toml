@@ -11,6 +11,7 @@ base64 = { workspace = true }
 # The NATS users file holds bcrypt hashes.
 bcrypt = "0.19.3"
 chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-http = { workspace = true }
 chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
