@@ -269,8 +269,24 @@ pub fn stale_apps(recorded: &HashMap<String, u64>, current: &HashMap<String, u64
     stale
 }
 
+/// The apps `up` recreates before the bootstrap: on a running stack, every app whose binary
+/// changed since it started (a stack that wasn't running starts them all on the current one).
+pub fn recreate_before_bootstrap(
+    was_running: bool,
+    recorded: &HashMap<String, u64>,
+    current: &HashMap<String, u64>,
+) -> Vec<String> {
+    if was_running {
+        stale_apps(recorded, current)
+    } else {
+        Vec::new()
+    }
+}
+
 /// What `up` recreates on a running stack: the apps whose binary changed since their start plus
-/// the readers of changed env files, sorted and deduped (T5 review I2).
+/// the readers of changed env files, sorted and deduped (T5 review I2). `up` now recreates the
+/// two around the bootstrap ([`recreate_before_bootstrap`], then the env readers).
+#[cfg(test)]
 pub fn up_recreates(
     recorded: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
@@ -950,21 +966,25 @@ fn start_stack(
         remove_computes_off_network(&stack.slug, &super::env::compute_network(&stack.project))
     })?;
 
+    // An app on its old binary (compose leaves a running container as it is) must not be what
+    // the bootstrap waits on: an old orchestrator never applies a new migration (B3).
+    let rebuilt = recreate_before_bootstrap(
+        was_running,
+        &read_binaries(stack),
+        &current_binaries(stack, &RUST_APPS),
+    );
+    if !rebuilt.is_empty() {
+        phases.run(&format!("recreating {} (new binaries)", rebuilt.join(", ")), || {
+            recreate(stack, &rebuilt)
+        })?;
+    }
+
     // One run, after the apps: it waits for the orchestrator (the metadata migrations, the
     // Actions target's host) itself.
     phases.run("bootstrap", || bootstrap(stack, None))?;
 
-    // Every app container predates the bootstrap's files, on a fresh stack too.
-    let changed = changed_env_users(&before_bootstrap, &app_env_files(stack));
-    let stale = if was_running {
-        up_recreates(
-            &read_binaries(stack),
-            &current_binaries(stack, &RUST_APPS),
-            &changed,
-        )
-    } else {
-        changed
-    };
+    // Then only what the bootstrap's files changed: every app container predates them.
+    let stale = changed_env_users(&before_bootstrap, &app_env_files(stack));
     if !stale.is_empty() {
         phases.run(&format!("recreating {}", stale.join(", ")), || {
             recreate(stack, &stale)
@@ -1191,7 +1211,9 @@ fn bootstrap(stack: &Stack, admin_email: Option<&str>) -> anyhow::Result<()> {
         .canonicalize()
         .with_context(|| format!("{} isn't built (cargo build -p init)", bin.display()))?;
     let mut cmd = Command::new("docker");
-    cmd.args(bootstrap_args(&stack.project, &env, &bin, &out, admin_email)?);
+    cmd.args(bootstrap_args(&stack.project, &env, &bin, &out, admin_email)?)
+        // The values reach the container through docker's own env, never its argv.
+        .envs(bootstrap_env(&env, &out));
     run(cmd)?;
     crate::dev::bootstrap::render_workbench_files(&out, &stack.state.join("studio.env"), &env)
 }
@@ -1227,17 +1249,10 @@ pub fn bootstrap_args(
     ]
     .map(str::to_string)
     .to_vec();
-    let mut pairs: Vec<(String, String)> = chelabase_init::bootstrap::ENV_KEYS
-        .iter()
-        .filter(|k| **k != "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-        .filter_map(|k| env.get(*k).map(|v| (k.to_string(), v.clone())))
-        .collect();
-    pairs.push((
-        "CHELABASE_ZITADEL_ADMIN_PAT_FILE".into(),
-        format!("{out}/admin.pat"),
-    ));
-    for (k, v) in pairs {
-        args.extend(["-e".to_string(), format!("{k}={v}")]);
+    for (k, _) in bootstrap_env(env, Path::new(&out)) {
+        // `-e NAME`: docker takes the value from its own environment (see [`bootstrap`]), so
+        // no value (the metadata URL carries its password) is on the command line.
+        args.extend(["-e".to_string(), k]);
     }
     args.push(get("CHELABASE_WORKBENCH_IMAGE")?);
     args.extend(["bootstrap", "--demo", "--out", &out].map(str::to_string));
@@ -1245,6 +1260,21 @@ pub fn bootstrap_args(
         args.extend(["--admin-email".to_string(), email.to_string()]);
     }
     Ok(args)
+}
+
+/// The env [`bootstrap`]'s container gets: the stack env's values of what the bootstrap reads,
+/// and the admin PAT's path in the output dir.
+pub fn bootstrap_env(env: &HashMap<String, String>, out: &Path) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = chelabase_init::bootstrap::ENV_KEYS
+        .iter()
+        .filter(|k| **k != "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+        .filter_map(|k| env.get(*k).map(|v| (k.to_string(), v.clone())))
+        .collect();
+    pairs.push((
+        "CHELABASE_ZITADEL_ADMIN_PAT_FILE".into(),
+        format!("{}/admin.pat", out.display()),
+    ));
+    pairs
 }
 
 /// `chelabase dev bootstrap [--admin-email e]`: the current checkout's stack's bootstrap, as
@@ -2095,6 +2125,51 @@ mod tests {
     // The workbench's one bootstrap: `chelabase-init bootstrap --demo` on the stack network,
     // with its binary read-only and the output dir the only writable mount (no docker socket,
     // no keys dir), and the env it reads taken from the stack env.
+    // B3 (live, `up` on an existing stack): an app whose binary changed is recreated before
+    // the bootstrap waits on it. An orchestrator left on its old binary never applies a new
+    // migration, and the bootstrap waited on it until its deadline.
+    #[test]
+    fn an_app_whose_binary_changed_is_recreated_before_the_bootstrap() {
+        let map = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        let recorded = map(&[("orchestrator", 1), ("worker", 1), ("auth", 1)]);
+        let current = map(&[("orchestrator", 2), ("worker", 1), ("auth", 1), ("rest", 1)]);
+        assert_eq!(
+            recreate_before_bootstrap(true, &recorded, &current),
+            ["orchestrator", "rest"]
+        );
+        // A stack that wasn't running starts every app on its current binary.
+        assert!(recreate_before_bootstrap(false, &recorded, &current).is_empty());
+        assert!(recreate_before_bootstrap(true, &current, &current).is_empty());
+    }
+
+    // N1: no value reaches `docker run`'s argv (host `ps`, `docker inspect` of the command):
+    // the metadata URL carries the database password.
+    #[test]
+    fn the_bootstrap_argv_holds_no_secret() {
+        let env: HashMap<String, String> = [
+            ("CHELABASE_UID", "1000"),
+            ("CHELABASE_GID", "1001"),
+            ("CHELABASE_WORKBENCH_IMAGE", "chelabase-workbench:abc"),
+            ("CHELABASE_METADATA_DATABASE_URL", "postgres://chelabase:s3cret@metadata-db:5432/m"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let args = bootstrap_args(
+            "chelabase-x",
+            &env,
+            Path::new("/c/target/debug/chelabase-init"),
+            Path::new("/s/zitadel"),
+            None,
+        )
+        .unwrap();
+        let joined = args.join(" ");
+        assert!(!joined.contains("s3cret") && !joined.contains("postgres://"), "{joined}");
+        assert!(args.windows(2).any(|w| w[0] == "-e" && w[1] == "CHELABASE_METADATA_DATABASE_URL"), "{joined}");
+    }
+
     #[test]
     fn the_bootstrap_runs_once_in_the_stack_with_only_its_output_dir() {
         let env: HashMap<String, String> = [
@@ -2129,9 +2204,14 @@ mod tests {
             volumes,
             ["/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro", "/s/zitadel:/s/zitadel"]
         );
-        let envs: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
-        assert!(envs.contains(&"CHELABASE_ZITADEL_ADMIN_PAT_FILE=/s/zitadel/admin.pat"), "{envs:?}");
-        assert!(envs.contains(&"CHELABASE_ZITADEL_UPSTREAM=http://zitadel:8080"), "{envs:?}");
+        let names: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
+        let envs: Vec<String> = bootstrap_env(&env, Path::new("/s/zitadel"))
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        assert_eq!(names.len(), envs.len(), "every value is named on the argv: {names:?}");
+        assert!(envs.contains(&"CHELABASE_ZITADEL_ADMIN_PAT_FILE=/s/zitadel/admin.pat".to_string()), "{envs:?}");
+        assert!(envs.contains(&"CHELABASE_ZITADEL_UPSTREAM=http://zitadel:8080".to_string()), "{envs:?}");
         assert!(!envs.iter().any(|e| e.starts_with("CHELABASE_KEYS_DIR")), "{envs:?}");
         assert!(!joined.contains("docker.sock"));
         assert!(

@@ -12,6 +12,7 @@ use reqwest::Method;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -39,6 +40,11 @@ struct ZState {
     users: BTreeMap<String, (String, bool, String, String)>,
     keys: Vec<String>,
     smtp: Vec<(String, String, bool)>,
+    /// Each SMTP configuration's full settings, the password included (by id).
+    smtp_config: BTreeMap<String, Value>,
+    /// The instance's IAM members (user ids), and how many more the listing says exist.
+    iam: std::collections::BTreeSet<String>,
+    iam_unlisted: u32,
     targets: Vec<(String, String, String)>,
     execution: Option<Value>,
 }
@@ -74,6 +80,9 @@ impl FakeZitadel {
                 "USER_STATE_ACTIVE".into(),
             ),
         );
+        state.iam = ["u-human".to_string(), "u-bootstrap".to_string()]
+            .into_iter()
+            .collect();
         Self {
             state: Mutex::new(state),
             next: AtomicU32::new(1),
@@ -204,15 +213,39 @@ impl FakeZitadel {
                 json!({"id": id})
             }
             "POST /admin/v1/smtp/_search" => {
-                json!({"result": s.smtp.iter().map(|(id, host, active)| json!({
-                "id": id, "host": host,
-                "state": if *active { "SMTP_CONFIG_ACTIVE" } else { "SMTP_CONFIG_INACTIVE" }})).collect::<Vec<_>>()})
+                json!({"result": s.smtp.iter().map(|(id, host, active)| {
+                    // As Zitadel lists it: no password, and `tls: false` left out.
+                    let mut c = s.smtp_config.get(id).cloned().unwrap_or_else(|| json!({}));
+                    let o = c.as_object_mut().unwrap();
+                    o.remove("password");
+                    if o.get("tls") == Some(&json!(false)) {
+                        o.remove("tls");
+                    }
+                    o.insert("id".into(), json!(id));
+                    o.insert("host".into(), json!(host));
+                    o.insert("state".into(), json!(if *active { "SMTP_CONFIG_ACTIVE" } else { "SMTP_CONFIG_INACTIVE" }));
+                    c
+                }).collect::<Vec<_>>()})
             }
             "POST /admin/v1/smtp" => {
                 let id = self.id("s");
                 s.smtp
                     .push((id.clone(), body["host"].as_str().unwrap().into(), false));
+                s.smtp_config.insert(id.clone(), body.clone());
                 json!({"id": id})
+            }
+            "POST /admin/v1/members/_search" => {
+                let result: Vec<Value> = s
+                    .iam
+                    .iter()
+                    .map(|id| {
+                        let human = s.users[id].1;
+                        json!({"userId": id, "roles": ["IAM_OWNER"],
+                            "userType": if human { "TYPE_HUMAN" } else { "TYPE_MACHINE" }})
+                    })
+                    .collect();
+                let total = result.len() as u32 + s.iam_unlisted;
+                json!({"details": {"totalResult": total.to_string()}, "result": result})
             }
             "POST /v2/actions/targets/search" => {
                 json!({"targets": s.targets.iter().map(|(id, name, ep)| json!({
@@ -263,6 +296,29 @@ impl FakeZitadel {
                         c.2 = c.0 == id;
                     }
                     json!({})
+                } else if let Some(id) = other
+                    .strip_prefix("PUT /admin/v1/smtp/")
+                    .and_then(|r| r.strip_suffix("/password"))
+                {
+                    s.smtp_config.get_mut(id).unwrap()["password"] = body["password"].clone();
+                    json!({})
+                } else if let Some(id) = other.strip_prefix("PUT /admin/v1/smtp/") {
+                    let c = s.smtp_config.get_mut(id).unwrap();
+                    for (k, v) in body.as_object().unwrap() {
+                        if k != "password" {
+                            c[k] = v.clone();
+                        }
+                    }
+                    json!({})
+                } else if let Some(id) = other.strip_prefix("GET /v2/users/") {
+                    match s.users.get(id) {
+                        Some(u) => json!({"user": {"userId": id, "state": u.3}}),
+                        None => {
+                            return Err(
+                                ApiError::new(other, Some(404), "Errors.User.NotFound").into()
+                            );
+                        }
+                    }
                 } else if let Some(id) = other.strip_prefix("DELETE /v2/actions/targets/") {
                     s.targets.retain(|t| t.0 != id);
                     json!({})
@@ -701,8 +757,9 @@ async fn non_retryable_fails_fast() {
     );
     assert_eq!(w.zitadel.calls("ProjectService/CreateProject"), 1);
     assert!(err.contains("the project") && err.contains("409"), "{err}");
+    // The bind comes first now; nothing after the failed step ran.
     assert!(
-        w.metadata.state().org.is_none(),
+        w.zitadel.state().apps.is_empty() && w.out(outputs::ORG_ID).is_none(),
         "nothing after the failed step ran"
     );
 }
@@ -974,4 +1031,256 @@ fn the_first_human_is_looked_for_by_zitadels_names() {
         steps::first_human_usernames("localhost"),
         ["zitadel-admin@zitadel.localhost", "zitadel-admin"]
     );
+}
+
+// --- m4 fix round (audit of #11) ---
+
+// B1: the FirstInstance human is found by what it is (a human IAM member), not by a guessed
+// name: renamed, it is still deactivated.
+#[tokio::test]
+async fn first_human_with_other_name_is_deactivated() {
+    let w = World::new();
+    w.zitadel
+        .state
+        .lock()
+        .unwrap()
+        .users
+        .get_mut("u-human")
+        .unwrap()
+        .0 = "zitadel-admin@chelabase.auth.chelabase.localhost".into();
+    w.run(Demo::Off).await.unwrap();
+    assert_eq!(human_state(&w), "USER_STATE_INACTIVE");
+}
+
+// B1: every active human IAM member is deactivated; the machine owners (the admin PAT's user)
+// stay; a rerun deactivates nothing again.
+#[tokio::test]
+async fn every_human_iam_member_is_deactivated_and_machines_kept() {
+    let w = World::new();
+    {
+        let mut s = w.zitadel.state.lock().unwrap();
+        s.users.insert(
+            "u-ops".into(),
+            (
+                "ops@example.com".into(),
+                true,
+                "ops@example.com".into(),
+                "USER_STATE_ACTIVE".into(),
+            ),
+        );
+        s.iam.insert("u-ops".into());
+    }
+    w.run(Demo::Off).await.unwrap();
+    let users = w.zitadel.state().users;
+    assert_eq!(users["u-human"].3, "USER_STATE_INACTIVE");
+    assert_eq!(users["u-ops"].3, "USER_STATE_INACTIVE");
+    assert_eq!(users["u-bootstrap"].3, "USER_STATE_ACTIVE");
+    let before = w.log().len();
+    w.run(Demo::Off).await.unwrap();
+    assert!(
+        !w.log()[before..].iter().any(|e| e.contains("/deactivate")),
+        "{:?}",
+        &w.log()[before..]
+    );
+}
+
+// B1: a human IAM owner it can't deactivate fails the step, naming it (never "nothing to do").
+#[tokio::test]
+async fn a_human_owner_left_active_fails_the_step() {
+    let w = World::new();
+    w.zitadel.fault(
+        "POST /v2/users/u-human/deactivate",
+        ApiError::new(
+            "POST /v2/users/u-human/deactivate",
+            Some(412),
+            "Errors.User.NotFound",
+        ),
+        100,
+    );
+    let err = format!("{:#}", w.run(Demo::Off).await.unwrap_err());
+    assert!(
+        err.contains("Zitadel's human admins") && err.contains("412"),
+        "{err}"
+    );
+    // An IAM listing that doesn't hold every member can't prove none is left: it fails too.
+    let w = World::new();
+    w.zitadel.state.lock().unwrap().iam_unlisted = 1;
+    let err = format!("{:#}", w.run(Demo::Off).await.unwrap_err());
+    assert!(
+        err.contains("Zitadel's human admins") && err.contains("listed 2 of 3"),
+        "{err}"
+    );
+    assert_eq!(
+        human_state(&w),
+        "USER_STATE_ACTIVE",
+        "nothing deactivated from a partial list"
+    );
+}
+
+// B1: no human IAM member at all (removed by the operator, or demoted) is the state this step
+// wants: success, and nothing is called but the listing.
+#[tokio::test]
+async fn no_human_iam_member_is_success() {
+    let w = World::new();
+    w.zitadel.state.lock().unwrap().iam.remove("u-human");
+    w.run(Demo::Off).await.unwrap();
+    assert_eq!(w.zitadel.calls("POST /v2/users/u-human/deactivate"), 0);
+    assert_eq!(
+        human_state(&w),
+        "USER_STATE_ACTIVE",
+        "not an IAM member: not touched"
+    );
+}
+
+// S1 (AC 9): a refused rebind changes nothing: no output file, no Zitadel object. Without
+// `--demo` the one change left is the FirstInstance human's deactivation, which AC 8 puts
+// before any wait on the orchestrator (and so before the bind).
+#[tokio::test]
+async fn refused_rebind_changes_nothing() {
+    for demo in [Demo::On, Demo::Off] {
+        let w = World::new();
+        w.metadata.state.lock().unwrap().org = Some("org-A".into());
+        let (files, mut zitadel) = (w.files(), w.zitadel.state());
+        w.run(demo).await.unwrap_err();
+        assert_eq!(w.files(), files, "{demo:?}: the output dir changed");
+        if demo == Demo::Off {
+            zitadel.users.get_mut("u-human").unwrap().3 = "USER_STATE_INACTIVE".into();
+        }
+        assert_eq!(w.zitadel.state(), zitadel, "{demo:?}: Zitadel changed");
+    }
+}
+
+fn smtp_world(password: &str, from: &str) -> World {
+    let mut w = World::new();
+    w.cfg.smtp = Some(steps::Smtp {
+        host: "smtp.example.com:587".into(),
+        payload: json!({"senderAddress": from, "senderName": "Chelabase", "tls": true,
+            "host": "smtp.example.com:587", "user": "u", "password": password,
+            "description": "chelabase"}),
+    });
+    w
+}
+
+// S2: a changed SMTP password or sender is applied on the next run; an unchanged one isn't
+// rewritten.
+#[tokio::test]
+async fn a_changed_smtp_config_is_applied() {
+    let mut w = smtp_world("old", "a@example.com");
+    w.run(Demo::Off).await.unwrap();
+    let id = w.zitadel.state().smtp[0].0.clone();
+    let config = |w: &World| w.zitadel.state().smtp_config[&id].clone();
+    assert_eq!(config(&w)["password"], "old");
+
+    // Unchanged: no SMTP write.
+    let before = w.log().len();
+    w.run(Demo::Off).await.unwrap();
+    let smtp_writes = |w: &World, from: usize| -> Vec<String> {
+        w.log()[from..]
+            .iter()
+            .filter(|e| e.contains("/admin/v1/smtp") && !e.ends_with("_search"))
+            .cloned()
+            .collect()
+    };
+    assert!(
+        smtp_writes(&w, before).is_empty(),
+        "{:?}",
+        smtp_writes(&w, before)
+    );
+
+    // A new password.
+    w.cfg.smtp = smtp_world("new", "a@example.com").cfg.smtp;
+    w.run(Demo::Off).await.unwrap();
+    assert_eq!(config(&w)["password"], "new");
+    // A new sender.
+    w.cfg.smtp = smtp_world("new", "b@example.com").cfg.smtp;
+    let before = w.log().len();
+    w.run(Demo::Off).await.unwrap();
+    assert_eq!(config(&w)["senderAddress"], "b@example.com");
+    assert_eq!(config(&w)["password"], "new");
+    assert!(
+        !smtp_writes(&w, before)
+            .iter()
+            .any(|e| e.ends_with("/password")),
+        "the password is unchanged: not resent"
+    );
+    assert_eq!(
+        w.zitadel.state().smtp.len(),
+        1,
+        "updated in place, not duplicated"
+    );
+}
+
+// N2: the orchestrator's probe waits on no answer, a 404 and 502/503/504; a 500 fails at once.
+#[tokio::test]
+async fn the_orchestrator_probe_fails_on_a_500() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn answering(status: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/health", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock
+                .write_all(
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await;
+        });
+        url
+    }
+    let probe = HttpProbe::new(
+        "the orchestrator",
+        &answering("500 Internal Server Error").await,
+    );
+    assert!(
+        probe.check().await.is_err(),
+        "a 500 is an answer, not a wait"
+    );
+    for status in [
+        "503 Service Unavailable",
+        "502 Bad Gateway",
+        "504 Gateway Timeout",
+        "404 Not Found",
+    ] {
+        let probe = HttpProbe::new("the orchestrator", &answering(status).await);
+        assert!(
+            matches!(probe.check().await.unwrap(), Check::Wait(_)),
+            "{status}"
+        );
+    }
+}
+
+// N3: a second run behind a held output-dir lock waits only until the deadline, naming it.
+#[tokio::test]
+async fn the_output_lock_waits_only_until_the_deadline() {
+    let mut w = World::new();
+    w.cfg.timeout = Duration::from_millis(200);
+    let held = std::fs::File::create(w.cfg.out_dir.join(outputs::LOCK)).unwrap();
+    held.lock().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), w.run(Demo::Off)).await;
+    let err = format!("{:#}", result.expect("bounded by --timeout").unwrap_err());
+    assert!(
+        err.contains(outputs::LOCK) && err.contains("another bootstrap"),
+        "{err}"
+    );
+}
+
+// S3: the SQL the bootstrap runs is the one the metadata crate's live test checks: no copy is
+// left in the CLI.
+#[test]
+fn the_tenant_name_sql_has_one_home() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    for orphan in [
+        "tools/cli/src/dev/tenant_name.sql",
+        "tools/cli/src/dev/tenant_admin.sql",
+    ] {
+        assert!(!root.join(orphan).exists(), "{orphan} is an orphaned copy");
+    }
+    let live =
+        std::fs::read_to_string(root.join("crates/chelabase-metadata/tests/members_live.rs"))
+            .unwrap();
+    assert!(live.contains("chelabase-init/src/bootstrap/tenant_name.sql"));
+    assert!(!live.contains("tools/cli/src/dev/tenant_"));
 }

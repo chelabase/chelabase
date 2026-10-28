@@ -371,6 +371,14 @@ impl Dir {
     /// Opens (creating it 0600 if needed) the lock file `name` and takes an exclusive `flock`
     /// on it, held until the returned file is dropped.
     pub fn lock(&self, name: &str) -> Result<std::fs::File> {
+        let file = self.open_lock(name)?;
+        file.lock()
+            .with_context(|| format!("locking {}", self.child(name).display()))?;
+        Ok(file)
+    }
+
+    /// Opens (creating it 0600 if needed) the lock file `name`; a symlink is refused.
+    fn open_lock(&self, name: &str) -> Result<std::fs::File> {
         let c = cname(name)?;
         let path = self.child(name);
         // SAFETY: `c` is NUL-terminated; the returned fd is checked.
@@ -390,10 +398,19 @@ impl Dir {
             return Err(e).with_context(|| format!("opening {}", path.display()));
         }
         // SAFETY: `fd` is a fresh, owned descriptor.
-        let file = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        file.lock()
-            .with_context(|| format!("locking {}", path.display()))?;
-        Ok(file)
+        Ok(std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    }
+
+    /// [`Dir::lock`] without waiting: `None` when another holder has the lock.
+    pub fn try_lock(&self, name: &str) -> Result<Option<std::fs::File>> {
+        let file = self.open_lock(name)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking {}", self.child(name).display()))
+            }
+        }
     }
 
     fn write_temp(&self, name: &str, contents: &[u8], perm: Perm) -> Result<String> {

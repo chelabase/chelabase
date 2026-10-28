@@ -24,11 +24,14 @@ pub const ACTIONS_SIGNING_KEY: &str = "actions-signing-key";
 pub const DEMO_USER_ID: &str = "demo-user-id";
 /// `--demo`: the demo machine user's key file (secret).
 pub const DEMO_KEY: &str = "demo-sa.json";
+/// A digest of the SMTP password last sent to Zitadel (secret-derived), so a changed password is
+/// sent again and an unchanged one isn't.
+pub const SMTP_PASSWORD_DIGEST: &str = "smtp-password.sha256";
 /// Serialises runs on one output dir.
 pub const LOCK: &str = ".chelabase-bootstrap.lock";
 
 /// Every name the bootstrap reads or writes in its output dir.
-pub const ALL: [&str; 7] = [
+pub const ALL: [&str; 8] = [
     ORG_ID,
     PROJECT_ID,
     API_CLIENT_ID,
@@ -36,6 +39,7 @@ pub const ALL: [&str; 7] = [
     ACTIONS_SIGNING_KEY,
     DEMO_USER_ID,
     DEMO_KEY,
+    SMTP_PASSWORD_DIGEST,
 ];
 
 /// Ids are readable by the apps; secrets by the writer only.
@@ -63,9 +67,9 @@ impl Outputs {
         self.dir.path()
     }
 
-    /// Takes the dir's lock, held until the returned file is dropped.
-    pub fn lock(&self) -> Result<std::fs::File> {
-        self.dir.lock(LOCK)
+    /// The dir's lock if no other run holds it (`None`), held until the file is dropped.
+    pub fn try_lock(&self) -> Result<Option<std::fs::File>> {
+        self.dir.try_lock(LOCK)
     }
 
     fn check(&self, name: &str) -> Result<bool> {
