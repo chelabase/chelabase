@@ -161,29 +161,6 @@ fn read_secret_file(name: &str, path: &str) -> Result<String> {
     Ok(value)
 }
 
-/// `url` with `password` put in its user info (`postgres://user@…` -> `postgres://user:pw@…`).
-pub fn with_password(url: &str, password: &str) -> Result<String> {
-    let (scheme, rest) = url
-        .split_once("://")
-        .context("CHELABASE_METADATA_DATABASE_URL is not a URL")?;
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let Some(at) = rest[..authority_end].rfind('@') else {
-        bail!("CHELABASE_METADATA_DATABASE_URL names no user for its password file");
-    };
-    let user = &rest[..at];
-    if user.contains(':') {
-        bail!(
-            "CHELABASE_METADATA_DATABASE_URL carries a password; with \
-             CHELABASE_METADATA_DATABASE_PASSWORD_FILE it must not"
-        );
-    }
-    Ok(format!(
-        "{scheme}://{user}:{}{}",
-        urlencoding::encode(password),
-        &rest[at..]
-    ))
-}
-
 /// SMTP from `CHELABASE_SMTP_*`, when `CHELABASE_SMTP_HOST` is set: TLS on, the password from
 /// a file only.
 fn smtp_from(get: &impl Fn(&str) -> Option<String>) -> Result<Option<steps::Smtp>> {
@@ -228,15 +205,15 @@ impl Config {
         let mode = Mode::parse(get(Mode::ENV).as_deref()).map_err(anyhow::Error::msg)?;
         let admin_pat_file = non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
             .context("CHELABASE_ZITADEL_ADMIN_PAT_FILE is required (Zitadel's admin PAT)")?;
-        let url = non_blank(&get, "CHELABASE_METADATA_DATABASE_URL")
-            .context("CHELABASE_METADATA_DATABASE_URL is required")?;
-        let metadata_url = match non_blank(&get, "CHELABASE_METADATA_DATABASE_PASSWORD_FILE") {
-            Some(path) => with_password(
-                &url,
-                &read_secret_file("CHELABASE_METADATA_DATABASE_PASSWORD_FILE", &path)?,
-            )?,
-            None => url,
-        };
+        // The shared helper: refuses a password in the URL's user info or `password=` query
+        // beside the file, and a symlinked, world-readable or empty file (0640 is fine).
+        let metadata_url = chelabase_types::secret_env::url_with_password_file(
+            &get,
+            "CHELABASE_METADATA_DATABASE_URL",
+            "CHELABASE_METADATA_DATABASE_PASSWORD_FILE",
+        )
+        .map_err(anyhow::Error::msg)?
+        .context("CHELABASE_METADATA_DATABASE_URL is required")?;
         let orchestrator_health = match non_blank(&get, "CHELABASE_ORCHESTRATOR_HEALTH_URL") {
             Some(v) if v.eq_ignore_ascii_case("none") => None,
             Some(v) => Some(v),
