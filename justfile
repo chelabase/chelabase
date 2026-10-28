@@ -317,3 +317,9 @@ auth-e2e:
 # Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
 selfhost-e2e:
     scripts/selfhost-e2e.sh
+
+# The self-hosted install behind a TLS proxy with no port in the hosts (#24): nginx with a
+# throwaway CA in front of a throwaway project, on the local release images (`just images`;
+# CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG pick others). Needs node for its socket client.
+selfhost-tls-e2e:
+    scripts/selfhost-tls-e2e.sh
