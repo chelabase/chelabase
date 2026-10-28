@@ -12,6 +12,14 @@
 //! - a [`Sensitivity::Secret`] file readable by its group or others is refused (`chmod 600`);
 //! - so is a file over [`MAX_LEN`] bytes or one that isn't UTF-8.
 //!
+//! **Writers must replace a file atomically** (write a temporary file in the same directory, then
+//! rename it into place), never write it in place: the first non-empty read is cached until the
+//! process restarts, so a reader that catches a half-written file keeps the truncated value.
+//! `chelabase-init`'s writers (the secrets and the bootstrap's outputs) already do; an operator
+//! writing one by hand should too (`printf … > f.tmp && mv f.tmp f`). The file is opened with
+//! `O_NOFOLLOW | O_NONBLOCK`, so a name swapped for a symlink or a FIFO is refused or read again,
+//! and never blocks the caller.
+//!
 //! These are the bootstrap's own rules for its output dir (`chelabase-init`'s `fsx`): ids 0644,
 //! secrets 0600, no symlinks. Nothing here ever puts the value in a message: errors and `Debug`
 //! name the variable and the path only.
@@ -209,6 +217,16 @@ impl fmt::Debug for FileValue {
 /// `Ok(None)`: missing or empty (not yet). `Err`: present but refused, with the reason (never
 /// the contents).
 fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String> {
+    read_with(path, sensitivity, || {})
+}
+
+/// [`read`], with `between` run after the name is checked and before it is opened (tests swap
+/// the file there).
+fn read_with(
+    path: &Path,
+    sensitivity: Sensitivity,
+    between: impl FnOnce(),
+) -> Result<Option<String>, String> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
@@ -224,9 +242,21 @@ fn read(path: &Path, sensitivity: Sensitivity) -> Result<Option<String>, String>
     if !named.is_file() {
         return Err("it is not a regular file".into());
     }
-    let mut file = match std::fs::File::open(path) {
+    between();
+    // Never follows a symlink and never waits (a FIFO swapped in would otherwise block until a
+    // writer came); what was opened is checked below.
+    let opened_file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    };
+    let mut file = match opened_file {
         Ok(f) => f,
         Err(e) if not_found(&e) => return Ok(None),
+        // ELOOP: the name became a symlink since the check.
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Err("it is a symlink".into()),
         Err(e) => return Err(format!("opening it: {e}")),
     };
     // What is checked below is the file that was opened: if the name now points elsewhere
@@ -363,6 +393,31 @@ mod tests {
         std::os::unix::fs::symlink(t.0.join("nowhere"), &dangling).unwrap();
         let msg = refused(&FileValue::file("K_FILE", &dangling, Sensitivity::Public));
         assert!(msg.contains("symlink"), "{msg}");
+    }
+
+    // N1: a FIFO swapped in between the check and the open must not block the caller (a
+    // tokio worker): the open doesn't wait for a writer, and the opened file is refused (or
+    // read again later) because it isn't the regular file that was checked.
+    #[test]
+    fn a_fifo_swapped_in_never_blocks() {
+        let t = tmp();
+        let path = t.0.join("org-id");
+        write(&path, "o1", 0o644);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            let got = read_with(&p, Sensitivity::Public, || {
+                std::fs::remove_file(&p).unwrap();
+                let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+                // SAFETY: a valid NUL-terminated path.
+                assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+            });
+            let _ = done_tx.send(got);
+        });
+        let got = done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO swapped in blocked the caller");
+        assert!(!matches!(got, Ok(Some(_))), "{got:?}");
     }
 
     #[test]
