@@ -3,6 +3,10 @@
 # daemon. REPO is the image prefix, TAG the tag.
 variable "REPO" { default = "chelabase" }
 variable "TAG" { default = "latest" }
+# REVISION is the git commit the images are built from (scripts/publish-images.sh sets it to HEAD);
+# it goes into the org.opencontainers.image.revision label, which `--push-only` checks.
+variable "REVISION" { default = "" }
+variable "SOURCE" { default = "https://github.com/chelabase/chelabase" }
 
 group "default" {
   targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio"]
@@ -11,6 +15,10 @@ group "default" {
 target "_app" {
   context    = "."
   dockerfile = "infra/images/server.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
 }
 
 target "gateway" {
@@ -57,5 +65,9 @@ target "server" {
 target "studio" {
   context    = "."
   dockerfile = "infra/images/studio.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
   tags       = ["${REPO}/studio:${TAG}"]
 }
