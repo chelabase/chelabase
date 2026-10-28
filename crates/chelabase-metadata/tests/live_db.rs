@@ -3064,7 +3064,7 @@ impl ScratchDb {
             .await
             .unwrap();
         let alice = c
-            .ensure_member(t, "alice", "alice@x.com", "Alice", Admission::Active)
+            .ensure_member_first_comer_for_tests(t, "alice", "alice@x.com", "Alice", Admission::Active)
             .await
             .unwrap();
         assert!(alice.tenant_admin);
@@ -5881,7 +5881,7 @@ async fn saved_query_round_trip() {
     let id = uuid::Uuid::new_v4();
     let tag = uuid::Uuid::new_v4().simple().to_string();
     let author = client
-        .ensure_member(TenantId(DEMO_TENANT_ID), &format!("saved-{tag}"), &format!("saved-{tag}@example.test"), "Author", chelabase_metadata::members::Admission::Active)
+        .ensure_member_first_comer_for_tests(TenantId(DEMO_TENANT_ID), &format!("saved-{tag}"), &format!("saved-{tag}@example.test"), "Author", chelabase_metadata::members::Admission::Active)
         .await
         .unwrap()
         .id;

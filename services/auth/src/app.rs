@@ -506,15 +506,15 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
     let setup_code = b.setup_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
-    let mut checks = vec![
-        (format!("sign-up:ip:{ip}"), 20, HOUR),
-        (format!("sign-up:email:{}", email_tag(&email)), 5, HOUR),
-    ];
-    // Guessing the setup code (about 98 bits) is also capped across every client.
-    if setup_code.is_some() {
-        checks.push(("sign-up:setup-code".to_string(), SETUP_CODE_TRIES_PER_HOUR, HOUR));
-    }
-    if !allowed(s, &checks) {
+    // Code guesses count against these too. No bucket is shared by every client: anyone could
+    // drain it with junk and lock the operator out, and the code's ~98 bits need no global cap.
+    if !allowed(
+        s,
+        &[
+            (format!("sign-up:ip:{ip}"), 20, HOUR),
+            (format!("sign-up:email:{}", email_tag(&email)), 5, HOUR),
+        ],
+    ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if !is_auth_request_id(&b.auth_request) {
@@ -579,9 +579,6 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     }
     verify_step(s, &b.auth_request, user_id, session).await
 }
-
-/// Every client's setup-code sign-ups together, per hour.
-pub const SETUP_CODE_TRIES_PER_HOUR: u32 = 300;
 
 /// Why the sign-up gate refused; [`Refusal::response`] is its answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

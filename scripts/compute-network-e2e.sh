@@ -141,7 +141,8 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
       refused PUT http://orchestrator:8083/storcon/notify-attach "the storage controller hook" -H 'Content-Type: application/json' -d '{}'
       refused GET "http://orchestrator:8083/internal/data/keys/$sha" "the data-key lookup"
       refused GET "http://orchestrator:8083/internal/data/branches/$uuid/connection" "the connection route"
-      refused GET http://orchestrator:8083/internal/signup/allowed "the sign-up gate"
+      refused POST http://orchestrator:8083/internal/signup/check "the sign-up gate" -H 'Content-Type: application/json' -d '{"org":"x"}'
+      refused POST http://orchestrator:8083/internal/signup/claimed "the setup claim" -H 'Content-Type: application/json' -d '{"org":"x"}'
       refused GET "http://orchestrator:8083/internal/app/sessions/$uuid" "session liveness"
       refused POST http://orchestrator:8083/internal/app/sync "the app-users sync" -d '{}'
       refused POST http://orchestrator:8083/internal/zitadel/events "the Zitadel webhook" -H 'Content-Type: application/json' -d '{}' ;;

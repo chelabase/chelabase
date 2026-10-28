@@ -278,9 +278,10 @@ where
             if !is_user_id(&c.zitadel_user_id) {
                 None
             } else {
-                match zitadel.get_user(&c.zitadel_user_id).await {
-                    Ok(None) => Some(c.zitadel_user_id),
-                    Ok(Some(_)) => None,
+                // Only a definite not-found is "gone"; an unreadable answer fails closed.
+                match zitadel.user_is_gone(&c.zitadel_user_id).await {
+                    Ok(true) => Some(c.zitadel_user_id),
+                    Ok(false) => None,
                     Err(e) => return unavailable(&format!("Zitadel lookup failed: {e}")),
                 }
             }

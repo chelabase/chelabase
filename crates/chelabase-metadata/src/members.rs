@@ -77,7 +77,7 @@ impl MemberStatus {
     }
 }
 
-/// What a person with no member row becomes when they first ask in ([`MetadataClient::ensure_member`]).
+/// What a person with no member row becomes when they first ask in ([`MetadataClient::admit_member`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
     /// An active member without grants.
@@ -88,8 +88,8 @@ pub enum Admission {
     Closed,
 }
 
-/// Who may claim `tenant_admin` while a tenant has no active admin ([`MetadataClient::ensure_member`]
-/// against [`MetadataClient::admit_member`]).
+/// Who may claim `tenant_admin` while a tenant has no active admin
+/// ([`MetadataClient::ensure_member_first_comer_for_tests`] against [`MetadataClient::admit_member`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminClaim {
     /// Only the Zitadel user the tenant's `setup_claims` row binds (a code-gated sign-up).
@@ -1629,10 +1629,13 @@ impl MetadataClient {
     /// `NotAdmitted`. An existing row is never changed by `admission`, and a pending one stays
     /// pending.
     ///
-    /// **Who claims the admin here is the first comer**: the tests' and tools' shortcut for a
-    /// tenant with an admin. No service calls it; the orchestrator admits people with
-    /// [`MetadataClient::admit_member`], which binds the claim to the setup code.
-    pub async fn ensure_member(
+    /// **Tests only: who claims the admin here is the first comer**, the shortcut tests use
+    /// for a tenant with an admin. No service may call it: it would let anyone in the org
+    /// claim an unclaimed tenant. The orchestrator admits people with
+    /// [`MetadataClient::admit_member`], which binds the claim to the setup code. (A
+    /// `cfg(test)` gate can't reach other crates' tests, and a test-only feature would need a
+    /// Cargo.toml change, so the name carries the warning.)
+    pub async fn ensure_member_first_comer_for_tests(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1644,8 +1647,8 @@ impl MetadataClient {
             .await
     }
 
-    /// [`MetadataClient::ensure_member`] as the orchestrator runs it on every request: while
-    /// the tenant has no active admin, only the Zitadel user its `setup_claims` row binds (the
+    /// [`MetadataClient::ensure_member_first_comer_for_tests`] as the orchestrator runs it on
+    /// every request: while the tenant has no active admin, only the Zitadel user its `setup_claims` row binds (the
     /// account a sign-up with the right setup code created) claims `tenant_admin`, and only
     /// from no row at all. Without a claim row nobody does. Anyone else (Zitadel's
     /// FirstInstance human, a machine user, the loser of a sign-up race, a member left after the
@@ -3143,9 +3146,10 @@ impl MetadataClient {
         Ok(zitadel_user_id)
     }
 
-    /// Whether the tenant's admin was claimed (first sign-in, `admin_claimed`) after `since`:
-    /// the window in which a second sign-up of a fresh install may still be waiting to arrive
-    /// (R41, M7).
+    /// Whether the tenant's admin was claimed (first sign-in, `admin_claimed`), or its
+    /// fresh-install claim bound (`setup_claims`), after `since`: the window in which a second
+    /// sign-up of a fresh install may still be waiting to arrive (R41, M7). The binding counts
+    /// too, so the race loser is a pending request whichever first request comes first.
     pub async fn admin_claimed_since(
         &self,
         tenant: TenantId,
@@ -3153,7 +3157,8 @@ impl MetadataClient {
     ) -> Result<bool, MetadataError> {
         Ok(sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM access_events
-                             WHERE tenant_id = $1 AND action = 'admin_claimed' AND at > $2)",
+                             WHERE tenant_id = $1 AND action = 'admin_claimed' AND at > $2)
+                 OR EXISTS (SELECT 1 FROM setup_claims WHERE tenant_id = $1 AND created_at > $2)",
         )
         .bind(tenant.as_uuid())
         .bind(since)

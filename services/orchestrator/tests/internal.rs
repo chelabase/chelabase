@@ -6635,3 +6635,68 @@ mod t4 {
         assert!(events.published().is_empty());
     }
 }
+
+// B2 (m3 audit): every orchestrator:8083 probe of `scripts/compute-network-e2e.sh` hits a route
+// that exists and refuses a caller without a credential (401/403, never 404), and the sign-up
+// gate's two POST routes are among them.
+#[tokio::test]
+async fn signup_routes_are_probed_by_the_network_e2e() {
+    let script = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/compute-network-e2e.sh"),
+    )
+    .unwrap();
+    let vars = [
+        ("$zero32", "00000000000000000000000000000000"),
+        ("$sha", "0000000000000000000000000000000000000000000000000000000000000000"),
+        ("$uuid", "00000000-0000-4000-8000-000000000000"),
+    ];
+    let mut probes = Vec::new();
+    for line in script.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("refused ") else { continue };
+        let mut words = rest.split_whitespace();
+        let (Some(method), Some(url)) = (words.next(), words.next()) else { continue };
+        let mut url = url.trim_matches('"').to_string();
+        let Some(path) = url.strip_prefix("http://orchestrator:8083") else { continue };
+        let mut path = path.to_string();
+        for (k, v) in vars {
+            path = path.replace(k, v);
+        }
+        url = path;
+        probes.push((method.to_string(), url));
+    }
+    let probed: Vec<(&str, &str)> = probes.iter().map(|(m, p)| (m.as_str(), p.split('?').next().unwrap())).collect();
+    for route in [("POST", "/internal/signup/check"), ("POST", "/internal/signup/claimed")] {
+        assert!(probed.contains(&route), "the e2e doesn't probe {route:?}: {probed:?}");
+    }
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let http = reqwest::Client::new();
+    for (method, path) in &probes {
+        let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
+        let mut req = http.request(m.clone(), format!("{}{path}", a.app.base));
+        if m != reqwest::Method::GET {
+            req = req.header("content-type", "application/json").body("{}");
+        }
+        let status = req.send().await.unwrap().status().as_u16();
+        assert!(status == 401 || status == 403, "{method} {path} without a credential answers {status}");
+    }
+}
+
+// N1 (m3 audit): Zitadel answering something that can't be read as the claim's user is not
+// "gone": no replacement, 503, the nonce stays live and the claim unchanged.
+#[tokio::test]
+async fn signup_unreadable_zitadel_answer_keeps_the_claim() {
+    let neon = fresh_install();
+    let mock = MockZitadel::start().await;
+    let first = mock.add_user_in(SETUP_ORG, "first@x.com", "pw", true);
+    let new = mock.add_user_in(SETUP_ORG, "new@x.com", "pw", true);
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    assert_eq!(claim(&app, SETUP_ORG, &first, &n).await, (200, json!({"bound": true})));
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    mock.fail(&format!("GET /v2/users/{first}"), 200, "Odd.Answer", 1);
+    let (status, body) = claim(&app, SETUP_ORG, &new, &n).await;
+    assert_eq!((status, error_code(&body)), (503, "unavailable"), "{body}");
+    assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(first.as_str()));
+    assert!(neon.live_nonces(SETUP_ORG).contains(&nonce_sha(&n)));
+}

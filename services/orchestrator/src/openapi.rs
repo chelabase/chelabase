@@ -597,7 +597,7 @@ impl MetadataPort for Doc {
     ) -> Result<Option<MemberRecord>, MetadataError> {
         match *self {}
     }
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,

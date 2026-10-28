@@ -107,12 +107,17 @@ struct FakeMetadata {
     /// fills it, the fake does to test the per-role levels, T2).
     #[allow(clippy::type_complexity)]
     team_grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), Vec<Grant>>>>,
-    /// Reads of a member row (`member_by_zitadel` and `ensure_member` each read it once).
+    /// Reads of a member row (`member_by_zitadel` and `admit_member` each read it once).
     member_reads: Arc<AtomicUsize>,
     /// Reads of a branch's roles (`list_roles`).
     role_reads: Arc<AtomicUsize>,
     /// When each tenant's admin was claimed by a first sign-in (`admin_claimed`).
     admin_claims: Arc<Mutex<HashMap<TenantId, chrono::DateTime<chrono::Utc>>>>,
+    /// Selfhost-install m3: each tenant's fresh-install claim (bound user, when bound). With
+    /// one, only that user claims the admin (`admit_member`'s rule); without one the fake
+    /// keeps the first comer's rule the other tests build on.
+    #[allow(clippy::type_complexity)]
+    setup_claims: Arc<Mutex<HashMap<TenantId, (String, chrono::DateTime<chrono::Utc>)>>>,
     /// A write "another request" makes just before the next checked grant or override write.
     race_before_write: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
     /// The reconciler's `member_branch_roles` rows.
@@ -348,6 +353,10 @@ impl FakeMetadata {
     }
 
     /// Sets (or clears) when the tenant's admin was claimed.
+    fn set_setup_claim(&self, tenant: TenantId, user: &str) {
+        self.setup_claims.lock().unwrap().insert(tenant, (user.into(), chrono::Utc::now()));
+    }
+
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
         let mut claims = self.admin_claims.lock().unwrap();
         match at {
@@ -1836,7 +1845,7 @@ impl MetadataPort for FakeMetadata {
     /// As the real one: a removed or pending member is returned as is, an invited one is
     /// activated, an active one gets the claims, and a new one claims the admin when the tenant
     /// has no active admin, else is active, pending or refused (`NotAdmitted`) per `admission`.
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1877,10 +1886,12 @@ impl MetadataPort for FakeMetadata {
         let has_admin = members
             .iter()
             .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin);
-        let status = match (has_admin, admission) {
-            (false, _) | (true, Admission::Active) => MemberStatus::Active,
-            (true, Admission::Pending) => MemberStatus::Pending,
-            (true, Admission::Closed) => return Err(MetadataError::NotAdmitted(tenant)),
+        let bound = self.setup_claims.lock().unwrap().get(&tenant).map(|(u, _)| u.clone());
+        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == zitadel_user_id);
+        let status = match (claims, admission) {
+            (true, _) | (false, Admission::Active) => MemberStatus::Active,
+            (false, Admission::Pending) => MemberStatus::Pending,
+            (false, Admission::Closed) => return Err(MetadataError::NotAdmitted(tenant)),
         };
         let record = MemberRecord {
             id: uuid::Uuid::new_v4(),
@@ -1888,7 +1899,7 @@ impl MetadataPort for FakeMetadata {
             zitadel_user_id: zitadel_user_id.into(),
             email,
             display_name: name.into(),
-            tenant_admin: !has_admin,
+            tenant_admin: claims,
             status,
             accepted_at: Some(chrono::Utc::now()),
             offboarded: false, suspended_at: None, suspended_by: None,
@@ -3450,7 +3461,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     }
 
     async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
-        Ok(self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
+        let bound = self.setup_claims.lock().unwrap().get(&tenant).is_some_and(|(_, at)| *at > since);
+        Ok(bound || self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
     }
 
     async fn access_events(
