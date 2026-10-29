@@ -813,6 +813,15 @@ async fn internal_types_needs_the_bearer_and_one_role() {
         let (status, body) = internal_types(&h, query, Some(TOKEN)).await;
         assert_eq!((status, &body["error"]["code"]), (400, &Value::from("invalid_query")), "{query}: {body}");
     }
+    // The unknown-option message lists what this route takes: `role` too.
+    let (_, body) = internal_types(&h, "?role=authenticated&branch=x", Some(TOKEN)).await;
+    let message = body["error"]["message"].as_str().unwrap();
+    for option in ["`role`", "`format`", "`database`", "`all_databases`"] {
+        assert!(message.contains(option), "{option} missing: {message}");
+    }
+    let (status, _, text) = get_raw(&h, "/data/v1/types?branch=x", Some(&h.token("rest", Some(DataKeyKind::Secret)))).await;
+    assert_eq!(status, 400);
+    assert!(!text.contains("`role`"), "the public route takes no role: {text}");
     assert_eq!(h.calls.load(Ordering::SeqCst), 0);
     // A valid request reaches the connection (nothing listens: 503).
     let (status, _) = internal_types(&h, "?role=authenticated&format=json", Some(TOKEN)).await;

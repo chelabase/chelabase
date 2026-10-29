@@ -60,7 +60,7 @@ Any other key is 422 `unknown_column`. That includes managed columns, generated 
 
 The values go through your column types and constraints. A failure is 422 `constraint_violation` with Postgres' message (and the constraint's name when it has one), and no Zitadel user is created.
 
-`chelabase gen types` marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
+The generated `db.ts` (Studio's **Download types**, `curl` of `/data/v1/types`; they produce the same module) marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
 
 ## Defaults and triggers run as `chelabase_auth_sync`
 

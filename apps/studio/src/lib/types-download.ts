@@ -1,20 +1,20 @@
 import { fetchDataApiTypes, type GetDataApiTypesParams } from "@chelabase/management-client";
 
-/** The database choice that downloads every served database (`all_databases=true`). */
-export const ALL_DATABASES = "*all*";
+/** Which database(s) the types describe: tagged, so no database name can read as another kind. */
+export type TypesDatabase = { kind: "main" } | { kind: "named"; name: string } | { kind: "all" };
 
 export interface TypesChoice {
   /** The secret key role whose view the types describe. */
   role: string;
-  /** `null`: the main database; a name; or {@link ALL_DATABASES}. */
-  database: string | null;
+  /** The main database, one named database, or every served database (`all_databases=true`). */
+  database: TypesDatabase;
 }
 
 /** The download's query and file name. */
 export function typesRequest(choice: TypesChoice): { params: GetDataApiTypesParams; filename: string } {
   const params: GetDataApiTypesParams = { role: choice.role.trim() };
-  if (choice.database === ALL_DATABASES) params.all_databases = true;
-  else if (choice.database !== null) params.database = choice.database;
+  if (choice.database.kind === "all") params.all_databases = true;
+  else if (choice.database.kind === "named") params.database = choice.database.name;
   return { params, filename: "db.ts" };
 }
 

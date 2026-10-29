@@ -2,7 +2,7 @@ import { useId, useState } from "react";
 import type { BranchDatabaseView } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
-import { ALL_DATABASES, downloadTypes } from "@/lib/types-download";
+import { downloadTypes, type TypesDatabase } from "@/lib/types-download";
 import { CopyButton } from "./copy-button";
 
 export interface DataApiTypesProps {
@@ -21,10 +21,22 @@ const db = createClient<Database>({ url, key: secretKey, types: await fetchTypes
 export function DataApiTypes({ databaseId, branchId, databases }: DataApiTypesProps) {
   const served = databases.filter((d) => d.origin !== "system" && d.data_api === "on");
   const [role, setRole] = useState("authenticated");
-  // `null` is the main database.
-  const [database, setDatabase] = useState<string | null>(null);
+  // The select's value is an index into `choices`, so no database name can read as the "all" choice.
+  const [picked, setPicked] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const choices: { label: string; database: TypesDatabase }[] = [
+    ...served.map((d) => ({
+      label: d.main ? `${d.name} (main)` : d.name,
+      database: d.main ? ({ kind: "main" } as const) : ({ kind: "named", name: d.name } as const),
+    })),
+    { label: "All databases", database: { kind: "all" } },
+  ];
+  // Until one is picked: main, else the first served. A pick past the end (a database stopped
+  // being served) falls back the same way.
+  const fallback = Math.max(0, choices.findIndex((c) => c.database.kind === "main"));
+  const chosen = picked !== null && picked < choices.length ? picked : fallback;
+  const database = choices[chosen].database;
   const reasonId = useId();
   const reason = role.trim() === "" ? "Enter a role." : served.length === 0 ? "No database is served yet." : null;
 
@@ -55,17 +67,12 @@ export function DataApiTypes({ databaseId, branchId, databases }: DataApiTypesPr
         {served.length > 1 && (
           <label className="flex flex-col gap-1">
             <span>Types database</span>
-            <select
-              value={database ?? ""}
-              onChange={(e) => setDatabase(e.target.value === "" ? null : e.target.value)}
-              className={field}
-            >
-              {served.map((d) => (
-                <option key={d.name} value={d.main ? "" : d.name}>
-                  {d.main ? `${d.name} (main)` : d.name}
+            <select value={String(chosen)} onChange={(e) => setPicked(Number(e.target.value))} className={field}>
+              {choices.map((c, i) => (
+                <option key={i} value={String(i)}>
+                  {c.label}
                 </option>
               ))}
-              <option value={ALL_DATABASES}>All databases</option>
             </select>
           </label>
         )}

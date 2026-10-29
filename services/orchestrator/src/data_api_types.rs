@@ -7,11 +7,17 @@
 //! orchestrator can't call the public route itself: it holds no key's plaintext and can't mint
 //! a data key identity.
 //!
-//! Who may call it is who may create a secret key for `role` on the branch: createKey's
-//! `Project(Developer)` check, MH-12 (never a personal login) and the key-role check (T6:
-//! the role in the caller's roles or reachable through a granted role's chain, owner-level,
-//! LOGIN and reserved roles Admin-only), in that order, with the same answers. Nothing reaches
-//! rest before they pass.
+//! Who may call it is who may create a secret key for `role` on the branch, by the checks
+//! createKey runs on the caller and the role, in its order and with its answers: the
+//! `Project(Developer)` access check, `load_branch`, MH-12 (`refuse_personal_login_key`: never a
+//! personal login), the key-role check (`authorize_key_role`, T6: the role in the caller's roles
+//! or reachable through a granted role's chain, owner-level, LOGIN and reserved roles
+//! Admin-only), and the worker's `check_role`. Nothing reaches rest before they pass.
+//!
+//! Not reused: createKey's all-rows exposure check (EOS-H1 `check_all_rows`, 422
+//! `exposes_data_api`, 503 when it can't complete). It guards a key handing out every row;
+//! types expose the schema, never rows, so a role createKey refuses for that reason still gets
+//! its types here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,7 +172,7 @@ impl Options {
     operation_id = "getDataApiTypes",
     tag = "data-api",
     summary = "The branch's generated types for a secret key role",
-    description = "What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it exactly when you may create a secret key for `role` (the same checks and answers as `createKey`). The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).",
+    description = "What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it when you pass `createKey`'s checks on the caller and the role: Developer access on the branch, not a personal login's role, and a role you may use. Its all-rows exposure check (`exposes_data_api`) does not apply, since types expose the schema and never rows. The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),
@@ -191,7 +197,7 @@ impl Options {
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `data_api_disabled`: the Postgres database isn't served by the data API; `conflict`: the schema can't be typed (a schema the role reaches has a dot in its name, or with `all_databases` another database is named `main`, the key main always takes)", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: an option isn't `role=<name>`, `format=ts|json`, `database=<name>` or `all_databases=true|false`, is repeated or empty, or `database` came with `all_databases=true`; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 502, description = "`unavailable`: the data API answered something unexpected", body = ErrorEnvelope),
+        (status = 502, description = "`unavailable`: the data API answered something unexpected, or refused the orchestrator's internal credential (a server misconfiguration, not your sign-in)", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the data API or the branch's database can't be reached; retry after `Retry-After`; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope, headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
         (status = 504, description = "`timeout`: the worker didn't answer in time; the data API's `timeout` when reading the schema ran past the statement timeout", body = ErrorEnvelope),
     ),
