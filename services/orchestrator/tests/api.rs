@@ -4585,6 +4585,37 @@ async fn the_owners_name_as_a_role_is_422() {
     assert!(t.role_checks().is_empty());
 }
 
+/// rest's 401 means the orchestrator's own bearer was refused, never that the user is signed
+/// out: Studio signs the user out on a 401, so every route that passes rest's answer on turns
+/// it into a 502 `unavailable`. rest's 403 is the user's request refused and stays as it is.
+#[tokio::test]
+async fn a_rest_401_never_reaches_the_browser_as_a_401() {
+    let refused: RestAnswer = Arc::new(|_| {
+        (401, vec![], json!({ "error": { "code": "unauthorized", "message": "a valid bearer is required" } }))
+    });
+    let (t, calls) = cell_app(refused).await;
+    let main = t.main();
+    t.metadata.set_data_api(main, "analytics", chelabase_metadata::DataApiState::On);
+    let mut seen = Vec::new();
+    let console = t
+        .console(main, json!({ "role": "editor", "database": null, "tree": select_notes() }))
+        .await;
+    seen.push(("console query", console));
+    seen.push(("role schema", t.console_schema(main, "?role=editor").await));
+    let cell = t
+        .cell_as("mixed", main, json!({ "role": "billing_admin", "key": { "id": 1 }, "column": "id" }))
+        .await;
+    seen.push(("cell", cell));
+    for (route, resp) in seen {
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(status, 502, "{route}: {body}");
+        assert_eq!(code_of(&body), "unavailable", "{route}");
+        assert!(!message_of(&body).contains("bearer"), "{route}: {body}");
+    }
+    assert_eq!(calls.lock().unwrap().len(), 3, "each route asked rest");
+}
+
 #[tokio::test]
 async fn console_schema_as_a_role_checks_then_forwards_role_and_database() {
     let schema = json!({ "version": "v1", "default_schema": "reporting", "schemas": {} });
