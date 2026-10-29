@@ -63,7 +63,7 @@ body,
   }
 }
 [role="gridcell"][data-changed="true"][data-motion="flash"] {
-  animation: live-cell-flash 1.4s var(--ease-lagoon) both;
+  animation: live-cell-flash 1.4s var(--ease-design) both;
 }
 [role="gridcell"][data-changed="true"][data-motion="none"] {
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--seafoam) 60%, transparent);

@@ -74,7 +74,7 @@ describe("ApiReference", () => {
 
   it("themes Scalar onto the design tokens, scoped to the page wrapper", () => {
     const { container } = render(wrap("t"));
-    const wrapper = container.querySelector(".lagoon-scalar");
+    const wrapper = container.querySelector(".design-scalar");
     expect(wrapper).not.toBeNull();
     expect(wrapper!.querySelector('[data-testid="scalar"]')).not.toBeNull();
     // Both stylesheets render as <style> next to the wrapper. The skin itself and its scoping

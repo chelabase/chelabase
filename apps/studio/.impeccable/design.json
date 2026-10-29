@@ -54,14 +54,14 @@
       { "name": "focus-outset", "value": "outline: 2px solid var(--sand); outline-offset: 2px", "purpose": "Header account trigger and skip link." }
     ],
     "motion": [
-      { "name": "ease-lagoon", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Rail width and grid column changes, 200ms; instant under prefers-reduced-motion." },
+      { "name": "ease-design", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Rail width and grid column changes, 200ms; instant under prefers-reduced-motion." },
       { "name": "rail-hover-open-delay", "value": "150ms", "purpose": "Pointer rest before the hover-mode rail widens." },
       { "name": "rail-hover-close-delay", "value": "200ms", "purpose": "Grace after pointer leave before it narrows; re-entry cancels." },
       { "name": "tooltip-delay", "value": "300ms", "purpose": "Collapsed-rail label tooltips." }
     ],
     "breakpoints": [],
     "gridResize": "Grip: 5px strip straddling a header's right edge, sand on hover and while dragging. Click widens 16px, Shift+click narrows 16px, double-click resets; Alt+Left/Right on a focused header steps 16px. Widths clamp to 64-960px. The grip is a separator named \"Resize <column>\", apart from the header's name.",
-    "apiReference": "Scalar is themed onto the lagoon by @chelabase/design/scalar.css, scoped to .lagoon-scalar. Surfaces ink/deep/channel, text chalk/chalk-dim, accent and button sand (ink text), borders --input (3:1), shadows replaced by a hairline. Method colours are their own small set, the one carve-out from One Meaning: each method has its own hue. POST and 2xx are seafoam (yes); DELETE, errors and alerts are coral (hazard). GET #9cc8ea, PUT #c4b6ec and PATCH #e3d58c are method-only tones (--method-get/put/patch, in the package's tokens.css); Scalar also uses PATCH's for 3xx and PUT's for required. OPTIONS, HEAD and TRACE are chalk-dim. Each is at least 5.4:1 on ink, deep and channel and on its 10% badge tint. Sand never marks a method or status; palm stays reserved. Code samples default to JavaScript / Axios.",
+    "apiReference": "Scalar is themed onto the lagoon by @chelabase/design/scalar.css, scoped to .design-scalar. Surfaces ink/deep/channel, text chalk/chalk-dim, accent and button sand (ink text), borders --input (3:1), shadows replaced by a hairline. Method colours are their own small set, the one carve-out from One Meaning: each method has its own hue. POST and 2xx are seafoam (yes); DELETE, errors and alerts are coral (hazard). GET #9cc8ea, PUT #c4b6ec and PATCH #e3d58c are method-only tones (--method-get/put/patch, in the package's tokens.css); Scalar also uses PATCH's for 3xx and PUT's for required. OPTIONS, HEAD and TRACE are chalk-dim. Each is at least 5.4:1 on ink, deep and channel and on its 10% badge tint. Sand never marks a method or status; palm stays reserved. Code samples default to JavaScript / Axios.",
     "openGaps": [
       "Phone width is not designed: a later pass gives the rail a drawer and the header its own menu trigger.",
       "Buttons, dialogs and fields keep inherited shapes (8px radius) until the lagoon plates pass.",
@@ -192,7 +192,7 @@
       "**Do** keep popups, menus and tooltips on deep water with a strong hairline.",
       "**Do** set UI in Atkinson Hyperlegible Next at 14px and icons as lucide line icons at 18px, stroke 1.5.",
       "**Do** use a dashed outline only to mean \"not there yet\": not built (a rail placeholder) or not applied (a pending column).",
-      "**Do** make width changes 200ms on `ease-lagoon`, instant under reduced motion.",
+      "**Do** make width changes 200ms on `ease-design`, instant under reduced motion.",
       "**Do** give data grids zebra rows (chalk 4.5%) and a hairline on every column edge and row.",
       "**Do** keep a table's columns in sight as a typed strip over its grid, each chip over its column, with short type names.",
       "**Do** give every drag a click and a keyboard alternative (the resize grip: click, Shift+click, double-click, Alt+arrows).",

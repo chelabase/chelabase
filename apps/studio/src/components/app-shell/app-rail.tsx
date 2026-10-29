@@ -224,7 +224,7 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges, variant 
       <div
         className={cn(
           "flex h-full flex-col overflow-hidden border-r border-line-strong bg-deep text-chalk",
-          "transition-[width] duration-200 ease-lagoon motion-reduce:transition-none",
+          "transition-[width] duration-200 ease-design motion-reduce:transition-none",
           drawer ? "w-full" : expanded ? "w-[232px]" : "w-14",
           hover && "absolute top-0 left-0 z-30",
         )}

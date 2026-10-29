@@ -8,7 +8,7 @@ describe("scalar skin", () => {
     const parts = selectors(css);
     expect(parts.length).toBeGreaterThan(0);
     for (const p of parts) {
-      expect(p.startsWith(".lagoon-scalar") || p === "body > .scalar-app", p).toBe(true);
+      expect(p.startsWith(".design-scalar") || p === "body > .scalar-app", p).toBe(true);
     }
   });
 

@@ -38,7 +38,7 @@ export function AppShell({ profile, onSignOut, badges, children }: AppShellProps
   return (
     <CrumbLabelsProvider>
     <div
-      className="grid min-h-screen bg-background text-foreground transition-[grid-template-columns] duration-200 ease-lagoon motion-reduce:transition-none"
+      className="grid min-h-screen bg-background text-foreground transition-[grid-template-columns] duration-200 ease-design motion-reduce:transition-none"
       style={{ gridTemplateColumns: narrow ? "1fr" : `${railWidth} 1fr` }}
     >
       <a

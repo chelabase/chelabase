@@ -51,11 +51,11 @@ export default function ApiReference() {
   return (
     <>
       <style>{scalarCss}</style>
-      {/* The design palette over Scalar's dark theme, scoped to .lagoon-scalar (@chelabase/design/scalar.css). */}
+      {/* The design palette over Scalar's dark theme, scoped to .design-scalar (@chelabase/design/scalar.css). */}
       <style>{designScalarCss}</style>
       {/* The shell's sticky header is 52px: Scalar's own sticky sidebar sits under it. */}
       <div
-        className="lagoon-scalar"
+        className="design-scalar"
         style={{ "--scalar-custom-header-height": "52px" } as CSSProperties}
       >
         <ApiReferenceReact configuration={configuration} />

@@ -75,7 +75,7 @@ describe("design tokens", () => {
     expect(tw.get("--font-mono")).toBe('"JetBrains Mono Variable", ui-monospace, monospace');
     expect(tw.get("--color-ink")).toBe("var(--ink)");
     expect(tw.get("--color-input")).toBe("var(--input)");
-    expect(tw.get("--ease-lagoon")).toBe("cubic-bezier(0.16, 1, 0.3, 1)");
+    expect(tw.get("--ease-design")).toBe("cubic-bezier(0.16, 1, 0.3, 1)");
   });
 
   // D7: the landing's colours are all design tokens, and the preset maps them to utilities.

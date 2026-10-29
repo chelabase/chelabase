@@ -39,7 +39,7 @@ export const FOCUS = "focus-visible:outline-2 focus-visible:outline-offset-3 foc
 const MODE_TAB = [
   "block -mb-px px-2 pt-2.5 pb-2.75 border border-transparent border-b-line-strong rounded-t-lg",
   "text-center font-serif font-semibold text-[1.05rem] text-chalk-dim",
-  "transition-[color,border-color] duration-160 ease-lagoon",
+  "transition-[color,border-color] duration-160 ease-design",
   "peer-hover:text-chalk",
   "peer-checked:text-chalk peer-checked:border-line-strong peer-checked:border-b-ink",
   "peer-checked:bg-ink peer-checked:bg-[linear-gradient(var(--sand),var(--sand))] peer-checked:bg-top peer-checked:bg-[length:100%_3px] peer-checked:bg-no-repeat",

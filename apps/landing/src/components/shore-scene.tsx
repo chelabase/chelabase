@@ -133,7 +133,7 @@ function buildScene(W: number, H: number) {
   };
 }
 
-const NAME = "font-serif italic text-[17px] transition-opacity ease-lagoon";
+const NAME = "font-serif italic text-[17px] transition-opacity ease-design";
 /** A branch's name, in ink on the sand. */
 const BRANCH_NAME = `${NAME} fill-ink duration-400`;
 /** What just happened to a branch (reset, merged), in the claw's dark shell. */

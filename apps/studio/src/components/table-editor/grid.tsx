@@ -895,7 +895,7 @@ export function Grid(props: GridProps) {
                 selected ? "bg-sand/[0.08]" : zebra && "bg-chalk/[0.045]",
                 open && "bg-channel shadow-[inset_2px_0_0_var(--sand)]",
                 deleted && "text-chalk-dim line-through decoration-coral/70",
-                fading && "opacity-40 transition-opacity duration-700 ease-lagoon motion-reduce:transition-none",
+                fading && "opacity-40 transition-opacity duration-700 ease-design motion-reduce:transition-none",
               )}
               style={{
                 transform: `translateY(${v.start - rowMargin}px)`,

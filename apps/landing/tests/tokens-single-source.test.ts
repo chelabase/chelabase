@@ -41,7 +41,7 @@ describe('one palette source', () => {
   });
 
   it('the_check_catches_a_redeclared_token', () => {
-    expect(redeclared('.lagoon { --ink: #000; --mine: 1px; }', tokens)).toEqual(['--ink']);
+    expect(redeclared('.landing { --ink: #000; --mine: 1px; }', tokens)).toEqual(['--ink']);
     expect(redeclared('/* --ink: #000; */ .a { --mine: 1px; }', tokens)).toEqual([]);
     expect(redeclared('.band--ink :focus-visible { color: red; }', tokens)).toEqual([]);
   });

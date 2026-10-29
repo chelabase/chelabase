@@ -310,7 +310,7 @@ The signed-in frame is a two-column grid: the rail column on the left, and on th
 - **Page body:** pages own their composition. Dashboard and project pages use a centred `page-column` (56rem) with `page-gutter` padding; the API reference runs full width.
 - **Data surfaces (the table editor):** a `table-list` (248px) deep-water list on the left behind a hairline; the work area (table bar, then the column strip and the grid filling the rest); and at most one right panel. The grid's gutter is `grid-gutter` (88px: checkbox, row number, open-row button); rows and the header row are `row` (36px); a pending column's track is `pending-column` (160px).
 - **The right panel:** one panel at a time (pending changes, a column form or a row), `panel` wide (360px; the row panel `panel-wide`, 26rem, at most 45vw), deep water behind a strong hairline. It collapses to a `panel-collapsed` (48px) strip that keeps the view mounted, so a form keeps its draft.
-- **Motion:** width changes take 200ms on `ease-lagoon` (`cubic-bezier(0.16, 1, 0.3, 1)`), the rail's width and the grid column alike. Under `prefers-reduced-motion` they are instant.
+- **Motion:** width changes take 200ms on `ease-design` (`cubic-bezier(0.16, 1, 0.3, 1)`), the rail's width and the grid column alike. Under `prefers-reduced-motion` they are instant.
 - **Open gap: phone width.** Mobile is not designed. A later pass gives the rail a drawer and the header its own menu trigger. Until then, nothing here prescribes narrow-screen behaviour.
 
 ### Named Rules
@@ -411,7 +411,7 @@ Ink ground, chalk text, 13px JetBrains Mono, a hairline frame, a deep-water gutt
 The first focusable element: "Skip to content", revealed on focus top-left on deep water with a sand outline; it targets `#content`.
 
 ### API reference (Scalar)
-Scalar is forced into dark mode with its toggle hidden, sits under the 52px header, and is themed onto the lagoon tokens by `@chelabase/design/scalar.css`, scoped to the `.lagoon-scalar` wrapper (nothing global). Backgrounds 1/2/3 are ink/deep/channel, text chalk/chalk-dim, accent and primary button sand (ink text), borders `--input` (3:1), shadows replaced by a hairline, fonts the Studio sans and mono. Method colours are a small set of their own, the one carve-out from One Meaning: each HTTP method gets its own hue, as API docs conventionally do. POST and 2xx seafoam (yes) and DELETE, errors and alerts coral (hazard) keep their lagoon meanings. GET `#9cc8ea` (lagoon blue), PUT `#c4b6ec` (lilac) and PATCH `#e3d58c` (straw) are method-only tones (`--method-get/put/patch`, in the package's `tokens.css`) that mean nothing else in Studio. Scalar also paints 3xx with the PATCH tone and "required" with the PUT tone. OPTIONS, HEAD and TRACE are chalk-dim. All of them reach at least 5.4:1 on ink, deep and channel and on their 10% badge tint. Sand never marks a method or status, and palm stays reserved. Code samples default to JavaScript / Axios.
+Scalar is forced into dark mode with its toggle hidden, sits under the 52px header, and is themed onto the lagoon tokens by `@chelabase/design/scalar.css`, scoped to the `.design-scalar` wrapper (nothing global). Backgrounds 1/2/3 are ink/deep/channel, text chalk/chalk-dim, accent and primary button sand (ink text), borders `--input` (3:1), shadows replaced by a hairline, fonts the Studio sans and mono. Method colours are a small set of their own, the one carve-out from One Meaning: each HTTP method gets its own hue, as API docs conventionally do. POST and 2xx seafoam (yes) and DELETE, errors and alerts coral (hazard) keep their lagoon meanings. GET `#9cc8ea` (lagoon blue), PUT `#c4b6ec` (lilac) and PATCH `#e3d58c` (straw) are method-only tones (`--method-get/put/patch`, in the package's `tokens.css`) that mean nothing else in Studio. Scalar also paints 3xx with the PATCH tone and "required" with the PUT tone. OPTIONS, HEAD and TRACE are chalk-dim. All of them reach at least 5.4:1 on ink, deep and channel and on their 10% badge tint. Sand never marks a method or status, and palm stays reserved. Code samples default to JavaScript / Axios.
 
 ## Do's and Don'ts
 
@@ -422,7 +422,7 @@ Scalar is forced into dark mode with its toggle hidden, sits under the 52px head
 - **Do** keep popups, menus and tooltips on deep water with a strong hairline.
 - **Do** set UI in Atkinson Hyperlegible Next at 14px and icons as lucide line icons at 18px, stroke 1.5.
 - **Do** use a dashed outline only to mean "not there yet": not built (a rail placeholder) or not applied (a pending column).
-- **Do** make width changes 200ms on `ease-lagoon`, instant under reduced motion.
+- **Do** make width changes 200ms on `ease-design`, instant under reduced motion.
 - **Do** give data grids zebra rows (chalk 4.5%) and a hairline on every column edge and row.
 - **Do** keep a table's columns in sight as a typed strip over its grid, each chip over its column, with short type names.
 - **Do** give every drag a click and a keyboard alternative (the resize grip: click, Shift+click, double-click, Alt+arrows).

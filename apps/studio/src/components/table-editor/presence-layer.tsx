@@ -96,7 +96,7 @@ export function PresenceLayer({ members, selfSub, rowKeys, geometry, selfCell }:
   });
   const move = reduced
     ? undefined
-    : "top 120ms var(--ease-lagoon), left 120ms var(--ease-lagoon), width 120ms var(--ease-lagoon), height 120ms var(--ease-lagoon)";
+    : "top 120ms var(--ease-design), left 120ms var(--ease-design), width 120ms var(--ease-design), height 120ms var(--ease-design)";
 
   // Whether the viewer's own outline is on a cell: the grid's active cell when given, else the viewer's presence entry.
   const viewerOn = (row: Key, column: string) =>
