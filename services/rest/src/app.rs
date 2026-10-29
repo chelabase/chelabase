@@ -373,9 +373,11 @@ fn types_options_with(
             ("all_databases", _) => &mut all,
             ("role", Some(role)) => role,
             _ => {
-                return Err(ApiError::invalid_query(
-                    "the types route takes `format`, `database` and `all_databases` only",
-                ));
+                return Err(ApiError::invalid_query(if role.is_some() {
+                    "the types route takes `role`, `format`, `database` and `all_databases` only"
+                } else {
+                    "the types route takes `format`, `database` and `all_databases` only"
+                }));
             }
         };
         if slot.replace(value).is_some() {
