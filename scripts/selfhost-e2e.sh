@@ -482,11 +482,12 @@ ca_file="$(jq -r .ca_file "$tmp/connection.json")"
 [[ "$http_url" == "https://$pg_host:$PROXY_HTTP_PORT/sql" ]] || die "unexpected http_url '$http_url'"
 [[ "$ca_file" == proxy-ca.crt ]] || die "ca_file is '$ca_file' (wanted proxy-ca.crt, the docs' file name)"
 # The CA as the install docs fetch it (the project flag added), then psql on the host itself:
-# <ep>.localtest.me resolves to loopback, where the proxy is published; verify-full checks the
-# certificate against the CA and the host name.
+# The proxy is published on 127.0.0.1 only, so the connection pins that address (hostaddr) while
+# verify-full still checks the certificate against the CA and the host name <ep>.localtest.me, which
+# may resolve to ::1 first.
 compose "$PROJECT" cp proxy:/tls/ca.crt "$tmp/$ca_file" >/dev/null 2>"$tmp/cp.err" || die "docker compose cp of the CA: $(cat "$tmp/cp.err")"
 openssl x509 -in "$tmp/$ca_file" -noout -subject | grep -q 'Chelabase local CA' || die "the fetched CA is not the install's"
-psql_host() { PGCONNECT_TIMEOUT=10 psql "$pg_uri&sslrootcert=$tmp/$ca_file" -v ON_ERROR_STOP=1 -qtAX "$@"; }
+psql_host() { PGCONNECT_TIMEOUT=10 psql "$pg_uri&sslrootcert=$tmp/$ca_file&hostaddr=127.0.0.1" -v ON_ERROR_STOP=1 -qtAX "$@"; }
 deadline=$((SECONDS + 120))
 one=""
 while ((SECONDS < deadline)); do
@@ -498,7 +499,7 @@ done
 pg_user="$(jq -r .user "$tmp/connection.json")"
 pg_pass="$(jq -r .password "$tmp/connection.json")"
 pg_name="$(jq -r .database "$tmp/connection.json")"
-out="$(curl -sS --max-time 30 --cacert "$tmp/$ca_file" -w '\n%{http_code}' -X POST "$http_url" \
+out="$(curl -sS --max-time 30 --resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1" --cacert "$tmp/$ca_file" -w '\n%{http_code}' -X POST "$http_url" \
   -H "Neon-Connection-String: postgresql://$pg_user:$pg_pass@$pg_host/$pg_name" -H 'content-type: application/json' \
   -d '{"query":"select v from e2e","params":[]}')" || die "SQL over HTTP: no answer at $http_url"
 [[ "${out##*$'\n'}" == 200 ]] && jq -e '.rows[0].v == 42' <<<"${out%$'\n'*}" >/dev/null ||
