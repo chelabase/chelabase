@@ -899,7 +899,7 @@ export function Grid(props: GridProps) {
           className="grid h-9 border-b border-line-strong bg-channel text-xs text-chalk-dim"
           style={{ gridTemplateColumns: template }}
         >
-          <div role="columnheader" {...cellProps({ row: -1, col: 0 })} className={cn(cellBase, "sticky left-0 z-10 justify-center bg-channel px-0")}>
+          <div role="columnheader" {...cellProps({ row: -1, col: 0 })} className={cn(cellBase, "sticky left-0 z-10 bg-channel")}>
             {selectable && (
               <Checkbox
                 ref={pageBox}

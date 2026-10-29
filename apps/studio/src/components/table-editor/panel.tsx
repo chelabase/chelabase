@@ -86,7 +86,7 @@ export function EditorPanel({ target, access, object, params, navigate, structur
   if (panel.kind === "column") {
     const title = panel.column === null ? "New column" : `Edit column ${panel.column}`;
     return (
-      <PanelFrame key={`column:${target.key}:${panel.column ?? ""}`} label={title} heading={title} strip={{ text: `${title} · draft, not added yet`, icon: Columns3, badge: "dot" }}>
+      <PanelFrame key={`column:${target.key}:${panel.column ?? ""}`} label={title} heading={title} strip={{ text: `${title} · draft, not added yet`, icon: Columns3 }}>
         <ColumnFormPanel target={target} column={panel.column} reason={structureReason} totalBytes={totalBytes} />
       </PanelFrame>
     );

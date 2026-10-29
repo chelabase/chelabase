@@ -102,11 +102,12 @@ export function useColumnHeaders(target: TableTarget, chips: ColumnChips | undef
       content: (
         <span className="flex min-w-0 flex-col justify-center gap-0.5 font-mono text-[11px] leading-tight">
           <span className={cn("truncate text-chalk", isDropped && "text-chalk-dim line-through decoration-coral")}>{c.name}</span>
+          {/* In a narrow column the notes give way before the type does. */}
           <span className="flex min-w-0 text-chalk-dim">
-            <span title={c.data_type} className="truncate">
+            <span title={c.data_type} className="max-w-full shrink-0 truncate">
               {shortType(c.data_type)}
             </span>
-            {notes.length > 0 && <span className="shrink-0 whitespace-pre">{` · ${notes.join(" · ")}`}</span>}
+            {notes.length > 0 && <span className="min-w-0 truncate whitespace-pre">{` · ${notes.join(" · ")}`}</span>}
             {c.mark === "added" && <b className="ml-1 shrink-0 font-sans font-semibold text-sand">new</b>}
           </span>
         </span>
