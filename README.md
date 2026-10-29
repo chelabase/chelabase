@@ -58,12 +58,15 @@ The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the r
 1. In Studio, create a project (**New project**), then a database in it. It shows as provisioning, then as ready.
 2. Create a table, in the SQL editor or the table editor.
 3. In the database's Data API view, copy the public key (role `anon`, safe in a browser) or create a secret key (server only; it is shown once).
-4. Generate the types and query the database from your app with `@chelabase/client`:
+4. Get the generated types, `db.ts`: in the same Data API view, choose **Download types**. Or fetch them with a secret key, from any build step:
 
    ```bash
-   export CHELABASE_DATA_KEY=chk_sec_…   # a secret key: type generation refuses a public one
-   cargo run -p chelabase -- gen types --url http://api.chelabase.localhost:8000 --out db.ts
+   export CHELABASE_DATA_KEY=chk_sec_…   # a secret key: the types route refuses a public one
+   curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+     http://api.chelabase.localhost:8000/data/v1/types -o db.ts
    ```
+
+5. Query the database from your app with `@chelabase/client`. In a browser, use the public key and the `types` from `db.ts`:
 
    ```ts
    import { createClient } from "@chelabase/client";
@@ -74,7 +77,19 @@ The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the r
    const rows = await db.from("orders").select("id", "total").where({ status: "paid" }).limit(10);
    ```
 
-The client is not on npm yet: it is a workspace package in this repository (`packages/client`, added as `"@chelabase/client": "workspace:*"`), and `chelabase gen types` is this repository's CLI, so both need a checkout, and type generation needs the Rust toolchain. Without generated types, `createClient({ url, key })` works untyped. See the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [Generated types](apps/docs/content/docs/using/client/types.mdx) and the [data API](apps/docs/content/docs/using/data-api/index.mdx).
+   On a server, keep the secret key there and fetch the runtime types when the server starts, so value decoding follows the live schema without a rebuild:
+
+   ```ts
+   import { createClient, fetchTypes } from "@chelabase/client";
+   import type { Database } from "./db";
+
+   const url = process.env.CHELABASE_URL!;
+   const key = process.env.CHELABASE_DATA_KEY!; // chk_sec_…
+
+   const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key }) });
+   ```
+
+The client is not on npm yet: it is a workspace package in this repository (`packages/client`, added as `"@chelabase/client": "workspace:*"`). Getting the types needs only Studio or `curl`. Without them, `createClient({ url, key })` works untyped. See the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [Generated types](apps/docs/content/docs/using/client/types.mdx) and the [data API](apps/docs/content/docs/using/data-api/index.mdx).
 
 For migrations, ORMs and admin tools, connect to Postgres directly with the credentials in the database's **Connection details** in Studio; the [Install](apps/docs/content/docs/self-hosting/install.mdx) page says how connections reach the instance from the host. The [Quickstart](apps/docs/content/docs/using/quickstart.mdx) walks through all of it.
 

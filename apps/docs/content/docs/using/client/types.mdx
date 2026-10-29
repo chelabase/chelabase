@@ -1,9 +1,15 @@
 ---
 title: Generated types
-description: Fetch Database and types over HTTP (or write them with chelabase gen types), fetch the runtime types at startup, and use other databases of a branch.
+description: Download db.ts from Studio or fetch it over HTTP, fetch the runtime types at startup, and use other databases of a branch.
 ---
 
 The data API serves a branch's generated types: a typed `Database` type and a `types` constant, for the schema a secret data key reaches. Pass both to `createClient`: `createClient<Database>({ url, key, types })`. Without them (`createClient({ url, key })`), the client accepts any table, column and function, and types values as `unknown`.
+
+## Download db.ts from Studio
+
+On a database's **Data API** view, choose **Download types** to save `db.ts` for the selected branch. Pick the role (a new secret key's default, `authenticated`, unless your keys use another) and, when the branch serves several databases, the database or **All databases**. The file is what a secret key of that role gets from `GET /data/v1/types` below, byte for byte.
+
+You can download types when you may create a secret key for that role: Developer or above on the project, with the role among the ones you may use (an Admin may use any). Behind the button is the Management API's `GET /v1/databases/{id}/branches/{branch_id}/data-api/types`, which takes `role` and the options below.
 
 ## Fetch db.ts over HTTP
 
@@ -55,9 +61,9 @@ const db = createClient<Database>({ url, key: secretKey, types: await fetchTypes
 
 The two halves do different jobs. **Compile-time** checking (table, column and argument names, row shapes) comes only from the `Database` type in the fetched `db.ts`, so that file must be in the build: fetch it again and rebuild when the schema changes. **Runtime** decoding needs only the `types` map, which can be fetched live.
 
-## The CLI
+## The CLI (contributors)
 
-Contributors with a checkout can write the same file with the CLI:
+Contributors with a checkout of this repository can write the same file with its CLI:
 
 ```bash
 export CHELABASE_DATA_KEY=chk_sec_…

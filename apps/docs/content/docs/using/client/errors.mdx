@@ -34,7 +34,7 @@ A non-2xx answer without the data API's error body (a proxy's error page) gets i
 | 504 | `timeout` |
 | anything else | `internal` |
 
-Its message holds the status and the first 200 characters of the body. A 2xx answer that isn't JSON is a `DataApiError` with `code: "internal"`. Network failures are rethrown unchanged.
+Its message holds the status and the first 200 characters of the body. A 2xx answer that isn't JSON is a `DataApiError` with `code: "internal"`. The client never follows a redirect (every request is sent with `redirect: "manual"`): a 3xx answer is a `DataApiError` with `code: "internal"` (in a browser, with `status` 0). Network failures are rethrown unchanged.
 
 ## UnsafeIntegerError
 

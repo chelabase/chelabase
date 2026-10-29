@@ -29,7 +29,7 @@ Chelabase's designs are its own. It never mirrors Supabase (PostgREST URL gramma
 - Modes: `self-hosted` (the default, and what the Docker Compose install runs; email verification off, a shared workspace, and the first account to sign up with the one-time setup code claims the instance as its admin) and `platform` (the hosted cloud, not built yet; behaviour decided separately, e.g. verification required, no account-existence leaks).
 - Studio screens: sign-in/register/verify/password reset (Zitadel OIDC + PKCE), the projects dashboard, project view with databases, the branch tree, login roles, the Tables console (grid, filters, row editor), the SQL editor (run as owner or a chosen role, cancel, server-side guard, saved queries, history), Data API panels (keys, per-database access, RLS warning), Users (app users and sessions), settings, and the API reference.
 - Transitional resources (creating, deleting) poll every 2s until settled.
-- All traffic goes through the gateway on :8000. Studio runs on :3000 in dev (`just studio`).
+- All traffic goes through the gateway on :8000. In development Studio runs in the workbench stack, behind its gateway (`just workbench up`).
 
 ## Capabilities and Constraints
 

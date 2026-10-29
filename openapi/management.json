@@ -1826,7 +1826,7 @@
             }
           },
           "409": {
-            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `data_api_disabled`: the Postgres database isn't served by the data API; `conflict`: the schema can't be typed (a schema the role reaches has a dot in its name)",
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `data_api_disabled`: the Postgres database isn't served by the data API; `conflict`: the schema can't be typed (a schema the role reaches has a dot in its name, or with `all_databases` another database is named `main`, the key main always takes)",
             "content": {
               "application/json": {
                 "schema": {

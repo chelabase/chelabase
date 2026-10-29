@@ -45,11 +45,12 @@ On the database, open **Data API**, then under **Secret keys** choose **Create k
 
 `@chelabase/client` is the typed client for the data API. It is a workspace package in the repository (`packages/client`), not yet on npm: add it to a workspace app as `"@chelabase/client": "workspace:*"`.
 
-Generate the types of the branch's schema, with the secret key in the environment (never on the command line):
+Get the generated types of the branch's schema, `db.ts`: on the **Data API** view, choose **Download types** (keep the role `authenticated`, the key's). Or fetch the same file with the secret key, from a terminal or any build step:
 
 ```bash
 export CHELABASE_DATA_KEY=chk_sec_…
-cargo run -p chelabase -- gen types --url http://api.chelabase.localhost:8000 --out db.ts
+curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+  http://api.chelabase.localhost:8000/data/v1/types -o db.ts
 ```
 
 Then write and read rows:
@@ -66,6 +67,18 @@ const db = createClient<Database>({
 
 await db.from("todos").insert([{ title: "Try Chelabase" }]).returning("id");
 const open = await db.from("todos").select("id", "title").where({ done: false });
+```
+
+A server can instead fetch the runtime types when it starts, so its value decoding follows the live schema without a rebuild (the `Database` type still comes from `db.ts`):
+
+```ts
+import { createClient, fetchTypes } from "@chelabase/client";
+import type { Database } from "./db";
+
+const url = "http://api.chelabase.localhost:8000";
+const key = process.env.CHELABASE_DATA_KEY!;
+
+const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key }) });
 ```
 
 A secret key stays on a server; in a browser use the public key, with row-level security on the tables it reaches. The [TypeScript client](/docs/using/client) covers filters, writes, functions, batches and [generated types](/docs/using/client/types); the [data API](/docs/using/data-api) is the HTTP endpoint underneath, for any other language:
