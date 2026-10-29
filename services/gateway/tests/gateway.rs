@@ -4,7 +4,7 @@
 //! binary on a pre-picked free port and kills it on drop.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use axum::extract::Request;
 use axum::{Json, Router};

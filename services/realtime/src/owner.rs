@@ -149,7 +149,7 @@ pub fn parse_convert(
 /// The orchestrator's `/internal/realtime/visible`.
 #[derive(Clone)]
 pub struct OwnerClient {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     url: String,
     bearer: String,
     timeout: Duration,

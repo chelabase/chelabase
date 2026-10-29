@@ -209,7 +209,7 @@ pub const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Clone)]
 pub struct JwtVerifier {
     config: ZitadelAuthConfig,
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     cache: Arc<RwLock<Option<JwksCache>>>,
     cache_ttl: Duration,
 }

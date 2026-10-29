@@ -2,7 +2,7 @@
 //! errors and the body cap. The connection source is a fake; nothing here reaches Postgres.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

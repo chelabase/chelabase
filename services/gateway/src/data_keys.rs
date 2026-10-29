@@ -50,7 +50,7 @@ pub enum KeyError {
 }
 
 pub struct DataKeyResolver {
-    client: reqwest::Client,
+    client: chelabase_http::Client,
     base: String,
     bearer: String,
     ttl_cache: Cache<[u8; 32], Option<ResolvedKey>>,

@@ -4,21 +4,24 @@
 # forced Host, and a redirect would take it, or the answer it trusts, to wherever the upstream
 # points. reqwest follows up to 10 redirects by default.
 #
-# The compiler does most of this: clients start from `chelabase_http::client_builder()`
-# (redirect(Policy::none())), and the workspace clippy.toml disallows every other reqwest
+# The compiler does most of this: every client is a `chelabase_http::Client`, which only
+# `chelabase_http::client_builder()` (redirect(Policy::none())) can make and which has no
+# `Default`, `Deref` or conversion to a `reqwest::Client`. The workspace clippy.toml disallows
+# the `reqwest::Client`/`ClientBuilder` types themselves (#32: an inferred `Default::default()`
+# of a client field names the type in its struct, so it fails too), every other reqwest
 # constructor, `reqwest::get` and `ClientBuilder::redirect`; `just check` runs clippy with
 # `-D warnings` on every target. This script covers what clippy can't see. In every Rust file
 # under crates/*/src, services/*/src and tools/*/src (inline test modules and test-named files
 # included: they use the helper too):
-#   - no `allow`/`expect` of clippy::disallowed_methods (or the `style`/`all` groups that hold
-#     it) outside crates/chelabase-http, so production code can't opt out of the clippy rule;
-#   - no `Default` client: clippy's disallowed-methods can't name a trait impl, so
-#     `Client::default()`, `ClientBuilder::default()`, a `Default::default()` on a line that names
-#     a client type, a `#[derive(Default)]` struct holding a reqwest client, and an
-#     `unwrap_or_default()`/`unwrap_or_else(` fallback on a client build are matched here. A
-#     `Default::default()` whose client type is only inferred (a struct-literal field) is not:
-#     review catches that one.
-# Integration-test crates (`*/tests/`) are not production code and may allow the lint.
+#   - no `allow`/`expect` of clippy::disallowed_methods or clippy::disallowed_types (or the
+#     `style`/`all` groups that hold them) outside crates/chelabase-http, so production code
+#     can't opt out of the clippy rules;
+#   - no `Default` client, a second line behind the type ban: `Client::default()`,
+#     `ClientBuilder::default()`, a `Default::default()` on a line that names a client type, a
+#     `#[derive(Default)]` struct holding a reqwest client, and an
+#     `unwrap_or_default()`/`unwrap_or_else(` fallback on a client build are matched here.
+# Integration-test crates (`*/tests/`) are not production code and may allow both lints; their
+# files are not in the list below.
 #
 #   scripts/tests/http-no-redirects.sh
 set -euo pipefail

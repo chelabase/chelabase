@@ -2,7 +2,7 @@
 //! cap on bodies that aren't text or are empty, and verifier spellings we refuse.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::net::SocketAddr;
 
@@ -31,7 +31,7 @@ async fn status_error(addr: SocketAddr) -> String {
     let signer = ComputeSigner::new(&pem, &x).unwrap();
     format!(
         "{:#}",
-        status_report(&reqwest::Client::new(), addr, &signer, "ep-a")
+        status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a")
             .await
             .unwrap_err()
     )

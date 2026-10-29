@@ -3,7 +3,7 @@
 //! instances (P16) and shutdown (1012). In-process realtime with fakes (`common`).
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod common;
 

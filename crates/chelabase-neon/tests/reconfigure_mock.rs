@@ -1,7 +1,7 @@
 //! `reconfigure::push` against an in-process compute_ctl stand-in.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -67,7 +67,7 @@ async fn pushes_the_spec_with_a_token_only_that_compute_accepts() {
     let (pem, x) = generate_keypair();
     let signer = ComputeSigner::new(&pem, &x).unwrap();
     let (addr, seen) = compute(200).await;
-    push(&reqwest::Client::new(), addr, &signer, "ep-a", &config())
+    push(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a", &config())
         .await
         .unwrap();
 
@@ -89,7 +89,7 @@ async fn a_compute_that_refuses_is_an_error() {
     let (pem, x) = generate_keypair();
     let signer = ComputeSigner::new(&pem, &x).unwrap();
     let (addr, _) = compute(412).await;
-    let err = push(&reqwest::Client::new(), addr, &signer, "ep-a", &config())
+    let err = push(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a", &config())
         .await
         .unwrap_err()
         .to_string();
@@ -137,7 +137,7 @@ async fn status_reads_compute_ctl_with_its_token() {
         (with("configuration_pending", None), ComputeCtlStatus::Other("configuration_pending".into())),
     ] {
         let (addr, seen) = status_compute(body).await;
-        let got = status(&reqwest::Client::new(), addr, &signer, "ep-a").await.unwrap();
+        let got = status(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a").await.unwrap();
         assert_eq!(got, want);
         assert!(seen.auth.lock().unwrap().clone().unwrap().starts_with("Bearer "));
     }
@@ -197,7 +197,7 @@ async fn status_report_reads_the_status_and_the_refresh_capability() {
         (Some(json!([" storage_token_refresh"])), false),
     ] {
         let (addr, seen) = status_compute(status_body("running", capabilities.clone())).await;
-        let report = status_report(&reqwest::Client::new(), addr, &signer, "ep-a")
+        let report = status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a")
             .await
             .unwrap();
         assert_eq!(
@@ -228,7 +228,7 @@ async fn status_report_keeps_every_status_mapping() {
         ),
     ] {
         let (addr, _) = status_compute(body).await;
-        let report = status_report(&reqwest::Client::new(), addr, &signer, "ep-a").await.unwrap();
+        let report = status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a").await.unwrap();
         assert_eq!(report.status, want);
     }
 }
@@ -237,7 +237,7 @@ async fn status_report_keeps_every_status_mapping() {
 async fn status_still_works_on_a_body_with_capabilities() {
     // The old `status()` keeps its callers (P11): it ignores the new field.
     let (addr, _) = status_compute(status_body("running", Some(json!(["storage_token_refresh"])))).await;
-    let got = chelabase_neon::reconfigure::status(&reqwest::Client::new(), addr, &signer(), "ep-a")
+    let got = chelabase_neon::reconfigure::status(&chelabase_http::client_builder().build().unwrap(), addr, &signer(), "ep-a")
         .await
         .unwrap();
     assert_eq!(got, ComputeCtlStatus::Running);
@@ -253,7 +253,7 @@ async fn status_report_errors_carry_the_status_and_compute_ctls_body() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let err = status_report(&reqwest::Client::new(), addr, &signer, "ep-a")
+    let err = status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a")
         .await
         .unwrap_err();
     let text = format!("{err:#}");
@@ -265,9 +265,9 @@ async fn status_report_errors_carry_the_status_and_compute_ctls_body() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
     };
-    assert!(status_report(&reqwest::Client::new(), dead, &signer, "ep-a").await.is_err());
+    assert!(status_report(&chelabase_http::client_builder().build().unwrap(), dead, &signer, "ep-a").await.is_err());
     let (addr, _) = status_compute(json!({"nonsense": true})).await;
-    assert!(status_report(&reqwest::Client::new(), addr, &signer, "ep-a").await.is_err());
+    assert!(status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a").await.is_err());
 }
 
 struct Refresh {
@@ -305,7 +305,7 @@ async fn storage_token_compute(status: u16, answer: &'static str) -> (SocketAddr
 async fn push_storage_token_posts_the_token_with_the_computes_own_bearer() {
     let signer = signer();
     let (addr, seen) = storage_token_compute(204, "").await;
-    push_storage_token(&reqwest::Client::new(), addr, &signer, "ep-a", "the.new.jwt")
+    push_storage_token(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a", "the.new.jwt")
         .await
         .unwrap();
     let seen = seen.lock().unwrap();
@@ -318,7 +318,7 @@ async fn push_storage_token_posts_the_token_with_the_computes_own_bearer() {
 async fn push_storage_token_accepts_any_2xx() {
     for code in [200, 204] {
         let (addr, _) = storage_token_compute(code, "").await;
-        push_storage_token(&reqwest::Client::new(), addr, &signer(), "ep-a", "t")
+        push_storage_token(&chelabase_http::client_builder().build().unwrap(), addr, &signer(), "ep-a", "t")
             .await
             .unwrap();
     }
@@ -333,7 +333,7 @@ async fn push_storage_token_non_2xx_is_an_error_with_status_and_body_but_never_t
         (500, "disk full"),
     ] {
         let (addr, _) = storage_token_compute(code, answer).await;
-        let err = push_storage_token(&reqwest::Client::new(), addr, &signer(), "ep-a", "SECRET.JWT.VALUE")
+        let err = push_storage_token(&chelabase_http::client_builder().build().unwrap(), addr, &signer(), "ep-a", "SECRET.JWT.VALUE")
             .await
             .unwrap_err();
         let text = format!("{err:#}");
@@ -350,7 +350,7 @@ async fn push_storage_token_to_nobody_is_an_error() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap()
     };
-    let err = push_storage_token(&reqwest::Client::new(), dead, &signer(), "ep-a", "SECRET.JWT.VALUE")
+    let err = push_storage_token(&chelabase_http::client_builder().build().unwrap(), dead, &signer(), "ep-a", "SECRET.JWT.VALUE")
         .await
         .unwrap_err();
     assert!(!format!("{err:#}").contains("SECRET.JWT.VALUE"));
