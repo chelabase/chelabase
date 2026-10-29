@@ -718,6 +718,7 @@ dependencies = [
  "chelabase-init",
  "chelabase-neon",
  "chelabase-secrets",
+ "chelabase-typegen",
  "chelabase-types",
  "chelabase-zitadel",
  "chrono",
@@ -935,6 +936,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "chelabase-typegen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
