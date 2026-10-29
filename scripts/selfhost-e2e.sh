@@ -5,12 +5,18 @@
 # `just selfhost-e2e`.
 #
 #   1. render + up      a fresh `docker compose up --wait` from infra/compose
-#   2. healthy          every service is healthy or a one-shot that exited 0
+#   2. healthy          every service is healthy or a one-shot that exited 0; with SMTP set (a
+#                      throwaway Mailpit, the password file at the documented owner and mode) the
+#                      bootstrap succeeded and Zitadel's SMTP configuration is active
 #   3. setup code       the code is in `logs init-secrets` and the documented command prints it
 #   4. code required    sign-up without the code, and with a wrong one, is 403 setup_code_invalid
 #   5. claim            sign-up with the code, sign-in, GET /v1/me: tenant admin and instance admin
-#   6. claimed          the code no longer opens the instance
-#   7. data             create a project and a database through the API, connect through the proxy
+#   6. claimed          the code no longer opens the instance, and sign-up is closed (403
+#                      sign_up_closed: open sign-up is off by default)
+#   7. data             create a project and a database through the API; the connection details
+#                      name the published proxy (<ep>.localtest.me, CHELABASE_PROXY_PORT); with the
+#                      CA fetched as the docs say, psql on the host (verify-full) creates and reads
+#                      a row, and SQL over HTTP on the host answers
 #   8. webhook          a signed Zitadel user.deactivated event is answered 200 (a bad signature 401)
 #   9. no secret leaks  no secret file value appears in any container's `docker inspect`
 #  10. secret reads     every running service reads its mounted secrets as its own uid and groups
@@ -128,7 +134,7 @@ trap cleanup EXIT
 
 # ---- helpers -------------------------------------------------------------------------------------
 
-for tool in docker jq curl openssl ss; do
+for tool in docker jq curl openssl ss psql; do
   command -v "$tool" >/dev/null || die "$tool is missing"
 done
 
@@ -161,11 +167,14 @@ free_octet() {
 }
 
 # write_env <project> <port> [extra lines…]: the install's .env: .env.example with the hosts moved
-# to the port, the settings Compose can't derive, and a private control subnet.
+# to the port, the settings Compose can't derive, a private control subnet and free proxy ports.
 write_env() {
-  local p="$1" port="$2" n
+  local p="$1" port="$2" n pg_port http_port
   shift 2
   n="$(free_octet)"
+  pg_port="$(free_port)"
+  http_port="$(free_port)"
+  while [[ "$http_port" == "$pg_port" || "$http_port" == "$port" ]]; do http_port="$(free_port)"; done
   {
     sed -E "s/^(CHELABASE_[A-Z]+_HOST=.*):8000\$/\1:$port/" "$dir/.env.example"
     echo "CHELABASE_STUDIO_HOST_NAME=studio.chelabase.localhost"
@@ -178,6 +187,8 @@ write_env() {
     echo "CHELABASE_CONTROL_COMPUTE_RANGE=10.$n.2.0/23"
     echo "CHELABASE_ORCHESTRATOR_CONTROL_IP=10.$n.0.10"
     echo "CHELABASE_REALTIME_CONTROL_IP=10.$n.0.12"
+    echo "CHELABASE_PROXY_PORT=$pg_port"
+    echo "CHELABASE_PROXY_HTTP_PORT=$http_port"
     if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]]; then
       echo "CHELABASE_IMAGE_REPO=${CHELABASE_IMAGE_REPO:-chelabase}"
       echo "CHELABASE_IMAGE_TAG=${CHELABASE_IMAGE_TAG:-latest}"
@@ -192,7 +203,31 @@ services:
     volumes:
       - {type: bind, source: $tmp/$p.env, target: /run/chelabase/seeds.env, read_only: true, bind: {create_host_path: false}}
 EOF
+  if [[ -n "${WITH_MAILPIT:-}" ]]; then
+    # A throwaway SMTP server on the stack's network (it accepts any user and password).
+    cat >>"$tmp/$p.override.yml" <<EOF
+  mailpit:
+    image: $MAILPIT
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+    healthcheck:
+      test: ["CMD", "/mailpit", "readyz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+  init-bootstrap:
+    depends_on:
+      mailpit:
+        condition: service_healthy
+EOF
+  fi
 }
+
+# The base file's pinned Postgres image: a shell to make root-owned test files with.
+FILE_HELPER="$(grep -m1 -oE 'postgres:[^ ]+@sha256:[0-9a-f]{64}' "$dir/docker-compose.yml")"
+# The workbench's Mailpit, pinned.
+MAILPIT="axllent/mailpit:v1.31.3@sha256:ed9b00c609e77e99c79b93f1178255ebc271868920f2c69a8d166bd5634ed10d"
 
 case "${SELFHOST_E2E_IMAGES:-}" in
   local) COMPOSE_FILES=(-f "$dir/docker-compose.yml") ;;
@@ -282,7 +317,17 @@ api() {
 step "render and start a fresh project"
 PROJECT="chelabase-selfhost-e2e-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')"
 PORT="${SELFHOST_E2E_PORT:-$(free_port)}"
-write_env "$PROJECT" "$PORT"
+# SMTP as the install docs say: the password in a host file owned by uid 10001 at mode 0600 (made
+# by a root container, as `sudo chown 10001` would), never in .env.
+SMTP_PASSWORD="smtp-$(openssl rand -hex 12)"
+docker run --rm --network none -v "$tmp:/w" --entrypoint sh "$FILE_HELPER" -c \
+  'umask 077 && printf %s "$1" >/w/smtp.password && chown 10001:10001 /w/smtp.password && chmod 600 /w/smtp.password' sh "$SMTP_PASSWORD" ||
+  die "writing the SMTP password file"
+[[ "$(stat -c %u:%a "$tmp/smtp.password")" == 10001:600 ]] || die "the SMTP password file is $(stat -c %u:%a "$tmp/smtp.password")"
+WITH_MAILPIT=1 write_env "$PROJECT" "$PORT" CHELABASE_SMTP_HOST=mailpit CHELABASE_SMTP_PORT=1025 \
+  CHELABASE_SMTP_FROM=chelabase@example.com CHELABASE_SMTP_USER=chelabase "CHELABASE_SMTP_PASSWORD_PATH=$tmp/smtp.password"
+PROXY_PORT="$(sed -n 's/^CHELABASE_PROXY_PORT=//p' "$tmp/$PROJECT.env")"
+PROXY_HTTP_PORT="$(sed -n 's/^CHELABASE_PROXY_HTTP_PORT=//p' "$tmp/$PROJECT.env")"
 STUDIO="http://studio.chelabase.localhost:$PORT"
 API="http://api.chelabase.localhost:$PORT"
 AUTH="http://auth.chelabase.localhost:$PORT"
@@ -317,6 +362,18 @@ for one_shot in init-secrets init-bootstrap; do
 done
 pass "$n_services containers healthy or done; init-secrets and init-bootstrap exited 0"
 
+step "Zitadel's SMTP configuration is the install's and active"
+# Zitadel's admin API with the bootstrap's PAT, from inside the orchestrator (the PAT goes to
+# curl in its config on stdin, never its command line); Zitadel's instance is the auth host.
+compose "$PROJECT" exec -T orchestrator sh -c '
+  printf "header = \"Authorization: Bearer %s\"\n" "$(cat /run/chelabase/secrets/zitadel-pats/admin.pat)" |
+    curl -sS --max-time 30 -K - -X POST -H "Host: $1" -H "content-type: application/json" -d "{}" \
+      http://zitadel:8080/admin/v1/smtp/_search' sh "auth.chelabase.localhost:$PORT" >"$tmp/smtp.json" 2>&1 ||
+  die "listing Zitadel's SMTP configurations: $(cat "$tmp/smtp.json")"
+jq -e 'any(.result[]?; .host == "mailpit:1025" and .state == "SMTP_CONFIG_ACTIVE" and .senderAddress == "chelabase@example.com")' \
+  "$tmp/smtp.json" >/dev/null || die "no active SMTP configuration for mailpit:1025: $(jq -c '[.result[]? | {host, state}]' "$tmp/smtp.json" 2>&1 || cat "$tmp/smtp.json")"
+pass "SMTP mailpit:1025 is active (the password file was read at 10001:0600)"
+
 # ---- 3. setup code -------------------------------------------------------------------------------
 
 step "the setup code is in the init-secrets logs"
@@ -337,9 +394,9 @@ curl -fsS --max-time 30 "$API/auth/v1/instance" >"$tmp/instance.json" || die "GE
 [[ "$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "$API/_gateway/ready")" == 200 ]] || die "/_gateway/ready is not 200"
 pass "setupRequired is true, Studio answers 200, the gateway is ready"
 
-PROJECT_ID="$(vol_cat bootstrap/project-id | tr -d '\r\n')"
-CLIENT="$(vol_cat bootstrap/studio-client-id | tr -d '\r\n')"
-ORG_ID="$(vol_cat bootstrap/org-id | tr -d '\r\n')"
+PROJECT_ID="$(vol_cat bootstrap/ids/project-id | tr -d '\r\n')"
+CLIENT="$(vol_cat bootstrap/ids/studio-client-id | tr -d '\r\n')"
+ORG_ID="$(vol_cat bootstrap/ids/org-id | tr -d '\r\n')"
 [[ -n "$PROJECT_ID" && -n "$CLIENT" && -n "$ORG_ID" ]] || die "the bootstrap's ids are missing from the secrets volume"
 
 # ---- 4. the code is required ---------------------------------------------------------------------
@@ -373,24 +430,20 @@ jq -e --arg e "$EMAIL" '.member.tenant_admin == true and .instance_admin == true
 TENANT_ID="$(jq -r .tenant_id "$tmp/body")"
 pass "the claimant signed in and is tenant admin (tenant $TENANT_ID)"
 
-step "the claimed instance no longer takes the code"
+step "the claimed instance no longer takes the code, and sign-up is closed"
 [[ "$(curl -fsS --max-time 30 "$API/auth/v1/instance" | jq -r .setupRequired)" == false ]] || die "setupRequired is still true after the claim"
-# Self-hosted sign-up stays open after the claim (as an ordinary account); what matters is that
-# the used code makes nobody else an admin.
-EMAIL2="second-$(openssl rand -hex 3)@example.com"
-out="$(sign_up "$EMAIL2" "$CODE")"
-status="$(cat "$tmp/ui-status")"
-say "second sign-up with the used code: $status $out"
-if [[ "$status" == 200 ]]; then
-  second_token="$(sign_in "$EMAIL2")"
-  status="$(curl -sS --max-time 30 -o "$tmp/body2" -w '%{http_code}' "$API/v1/me" -H "Authorization: Bearer $second_token")"
-  jq -e '(.member.tenant_admin // false) == false and (.instance_admin // false) == false' "$tmp/body2" >/dev/null ||
-    die "a second account became admin with the used code: $(cat "$tmp/body2")"
-fi
+# After the claim, sign-up follows the tenant's open sign-up, off by default (`open_signup
+# DEFAULT false`): an admin invites everyone else. The used code changes nothing.
+for code in "$CODE" ""; do
+  out="$(sign_up "second-$(openssl rand -hex 3)@example.com" "$code")"
+  status="$(cat "$tmp/ui-status")"
+  [[ "$status" == 403 && "$(jq -r '.error.code // empty' <<<"$out")" == sign_up_closed ]] ||
+    die "a second sign-up ${code:+with the used code }after the claim: $status $out (wanted 403 sign_up_closed)"
+done
 status="$(api GET /v1/members)"
 [[ "$status" == 200 ]] || die "GET /v1/members: $status"
 [[ "$(jq '[.[] | select(.tenant_admin == true)] | length' "$tmp/body")" == 1 ]] || die "expected exactly one tenant admin: $(cat "$tmp/body")"
-pass "setupRequired is false and the used code makes nobody else admin"
+pass "setupRequired is false; a second sign-up (with the used code or none) is 403 sign_up_closed"
 
 # ---- 7. a project and a database, through the proxy ----------------------------------------------
 
@@ -415,30 +468,42 @@ done
 [[ "$db_status" == ready ]] || die "database $db_id is still '$db_status' after 240 s"
 pass "project $project_id and database $db_id are ready"
 
-step "connect to the database through the proxy"
+step "connect to the database from the host, as the connection details say"
 [[ "$(api GET "/v1/databases/$db_id/connection")" == 200 ]] || die "GET /connection: $(cat "$tmp/body")"
-pg_host="$(jq -r .host "$tmp/body")"
-pg_pass="$(jq -r .password "$tmp/body")"
-pg_name="$(jq -r .database "$tmp/body")"
-[[ "$pg_host" == ep-*.localtest.me && -n "$pg_pass" ]] || die "unexpected /connection: host '$pg_host'"
-proxy_ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"${PROJECT}_default\").IPAddress}}" "$(compose "$PROJECT" ps -q proxy)")"
-[[ -n "$proxy_ip" ]] || die "no address for the proxy"
-# psql runs in a container on the stack's network (the proxy's Postgres port is not published),
-# trusting the stack's own CA; <ep>.localtest.me is pointed at the proxy.
-psql_proxy() {
-  docker run --rm --network "${PROJECT}_default" --add-host "$pg_host:$proxy_ip" -v "${PROJECT}_neon_proxy_tls:/tls:ro" \
-    -e PGPASSWORD="$pg_pass" -e PGCONNECT_TIMEOUT=10 --entrypoint psql "$HELPER" \
-    "host=$pg_host port=4432 user=postgres dbname=$pg_name sslmode=verify-full sslrootcert=/tls/ca.crt" -v ON_ERROR_STOP=1 -qtA "$@"
-}
+cp "$tmp/body" "$tmp/connection.json"
+pg_host="$(jq -r .host "$tmp/connection.json")"
+pg_port="$(jq -r .port "$tmp/connection.json")"
+pg_uri="$(jq -r .uri "$tmp/connection.json")"
+http_url="$(jq -r .http_url "$tmp/connection.json")"
+ca_file="$(jq -r .ca_file "$tmp/connection.json")"
+[[ "$pg_host" == ep-*.localtest.me && "$pg_port" == "$PROXY_PORT" ]] ||
+  die "the connection details name $pg_host:$pg_port, not <ep>.localtest.me:$PROXY_PORT (the published proxy port)"
+[[ "$pg_uri" == "postgresql://"*"@$pg_host:$PROXY_PORT/"*"?sslmode=verify-full" ]] || die "unexpected uri (host or port): ${pg_uri#*@}"
+[[ "$http_url" == "https://$pg_host:$PROXY_HTTP_PORT/sql" ]] || die "unexpected http_url '$http_url'"
+[[ "$ca_file" == proxy-ca.crt ]] || die "ca_file is '$ca_file' (wanted proxy-ca.crt, the docs' file name)"
+# The CA as the install docs fetch it (the project flag added), then psql on the host itself:
+# <ep>.localtest.me resolves to loopback, where the proxy is published; verify-full checks the
+# certificate against the CA and the host name.
+compose "$PROJECT" cp proxy:/tls/ca.crt "$tmp/$ca_file" >/dev/null 2>"$tmp/cp.err" || die "docker compose cp of the CA: $(cat "$tmp/cp.err")"
+openssl x509 -in "$tmp/$ca_file" -noout -subject | grep -q 'Chelabase local CA' || die "the fetched CA is not the install's"
+psql_host() { PGCONNECT_TIMEOUT=10 psql "$pg_uri&sslrootcert=$tmp/$ca_file" -v ON_ERROR_STOP=1 -qtAX "$@"; }
 deadline=$((SECONDS + 120))
 one=""
 while ((SECONDS < deadline)); do
-  if one="$(psql_proxy -c 'select 1' 2>"$tmp/psql.err")"; then break; fi
+  if one="$(psql_host -c 'select 1' 2>"$tmp/psql.err")"; then break; fi
   sleep 3
 done
-[[ "$one" == 1 ]] || die "the compute never answered through the proxy: $(cat "$tmp/psql.err")"
-[[ "$(psql_proxy -c 'create table e2e(v int); insert into e2e values (42); select v from e2e')" == 42 ]] || die "write and read through the proxy"
-pass "psql through the proxy (verify-full against the stack's CA) created and read a row"
+[[ "$one" == 1 ]] || die "psql on the host never reached the database through the published proxy: $(cat "$tmp/psql.err")"
+[[ "$(psql_host -c 'create table e2e(v int); insert into e2e values (42); select v from e2e')" == 42 ]] || die "write and read through the proxy"
+pg_user="$(jq -r .user "$tmp/connection.json")"
+pg_pass="$(jq -r .password "$tmp/connection.json")"
+pg_name="$(jq -r .database "$tmp/connection.json")"
+out="$(curl -sS --max-time 30 --cacert "$tmp/$ca_file" -w '\n%{http_code}' -X POST "$http_url" \
+  -H "Neon-Connection-String: postgresql://$pg_user:$pg_pass@$pg_host/$pg_name" -H 'content-type: application/json' \
+  -d '{"query":"select v from e2e","params":[]}')" || die "SQL over HTTP: no answer at $http_url"
+[[ "${out##*$'\n'}" == 200 ]] && jq -e '.rows[0].v == 42' <<<"${out%$'\n'*}" >/dev/null ||
+  die "SQL over HTTP at $http_url: ${out##*$'\n'} $(head -c 300 <<<"${out%$'\n'*}")"
+pass "from the host: psql (verify-full, the CA from docker compose cp) created and read a row; SQL over HTTP read it"
 
 # ---- 8. the Zitadel webhook ----------------------------------------------------------------------
 
@@ -478,8 +543,9 @@ docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s:ro" 
   done' >"$tmp/secrets.tsv" || die "listing the secret files failed"
 n_secrets="$(wc -l <"$tmp/secrets.tsv")"
 ((n_secrets >= 30)) || die "only $n_secrets secret values found in the volume (expected 30+): the scan would prove little"
-# The setup code is a secret too, with and without its dashes.
+# The setup code is a secret too, with and without its dashes; and the SMTP password.
 printf 'setup/setup.code\t%s\n' "$CODE" "${CODE//-/}" >>"$tmp/secrets.tsv"
+printf 'smtp.password\t%s\n' "$SMTP_PASSWORD" >>"$tmp/secrets.tsv"
 containers=$(compose "$PROJECT" ps -aq)
 # shellcheck disable=SC2086
 docker inspect $containers >"$tmp/inspect.json" || die "docker inspect"

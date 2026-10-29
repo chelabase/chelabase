@@ -116,8 +116,7 @@ gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	tokens/data-keys.token	ro
 gateway	tokens/app-sessions.token	ro
-gateway	bootstrap/project-id	ro
-gateway	bootstrap/api-client-id	ro
+gateway	bootstrap/ids	ro
 auth	auth/cookie.key	ro
 auth	auth/app-jwt.key	ro
 auth	auth/app-jwt.pub	ro
@@ -126,9 +125,7 @@ auth	compute-ca/ca.crt	ro
 auth	tokens/app-auth.token	ro
 auth	zitadel-pats/admin.pat	ro
 auth	zitadel-pats/login-client.pat	ro
-auth	bootstrap/org-id	ro
-auth	bootstrap/project-id	ro
-auth	bootstrap/studio-client-id	ro
+auth	bootstrap/ids	ro
 rest	gateway/internal-verify.pem	ro
 rest	compute-ca/ca.crt	ro
 rest	tokens/rest-internal.token	ro
@@ -140,8 +137,7 @@ realtime	realtime/pg.password	ro
 realtime	realtime/ticket.key	ro
 realtime	realtime/internal.token	ro
 realtime	realtime-tls	ro
-realtime	bootstrap/project-id	ro
-realtime	bootstrap/api-client-id	ro
+realtime	bootstrap/ids	ro
 EOF
 
 # 1. The table.

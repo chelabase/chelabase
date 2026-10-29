@@ -16,8 +16,10 @@
 # `*_FILE` settings or key paths; no secret is ever an environment value, an argument or in this
 # file. Every value read from .env has a default here or fails `up` naming .env.
 #
-# Only the gateway is published (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT). Everything else talks
-# over the project network by service name; computes get their own `compute` network.
+# Two services are published: the gateway (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT) and the
+# proxy's Postgres and SQL-over-HTTP ports (CHELABASE_PROXY_ADDR, CHELABASE_PROXY_PORT and
+# CHELABASE_PROXY_HTTP_PORT). Everything else talks over the project network by service name;
+# computes get their own `compute` network.
 #
 # The workbench passes `-f docker-compose.yml -f docker-compose.workbench.yml --env-file
 # <state>/env/stack.env`: the overlay runs the dev loop on this file (its host-built binaries,
@@ -776,41 +778,56 @@ services:
       safekeeper3:
         condition: service_healthy
 
-  # Writes the proxy's TLS certificate once: a local CA and a *.localtest.me certificate signed
-  # by it. Clients verify against the CA. The proxy runs as the app user and reads tls.key.
+  # Writes the proxy's TLS certificate: a local CA (made once, kept) and a certificate for
+  # *.CHELABASE_PROXY_DOMAIN signed by it. The proxy routes a connection by its TLS server name
+  # (<endpoint>.<domain>, the domain taken from the certificate's CN), so a changed domain issues
+  # a new certificate from the same CA: clients keep trusting the CA they fetched. Clients verify
+  # against the CA (`docker compose cp proxy:/tls/ca.crt proxy-ca.crt`). The proxy runs as the app
+  # user and reads tls.key.
   proxy-tls:
     image: *neon-image
     restart: "no"
     user: "0"
+    environment:
+      CHELABASE_PROXY_DOMAIN: ${CHELABASE_PROXY_DOMAIN:-localtest.me}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
         set -e
         cd /tls
         owner="10001:10001"
-        if [ -s tls.crt ] && openssl x509 -in tls.crt -noout -subject | grep -qF '*.localtest.me'; then
+        domain="$$CHELABASE_PROXY_DOMAIN"
+        # A lowercase DNS name with at least one dot (the certificate is *.<domain>).
+        if ! printf '%s' "$$domain" | grep -Eqx '([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?'; then
+          echo "proxy-tls: CHELABASE_PROXY_DOMAIN=$$domain in .env is not a lowercase DNS name with a dot (e.g. db.example.com)" >&2
+          exit 1
+        fi
+        if [ -s tls.crt ] && [ "$$(openssl x509 -in tls.crt -noout -subject -nameopt RFC2253)" = "subject=CN=*.$$domain" ]; then
           chown "$$owner" tls.key tls.crt ca.crt
-          echo "certificate for *.localtest.me exists"; exit 0
+          echo "certificate for *.$$domain exists"; exit 0
         fi
         [ -s ca.key ] || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
           -keyout ca.key -out ca.crt -days 3650 -subj "/CN=Chelabase local CA"
         openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout tls.key -out tls.csr \
-          -subj "/CN=*.localtest.me"
-        printf 'subjectAltName=DNS:*.localtest.me\n' > ext.cnf
+          -subj "/CN=*.$$domain"
+        printf 'subjectAltName=DNS:*.%s\n' "$$domain" > ext.cnf
         openssl x509 -req -in tls.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 825 \
           -extfile ext.cnf -out tls.crt
         rm -f tls.csr ext.cnf
         chown "$$owner" tls.key tls.crt ca.crt
         chmod 600 ca.key tls.key
-        echo "issued a certificate for *.localtest.me"
+        echo "issued a certificate for *.$$domain"
     volumes: ["neon_proxy_tls:/tls"]
     network_mode: none
 
-  # Neon's proxy. Clients connect to <endpoint-id>.localtest.me: Postgres wire on 4432,
-  # WebSocket and SQL over HTTP on 4444, inside the stack's network only. It asks the
-  # orchestrator's internal listener for role secrets and compute addresses, and reaches computes
-  # on this network. Role secrets are cached for at most a minute, and dropped at once when the
-  # control plane publishes /password_updated to Valkey.
+  # Neon's proxy. Clients connect to <endpoint-id>.<CHELABASE_PROXY_DOMAIN> (default
+  # localtest.me, which resolves to loopback): Postgres wire on 4432 and SQL over HTTP on 4444,
+  # published on CHELABASE_PROXY_ADDR (default 127.0.0.1) at CHELABASE_PROXY_PORT (default 5432)
+  # and CHELABASE_PROXY_HTTP_PORT (default 4444). The orchestrator's connection details name the
+  # same host and ports. It asks the orchestrator's internal listener for role secrets and
+  # compute addresses, and reaches computes on the compute network. Role secrets are cached for at
+  # most a minute, and dropped at once when the control plane publishes /password_updated to
+  # Valkey.
   # RT1 T1 (S6, S27): it logs in to Valkey as the `proxy` ACL user and calls the orchestrator
   # with its generated token, each read from its file. Runs as the app user (their owner).
   proxy:
@@ -833,6 +850,11 @@ services:
       - --tls-key=/tls/tls.key
       - --project-info-cache=size=10000,ttl=1m,max_roles=64,gc_interval=60m
       - --redis-auth-type=plain
+    # 5432, the Postgres default, so clients need no port; it is free beside a workbench (4432,
+    # 4500-4599). Move it when the host runs its own Postgres.
+    ports:
+      - "${CHELABASE_PROXY_ADDR:-127.0.0.1}:${CHELABASE_PROXY_PORT:-5432}:4432"
+      - "${CHELABASE_PROXY_ADDR:-127.0.0.1}:${CHELABASE_PROXY_HTTP_PORT:-4444}:4444"
     networks:
       default: {}
       compute: {}
@@ -854,7 +876,7 @@ services:
   # --- The app tier ---------------------------------------------------------------------------
   # The release images (infra/images), as the app user 10001. Each app's own credentials come
   # from its own files (by <NAME>_FILE); listeners bind 0.0.0.0 inside and every URL is a service
-  # name. The gateway is the one way in from the host. CHELABASE_IMAGE_REPO and
+  # name. The gateway is the one way in from the host for HTTP (the proxy for Postgres). CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick the images (docker-compose.build.yml builds them from the clone).
 
   orchestrator:
@@ -865,15 +887,26 @@ services:
     command: ["orchestrator"]
     # RT1 T1 (S1, S27): its own credentials, from its own files below. The bootstrap's outputs
     # are read as they appear (it starts before the bootstrap, which waits for it), so it mounts
-    # bootstrap/ whole: the ids, the Actions signing key it verifies Zitadel's calls with, and the
-    # SMTP password's salted digest.
+    # bootstrap/ whole: the ids (ids/), the Actions signing key it verifies Zitadel's calls with,
+    # and the SMTP password's salted digest.
     environment:
       <<: *app-env
       CHELABASE_METADATA_DATABASE_PASSWORD_FILE: /run/chelabase/secrets/db/metadata.password
       CHELABASE_SETUP_CODE_FILE: /run/chelabase/secrets/setup/setup.code
       CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE: /run/chelabase/secrets/bootstrap/actions-signing-key
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/api-client-id
+      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
+      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
+      # Where clients reach the proxy (the connection details): <endpoint>.<domain> on the
+      # proxy's published ports, and the name of the CA file the docs fetch it to.
+      CHELABASE_PROXY_DOMAIN: ${CHELABASE_PROXY_DOMAIN:-localtest.me}
+      CHELABASE_PROXY_PG_PORT: ${CHELABASE_PROXY_PORT:-5432}
+      CHELABASE_PROXY_HTTP_PORT: ${CHELABASE_PROXY_HTTP_PORT:-4444}
+      CHELABASE_PROXY_CA_FILE: ${CHELABASE_PROXY_CA_FILE:-proxy-ca.crt}
+      # .env's tunables (blank = the service's default).
+      CHELABASE_BRANCH_ROLE_CAP: ${CHELABASE_BRANCH_ROLE_CAP:-}
+      CHELABASE_BRANCH_DATABASE_CAP: ${CHELABASE_BRANCH_DATABASE_CAP:-}
+      CHELABASE_PASSWORD_STRENGTH: ${CHELABASE_PASSWORD_STRENGTH:-}
+      CHELABASE_APP_REFRESH_TTL_SECS: ${CHELABASE_APP_REFRESH_TTL_SECS:-}
       CHELABASE_NATS_USER: orchestrator
       CHELABASE_NATS_PASSWORD_FILE: /run/chelabase/secrets/nats/orchestrator.password
       CHELABASE_NATS_INBOX_PREFIX: _INBOX_orchestrator
@@ -949,6 +982,15 @@ services:
       CHELABASE_VALKEY_USER: control
       CHELABASE_VALKEY_PASSWORD_FILE: /run/chelabase/secrets/valkey/control.password
       CHELABASE_REALTIME_PG_PASSWORD_FILE: /run/chelabase/secrets/realtime/pg.password
+      # .env's tunables (blank = the service's default).
+      CHELABASE_DB_OWNER_SUPERUSER: ${CHELABASE_DB_OWNER_SUPERUSER:-}
+      CHELABASE_BRANCH_ROLE_CAP: ${CHELABASE_BRANCH_ROLE_CAP:-}
+      CHELABASE_BRANCH_DATABASE_CAP: ${CHELABASE_BRANCH_DATABASE_CAP:-}
+      CHELABASE_PASSWORD_STRENGTH: ${CHELABASE_PASSWORD_STRENGTH:-}
+      CHELABASE_APP_USERS_RECONCILE_SECS: ${CHELABASE_APP_USERS_RECONCILE_SECS:-}
+      CHELABASE_MEMBER_ROLES_SWEEP_SECS: ${CHELABASE_MEMBER_ROLES_SWEEP_SECS:-}
+      CHELABASE_IDENTITY_SWEEP_SECS: ${CHELABASE_IDENTITY_SWEEP_SECS:-}
+      CHELABASE_WORKER_REMOVE_ORPHANS: ${CHELABASE_WORKER_REMOVE_ORPHANS:-}
     # P4: it dials computes (compute_ctl) on the compute network.
     networks:
       default: {}
@@ -993,7 +1035,7 @@ services:
       zitadel:
         condition: service_healthy
 
-  # The front door, published on CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT. It listens on the
+  # The front door for HTTP, published on CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT. It listens on the
   # public port inside too and answers every host on the network (the aliases), so one URL works
   # from the host and from a container when the hosts are plain http. The apps reach Zitadel
   # directly (CHELABASE_ZITADEL_INTERNAL_URL), never through these aliases.
@@ -1008,8 +1050,8 @@ services:
       CHELABASE_GATEWAY_TRUSTED_PROXIES: ${CHELABASE_GATEWAY_TRUSTED_PROXIES:-}
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/api-client-id
+      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
+      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
     ports:
       - "${CHELABASE_HTTP_ADDR:-127.0.0.1}:${CHELABASE_HTTP_PORT:-${CHELABASE_PUBLIC_PORT:-8000}}:${CHELABASE_PUBLIC_PORT:-8000}"
     networks:
@@ -1023,8 +1065,8 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/data-keys.token, read_only: true, volume: {subpath: tokens/data-keys.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/project-id, read_only: true, volume: {subpath: bootstrap/project-id}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/api-client-id, read_only: true, volume: {subpath: bootstrap/api-client-id}}
+      # The bootstrap's ids (never its signing key), as a dir: a rewritten id is seen at once.
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:${CHELABASE_PUBLIC_PORT:-8000}/_gateway/health"]
@@ -1044,9 +1086,12 @@ services:
     environment:
       <<: *app-env
       CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-auth.token
-      CHELABASE_ZITADEL_ORG_ID_FILE: /run/chelabase/secrets/bootstrap/org-id
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/project-id
-      CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/studio-client-id
+      CHELABASE_ZITADEL_ORG_ID_FILE: /run/chelabase/secrets/bootstrap/ids/org-id
+      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
+      CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/studio-client-id
+      # .env's tunables (blank = the service's default).
+      CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
+      CHELABASE_APP_ACCESS_TTL_SECS: ${CHELABASE_APP_ACCESS_TTL_SECS:-}
     networks:
       default: {}
       compute: {}
@@ -1059,9 +1104,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-auth.token, read_only: true, volume: {subpath: tokens/app-auth.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/login-client.pat, read_only: true, volume: {subpath: zitadel-pats/login-client.pat}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/org-id, read_only: true, volume: {subpath: bootstrap/org-id}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/project-id, read_only: true, volume: {subpath: bootstrap/project-id}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/studio-client-id, read_only: true, volume: {subpath: bootstrap/studio-client-id}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8084/health"]
@@ -1114,8 +1157,8 @@ services:
       CHELABASE_REALTIME_PG_PASSWORD_FILE: /run/chelabase/secrets/realtime/pg.password
       CHELABASE_REALTIME_TICKET_KEY_FILE: /run/chelabase/secrets/realtime/ticket.key
       CHELABASE_REALTIME_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/realtime/internal.token
-      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/project-id
-      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/api-client-id
+      CHELABASE_ZITADEL_PROJECT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/project-id
+      CHELABASE_ZITADEL_API_CLIENT_ID_FILE: /run/chelabase/secrets/bootstrap/ids/api-client-id
     # Realtime's replication connection dials the compute's `replication_host` on `control`
     # (from its static address, in the chelabase_realtime login rule); its check connections and
     # the compute's other listeners are reached on `compute`.
@@ -1133,8 +1176,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/ticket.key, read_only: true, volume: {subpath: realtime/ticket.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/internal.token, read_only: true, volume: {subpath: realtime/internal.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, read_only: true, volume: {subpath: realtime-tls}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/project-id, read_only: true, volume: {subpath: bootstrap/project-id}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/api-client-id, read_only: true, volume: {subpath: bootstrap/api-client-id}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
     healthcheck:
       <<: *app-health
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/health"]

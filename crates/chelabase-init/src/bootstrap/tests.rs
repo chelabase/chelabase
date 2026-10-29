@@ -875,7 +875,7 @@ async fn bootstrap_creates_no_keys() {
             "written outside the output dir: {}",
             p.display()
         );
-        let name = p.file_name().unwrap().to_str().unwrap();
+        let name = p.strip_prefix(&w.cfg.out_dir).unwrap().to_str().unwrap();
         assert!(outputs::ALL.contains(&name), "not an output: {name}");
         assert!(!name.ends_with(".pem") && !name.ends_with(".key"), "{name}");
     }
@@ -947,7 +947,11 @@ async fn outputs_refuse_symlinks() {
         let w = World::new();
         let target = w.root.path().join("elsewhere");
         std::fs::write(&target, "keep").unwrap();
-        std::os::unix::fs::symlink(&target, w.cfg.out_dir.join(name)).unwrap();
+        let link = w.cfg.out_dir.join(name);
+        let parent = link.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&target, link).unwrap();
         let err = format!("{:#}", w.run(Demo::On).await.unwrap_err());
         assert!(
             err.contains("symlink") && err.contains(name),
