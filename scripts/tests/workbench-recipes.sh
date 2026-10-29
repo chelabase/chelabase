@@ -95,8 +95,17 @@ just --show check | gq 'scripts/tests/workbench-recipes.sh' || fail "just check 
 # proxy's address; inside the runner the name resolves to loopback.
 for f in $(grep -lE 'PROXY_HTTP_PORT|:4444' "${scripts[@]}" || true); do
   if grep -qE '^\s*[^#]*curl ' "$f"; then
-    grep -qE -- '--(connect-to|resolve)[ =][^ ]*PROXY_HOSTADDR' "$f" ||
-      fail "$f curls the proxy's HTTP endpoint without --connect-to/--resolve to \$CHELABASE_PROXY_HOSTADDR"
+    if [[ "$selfhost_e2e" == *" $f "* ]]; then
+      # The self-host e2e scripts have no CHELABASE_PROXY_HOSTADDR: a script that calls the proxy's
+      # SQL-over-HTTP URL (http_url) pins the published loopback address; the TLS script's curls go to the gateway.
+      if grep -qF 'http_url' "$f"; then
+        grep -qF -- '--resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1"' "$f" ||
+          fail "$f curls the proxy's HTTP endpoint without --resolve \"\$pg_host:\$PROXY_HTTP_PORT:127.0.0.1\""
+      fi
+    else
+      grep -qE -- '--(connect-to|resolve)[ =][^ ]*PROXY_HOSTADDR' "$f" ||
+        fail "$f curls the proxy's HTTP endpoint without --connect-to/--resolve to \$CHELABASE_PROXY_HOSTADDR"
+    fi
   fi
 done
 # I2: recipe arguments are passed as arguments, never re-split by the shell.
