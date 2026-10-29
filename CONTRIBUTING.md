@@ -311,6 +311,30 @@ Some Rust tests are `#[ignore]`d because they need the stack. Run them on your c
 - `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
 - `storcon_live` (`just workbench test -p chelabase-neon --test storcon_live -- --run-ignored only`): a round trip through the Rust storage-controller client. Other live files live in `services/worker/tests/` (`branch_live`, `neon_live`, `roles_live`).
 
+## CI (GitHub Actions)
+
+Two workflows in `.github/workflows/`. Until the repo is public (Actions minutes are billed on a private repo) both run **by hand only** (`workflow_dispatch`). Neither uses `pull_request_target` or any secret, and both have `permissions: contents: read`. Actions are pinned to commit SHAs.
+
+| Workflow | What it runs |
+| --- | --- |
+| `ci.yml` | On ubuntu-latest: the toolchain from `.prototools` (via `moonrepo/setup-toolchain`), the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2, then `just check` and `just test` |
+| `live.yml` | `just workbench up`, every live recipe in the table above except `bench-data-api` (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
+
+**At launch**, enable the triggers (one change per workflow, each marked `# enable at launch`):
+
+- `ci.yml`: uncomment `pull_request:` and `push: { branches: [main] }`.
+- `live.yml`: uncomment the nightly `schedule:`. For a `run-live` PR label, uncomment the `pull_request:` block and the job's `if:` line too.
+
+**Checking a workflow without Actions minutes:** `actionlint` for syntax and expressions, and `act` to run it in Docker (both are single binaries from their GitHub releases; install them outside the repo):
+
+```bash
+actionlint
+act workflow_dispatch -W .github/workflows/ci.yml
+act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /var/run/docker.sock --artifact-server-path /tmp/act-artifacts   # brings up a workbench stack
+```
+
+`act` can't prove: that its runner image matches ubuntu-latest (the packages, the Docker and Compose versions: the workbench needs Compose 2.30 or newer), how `actions/cache` and `rust-cache` behave on GitHub's cache service, timing and disk limits on the hosted runner, and the `workflow_dispatch` UI. The first real run at launch checks these.
+
 ## Releasing images
 
 The install pulls the per-app images and Studio from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
