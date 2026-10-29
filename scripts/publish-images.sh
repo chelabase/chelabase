@@ -32,7 +32,9 @@ head_full="$(git rev-parse HEAD)"
 sha="$(git rev-parse --short=12 HEAD)"
 images=(gateway orchestrator worker rest auth realtime init studio)
 REPO="${PUBLISH_IMAGES_REPO:-ghcr.io/chelabase}"
-export REPO TAG="${sha}" REVISION="${head_full}"
+# RELEASE adds the OCI index annotations (infra/images/docker-bake.hcl); `--load` with them
+# needs the containerd image store.
+export REPO TAG="${sha}" REVISION="${head_full}" RELEASE=1
 bake=(docker buildx bake -f infra/images/docker-bake.hcl)
 
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
