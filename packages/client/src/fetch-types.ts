@@ -1,6 +1,6 @@
 // `fetchTypes`: the runtime `types` map, fetched live from `GET /data/v1/types?format=json`.
 
-import { plainError, toError } from "./error.ts";
+import { NO_REDIRECTS, plainError, toError } from "./error.ts";
 import type { TypeMap } from "./types.ts";
 
 export interface FetchTypesOptions {
@@ -36,8 +36,9 @@ export function fetchTypes(opts: FetchTypesOptions & { allDatabases: true }): Pr
 export function fetchTypes(opts: FetchTypesOptions & { allDatabases?: false }): Promise<TypeMap>;
 export function fetchTypes(opts: FetchTypesOptions): Promise<TypeMap | Record<string, TypeMap>>;
 export async function fetchTypes(opts: FetchTypesOptions): Promise<TypeMap | Record<string, TypeMap>> {
-  // As the CLI checks it: `chk_sec_` and 43 base62 characters.
-  if (!/^chk_sec_[0-9A-Za-z]{43}$/.test(opts.key)) throw new Error(NEEDS_SECRET);
+  // As the CLI checks it: trimmed, then `chk_sec_` and 43 base62 characters.
+  const key = opts.key.trim();
+  if (!/^chk_sec_[0-9A-Za-z]{43}$/.test(key)) throw new Error(NEEDS_SECRET);
   const all = opts.allDatabases === true;
   if (all && opts.database !== undefined) {
     throw new Error("fetchTypes: `database` and `allDatabases` can't be combined");
@@ -48,7 +49,8 @@ export async function fetchTypes(opts: FetchTypesOptions): Promise<TypeMap | Rec
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
   const res = await doFetch(`${opts.url.replace(/\/+$/, "")}/data/v1/types?${query}`, {
     method: "GET",
-    headers: { authorization: `Bearer ${opts.key}`, accept: "application/json" },
+    headers: { authorization: `Bearer ${key}`, accept: "application/json" },
+    redirect: NO_REDIRECTS,
   });
   const text = await res.text();
   if (!res.ok) throw toError(res, text);

@@ -1,5 +1,5 @@
 // `db.auth`: app user flows under `/auth/v1/app/`, and the session state the data requests use.
-import { DataApiError } from "./error.ts";
+import { DataApiError, NO_REDIRECTS } from "./error.ts";
 import type { AppUser, Auth, AuthEvent, AuthOptions, AuthStorage, DatabaseShape, Session } from "./types.ts";
 
 /** Header carrying the signed-in user's access token. */
@@ -91,6 +91,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     const res = await cfg.fetch(`${cfg.base}/auth/v1/app/${path}`, {
       method,
       headers,
+      redirect: NO_REDIRECTS,
       ...(method === "POST" ? { body: JSON.stringify(init.body ?? {}) } : {}),
     });
     const text = await res.text();
