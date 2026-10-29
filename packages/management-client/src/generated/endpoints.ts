@@ -1471,7 +1471,7 @@ export const getGetDataApiTypesUrl = (id: string,
 }
 
 /**
- * What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it exactly when you may create a secret key for `role` (the same checks and answers as `createKey`). The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).
+ * What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it when you pass `createKey`'s checks on the caller and the role: Developer access on the branch, not a personal login's role, and a role you may use. Its all-rows exposure check (`exposes_data_api`) does not apply, since types expose the schema and never rows. The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).
  * @summary The branch's generated types for a secret key role
  */
 export const getDataApiTypes = async (id: string,

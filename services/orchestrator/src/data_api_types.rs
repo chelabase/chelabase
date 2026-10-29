@@ -7,11 +7,17 @@
 //! orchestrator can't call the public route itself: it holds no key's plaintext and can't mint
 //! a data key identity.
 //!
-//! Who may call it is who may create a secret key for `role` on the branch: createKey's
-//! `Project(Developer)` check, MH-12 (never a personal login) and the key-role check (T6:
-//! the role in the caller's roles or reachable through a granted role's chain, owner-level,
-//! LOGIN and reserved roles Admin-only), in that order, with the same answers. Nothing reaches
-//! rest before they pass.
+//! Who may call it is who may create a secret key for `role` on the branch, by the checks
+//! createKey runs on the caller and the role, in its order and with its answers: the
+//! `Project(Developer)` access check, `load_branch`, MH-12 (`refuse_personal_login_key`: never a
+//! personal login), the key-role check (`authorize_key_role`, T6: the role in the caller's roles
+//! or reachable through a granted role's chain, owner-level, LOGIN and reserved roles
+//! Admin-only), and the worker's `check_role`. Nothing reaches rest before they pass.
+//!
+//! Not reused: createKey's all-rows exposure check (EOS-H1 `check_all_rows`, 422
+//! `exposes_data_api`, 503 when it can't complete). It guards a key handing out every row;
+//! types expose the schema, never rows, so a role createKey refuses for that reason still gets
+//! its types here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -166,7 +172,7 @@ impl Options {
     operation_id = "getDataApiTypes",
     tag = "data-api",
     summary = "The branch's generated types for a secret key role",
-    description = "What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it exactly when you may create a secret key for `role` (the same checks and answers as `createKey`). The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).",
+    description = "What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it when you pass `createKey`'s checks on the caller and the role: Developer access on the branch, not a personal login's role, and a role you may use. Its all-rows exposure check (`exposes_data_api`) does not apply, since types expose the schema and never rows. The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).",
     params(
         ("id" = Uuid, Path, description = "Database id"),
         ("branch_id" = Uuid, Path, description = "Branch id"),

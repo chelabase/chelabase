@@ -708,6 +708,14 @@ async fn types_route_answers_branch_database_and_rest_states() {
             503,
             "unavailable",
         ),
+        // The orchestrator's own bearer refused: never a 401 to Studio, which signs out on it.
+        (
+            401,
+            ct.clone(),
+            json(json!({ "error": { "code": "unauthorized", "message": "a valid bearer is required" } })),
+            502,
+            "unavailable",
+        ),
         (
             302,
             vec![("location", "http://elsewhere.test/".into())],
@@ -739,4 +747,56 @@ async fn types_route_answers_branch_database_and_rest_states() {
             assert_eq!(retry.as_deref(), Some("2"));
         }
     }
+}
+
+/// Types expose the schema, not rows: createKey's all-rows check (EOS-H1) is not one the types
+/// route runs. Where a key for the role would hand every row out (422 `exposes_data_api`),
+/// createKey refuses and the types route serves.
+#[tokio::test]
+async fn types_route_skips_the_all_rows_check_createkey_runs() {
+    let world = world().await;
+    let w = &world.w;
+    w.metadata
+        .add_granted(w.tenant, "ada", w.project, PlatformRole::Admin, &[]);
+    *w.jobs.all_rows_reply.lock().unwrap() = Some(Ok(chelabase_nats::AllRowsCheckReply::Exposed {
+        chain: vec!["authenticated".into(), "everything".into()],
+    }));
+    let keys = format!("{}/keys", world.base(w.db, w.dev));
+    let (status, body) = answer_of(
+        w.app
+            .send_as(
+                "ada",
+                "org-1",
+                Method::POST,
+                &keys,
+                Some(json!({ "name": "k", "role": "authenticated" })),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["code"].as_str()),
+        (422, Some("exposes_data_api")),
+        "{body}"
+    );
+    let resp = world.get("ada", &world.types(""), &[]).await;
+    assert_eq!(resp.status().as_u16(), 200);
+    assert_eq!(world.rest_calls(), 1);
+    // The check can't complete: createKey fails closed, the types route still serves.
+    *w.jobs.all_rows_reply.lock().unwrap() = Some(Err(ResetError::Timeout));
+    let (status, _) = answer_of(
+        w.app
+            .send_as(
+                "ada",
+                "org-1",
+                Method::POST,
+                &keys,
+                Some(json!({ "name": "k2", "role": "authenticated" })),
+            )
+            .await,
+    )
+    .await;
+    assert_eq!(status, 503);
+    let resp = world.get("ada", &world.types(""), &[]).await;
+    assert_eq!(resp.status().as_u16(), 200);
 }
