@@ -281,13 +281,10 @@ pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
 ];
 
-/// The key check's `LOCK TABLE … IN SHARE MODE` over every table in [`SECRETS_KEY_SEALED`]
-/// and the one statement summing their sealed values. Built from the constant list only.
-fn sealed_check_sql() -> (String, String) {
-    let mut tables: Vec<&str> = SECRETS_KEY_SEALED.iter().map(|(t, _, _)| *t).collect();
-    tables.sort_unstable();
-    tables.dedup();
-    let lock = format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "));
+/// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
+/// [`MetadataClient::ensure_key_check`] counts them (tests count with it too). Built from the
+/// constant list only.
+pub fn sealed_count_sql() -> String {
     let counts: Vec<String> = SECRETS_KEY_SEALED
         .iter()
         .map(|(t, c, also)| {
@@ -295,7 +292,17 @@ fn sealed_check_sql() -> (String, String) {
             format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL{also})")
         })
         .collect();
-    (lock, format!("SELECT {}", counts.join(" + ")))
+    format!("SELECT {}", counts.join(" + "))
+}
+
+/// The key check's `LOCK TABLE … IN SHARE MODE` over every table in [`SECRETS_KEY_SEALED`]
+/// and [`sealed_count_sql`].
+fn sealed_check_sql() -> (String, String) {
+    let mut tables: Vec<&str> = SECRETS_KEY_SEALED.iter().map(|(t, _, _)| *t).collect();
+    tables.sort_unstable();
+    tables.dedup();
+    let lock = format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "));
+    (lock, sealed_count_sql())
 }
 
 /// Outcome of [`MetadataClient::ensure_key_check`].
@@ -910,6 +917,36 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #38 review: the key check counts every listed column, with its condition, and locks
+    // every listed table first.
+    #[test]
+    fn sealed_check_sql_counts_every_listed_column() {
+        let (lock, count) = sealed_check_sql();
+        let terms: Vec<&str> = count
+            .strip_prefix("SELECT ")
+            .expect("one SELECT")
+            .split(" + ")
+            .collect();
+        let expected: Vec<String> = SECRETS_KEY_SEALED
+            .iter()
+            .map(|(t, c, also)| match also {
+                Some(a) => format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL AND {a})"),
+                None => format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL)"),
+            })
+            .collect();
+        assert_eq!(terms, expected);
+        assert!(count.contains("grace_refresh_sealed IS NOT NULL AND grace_until > now()"));
+        let tables = lock
+            .strip_prefix("LOCK TABLE ")
+            .and_then(|l| l.strip_suffix(" IN SHARE MODE"))
+            .expect("one LOCK TABLE … IN SHARE MODE");
+        let tables: Vec<&str> = tables.split(", ").collect();
+        for (t, _, _) in SECRETS_KEY_SEALED {
+            assert_eq!(tables.iter().filter(|x| *x == t).count(), 1, "{t} locked once");
+        }
+        assert_eq!(count, sealed_count_sql());
+    }
 
     // m5 re-audit S2: `Debug` hides a password in the user info and in a `password` query
     // parameter (any position, a percent-encoded key too), and keeps everything else.
