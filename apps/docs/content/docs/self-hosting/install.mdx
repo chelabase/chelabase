@@ -23,7 +23,7 @@ cp .env.example .env
 docker compose up -d --wait
 ```
 
-`.env` is required. Every setting has a default, so the copy runs as it is on one machine and serves Studio at `http://studio.chelabase.localhost:8000`, and databases on `127.0.0.1:5432` (see [Connect to databases](#connect-to-databases)). A fresh project is healthy in under a minute once the images are pulled.
+`.env` is required. Every setting has a default, so the copy runs as it is on one machine and serves Studio at `http://studio.chelabase.localhost:8000`, and databases on `127.0.0.1:5432` (see [Connect to databases](#connect-to-databases)). A fresh project is healthy in under a minute once the images are pulled. The compute image each database runs on isn't a Compose service, so the worker pulls it when it creates the first database, which then takes longer.
 
 Two one-shot containers do the setup, and both must exit 0:
 

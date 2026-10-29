@@ -2,7 +2,8 @@
 //! uploading the TLS files, starting it) removes the container it made, best effort, and still
 //! returns the step's own error. Carried gaps T2 (R4): a `create` whose future is dropped after
 //! the container exists (a caller's timeout, a cancelled job) removes it too, and (R5)
-//! `list_not_running` names the computes whose container exists but isn't running. Against a
+//! `list_not_running` names the computes whose container exists but isn't running. A `create`
+//! refused for a missing image pulls it and creates again. Against a
 //! mock Docker Engine API on a TCP port, handed to the backend as its client
 //! (`DockerBackend::with_docker`), so no daemon is needed.
 
@@ -32,6 +33,10 @@ struct Mock {
     fail_delete: Arc<Mutex<bool>>,
     /// What `GET /containers/json` (and each container's inspect) knows of.
     containers: Arc<Mutex<Vec<Listed>>>,
+    /// The compute image isn't there: a container create answers 404 until a pull.
+    missing_image: Arc<Mutex<bool>>,
+    /// A pull streams an error instead of the image.
+    fail_pull: Arc<Mutex<bool>>,
 }
 
 const STACK: &str = "mock";
@@ -74,7 +79,24 @@ async fn engine(State(mock): State<Mock>, request: Request) -> Response {
         )
             .into_response()
     };
+    if method == "POST" && path.ends_with("/images/create") {
+        // Docker answers a pull 200 and streams its progress; a failure is a line of the stream.
+        let line = if *mock.fail_pull.lock().unwrap() {
+            r#"{"errorDetail":{"message":"denied"},"error":"denied"}"#
+        } else {
+            *mock.missing_image.lock().unwrap() = false;
+            r#"{"status":"Downloaded newer image"}"#
+        };
+        return (StatusCode::OK, [("content-type", "application/json")], line).into_response();
+    }
     if method == "POST" && path.ends_with("/containers/create") {
+        if *mock.missing_image.lock().unwrap() {
+            return (
+                StatusCode::NOT_FOUND,
+                r#"{"message":"No such image: neon/compute-node-v17:test"}"#,
+            )
+                .into_response();
+        }
         return (
             StatusCode::CREATED,
             [("content-type", "application/json")],
@@ -204,6 +226,15 @@ async fn mock_backend() -> (Mock, DockerBackend) {
     )
     .unwrap();
     (mock, DockerBackend::with_docker(settings(), docker_settings(), docker))
+}
+
+fn seen(mock: &Mock, what: &str) -> usize {
+    mock.requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.starts_with("POST ") && r.contains(what))
+        .count()
 }
 
 /// The DELETEs the mock has seen once `wait` has passed with no new one (a removal spawned on
@@ -422,4 +453,64 @@ async fn a_finished_create_removes_nothing_more() {
             mock.requests.lock().unwrap()
         );
     }
+}
+
+// A fresh install has the compute image pinned but never pulled (Compose pulls only the images
+// of its services): `create` pulls the image it was refused for and creates again.
+#[tokio::test]
+async fn a_create_pulls_a_missing_image() {
+    let (mock, backend) = mock_backend().await;
+    *mock.missing_image.lock().unwrap() = true;
+
+    backend.create("ep-new", "tok").await.unwrap();
+
+    let requests = mock.requests.lock().unwrap().clone();
+    assert!(
+        requests.iter().any(|r| r.contains("/images/create?")
+            && r.contains("fromImage=neon%2Fcompute-node-v17%3Atest")),
+        "the configured image is pulled: {requests:?}"
+    );
+    assert_eq!(seen(&mock, "/images/create"), 1, "{requests:?}");
+    assert_eq!(
+        seen(&mock, "/containers/create"),
+        2,
+        "refused, then created: {requests:?}"
+    );
+    assert!(
+        requests.iter().any(|r| r.ends_with("/start?")),
+        "{requests:?}"
+    );
+    assert_eq!(deletes(&mock), Vec::<String>::new());
+}
+
+// A pull that fails is the create's error, said as a pull; it is tried once, not in a loop.
+#[tokio::test]
+async fn a_failed_pull_fails_the_create() {
+    let (mock, backend) = mock_backend().await;
+    *mock.missing_image.lock().unwrap() = true;
+    *mock.fail_pull.lock().unwrap() = true;
+
+    let err = backend.create("ep-new", "tok").await.unwrap_err();
+
+    let text = format!("{err:#}");
+    assert!(
+        text.contains("pulling neon/compute-node-v17:test"),
+        "{text}"
+    );
+    assert!(
+        text.contains("denied"),
+        "Docker's own reason is kept: {text}"
+    );
+    assert_eq!(seen(&mock, "/images/create"), 1);
+    assert_eq!(seen(&mock, "/containers/create"), 1);
+}
+
+// Present images aren't pulled again: a good create makes no pull request.
+#[tokio::test]
+async fn a_create_with_the_image_present_pulls_nothing() {
+    let (mock, backend) = mock_backend().await;
+
+    backend.create("ep-ok", "tok").await.unwrap();
+
+    assert_eq!(seen(&mock, "/images/create"), 0);
 }

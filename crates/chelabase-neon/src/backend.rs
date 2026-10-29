@@ -15,8 +15,8 @@ use bollard::models::{
     RestartPolicy, RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, DownloadFromContainerOptions, ListContainersOptions,
-    RemoveContainerOptions, StartContainerOptions, UploadToContainerOptions,
+    CreateContainerOptions, CreateImageOptionsBuilder, DownloadFromContainerOptions,
+    ListContainersOptions, RemoveContainerOptions, StartContainerOptions, UploadToContainerOptions,
 };
 use futures_util::{StreamExt, TryStreamExt};
 use tokio::io::AsyncWriteExt;
@@ -338,6 +338,12 @@ fn is_status(err: &DockerError, code: u16) -> bool {
     matches!(err, DockerError::DockerResponseServerError { status_code, .. } if *status_code == code)
 }
 
+/// Docker's answer to a container create whose image isn't on the host.
+fn is_missing_image(err: &DockerError) -> bool {
+    matches!(err, DockerError::DockerResponseServerError { status_code: 404, message }
+        if message.contains("No such image"))
+}
+
 /// Removes container `name` (or id), forced, with its anonymous volumes; one already gone is
 /// fine.
 async fn remove_container(docker: &Docker, name: &str) -> Result<(), DockerError> {
@@ -468,6 +474,22 @@ impl DockerBackend {
 
     fn docker(&self) -> &Docker {
         &self.locator.docker
+    }
+
+    /// Pulls the compute image, waiting out Docker's progress stream (a failed pull is a line
+    /// of it).
+    async fn pull_image(&self) -> anyhow::Result<()> {
+        let image = &self.settings.image;
+        tracing::info!(image = %image, "compute image missing; pulling it");
+        self.docker()
+            .create_image(
+                Some(CreateImageOptionsBuilder::new().from_image(image).build()),
+                None,
+                None,
+            )
+            .try_for_each(|_| async { Ok(()) })
+            .await
+            .with_context(|| format!("pulling {image}"))
     }
 
     fn ca(&self) -> anyhow::Result<&ComputeCa> {
@@ -650,7 +672,16 @@ impl ComputeBackend for DockerBackend {
                 body.clone(),
             )
         };
+        // Compose pulls only the images of its services, so a fresh install has never pulled
+        // the compute image: pull it once and create again.
         let created = match create().await {
+            Err(e) if is_missing_image(&e) => {
+                self.pull_image().await?;
+                create().await
+            }
+            other => other,
+        };
+        let created = match created {
             Err(e) if is_status(&e, 409) => {
                 self.remove(&name)
                     .await
