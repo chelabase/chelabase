@@ -359,7 +359,9 @@ export function BranchRoles({ projectId, databaseId, branchId }: BranchRolesProp
           </dl>
           {shown.details.ca_file && (
             <p className="text-xs text-muted-foreground">
-              Local dev: pass the proxy&apos;s CA with <code>sslrootcert={shown.details.ca_file}</code>.
+              CA file: pass the proxy&apos;s CA with <code>sslrootcert={shown.details.ca_file}</code>.
+              Self-hosted, fetch it with <code>docker compose cp proxy:/tls/ca.crt {shown.details.ca_file}</code> (install
+              guide, &ldquo;Connect to databases&rdquo;).
             </p>
           )}
           <Button size="sm" variant="outline" onClick={() => setShown(null)}>
