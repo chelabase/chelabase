@@ -50,3 +50,44 @@ export class UnsafeIntegerError extends Error {
     this.source = source;
   }
 }
+
+/** The `DataApiError` for a non-2xx answer (internal: not exported from the package). */
+export function toError(res: Response, text: string): DataApiError {
+  try {
+    const body = JSON.parse(text) as { error?: Record<string, unknown> };
+    const e = body.error;
+    if (e && typeof e["code"] === "string" && typeof e["message"] === "string") {
+      const opt = (k: string) => (typeof e[k] === "string" ? (e[k] as string) : undefined);
+      return new DataApiError({
+        status: res.status,
+        code: e["code"],
+        message: e["message"],
+        detail: opt("detail"),
+        hint: opt("hint"),
+        sqlstate: opt("sqlstate"),
+      });
+    }
+  } catch {
+    // not JSON: fall through
+  }
+  return plainError(res, text, STATUS_CODES[res.status] ?? "internal");
+}
+
+/** The `code` for a non-2xx answer without the data API's error body (a proxy's page). */
+const STATUS_CODES: Record<number, string> = {
+  401: "unauthorized",
+  413: "too_large",
+  429: "rate_limited",
+  502: "unavailable",
+  503: "unavailable",
+  504: "timeout",
+};
+
+export function plainError(res: Response, text: string, code: string): DataApiError {
+  const snippet = text.length > 200 ? `${text.slice(0, 200)}…` : text;
+  return new DataApiError({
+    status: res.status,
+    code,
+    message: `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}${snippet ? `: ${snippet}` : ""}`,
+  });
+}

@@ -718,6 +718,7 @@ dependencies = [
  "chelabase-init",
  "chelabase-neon",
  "chelabase-secrets",
+ "chelabase-typegen",
  "chelabase-types",
  "chelabase-zitadel",
  "chrono",
@@ -935,6 +936,15 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "uuid",
+]
+
+[[package]]
+name = "chelabase-typegen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3868,6 +3878,7 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-typegen",
  "chelabase-types",
  "chrono",
  "deadpool-postgres",
@@ -3877,6 +3888,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "subtle",
  "thiserror 2.0.21",

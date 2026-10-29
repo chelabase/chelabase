@@ -286,6 +286,202 @@
           }
         ]
       }
+    },
+    "/data/v1/types": {
+      "get": {
+        "tags": [
+          "data"
+        ],
+        "summary": "The generated types for the key's schema",
+        "description": "What `chelabase gen types` writes for the same secret key and options, byte for byte: the TypeScript module (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the runtime `types` map alone. It is built from exactly what `GET /data/v1/schema` gives the key. The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`): the schema follows the key.",
+        "operationId": "getDataTypes",
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "description": "`ts` (the default): the TypeScript module `chelabase gen types` writes. `json`: the\nruntime `types` map alone, exactly what the module's `types` constant holds.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ts",
+                "json"
+              ]
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Generate this database (not the main one) as `Database`. It must be served and, when\nthe key has a database list, on it. Not with `all_databases`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "all_databases",
+            "in": "query",
+            "description": "`true`: every database the key reaches, as `Databases` and a `types` map keyed by\nname (main as `main`). With only main reachable, the one-database module.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The module (`format=ts`, `text/typescript`) or the runtime `types` map (`format=json`)",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "A strong tag: the body's SHA-256"
+              }
+            },
+            "content": {
+              "text/typescript": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current `ETag`: the body is unchanged (and not sent)",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The current tag"
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_query`, `user_token_with_secret_key`: an option isn't `format=ts|json`, `database=<name>` or `all_databases=true|false`, is repeated, or `database` came with `all_databases=true` (`invalid_query`); or a `Chelabase-User` token came with the secret key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: the key is missing, invalid, revoked or not a secret key, or its branch is gone",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`role_not_allowed`: the role is owner-level or has system privileges: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of a superuser role, `neon_superuser` or a system role (BYPASSRLS alone is allowed)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`unknown_database`: the database (or, with `all_databases`, main) doesn't exist, isn't served or isn't on the key's list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`rate_limited`: too many requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: an unexpected error; the message carries the request id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the database can't be reached right now; retry after `Retry-After`",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: reading the schema ran past the statement timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {

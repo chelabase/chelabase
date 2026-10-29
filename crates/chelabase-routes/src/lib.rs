@@ -1075,6 +1075,14 @@ pub mod rest {
         },
         websocket: false,
     };
+
+    /// The generated types (`chelabase gen types`' output) for the key's schema: a secret
+    /// key only, as the schema route.
+    pub const TYPES: Endpoint = Endpoint {
+        name: "rest.types",
+        path: "/data/v1/types",
+        ..SCHEMA
+    };
 }
 
 /// Studio's sign-in pages, served by `auth`.
@@ -1338,6 +1346,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::GET_CELL,
     rest::QUERY,
     rest::SCHEMA,
+    rest::TYPES,
     auth::AUTH_REQUEST,
     auth::INSTANCE,
     auth::STUDIO_CONFIG,
@@ -1783,6 +1792,8 @@ mod tests {
     fn rest_endpoints_match_and_are_listed() {
         assert_eq!(found("POST", "/data/v1/query"), "rest.query");
         assert_eq!(found("GET", "/data/v1/schema"), "rest.schema");
+        assert_eq!(found("GET", "/data/v1/types"), "rest.types");
+        assert_eq!(rest::TYPES.policy, rest::SCHEMA.policy, "the types route is the schema route's");
         assert_eq!(
             rest::QUERY.policy,
             Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey }
@@ -1791,7 +1802,7 @@ mod tests {
             rest::SCHEMA.policy,
             Policy { auth: Auth::SecretDataKey, cors: Cors::Any, access: Access::DataKey }
         );
-        for ep in [rest::QUERY, rest::SCHEMA] {
+        for ep in [rest::QUERY, rest::SCHEMA, rest::TYPES] {
             assert_eq!(ep.service, Service::Rest);
             assert_eq!(ep.scope, Scope::Api);
             assert!(ENDPOINTS.contains(&ep));
@@ -2100,6 +2111,7 @@ mod tests {
             // Data API.
             ("rest.query", Access::DataKey),
             ("rest.schema", Access::DataKey),
+            ("rest.types", Access::DataKey),
             // Studio sign-in.
             ("auth.auth_request", Access::Public),
             ("auth.instance", Access::Public),

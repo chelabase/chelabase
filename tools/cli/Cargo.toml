@@ -18,6 +18,7 @@ chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-init = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
+chelabase-typegen = { workspace = true }
 chelabase-types = { workspace = true }
 chelabase-zitadel = { workspace = true }
 clap = { workspace = true }

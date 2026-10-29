@@ -2629,3 +2629,165 @@ async fn count_respects_rls_and_filters() {
     })
     .await;
 }
+
+/// `GET /data/v1/types` as a secret key with `authenticated` on main, with `If-None-Match`.
+async fn types_of(l: &Live, query: &str, if_none_match: Option<&str>) -> reqwest::Response {
+    let mut req = l
+        .http
+        .get(format!("http://{}/data/v1/types{query}", l.rest))
+        .header(
+            IDENTITY_HEADER,
+            l.token(l.main_id(), DataKeyKind::Secret, "authenticated"),
+        );
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    req.send().await.unwrap()
+}
+
+/// What `chelabase gen types` writes for the same key and options: its fetch plan over
+/// `GET /data/v1/schema` (the CLI's own code, minus the HTTP client), then the generator.
+async fn cli_output(l: &Live, which: chelabase_typegen::Which, format: chelabase_typegen::Format) -> String {
+    let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
+        let schema = l.schema_of("authenticated", database.as_deref()).await;
+        // The CLI parses the response text, exactly as served.
+        serde_json::from_str::<chelabase_typegen::Schema>(&schema.text)
+            .map_err(|e| format!("{e}: {schema:?}"))
+    })
+    .await
+    .unwrap();
+    chelabase_typegen::render(&schemas, format).unwrap()
+}
+
+/// A schema with what the generator treats specially: int8 and numeric columns, an enum,
+/// a generated column, a set-returning function and a function returning a row.
+const TYPES_DDL: &str = "CREATE TYPE mood AS ENUM ('sad', 'happy');
+     CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+       total numeric NOT NULL, qty int NOT NULL DEFAULT 1, m mood, note text, \
+       doubled bigint GENERATED ALWAYS AS (qty * 2) STORED);
+     CREATE FUNCTION latest() RETURNS orders LANGUAGE sql AS 'SELECT * FROM orders ORDER BY id DESC LIMIT 1';
+     CREATE FUNCTION bump(n int DEFAULT 1) RETURNS SETOF bigint LANGUAGE sql AS 'SELECT n::bigint';";
+
+/// The body is `chelabase gen types`' output byte for byte, for the default, `database=`
+/// and `all_databases=true`, as `ts` and as `json`.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_matches_the_cli_output() {
+    use chelabase_typegen::{Format, Which};
+    live("types", |l| async move {
+        l.owner(TYPES_DDL).await;
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE TABLE events (id bigint PRIMARY KEY, amount numeric, at timestamptz);",
+        )
+        .await;
+        l.enable(l.main_id(), "analytics").await;
+
+        for (query, which) in [
+            ("", Which::Main),
+            ("?database=analytics", Which::One("analytics".into())),
+            ("?all_databases=true", Which::All),
+        ] {
+            for (format, suffix, content_type) in [
+                (Format::Ts, "", "text/typescript; charset=utf-8"),
+                (Format::Ts, "format=ts", "text/typescript; charset=utf-8"),
+                (Format::Json, "format=json", "application/json"),
+            ] {
+                let q = match (query.is_empty(), suffix.is_empty()) {
+                    (_, true) => query.to_string(),
+                    (true, false) => format!("?{suffix}"),
+                    (false, false) => format!("{query}&{suffix}"),
+                };
+                let resp = types_of(&l, &q, None).await;
+                assert_eq!(resp.status(), 200, "{q}");
+                let headers = resp.headers().clone();
+                assert_eq!(headers["content-type"], content_type, "{q}");
+                assert_eq!(headers["cache-control"], "no-store", "{q}");
+                let body = resp.text().await.unwrap();
+                let want = cli_output(&l, which.clone(), format).await;
+                assert_eq!(body, want, "{q}");
+            }
+        }
+        // The cases differ where they should.
+        let main = cli_output(&l, Which::Main, Format::Ts).await;
+        let all = cli_output(&l, Which::All, Format::Ts).await;
+        assert!(main.contains("orders: {") && !main.contains("events"), "{main}");
+        assert!(all.contains("export type Databases = {") && all.contains("events: {"), "{all}");
+        assert!(main.contains("total: string;") && main.contains("id: Int8;"), "{main}");
+    })
+    .await;
+}
+
+/// `format=json` is the runtime map the module's `types` constant holds.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_json_is_the_runtime_map() {
+    live("typesjson", |l| async move {
+        l.owner(TYPES_DDL).await;
+        let module = types_of(&l, "", None).await.text().await.unwrap();
+        let json: Value = serde_json::from_str(&types_of(&l, "?format=json", None).await.text().await.unwrap()).unwrap();
+        let schema: chelabase_typegen::Schema =
+            serde_json::from_str(&l.schema_of("authenticated", None).await.text).unwrap();
+        assert_eq!(json, chelabase_typegen::runtime(&schema).unwrap());
+        assert_eq!(module, chelabase_typegen::generate(&schema).unwrap());
+        assert_eq!(json["defaultSchema"], "public");
+        let public = &json["schemas"]["public"];
+        assert_eq!(
+            public["tables"]["orders"],
+            json!({ "id": "int8", "total": "numeric", "doubled": "int8" })
+        );
+        assert_eq!(public["functions"]["bump"], json!({ "returns": "int8" }));
+        assert_eq!(
+            public["functions"]["latest"],
+            json!({ "columns": { "id": "int8", "total": "numeric", "doubled": "int8" } })
+        );
+        // Every entry's text is in the module's `types` constant.
+        assert!(module.contains("orders: { doubled: \"int8\", id: \"int8\", total: \"numeric\" },"), "{module}");
+    })
+    .await;
+}
+
+/// A 200's ETag and body.
+async fn tag_of(l: &Live, q: &str) -> (String, String) {
+    let resp = types_of(l, q, None).await;
+    assert_eq!(resp.status(), 200);
+    let tag = resp.headers()["etag"].to_str().unwrap().to_owned();
+    (tag, resp.text().await.unwrap())
+}
+
+/// The ETag is the body's: equal for the same schema, a 304 for `If-None-Match`, a new one
+/// once the schema changes.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_etag_and_304() {
+    live("typesetag", |l| async move {
+        l.owner(TYPES_DDL).await;
+        let (ts, ts_body) = tag_of(&l, "").await;
+        let (again, again_body) = tag_of(&l, "").await;
+        assert_eq!((&ts, &ts_body), (&again, &again_body));
+        assert!(ts.starts_with('"') && ts.ends_with('"') && !ts.starts_with("W/"), "{ts}");
+        let (json_tag, _) = tag_of(&l, "?format=json").await;
+        assert_ne!(ts, json_tag, "the tag is the body's");
+
+        for header in [ts.clone(), format!("W/{ts}"), format!("\"other\", {ts}"), "*".to_string()] {
+            let resp = types_of(&l, "", Some(&header)).await;
+            assert_eq!(resp.status(), 304, "{header}");
+            assert_eq!(resp.headers()["etag"], ts.as_str());
+            assert_eq!(resp.headers()["cache-control"], "no-store");
+            assert_eq!(resp.text().await.unwrap(), "");
+        }
+        let resp = types_of(&l, "", Some("\"other\"")).await;
+        assert_eq!(resp.status(), 200);
+        // The JSON's tag doesn't match the module.
+        assert_eq!(types_of(&l, "", Some(&json_tag)).await.status(), 200);
+
+        l.owner("ALTER TABLE orders ADD COLUMN extra bigint;").await;
+        let (changed, body) = tag_of(&l, "").await;
+        assert_ne!(changed, ts);
+        assert!(body.contains("extra"), "{body}");
+        assert_eq!(types_of(&l, "", Some(&ts)).await.status(), 200);
+        assert_eq!(types_of(&l, "", Some(&changed)).await.status(), 304);
+    })
+    .await;
+}

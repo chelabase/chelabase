@@ -1,5 +1,5 @@
 //! The HTTP edge. The public listener serves the gateway (`POST /data/v1/query`,
-//! `GET /data/v1/schema`) and trusts only the gateway's identity token, minted for `rest`
+//! `GET /data/v1/schema`, `GET /data/v1/types`) and trusts only the gateway's identity token, minted for `rest`
 //! with a data key's identity. The internal listener serves the orchestrator behind a
 //! static bearer: `GET /internal/schema/{branch_id}` (`?database=&role=`),
 //! `POST /internal/branches/{id}/invalidate`,
@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::rejection::BytesRejection;
+use axum::extract::rejection::{BytesRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -115,6 +115,7 @@ pub fn api_router<S: ConnSource>() -> OpenApiRouter<Arc<AppState<S>>> {
     OpenApiRouter::new()
         .routes(routes!(query))
         .routes(routes!(role_schema))
+        .routes(routes!(types))
 }
 
 pub fn router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
@@ -323,6 +324,186 @@ async fn role_schema<S: ConnSource>(
     }
 }
 
+/// `GET /data/v1/types`' query, for the document: [`types_options`] parses it.
+#[derive(utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[allow(dead_code)]
+struct TypesParams {
+    /// `ts` (the default): the TypeScript module `chelabase gen types` writes. `json`: the
+    /// runtime `types` map alone, exactly what the module's `types` constant holds.
+    #[param(inline)]
+    format: Option<TypesFormat>,
+    /// Generate this database (not the main one) as `Database`. It must be served and, when
+    /// the key has a database list, on it. Not with `all_databases`.
+    database: Option<String>,
+    /// `true`: every database the key reaches, as `Databases` and a `types` map keyed by
+    /// name (main as `main`). With only main reachable, the one-database module.
+    all_databases: Option<bool>,
+}
+
+#[derive(utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+#[allow(dead_code)]
+enum TypesFormat {
+    Ts,
+    Json,
+}
+
+/// `format`, `database` and `all_databases` with `gen types`' meanings; anything else, a
+/// repeat, or `database` with `all_databases=true` is refused (`invalid_query`).
+fn types_options(
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+) -> Result<(chelabase_typegen::Which, chelabase_typegen::Format), ApiError> {
+    let Query(pairs) = query.map_err(|_| ApiError::invalid_query("the query string isn't valid"))?;
+    let (mut format, mut database, mut all) = (None, None, None);
+    for (name, value) in pairs {
+        let slot = match name.as_str() {
+            "format" => &mut format,
+            "database" => &mut database,
+            "all_databases" => &mut all,
+            _ => {
+                return Err(ApiError::invalid_query(
+                    "the types route takes `format`, `database` and `all_databases` only",
+                ));
+            }
+        };
+        if slot.replace(value).is_some() {
+            return Err(ApiError::invalid_query(format!("`{name}` is given more than once")));
+        }
+    }
+    let format = match format.as_deref() {
+        None | Some("ts") => chelabase_typegen::Format::Ts,
+        Some("json") => chelabase_typegen::Format::Json,
+        Some(_) => return Err(ApiError::invalid_query("`format` is `ts` or `json`")),
+    };
+    let all = match all.as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => return Err(ApiError::invalid_query("`all_databases` is `true` or `false`")),
+    };
+    let which = chelabase_typegen::Which::from_options(database, all)
+        .map_err(|e| ApiError::invalid_query(e.to_string()))?;
+    Ok((which, format))
+}
+
+/// The ETag of a body: a strong tag, its SHA-256 in hex. It depends on the bytes alone.
+fn types_etag(body: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(body);
+    let mut tag = String::with_capacity(66);
+    tag.push('"');
+    for b in digest {
+        use std::fmt::Write as _;
+        let _ = write!(tag, "{b:02x}");
+    }
+    tag.push('"');
+    tag
+}
+
+/// Whether `If-None-Match` names `etag` (weak comparison, as RFC 9110 has for it), or is `*`.
+fn none_match(headers: &HeaderMap, etag: &str) -> bool {
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .any(|t| t == "*" || t.strip_prefix("W/").unwrap_or(t) == etag)
+}
+
+/// `chelabase gen types`' output for the key, built from the schema `GET /data/v1/schema`
+/// gives it, through the same generator.
+#[utoipa::path(
+    get,
+    path = "/data/v1/types",
+    operation_id = "getDataTypes",
+    tag = "data",
+    summary = "The generated types for the key's schema",
+    description = "What `chelabase gen types` writes for the same secret key and options, byte for byte: the TypeScript module (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the runtime `types` map alone. It is built from exactly what `GET /data/v1/schema` gives the key. The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`): the schema follows the key.",
+    params(TypesParams),
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The module (`format=ts`, `text/typescript`) or the runtime `types` map (`format=json`)",
+            content((String = "text/typescript"), (Object = "application/json")),
+            headers(
+                ("ETag" = String, description = "A strong tag: the body's SHA-256"),
+                ("Cache-Control" = String, description = "`no-store`"),
+            )),
+        (status = 304, description = "`If-None-Match` names the current `ETag`: the body is unchanged (and not sent)",
+            headers(
+                ("ETag" = String, description = "The current tag"),
+                ("Cache-Control" = String, description = "`no-store`"),
+            )),
+        (status = 400, description = "`invalid_query`, `user_token_with_secret_key`: an option isn't `format=ts|json`, `database=<name>` or `all_databases=true|false`, is repeated, or `database` came with `all_databases=true` (`invalid_query`); or a `Chelabase-User` token came with the secret key", body = DataErrorEnvelope),
+        (status = 401, description = "`unauthorized`: the key is missing, invalid, revoked or not a secret key, or its branch is gone", body = DataErrorEnvelope),
+        (status = 403, description = "`role_not_allowed`: the role is owner-level or has system privileges: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of a superuser role, `neon_superuser` or a system role (BYPASSRLS alone is allowed)", body = DataErrorEnvelope),
+        (status = 404, description = "`unknown_database`: the database (or, with `all_databases`, main) doesn't exist, isn't served or isn't on the key's list", body = DataErrorEnvelope),
+        (status = 409, description = "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it)", body = DataErrorEnvelope),
+        (status = 429, description = "`rate_limited`: too many requests", body = DataErrorEnvelope),
+        (status = 500, description = "`internal`: an unexpected error; the message carries the request id", body = DataErrorEnvelope),
+        (status = 503, description = "`unavailable`: the database can't be reached right now; retry after `Retry-After`", body = DataErrorEnvelope,
+            headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
+        (status = 504, description = "`timeout`: reading the schema ran past the statement timeout", body = DataErrorEnvelope),
+    ),
+)]
+async fn types<S: ConnSource>(
+    State(state): State<Arc<AppState<S>>>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (data, rid) = match identity(&state, &headers) {
+        Ok(id) => id,
+        Err(e) => return e.into_response(),
+    };
+    // As on the schema route: the gateway refuses public keys here; check again.
+    if data.kind != DataKeyKind::Secret {
+        return ApiError::unauthorized("the schema needs a secret key").into_response();
+    }
+    let (which, format) = match types_options(query) {
+        Ok(options) => options,
+        Err(e) => return e.into_response(),
+    };
+    // `gen types`' own plan, one schema call at a time, each exactly `GET /data/v1/schema`'s.
+    let (engine, data_ref, rid_ref) = (&state.engine, &data, rid.as_str());
+    let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
+        let schema = engine
+            .role_schema(data_ref, database.as_deref(), rid_ref)
+            .await
+            .map_err(|f| public_failure(f, rid_ref))?;
+        serde_json::from_value::<chelabase_typegen::Schema>(schema)
+            .map_err(|e| ApiError::internal(rid_ref, format!("the schema isn't the generator's: {e}")).into_response())
+    })
+    .await;
+    let schemas = match schemas {
+        Ok(schemas) => schemas,
+        Err(resp) => return resp,
+    };
+    let body = match chelabase_typegen::render(&schemas, format) {
+        Ok(body) => body,
+        Err(e) => {
+            // The names in it are the key's own schema's.
+            let mut message = e.to_string();
+            let mut source = std::error::Error::source(&e);
+            while let Some(s) = source {
+                message.push_str(": ");
+                message.push_str(&s.to_string());
+                source = s.source();
+            }
+            return ApiError::new(StatusCode::CONFLICT, "conflict", message).into_response();
+        }
+    };
+    let etag = types_etag(body.as_bytes());
+    let content_type = match format {
+        chelabase_typegen::Format::Ts => "text/typescript; charset=utf-8",
+        chelabase_typegen::Format::Json => "application/json",
+    };
+    let cache = [(header::ETAG, etag.clone()), (header::CACHE_CONTROL, "no-store".to_string())];
+    if none_match(&headers, &etag) {
+        return (StatusCode::NOT_MODIFIED, cache).into_response();
+    }
+    (cache, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
 async fn branch_schema<S: ConnSource>(
     State(state): State<Arc<AppState<S>>>,
     Path(branch): Path<Uuid>,
@@ -467,5 +648,45 @@ mod tests {
                 "{text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod types_tests {
+    use super::*;
+
+    fn with(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(header::IF_NONE_MATCH, v.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn the_etag_is_the_bodys_hash() {
+        let tag = types_etag(b"x");
+        assert_eq!(tag, types_etag(b"x"));
+        assert_ne!(tag, types_etag(b"y"));
+        assert_eq!(tag.len(), 66);
+        assert!(tag.starts_with('"') && tag.ends_with('"'));
+        // SHA-256 of "x".
+        assert_eq!(
+            tag,
+            "\"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881\""
+        );
+    }
+
+    #[test]
+    fn if_none_match_compares_weakly_and_takes_lists() {
+        let tag = types_etag(b"x");
+        assert!(none_match(&with(&[&tag]), &tag));
+        assert!(none_match(&with(&[&format!("W/{tag}")]), &tag));
+        assert!(none_match(&with(&[&format!("\"a\", {tag}")]), &tag));
+        assert!(none_match(&with(&["\"a\"", &tag]), &tag));
+        assert!(none_match(&with(&["*"]), &tag));
+        assert!(!none_match(&with(&[]), &tag));
+        assert!(!none_match(&with(&["\"a\""]), &tag));
+        assert!(!none_match(&with(&[&tag[1..65]]), &tag), "unquoted");
     }
 }
