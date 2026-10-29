@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { X } from "lucide-react";
+import { CircleAlert, ListChecks, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { changesWord, CollapseButton, CollapsedStrip, lockWords } from "@/components/table-editor/panel-bits";
 import { cn } from "@/lib/utils";
@@ -23,7 +23,7 @@ export function PrivilegePanel({ editor, role }: { editor: PrivilegeEditorState;
   if (collapsed) {
     return (
       <aside aria-label={label} className="flex lg:sticky lg:top-[52px] lg:h-[calc(100dvh-52px)]">
-        <CollapsedStrip text={heading} onExpand={() => setCollapsed(false)} />
+        <CollapsedStrip text={heading} icon={notApplied ? CircleAlert : ListChecks} badge={notApplied ? undefined : review ? review.edits.length : pending.length} onExpand={() => setCollapsed(false)} />
       </aside>
     );
   }

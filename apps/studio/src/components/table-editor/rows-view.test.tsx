@@ -44,14 +44,18 @@ describe("RowsView", () => {
     expect(within(screen.getByRole("navigation", { name: "Tables" })).getByRole("button", { name: "invoices" })).toHaveTextContent("3");
   });
 
-  it("header_click_cycles_the_sort", async () => {
+  it("the_header_menu_sorts_and_clears", async () => {
     const { f, user } = renderEditor();
-    const header = await within(await grid()).findByRole("columnheader", { name: /amount_cents/ });
-    await user.click(header);
+    const pick = async (item: string) => {
+      await user.click(within(await grid()).getByRole("button", { name: "Column actions for amount_cents" }));
+      await user.click(await screen.findByRole("menuitem", { name: item }));
+    };
+    await within(await grid()).findByRole("columnheader", { name: /amount_cents/ });
+    await pick("Sort ascending");
     await vi.waitFor(async () => expect((await selects(f)).at(-1).tree.orderBy).toEqual([{ col: "amount_cents", dir: "asc" }, { col: "id", dir: "asc" }]));
-    await user.click(header);
+    await pick("Sort descending");
     await vi.waitFor(async () => expect((await selects(f)).at(-1).tree.orderBy[0]).toEqual({ col: "amount_cents", dir: "desc" }));
-    await user.click(header);
+    await pick("Clear sort");
     await vi.waitFor(async () => expect((await selects(f)).at(-1).tree.orderBy).toEqual([{ col: "id", dir: "asc" }]));
   });
 

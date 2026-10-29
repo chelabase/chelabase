@@ -256,7 +256,8 @@ describe("E-M2: sort and filter after the table's columns change", () => {
     };
     const { f, user, queryClient } = renderEditor({ routes: { [`GET ${T}`]: table } });
     await cell("45000");
-    await user.click(within(await grid()).getByRole("columnheader", { name: /memo/ }));
+    await user.click(within(await grid()).getByRole("button", { name: "Column actions for memo" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Sort ascending" }));
     await vi.waitFor(async () => expect(JSON.stringify((await selects(f)).at(-1).tree)).toContain("memo"));
     renamed = true;
     const before = (await selects(f)).length;

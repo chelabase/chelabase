@@ -7,16 +7,18 @@ export interface MenuProps {
   trigger: ReactElement;
   children: ReactNode;
   align?: "start" | "end";
+  /** Where focus goes when the menu closes (the trigger by default): an element, or false to leave it. */
+  finalFocus?: () => HTMLElement | false | null;
 }
 
 /** A menu styled as the account menu: deep water, strong hairline, square, highlighted items outlined in sand. */
-export function Menu({ trigger, children, align = "end" }: MenuProps) {
+export function Menu({ trigger, children, align = "end", finalFocus }: MenuProps) {
   return (
     <MenuPrimitive.Root>
       <MenuPrimitive.Trigger render={trigger} />
       <MenuPrimitive.Portal>
         <MenuPrimitive.Positioner align={align} sideOffset={6} className="z-50">
-          <MenuPrimitive.Popup className="min-w-48 border border-line-strong bg-deep p-1 text-sm text-chalk outline-none">
+          <MenuPrimitive.Popup finalFocus={finalFocus ? () => finalFocus() ?? true : undefined} className="min-w-48 border border-line-strong bg-deep p-1 text-sm text-chalk outline-none">
             {children}
           </MenuPrimitive.Popup>
         </MenuPrimitive.Positioner>
@@ -47,6 +49,11 @@ export function MenuItem({ onClick, children, destructive = false, disabled }: M
       {children}
     </MenuPrimitive.Item>
   );
+}
+
+/** A hairline between groups of items. */
+export function MenuSeparator() {
+  return <MenuPrimitive.Separator className="my-1 h-px bg-line" />;
 }
 
 /** A line of explanation inside a menu (not an item: never focused). */

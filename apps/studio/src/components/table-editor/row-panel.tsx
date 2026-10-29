@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { Rows3 } from "lucide-react";
 import { consoleQueryExact, useGetTable, useInsertDefaultRow, useListTypes, type ObjectSummary } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { Modal } from "@/components/ui/dialog";
@@ -118,9 +119,13 @@ export function RowPanelHost(props: RowPanelHostProps) {
   const setCollapsed = useTableEditor((s) => s.setCollapsed);
   // A Discard remounts the panel empty.
   const epoch = useTableEditor((s) => s.rowDraftEpoch);
+  // Unsaved edits (a draft the discard prompt guards), or a new row: the strip's sand dot.
+  const held = useTableEditor((s) => s.rowDraft !== null);
   return (
     <>
-      {panel.collapsed && <CollapsedStrip text={panel.row === null ? "New row" : "Row"} onExpand={() => setCollapsed(false)} />}
+      {panel.collapsed && (
+        <CollapsedStrip text={panel.row === null ? "New row" : "Row"} icon={Rows3} badge={panel.row === null || held ? "dot" : undefined} onExpand={() => setCollapsed(false)} />
+      )}
       <RowPanel key={`${props.target.key}|${props.target.role ?? ""}|${panel.row ?? ""}|${epoch}`} {...props} rowKeyText={panel.row} hidden={panel.collapsed} />
     </>
   );

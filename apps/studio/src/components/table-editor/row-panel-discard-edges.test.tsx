@@ -96,16 +96,16 @@ describe("F6 ruling 2: Insert with all defaults", () => {
   });
 });
 
-describe("F6 ruling 3: the column strip", () => {
+describe("F6 ruling 3: the column chips", () => {
   it("a_chip_over_a_dirty_panel_asks_and_discard_opens_the_column_form", async () => {
     const { user } = mount();
     const panel = await openRow(user, 2);
     await dirty(user, panel);
-    await user.click(within(screen.getByRole("list", { name: "Columns" })).getByRole("button", { name: /^memo / }));
+    await user.click(within(screen.getByRole("grid", { name: "public.invoices" })).getByRole("columnheader", { name: "memo" }));
     await answer(user, await dialog("Discard changes to row 2?"), "Keep editing");
     expect(amount()).toHaveValue("450001");
     expect(screen.queryByRole("complementary", { name: "Edit column memo" })).toBeNull();
-    await user.click(within(screen.getByRole("list", { name: "Columns" })).getByRole("button", { name: /^memo / }));
+    await user.click(within(screen.getByRole("grid", { name: "public.invoices" })).getByRole("columnheader", { name: "memo" }));
     await answer(user, await dialog("Discard changes to row 2?"), "Discard");
     expect(await screen.findByRole("complementary", { name: "Edit column memo" })).toBeInTheDocument();
     expect(rowPanel()).toBeNull();
@@ -115,7 +115,7 @@ describe("F6 ruling 3: the column strip", () => {
     const { user } = mount();
     const panel = await openRow(user, 2);
     await dirty(user, panel);
-    await user.click(within(screen.getByRole("list", { name: "Columns" })).getByRole("button", { name: "Add column" }));
+    await user.click(screen.getByRole("button", { name: "Add column" }));
     await answer(user, await dialog("Discard changes to row 2?"), "Keep editing");
     expect(amount()).toHaveValue("450001");
   });

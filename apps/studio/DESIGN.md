@@ -83,7 +83,6 @@ spacing:
   page-gutter: "32px"
   page-column: "56rem"
   table-list: "248px"
-  column-strip: "44px"
   grid-gutter: "88px"
   pending-column: "160px"
   panel: "360px"
@@ -173,9 +172,6 @@ components:
     textColor: "{colors.chalk-dim}"
     typography: "{typography.micro}"
     width: "{spacing.grid-gutter}"
-  column-strip:
-    backgroundColor: "{colors.deep-water}"
-    height: "{spacing.column-strip}"
   column-chip:
     textColor: "{colors.chalk}"
     rounded: "{rounded.none}"
@@ -224,7 +220,7 @@ Studio is a dark tool that recedes. One deep-water rail and an ink header, separ
 
 Density is calm and even: 36px rows, 18px line icons, a 14px UI face built for legibility. There are no depth bands, chart drawings or neat-line ticks in the app chrome. The confirmed rejections are a grey or green SaaS sidebar with glowing active pills, tinted cards and icon tiles; neon glow; purple SaaS; cream-and-terracotta editorial; and anything taken from Supabase's look, menu tree or wording.
 
-Data surfaces keep structure and data on one plane: a table's columns stay in sight as a typed strip over its rows, and every change to them is staged, shown as exact SQL with its dry-run line, and applied once from one right panel.
+Data surfaces keep structure and data on one plane: a table's columns stay in sight as typed chips in the grid's one header row, and every change to them is staged, shown as exact SQL with its dry-run line, and applied once from one right panel.
 
 The shell is desktop first. Phone-width behaviour is an open gap, not a rule (see Layout).
 
@@ -253,12 +249,12 @@ A warm matte-black (Basalt) dark carrying pastel roles, each with one meaning.
 
 ### Neutral
 - **Lagoon Ink** (`ink`): the ground of the page and the header (`--background`); also `--primary-foreground`, the grid's ground and the fill of fields and checkboxes.
-- **Deep Water** (`deep-water`): the second layer (`--muted`): the rail, menu popups, tooltips, the editor gutter, the table list, the column strip, the right panel and its collapsed strip.
-- **Channel** (`channel`): secondary surfaces (`--secondary`): the grid's header row, the current table in the list, the row open in the row panel, the chosen tab segment.
+- **Deep Water** (`deep-water`): the second layer (`--muted`): the rail, menu popups, tooltips, the editor gutter, the table list, the right panel and its collapsed strip.
+- **Channel** (`channel`): secondary surfaces (`--secondary`): the grid's header row (its column chips), the current table in the list, the row open in the row panel, the chosen tab segment.
 - **Chalk** (`chalk`): primary text (`--foreground`), active and hovered rail items, cell values.
 - **Chalk Dim** (`chalk-dim`): secondary text (`--muted-foreground`), inactive rail items, placeholders, grid headers, the gutter's row numbers, NULL cells.
 - **Hairline** (`hairline`, chalk 16%): `--border`; the header's bottom rule, the rail foot's top rule, the editor frame, every grid column's right edge and every row's bottom edge.
-- **Strong Hairline** (`hairline-strong`, chalk 34%): the rail's right edge, popup and tooltip borders, placeholder dashes, scrollbar thumbs, the grid header's and the column strip's bottom rules, the right panel's left edge.
+- **Strong Hairline** (`hairline-strong`, chalk 34%): the rail's right edge, popup and tooltip borders, placeholder dashes, scrollbar thumbs, the grid header's bottom rule, the right panel's left edge.
 - **Control Border** (`control-border`, chalk 40%): `--input`, the border of form controls, checkboxes and segmented groups. 40% clears WCAG 1.4.11's 3:1 on ink, deep water and channel; 34% did not on every ground.
 - **Chalk Washes** (`chalk-wash` 6%, `chalk-wash-strong` 8%): hover and highlight fills. 6% on rail rows, the behaviour trigger and segments; 8% on the header trigger and menu items.
 - **Zebra** (`zebra`, chalk 4.5%): every second grid row (and its gutter cell, mixed onto ink).
@@ -292,7 +288,7 @@ A warm matte-black (Basalt) dark carrying pastel roles, each with one meaning.
 - **Body** (400, 0.875rem): all shell text: rail labels, the account trigger, menu items, form labels and fields, segments.
 - **Note** (400, 13px): the right panel's running text: dry-run lines, warnings, errors, edit labels, explanations. One step under body so a panel's prose sits below its controls.
 - **Label** (400, 0.75rem): tooltips, the email line in the account menu, grid header names, field errors.
-- **Micro** (400, 11px, line-height 1rem): the smallest step, for dense annotations that sit beside larger text: the grid gutter's row numbers, the column strip's chips (in mono: name over short type and key marks), and tags (`key`, `new`, `pending`, an object's kind, a shortcut key). Always on a solid ground in chalk or chalk dim, never as running text or a control's only label.
+- **Micro** (400, 11px, line-height 1rem): the smallest step, for dense annotations that sit beside larger text: the grid gutter's row numbers, the column chips (in mono: name over short type and key marks), and tags (`key`, `new`, `pending`, an object's kind, a shortcut key). Always on a solid ground in chalk or chalk dim, never as running text or a control's only label.
 - **Code** (JetBrains Mono, 13px in the editor, the row panel's fields and the edit list, 12px in hover docs, SQL blocks and grid cells): SQL, identifiers, cell values, table and column names.
 
 ### Named Rules
@@ -308,7 +304,7 @@ The signed-in frame is a two-column grid: the rail column on the left, and on th
 - **Rail anatomy:** the home link (52px tall, aligned with the header) at the top, the item list (36px rows, 4px apart, 8px vertical padding), and the behaviour trigger at the foot behind a hairline. Icons sit centred in the collapsed rail at a 19px inset.
 - **Header:** `header` tall, 16px side gutters, sticky, a hairline below. Left: the context slot (the table editor fills it with one labelled picker per level). Right: the account trigger.
 - **Page body:** pages own their composition. Dashboard and project pages use a centred `page-column` (56rem) with `page-gutter` padding; the API reference runs full width.
-- **Data surfaces (the table editor):** a `table-list` (248px) deep-water list on the left behind a hairline; the work area (table bar, then the column strip and the grid filling the rest); and at most one right panel. The grid's gutter is `grid-gutter` (88px: checkbox, row number, open-row button); rows and the header row are `row` (36px); a pending column's track is `pending-column` (160px).
+- **Data surfaces (the table editor):** a `table-list` (248px) deep-water list on the left behind a hairline; the work area (table bar, then the grid filling the rest, its header row the column chips); and at most one right panel. The grid's gutter is `grid-gutter` (88px: checkbox, row number, open-row button); rows and the header row are `row` (36px); a pending column's track is `pending-column` (160px).
 - **The right panel:** one panel at a time (pending changes, a column form or a row), `panel` wide (360px; the row panel `panel-wide`, 26rem, at most 45vw), deep water behind a strong hairline. It collapses to a `panel-collapsed` (48px) strip that keeps the view mounted, so a form keeps its draft.
 - **Motion:** width changes take 200ms on `ease-design` (`cubic-bezier(0.16, 1, 0.3, 1)`), the rail's width and the grid column alike. Under `prefers-reduced-motion` they are instant.
 - **Open gap: phone width.** Mobile is not designed. A later pass gives the rail a drawer and the header its own menu trigger. Until then, nothing here prescribes narrow-screen behaviour.
@@ -318,7 +314,7 @@ The signed-in frame is a two-column grid: the rail column on the left, and on th
 
 ## Elevation & Depth
 
-Flat. There are no shadows anywhere in the shell, including when the hover-mode rail overlays the page. Depth is tonal and linear: ink is the ground, deep water is the raised layer (rail, popups, tooltips, the table list, the column strip, the right panel), channel marks the grid's header row and what is current, and hairlines draw the edges. Overlays are separated from the page by a 34% chalk hairline, not by a shadow or a scrim. A 2px inset edge (drawn with an inset box-shadow) is an edge-mark, not elevation: it marks state on one side of a row, chip or segment.
+Flat. There are no shadows anywhere in the shell, including when the hover-mode rail overlays the page. Depth is tonal and linear: ink is the ground, deep water is the raised layer (rail, popups, tooltips, the table list, the right panel), channel marks the grid's header row and what is current, and hairlines draw the edges. Overlays are separated from the page by a 34% chalk hairline, not by a shadow or a scrim. A 2px inset edge (drawn with an inset box-shadow) is an edge-mark, not elevation: it marks state on one side of a row, chip or segment.
 
 ### Named Rules
 **The Hairline Not Shadow Rule.** A surface that sits above another gets a deep-water fill and a strong hairline. It never gets a drop shadow or glow.
@@ -381,21 +377,21 @@ Rows | Structure: 14px chalk-dim text, chalk on hover; the active tab is channel
 ### Data grid
 The rows of a table: an ARIA grid on ink, virtualized, with a sticky header row and a sticky gutter.
 - **Rows:** 36px, mono 12px chalk; NULL in chalk dim. A hairline under every row and on every column's right edge. Every second row is zebra (chalk 4.5%). A selected row is a sand wash (sand 8%); the row open in the row panel is channel with a 2px sand inset edge on its left.
-- **Header row:** channel, 12px chalk-dim mono names, a strong hairline below. Hover or sorted turns the name chalk; a 12px arrow shows the direction. Clicking sorts.
+- **Header row:** one row, channel, a strong hairline below. Each header is its column's chip (below) when the table's structure is read; otherwise a 12px chalk-dim mono name. A 12px arrow after the name shows the sort direction. A header's `⋯` menu starts with Sort ascending, Sort descending and (when sorted) Clear sort, then the chip's structure items. Clicking a chip (or Enter on it) opens its column form; clicking a plain name header (or Enter) cycles the sort. Shift+F10 opens the focused header's menu.
 - **Gutter:** 88px, sticky: a themed checkbox, the row number in micro chalk dim, and an open-row button that shows on hover.
 - **Resize grip:** a 5px strip straddling each header's right edge; sand on hover and while dragging. Alternatives that need no drag (WCAG 2.5.7): click the edge to widen 16px, Shift+click to narrow, double-click to reset; on a focused header, Alt+Left / Alt+Right steps 16px. Widths clamp to 64–960px. The header and its grip are named separately (the grip is a `separator`, "Resize <column>").
-- **Pending columns:** a column added in the pending changes gets its own 160px track after the table's columns: its header carries a 2px sand-45% top edge and a chalk-dim mono name; its cells are empty placeholders with a dashed sand-30% left edge over a sand-3% fill, outside the keyboard model.
+- **Pending columns:** a column added in the pending changes gets its own 160px track after the table's columns: its header is its chip (or, before the structure is read, a 2px sand-45% top edge and a chalk-dim mono name) and is reachable by the keys on the header row; its cells are empty placeholders with a dashed sand-30% left edge over a sand-3% fill, outside the keyboard model.
 - **Cells:** focus is a 2px sand outline inset by 2px. Enter or F2 edits, typing starts editing, Escape cancels; arrows, Home/End, PageUp/PageDown move.
 
-### Column strip
-A typed strip over the grid's columns, sharing the grid's template and scroll so each chip sits exactly over its column. Deep water, 44px, a strong hairline below; an empty cell over the gutter keeps alignment.
-- **Chip:** 36px, a hairline on its right edge. Two lines in mono micro: the column name in chalk, then the short type (`int8`, `timestamptz`, `varchar(80)[]`; the full name in its title and accessible name) and key marks (`key`, `→ fk`, `null`) in chalk dim, joined by ` · `. A 24px column-actions menu at the right. Hover is a 5% chalk wash.
+### Column chips
+The grid's header cells, one per column, in its one sticky header row.
+- **Chip:** 36px, a hairline on its right edge. Two lines in mono micro: the column name in chalk, then the short type (`int8`, `timestamptz`, `varchar(80)[]`; the full name in its title and accessible description) and key marks (`key`, `→ fk`, `null`) in chalk dim, joined by ` · `. A 24px column-actions menu at the right. Hover is a 5% chalk wash.
 - **Pending marks:** added and changed chips carry a 2px sand inset left edge (added also a sand "new"); dropped chips a coral edge and a coral strike; a column just applied a seafoam edge.
-- **Add column:** at the strip's end, an outline button on channel whose border turns sand on hover.
+- **Add column:** in a 136px track after the last column of the header row, an outline button on channel whose border turns sand on hover.
 
 ### Right panel
 Deep water, a strong hairline on its left edge, 16px padding, 12px between blocks. The heading row holds a title-step heading and the one collapse control: a 28px square with a hairline frame and a 16px PanelRightClose icon.
-- **Collapsed strip:** 48px, deep water, a strong hairline on its left: a 36px expand button (control border, sand on hover) above the open view's name set vertically in 14px chalk, led by an 8px sand square ("Pending changes · 3", "New column · draft, not added yet").
+- **Collapsed strip:** 48px, deep water, a strong hairline on its left, like an activity bar: a 36px expand button (control border, sand on hover), then one 18px chalk-dim icon naming what the panel holds (Columns3 a column form, ListChecks pending changes, Rows3 a row) with a small badge: a sand micro count (ink, tabular) for pending changes, a 6px sand dot for a held draft (a column form, a new or edited row). No vertical text: the full name ("Pending changes · 3", "New column · draft, not added yet") is the button's tooltip and accessible description.
 - **Pending changes:** a numbered list of edits (mono 13px, hairline-framed rows, a remove control), the SQL block (ink, hairline frame, mono 12px; the highlighted edit's statement in sand), then the outcome lines and the footer (Discard ghost, Apply sand).
 
 ### Dry-run result
@@ -424,7 +420,7 @@ Scalar is forced into dark mode with its toggle hidden, sits under the 52px head
 - **Do** use a dashed outline only to mean "not there yet": not built (a rail placeholder) or not applied (a pending column).
 - **Do** make width changes 200ms on `ease-design`, instant under reduced motion.
 - **Do** give data grids zebra rows (chalk 4.5%) and a hairline on every column edge and row.
-- **Do** keep a table's columns in sight as a typed strip over its grid, each chip over its column, with short type names.
+- **Do** keep a table's columns in sight as typed chips in the grid's one header row, with short type names.
 - **Do** give every drag a click and a keyboard alternative (the resize grip: click, Shift+click, double-click, Alt+arrows).
 - **Do** use the themed square checkbox and, inside panels, the `tab` segmented radio.
 - **Do** keep one sand-filled button per panel, popover or dialog: its commit.

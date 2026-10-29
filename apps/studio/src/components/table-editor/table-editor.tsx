@@ -29,7 +29,6 @@ import { changesetKey } from "@/lib/table-editor/changeset";
 import { branchTree, editorPath, readLast, resolveParams, writeLast, type EditorParams, type Resolution } from "@/lib/table-editor/context";
 import { formatBytes } from "@/lib/table-editor/dry-run";
 import { TableEditorStoreContext, createTableEditorStore, useTableEditor } from "@/lib/table-editor/store";
-import { ColumnStrip } from "./column-strip";
 import { ContextBar } from "./context-bar";
 import { DiscardPrompt, EditorPanel, reviewLabel } from "./panel";
 import { RlsBanner } from "./rls-banner";
@@ -336,7 +335,7 @@ function Editor({ params, navigate }: TableEditorProps) {
               pageSize={pageSize}
               toolsSlot={toolsSlot}
               selfSub={me.data?.sub}
-              above={(layout) => <ColumnStrip target={target} layout={layout} reason={structure && !structure.allowed ? structure.reason : null} />}
+              chips={{ reason: structure && !structure.allowed ? structure.reason : null }}
             />
           ) : (
             <p role="status" className="p-6 text-sm text-chalk-dim">

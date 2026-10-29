@@ -100,23 +100,21 @@ describe("T3 fix round", () => {
     expect(json.closest(".cm-editor")).not.toBeNull();
     await user.keyboard("{Escape}");
     await user.dblClick(await cell("2026-10-01"));
-    const date = await screen.findByLabelText("due_on");
+    const date = await screen.findByLabelText("due_on", { selector: "input" });
     expect(date).toHaveAttribute("type", "date");
     expect(date).toHaveValue("2026-10-01");
   });
 });
 
-describe("I1: the grid hosts a strip in its own scroll container", () => {
-  it("renders_above_inside_the_scroll_container_outside_the_grid_role", () => {
+describe("I1: the header row's end content sits in the grid's scroll container", () => {
+  it("renders_the_end_inside_the_scroll_container_outside_the_grid_role", () => {
     stubLayout();
     const columns = ["id", "memo"].map((name) => ({ name, desc: { type: "text", nullable: true, has_default: false, generated: false, array: false, enum: null }, labels: null, readOnly: false }));
     const props = {
       label: "public.t", columns, rows: [{ id: "a", memo: "x" }], firstRowNumber: 1, keys: ['["a"]'],
       isSelected: () => false, pageSelection: "none", onToggleRow: () => {}, onTogglePage: () => {}, sort: null, onSort: () => {},
       canEdit: () => false, onSave: async () => null, onCopy: () => {}, widths: {}, onWidths: () => {},
-      above: (layout: { template: string; totalWidth: number; visibleCols: number[] }) => (
-        <div data-testid="probe" data-template={layout.template} data-cols={layout.visibleCols.join(",")}>strip</div>
-      ),
+      headers: { column: () => undefined, pending: () => undefined, end: <div data-testid="probe">end</div> },
     } as unknown as GridProps;
     render(<Grid {...props} />);
     const probe = screen.getByTestId("probe");
@@ -125,7 +123,7 @@ describe("I1: the grid hosts a strip in its own scroll container", () => {
     expect(scroller).not.toBeNull();
     expect(probe.closest("[data-grid-scroll]")).toBe(scroller);
     expect(g.contains(probe)).toBe(false);
-    expect(probe.dataset.template).not.toBe("");
-    expect(probe.dataset.cols).toBe("0,1");
+    // Its track is the last of every row's template.
+    expect(g.querySelector<HTMLElement>('[aria-rowindex="1"]')!.style.gridTemplateColumns).toMatch(/136px$/);
   });
 });
