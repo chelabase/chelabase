@@ -8,7 +8,8 @@
 //! then [`render`] them.
 //!
 //! ```no_run
-//! # async fn demo(fetch: impl AsyncFnMut(Option<&str>) -> Result<chelabase_typegen::Schema, String>) -> Result<(), String> {
+//! # async fn fetch(database: Option<String>) -> Result<chelabase_typegen::Schema, String> { todo!() }
+//! # async fn demo() -> Result<(), String> {
 //! use chelabase_typegen::{Format, Which, collect, render};
 //! let which = Which::from_options(None, false).map_err(|e| e.to_string())?;
 //! let schemas = collect(&which, fetch).await?;
@@ -777,19 +778,22 @@ impl std::str::FromStr for Format {
 ///   lists (the list names main first, under its real name: skipped), one call at a time.
 ///
 /// The first failed call stops the plan with its error.
-pub async fn collect<E>(
+pub async fn collect<E, Fut>(
     which: &Which,
-    mut fetch: impl AsyncFnMut(Option<&str>) -> Result<Schema, E>,
-) -> Result<Vec<(String, Schema)>, E> {
+    mut fetch: impl FnMut(Option<String>) -> Fut,
+) -> Result<Vec<(String, Schema)>, E>
+where
+    Fut: std::future::Future<Output = Result<Schema, E>>,
+{
     match which {
         Which::Main => Ok(vec![("main".to_string(), fetch(None).await?)]),
-        Which::One(name) => Ok(vec![(name.clone(), fetch(Some(name)).await?)]),
+        Which::One(name) => Ok(vec![(name.clone(), fetch(Some(name.clone())).await?)]),
         Which::All => {
             let main = fetch(None).await?;
             let others: Vec<String> = main.databases.iter().skip(1).cloned().collect();
             let mut all = vec![("main".to_string(), main)];
             for d in others {
-                let s = fetch(Some(&d)).await?;
+                let s = fetch(Some(d.clone())).await?;
                 all.push((d, s));
             }
             Ok(all)
@@ -1326,10 +1330,11 @@ mod tests {
         let listed = SCHEMA.replacen('{', "{\"databases\":[\"app_main\",\"analytics\"],", 1);
         let plan = async |which: Which, main: &str| {
             let mut calls: Vec<Option<String>> = Vec::new();
-            let got = collect(&which, async |d: Option<&str>| {
-                calls.push(d.map(str::to_owned));
-                serde_json::from_str::<Schema>(if d.is_none() { main } else { ANALYTICS })
-                    .map_err(|e| e.to_string())
+            let got = collect(&which, |d: Option<String>| {
+                let r = serde_json::from_str::<Schema>(if d.is_none() { main } else { ANALYTICS })
+                    .map_err(|e| e.to_string());
+                calls.push(d);
+                async move { r }
             })
             .await
             .unwrap();
@@ -1359,13 +1364,14 @@ mod tests {
         );
         // A failed fetch stops the plan with its error.
         let mut n = 0;
-        let err = collect(&Which::All, async |_d: Option<&str>| {
+        let err = collect(&Which::All, |_d: Option<String>| {
             n += 1;
-            if n == 1 {
+            let r = if n == 1 {
                 serde_json::from_str::<Schema>(&listed).map_err(|e| e.to_string())
             } else {
                 Err("refused".to_string())
-            }
+            };
+            async move { r }
         })
         .await
         .unwrap_err();

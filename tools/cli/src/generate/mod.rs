@@ -63,8 +63,9 @@ async fn fetch_and_write(
         .timeout(timeout)
         .build()
         .context("an HTTP client")?;
-    let schemas = chelabase_typegen::collect(&which, async |database: Option<&str>| {
-        fetch_schema(&http, url, key, database).await
+    let http = &http;
+    let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
+        fetch_schema(http, url, key, database.as_deref()).await
     })
     .await?;
     let text = chelabase_typegen::render(&schemas, Format::Ts)?;
