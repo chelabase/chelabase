@@ -416,7 +416,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it)",
+            "description": "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it), or with `all_databases` another database is named `main`, the key main always takes (generate it alone with `database=main`)",
             "content": {
               "application/json": {
                 "schema": {

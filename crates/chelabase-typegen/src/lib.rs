@@ -34,6 +34,9 @@ pub enum Error {
     },
     /// [`render`] was given no schema at all.
     NoSchemas,
+    /// Two of several databases share a key: with every database, main is keyed `main`, so
+    /// another database named `main` clashes with it (#29).
+    DuplicateDatabase { database: String },
 }
 
 impl std::fmt::Display for Error {
@@ -46,6 +49,14 @@ impl std::fmt::Display for Error {
             ),
             Error::Database { database, .. } => write!(f, "database {}", quote(database)),
             Error::NoSchemas => f.write_str("no schema to generate from"),
+            Error::DuplicateDatabase { database } if database == "main" => f.write_str(
+                "another database is named \"main\", the key main's types always take with every database; generate it alone (`database=main`, or `--database main`) instead of all databases",
+            ),
+            Error::DuplicateDatabase { database } => write!(
+                f,
+                "the database {} is listed twice; generate it alone (`database=`) instead of all databases",
+                quote(database)
+            ),
         }
     }
 }
@@ -512,12 +523,26 @@ pub fn generate(schema: &Schema) -> Result<String> {
     Ok(out)
 }
 
-/// The module text for several databases (main first, as given): `Databases` with a key per
-/// database, `Database` as the first one, and `types` keyed alike.
-pub fn generate_all(all: &[(String, Schema)]) -> Result<String> {
+/// Several databases need a key each: none empty, none twice (#29).
+fn distinct(all: &[(String, Schema)]) -> Result<()> {
     if all.is_empty() {
         return Err(Error::NoSchemas);
     }
+    let mut seen = std::collections::BTreeSet::new();
+    for (n, _) in all {
+        if !seen.insert(n.as_str()) {
+            return Err(Error::DuplicateDatabase {
+                database: n.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The module text for several databases (main first, as given): `Databases` with a key per
+/// database, `Database` as the first one, and `types` keyed alike.
+pub fn generate_all(all: &[(String, Schema)]) -> Result<String> {
+    distinct(all)?;
     let rendered = all
         .iter()
         .map(|(n, s)| {
@@ -810,6 +835,7 @@ pub fn runtime(schema: &Schema) -> Result<Value> {
 /// The runtime `types` map for several databases, keyed by name: what [`generate_all`]'s
 /// `types` constant holds, as JSON.
 pub fn runtime_all(all: &[(String, Schema)]) -> Result<Value> {
+    distinct(all)?;
     let mut out = Map::new();
     for (n, s) in all {
         let r = render_one(s).map_err(|e| Error::Database {
@@ -1298,6 +1324,39 @@ mod tests {
         );
         assert!(render(&[], Format::Ts).is_err());
         assert!(render(&[], Format::Json).is_err());
+    }
+
+    /// #29: with every database, main is keyed `main`; another database named `main` would
+    /// take the same key (a duplicate in `Databases`, a lost entry in `types` and the JSON).
+    #[tokio::test]
+    async fn all_databases_refuses_a_database_named_main() {
+        let listed = SCHEMA.replacen('{', "{\"databases\":[\"app_main\",\"main\"],", 1);
+        let schemas = collect(&Which::All, |d: Option<String>| {
+            let r = serde_json::from_str::<Schema>(if d.is_none() { &listed } else { ANALYTICS })
+                .map_err(|e| e.to_string());
+            async move { r }
+        })
+        .await
+        .unwrap();
+        for format in [Format::Ts, Format::Json] {
+            let err = render(&schemas, format).unwrap_err();
+            assert_eq!(
+                err,
+                Error::DuplicateDatabase {
+                    database: "main".into()
+                },
+                "{format:?}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains("\"main\"") && text.contains("database=main"),
+                "{text}"
+            );
+        }
+        assert!(generate_all(&schemas).is_err());
+        assert!(runtime_all(&schemas).is_err());
+        // Main's real name is never fetched twice, so `app_main` alone is fine.
+        assert!(render(&two(), Format::Ts).is_ok());
     }
 
     /// A dotted schema in a second database names the database, then the schema.
