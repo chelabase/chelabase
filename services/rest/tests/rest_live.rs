@@ -2797,3 +2797,92 @@ async fn types_etag_and_304() {
     })
     .await;
 }
+
+/// `GET /internal/types/{branch}?role=…` (the orchestrator's Studio download), with
+/// `If-None-Match`.
+async fn internal_types_of(l: &Live, role: &str, query: &str, if_none_match: Option<&str>) -> reqwest::Response {
+    let sep = if query.is_empty() { "" } else { "&" };
+    let mut req = l
+        .http
+        .get(format!(
+            "http://{}/internal/types/{}?role={role}{sep}{query}",
+            l.internal,
+            l.main_id().as_uuid()
+        ))
+        .bearer_auth(&l.internal_token);
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    req.send().await.unwrap()
+}
+
+/// The internal types route gives a role what `GET /data/v1/types` gives a secret key of that
+/// role (no database list), byte for byte with the same ETag and headers, for every option;
+/// its `If-None-Match` is the public route's; a role it can't take is refused as the console's.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn internal_types_matches_the_data_api_types() {
+    live("typesint", |l| async move {
+        l.owner(TYPES_DDL).await;
+        l.owner(
+            "CREATE ROLE reporter NOLOGIN;
+             GRANT USAGE ON SCHEMA public TO reporter;
+             GRANT SELECT ON orders TO reporter;
+             CREATE ROLE types_boss NOLOGIN CREATEDB;",
+        )
+        .await;
+        assert!(matches!(
+            l.worker.check_data_role(l.main_id(), "reporter").await,
+            RoleCheck::Ok(_, false)
+        ));
+        l.create_database("analytics").await;
+        l.owner_in("analytics", "CREATE TABLE events (id bigint PRIMARY KEY, at timestamptz);").await;
+        l.enable(l.main_id(), "analytics").await;
+
+        for role in ["authenticated", "reporter"] {
+            for query in [
+                "",
+                "format=json",
+                "database=analytics",
+                "database=analytics&format=json",
+                "all_databases=true",
+                "all_databases=true&format=json",
+            ] {
+                let public = l
+                    .http
+                    .get(format!(
+                        "http://{}/data/v1/types{}{query}",
+                        l.rest,
+                        if query.is_empty() { "" } else { "?" }
+                    ))
+                    .header(IDENTITY_HEADER, l.token(l.main_id(), DataKeyKind::Secret, role))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(public.status(), 200, "{role} {query}");
+                let internal = internal_types_of(&l, role, query, None).await;
+                assert_eq!(internal.status(), 200, "{role} {query}");
+                for name in ["etag", "content-type", "cache-control"] {
+                    assert_eq!(internal.headers().get(name), public.headers().get(name), "{role} {query} {name}");
+                }
+                let tag = internal.headers()["etag"].to_str().unwrap().to_owned();
+                assert_eq!(internal.text().await.unwrap(), public.text().await.unwrap(), "{role} {query}");
+                let resp = internal_types_of(&l, role, query, Some(&tag)).await;
+                assert_eq!(resp.status(), 304, "{role} {query}");
+                assert_eq!(resp.headers()["etag"], tag.as_str());
+                assert_eq!(resp.text().await.unwrap(), "");
+            }
+        }
+        // The two roles' modules differ where their privileges do.
+        let auth = internal_types_of(&l, "authenticated", "", None).await.text().await.unwrap();
+        let reporter = internal_types_of(&l, "reporter", "", None).await.text().await.unwrap();
+        assert_ne!(auth, reporter);
+        assert!(reporter.contains("orders: {"), "{reporter}");
+
+        let answer = Live::answer(internal_types_of(&l, "types_ghost", "", None).await).await;
+        answer.error(404, "unknown_role");
+        let answer = Live::answer(internal_types_of(&l, "types_boss", "", None).await).await;
+        answer.error(403, "role_not_allowed");
+    })
+    .await;
+}

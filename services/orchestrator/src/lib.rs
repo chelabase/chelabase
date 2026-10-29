@@ -42,6 +42,7 @@ mod branches;
 mod console;
 pub mod compute_tls;
 mod data_api_databases;
+mod data_api_types;
 mod app_user_admin;
 mod app_users;
 mod data_keys;
@@ -2572,6 +2573,7 @@ where
         .merge(merges::routes())
         .merge(data_keys::routes())
         .merge(data_api_databases::routes())
+        .merge(data_api_types::routes())
         .merge(console::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())

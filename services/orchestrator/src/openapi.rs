@@ -1168,6 +1168,10 @@ mod tests {
                 "getDataApiSchema",
             ),
             (
+                "GET /v1/databases/{id}/branches/{branch_id}/data-api/types",
+                "getDataApiTypes",
+            ),
+            (
                 "GET /v1/databases/{id}/branches/{branch_id}/databases",
                 "listBranchDatabases",
             ),

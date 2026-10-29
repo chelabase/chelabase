@@ -44,7 +44,7 @@ const next = await db.call("next_id");
 - A column's type never depends on its value: an `int8` is `number` or `bigint` for the whole client, chosen by `bigint` and followed by the types.
 - Forgetting `bigint: true` is loud, not silent: an `int8` outside the safe range throws `UnsafeIntegerError` (with `column` and the exact `source` digits) instead of returning a rounded number.
 - Without `types`, any integer literal outside the safe range throws `UnsafeIntegerError`, wherever it is; other numbers stay numbers.
-- With `types`, a value the map doesn't cover (a column added after `gen types`, a function with no `int8` or `numeric` return) still throws `UnsafeIntegerError` when it's a top-level integer, or an array of them, outside the safe range. It's never rounded silently; run `gen types` again.
+- With `types`, a value the map doesn't cover (a column added after you got the types, a function with no `int8` or `numeric` return) still throws `UnsafeIntegerError` when it's a top-level integer, or an array of them, outside the safe range. It's never rounded silently; download or fetch the types again.
 - Only top-level row keys (and scalar returns) are mapped. Numbers inside `json` and `jsonb` objects are parsed as plain JSON numbers.
 - Writes are exact too: a `bigint` in `insert`, `update`, `where` or call arguments is sent as its digits. Send `numeric` values as strings.
 

@@ -1,6 +1,6 @@
 import { ApiError } from "./error";
-import { getConsoleQueryUrl, getExportMergePlanUrl } from "./generated/endpoints";
-import type { ConsoleRequest } from "./generated/model";
+import { getConsoleQueryUrl, getExportMergePlanUrl, getGetDataApiTypesUrl } from "./generated/endpoints";
+import type { ConsoleRequest, GetDataApiTypesParams } from "./generated/model";
 import type { ErrorCode } from "./generated/model/errorCode";
 
 export interface ManagementClientConfig {
@@ -177,6 +177,13 @@ export const consoleQueryExact = async (
 /** A merge's plan as SQL text (the generated `exportMergePlan` returns the same). */
 export const fetchMergePlanSql = async (id: string, mergeId: string): Promise<string> =>
   send<string>(getExportMergePlanUrl(id, mergeId), { method: "GET" }, (text) => text);
+
+/**
+ * A branch's generated types as text: the `db.ts` module, or with `format: "json"` the runtime map's JSON (the
+ * generated `getDataApiTypes` would parse the module as JSON).
+ */
+export const fetchDataApiTypes = async (id: string, branchId: string, params?: GetDataApiTypesParams): Promise<string> =>
+  send<string>(getGetDataApiTypesUrl(id, branchId, params), { method: "GET" }, (text) => text);
 
 /**
  * POSTs `body` as JSON and returns the response body stream (for NDJSON endpoints).

@@ -69,6 +69,8 @@ import type {
   GetBranchConnectionParams,
   GetConsoleSchemaParams,
   GetDataApiSchemaParams,
+  GetDataApiTypes200Two,
+  GetDataApiTypesParams,
   GetPrivilegesParams,
   GetSqlSchema200,
   GetSqlSchemaParams,
@@ -1439,6 +1441,131 @@ export function useGetDataApiSchema<TData = Awaited<ReturnType<typeof getDataApi
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
 
   const queryOptions = getGetDataApiSchemaQueryOptions(id,branchId,params,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const getGetDataApiTypesUrl = (id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/types?${stringifiedParams}` : `/v1/databases/${encodeURIComponent(String(id))}/branches/${encodeURIComponent(String(branchId))}/data-api/types`
+}
+
+/**
+ * What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it exactly when you may create a secret key for `role` (the same checks and answers as `createKey`). The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).
+ * @summary The branch's generated types for a secret key role
+ */
+export const getDataApiTypes = async (id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams, options?: Parameters<typeof customFetch>[1]): Promise<string | GetDataApiTypes200Two> => {
+
+  return customFetch<string | GetDataApiTypes200Two>(getGetDataApiTypesUrl(id,branchId,params),
+  {
+    ...options,
+    method: 'GET'
+
+
+  }
+);}
+
+
+
+
+
+export const getGetDataApiTypesQueryKey = (id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams,) => {
+    return [
+    `/v1/databases/${id}/branches/${branchId}/data-api/types`, ...(params ? [params] : [])
+    ] as const;
+    }
+
+
+export const getGetDataApiTypesQueryOptions = <TData = Awaited<ReturnType<typeof getDataApiTypes>>, TError = ErrorType<void | ErrorEnvelope>>(id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetDataApiTypesQueryKey(id,branchId,params);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getDataApiTypes>>> = ({ signal }) => getDataApiTypes(id,branchId,params, { signal, ...requestOptions });
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: id !== null && id !== undefined && branchId !== null && branchId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetDataApiTypesQueryResult = NonNullable<Awaited<ReturnType<typeof getDataApiTypes>>>
+export type GetDataApiTypesQueryError = ErrorType<void | ErrorEnvelope>
+
+
+export function useGetDataApiTypes<TData = Awaited<ReturnType<typeof getDataApiTypes>>, TError = ErrorType<void | ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params: undefined |  GetDataApiTypesParams, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getDataApiTypes>>,
+          TError,
+          Awaited<ReturnType<typeof getDataApiTypes>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetDataApiTypes<TData = Awaited<ReturnType<typeof getDataApiTypes>>, TError = ErrorType<void | ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getDataApiTypes>>,
+          TError,
+          Awaited<ReturnType<typeof getDataApiTypes>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetDataApiTypes<TData = Awaited<ReturnType<typeof getDataApiTypes>>, TError = ErrorType<void | ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+/**
+ * @summary The branch's generated types for a secret key role
+ */
+
+export function useGetDataApiTypes<TData = Awaited<ReturnType<typeof getDataApiTypes>>, TError = ErrorType<void | ErrorEnvelope>>(
+ id: string,
+    branchId: string,
+    params?: GetDataApiTypesParams, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getDataApiTypes>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetDataApiTypesQueryOptions(id,branchId,params,options)
 
   const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
 

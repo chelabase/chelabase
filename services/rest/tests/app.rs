@@ -777,3 +777,59 @@ async fn types_refuses_options_the_cli_refuses() {
     let (status, _, _) = get_raw(&h, "/data/v1/types?all_databases=false&format=ts", Some(&token)).await;
     assert_eq!(status, 503);
 }
+
+/// `GET /internal/types/{branch_id}?role=…`, as the internal listener answers it.
+async fn internal_types(h: &Harness, query: &str, bearer: Option<&str>) -> (u16, Value) {
+    let path = format!("/internal/types/{}{query}", Uuid::new_v4());
+    let header = bearer.map(|b| ("authorization", format!("Bearer {b}")));
+    h.get(h.internal, &path, header).await
+}
+
+/// The orchestrator's types route: only with the internal bearer, only on the internal
+/// listener, and with exactly one non-empty `role` beside the public route's options. Each
+/// refusal comes before any connection.
+#[tokio::test]
+async fn internal_types_needs_the_bearer_and_one_role() {
+    let h = harness(served).await;
+    for bearer in [None, Some("nope")] {
+        let (status, _) = internal_types(&h, "?role=authenticated", bearer).await;
+        assert_eq!(status, 401, "{bearer:?}");
+    }
+    // Not on the public listener, whatever the identity.
+    let token = h.token("rest", Some(DataKeyKind::Secret));
+    let (status, _, _) =
+        get_raw(&h, &format!("/internal/types/{}?role=authenticated", Uuid::new_v4()), Some(&token)).await;
+    assert_eq!(status, 404);
+    for query in [
+        "",
+        "?role=",
+        "?format=ts",
+        "?role=a&role=b",
+        "?role=authenticated&format=xml",
+        "?role=authenticated&database=main&all_databases=true",
+        "?role=authenticated&format=ts&format=json",
+        "?role=authenticated&branch=x",
+    ] {
+        let (status, body) = internal_types(&h, query, Some(TOKEN)).await;
+        assert_eq!((status, &body["error"]["code"]), (400, &Value::from("invalid_query")), "{query}: {body}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    // A valid request reaches the connection (nothing listens: 503).
+    let (status, _) = internal_types(&h, "?role=authenticated&format=json", Some(TOKEN)).await;
+    assert_eq!(status, 503);
+}
+
+/// The branch's states, as the internal schema route answers them.
+#[tokio::test]
+async fn internal_types_passes_branch_states_through() {
+    let h = harness(not_ready).await;
+    let (status, body) = internal_types(&h, "?role=authenticated", Some(TOKEN)).await;
+    assert_eq!((status, &body["status"]), (409, &Value::from("resetting")), "{body}");
+    let h = harness(unknown).await;
+    let (status, body) = internal_types(&h, "?role=authenticated", Some(TOKEN)).await;
+    assert_eq!((status, &body["error"]["code"]), (404, &Value::from("unknown_branch")), "{body}");
+    // A database the branch doesn't serve: the public route's answer.
+    let h = harness(served).await;
+    let (status, body) = internal_types(&h, "?role=authenticated&database=ghost", Some(TOKEN)).await;
+    assert_eq!((status, &body["error"]["code"]), (404, &Value::from("unknown_database")), "{body}");
+}
