@@ -10,7 +10,7 @@ on:
   # enable at launch (optional): run on a PR carrying the `run-live` label by uncommenting this
   # and the `if:` line on the job below
   # pull_request:
-  #   types: [labeled, synchronize]
+  #   types: [labeled]
 
 permissions:
   contents: read

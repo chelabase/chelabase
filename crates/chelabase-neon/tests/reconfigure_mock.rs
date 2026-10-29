@@ -1,7 +1,7 @@
 //! `reconfigure::push` against an in-process compute_ctl stand-in.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};

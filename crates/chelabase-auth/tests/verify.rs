@@ -1,5 +1,5 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::disallowed_methods)]
 
 use chelabase_auth::test_support::{BrokenJwks, MockJwks};
 use chelabase_auth::{AuthError, JwtVerifier, VerifiedClaims};
