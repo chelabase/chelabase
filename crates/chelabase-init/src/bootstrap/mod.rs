@@ -32,18 +32,19 @@
 //!
 //! # Output dir (`--out`)
 //!
-//! The only place it writes. The apps read these files (m5: through `*_FILE`); none becomes an
+//! The only place it writes. The ids are in `ids/` (0700, mounted whole and read-only by the
+//! apps that read them); the secrets stay at the top. The apps read these files (m5: through `*_FILE`); none becomes an
 //! env file or a container env var. A symlink at any of these names fails the run before
 //! anything is written.
 //!
 //! | File | What | Mode |
 //! |---|---|---|
-//! | `org-id` | the Zitadel org the tenant is bound to | 0644 |
-//! | `project-id` | the `chelabase` project | 0644 |
-//! | `api-client-id` | the API app's client id (a token audience) | 0644 |
-//! | `studio-client-id` | Studio's OIDC client id | 0644 |
+//! | `ids/org-id` | the Zitadel org the tenant is bound to | 0644 |
+//! | `ids/project-id` | the `chelabase` project | 0644 |
+//! | `ids/api-client-id` | the API app's client id (a token audience) | 0644 |
+//! | `ids/studio-client-id` | Studio's OIDC client id | 0644 |
+//! | `ids/demo-user-id` | `--demo`: the demo machine user | 0644 |
 //! | `actions-signing-key` | the Actions webhook's signing key | 0600 |
-//! | `demo-user-id` | `--demo`: the demo machine user | 0644 |
 //! | `demo-sa.json` | `--demo`: the demo machine user's key file | 0600 |
 //! | `smtp-password.sha256` | a salted digest of the SMTP password last sent (never the password) | 0600 |
 //!

@@ -164,7 +164,7 @@ describe("BranchRoles", () => {
     );
     await userEvent.click((await rowOf("chelabase_owner")).getByRole("button", { name: "Reveal chelabase_owner" }));
     const section = await screen.findByRole("region", { name: "Connection for chelabase_owner" });
-    expect(within(section).getByText(/Local dev: pass the proxy's CA with/)).toHaveTextContent(
+    expect(within(section).getByText(/CA file: pass the proxy's CA with/)).toHaveTextContent(
       "sslrootcert=.chelabase/neon/proxy-ca.crt",
     );
   });

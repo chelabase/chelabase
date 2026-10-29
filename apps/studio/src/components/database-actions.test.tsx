@@ -97,9 +97,9 @@ describe("DatabaseActions", () => {
   it("connection_shows_ca_file_hint", async () => {
     setup({ [CONNECTION]: () => jsonResponse({ ...details("s3cret"), ca_file: ".chelabase/neon/proxy-ca.crt" }) });
     await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    const note = await screen.findByText(/Local dev: pass the proxy's CA with/);
+    const note = await screen.findByText(/CA file: pass the proxy's CA with/);
     expect(note).toHaveTextContent(
-      "Local dev: pass the proxy's CA with sslrootcert=.chelabase/neon/proxy-ca.crt. If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
+      "CA file: pass the proxy's CA with sslrootcert=.chelabase/neon/proxy-ca.crt. Self-hosted, fetch it with docker compose cp proxy:/tls/ca.crt .chelabase/neon/proxy-ca.crt (install guide, “Connect to databases”). If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
     );
   });
 

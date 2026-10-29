@@ -3,7 +3,7 @@ title: Settings
 description: The environment variables that configure app users.
 ---
 
-These are service settings for a self-hosted stack. A Compose install sets them up (`init-secrets` and `chelabase-init bootstrap` write the keys and ids into the `secrets` volume, and the services read them from `bootstrap/`), and so do `just workbench up` and `chelabase dev bootstrap` on a workbench stack. You only change them to tune lifetimes or intervals, or to point services at each other. On a Compose install, set the tunables in `.env` (see `.env.example`).
+These are service settings for a self-hosted stack. A Compose install sets them up (`init-secrets` and `chelabase-init bootstrap` write the keys and ids into the `secrets` volume, and the services read them from `bootstrap/`: the ids in `bootstrap/ids/`, the Actions signing key at `bootstrap/actions-signing-key`), and so do `just workbench up` and `chelabase dev bootstrap` on a workbench stack. You only change them to tune lifetimes or intervals, or to point services at each other. On a Compose install, set the tunables in `.env` (see `.env.example`).
 
 | Variable | Default | Read by |
 |---|---|---|
