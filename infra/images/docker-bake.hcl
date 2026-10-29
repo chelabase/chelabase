@@ -19,6 +19,12 @@ target "_app" {
     "org.opencontainers.image.revision" = "${REVISION}"
     "org.opencontainers.image.source"   = "${SOURCE}"
   }
+  # Index annotations: GHCR links a package to its repository from these, not from the labels.
+  annotations = [
+    "index:org.opencontainers.image.source=${SOURCE}",
+    "index:org.opencontainers.image.revision=${REVISION}",
+    "index:org.opencontainers.image.licenses=Apache-2.0",
+  ]
 }
 
 target "gateway" {
@@ -69,5 +75,11 @@ target "studio" {
     "org.opencontainers.image.revision" = "${REVISION}"
     "org.opencontainers.image.source"   = "${SOURCE}"
   }
+  # Index annotations: GHCR links a package to its repository from these, not from the labels.
+  annotations = [
+    "index:org.opencontainers.image.source=${SOURCE}",
+    "index:org.opencontainers.image.revision=${REVISION}",
+    "index:org.opencontainers.image.licenses=Apache-2.0",
+  ]
   tags       = ["${REPO}/studio:${TAG}"]
 }

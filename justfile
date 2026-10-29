@@ -147,6 +147,10 @@ test:
 images:
     docker buildx bake -f infra/images/docker-bake.hcl
 
+# Check the built release images' index annotations (GHCR repo link); run `scripts/publish-images.sh` first.
+images-annotations:
+    scripts/tests/images-annotations.sh
+
 # Delete build artifacts older than `days` from the main checkout's target/ and every worktree's
 # (needs cargo-sweep: cargo install cargo-sweep --locked)
 sweep-builds days="14":
