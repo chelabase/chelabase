@@ -30,6 +30,22 @@ describe("fetchTypes", () => {
     expect(call.init.headers).toMatchObject({ authorization: `Bearer ${secret}`, accept: "application/json" });
   });
 
+  test("trims the key, as the CLI does, and sends it trimmed", async () => {
+    for (const key of [`${secret}\n`, ` ${secret} `, `\t${secret}\r\n`]) {
+      const fetch = fakeFetch(JSON.stringify(golden));
+      expect(await fetchTypes({ url, key, fetch })).toEqual(golden);
+      expect(fetch.calls[0]!.init.headers).toMatchObject({ authorization: `Bearer ${secret}` });
+    }
+  });
+
+  test("never follows a redirect", async () => {
+    const fetch = fakeFetch("", 302, { location: "/elsewhere" });
+    const err = await rejection(fetchTypes({ url, key: secret, fetch }));
+    expect(fetch.calls[0]!.init.redirect).toBe("manual");
+    expect(err).toMatchObject({ status: 302, code: "internal" });
+    expect((err as Error).message).toContain("redirect");
+  });
+
   test("names the database, or asks for every database keyed by name", async () => {
     const one = fakeFetch(JSON.stringify(golden));
     await fetchTypes({ url, key: secret, database: "analytics db", fetch: one });
@@ -49,7 +65,7 @@ describe("fetchTypes", () => {
   test("refuses a public key, or anything else, before any request, without echoing it", async () => {
     const fetch = fakeFetch("{}");
     const pub = "chk_pub_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
-    for (const key of [pub, "nonsense", "", ` ${secret}`]) {
+    for (const key of [pub, "nonsense", "", `${secret}x`, ` ${pub}\n`]) {
       const err = await rejection(fetchTypes({ url, key, fetch }));
       expect(err).toBeInstanceOf(Error);
       expect((err as Error).message).toContain("secret key (chk_sec_");
