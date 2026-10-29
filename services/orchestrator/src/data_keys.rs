@@ -38,7 +38,7 @@ use chelabase_routes::orchestrator as ep;
 /// Longest key name.
 const MAX_NAME_LEN: usize = 63;
 /// The role a secret key gets when the request names none.
-const DEFAULT_ROLE: &str = "authenticated";
+pub(crate) const DEFAULT_ROLE: &str = "authenticated";
 /// Longest wait for the REST service's schema.
 const REST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -487,12 +487,12 @@ where
 /// A secret key's role identity from the worker's check: `(pg_roles.oid, the timeline it was
 /// read on, whether the role has BYPASSRLS)`; `None`s (and `false`) from a worker that
 /// predates them.
-type RoleIdentity = (Option<i64>, Option<String>, bool);
+pub(crate) type RoleIdentity = (Option<i64>, Option<String>, bool);
 
 /// The worker's check that `role` may back a secret key on the branch, on its compute: any
 /// existing role that isn't refused for its attributes (owner-level; BYPASSRLS is allowed),
 /// with or without a password. The role's identity.
-async fn check_role<M, J>(
+pub(crate) async fn check_role<M, J>(
     state: &AppState<M, J>,
     branch: BranchId,
     role: &str,

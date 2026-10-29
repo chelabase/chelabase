@@ -1668,6 +1668,241 @@
         ]
       }
     },
+    "/v1/databases/{id}/branches/{branch_id}/data-api/types": {
+      "get": {
+        "tags": [
+          "data-api"
+        ],
+        "summary": "The branch's generated types for a secret key role",
+        "description": "What `GET /data/v1/types` serves a secret key of `role` on this branch (with no database list), byte for byte: the TypeScript module `db.ts` (`Database` and the runtime `types` map for `@chelabase/client`), or with `format=json` the `types` map alone. Studio's Download types. You may call it exactly when you may create a secret key for `role` (the same checks and answers as `createKey`). The `ETag` is the body's hash: send it back as `If-None-Match` for a 304 while the schema is unchanged. Not cached (`Cache-Control: no-store`).",
+        "operationId": "getDataApiTypes",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Database id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "branch_id",
+            "in": "path",
+            "description": "Branch id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "role",
+            "in": "query",
+            "description": "The secret key role whose types to generate; `authenticated` (a new key's default) when\nabsent. You must be allowed to create a secret key for it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "format",
+            "in": "query",
+            "description": "`ts` (the default): the TypeScript module (`db.ts`). `json`: the runtime `types` map\nalone.",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "ts",
+                "json"
+              ]
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Generate this Postgres database (not the main one) as `Database`. It must be served by\nthe data API. Not with `all_databases`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "all_databases",
+            "in": "query",
+            "description": "`true`: every database the data API serves on the branch, as `Databases` and a `types`\nmap keyed by name (main as `main`).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The module (`format=ts`, `text/typescript`) or the runtime `types` map (`format=json`)",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "A strong tag: the body's SHA-256"
+              }
+            },
+            "content": {
+              "text/typescript": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current `ETag`: the body is unchanged (and not sent)",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`"
+              },
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The current tag"
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`: a path id isn't a valid UUID",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden` as on `createKey`: `required` is `developer` below Developer, `role:<name>` when the role isn't one you may use (in your roles, or reachable through a granted role) or is a personal login, or `admin` for a LOGIN or owner-level role; `no_access_yet`, `pending_approval`, `member_suspended`, `member_offboarded` for those member states; `forbidden`: your role on the project is below `developer` (`required` names it); `no_access_yet`: you have no grant on any project yet (ask a tenant admin); `pending_approval`: you signed up and an admin hasn't approved you yet; `not_available_in_platform_mode`: platform mode, and you aren't a member of the tenant",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not_found`: the database (or another tenant's), the branch or the named Postgres database doesn't exist; the data API's `unknown_role` when the role was dropped after the worker's check; `not_found`: you have no access to it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `data_api_disabled`: the Postgres database isn't served by the data API; `conflict`: the schema can't be typed (a schema the role reaches has a dot in its name)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`invalid_request`: an option isn't `role=<name>`, `format=ts|json`, `database=<name>` or `all_databases=true|false`, is repeated or empty, or `database` came with `all_databases=true`; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`internal`: unexpected; details only in the logs",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`unavailable`: the data API answered something unexpected",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`unavailable`: the data API or the branch's database can't be reached; retry after `Retry-After`; `worker_unavailable`: the worker can't be reached",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before retrying"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "`timeout`: the worker didn't answer in time; the data API's `timeout` when reading the schema ran past the statement timeout",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/databases/{id}/branches/{branch_id}/databases": {
       "get": {
         "tags": [

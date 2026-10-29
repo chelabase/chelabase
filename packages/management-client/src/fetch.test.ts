@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./error";
-import { configureManagementClient, consoleQueryExact, customFetch, fetchMergePlanSql, parseExact, streamRequest } from "./fetch";
+import { configureManagementClient, consoleQueryExact, customFetch, fetchDataApiTypes, fetchMergePlanSql, parseExact, streamRequest } from "./fetch";
 import { exportMergePlan } from "./generated/endpoints";
 
 function res(body: string | null, status = 200, type = "application/json"): Response {
@@ -201,5 +201,28 @@ describe("fetchMergePlanSql", () => {
   it("errors_are_api_errors", async () => {
     setup((async () => res('{"error":{"code":"conflict","message":"the merge has no plan yet"}}', 409)) as typeof fetch);
     await expect(fetchMergePlanSql("d", "m")).rejects.toMatchObject({ status: 409, code: "conflict" });
+  });
+});
+
+describe("fetchDataApiTypes", () => {
+  it("returns_the_module_text_unparsed_with_the_options", async () => {
+    const module = "export type Database = { a: 1 };\n";
+    const f = vi.fn(async () => res(module, 200, "text/typescript; charset=utf-8"));
+    setup(f as unknown as typeof fetch);
+    expect(await fetchDataApiTypes("d", "b", { role: "a b", database: "analytics" })).toBe(module);
+    const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe("https://api.test/v1/databases/d/branches/b/data-api/types?role=a+b&database=analytics");
+    expect(init.method).toBe("GET");
+    expect(new Headers(init.headers).get("authorization")).toBe("Bearer tok");
+  });
+
+  it("the_json_map_comes_back_as_its_text_too", async () => {
+    setup((async () => res('{"defaultSchema":"public"}', 200)) as typeof fetch);
+    expect(await fetchDataApiTypes("d", "b", { format: "json" })).toBe('{"defaultSchema":"public"}');
+  });
+
+  it("errors_are_api_errors", async () => {
+    setup((async () => res('{"error":{"code":"forbidden","message":"this needs role:x","required":"role:x"}}', 403)) as typeof fetch);
+    await expect(fetchDataApiTypes("d", "b")).rejects.toMatchObject({ status: 403, code: "forbidden" });
   });
 });

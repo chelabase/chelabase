@@ -338,6 +338,16 @@ pub mod orchestrator {
         Access::Project(Viewer),
     );
 
+    /// The branch's generated types (`GET /data/v1/types`'s module or map) for a secret key's
+    /// role: who may create a secret key for the role may download them (createKey's checks;
+    /// the handler refines by role).
+    pub const DATA_API_TYPES: Endpoint = key_endpoint(
+        "orchestrator.data_api_types",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/data-api/types",
+        Access::Project(Developer),
+    );
+
     /// Starts serving one of the branch's Postgres databases through the data API.
     pub const ENABLE_DATA_API: Endpoint = key_endpoint(
         "orchestrator.enable_data_api",
@@ -1248,6 +1258,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::ROTATE_KEY,
     orchestrator::REVOKE_KEY,
     orchestrator::DATA_API_SCHEMA,
+    orchestrator::DATA_API_TYPES,
     orchestrator::ENABLE_DATA_API,
     orchestrator::DISABLE_DATA_API,
     orchestrator::UPDATE_PG_DATABASE,
@@ -1815,7 +1826,13 @@ mod tests {
             found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/schema"),
             "orchestrator.data_api_schema"
         );
-        for name in ["list_keys", "create_key", "rotate_key", "revoke_key", "data_api_schema"] {
+        assert_eq!(
+            found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/types"),
+            "orchestrator.data_api_types"
+        );
+        // Downloading types is creating a key's access, not listing keys'.
+        assert_eq!(orchestrator::DATA_API_TYPES.policy, orchestrator::CREATE_KEY.policy);
+        for name in ["list_keys", "create_key", "rotate_key", "revoke_key", "data_api_schema", "data_api_types"] {
             let ep = ENDPOINTS
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
@@ -2002,6 +2019,7 @@ mod tests {
             // Data keys (Admin for a key not bound to an allowed role, refined in the handler).
             ("orchestrator.list_keys", Access::Project(Viewer)),
             ("orchestrator.data_api_schema", Access::Project(Viewer)),
+            ("orchestrator.data_api_types", Access::Project(Developer)),
             ("orchestrator.create_key", Access::Project(Developer)),
             ("orchestrator.rotate_key", Access::Project(Developer)),
             ("orchestrator.update_key", Access::Project(Developer)),
