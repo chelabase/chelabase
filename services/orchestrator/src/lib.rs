@@ -1837,7 +1837,7 @@ pub struct RestInternal {
     /// `http://host:port`, no path.
     pub url: String,
     pub token: String,
-    pub http: reqwest::Client,
+    pub http: chelabase_http::Client,
 }
 
 /// Longest wait for rest to acknowledge an invalidation.

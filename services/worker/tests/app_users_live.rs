@@ -15,7 +15,7 @@
 //! or fail (with the project's Zitadel org and users, when the test made them).
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::future::Future;
 use std::process::Stdio;

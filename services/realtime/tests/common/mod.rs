@@ -5,7 +5,7 @@
 //! and the orchestrator, as instances share Valkey, NATS and the orchestrator.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![allow(dead_code)]
 
 use std::net::{Ipv4Addr, SocketAddr};

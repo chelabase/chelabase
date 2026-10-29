@@ -63,7 +63,7 @@ impl SessionAnswer {
 
 pub struct UserTokens {
     verifier: Option<AppTokenVerifier>,
-    client: reqwest::Client,
+    client: chelabase_http::Client,
     base: String,
     bearer: String,
     live: Cache<Uuid, Liveness>,

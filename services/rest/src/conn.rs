@@ -211,7 +211,7 @@ pub trait ConnSource: Send + Sync + 'static {
 
 /// The orchestrator's internal listener.
 pub struct InternalSource {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: String,
     token: String,
 }

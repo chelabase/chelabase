@@ -3,7 +3,7 @@
 //! on when they are signed.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use axum::Router;
 use axum::extract::{Request, State};

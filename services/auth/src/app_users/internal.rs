@@ -130,7 +130,7 @@ pub enum InternalError {
 }
 
 pub struct InternalClient {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: String,
     token: String,
 }

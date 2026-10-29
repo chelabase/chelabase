@@ -228,7 +228,7 @@ pub struct LsnAtTime {
 
 #[derive(Clone)]
 pub struct StorconClient {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: String,
     /// Warm secondary locations per tenant (`PlacementPolicy::Attached(n)`). With at least
     /// one, the storage controller can move a tenant off a draining or failed pageserver.
@@ -247,7 +247,7 @@ pub struct StorconClient {
 }
 
 /// A client sending `token` as a bearer on every request.
-pub(crate) fn http_client_with(timeout: Duration, token: Option<&str>) -> reqwest::Client {
+pub(crate) fn http_client_with(timeout: Duration, token: Option<&str>) -> chelabase_http::Client {
     // Never a redirect (#26): the NeonJWT goes to the configured service only.
     let mut builder = chelabase_http::client_builder().timeout(timeout);
     if let Some(token) = token {

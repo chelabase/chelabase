@@ -146,7 +146,7 @@ impl std::fmt::Debug for ConnInfo {
 
 /// The orchestrator's connection route, cached per branch.
 pub struct ConnLookup {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: String,
     token: String,
     cache: Mutex<HashMap<Uuid, (Instant, Arc<ConnInfo>)>>,

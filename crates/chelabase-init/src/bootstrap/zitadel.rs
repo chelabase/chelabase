@@ -70,7 +70,7 @@ pub trait ZitadelApi: Send + Sync {
 }
 
 pub struct HttpZitadel {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     /// Where requests go (no trailing slash).
     base: String,
     /// The `Host` header, when it differs from `base`'s (Zitadel picks its instance by Host).

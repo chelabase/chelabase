@@ -4,7 +4,7 @@
 //! running here: 503). The same-session behaviour is the live suites'.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 #![allow(dead_code, unused_imports)]
 
 include!("common/fakes.rs");

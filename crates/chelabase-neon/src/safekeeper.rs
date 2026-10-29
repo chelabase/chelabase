@@ -27,7 +27,7 @@ impl From<reqwest::Error> for SafekeeperError {
 
 #[derive(Clone)]
 pub struct SafekeeperClient {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: Url,
 }
 
