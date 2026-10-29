@@ -1,4 +1,5 @@
-# The offline checks: `just check` and `just test`, the same recipes a contributor runs.
+# The offline checks: `just check` (nextest included) and the doctests `just test` adds, the same
+# commands a contributor runs.
 # Until the repo is public this runs by hand only (Actions minutes are billed on a private repo).
 name: ci
 
@@ -13,7 +14,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,7 +22,7 @@ env:
 
 jobs:
   check:
-    name: just check, just test
+    name: just check, doctests
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -44,6 +45,9 @@ jobs:
         with:
           tool: nextest,cargo-deny@0.20.2
 
+      - name: Compose version (just check's compose scripts need 2.30 or newer)
+        run: docker compose version
+
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: pnpm store path
@@ -60,6 +64,6 @@ jobs:
 
       - run: just check
 
-      # `just check` already ran nextest (no flag skips it in `just test`), so this reruns it from the
-      # warm build; the doctests are what is new.
-      - run: just test
+      # `just test` is `cargo nextest run --workspace` (already run by `just check`) plus the
+      # doctests, which nextest doesn't run: only the doctests are left.
+      - run: cargo test --workspace --doc

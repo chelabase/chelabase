@@ -317,8 +317,8 @@ Two workflows in `.github/workflows/`. Until the repo is public (Actions minutes
 
 | Workflow | What it runs |
 | --- | --- |
-| `ci.yml` | On ubuntu-latest: the toolchain from `.prototools` (via `moonrepo/setup-toolchain`), the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2, then `just check` and `just test` |
-| `live.yml` | `just workbench up`, every live recipe in the table above except `bench-data-api` (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
+| `ci.yml` | On ubuntu-latest: the toolchain from `.prototools` (via `moonrepo/setup-toolchain`), the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2, then `just check` and the doctests (`cargo test --workspace --doc`, all `just test` adds) |
+| `live.yml` | `just workbench up`, every recipe in *Live recipes on the workbench* except `bench-data-api`; the self-hosted e2e and the live Rust tests (`--run-ignored`) are not run (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
 
 **At launch**, enable the triggers (one change per workflow, each marked `# enable at launch`):
 

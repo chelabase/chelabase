@@ -2,7 +2,7 @@
 //! cap on bodies that aren't text or are empty, and verifier spellings we refuse.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::disallowed_methods)]
 
 use std::net::SocketAddr;
 

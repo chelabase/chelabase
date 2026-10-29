@@ -7,8 +7,10 @@
 #   scripts/tests/images-annotations.sh
 #   SOURCE="" scripts/publish-images.sh ...   (build with a missing source) -> this fails naming it
 #
-# Reads the index straight from the local image store (`docker save` -> index.json -> index blob),
-# so it sees what `docker push` will send. REPO/TAG default to what publish-images.sh builds.
+# Reads the index straight from the local image store: it streams each image through
+# `docker save` (layers included, so it takes a while) -> index.json -> index blob, so it sees
+# what `docker push` will send. Plain `just images` adds no annotations (only publish-images.sh
+# sets RELEASE). REPO/TAG default to what publish-images.sh builds.
 #
 # Manual check of the push-only path against a scratch registry (never GHCR). Retagging keeps the
 # tested index, so nothing is rebuilt:
@@ -51,7 +53,8 @@ with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as t:
 d = index["manifests"][0]["digest"].split(":")[1]
 doc = json.loads(blobs[d])
 if "manifests" not in doc:
-    print("{}"); sys.exit(0)
+    print("not an index: the top-level descriptor is " + doc.get("mediaType", "a single manifest"))
+    sys.exit(3)
 print(json.dumps(doc.get("annotations", {})))
 '
 }
@@ -59,7 +62,10 @@ print(json.dumps(doc.get("annotations", {})))
 for i in "${images[@]}"; do
   img="${REPO}/${i}:${TAG}"
   docker image inspect "${img}" >/dev/null 2>&1 || { bad "${img} isn't built"; continue; }
-  ann="$(index_annotations "${img}")"
+  if ! ann="$(index_annotations "${img}")"; then
+    bad "${i}: ${ann:-could not read its index} (build with scripts/publish-images.sh on the containerd image store)"
+    continue
+  fi
   for key in source revision licenses; do
     val="$(jq -r --arg k "org.opencontainers.image.${key}" '.[$k] // empty' <<<"${ann}")"
     if [[ -z "${val}" ]]; then bad "${i}: index annotation org.opencontainers.image.${key} is missing"; continue; fi
