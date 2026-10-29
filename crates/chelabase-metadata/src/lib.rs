@@ -257,10 +257,11 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
     Ok(cleaned)
 }
 
-/// Every `(table, column)` that holds a value sealed with the secrets key
-/// (`chelabase_secrets::SecretKey`). [`MetadataClient::ensure_key_check`] adopts a new key only
-/// while all of them are empty; a live test fails when a metadata column named like a sealed
-/// one is missing here.
+/// Every `(table, column, also)` that holds a value sealed with the secrets key
+/// (`chelabase_secrets::SecretKey`). A row counts as sealed when `column IS NOT NULL` and, if
+/// `also` is set, that SQL condition holds too (a value that can never be opened again doesn't
+/// count). [`MetadataClient::ensure_key_check`] adopts a new key only while no row counts; a
+/// live test fails when a metadata column named like a sealed one is missing here.
 ///
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
 /// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`); `data_api_keys.sealed`
@@ -268,27 +269,31 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
 /// (worker member roles, `seal_member_role_password`); `branch_auth_sync.password_sealed`
 /// (worker app users, `seal_role_password`); `app_sessions.grace_refresh_sealed` (orchestrator
-/// app refresh, `seal`).
-pub const SECRETS_KEY_SEALED: &[(&str, &str)] = &[
-    ("branches", "owner_password_enc"),
-    ("branches", "authenticator_password_enc"),
-    ("data_api_keys", "sealed"),
-    ("neon_roles", "password_enc"),
-    ("member_branch_roles", "password_enc"),
-    ("branch_auth_sync", "password_sealed"),
-    ("app_sessions", "grace_refresh_sealed"),
+/// app refresh, `seal`; opened only while `grace_until > now()`, see
+/// [`MetadataClient::refresh_app_session`], and nothing clears it once the window is over).
+pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
+    ("branches", "owner_password_enc", None),
+    ("branches", "authenticator_password_enc", None),
+    ("data_api_keys", "sealed", None),
+    ("neon_roles", "password_enc", None),
+    ("member_branch_roles", "password_enc", None),
+    ("branch_auth_sync", "password_sealed", None),
+    ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
 ];
 
 /// The key check's `LOCK TABLE … IN SHARE MODE` over every table in [`SECRETS_KEY_SEALED`]
 /// and the one statement summing their sealed values. Built from the constant list only.
 fn sealed_check_sql() -> (String, String) {
-    let mut tables: Vec<&str> = SECRETS_KEY_SEALED.iter().map(|(t, _)| *t).collect();
+    let mut tables: Vec<&str> = SECRETS_KEY_SEALED.iter().map(|(t, _, _)| *t).collect();
     tables.sort_unstable();
     tables.dedup();
     let lock = format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "));
     let counts: Vec<String> = SECRETS_KEY_SEALED
         .iter()
-        .map(|(t, c)| format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL)"))
+        .map(|(t, c, also)| {
+            let also = also.map(|a| format!(" AND {a}")).unwrap_or_default();
+            format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL{also})")
+        })
         .collect();
     (lock, format!("SELECT {}", counts.join(" + ")))
 }
@@ -648,6 +653,9 @@ impl MetadataClient {
     /// A key that doesn't open the stored check is adopted only while no column in
     /// [`SECRETS_KEY_SEALED`] holds a value. The count and the replace run in one transaction
     /// holding `SHARE` locks on those tables, so no sealed row can be written in between.
+    /// Those locks can deadlock with a writer that holds one listed table and wants another:
+    /// Postgres aborts one side (40P01), and if it is this check the start fails closed and is
+    /// retried on restart. `lock_timeout` bounds the wait behind a long transaction.
     pub async fn ensure_key_check(
         &self,
         candidate: &str,

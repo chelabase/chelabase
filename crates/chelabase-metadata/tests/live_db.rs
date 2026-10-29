@@ -455,10 +455,11 @@ async fn key_check_adopts_a_new_key_when_nothing_is_encrypted_yet() {
 /// Sealed values in every column the key check covers, counted the way a test sees them.
 async fn sealed_values(client: &MetadataClient) -> i64 {
     let mut total = 0;
-    for (table, column) in chelabase_metadata::SECRETS_KEY_SEALED {
-        // Constant identifiers from the list.
+    for (table, column, also) in chelabase_metadata::SECRETS_KEY_SEALED {
+        let also = also.map(|a| format!(" AND {a}")).unwrap_or_default();
+        // Constant identifiers and conditions from the list.
         let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT count(*) FROM {table} WHERE {column} IS NOT NULL"
+            "SELECT count(*) FROM {table} WHERE {column} IS NOT NULL{also}"
         )))
         .fetch_one(client.pool())
         .await
@@ -466,6 +467,25 @@ async fn sealed_values(client: &MetadataClient) -> i64 {
         total += n;
     }
     total
+}
+
+/// An app session in the demo project holding a sealed grace token whose window ends
+/// `grace_secs` from now (negative: already over); returns its id.
+async fn insert_grace_session(client: &MetadataClient, grace_secs: f64) -> uuid::Uuid {
+    let session = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+                                   grace_refresh_sealed, grace_until, expires_at)
+         VALUES ($1, $2, gen_random_uuid(), 'key-check', decode('00', 'hex'), 'v1:x',
+                 now() + make_interval(secs => $3), now() + interval '1 hour')",
+    )
+    .bind(session)
+    .bind(DEMO_PROJECT_ID)
+    .bind(grace_secs)
+    .execute(client.pool())
+    .await
+    .unwrap();
+    session
 }
 
 /// The parent rows one sealed fixture needs, deleted by [`SealedFixture::remove`].
@@ -549,19 +569,8 @@ impl SealedFixture {
                 .unwrap();
             }
             ("app_sessions", "grace_refresh_sealed") => {
-                let session = uuid::Uuid::new_v4();
-                sqlx::query(
-                    "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id,
-                                               refresh_hash, grace_refresh_sealed, expires_at)
-                     VALUES ($1, $2, gen_random_uuid(), 'key-check', decode('00', 'hex'), 'v1:x',
-                             now() + interval '1 hour')",
-                )
-                .bind(session)
-                .bind(DEMO_PROJECT_ID)
-                .execute(pool)
-                .await
-                .unwrap();
-                fixture.session = Some(session);
+                // Within its grace window: it can still be opened.
+                fixture.session = Some(insert_grace_session(client, 3600.0).await);
             }
             other => panic!("no fixture for sealed column {other:?}: add one here"),
         }
@@ -597,15 +606,20 @@ async fn key_check_refuses_when_only_one_column_is_sealed() {
     let _lock = key_check_lock().await;
     let saved = saved_key_check(&client).await;
     let mut wrong = Vec::new();
-    for &(table, column) in chelabase_metadata::SECRETS_KEY_SEALED {
+    for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
+        let before = sealed_values(&client).await;
         let fixture = SealedFixture::new(&client, table, column).await;
         restore_key_check(&client, Some("check-a".into())).await;
         let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
         let stored = saved_key_check(&client).await;
         fixture.remove(&client).await;
-        let refused = matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows >= 1);
+        // Exact: a value already in the environment must not hide a missed column.
+        let refused =
+            matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows == before + 1);
         if !refused || stored.as_deref() != Some("check-a") {
-            wrong.push(format!("{table}.{column}: {outcome:?}, stored check {stored:?}"));
+            wrong.push(format!(
+                "{table}.{column}: {outcome:?} ({before} before), stored check {stored:?}"
+            ));
         }
     }
     restore_key_check(&client, saved).await;
@@ -627,7 +641,7 @@ async fn key_check_adopts_only_with_no_sealed_values() {
     }
     let saved = saved_key_check(&client).await;
     let mut fixtures = Vec::new();
-    for &(table, column) in chelabase_metadata::SECRETS_KEY_SEALED {
+    for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         fixtures.push(SealedFixture::new(&client, table, column).await);
     }
     restore_key_check(&client, Some("check-a".into())).await;
@@ -646,6 +660,34 @@ async fn key_check_adopts_only_with_no_sealed_values() {
     }
     assert_eq!(adopted, KeyCheck::Replaced);
     assert_eq!(after.as_deref(), Some("check-b"));
+}
+
+// #38 audit: a grace token past its window can never be opened again, so it doesn't hold a
+// new key off.
+#[tokio::test]
+#[ignore]
+async fn key_check_ignores_an_expired_grace_token() {
+    use chelabase_metadata::KeyCheck;
+    let client = client().await;
+    let _lock = key_check_lock().await;
+    let sealed = sealed_values(&client).await;
+    if sealed > 0 {
+        eprintln!("skipping: {sealed} sealed values exist in this environment");
+        return;
+    }
+    let saved = saved_key_check(&client).await;
+    let session = insert_grace_session(&client, -60.0).await;
+    restore_key_check(&client, Some("check-a".into())).await;
+    let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
+    let stored = saved_key_check(&client).await;
+    sqlx::query("DELETE FROM app_sessions WHERE id = $1")
+        .bind(session)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    restore_key_check(&client, saved).await;
+    assert_eq!(outcome.unwrap(), KeyCheck::Replaced);
+    assert_eq!(stored.as_deref(), Some("check-b"));
 }
 
 // #38 Review Focus: a sealed write still in flight when the key check counts must not be
@@ -708,7 +750,7 @@ async fn every_sealed_column_is_checked() {
     let missing: Vec<String> = columns
         .iter()
         .filter(|(t, c)| {
-            !chelabase_metadata::SECRETS_KEY_SEALED.contains(&(t.as_str(), c.as_str()))
+            !chelabase_metadata::SECRETS_KEY_SEALED.iter().any(|(lt, lc, _)| (*lt, *lc) == (t.as_str(), c.as_str()))
                 && !NOT_SECRETS_KEY_SEALED.iter().any(|(et, ec, _)| (*et, *ec) == (t.as_str(), c.as_str()))
         })
         .map(|(t, c)| format!("{t}.{c}"))
@@ -718,7 +760,7 @@ async fn every_sealed_column_is_checked() {
         "sealed-looking columns neither in SECRETS_KEY_SEALED nor excluded: {missing:?}"
     );
     // The list names only columns that exist.
-    for (table, column) in chelabase_metadata::SECRETS_KEY_SEALED {
+    for (table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         assert!(
             columns.iter().any(|(t, c)| (t.as_str(), c.as_str()) == (*table, *column)),
             "SECRETS_KEY_SEALED names {table}.{column}, which doesn't exist"
