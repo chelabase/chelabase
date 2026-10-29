@@ -31,11 +31,11 @@ The Rust workspace holds the control plane; a pnpm workspace holds Studio, this 
 | Service | Role | Page |
 | --- | --- | --- |
 | Gateway | Pingora front door on `:8000`: authenticates every request and routes it | [Gateway](/docs/architecture/gateway) |
-| Orchestrator | The Management API (`/v1`), the metadata store and the internal listener | [Neon](/docs/architecture/neon) |
-| Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Neon](/docs/architecture/neon) |
-| rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/docs/architecture/data-api) |
-| auth | Sign-in backend for Studio and for app users | [Studio](/docs/architecture/studio), [App users](/docs/architecture/app-users) |
-| realtime | Live rows and presence over a WebSocket | [Realtime](/docs/architecture/realtime) |
+| Orchestrator | The Management API (`/v1`), the metadata store and the internal listener | [Orchestrator and worker](/docs/architecture/orchestrator) |
+| Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Orchestrator and worker](/docs/architecture/orchestrator) |
+| Rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/docs/architecture/data-api) |
+| Auth | Sign-in backend for Studio and for app users | [Studio](/docs/architecture/studio), [App users](/docs/architecture/app-users) |
+| Realtime | Live rows and presence over a WebSocket | [Realtime](/docs/architecture/realtime) |
 | Studio | The web app | [Studio](/docs/architecture/studio) |
 
 Zitadel is the identity provider, NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and realtime's tickets, and Mailpit catches local email.
@@ -57,6 +57,7 @@ This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, pre
 
 <Cards>
   <Card title="Gateway" href="/docs/architecture/gateway">Authentication, routing, limits and the internal identity token.</Card>
+  <Card title="Orchestrator and worker" href="/docs/architecture/orchestrator">The Management API, access decisions, jobs and reconcile.</Card>
   <Card title="Studio" href="/docs/architecture/studio">Sign-in, data fetching and how the bootstrap wires it up.</Card>
   <Card title="Data API" href="/docs/architecture/data-api">The request flow, the schema model and the benchmark.</Card>
   <Card title="App users" href="/docs/architecture/app-users">Identity, tokens and how users are synced.</Card>

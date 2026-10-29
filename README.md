@@ -1,6 +1,6 @@
 # Chelabase
 
-Chelabase is a database platform you run yourself: Postgres databases with copy-on-write branches, a typed data API, login roles, app-user auth and a web console, on Neon's storage engine.
+Chelabase is an open-source Postgres platform: databases with copy-on-write branches, a typed data API, login roles, auth for your app's users and a web console, built on Neon's storage engine. You can self-host it today with Docker Compose; a hosted version is planned.
 
 <!-- Static badges: the repo is private and has no release or CI yet. When the repo is public, the
 first release is cut and CI (#7) exists, swap in dynamic release and CI badges. -->
@@ -9,17 +9,59 @@ first release is cut and CI (#7) exists, swap in dynamic release and CI badges. 
 [![Self-hosted: Docker Compose ≥ 2.30](https://img.shields.io/badge/self--hosted-Docker%20Compose%20%E2%89%A5%202.30-2496ed)](apps/docs/content/docs/self-hosting/install.mdx)
 [![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)](SECURITY.md#supported-versions)
 
-## What it is
+## How it works
 
-- **Postgres on Neon's storage engine.** Each database gets its own Neon tenant, timeline and compute. Branches are copy-on-write, and a branch can be made or restored at a point in time.
-- **A typed data API.** A JSON query endpoint with row-level security, per-branch keys, generated TypeScript types and a client, `@chelabase/client`.
-- **Login roles** for connecting with `psql` and Postgres drivers, with encrypted, re-revealable credentials.
-- **App-user auth:** sign-up, sign-in and sessions for your app's own users, with helpers for RLS policies.
-- **Studio**, the web console: projects, databases, branches, tables, the SQL editor, keys, members and app users.
+Chelabase is a set of open-source services behind one gateway. Each database is a Postgres
+compute on Neon's storage engine, so branches are copy-on-write and can be made or restored at a
+point in time.
 
-One gateway fronts Studio, the APIs and sign-in.
+```mermaid
+flowchart LR
+  app["Your app<br/>@chelabase/client"] -- HTTPS --> gateway
+  browser["Studio<br/>(web console)"] -- HTTPS --> gateway
+  tools["psql, ORMs,<br/>migration tools"] -- Postgres --> proxy["Neon proxy"]
 
-## Requirements
+  gateway["Gateway"] --> orchestrator["Orchestrator<br/>Management API"]
+  gateway --> rest["Rest<br/>data API"]
+  gateway --> auth["Auth<br/>sign-in, app users"]
+  gateway --> realtime["Realtime<br/>live rows, presence"]
+  orchestrator -- jobs --> worker["Worker"]
+
+  subgraph neon ["Neon storage engine"]
+    compute["Postgres compute<br/>(one per branch)"]
+    storage["Pageserver, safekeepers,<br/>object store"]
+    compute --- storage
+  end
+
+  rest --> compute
+  proxy --> compute
+  worker -- provisions --> compute
+```
+
+- **[Gateway](apps/docs/content/docs/architecture/gateway.mdx)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.
+- **[Studio](apps/docs/content/docs/using/studio.mdx)** is the web console: projects, databases, branches, the table and SQL editors, keys, members and app users.
+- **[Orchestrator](apps/docs/content/docs/architecture/orchestrator.mdx)** serves the Management API (`/v1`), decides who may do what and keeps the platform's own state. The **Worker** runs its jobs: creating, branching, resetting and deleting databases.
+- **[Rest](apps/docs/content/docs/architecture/data-api.mdx)** is the data API. It turns a JSON query into SQL and runs it as the key's role, so Postgres row-level security decides what each caller sees.
+- **[Auth](apps/docs/content/docs/architecture/app-users.mdx)** signs in Studio members and your app's own users (sign-up, sign-in, sessions), with helpers for RLS policies.
+- **[Realtime](apps/docs/content/docs/architecture/realtime.mdx)** pushes live rows and presence to Studio over a WebSocket.
+- **[Neon](apps/docs/content/docs/architecture/neon.mdx)** stores the data. Postgres clients connect through its proxy with [login roles](apps/docs/content/docs/using/login-roles.mdx), whose credentials are encrypted and can be shown again.
+
+The [architecture docs](apps/docs/content/docs/architecture/index.mdx) go deeper.
+
+### Client libraries
+
+| Language | Package | What it covers | Status |
+|---|---|---|---|
+| TypeScript | [`@chelabase/client`](packages/client) | Data API queries with generated types, and app-user auth (`db.auth`) | In this repository; not on npm yet |
+| TypeScript | [`@chelabase/management-client`](packages/management-client) | The Management API, as TanStack Query hooks (what Studio uses) | In this repository; not on npm yet |
+| Any | Your Postgres driver | Direct SQL over the Postgres protocol | Works today |
+| Any | HTTP | The [data API](apps/docs/content/docs/using/data-api/index.mdx) and Management API, described in [`openapi/`](openapi/) | Works today |
+
+## Self-hosting
+
+Self-hosted Chelabase runs on one machine with Docker Compose.
+
+### Requirements
 
 - Docker Engine 26.0 or newer (the install mounts volume sub-paths).
 - Docker Compose 2.30 or newer. Check with `docker compose version`.
@@ -27,7 +69,7 @@ One gateway fronts Studio, the APIs and sign-in.
 
 Running Chelabase needs nothing else on the host. The [Install](apps/docs/content/docs/self-hosting/install.mdx#requirements) page lists what the machine needs.
 
-## Install
+### Install
 
 ```bash
 git clone https://github.com/chelabase/chelabase.git
@@ -55,43 +97,43 @@ The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the r
 
 ## First database
 
-1. In Studio, create a project (**New project**), then a database in it. It shows as provisioning, then as ready.
-2. Create a table, in the SQL editor or the table editor.
-3. In the database's Data API view, copy the public key (role `anon`, safe in a browser) or create a secret key (server only; it is shown once).
-4. Get the generated types, `db.ts`: in the same Data API view, choose **Download types**. Or fetch them with a secret key, from any build step:
+Once you're signed in to Studio:
 
-   ```bash
-   export CHELABASE_DATA_KEY=chk_sec_…   # a secret key: the types route refuses a public one
-   curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
-     http://api.chelabase.localhost:8000/data/v1/types -o db.ts
+1. **Create a database.** Choose **New project**, then add a database to it. Wait until it shows as ready.
+2. **Add a table.** Open the database's **SQL** editor and run:
+
+   ```sql
+   create table todos (
+     id bigint generated always as identity primary key,
+     title text not null,
+     done boolean not null default false
+   );
    ```
 
-5. Query the database from your app with `@chelabase/client`. In a browser, use the public key and the `types` from `db.ts`:
+3. **Get a key and your types.** Open the database's **Data API** view. Under **Secret keys**, choose **Create key** and save it (it is shown only once). Then choose **Download types** to save `db.ts`.
+4. **Query it from your server:**
 
    ```ts
    import { createClient } from "@chelabase/client";
    import { type Database, types } from "./db";
 
-   const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
+   const db = createClient<Database>({
+     url: "http://api.chelabase.localhost:8000",
+     key: process.env.CHELABASE_DATA_KEY!, // the secret key, chk_sec_…
+     types,
+   });
 
-   const rows = await db.from("orders").select("id", "total").where({ status: "paid" }).limit(10);
+   await db.from("todos").insert([{ title: "Try Chelabase" }]);
+   const open = await db.from("todos").select("id", "title").where({ done: false });
    ```
 
-   On a server, keep the secret key there and fetch the runtime types when the server starts, so value decoding follows the live schema without a rebuild:
+That's it. A few things to know:
 
-   ```ts
-   import { createClient, fetchTypes } from "@chelabase/client";
-   import type { Database } from "./db";
+- **Secret keys stay on servers.** For browser code, use the database's public key (`chk_pub_…`, shown in the same view) and turn on row-level security for the tables it can reach.
+- **`@chelabase/client` isn't on npm yet.** Add it from this repository as `"@chelabase/client": "workspace:*"`. The types are optional: `createClient({ url, key })` works untyped.
+- **Using Postgres directly?** Migrations, ORMs and `psql` connect with the credentials in the database's **Connection details**.
 
-   const url = process.env.CHELABASE_URL!;
-   const key = process.env.CHELABASE_DATA_KEY!; // chk_sec_…
-
-   const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key }) });
-   ```
-
-The client is not on npm yet: it is a workspace package in this repository (`packages/client`, added as `"@chelabase/client": "workspace:*"`). Getting the types needs only Studio or `curl`. Without them, `createClient({ url, key })` works untyped. See the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [Generated types](apps/docs/content/docs/using/client/types.mdx) and the [data API](apps/docs/content/docs/using/data-api/index.mdx).
-
-For migrations, ORMs and admin tools, connect to Postgres directly with the credentials in the database's **Connection details** in Studio; the [Install](apps/docs/content/docs/self-hosting/install.mdx) page says how connections reach the instance from the host. The [Quickstart](apps/docs/content/docs/using/quickstart.mdx) walks through all of it.
+The [Quickstart](apps/docs/content/docs/using/quickstart.mdx) covers each step in more detail, including fetching types in a build step and connecting over Postgres.
 
 ## Documentation
 

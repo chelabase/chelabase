@@ -3,7 +3,7 @@ title: Self-hosted vs platform
 description: Every rule that differs between self-hosted mode and platform mode, from one policy table in the code.
 ---
 
-`CHELABASE_MODE` is `self-hosted` (the default, and what you run yourself) or `platform` (the hosted cloud, not built yet). Every decision that depends on the mode lives in one place in the code, `ModePolicy`, so nothing else compares the mode. **Platform mode fails closed**: where a feature isn't designed for it yet, the answer is refused (403 `not_available_in_platform_mode`) rather than falling back to the self-hosted behaviour.
+`CHELABASE_MODE` is `self-hosted` (the default: an instance you install and operate) or `platform` (the hosted cloud, not built yet). Every decision that depends on the mode lives in one place in the code, `ModePolicy`, so nothing else compares the mode. **Platform mode fails closed**: where a feature isn't designed for it yet, the answer is refused (403 `not_available_in_platform_mode`) rather than falling back to the self-hosted behaviour.
 
 ## In practice
 
