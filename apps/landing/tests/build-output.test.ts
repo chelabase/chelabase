@@ -28,7 +28,7 @@ describe('the built landing page', () => {
   });
 
   it('prerendered_html_carries_the_copy', () => {
-    expect(html).toContain('Postgres that branches. Run it yourself.');
+    expect(html).toContain('Postgres that branches. Host it anywhere.');
     expect(html).toContain('staging merged into main');
     expect(html).toContain('<title>Chelabase — Postgres that branches</title>');
   });

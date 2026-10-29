@@ -4,6 +4,7 @@
   "pages": [
     "index",
     "gateway",
+    "orchestrator",
     "studio",
     "data-api",
     "app-users",

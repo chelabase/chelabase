@@ -1,0 +1,69 @@
+---
+title: "Orchestrator and worker"
+description: "The control plane: the Management API, the metadata store, the job queue and the worker that carries the jobs out."
+---
+
+The orchestrator (`services/orchestrator`) is the control plane. It serves the Management API (`/v1`), keeps the platform's own state in the metadata store, and decides who may do what. It doesn't do slow work itself: anything that touches a compute or Neon's storage is handed to the worker (`services/worker`) as a job, and the API answers as soon as the job is queued.
+
+```
+gateway ──identity token──▶ orchestrator ──job (JetStream)──▶ worker ──▶ Neon storage, computes
+                                 │                              │
+                                 └──────── metadata Postgres ◀──┘
+```
+
+## What the orchestrator owns
+
+- **The Management API.** Projects, databases, branches, merges, login roles, data API keys and settings, members and teams, app users, saved queries, the SQL editor and the table API. Each route is declared in `chelabase-routes`, like every other public endpoint (see [Gateway](/docs/architecture/gateway#one-declaration-per-endpoint)); the reference is generated from `openapi/management.json`.
+- **Access decisions.** The gateway proves who is calling; the orchestrator decides whether they may. For each request it checks, in order: that the caller is an admitted member, that the target is in the caller's tenant, the branch's protection, and the member's effective grant, read fresh on every request. Answers that don't depend on the target come first, so a refusal doesn't reveal whether the target exists. [Access per route](/docs/reference/access) lists the level each route needs.
+- **The metadata store.** A Postgres database (not one of your databases) holds tenants, projects, databases, branches, members, grants, keys and encrypted credentials. The orchestrator and the worker both run its migrations at start-up, and both refuse to start if the secrets key doesn't match the one the store was encrypted with.
+- **The internal listener.** A second listener, on `127.0.0.1:8083` by default, serves the machines that call the control plane: Neon's proxy, `compute_ctl`, the storage controller, and the gateway, `rest` and `auth` for their lookups. It never goes through the gateway, and each caller has its own bearer token. See [Neon: the internal listener](/docs/architecture/neon#the-internal-listener).
+
+## How a database is created
+
+1. `POST /v1/databases` reaches the orchestrator with the caller's identity. It validates the name and checks the caller may create databases in the project.
+2. It writes the database's row as `pending` and publishes a provision job to JetStream.
+3. It answers straight away. If the job can't be queued, the row is marked `failed` and the answer is 503 `worker_unavailable`.
+4. The worker picks up the job and marks the database `provisioning`. It creates the Neon tenant and timeline, waits until the storage controller reports the tenant attached, starts the compute container, and runs the database's bootstrap SQL as its owner role.
+5. The worker marks the database `ready`. Studio sees each status change through [realtime](/docs/architecture/realtime)'s project events.
+
+Branches, resets, restores, merges and deletes follow the same shape: the orchestrator records the intent and queues a job; the worker does the work and writes the outcome.
+
+## The worker
+
+The worker has no public API. It listens to NATS in two ways.
+
+**Durable jobs** go through the `CHELABASE_CONTROL` JetStream stream. Each kind has its own subject and durable consumer, so a job survives a restart of either service, and with several workers each job goes to one of them. A failed job is redelivered after a delay (10 seconds, or 30 for branch jobs so their retries outlast a storage-controller restart).
+
+| Subject | Jobs |
+| --- | --- |
+| `chelabase.provision` | Create a database |
+| `chelabase.delete` | Delete a database: its computes and storage |
+| `chelabase.branch` | Create, reset to parent, restore and delete a branch |
+| `chelabase.merge` | Compute, rehearse, apply, resume and cancel a schema merge |
+| `chelabase.database_settings` | Push settings such as the history window to the tenant |
+| `chelabase.project_delete` | Delete a project and everything in it |
+| `chelabase.app_users`, `chelabase.app_users_sync` | Turn app users on or off for a project, and copy user rows into its databases |
+
+**Quick calls** use NATS request/reply (`chelabase.rpc.*`) when the API needs the answer before it responds: creating, updating and deleting login roles, resetting a password, turning the data API on or off, checking a role or a table, and the merge review. The orchestrator waits a few seconds for the reply; the worker keeps each call well under that deadline.
+
+**Background loops** keep the system converging without being asked:
+
+- **Reconcile**, every 30 seconds, compares each branch's recorded status with its compute and fixes the difference: it recreates a compute that is missing or stopped (backing off when one keeps failing), finishes interrupted switches, and hands a merge whose worker went silent back to the queue.
+- Separate sweeps reconcile member roles and app users, revoke the logins of members who were deactivated or deleted in the identity provider, renew compute certificates and refresh storage tokens before they expire.
+
+The worker serves only `/health`, on `127.0.0.1:8082` by default.
+
+## Statuses
+
+A database and each of its branches carry a status that the orchestrator writes when a job is queued and the worker writes as it goes:
+
+| Status | Meaning |
+| --- | --- |
+| `pending` | Recorded; the job is queued |
+| `provisioning` | The worker is creating storage and the compute |
+| `ready` | Serving queries |
+| `resetting` | A branch is being reset or restored (branches only) |
+| `failed` | The job failed; the error is recorded on the row |
+| `deleting`, `deleted` | Being removed, then gone |
+
+Studio shows these statuses, and `GET /v1/databases/{id}` returns them.

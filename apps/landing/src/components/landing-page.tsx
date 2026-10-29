@@ -110,7 +110,7 @@ export function LandingPage({ studioUrl }: LandingPageProps) {
         <div className={`${COLUMN} relative z-1 flex-none pt-12 short:pt-7`}>
           <Wordmark as="h1" className="m-0 text-[4rem] short:text-[3.25rem]" clawClassName={`h-[1.3em] ${CLAW}`} />
           <p className="mt-4.5 font-serif font-semibold text-[1.75rem] leading-[1.2] tracking-[-0.015em] short:mt-3 short:text-[1.5rem]">
-            Postgres that branches. Run it yourself.
+            Postgres that branches. Host it anywhere.
           </p>
           <p className="mt-2.5 max-w-160 text-chalk-dim text-[1.125rem] text-pretty">
             Postgres on Neon's storage engine, with copy-on-write branches, point-in-time restore, a typed data API and
@@ -507,7 +507,7 @@ const ROWS: Array<{ label: string; marks: [Mark, Mark, Mark, Mark, Mark] }> = [
   { label: "Postgres", marks: ["yes", "yes", "other", "yes", "unknown"] },
   { label: "Copy-on-write branches", marks: ["yes", "other", "no", "yes", "unknown"] },
   { label: "Point-in-time restore", marks: ["yes", "yes", "unknown", "yes", "unknown"] },
-  { label: "Run it yourself", marks: ["yes", "yes", "no", "partial", "unknown"] },
+  { label: "Self-hostable", marks: ["yes", "yes", "no", "partial", "unknown"] },
   { label: "Typed query API", marks: ["yes", "other", "other", "unknown", "unknown"] },
   { label: "App-user auth", marks: ["yes", "yes", "yes", "unknown", "unknown"] },
   { label: "Object storage", marks: ["soon", "yes", "yes", "no", "unknown"] },
