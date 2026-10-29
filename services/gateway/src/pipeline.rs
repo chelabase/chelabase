@@ -199,7 +199,7 @@ impl Pipeline {
                 return Outcome::Respond(data_error(
                     404,
                     "invalid_query",
-                    "no such data API endpoint: use POST /data/v1/query or GET /data/v1/schema",
+                    "no such data API endpoint: use POST /data/v1/query, GET /data/v1/schema or GET /data/v1/types",
                 ));
             }
             Match::NotFound => {
@@ -884,7 +884,11 @@ mod tests {
         assert_eq!(resp.status, 404);
         let body = resp.body.unwrap();
         assert_eq!(body["error"]["code"], "invalid_query");
-        assert!(body["error"]["message"].as_str().unwrap().contains("/data/v1/query"), "{body}");
+        // The hint names every data API route a client can call.
+        let message = body["error"]["message"].as_str().unwrap();
+        for route in ["POST /data/v1/query", "GET /data/v1/schema", "GET /data/v1/types"] {
+            assert!(message.contains(route), "{route}: {body}");
+        }
         let resp = expect_response(run(&h.pipeline, "GET", "/data/v1/query", None, &[]).await.outcome);
         assert_eq!(resp.status, 405);
         assert_eq!(header(&resp.headers, "allow"), Some("POST"));

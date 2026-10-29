@@ -129,6 +129,7 @@ pub fn router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
 pub fn internal_router<S: ConnSource>(state: Arc<AppState<S>>) -> Router {
     Router::new()
         .route("/internal/schema/{branch_id}", get(branch_schema::<S>))
+        .route("/internal/types/{branch_id}", get(internal_types::<S>))
         .route(
             "/internal/branches/{branch_id}/invalidate",
             post(invalidate::<S>),
@@ -354,13 +355,23 @@ enum TypesFormat {
 fn types_options(
     query: Result<Query<Vec<(String, String)>>, QueryRejection>,
 ) -> Result<(chelabase_typegen::Which, chelabase_typegen::Format), ApiError> {
+    types_options_with(query, None)
+}
+
+/// [`types_options`], also taking one `role` into `role` when it is given (the internal
+/// route's).
+fn types_options_with(
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+    mut role: Option<&mut Option<String>>,
+) -> Result<(chelabase_typegen::Which, chelabase_typegen::Format), ApiError> {
     let Query(pairs) = query.map_err(|_| ApiError::invalid_query("the query string isn't valid"))?;
     let (mut format, mut database, mut all) = (None, None, None);
     for (name, value) in pairs {
-        let slot = match name.as_str() {
-            "format" => &mut format,
-            "database" => &mut database,
-            "all_databases" => &mut all,
+        let slot = match (name.as_str(), role.as_deref_mut()) {
+            ("format", _) => &mut format,
+            ("database", _) => &mut database,
+            ("all_databases", _) => &mut all,
+            ("role", Some(role)) => role,
             _ => {
                 return Err(ApiError::invalid_query(
                     "the types route takes `format`, `database` and `all_databases` only",
@@ -463,15 +474,38 @@ async fn types<S: ConnSource>(
         Ok(options) => options,
         Err(e) => return e.into_response(),
     };
-    // `gen types`' own plan, one schema call at a time, each exactly `GET /data/v1/schema`'s.
     let (engine, data_ref, rid_ref) = (&state.engine, &data, rid.as_str());
-    let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
-        let schema = engine
+    types_answer(&which, format, &headers, rid_ref, |database: Option<String>| async move {
+        engine
             .role_schema(data_ref, database.as_deref(), rid_ref)
             .await
-            .map_err(|f| public_failure(f, rid_ref))?;
-        serde_json::from_value::<chelabase_typegen::Schema>(schema)
-            .map_err(|e| ApiError::internal(rid_ref, format!("the schema isn't the generator's: {e}")).into_response())
+            .map_err(|f| public_failure(f, rid_ref))
+    })
+    .await
+}
+
+/// The types of the schemas `schema` gives (one call per database, `gen types`' own plan),
+/// rendered, with the ETag, `no-store` and the 304: the public and the internal route's
+/// shared answer, so both are the same bytes for the same role.
+async fn types_answer<F, Fut>(
+    which: &chelabase_typegen::Which,
+    format: chelabase_typegen::Format,
+    headers: &HeaderMap,
+    rid: &str,
+    schema: F,
+) -> Response
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, Response>>,
+{
+    let mut schema = schema;
+    let schemas = chelabase_typegen::collect(which, |database: Option<String>| {
+        let fetched = schema(database);
+        async move {
+            serde_json::from_value::<chelabase_typegen::Schema>(fetched.await?).map_err(|e| {
+                ApiError::internal(rid, format!("the schema isn't the generator's: {e}")).into_response()
+            })
+        }
     })
     .await;
     let schemas = match schemas {
@@ -481,7 +515,7 @@ async fn types<S: ConnSource>(
     let body = match chelabase_typegen::render(&schemas, format) {
         Ok(body) => body,
         Err(e) => {
-            // The names in it are the key's own schema's.
+            // The names in it are the role's own schema's.
             let mut message = e.to_string();
             let mut source = std::error::Error::source(&e);
             while let Some(s) = source {
@@ -498,10 +532,42 @@ async fn types<S: ConnSource>(
         chelabase_typegen::Format::Json => "application/json",
     };
     let cache = [(header::ETAG, etag.clone()), (header::CACHE_CONTROL, "no-store".to_string())];
-    if none_match(&headers, &etag) {
+    if none_match(headers, &etag) {
         return (StatusCode::NOT_MODIFIED, cache).into_response();
     }
     (cache, [(header::CONTENT_TYPE, content_type)], body).into_response()
+}
+
+/// `GET /internal/types/{branch}?role=&format=&database=&all_databases=`: what
+/// `GET /data/v1/types` gives a secret key of `role` with no database list, through the same
+/// code. The orchestrator's types download, after its member access check; the role is held
+/// to the console's check (it must exist and not be owner-level).
+async fn internal_types<S: ConnSource>(
+    State(state): State<Arc<AppState<S>>>,
+    Path(branch): Path<Uuid>,
+    query: Result<Query<Vec<(String, String)>>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = check_bearer(&state, &headers) {
+        return e.into_response();
+    }
+    let mut role = None;
+    let (which, format) = match types_options_with(query, Some(&mut role)) {
+        Ok(options) => options,
+        Err(e) => return e.into_response(),
+    };
+    let Some(role) = role.filter(|r| !r.is_empty()) else {
+        return ApiError::invalid_query("`role` is required").into_response();
+    };
+    let rid = format!("internal-{}", Uuid::new_v4());
+    let (engine, role_ref, rid_ref) = (&state.engine, role.as_str(), rid.as_str());
+    types_answer(&which, format, &headers, rid_ref, |database: Option<String>| async move {
+        engine
+            .key_role_schema(branch, role_ref, database.as_deref(), rid_ref)
+            .await
+            .map_err(|f| internal_failure(f, rid_ref))
+    })
+    .await
 }
 
 async fn branch_schema<S: ConnSource>(

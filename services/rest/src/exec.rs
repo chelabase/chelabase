@@ -708,6 +708,32 @@ impl<S: ConnSource> Engine<S> {
         database: Option<&str>,
         request_id: &str,
     ) -> Result<Value, Failure> {
+        self.role_schema_with(data, database, Guard::Key(data), request_id)
+            .await
+    }
+
+    /// [`Self::role_schema`] for a secret key of `role` on `branch` with no database list,
+    /// the role held to the console's check (it must exist and not be owner-level): the
+    /// orchestrator's types download, after its own access check.
+    pub async fn key_role_schema(
+        &self,
+        branch: Uuid,
+        role: &str,
+        database: Option<&str>,
+        request_id: &str,
+    ) -> Result<Value, Failure> {
+        let data = console_identity(branch, role);
+        self.role_schema_with(&data, database, Guard::Console(role), request_id)
+            .await
+    }
+
+    async fn role_schema_with(
+        &self,
+        data: &DataIdentity,
+        database: Option<&str>,
+        guard: Guard<'_>,
+        request_id: &str,
+    ) -> Result<Value, Failure> {
         let allowed = data.databases.as_deref();
         let (_, served) = self.database(data.branch_id, database, allowed).await?;
         let (schema, views, default_schema, info) = self
@@ -716,7 +742,7 @@ impl<S: ConnSource> Engine<S> {
                 &served,
                 &data.role,
                 &[&data.role],
-                Guard::Key(data),
+                guard,
                 request_id,
             )
             .await?;
