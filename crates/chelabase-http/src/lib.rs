@@ -7,13 +7,17 @@
 //!
 //! [`Client`] wraps a `reqwest::Client` that refuses redirects, and [`client_builder`] is the
 //! only way to make one. The wrapper has no `Default`, no `Deref`, and no conversion to or from
-//! a `reqwest::Client`, so the inner client never leaves this crate. [`ClientBuilder`] exposes
-//! only `timeout`, `default_headers` and `build`: nothing that changes the redirect policy.
+//! a `reqwest::Client`. [`ClientBuilder`] exposes only `timeout`, `default_headers` and `build`:
+//! nothing that changes the redirect policy.
 //!
-//! The workspace `clippy.toml` disallows the `reqwest::Client` and `reqwest::ClientBuilder`
-//! types themselves (so an inferred `Default::default()` field fails too), every other
-//! constructor, `reqwest::get` and `ClientBuilder::redirect`. This crate is the only production
-//! code allowed to name them; `scripts/tests/http-no-redirects.sh` fails any other allow.
+//! The forwarders return a plain `reqwest::RequestBuilder`, and reqwest itself has two ways
+//! across that boundary: `RequestBuilder::build_split` hands back the inner client, and
+//! `RequestBuilder::from_parts` takes any client, an inferred `Default::default()` one (which
+//! follows redirects) included. Neither is used here, and the workspace `clippy.toml`
+//! disallows both, along with the `reqwest::Client` and `reqwest::ClientBuilder` types
+//! themselves (so an inferred `Default::default()` field fails too), every other constructor,
+//! `reqwest::get` and `ClientBuilder::redirect`. This crate is the only production code allowed
+//! to name them; `scripts/tests/http-no-redirects.sh` fails any other opt-out.
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::time::Duration;

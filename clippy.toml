@@ -4,7 +4,9 @@
 # `chelabase_http::Client`; that crate is the only place allowed to name or call these, and
 # `ClientBuilder::redirect` is listed so nothing turns following back on. The reqwest client
 # types themselves are disallowed too (#32), so even an inferred `Default::default()` of a
-# `reqwest::Client` field fails. Clippy applies this to every target, tests included:
+# `reqwest::Client` field fails. `RequestBuilder::from_parts` is listed because its parameter
+# lets an inferred `Default::default()` client in without naming the type, and
+# `RequestBuilder::build_split` because it hands the inner client back out. Clippy applies this to every target, tests included:
 # integration-test crates (`*/tests/`) opt out with
 # `allow(clippy::disallowed_methods, clippy::disallowed_types)`.
 # scripts/tests/http-no-redirects.sh fails any such allow in production sources outside
@@ -17,11 +19,15 @@ disallowed-methods = [
     { path = "reqwest::ClientBuilder::new", reason = "follows redirects; use chelabase_http::client_builder()" },
     { path = "reqwest::ClientBuilder::redirect", reason = "chelabase_http::client_builder() already refuses redirects; never turn following back on" },
     { path = "reqwest::get", reason = "a default client that follows redirects; use chelabase_http::client_builder()" },
+    { path = "reqwest::RequestBuilder::from_parts", reason = "takes any reqwest::Client, an inferred Default::default() one included; send through a chelabase_http::Client" },
+    { path = "reqwest::RequestBuilder::build_split", reason = "hands the inner reqwest::Client out of chelabase_http::Client; use build()" },
     { path = "reqwest::blocking::Client::new", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
     { path = "reqwest::blocking::Client::builder", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
     { path = "reqwest::blocking::Client::default", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
     { path = "reqwest::blocking::ClientBuilder::new", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
     { path = "reqwest::blocking::ClientBuilder::redirect", reason = "never turn following back on", allow-invalid = true },
+    { path = "reqwest::blocking::RequestBuilder::from_parts", reason = "takes any reqwest client; send through a chelabase_http::Client", allow-invalid = true },
+    { path = "reqwest::blocking::RequestBuilder::build_split", reason = "hands the inner client out; use build()", allow-invalid = true },
     { path = "reqwest::blocking::get", reason = "a default client that follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
 ]
 disallowed-types = [
