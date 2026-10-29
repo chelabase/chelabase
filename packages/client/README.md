@@ -44,5 +44,5 @@ const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key
 
 The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types (and
 `fetchTypes`),
-other databases and app users (`db.auth`). Run the docs site (`just docs`, on
-http://docs.chelabase.localhost:8000) and open `/docs/using/client`.
+other databases and app users (`db.auth`). Read it in `apps/docs/content/docs/using/client/`, or run the docs site in the workbench
+(`just workbench up --with docs`, then http://docs.chelabase.localhost:8000/docs/using/client).
