@@ -197,7 +197,7 @@ impl Options {
         (status = 409, description = "`backup_branch`: a restore backup has no compute; `branch_not_ready`: the branch isn't ready; `data_api_disabled`: the Postgres database isn't served by the data API; `conflict`: the schema can't be typed (a schema the role reaches has a dot in its name, or with `all_databases` another database is named `main`, the key main always takes)", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: an option isn't `role=<name>`, `format=ts|json`, `database=<name>` or `all_databases=true|false`, is repeated or empty, or `database` came with `all_databases=true`; `role_refused`: the worker refused the role (it doesn't exist or may not back a key; the message says why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 502, description = "`unavailable`: the data API answered something unexpected", body = ErrorEnvelope),
+        (status = 502, description = "`unavailable`: the data API answered something unexpected, or refused the orchestrator's internal credential (a server misconfiguration, not your sign-in)", body = ErrorEnvelope),
         (status = 503, description = "`unavailable`: the data API or the branch's database can't be reached; retry after `Retry-After`; `worker_unavailable`: the worker can't be reached", body = ErrorEnvelope, headers(("Retry-After" = u32, description = "Seconds to wait before retrying"))),
         (status = 504, description = "`timeout`: the worker didn't answer in time; the data API's `timeout` when reading the schema ran past the statement timeout", body = ErrorEnvelope),
     ),

@@ -1856,7 +1856,7 @@
             }
           },
           "502": {
-            "description": "`unavailable`: the data API answered something unexpected",
+            "description": "`unavailable`: the data API answered something unexpected, or refused the orchestrator's internal credential (a server misconfiguration, not your sign-in)",
             "content": {
               "application/json": {
                 "schema": {
