@@ -99,7 +99,7 @@ The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the r
 
 Once you're signed in to Studio:
 
-1. **Create a database.** Choose **New project**, then add a database to it. Wait until it shows as ready.
+1. **Create a database.** Open the **default** project (you can rename or delete it later in its settings) or choose **New project**, then add a database to it. Wait until it shows as ready; the first one takes longer while the worker pulls the compute image.
 2. **Add a table.** Open the database's **SQL** editor and run:
 
    ```sql
