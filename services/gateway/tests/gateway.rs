@@ -1188,3 +1188,102 @@ async fn a_dead_realtime_upstream_answers_a_socket_upgrade_with_502() {
     let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
 }
+
+/// m16: an upstream serving types as rest and the orchestrator do: a strong `ETag`, and a 304
+/// for an `If-None-Match` naming it. It records the `If-None-Match` it got.
+async fn spawn_types_upstream() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let record = record.clone();
+        async move {
+            use axum::response::IntoResponse;
+            let inm = req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string());
+            record.lock().unwrap().push(inm.clone());
+            let cache = [("etag", "\"t1\""), ("cache-control", "no-store")];
+            if inm.as_deref() == Some("\"t1\"") {
+                return (axum::http::StatusCode::NOT_MODIFIED, cache).into_response();
+            }
+            (cache, [("content-type", "text/typescript; charset=utf-8")], "export type Database = {};\n").into_response()
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// The data key lookup, answering every key as a secret key (the types route takes no other).
+async fn spawn_secret_key_listener() -> String {
+    let app = Router::new().fallback(|req: Request| async move {
+        let bearer = req.headers().get("authorization").and_then(|v| v.to_str().ok());
+        if bearer != Some("Bearer e2e-data-keys-token") {
+            return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "key_id": "11111111-1111-4111-8111-111111111111",
+                "branch_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": E2E_PROJECT,
+                "kind": "secret",
+                "role": "authenticated",
+            })),
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// m16: `ETag`, `If-None-Match` and the 304 pass through the gateway unchanged, on the data
+/// API's `GET /data/v1/types` and on the management API's types download.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn types_etag_if_none_match_and_304_pass_through() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_types_upstream().await;
+    let internal = spawn_secret_key_listener().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &upstream,
+        &jwks,
+        &[
+            ("CHELABASE_REST_URL", &upstream),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ],
+    )
+    .await;
+    let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Secret).key;
+    let management = format!("Bearer {}", jwks.token_for_org("user-1", "org-1", 300));
+    let routes = [
+        (format!("{base}/data/v1/types"), format!("Bearer {key}")),
+        (
+            format!("{base}/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/types"),
+            management,
+        ),
+    ];
+    for (url, auth) in routes {
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).header("authorization", &auth).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{url}");
+        assert_eq!(resp.headers()["etag"], "\"t1\"", "{url}");
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{url}");
+        assert_eq!(resp.headers()["content-type"], "text/typescript; charset=utf-8", "{url}");
+        assert_eq!(resp.text().await.unwrap(), "export type Database = {};\n", "{url}");
+        assert_eq!(seen.lock().unwrap().last().unwrap(), &None, "{url}");
+
+        let resp = client
+            .get(&url)
+            .header("authorization", &auth)
+            .header("if-none-match", "\"t1\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 304, "{url}");
+        assert_eq!(resp.headers()["etag"], "\"t1\"", "{url}");
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{url}");
+        assert_eq!(resp.bytes().await.unwrap().len(), 0, "{url}");
+        assert_eq!(seen.lock().unwrap().last().unwrap().as_deref(), Some("\"t1\""), "{url}");
+    }
+}
