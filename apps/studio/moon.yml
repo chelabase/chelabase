@@ -12,10 +12,10 @@ tasks:
     args: ["build"]
     inputs:
       - "**/*"
-      - "/packages/lagoon/**/*"
+      - "/packages/design/**/*"
   typecheck:
     command: "pnpm"
     args: ["typecheck"]
     inputs:
       - "**/*"
-      - "/packages/lagoon/src/**/*"
+      - "/packages/design/src/**/*"

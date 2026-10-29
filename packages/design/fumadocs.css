@@ -1,5 +1,5 @@
 /*
- * Fumadocs in the lagoon palette. Import last, after fumadocs-ui's preset.css and the twoslash and
+ * Fumadocs in the design palette. Import last, after fumadocs-ui's preset.css and the twoslash and
  * openapi presets, and without fumadocs-ui's colour themes (neutral.css and the like): this file
  * declares every `--color-fd-*` colour itself. Unlayered, so it wins over Fumadocs' layered rules.
  *
@@ -64,7 +64,7 @@
   --color-fd-diff-add-symbol: var(--seafoam);
 }
 
-/* The radius scale: Fumadocs' larger radii (cards, code blocks, dialogs) fold into the lagoon
+/* The radius scale: Fumadocs' larger radii (cards, code blocks, dialogs) fold into the design
    radius; sm, md and lg come from tailwind.css. */
 @theme inline {
   --radius-xl: var(--radius);
@@ -91,7 +91,7 @@ figure.shiki {
   box-shadow: none;
 }
 
-/* Fonts (D8: the stacks come from tokens.css through Tailwind's --font-*). */
+/* Fonts (D8: the stacks are Tailwind's --font-*, from tailwind.css). */
 /* Every heading of the page (title, prose and operation sections); `.not-prose` headings are
    component internals (the response accordions' triggers). */
 #nd-page :is(h1, h2, h3, h4, h5, h6):not(.not-prose) {

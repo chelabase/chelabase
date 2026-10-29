@@ -16,7 +16,7 @@ describe("scalar skin", () => {
     expect(selectors(css)).toContain("body > .scalar-app");
   });
 
-  test("maps_onto_lagoon_tokens", () => {
+  test("maps_onto_design_tokens", () => {
     expect(css).toContain("--scalar-background-1: var(--ink)");
     expect(css).toContain("--scalar-color-accent: var(--sand)");
     expect(css).toContain("--scalar-color-red: var(--coral)");

@@ -168,9 +168,9 @@ importers:
 
   apps/docs:
     dependencies:
-      '@chelabase/lagoon':
+      '@chelabase/design':
         specifier: workspace:*
-        version: link:../../packages/lagoon
+        version: link:../../packages/design
       '@tanstack/react-router':
         specifier: 1.170.41
         version: 1.170.41(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -241,9 +241,9 @@ importers:
 
   apps/landing:
     dependencies:
-      '@chelabase/lagoon':
+      '@chelabase/design':
         specifier: workspace:*
-        version: link:../../packages/lagoon
+        version: link:../../packages/design
       '@tanstack/react-router':
         specifier: 1.170.41
         version: 1.170.41(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -308,9 +308,9 @@ importers:
       '@base-ui/react':
         specifier: ^1.8.0
         version: 1.8.0(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
-      '@chelabase/lagoon':
+      '@chelabase/design':
         specifier: workspace:*
-        version: link:../../packages/lagoon
+        version: link:../../packages/design
       '@chelabase/management-client':
         specifier: workspace:*
         version: link:../../packages/management-client
@@ -460,7 +460,7 @@ importers:
         specifier: ^5.0.2
         version: 5.0.2(@opentelemetry/api@1.9.0)(@types/node@24.19.0)(jsdom@30.1.1)(vite@8.3.2(@types/node@24.19.0)(esbuild@0.28.2)(jiti@2.7.0)(yaml@2.9.1))
 
-  packages/lagoon:
+  packages/design:
     dependencies:
       '@fontsource-variable/atkinson-hyperlegible-next':
         specifier: ^5.3.0

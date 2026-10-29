@@ -213,7 +213,7 @@ describe('the built docs site', () => {
     }
   });
 
-  it('lagoon_tokens_reach_the_css', () => {
+  it('design_tokens_reach_the_css', () => {
     const assets = join(dist, 'assets');
     const sheets = readdirSync(assets)
       .filter((name) => name.endsWith('.css'))
@@ -249,7 +249,7 @@ describe('the built docs site', () => {
   });
 
   it('badge_signature_is_on_operation_and_sidebar_badges', () => {
-    // packages/lagoon/fumadocs.css remaps the badge tones on `.font-mono.font-medium.dark\:text-
+    // packages/design/fumadocs.css remaps the badge tones on `.font-mono.font-medium.dark\:text-
     // <colour>-400`, fumadocs-openapi's Badge. If Fumadocs changes those classes, this fails.
     const operationHtml = read('docs/reference/data/runQuery/index.html');
     // The operation's own badge, and the open folder of its sidebar.
@@ -289,7 +289,7 @@ describe('the built docs site', () => {
     });
     expect(
       offenders,
-      'a non-method Badge (e.g. Deprecated) carries the method signature: decide its colour in packages/lagoon/fumadocs.css',
+      'a non-method Badge (e.g. Deprecated) carries the method signature: decide its colour in packages/design/fumadocs.css',
     ).toEqual([]);
   });
 

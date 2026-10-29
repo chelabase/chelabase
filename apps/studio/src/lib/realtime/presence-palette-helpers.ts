@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 export type Rgb = [number, number, number];
 export type Theme = Map<string, string>;
 
-const tokensPath = join(dirname(fileURLToPath(import.meta.url)), "../../../../../packages/lagoon/tokens.css");
+const tokensPath = join(dirname(fileURLToPath(import.meta.url)), "../../../../../packages/design/tokens.css");
 
 function block(css: string, selector: string): Map<string, string> {
   const stripped = css.replace(/\/\*[\s\S]*?\*\//g, "");

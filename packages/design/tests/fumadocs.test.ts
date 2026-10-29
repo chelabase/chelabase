@@ -48,7 +48,7 @@ function blocksDeclaring(name: string): { selector: string; props: Map<string, s
     .filter((b) => b.props.has(name));
 }
 
-/** The lagoon tokens a value reads through `var(--…)`. */
+/** The design tokens a value reads through `var(--…)`. */
 function tokenRefs(value: string): string[] {
   return [...value.matchAll(/var\((--[a-z0-9-]+)\)/g)].map((m) => m[1]!);
 }
@@ -70,7 +70,7 @@ describe("fumadocs skin", () => {
     expect(block("@theme")).toEqual(block(".dark"));
   });
 
-  test("fd_colours_take_the_lagoon_roles", () => {
+  test("fd_colours_take_the_design_roles", () => {
     const root = block("@theme");
     expect(root.get("--color-fd-background")).toBe("var(--ink)");
     expect(root.get("--color-fd-foreground")).toBe("var(--chalk)");
@@ -122,7 +122,7 @@ describe("fumadocs skin", () => {
     expect(stripped.indexOf("\n.font-mono.font-medium.dark\\:text-yellow-400 {")).toBeGreaterThan(-1);
   });
 
-  test("callouts_and_diffs_take_the_lagoon_meanings", () => {
+  test("callouts_and_diffs_take_the_design_meanings", () => {
     // One meaning: coral = hazard, seafoam = yes, sand = attention, chalk-dim = neutral note.
     const statics = block("@theme static");
     expect(statics.get("--color-fd-error")).toBe("var(--coral)");

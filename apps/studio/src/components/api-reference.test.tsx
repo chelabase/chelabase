@@ -72,13 +72,13 @@ describe("ApiReference", () => {
     expect(config.defaultHttpClient).toEqual({ targetKey: "js", clientKey: "axios" });
   });
 
-  it("themes Scalar onto the lagoon tokens, scoped to the page wrapper", () => {
+  it("themes Scalar onto the design tokens, scoped to the page wrapper", () => {
     const { container } = render(wrap("t"));
     const wrapper = container.querySelector(".lagoon-scalar");
     expect(wrapper).not.toBeNull();
     expect(wrapper!.querySelector('[data-testid="scalar"]')).not.toBeNull();
     // Both stylesheets render as <style> next to the wrapper. The skin itself and its scoping
-    // are tested in packages/lagoon.
+    // are tested in packages/design.
     expect(container.querySelectorAll("style")).toHaveLength(2);
   });
 

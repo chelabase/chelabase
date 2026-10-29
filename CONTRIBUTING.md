@@ -15,7 +15,7 @@ apps/landing           the landing page
 services/              gateway, orchestrator, worker, rest, auth, realtime, init (chelabase-init)
 crates/                shared Rust libraries: auth, http, init, metadata, nats, neon, query,
                        routes, schema, secrets, types, zitadel
-packages/              TypeScript packages: client, management-client, lagoon (design tokens), neon-e2e
+packages/              TypeScript packages: client, management-client, design (design system), neon-e2e
 openapi/               generated OpenAPI documents (management, login, data)
 infra/compose/         the self-hosted install (docker-compose.yml, .env.example,
                        docker-compose.build.yml) and the workbench overlay (docker-compose.workbench.yml)

@@ -1,8 +1,8 @@
 {
-  "name": "@chelabase/lagoon",
+  "name": "@chelabase/design",
   "version": "0.1.0",
   "private": true,
-  "description": "The lagoon design tokens, fonts, Tailwind preset, Scalar skin, Fumadocs theme and React crab marks shared by Studio, the docs site and the landing page",
+  "description": "The design tokens, fonts, Tailwind preset, Scalar skin, Fumadocs theme and React crab marks shared by Studio, the docs site and the landing page",
   "type": "module",
   "exports": {
     "./tokens.css": "./tokens.css",

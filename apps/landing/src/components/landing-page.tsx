@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Archive, Braces, Database, DoorOpen, GitBranch, LayoutDashboard, SquareTerminal, Users, type LucideIcon } from "lucide-react";
-import { ClawMark, CrabFigure, Wordmark } from "@chelabase/lagoon/crab-marks";
+import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
 import { ShoreScene } from "./shore-scene";
 import { FOCUS, INSET_LABEL, TideGauge } from "./tide-gauge";
 

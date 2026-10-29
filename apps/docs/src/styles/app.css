@@ -1,11 +1,11 @@
 @import 'tailwindcss';
-@import '@chelabase/lagoon/tokens.css';
-@import '@chelabase/lagoon/base.css';
-@import '@chelabase/lagoon/tailwind.css';
+@import '@chelabase/design/tokens.css';
+@import '@chelabase/design/base.css';
+@import '@chelabase/design/tailwind.css';
 @import 'fumadocs-ui/css/preset.css';
 @import 'fumadocs-twoslash/twoslash.css';
 @import 'fumadocs-openapi/css/preset.css';
-@import '@chelabase/lagoon/fumadocs.css';
+@import '@chelabase/design/fumadocs.css';
 
 html {
   scrollbar-gutter: stable;

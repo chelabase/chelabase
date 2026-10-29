@@ -1,6 +1,6 @@
 import { RotateCcw } from "lucide-react";
 import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { CrabFigure, PalmTree } from "@chelabase/lagoon/crab-marks";
+import { CrabFigure, PalmTree } from "@chelabase/design/crab-marks";
 
 /** The hero's dusk shore, drawn to the width it is given: crabs walk main and fork off down branches. Synthetic. */
 

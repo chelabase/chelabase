@@ -214,7 +214,7 @@ components:
 
 # Design System: Chelabase Studio
 
-Scope: the signed-in app shell (`src/components/app-shell/`), the table editor (`src/components/table-editor/`, the data-grid and right-panel patterns every later data surface reuses) and the lagoon tokens (`@chelabase/lagoon/tokens.css`; `src/styles.css` keeps only the shadcn map) as Studio's app system. The landing page's nautical-chart vocabulary belongs to the landing and is not recorded here.
+Scope: the signed-in app shell (`src/components/app-shell/`), the table editor (`src/components/table-editor/`, the data-grid and right-panel patterns every later data surface reuses) and the lagoon tokens (`@chelabase/design/tokens.css`; `src/styles.css` keeps only the shadcn map) as Studio's app system. The landing page's nautical-chart vocabulary belongs to the landing and is not recorded here.
 
 ## Overview
 
@@ -411,7 +411,7 @@ Ink ground, chalk text, 13px JetBrains Mono, a hairline frame, a deep-water gutt
 The first focusable element: "Skip to content", revealed on focus top-left on deep water with a sand outline; it targets `#content`.
 
 ### API reference (Scalar)
-Scalar is forced into dark mode with its toggle hidden, sits under the 52px header, and is themed onto the lagoon tokens by `@chelabase/lagoon/scalar.css`, scoped to the `.lagoon-scalar` wrapper (nothing global). Backgrounds 1/2/3 are ink/deep/channel, text chalk/chalk-dim, accent and primary button sand (ink text), borders `--input` (3:1), shadows replaced by a hairline, fonts the Studio sans and mono. Method colours are a small set of their own, the one carve-out from One Meaning: each HTTP method gets its own hue, as API docs conventionally do. POST and 2xx seafoam (yes) and DELETE, errors and alerts coral (hazard) keep their lagoon meanings. GET `#9cc8ea` (lagoon blue), PUT `#c4b6ec` (lilac) and PATCH `#e3d58c` (straw) are method-only tones (`--method-get/put/patch`, in the package's `tokens.css`) that mean nothing else in Studio. Scalar also paints 3xx with the PATCH tone and "required" with the PUT tone. OPTIONS, HEAD and TRACE are chalk-dim. All of them reach at least 5.4:1 on ink, deep and channel and on their 10% badge tint. Sand never marks a method or status, and palm stays reserved. Code samples default to JavaScript / Axios.
+Scalar is forced into dark mode with its toggle hidden, sits under the 52px header, and is themed onto the lagoon tokens by `@chelabase/design/scalar.css`, scoped to the `.lagoon-scalar` wrapper (nothing global). Backgrounds 1/2/3 are ink/deep/channel, text chalk/chalk-dim, accent and primary button sand (ink text), borders `--input` (3:1), shadows replaced by a hairline, fonts the Studio sans and mono. Method colours are a small set of their own, the one carve-out from One Meaning: each HTTP method gets its own hue, as API docs conventionally do. POST and 2xx seafoam (yes) and DELETE, errors and alerts coral (hazard) keep their lagoon meanings. GET `#9cc8ea` (lagoon blue), PUT `#c4b6ec` (lilac) and PATCH `#e3d58c` (straw) are method-only tones (`--method-get/put/patch`, in the package's `tokens.css`) that mean nothing else in Studio. Scalar also paints 3xx with the PATCH tone and "required" with the PUT tone. OPTIONS, HEAD and TRACE are chalk-dim. All of them reach at least 5.4:1 on ink, deep and channel and on their 10% badge tint. Sand never marks a method or status, and palm stays reserved. Code samples default to JavaScript / Axios.
 
 ## Do's and Don'ts
 

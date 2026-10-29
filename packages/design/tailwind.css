@@ -29,9 +29,10 @@
   --radius-lg: var(--radius);
 }
 
-/* Not inline: Tailwind emits --font-* on :root, so `var(--font-sans)` works in plain CSS too. */
+/* The font stacks, as literal values (no var(), so nothing can cycle). Not inline: Tailwind emits
+   --font-* on :root, so `var(--font-sans)` works in plain CSS too. Both themes share them. */
 @theme {
-  --font-sans: var(--lagoon-font-sans);
-  --font-serif: var(--lagoon-font-serif);
-  --font-mono: var(--lagoon-font-mono);
+  --font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
+  --font-serif: Spectral, "Iowan Old Style", Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
 }

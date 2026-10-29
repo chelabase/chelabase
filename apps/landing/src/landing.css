@@ -1,4 +1,4 @@
-/* The landing's leftovers: what Tailwind utilities can't express cleanly. Colours are lagoon tokens only. */
+/* The landing's leftovers: what Tailwind utilities can't express cleanly. Colours are design tokens only. */
 
 :root:has(.lagoon) {
   background: var(--ink);

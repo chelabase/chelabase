@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const appRoot = resolve(import.meta.dirname, '..');
-const tokensPath = resolve(appRoot, '../../packages/lagoon/tokens.css');
+const tokensPath = resolve(appRoot, '../../packages/design/tokens.css');
 
 const stripComments = (css: string) => css.replace(/\/\*[\s\S]*?\*\//g, '');
 
@@ -35,7 +35,7 @@ const cssFiles = (dir: string) => filesWith(dir, '.css');
 describe('one palette source', () => {
   const tokens = new Set(declared(readFileSync(tokensPath, 'utf8')));
 
-  it('reads_the_lagoon_tokens', () => {
+  it('reads_the_design_tokens', () => {
     expect(tokens.has('--ink')).toBe(true);
     expect(tokens.has('--sand')).toBe(true);
   });
@@ -51,7 +51,7 @@ describe('one palette source', () => {
     expect(arbitraryRedeclared('className="[--claw-gap:var(--sand)] bg-[var(--sand)]"', tokens)).toEqual([]);
   });
 
-  it('no_app_tsx_redeclares_a_lagoon_token_with_an_arbitrary_property', () => {
+  it('no_app_tsx_redeclares_a_design_token_with_an_arbitrary_property', () => {
     const files = filesWith(join(appRoot, 'src'), '.tsx');
     expect(files.length).toBeGreaterThan(0);
     const hits = files.flatMap((file) =>
@@ -60,7 +60,7 @@ describe('one palette source', () => {
     expect(hits).toEqual([]);
   });
 
-  it('no_app_css_redeclares_a_lagoon_token', () => {
+  it('no_app_css_redeclares_a_design_token', () => {
     const files = cssFiles(join(appRoot, 'src'));
     expect(files.length).toBeGreaterThan(0);
     const hits = files.flatMap((file) =>
