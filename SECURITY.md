@@ -14,4 +14,6 @@ rather stay anonymous.
 
 ## Supported versions
 
-Chelabase has no tagged releases yet. Fixes land on `main`.
+Chelabase has no tagged releases yet. Fixes land on `main`. A self-hosted install gets them once the
+release images pinned in `infra/compose/docker-compose.yml` are updated and the install is
+upgraded to them.

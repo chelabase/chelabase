@@ -1,78 +1,100 @@
 # Chelabase
 
-Chelabase is a database platform you run yourself: Postgres databases with copy-on-write branches and point-in-time restore (on Neon's storage engine), a typed data API with per-branch keys, login roles, app-user auth and a web console (Studio). One gateway fronts every API.
+Chelabase is a database platform you run yourself: Postgres databases with copy-on-write branches, a typed data API, login roles, app-user auth and a web console, on Neon's storage engine.
 
-Licensed under Apache-2.0.
+<!-- Static badges: the repo is private and has no release or CI yet. When the repo is public, the
+first release is cut and CI (#7) exists, swap in dynamic release and CI badges. -->
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](infra/neon/README.md)
+[![Self-hosted: Docker Compose ≥ 2.30](https://img.shields.io/badge/self--hosted-Docker%20Compose%20%E2%89%A5%202.30-2496ed)](apps/docs/content/docs/self-hosting/install.mdx)
+[![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)](SECURITY.md#supported-versions)
 
-## Repository layout
+## What it is
 
-```
-apps/studio          Studio, the web console
-apps/docs            the documentation site
-services/            gateway, orchestrator, worker, rest, auth
-tools/cli            the `chelabase` binary (dev bootstrap, type generation)
-crates/              shared Rust libraries (routes, types, metadata, query, ...)
-packages/            TypeScript packages: client, management-client, neon-e2e
-openapi/             generated OpenAPI documents (management, login, data)
-infra/compose/       metadata Postgres, NATS, Zitadel, Mailpit, Neon storage
-infra/neon/          Neon image pins and build notes
-scripts/             e2e, stack and codegen scripts
-docs/                security notes; roadmap/superpowers are archive only
-AGENTS.md            agent workflow (epics, issues, audits)
-```
+- **Postgres on Neon's storage engine.** Each database gets its own Neon tenant, timeline and compute. Branches are copy-on-write, and a branch can be made or restored at a point in time.
+- **A typed data API.** A JSON query endpoint with row-level security, per-branch keys, generated TypeScript types and a client, `@chelabase/client`.
+- **Login roles** for connecting with `psql` and Postgres drivers, with encrypted, re-revealable credentials.
+- **App-user auth:** sign-up, sign-in and sessions for your app's own users, with helpers for RLS policies.
+- **Studio**, the web console: projects, databases, branches, tables, the SQL editor, keys, members and app users.
 
-## Prerequisites
+One gateway fronts Studio, the APIs and sign-in.
 
-- [proto](https://moonrepo.dev/docs/proto), which installs Rust, moon, node, pnpm, just and sccache from `.prototools`
-- Docker (Compose runs the dependencies, and the worker starts each database's compute container)
-- cmake: `sudo apt-get install -y cmake`
-- clang and protoc: `sudo apt-get install -y clang protobuf-compiler`
-- psql (PostgreSQL client): `sudo apt-get install -y postgresql-client`
-- sccache as the Rust compiler wrapper: proto installs it, but the global registration and the `rustc-wrapper = "sccache"` line in `~/.cargo/config.toml` are one-time machine setup (see CONTRIBUTING.md, "Machine setup")
-- [cargo-nextest](https://nexte.st), the Rust test runner behind `just test`: `cargo install --locked cargo-nextest`
+## Requirements
+
+- Docker Engine 26.0 or newer (the install mounts volume sub-paths).
+- Docker Compose 2.30 or newer. Check with `docker compose version`.
+- A checkout of this repository, for `infra/compose`.
+
+Running Chelabase needs nothing else on the host. The [Install](apps/docs/content/docs/self-hosting/install.mdx#requirements) page lists what the machine needs.
 
 ## Install
 
-To run Chelabase, use Docker Compose (Docker with Compose 2.30 or newer):
-
 ```bash
-cd infra/compose
+git clone https://github.com/chelabase/chelabase.git
+cd chelabase/infra/compose
 cp .env.example .env
 docker compose up -d --wait
 ```
 
-Then read the setup code with `docker compose logs init-secrets` and claim the instance at http://studio.chelabase.localhost:8000. Claim it before you expose the host. The full guide (settings, choosing your own secrets, SMTP, upgrades) is the Install page of the docs, `apps/docs/content/docs/self-hosting/install.mdx`.
+The defaults run on one machine and serve Studio at <http://studio.chelabase.localhost:8000>.
 
-## Development quickstart
+> [!WARNING]
+> **Claim the instance before you expose the host.** A new instance has no admin: the first account that signs up with the setup code becomes the admin of the whole instance. The gateway is published on `127.0.0.1` only by default. Keep it that way until you have claimed it.
 
-The workbench is for developing Chelabase, not for running it. Self-hosters should use the install above.
+1. Read the setup code (`Setup code: XXXX-XXXX-XXXX-XXXX-XXXX`):
 
-```bash
-git clone https://github.com/chelabase/chelabase.git
-cd chelabase
-proto install
-pnpm install
-just workbench up
-```
+   ```bash
+   docker compose logs init-secrets
+   ```
 
-`just workbench up` builds the Rust services on the host, starts the Compose dependencies, bootstraps Zitadel, then runs the services and Studio in containers, and prints the URLs. The first run builds a lot and takes a while.
+2. Open <http://studio.chelabase.localhost:8000>, choose **Sign in**, then **Create account**, and enter the code. You are now the instance's admin.
 
-Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootstrap admin (`just zitadel-bootstrap` sets it, workbench only). Self-sign-up is off by default: an admin invites everyone else (or switches open sign-up on and approves requests). Emails such as invites and password resets land in Mailpit at http://mail.chelabase.localhost:8000.
+After the claim, sign-up is closed: you invite everyone else, or switch open sign-up on and approve requests.
 
-Stop everything with `just workbench down`. `just` lists every recipe.
+The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the rest: the settings, choosing your own secrets, your own domain with TLS behind a reverse proxy ([Hosts](apps/docs/content/docs/self-hosting/hosts.mdx)), email (SMTP), upgrades, and stopping or uninstalling.
+
+## First database
+
+1. In Studio, create a project (**New project**), then a database in it. It shows as provisioning, then as ready.
+2. Create a table, in the SQL editor or the table editor.
+3. In the database's Data API view, copy the public key (role `anon`, safe in a browser) or create a secret key (server only; it is shown once).
+4. Generate the types and query the database from your app with `@chelabase/client`:
+
+   ```bash
+   export CHELABASE_DATA_KEY=chk_sec_…   # a secret key: type generation refuses a public one
+   cargo run -p chelabase -- gen types --url http://api.chelabase.localhost:8000 --out db.ts
+   ```
+
+   ```ts
+   import { createClient } from "@chelabase/client";
+   import { type Database, types } from "./db";
+
+   const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: "chk_pub_…", types });
+
+   const rows = await db.from("orders").select("id", "total").where({ status: "paid" }).limit(10);
+   ```
+
+The client is not on npm yet: it is a workspace package in this repository (`packages/client`, added as `"@chelabase/client": "workspace:*"`), and `chelabase gen types` is this repository's CLI, so both need a checkout, and type generation needs the Rust toolchain. Without generated types, `createClient({ url, key })` works untyped. See the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [Generated types](apps/docs/content/docs/using/client/types.mdx) and the [data API](apps/docs/content/docs/using/data-api/index.mdx).
+
+For migrations, ORMs and admin tools, connect to Postgres directly with the credentials in the database's **Connection details** in Studio; the [Install](apps/docs/content/docs/self-hosting/install.mdx) page says how connections reach the instance from the host. The [Quickstart](apps/docs/content/docs/using/quickstart.mdx) walks through all of it.
 
 ## Documentation
 
-The docs site runs locally, reached through the gateway:
+The docs are in this repository, under [`apps/docs/content/docs/`](apps/docs/content/docs/). Start with the [Introduction](apps/docs/content/docs/index.mdx).
 
-```bash
-just workbench up --with docs
-```
+- **Using:** the [Quickstart](apps/docs/content/docs/using/quickstart.mdx), [projects and databases](apps/docs/content/docs/using/projects-and-databases.mdx), [branches](apps/docs/content/docs/using/branches.mdx), [login roles](apps/docs/content/docs/using/login-roles.mdx), the [data API](apps/docs/content/docs/using/data-api/index.mdx), the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [app users](apps/docs/content/docs/using/app-users/index.mdx), [members and invites](apps/docs/content/docs/using/members-and-invites.mdx) and [Studio](apps/docs/content/docs/using/studio.mdx). The rest is in [`using/`](apps/docs/content/docs/using/).
+- **Self-hosting:** [Install](apps/docs/content/docs/self-hosting/install.mdx) and [Hosts](apps/docs/content/docs/self-hosting/hosts.mdx).
+- **Reference:** the [error codes](apps/docs/content/docs/reference/errors.mdx) and the [access per route](apps/docs/content/docs/reference/access.mdx). The management and data API references are generated from the OpenAPI documents in [`openapi/`](openapi/).
+- **Architecture:** [how the parts fit together](apps/docs/content/docs/architecture/index.mdx): the gateway, Studio, the data API, Neon storage and [security](apps/docs/content/docs/architecture/security.mdx).
 
-Then open http://docs.chelabase.localhost:8000/docs. It has three sections:
+## Contributing
 
-- [Using Chelabase](http://docs.chelabase.localhost:8000/docs/using/quickstart): projects, databases, branches, the data API, the TypeScript client, app users
-- [Reference](http://docs.chelabase.localhost:8000/docs/reference/errors): the management and data API references and the error codes (the internal login API is under Architecture)
-- [Architecture](http://docs.chelabase.localhost:8000/docs/architecture): how the gateway, Studio, data API, Neon storage and security fit together
+To work on Chelabase itself, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Working on the repo: see [CONTRIBUTING.md](CONTRIBUTING.md) (worktrees and their stacks, tests, code generation). Product direction: [PRODUCT.md](PRODUCT.md).
+## Security
+
+Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
+
+## License
+
+[Apache-2.0](LICENSE).
