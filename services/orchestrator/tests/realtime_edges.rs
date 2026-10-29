@@ -1,6 +1,9 @@
 //! RT1 T6, the coder's edge cases beyond `realtime.rs`: revocation paths a re-authorization
 //! must see (a deleted branch, a grant taken away, a member removed), request-shape refusals,
 //! the key cap's boundary and `/projects`' refusals.
+
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
 #![allow(dead_code, unused_imports)]
 
 include!("common/fakes.rs");

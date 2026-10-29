@@ -1,0 +1,12 @@
+[package]
+name = "chelabase-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The one reqwest client builder services and tools use: it never follows a redirect"
+
+[dependencies]
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

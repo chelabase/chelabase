@@ -78,10 +78,11 @@ check "build.sh with an unknown target exits 2" refuses 2 "$here/build.sh" bogus
 check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compute
 
 # --- Compose ------------------------------------------------------------------------------
-# One file, one project (`chelabase`).
+# The base file and the workbench overlay, one project (`chelabase`).
 compose_file="$root/infra/compose/docker-compose.yml"
-check "one Compose file" \
-  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$compose_file "
+overlay_file="$root/infra/compose/docker-compose.workbench.yml"
+check "the base Compose file and the workbench overlay" \
+  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$overlay_file $compose_file "
 check "no hook-relay image or service left" \
   bash -c '! test -e "$1/infra/compose/hook-relay.Dockerfile" && ! grep -q "hook-relay" "$2"' _ "$root" "$compose_file"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
@@ -92,7 +93,7 @@ check "COMPUTE_NODE_IMAGE defaults to a digest-pinned GHCR image" \
 if command -v docker >/dev/null; then
   # A parametrized project (W2): the checks render one stack from the workbench fixture.
   fixture="$root/scripts/tests/fixtures/workbench-stack.env"
-  compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x -f "$compose_file" --env-file "$fixture")
+  compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x -f "$compose_file" -f "$overlay_file" --env-file "$fixture")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (infra, app tier, no hook relay)" \
     test "$(services)" = "auth create-bucket gateway mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage-broker storage-controller storcon-db studio valkey worker zitadel zitadel-db "

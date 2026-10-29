@@ -81,29 +81,98 @@ pub fn is_timeout(err: &anyhow::Error) -> bool {
 const MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 const NANO_CPUS: i64 = 1_000_000_000;
 
-/// A compute's container state, as far as callers care.
+/// Why a compute that exists isn't serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRunning {
+    /// It stopped and stays stopped.
+    Exited,
+    /// It failed and can't be resumed as it is.
+    Crashed,
+    /// Anything else the backend reports, in its own words (e.g. "restarting").
+    Other(String),
+}
+
+impl std::fmt::Display for NotRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exited => f.write_str("exited"),
+            Self::Crashed => f.write_str("crashed"),
+            Self::Other(other) => f.write_str(other),
+        }
+    }
+}
+
+/// A compute's state, as far as callers care.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComputeStatus {
     Running,
-    /// Docker's state, e.g. "exited".
-    NotRunning(String),
+    /// The compute exists but isn't serving.
+    NotRunning(NotRunning),
 }
 
-/// How computes are run.
+/// How computes are run, whatever the backend.
 #[derive(Debug, Clone)]
 pub struct ComputeSettings {
     pub image: String,
-    pub network: String,
     pub control_plane_uri: String,
     /// The stack the computes belong to: in their names and labels, and the only ones listed.
     pub stack: String,
+    /// The CA that issues each compute's server certificate at create. `None` where computes
+    /// are never created (the orchestrator): [`ComputeBackend::create`] then fails.
+    pub ca: Option<Arc<ComputeCa>>,
+}
+
+/// The Docker backend's own settings.
+#[derive(Debug, Clone)]
+pub struct DockerSettings {
+    /// The network computes run on.
+    pub network: String,
     /// The network the orchestrator reaches computes' Postgres on (member logins come from
     /// its address there). A compute joins it after create, before start; when it is
     /// `network` itself there is nothing to join.
     pub control_network: String,
-    /// The CA that issues each compute's server certificate at create. `None` where computes
-    /// are never created (the orchestrator): [`ComputeBackend::create`] then fails.
-    pub ca: Option<Arc<ComputeCa>>,
+}
+
+/// The env variable that picks the compute backend.
+pub const BACKEND_ENV: &str = "CHELABASE_COMPUTE_BACKEND";
+
+/// Which compute backend a service runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendKind {
+    Docker,
+}
+
+impl BackendKind {
+    /// The backend `CHELABASE_COMPUTE_BACKEND` names in the process environment.
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Unset or empty is `docker`; any other value that isn't a backend is an error.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        match lookup(BACKEND_ENV).as_deref().map(str::trim) {
+            None | Some("") | Some("docker") => Ok(Self::Docker),
+            Some(other) => bail!("{BACKEND_ENV}={other:?} is not a compute backend; accepted values: docker"),
+        }
+    }
+}
+
+/// The compute backend a service runs, picked at startup.
+pub enum Backend {
+    Docker(DockerBackend),
+}
+
+impl Backend {
+    /// Nothing is contacted yet. `docker` is used only by the Docker backend.
+    pub fn connect(
+        kind: BackendKind,
+        settings: ComputeSettings,
+        docker: DockerSettings,
+    ) -> anyhow::Result<Self> {
+        match kind {
+            BackendKind::Docker => Ok(Self::Docker(DockerBackend::connect(settings, docker)?)),
+        }
+    }
 }
 
 /// Lifecycle of computes plus admin SQL inside them.
@@ -114,7 +183,7 @@ pub trait ComputeBackend: ComputeLocator {
         compute_token: &str,
     ) -> impl Future<Output = anyhow::Result<()>> + Send;
     fn delete(&self, endpoint_id: &str) -> impl Future<Output = anyhow::Result<()>> + Send;
-    /// The contents of the file at `path` in the compute's container (at most 1 MiB).
+    /// The contents of the file at `path` in the compute (at most 1 MiB).
     fn read_file(
         &self,
         endpoint_id: &str,
@@ -131,13 +200,11 @@ pub trait ComputeBackend: ComputeLocator {
         &self,
         endpoint_id: &str,
     ) -> impl Future<Output = anyhow::Result<Option<ComputeStatus>>> + Send;
-    /// Endpoint ids of every one of this stack's computes (ENDPOINT_LABEL and STACK_LABEL),
-    /// running or not.
+    /// Endpoint ids of every one of this stack's computes, running or not.
     fn list(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
-    /// Endpoint ids of this stack's computes whose container exists but isn't running: Docker
-    /// state `exited`, `dead` or `restarting` (a crash loop under `unless-stopped`). Never
-    /// `created` (an in-flight create passes through it), `running`, `paused` or `removing`.
-    /// A listing that fails is an error, never an empty list.
+    /// Endpoint ids of this stack's computes that exist but aren't serving: stopped, failed or
+    /// in a crash loop. Never one that is mid-create or mid-removal, or is serving. A listing
+    /// that fails is an error, never an empty list.
     fn list_not_running(&self) -> impl Future<Output = anyhow::Result<Vec<String>>> + Send;
     /// Runs `sql` (stdin) with psql inside the compute, as `opts.user` (`cloud_admin` when
     /// `None`); returns stdout. A call that outlasts `opts.timeout` fails with [`SqlTimedOut`]
@@ -171,6 +238,7 @@ pub fn create_body(
     endpoint_id: &str,
     compute_token: &str,
     settings: &ComputeSettings,
+    network: &str,
 ) -> ContainerCreateBody {
     ContainerCreateBody {
         image: Some(settings.image.clone()),
@@ -185,7 +253,7 @@ pub fn create_body(
             .into(),
         ),
         host_config: Some(HostConfig {
-            network_mode: Some(settings.network.clone()),
+            network_mode: Some(network.to_string()),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -346,26 +414,55 @@ fn admin_exec_env_with(opts: &SqlOpts) -> Vec<String> {
     env
 }
 
+/// The Docker container states [`ComputeBackend::list_not_running`] lists: `exited`, `dead` and
+/// `restarting` (a crash loop under `unless-stopped`). Never `created` (an in-flight create
+/// passes through it), `running`, `paused` or `removing`.
+const DOCKER_NOT_RUNNING: [bollard::models::ContainerSummaryStateEnum; 3] = {
+    use bollard::models::ContainerSummaryStateEnum as State;
+    [State::EXITED, State::DEAD, State::RESTARTING]
+};
+
+fn docker_not_running_listed(state: bollard::models::ContainerSummaryStateEnum) -> bool {
+    DOCKER_NOT_RUNNING.contains(&state)
+}
+
+/// Docker's container state as a [`ComputeStatus`].
+fn docker_status(state: ContainerStateStatusEnum) -> ComputeStatus {
+    match state {
+        ContainerStateStatusEnum::RUNNING => ComputeStatus::Running,
+        ContainerStateStatusEnum::EXITED => ComputeStatus::NotRunning(NotRunning::Exited),
+        ContainerStateStatusEnum::DEAD => ComputeStatus::NotRunning(NotRunning::Crashed),
+        other => ComputeStatus::NotRunning(NotRunning::Other(other.to_string())),
+    }
+}
+
 /// [`ComputeBackend`] over the Docker Engine API.
 pub struct DockerBackend {
     locator: DockerLocator,
     settings: ComputeSettings,
+    docker_settings: DockerSettings,
 }
 
 impl DockerBackend {
     /// Nothing is contacted yet.
-    pub fn connect(settings: ComputeSettings) -> anyhow::Result<Self> {
+    pub fn connect(settings: ComputeSettings, docker: DockerSettings) -> anyhow::Result<Self> {
         Ok(Self {
-            locator: DockerLocator::connect(&settings.network, &settings.stack)?,
+            locator: DockerLocator::connect(&docker.network, &settings.stack)?,
             settings,
+            docker_settings: docker,
         })
     }
 
     /// A backend over an existing Docker client (tests aim one at a mock engine).
-    pub fn with_docker(settings: ComputeSettings, docker: Docker) -> Self {
+    pub fn with_docker(
+        settings: ComputeSettings,
+        docker_settings: DockerSettings,
+        docker: Docker,
+    ) -> Self {
         Self {
-            locator: DockerLocator::with_docker(docker, &settings.network, &settings.stack),
+            locator: DockerLocator::with_docker(docker, &docker_settings.network, &settings.stack),
             settings,
+            docker_settings,
         }
     }
 
@@ -543,7 +640,7 @@ impl ComputeBackend for DockerBackend {
         let ca = self.ca()?;
         let server = ca.issue_server(endpoint_id, SystemTime::now())?;
         let tls = tls_files_tar(&server, ca.cert_pem())?;
-        let body = create_body(endpoint_id, compute_token, &self.settings);
+        let body = create_body(endpoint_id, compute_token, &self.settings, &self.docker_settings.network);
         let create = || {
             self.docker().create_container(
                 Some(CreateContainerOptions {
@@ -578,10 +675,10 @@ impl ComputeBackend for DockerBackend {
         // Everything after the container exists: a failure removes it again (best effort; the
         // step's own error is what the caller sees), so no stopped container is left behind.
         let steps = async {
-            if self.settings.control_network != self.settings.network {
+            if self.docker_settings.control_network != self.docker_settings.network {
                 self.docker()
                     .connect_network(
-                        &self.settings.control_network,
+                        &self.docker_settings.control_network,
                         NetworkConnectRequest {
                             container: created.id.clone(),
                             endpoint_config: None,
@@ -591,7 +688,7 @@ impl ComputeBackend for DockerBackend {
                     .with_context(|| {
                         format!(
                             "connecting {name} to network {}",
-                            self.settings.control_network
+                            self.docker_settings.control_network
                         )
                     })?;
             }
@@ -629,9 +726,8 @@ impl ComputeBackend for DockerBackend {
     async fn status(&self, endpoint_id: &str) -> anyhow::Result<Option<ComputeStatus>> {
         Ok(self.locator.inspect(endpoint_id).await?.map(|inspect| {
             match inspect.state.and_then(|s| s.status) {
-                Some(ContainerStateStatusEnum::RUNNING) => ComputeStatus::Running,
-                Some(other) => ComputeStatus::NotRunning(other.to_string()),
-                None => ComputeStatus::NotRunning("unknown".to_string()),
+                Some(state) => docker_status(state),
+                None => ComputeStatus::NotRunning(NotRunning::Other("unknown".to_string())),
             }
         }))
     }
@@ -653,12 +749,10 @@ impl ComputeBackend for DockerBackend {
     }
 
     async fn list_not_running(&self) -> anyhow::Result<Vec<String>> {
-        use bollard::models::ContainerSummaryStateEnum as State;
-        const NOT_RUNNING: [State; 3] = [State::EXITED, State::DEAD, State::RESTARTING];
         let mut filters = list_filters(&self.settings.stack);
         filters.insert(
             "status".to_string(),
-            NOT_RUNNING.iter().map(|s| s.to_string()).collect(),
+            DOCKER_NOT_RUNNING.iter().map(|s| s.to_string()).collect(),
         );
         let containers = self
             .docker()
@@ -673,7 +767,7 @@ impl ComputeBackend for DockerBackend {
         // still being created) compute look stopped.
         Ok(containers
             .into_iter()
-            .filter(|c| c.state.is_some_and(|s| NOT_RUNNING.contains(&s)))
+            .filter(|c| c.state.is_some_and(docker_not_running_listed))
             .filter_map(|c| c.labels?.remove(ENDPOINT_LABEL))
             .collect())
     }
@@ -698,6 +792,82 @@ impl ComputeBackend for DockerBackend {
     }
 }
 
+impl ComputeLocator for Backend {
+    async fn address(&self, endpoint_id: &str) -> anyhow::Result<Option<IpAddr>> {
+        match self {
+            Self::Docker(b) => b.address(endpoint_id).await,
+        }
+    }
+
+    async fn control_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
+        match self {
+            Self::Docker(b) => b.control_addr(endpoint_id).await,
+        }
+    }
+
+    async fn postgres_addr(&self, endpoint_id: &str) -> anyhow::Result<Option<SocketAddr>> {
+        match self {
+            Self::Docker(b) => b.postgres_addr(endpoint_id).await,
+        }
+    }
+}
+
+impl ComputeBackend for Backend {
+    async fn create(&self, endpoint_id: &str, compute_token: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Docker(b) => b.create(endpoint_id, compute_token).await,
+        }
+    }
+
+    async fn delete(&self, endpoint_id: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Docker(b) => b.delete(endpoint_id).await,
+        }
+    }
+
+    async fn read_file(&self, endpoint_id: &str, path: &str) -> anyhow::Result<Vec<u8>> {
+        match self {
+            Self::Docker(b) => b.read_file(endpoint_id, path).await,
+        }
+    }
+
+    async fn upload_tls(&self, endpoint_id: &str, server: &IssuedCert) -> anyhow::Result<()> {
+        match self {
+            Self::Docker(b) => b.upload_tls(endpoint_id, server).await,
+        }
+    }
+
+    async fn status(&self, endpoint_id: &str) -> anyhow::Result<Option<ComputeStatus>> {
+        match self {
+            Self::Docker(b) => b.status(endpoint_id).await,
+        }
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Docker(b) => b.list().await,
+        }
+    }
+
+    async fn list_not_running(&self) -> anyhow::Result<Vec<String>> {
+        match self {
+            Self::Docker(b) => b.list_not_running().await,
+        }
+    }
+
+    async fn admin_sql_with(
+        &self,
+        endpoint_id: &str,
+        database: &str,
+        sql: &str,
+        opts: &SqlOpts,
+    ) -> anyhow::Result<String> {
+        match self {
+            Self::Docker(b) => b.admin_sql_with(endpoint_id, database, sql, opts).await,
+        }
+    }
+}
+
 /// An in-memory [`ComputeBackend`] for tests.
 #[cfg(any(test, feature = "fake"))]
 pub mod fake {
@@ -709,7 +879,7 @@ pub mod fake {
 
     use anyhow::bail;
 
-    use super::{ComputeBackend, ComputeStatus, SqlOpts, SqlTimedOut};
+    use super::{ComputeBackend, ComputeStatus, NotRunning, SqlOpts, SqlTimedOut};
     use crate::compute::ComputeLocator;
 
     pub type Journal = Arc<Mutex<Vec<String>>>;
@@ -960,7 +1130,7 @@ pub mod fake {
                 if c.running {
                     ComputeStatus::Running
                 } else {
-                    ComputeStatus::NotRunning("exited".to_string())
+                    ComputeStatus::NotRunning(NotRunning::Exited)
                 }
             }))
         }
@@ -1088,28 +1258,79 @@ mod tests {
     use super::fake::{FakeBackend, Journal};
     use super::*;
 
+    #[test]
+    fn backend_from_env_default_docker() {
+        assert_eq!(BackendKind::from_lookup(|_| None).unwrap(), BackendKind::Docker);
+        assert_eq!(
+            BackendKind::from_lookup(|_| Some(String::new())).unwrap(),
+            BackendKind::Docker
+        );
+        assert_eq!(
+            BackendKind::from_lookup(|_| Some("docker".to_string())).unwrap(),
+            BackendKind::Docker
+        );
+    }
+
+    #[test]
+    fn backend_from_env_rejects_unknown() {
+        let err = BackendKind::from_lookup(|_| Some("k8s".to_string())).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("CHELABASE_COMPUTE_BACKEND"), "{text}");
+        assert!(text.contains("docker"), "{text}");
+        assert!(text.contains("k8s"), "{text}");
+    }
+
+    #[test]
+    fn docker_status_maps_exited_dead_restarting() {
+        use bollard::models::{ContainerStateStatusEnum as S, ContainerSummaryStateEnum as L};
+        assert_eq!(docker_status(S::RUNNING), ComputeStatus::Running);
+        assert_eq!(docker_status(S::EXITED), ComputeStatus::NotRunning(NotRunning::Exited));
+        assert_eq!(docker_status(S::DEAD), ComputeStatus::NotRunning(NotRunning::Crashed));
+        assert_eq!(
+            docker_status(S::RESTARTING),
+            ComputeStatus::NotRunning(NotRunning::Other("restarting".to_string()))
+        );
+        // The listing keeps today's set.
+        for (state, listed) in [
+            (L::EXITED, true),
+            (L::DEAD, true),
+            (L::RESTARTING, true),
+            (L::CREATED, false),
+            (L::RUNNING, false),
+            (L::PAUSED, false),
+            (L::REMOVING, false),
+        ] {
+            assert_eq!(docker_not_running_listed(state), listed, "{state}");
+        }
+    }
+
     fn settings() -> ComputeSettings {
         ComputeSettings {
             image: "neon/compute-node-v17:test".to_string(),
-            network: "chelabase-feat-x_default".to_string(),
             control_plane_uri: "http://orchestrator:8083".to_string(),
             stack: "feat-x".to_string(),
-            control_network: "chelabase-feat-x_control".to_string(),
             ca: None,
+        }
+    }
+
+    fn docker_settings() -> DockerSettings {
+        DockerSettings {
+            network: "chelabase-feat-x_default".to_string(),
+            control_network: "chelabase-feat-x_control".to_string(),
         }
     }
 
     // The orchestrator's backend has no CA: creating a compute fails before Docker is asked.
     #[tokio::test]
     async fn create_without_a_ca_fails_before_docker() {
-        let backend = DockerBackend::connect(settings()).unwrap();
+        let backend = DockerBackend::connect(settings(), docker_settings()).unwrap();
         let err = backend.create("ep-abc123", "t").await.unwrap_err();
         assert!(format!("{err:#}").contains("no compute CA"), "{err:#}");
     }
 
     #[test]
     fn container_body_runs_compute_ctl_with_the_token_in_env() {
-        let body = create_body("ep-abc123", "s3cret-token", &settings());
+        let body = create_body("ep-abc123", "s3cret-token", &settings(), &docker_settings().network);
         assert_eq!(body.image.as_deref(), Some("neon/compute-node-v17:test"));
         assert_eq!(
             body.entrypoint,
@@ -1133,7 +1354,7 @@ mod tests {
 
     #[test]
     fn container_body_limits_restarts_and_networks() {
-        let host = create_body("ep-abc123", "t", &settings())
+        let host = create_body("ep-abc123", "t", &settings(), &docker_settings().network)
             .host_config
             .unwrap();
         assert_eq!(
@@ -1151,7 +1372,7 @@ mod tests {
 
     #[test]
     fn computes_publish_nothing_on_the_host() {
-        let body = create_body("ep-abc123", "t", &settings());
+        let body = create_body("ep-abc123", "t", &settings(), &docker_settings().network);
         assert_eq!(body.exposed_ports, None);
         let host = body.host_config.unwrap();
         assert!(host.port_bindings.as_ref().is_none_or(|b| b.is_empty()));
@@ -1160,7 +1381,7 @@ mod tests {
 
     #[test]
     fn computes_carry_their_stack_label() {
-        let labels = create_body("ep-abc123", "t", &settings()).labels.unwrap();
+        let labels = create_body("ep-abc123", "t", &settings(), &docker_settings().network).labels.unwrap();
         assert_eq!(labels.get("chelabase.dev/stack"), Some(&"feat-x".to_string()));
         assert_eq!(
             labels.get("chelabase.dev/endpoint-id"),
@@ -1257,7 +1478,7 @@ mod tests {
         fake.set_running("ep-1", false);
         assert_eq!(
             fake.status("ep-1").await.unwrap(),
-            Some(ComputeStatus::NotRunning("exited".to_string()))
+            Some(ComputeStatus::NotRunning(NotRunning::Exited))
         );
         assert_eq!(fake.address("ep-1").await.unwrap(), None);
         assert_eq!(fake.postgres_addr("ep-1").await.unwrap(), None);

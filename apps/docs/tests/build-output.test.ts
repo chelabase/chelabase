@@ -111,13 +111,14 @@ describe('the built docs site', () => {
 
   it('prerenders_every_data_operation', () => {
     const operations = countOperations('data.json');
-    expect(operations).toBe(2);
+    expect(operations).toBe(3);
     const pages = indexPages('docs/reference/data');
     expect(pages.length).toBe(operations);
 
     const run = pages.find((file) => file.includes('runQuery'));
     expect(run, 'a runQuery page').toBeDefined();
     expect(pages.some((file) => file.includes('getDataSchema')), 'a getDataSchema page').toBe(true);
+    expect(pages.some((file) => file.includes('getDataTypes')), 'a getDataTypes page').toBe(true);
     const html = readFileSync(run!, 'utf8');
     expect(html).toContain('/data/v1/query');
     // QueryRequest is a oneOf; every variant must be listed.

@@ -528,8 +528,24 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let Some(key) = state.actions_signing_key.as_deref() else {
+    // No key (unset, or its file not written or refused) is 503: nothing is checked against
+    // an absent key, and nothing below runs.
+    let Some(key) = state.actions_signing_key.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let key = match key.get() {
+        Ok(key) => key,
+        Err(e) => {
+            match e {
+                chelabase_types::file_value::Unavailable::NotYet { .. } => {
+                    tracing::debug!("the Actions webhook waits for its signing key: {e}")
+                }
+                chelabase_types::file_value::Unavailable::Refused { .. } => {
+                    warn!("the Actions webhook can't use its signing key: {e}")
+                }
+            }
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
     };
     let signature = headers
         .get(SIGNATURE_HEADER)

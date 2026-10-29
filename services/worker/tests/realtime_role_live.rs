@@ -28,7 +28,7 @@ use chelabase_nats::rt::{COMPUTE_STOPPING, ComputeStopping, ProjectEvent};
 use chelabase_nats::{BranchJob, NatsConfig, NatsError};
 use chelabase_neon::compute::ComputeLocator;
 use chelabase_neon::compute_tls::server_name;
-use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, DockerLocator};
+use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, DockerLocator, DockerSettings};
 use chelabase_types::{BranchId, DatabaseId};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
@@ -365,11 +365,12 @@ async fn compute_stopping_is_published_before_a_reset_stops_the_compute() {
     let config = WorkerConfig::from_env().expect("worker config");
     let docker = DockerBackend::connect(ComputeSettings {
         image: config.compute_image.clone(),
-        network: config.compute_network.clone(),
         control_plane_uri: config.control_plane_uri.clone(),
         stack: config.stack.clone(),
-        control_network: config.compute_control_network.clone(),
         ca: None,
+    }, DockerSettings {
+        network: config.compute_network.clone(),
+        control_network: config.compute_control_network.clone(),
     })
     .expect("a compute backend for the stack's computes (CHELABASE_STACK)");
     let ep_slot = Arc::new(Mutex::new(None));

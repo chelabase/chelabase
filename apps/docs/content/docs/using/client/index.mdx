@@ -9,7 +9,7 @@ The package lives in the repository (`packages/client`) and is a workspace packa
 
 ## Create a client
 
-`chelabase gen types` writes a `Database` type and a `types` constant from a branch's schema (see [Generated types](/docs/using/client/types)). Pass both to `createClient`, with the gateway's URL and a [key](/docs/using/data-api/keys):
+The generated types (`db.ts`, from Studio's **Download types** or `GET /data/v1/types`) hold a `Database` type and a `types` constant from a branch's schema (see [Generated types](/docs/using/client/types)). Pass both to `createClient`, with the gateway's URL and a [key](/docs/using/data-api/keys):
 
 ```ts twoslash
 import { createClient } from "@chelabase/client";

@@ -46,26 +46,26 @@ pub struct InternalConfig {
     pub app_sessions_token: String,
     /// `CHELABASE_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
     pub app_refresh_ttl: Duration,
-    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`: checks the Actions webhook's signature; without
-    /// it the webhook answers 503.
-    pub actions_signing_key: Option<String>,
+    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`, or the file `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE`
+    /// names (the bootstrap's `actions-signing-key`, 0600), read when the webhook first needs
+    /// it: checks the Actions webhook's signature. Unset, or the file not written yet, the
+    /// webhook answers 503.
+    pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
+    /// `CHELABASE_DEV_DEFAULTS=1` (the workbench only): a self-hosted instance may start with
+    /// the development bearers ([`Self::check_mode`]).
+    pub dev_defaults: chelabase_types::dev_defaults::DevDefaults,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
     pub zitadel_admin_pat_file: Option<PathBuf>,
     /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
+    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
+    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
+    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
 }
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
 /// instance refuses each, [`InternalConfig::check_mode`]).
-pub const DEV_BEARERS: [(&str, &str); 7] = [
-    ("CHELABASE_PROXY_API_TOKEN", "chelabase-dev-proxy-api"),
-    ("CHELABASE_STORCON_HOOK_TOKEN", "chelabase-dev-storcon-hook"),
-    ("CHELABASE_DATA_KEYS_TOKEN", "chelabase-dev-data-keys"),
-    ("CHELABASE_REST_INTERNAL_TOKEN", "chelabase-dev-rest-internal"),
-    ("CHELABASE_REALTIME_INTERNAL_TOKEN", "chelabase-dev-realtime-internal"),
-    ("CHELABASE_APP_AUTH_INTERNAL_TOKEN", chelabase_types::mode_policy::DEV_APP_AUTH_INTERNAL_TOKEN),
-    ("CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "chelabase-dev-app-sessions"),
-];
+pub const DEV_BEARERS: [(&str, &str); 7] = chelabase_types::dev_defaults::DEV_BEARERS;
 
 /// A session never lasts longer than this after it was created (and so neither can a refresh).
 pub const APP_SESSION_CAP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
@@ -88,6 +88,7 @@ impl InternalConfig {
                 .map_err(|e| anyhow!(e))?
                 .unwrap_or_else(|| default.to_string()))
         };
+        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
         Ok(Self {
             addr: or("CHELABASE_INTERNAL_ADDR", "127.0.0.1:8083")
                 .parse()
@@ -126,24 +127,35 @@ impl InternalConfig {
             app_auth_token: secret(DEV_BEARERS[5].0, DEV_BEARERS[5].1)?,
             app_sessions_token: secret(DEV_BEARERS[6].0, DEV_BEARERS[6].1)?,
             app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
-            actions_signing_key: get("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY")
-                .filter(|v| !v.trim().is_empty()),
+            actions_signing_key: chelabase_types::file_value::FileValue::from_lookup(
+                &get,
+                "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY",
+                chelabase_types::file_value::Sensitivity::Secret,
+            )
+            .map_err(|e| anyhow!(e))?,
+            dev_defaults: chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
+                .map_err(|e| anyhow!(e))?,
             zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .filter(|v| !v.trim().is_empty())
                 .map(PathBuf::from),
-            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
+            zitadel_at: zitadel_issuer
+                .as_deref()
+                .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
+                .transpose()
                 .map_err(anyhow::Error::new)?,
+            zitadel_issuer,
         })
     }
 
-    /// Startup refusals that depend on the mode (M9): a platform instance runs with none of the
-    /// internal listener's development bearers (each is public), whether its variable is unset
-    /// or set to one of them. The error names the variable, never the token.
+    /// Startup refusals that depend on the mode (M9): the internal listener runs with none of
+    /// its development bearers (each is public), whether its variable is unset or set to one of
+    /// them: never in platform mode, and in self-hosted mode only with `CHELABASE_DEV_DEFAULTS=1`
+    /// (the workbench, m5). The error names the variable, never the token.
     pub fn check_mode(&self, policy: &chelabase_types::mode_policy::ModePolicy) -> Result<()> {
         let dev_values: Vec<&str> = DEV_BEARERS.iter().map(|(_, value)| *value).collect();
         for (var, token) in self.bearers() {
-            policy
-                .check_dev_bearer(var, token, &dev_values)
+            self.dev_defaults
+                .check_bearer(policy, var, token, &dev_values)
                 .map_err(|e| anyhow!(e))?;
         }
         Ok(())
@@ -176,7 +188,11 @@ impl InternalConfig {
         };
         match std::fs::read_to_string(file) {
             Ok(pat) if !pat.trim().is_empty() => {
-                Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim()))
+                let at = self.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
+                    base: issuer.clone(),
+                    host: None,
+                });
+                Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
             }
             Ok(_) => {
                 tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty");
@@ -284,18 +300,142 @@ impl std::fmt::Debug for InternalConfig {
             .field("app_refresh_ttl", &self.app_refresh_ttl)
             .field(
                 "actions_signing_key",
-                &self.actions_signing_key.as_ref().map(|_| "<redacted>"),
+                &self.actions_signing_key.as_ref().map(|k| k.var().to_string()),
             )
+            .field("dev_defaults", &self.dev_defaults)
             .field("zitadel_admin_pat_file", &self.zitadel_admin_pat_file)
             .field("zitadel_issuer", &self.zitadel_issuer)
+            .field("zitadel_at", &self.zitadel_at)
             .finish()
     }
+}
+
+/// `CHELABASE_METADATA_DATABASE_URL`: where the metadata database is, with its password from
+/// `CHELABASE_METADATA_DATABASE_PASSWORD_FILE` when that is set (m1's `db/metadata.password`;
+/// the URL then names the user only). Required: there is no development fallback (the
+/// workbench's stack.env always sets it), so a fixed credential is never used by accident.
+/// Errors name the variables, never the URL or the password.
+pub fn metadata_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<chelabase_metadata::MetadataConfig> {
+    let database_url = chelabase_types::secret_env::url_with_password_file(
+        get,
+        "CHELABASE_METADATA_DATABASE_URL",
+        "CHELABASE_METADATA_DATABASE_PASSWORD_FILE",
+    )
+    .map_err(anyhow::Error::msg)?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "CHELABASE_METADATA_DATABASE_URL is not set: the metadata database's URL \
+             (postgres://user@host:port/database, the password in \
+             CHELABASE_METADATA_DATABASE_PASSWORD_FILE)"
+        )
+    })?;
+    Ok(chelabase_metadata::MetadataConfig { database_url })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+
+    // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
+    // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
+    // `postgres://chelabase:chelabase@…`; the workbench always sets it (its stack.env).
+    // m5 fix round: the metadata password from CHELABASE_METADATA_DATABASE_PASSWORD_FILE (m1's
+    // `db/metadata.password`), so it is never in the environment. It goes into the URL's user
+    // info, percent-encoded (as the bootstrap does); the URL then carries none. Both forms, a
+    // missing, empty, symlinked or loosely-moded file are startup errors naming the variables,
+    // and the password is in no error and no `Debug`.
+    #[test]
+    fn the_metadata_password_comes_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("metadata.password");
+        let write = |contents: &str, mode: u32| {
+            let _ = std::fs::remove_file(&file);
+            std::fs::write(&file, contents).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        const SECRET: &str = "p@ss/w:rd%Zz";
+        let path = file.to_str().unwrap().to_string();
+        let config = |url: &str| {
+            let (url, path) = (url.to_string(), path.clone());
+            metadata_config(move |k| match k {
+                "CHELABASE_METADATA_DATABASE_URL" => Some(url.clone()),
+                "CHELABASE_METADATA_DATABASE_PASSWORD_FILE" => Some(path.clone()),
+                _ => None,
+            })
+        };
+        const URL: &str = "postgres://chelabase@metadata-db:5432/chelabase_metadata?sslmode=disable";
+        for mode in [0o600, 0o400, 0o640] {
+            write(&format!("{SECRET}\n"), mode);
+            let c = config(URL).unwrap_or_else(|e| panic!("{mode:o}: {e:#}"));
+            assert_eq!(
+                c.database_url,
+                "postgres://chelabase:p%40ss%2Fw%3Ard%25Zz@metadata-db:5432/chelabase_metadata?sslmode=disable"
+            );
+            // What sqlx connects with: the same user, host and database.
+            let opts = sqlx::postgres::PgConnectOptions::from_str(&c.database_url).unwrap();
+            assert_eq!((opts.get_username(), opts.get_host(), opts.get_database()),
+                ("chelabase", "metadata-db", Some("chelabase_metadata")));
+            assert!(!format!("{c:?}").contains("p%40ss") && !format!("{c:?}").contains(SECRET), "{c:?}");
+        }
+        let refused = |what: &str, url: &str, needles: &[&str]| {
+            let err = match config(url) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{what}: accepted: {c:?}"),
+            };
+            for n in needles {
+                assert!(err.contains(n), "{what}: {err}");
+            }
+            assert!(!err.contains(SECRET) && !err.contains("p%40ss") && !err.contains("in-url-pw"), "{what}: {err}");
+        };
+        write(SECRET, 0o600);
+        refused(
+            "a password in both",
+            "postgres://chelabase:in-url-pw@metadata-db:5432/m",
+            &["CHELABASE_METADATA_DATABASE_URL", "CHELABASE_METADATA_DATABASE_PASSWORD_FILE"],
+        );
+        refused("no user", "postgres://metadata-db:5432/m", &["CHELABASE_METADATA_DATABASE_URL"]);
+        for mode in [0o644, 0o604, 0o660, 0o666] {
+            write(SECRET, mode);
+            refused(&format!("mode {mode:o}"), URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        }
+        write("\n", 0o600);
+        refused("empty", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        std::fs::remove_file(&file).unwrap();
+        refused("missing", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        let real = dir.path().join("real");
+        std::fs::write(&real, SECRET).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &file).unwrap();
+        refused("a symlink", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE", "symlink"]);
+        // A URL with its own password, and no file, still works (the workbench).
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| "postgres://u:in-url-pw@db:5432/m".to_string())
+        })
+        .unwrap();
+        assert!(!format!("{c:?}").contains("in-url-pw"), "{c:?}");
+    }
+
+    #[test]
+    fn the_metadata_url_is_required() {
+        for pairs in [vec![], vec![("CHELABASE_METADATA_DATABASE_URL", " ")], vec![("CHELABASE_DEV_DEFAULTS", "1")]] {
+            let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+            let err = match metadata_config(|k| map.get(k).map(|v| v.to_string())) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{pairs:?}: a fallback metadata URL: {}", c.database_url),
+            };
+            assert!(err.contains("CHELABASE_METADATA_DATABASE_URL"), "{err}");
+        }
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| " postgres://u:p@db:5432/m ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u:p@db:5432/m");
+    }
 
     #[test]
     fn defaults_are_for_local_dev() {
@@ -451,7 +591,7 @@ mod tests {
         assert_eq!(c.app_auth_token, "chelabase-dev-app-auth");
         assert_eq!(c.app_sessions_token, "chelabase-dev-app-sessions");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(2_592_000));
-        assert_eq!(c.actions_signing_key, None);
+        assert!(c.actions_signing_key.is_none());
         assert_eq!(c.zitadel_admin_pat_file, None);
         assert_eq!(c.zitadel_issuer, None);
     }
@@ -471,7 +611,14 @@ mod tests {
         })
         .unwrap();
         let (sh, pf) = (ModePolicy::new(Mode::SelfHosted), ModePolicy::new(Mode::Platform));
-        assert!(default.check_mode(&sh).is_ok());
+        // m5: self-hosted keeps the defaults only with CHELABASE_DEV_DEFAULTS=1.
+        let dev = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_DEV_DEFAULTS").then(|| "1".to_string())
+        })
+        .unwrap();
+        assert!(dev.check_mode(&sh).is_ok());
+        assert!(dev.check_mode(&pf).is_err());
+        assert!(default.check_mode(&sh).is_err());
         assert!(default.check_mode(&pf).is_err());
         assert!(own.check_mode(&sh).is_ok() && own.check_mode(&pf).is_ok());
     }
@@ -492,7 +639,7 @@ mod tests {
         assert_eq!(c.app_auth_token, "auth-tok");
         assert_eq!(c.app_sessions_token, "gw-tok");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(3600));
-        assert_eq!(c.actions_signing_key.as_deref(), Some("sign-key"));
+        assert_eq!(c.actions_signing_key.as_ref().map(|k| k.get().unwrap()), Some("sign-key"));
         assert_eq!(
             c.zitadel_admin_pat_file,
             Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
@@ -502,7 +649,88 @@ mod tests {
             (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
         })
         .unwrap();
-        assert_eq!(blank.actions_signing_key, None);
+        assert!(blank.actions_signing_key.is_none());
+    }
+
+    // m5 (AC 3): the Actions signing key is the variable or the file it names, not both; the
+    // error names the variable and never the key.
+    #[test]
+    fn config_refuses_env_and_file_both() {
+        let err = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE" => Some("/out/actions-signing-key".into()),
+            _ => None,
+        })
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY ") && msg.contains("not both"), "{msg}");
+        assert!(!msg.contains("sign-key-secret"), "{msg}");
+    }
+
+    // m5: the key file is read when the webhook first needs it, not at startup: a missing file
+    // starts the orchestrator (its readiness doesn't wait for the key) and is "not yet".
+    #[test]
+    fn the_actions_key_file_is_read_late() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("actions-signing-key");
+        let p = path.to_str().unwrap().to_string();
+        let c = InternalConfig::from_lookup(move |name| {
+            (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE").then(|| p.clone())
+        })
+        .unwrap();
+        let key = c.actions_signing_key.clone().expect("configured");
+        assert!(key.get().is_err(), "not written yet");
+        std::fs::write(&path, "late-key\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(key.get(), Ok("late-key"));
+        assert!(!format!("{c:?}").contains("late-key"));
+    }
+
+    // m5 (AC 4): self-hosted without CHELABASE_DEV_DEFAULTS=1 refuses every bearer that is
+    // unset or set to a development default, naming the variable; with it, today's behaviour.
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        use chelabase_types::mode::Mode;
+        use chelabase_types::mode_policy::ModePolicy;
+        let sh = ModePolicy::new(Mode::SelfHosted);
+        for (var, dev) in DEV_BEARERS {
+            for (how, value) in [("unset", None), ("set to the default", Some(dev))] {
+                let lookup = |dev_defaults: Option<&'static str>| {
+                    let value = value.map(str::to_string);
+                    move |name: &str| {
+                        if name == "CHELABASE_DEV_DEFAULTS" {
+                            return dev_defaults.map(str::to_string);
+                        }
+                        if name == var {
+                            return value.clone();
+                        }
+                        DEV_BEARERS
+                            .iter()
+                            .any(|(v, _)| *v == name)
+                            .then(|| format!("generated-secret-for-{name}"))
+                    }
+                };
+                let c = InternalConfig::from_lookup(lookup(None)).unwrap();
+                let msg = format!("{:#}", c.check_mode(&sh).expect_err(var));
+                assert!(msg.contains(var), "{var} {how}: {msg}");
+                assert!(!msg.contains(dev), "{var} {how}: the message repeats the token: {msg}");
+                let c = InternalConfig::from_lookup(lookup(Some("0"))).unwrap();
+                assert!(c.check_mode(&sh).is_err(), "{var} {how}: 0 is off");
+                let c = InternalConfig::from_lookup(lookup(Some("1"))).unwrap();
+                assert!(c.check_mode(&sh).is_ok(), "{var} {how}: the workbench keeps it");
+            }
+        }
+        // Every bearer generated: no switch needed.
+        let own = InternalConfig::from_lookup(|name| {
+            DEV_BEARERS.iter().any(|(v, _)| *v == name).then(|| format!("generated-{name}"))
+        })
+        .unwrap();
+        assert!(own.check_mode(&sh).is_ok());
+        let typo = InternalConfig::from_lookup(|name| {
+            (name == "CHELABASE_DEV_DEFAULTS").then(|| "true".to_string())
+        });
+        assert!(format!("{:#}", typo.unwrap_err()).contains("CHELABASE_DEV_DEFAULTS"));
     }
 
     #[test]
@@ -565,6 +793,7 @@ mod tests {
             ..InternalConfig::from_lookup(|_| None).unwrap()
         };
         let err = format!("{:#}", c.load_signer().err().expect("no keys"));
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 
@@ -579,6 +808,7 @@ mod tests {
         };
         let err = format!("{:#}", c.load_signer().err().expect("corrupt keys"));
         assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 
@@ -593,6 +823,35 @@ mod tests {
             ..InternalConfig::from_lookup(|_| None).unwrap()
         };
         assert!(c.load_signer().is_ok());
+    }
+
+    // #24: the session-deleting client goes in-network with the auth host as Host; the
+    // issuer stays the public one.
+    #[test]
+    fn zitadel_is_reached_at_the_in_network_url() {
+        let c = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_PUBLIC_SCHEME" => Some("https".into()),
+            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
+            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(
+            c.zitadel_at,
+            Some(chelabase_types::entry::ZitadelAt {
+                base: "http://zitadel:8080".into(),
+                host: Some("auth.example.com".into()),
+            })
+        );
+        let err = InternalConfig::from_lookup(|name| match name {
+            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
+            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080/x".into()),
+            _ => None,
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
     }
 
     #[test]

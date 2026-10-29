@@ -76,7 +76,10 @@ pub async fn run() -> Result<()> {
         "openid profile urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:{project_id}:aud"
     );
 
-    let client = reqwest::Client::new();
+    // Never a redirect (#26): the signed assertion goes to the issuer only.
+    let client = chelabase_http::client_builder()
+        .build()
+        .context("an HTTP client")?;
     let resp = client
         .post(format!("{iss}/oauth/v2/token"))
         .form(&[

@@ -1,5 +1,5 @@
 use chelabase_auth::internal::InternalVerifier;
-use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_metadata::MetadataClient;
 use chelabase_query::app_users::PgUsersDb;
 use chelabase_nats::{connect, ensure_control_stream, ensure_neon_events_stream, NatsConfig};
 use chelabase_neon::proxy_cache::ProxyCache;
@@ -18,6 +18,7 @@ use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("orchestrator", "The Chelabase orchestrator: projects, branches, computes and the management API.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -26,9 +27,8 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let metadata_config = MetadataConfig::from_env().unwrap_or_else(|_| MetadataConfig {
-        database_url: "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into(),
-    });
+    let metadata_config =
+        orchestrator::internal::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
@@ -40,6 +40,20 @@ async fn main() -> anyhow::Result<()> {
     let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
     entry.check_mode(mode).map_err(anyhow::Error::new)?;
     internal_config.check_mode(&ModePolicy::new(mode))?;
+    if internal_config.dev_defaults.is_on() {
+        tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (explicit opt-in)");
+    }
+    // Readiness doesn't wait for the Actions key: the bootstrap needs the orchestrator up to
+    // make the Actions target, and writes the key after. The webhook answers 503 until then.
+    match &internal_config.actions_signing_key {
+        None => tracing::warn!(
+            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY(_FILE) is not set: the Zitadel Actions webhook answers 503"
+        ),
+        Some(key) => match key.get() {
+            Ok(_) => tracing::info!("the Actions signing key is loaded from {}", key.var()),
+            Err(e) => tracing::info!("{e}; the Actions webhook answers 503 until it is"),
+        },
+    }
     let roles = RoleSettings::from_lookup(
         mode,
         |name| std::env::var(name).ok(),
@@ -65,10 +79,15 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("CHELABASE_TABLE_API_DRY_RUN_MAX_BYTES").ok().as_deref(),
     )
     .map_err(anyhow::Error::msg)?;
+    // Locators are Docker-only until another backend exists; an unknown backend is a startup error.
+    match chelabase_neon::BackendKind::from_env()? {
+        chelabase_neon::BackendKind::Docker => {}
+    }
     let rest = RestInternal {
         url: env_or("CHELABASE_REST_INTERNAL_URL", "http://127.0.0.1:8086"),
         token: internal_config.rest_token.clone(),
-        http: reqwest::Client::new(),
+        // Never a redirect (#26): the rest internal bearer goes to rest only.
+        http: chelabase_http::client_builder().build()?,
     };
 
     // The storage controller runs without --dev: an admin-scoped NeonJWT from the compute-JWT key.
@@ -86,7 +105,8 @@ async fn main() -> anyhow::Result<()> {
             .with_timeout(Duration::from_secs(10))
             .with_token(storcon_admin),
         signer,
-        http: reqwest::Client::builder()
+        // Never a redirect (#26): compute_ctl's JWT and the bearers go to the configured hosts.
+        http: chelabase_http::client_builder()
             .timeout(Duration::from_secs(30))
             .build()?,
         proxy_token: internal_config.proxy_token.clone(),
@@ -108,6 +128,9 @@ async fn main() -> anyhow::Result<()> {
         zitadel: internal_config.load_zitadel(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
+        setup_code: orchestrator::internal::load_setup_code(
+            std::env::var("CHELABASE_SETUP_CODE_FILE").ok().as_deref(),
+        ),
         member_logins,
         realtime_logins,
         control_locator: DockerLocator::connect(
@@ -148,7 +171,10 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.stack,
         )?),
         console: Console::default(),
-        zitadel: zitadel_admin(&entry.issuer()),
+        zitadel: zitadel_admin(
+            &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
+                .map_err(anyhow::Error::new)?,
+        ),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
@@ -195,9 +221,10 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
     }
 }
 
-/// Zitadel's admin API (at `issuer`) with the admin PAT from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`;
-/// `None` (warned) when that is unset or the file can't be read.
-fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
+/// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from
+/// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None` (warned) when that is unset or the file can't be
+/// read.
+fn zitadel_admin(at: &chelabase_types::entry::ZitadelAt) -> Option<chelabase_zitadel::client::Zitadel> {
     let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
         .ok()
         .map(|v| v.trim().to_string())
@@ -207,7 +234,9 @@ fn zitadel_admin(issuer: &str) -> Option<chelabase_zitadel::client::Zitadel> {
         return None;
     };
     match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim())),
+        Ok(pat) if !pat.trim().is_empty() => {
+            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
+        }
         Ok(_) => {
             warn!("{file} is empty; app users can't be enabled");
             None

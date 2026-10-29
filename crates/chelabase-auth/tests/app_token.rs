@@ -106,3 +106,26 @@ fn app_token_other_key_is_invalid() {
     let token = signer.sign(&claims(project, now() + 900)).unwrap();
     assert_eq!(other.verify(&token, project), Err(AppTokenError::Invalid));
 }
+
+// #24 follow-up: a token missing `iss`, `aud` or `exp`, signed with the right key and kid, is
+// refused.
+#[test]
+fn app_token_without_iss_aud_or_exp_is_invalid() {
+    let (private_pem, public_pem) = generate_keypair_pem();
+    let signer = AppTokenSigner::from_pem(private_pem.as_bytes(), public_pem.as_bytes()).unwrap();
+    let verifier = AppTokenVerifier::from_pem(public_pem.as_bytes()).unwrap();
+    let key = jsonwebtoken::EncodingKey::from_ed_pem(private_pem.as_bytes()).unwrap();
+    let project = Uuid::new_v4();
+    let full = serde_json::to_value(claims(project, now() + 900)).unwrap();
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+    header.kid = Some(signer.kid().to_string());
+    // The full claims pass: the refusals below are the missing claim's.
+    let token = jsonwebtoken::encode(&header, &full, &key).unwrap();
+    assert!(verifier.verify(&token, project).is_ok());
+    for missing in ["iss", "aud", "exp"] {
+        let mut c = full.clone();
+        c.as_object_mut().unwrap().remove(missing);
+        let token = jsonwebtoken::encode(&header, &c, &key).unwrap();
+        assert_eq!(verifier.verify(&token, project), Err(AppTokenError::Invalid), "without {missing}");
+    }
+}

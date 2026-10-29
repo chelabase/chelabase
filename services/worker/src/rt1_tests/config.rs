@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use chelabase_metadata::{MetadataClient, MetadataConfig};
-use chelabase_neon::DockerBackend;
+use chelabase_neon::{Backend, DockerBackend};
 use chelabase_neon::compute_tls::ComputeCa;
 use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE, generate_keypair};
 use chelabase_secrets::SecretKey;
@@ -87,9 +87,9 @@ fn built(config: &WorkerConfig) -> anyhow::Result<RealWorker> {
         SecretKey::generate(),
         Arc::new(NoopPublisher),
         crate::ports::AttachSource::Disabled,
-        |settings| {
+        |settings, docker_settings| {
             let docker = bollard::Docker::connect_with_http("http://127.0.0.1:1", 1, bollard::API_DEFAULT_VERSION)?;
-            Ok(DockerBackend::with_docker(settings, docker))
+            Ok(Backend::Docker(DockerBackend::with_docker(settings, docker_settings, docker)))
         },
     )
 }

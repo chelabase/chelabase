@@ -107,12 +107,16 @@ struct FakeMetadata {
     /// fills it, the fake does to test the per-role levels, T2).
     #[allow(clippy::type_complexity)]
     team_grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), Vec<Grant>>>>,
-    /// Reads of a member row (`member_by_zitadel` and `ensure_member` each read it once).
+    /// Reads of a member row (`member_by_zitadel` and `admit_member` each read it once).
     member_reads: Arc<AtomicUsize>,
     /// Reads of a branch's roles (`list_roles`).
     role_reads: Arc<AtomicUsize>,
     /// When each tenant's admin was claimed by a first sign-in (`admin_claimed`).
     admin_claims: Arc<Mutex<HashMap<TenantId, chrono::DateTime<chrono::Utc>>>>,
+    /// Selfhost-install m3: each tenant's fresh-install claim (its bound user). With one, only
+    /// that user claims the admin (`admit_member`'s rule); without one the fake keeps the first
+    /// comer's rule the other tests build on.
+    setup_claims: Arc<Mutex<HashMap<TenantId, String>>>,
     /// A write "another request" makes just before the next checked grant or override write.
     race_before_write: Arc<Mutex<std::collections::VecDeque<RaceWrite>>>,
     /// The reconciler's `member_branch_roles` rows.
@@ -348,6 +352,10 @@ impl FakeMetadata {
     }
 
     /// Sets (or clears) when the tenant's admin was claimed.
+    fn set_setup_claim(&self, tenant: TenantId, user: &str) {
+        self.setup_claims.lock().unwrap().insert(tenant, user.into());
+    }
+
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
         let mut claims = self.admin_claims.lock().unwrap();
         match at {
@@ -1836,7 +1844,7 @@ impl MetadataPort for FakeMetadata {
     /// As the real one: a removed or pending member is returned as is, an invited one is
     /// activated, an active one gets the claims, and a new one claims the admin when the tenant
     /// has no active admin, else is active, pending or refused (`NotAdmitted`) per `admission`.
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1877,10 +1885,12 @@ impl MetadataPort for FakeMetadata {
         let has_admin = members
             .iter()
             .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin);
-        let status = match (has_admin, admission) {
-            (false, _) | (true, Admission::Active) => MemberStatus::Active,
-            (true, Admission::Pending) => MemberStatus::Pending,
-            (true, Admission::Closed) => return Err(MetadataError::NotAdmitted(tenant)),
+        let bound = self.setup_claims.lock().unwrap().get(&tenant).cloned();
+        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == zitadel_user_id);
+        let status = match (claims, admission) {
+            (true, _) | (false, Admission::Active) => MemberStatus::Active,
+            (false, Admission::Pending) => MemberStatus::Pending,
+            (false, Admission::Closed) => return Err(MetadataError::NotAdmitted(tenant)),
         };
         let record = MemberRecord {
             id: uuid::Uuid::new_v4(),
@@ -1888,7 +1898,7 @@ impl MetadataPort for FakeMetadata {
             zitadel_user_id: zitadel_user_id.into(),
             email,
             display_name: name.into(),
-            tenant_admin: !has_admin,
+            tenant_admin: claims,
             status,
             accepted_at: Some(chrono::Utc::now()),
             offboarded: false, suspended_at: None, suspended_by: None,
@@ -2597,7 +2607,8 @@ fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
     chelabase_auth::ZitadelAuthConfig {
         issuer: "http://issuer.invalid".into(),
         jwks_url: "http://127.0.0.1:9/oauth/v2/keys".into(),
-        audiences: vec![],
+        jwks_host: None,
+        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
     }
 }
 
@@ -2635,6 +2646,7 @@ impl TestApp {
     }
 
     /// Sends a request with this identity.
+    #[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
     async fn send_identity(&self, identity: &Identity, method: Method, path: &str) -> reqwest::Response {
         let token = self.signer.sign(Service::Orchestrator.name(), identity).unwrap();
         reqwest::Client::new()
@@ -2646,6 +2658,7 @@ impl TestApp {
     }
 
     /// Sends a request as person `sub` in `org_id`, with an optional JSON body.
+    #[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
     async fn send_as(&self, sub: &str, org_id: &str, method: Method, path: &str, body: Option<Value>) -> reqwest::Response {
         let mut req = reqwest::Client::new()
             .request(method, format!("{}{path}", self.base))
@@ -2811,7 +2824,8 @@ async fn spawn_app_core(
         rest: RestInternal {
             url: rest_url.into(),
             token: REST_TOKEN.into(),
-            http: reqwest::Client::new(),
+            // The production client (no redirects), so tests see what production sees.
+            http: chelabase_http::client_builder().build().unwrap(),
         },
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
         operator_org: operator_org.map(str::to_string),
@@ -2862,6 +2876,7 @@ fn create_body(tenant_id: TenantId) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::disallowed_methods)] // test code: a plain client against the test app
 async fn post_create(app: &TestApp, identity_header: Option<&str>, body: serde_json::Value) -> reqwest::Response {
     let mut req = reqwest::Client::new()
         .post(format!("{}/v1/databases", app.base))
@@ -3450,6 +3465,8 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     }
 
     async fn admin_claimed_since(&self, tenant: TenantId, since: chrono::DateTime<chrono::Utc>) -> Result<bool, MetadataError> {
+        // As the real one: only the bound user's first request (`admin_claimed`) opens the
+        // window; binding the claim doesn't (m3 re-audit, B3).
         Ok(self.admin_claims.lock().unwrap().get(&tenant).is_some_and(|at| *at > since))
     }
 

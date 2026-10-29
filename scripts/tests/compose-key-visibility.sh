@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline check of the key-visibility invariant (U10, R-T9a): a service sees exactly the machine
 # key files it reads, nothing else under the keys dir, and `.chelabase` inside a checkout mount is
-# masked. Renders the one compose file (there is no other file or overlay) for three stacks and
+# masked. Renders the base compose file plus the workbench overlay for three stacks and
 # compares, per service, the visibility of every key path with a table.
 #
 # Visibility of a path for a service: the mount with the longest target that is the path or a
@@ -198,7 +198,8 @@ check() {
   shift 5
   local config
   config="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE "$@" docker compose -p chelabase-feat-x \
-    -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" --env-file "$fixture" \
+    -f "${COMPOSE_FILE_UNDER_TEST:-$root/infra/compose/docker-compose.yml}" \
+    -f "${COMPOSE_OVERLAY_UNDER_TEST:-$root/infra/compose/docker-compose.workbench.yml}" --env-file "$fixture" \
     --profile sites --profile runner config --no-env-resolution --format json |
     jq -f "$root/scripts/tests/fixtures/secrets-as-binds.jq")" ||
     fail "$label: compose config failed"

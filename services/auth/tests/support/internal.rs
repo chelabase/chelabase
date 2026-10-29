@@ -38,6 +38,13 @@ pub struct FakeState {
     pub signup: Option<(bool, String)>,
     /// Answer the gate with this status instead.
     pub signup_status: Option<u16>,
+    /// A fresh install with this setup code: the gate answers `first_member` with
+    /// `CLAIM_NONCE` for exactly this code, else `setup_code_invalid` (`setup_required`).
+    pub setup_code: Option<String>,
+    /// Answer `claimed` with this status instead.
+    pub claimed_status: Option<u16>,
+    /// `claimed`'s `bound` (`true` when unset).
+    pub claimed_unbound: bool,
     /// `(method path, query)` of every call.
     pub queries: Vec<(String, String)>,
     /// `(user id, token hash hex)` → the invite description JSON to answer.
@@ -174,13 +181,37 @@ async fn revoke_user(State(s): S, Path(user): Path<Uuid>, Json(b): Json<Value>) 
     StatusCode::NO_CONTENT
 }
 
-async fn signup_allowed(State(s): S) -> Response {
+/// The nonce the fake gate hands out with `first_member`.
+pub const CLAIM_NONCE: &str = "abababababababababababababababababababababababababababababababab";
+
+async fn signup_check(State(s): S, Json(b): Json<Value>) -> Response {
     let st = s.lock().unwrap();
     if let Some(status) = st.signup_status {
         return error(StatusCode::from_u16(status).unwrap(), "unavailable");
     }
+    if let Some(code) = &st.setup_code {
+        return if b["setup_code"].as_str() == Some(code.as_str()) {
+            Json(json!({"allowed": true, "reason": "first_member", "setup_required": true, "claim_nonce": CLAIM_NONCE}))
+                .into_response()
+        } else {
+            Json(json!({"allowed": false, "reason": "setup_code_invalid", "setup_required": true})).into_response()
+        };
+    }
     let (allowed, reason) = st.signup.clone().unwrap_or((true, "open".into()));
-    Json(json!({"allowed": allowed, "reason": reason})).into_response()
+    let mut answer = json!({"allowed": allowed, "reason": reason, "setup_required": false});
+    if reason == "first_member" {
+        answer["claim_nonce"] = json!(CLAIM_NONCE);
+    }
+    Json(answer).into_response()
+}
+
+async fn signup_claimed(State(s): S) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(status) = st.claimed_status {
+        let code = if status == 403 { "setup_code_invalid" } else { "unavailable" };
+        return error(StatusCode::from_u16(status).unwrap(), code);
+    }
+    Json(json!({"bound": !st.claimed_unbound})).into_response()
 }
 
 async fn describe_invite(State(s): S, Json(q): Json<HashMap<String, String>>) -> Response {
@@ -219,7 +250,8 @@ impl FakeInternal {
                 post(revoke_user),
             )
             .route("/internal/app/sync", post(sync))
-            .route("/internal/signup/allowed", get(signup_allowed))
+            .route("/internal/signup/check", post(signup_check))
+            .route("/internal/signup/claimed", post(signup_claimed))
             .route("/internal/invites/describe", post(describe_invite))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
             .with_state(inner.clone());
@@ -249,11 +281,23 @@ impl FakeInternal {
         self.inner.lock().unwrap().describe_status = status;
     }
 
+    pub fn set_setup_code(&self, code: &str) {
+        self.inner.lock().unwrap().setup_code = Some(code.into());
+    }
+
+    pub fn set_claimed_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().claimed_status = status;
+    }
+
+    pub fn set_claimed_unbound(&self) {
+        self.inner.lock().unwrap().claimed_unbound = true;
+    }
+
     pub fn set_signup_status(&self, status: Option<u16>) {
         self.inner.lock().unwrap().signup_status = status;
     }
 
-    /// The query strings of calls to `call` (`"GET /internal/signup/allowed"`).
+    /// The query strings of calls to `call` (`"POST /internal/invites/describe"`).
     pub fn queries(&self, call: &str) -> Vec<String> {
         self.inner
             .lock()

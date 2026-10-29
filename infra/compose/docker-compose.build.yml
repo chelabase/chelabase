@@ -1,0 +1,46 @@
+# Builds the self-hosted install from this clone instead of using the release images:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+# One all-in-one image (infra/images/server.Dockerfile, target `all`: every Rust binary, from
+# one cargo build) runs every Rust service and the init one-shots, each with its own command;
+# Studio is built from infra/images/studio.Dockerfile. Nothing else changes: the same wiring,
+# secrets, users and healthchecks as docker-compose.yml.
+
+# Built once (by init-secrets' build section); the other services use the same local image.
+x-server: &server
+  image: chelabase/server:local
+  pull_policy: never
+
+services:
+  init-secrets:
+    <<: *server
+    pull_policy: build
+    build:
+      context: ../..
+      dockerfile: infra/images/server.Dockerfile
+      target: all
+  init-bootstrap:
+    <<: *server
+  orchestrator:
+    <<: *server
+  worker:
+    <<: *server
+  gateway:
+    <<: *server
+    command: ["gateway"]
+  auth:
+    <<: *server
+    command: ["auth"]
+  rest:
+    <<: *server
+    command: ["rest"]
+  realtime:
+    <<: *server
+    command: ["realtime"]
+  studio:
+    image: chelabase/studio:local
+    pull_policy: build
+    build:
+      context: ../..
+      dockerfile: infra/images/studio.Dockerfile

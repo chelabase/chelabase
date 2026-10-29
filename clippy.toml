@@ -1,0 +1,23 @@
+# No HTTP client follows a redirect (#26). Every client a service or tool builds sends a
+# credential or a forced Host, and reqwest follows up to 10 redirects by default. Clients start
+# from `chelabase_http::client_builder()`, which sets `redirect(Policy::none())`; that function is
+# the only place allowed to call these, and `ClientBuilder::redirect` is listed so nothing turns
+# following back on. Clippy applies this to every target, tests included: integration-test
+# crates (`*/tests/`) opt out with `allow(clippy::disallowed_methods)`.
+# scripts/tests/http-no-redirects.sh fails any such allow in production sources outside
+# crates/chelabase-http, and covers the `Default` impls, which a path here can't name.
+# The blocking entries are `allow-invalid` because the `blocking` feature is off; they bite as
+# soon as someone turns it on.
+disallowed-methods = [
+    { path = "reqwest::Client::new", reason = "follows redirects; use chelabase_http::client_builder()" },
+    { path = "reqwest::Client::builder", reason = "follows redirects; use chelabase_http::client_builder()" },
+    { path = "reqwest::ClientBuilder::new", reason = "follows redirects; use chelabase_http::client_builder()" },
+    { path = "reqwest::ClientBuilder::redirect", reason = "chelabase_http::client_builder() already refuses redirects; never turn following back on" },
+    { path = "reqwest::get", reason = "a default client that follows redirects; use chelabase_http::client_builder()" },
+    { path = "reqwest::blocking::Client::new", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
+    { path = "reqwest::blocking::Client::builder", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
+    { path = "reqwest::blocking::Client::default", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
+    { path = "reqwest::blocking::ClientBuilder::new", reason = "follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
+    { path = "reqwest::blocking::ClientBuilder::redirect", reason = "never turn following back on", allow-invalid = true },
+    { path = "reqwest::blocking::get", reason = "a default client that follows redirects; use chelabase_http::client_builder()", allow-invalid = true },
+]

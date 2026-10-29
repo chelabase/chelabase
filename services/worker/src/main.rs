@@ -1,5 +1,5 @@
 use axum::{Json, Router, routing::get};
-use chelabase_metadata::{MetadataClient, MetadataConfig};
+use chelabase_metadata::MetadataClient;
 use chelabase_nats::{
     AppUsersCheckReply, AppUsersCheckRequest, CheckDataRoleReply, CheckDataRoleRequest,
     DataApiDatabaseRequest, JobEnvelope, MemberRolesReconcileRequest,
@@ -41,6 +41,7 @@ const RESET_QUEUE_GROUP: &str = "chelabase-worker";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("worker", "The Chelabase worker: background jobs for provisioning, branches, merges and roles.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -51,9 +52,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Before anything is contacted, so a missing image is the first thing a user sees.
     let config = WorkerConfig::from_env()?;
-    let metadata_config = MetadataConfig::from_env().unwrap_or_else(|_| MetadataConfig {
-        database_url: "postgres://chelabase:chelabase@127.0.0.1:5433/chelabase_metadata".into(),
-    });
+    let metadata_config = worker::config::metadata_config(|name| std::env::var(name).ok())?;
     let nats_config = NatsConfig::from_env().expect("nats config");
 
     let metadata = MetadataClient::connect(&metadata_config).await?;

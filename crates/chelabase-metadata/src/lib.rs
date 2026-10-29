@@ -62,10 +62,21 @@ pub const DEMO_TENANT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000
 pub const DEMO_PROJECT_ID: Uuid = Uuid::from_u128(0x0000_0000_0000_4000_8000_0000_0000_0002);
 
 /// Connection configuration for the control-plane metadata Postgres.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct MetadataConfig {
     pub database_url: String,
 }
+
+/// The URL without its passwords (the user info's, from `CHELABASE_METADATA_DATABASE_PASSWORD_FILE`,
+/// and any `password` query parameter's).
+impl std::fmt::Debug for MetadataConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetadataConfig")
+            .field("database_url", &chelabase_types::secret_env::redact_url_passwords(&self.database_url))
+            .finish()
+    }
+}
+
 
 impl MetadataConfig {
     pub fn from_env() -> Result<Self, MetadataError> {
@@ -707,28 +718,6 @@ impl MetadataClient {
         Ok(row.map(|(id,)| TenantId(id)))
     }
 
-    pub async fn set_tenant_zitadel_org_id(
-        &self,
-        tenant_id: TenantId,
-        zitadel_org_id: &str,
-    ) -> Result<(), MetadataError> {
-        let result = sqlx::query(
-            r#"
-            UPDATE tenants
-            SET zitadel_org_id = $2
-            WHERE id = $1
-            "#,
-        )
-        .bind(tenant_id.as_uuid())
-        .bind(zitadel_org_id)
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(MetadataError::TenantNotFound(tenant_id));
-        }
-        Ok(())
-    }
-
     pub async fn get_database(
         &self,
         database_id: DatabaseId,
@@ -858,6 +847,31 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // m5 re-audit S2: `Debug` hides a password in the user info and in a `password` query
+    // parameter (any position, a percent-encoded key too), and keeps everything else.
+    #[test]
+    fn debug_hides_every_url_password() {
+        for (url, shown) in [
+            ("postgres://u:in-url-pw@db:5432/m", "postgres://u:<redacted>@db:5432/m"),
+            ("postgres://u@db:5432/m?password=in-url-pw", "postgres://u@db:5432/m?password=<redacted>"),
+            (
+                "postgres://u@db/m?sslmode=disable&password=in-url-pw&application_name=x",
+                "postgres://u@db/m?sslmode=disable&password=<redacted>&application_name=x",
+            ),
+            ("postgres://u@db/m?%70assword=in-url-pw#f", "postgres://u@db/m?%70assword=<redacted>#f"),
+            (
+                "postgres://u:a@db/m?PASSWORD=in-url-pw",
+                "postgres://u:<redacted>@db/m?PASSWORD=<redacted>",
+            ),
+            ("postgres://u@db/m?passwordless=1", "postgres://u@db/m?passwordless=1"),
+        ] {
+            let c = MetadataConfig { database_url: url.into() };
+            let got = format!("{c:?}");
+            assert_eq!(got, format!("MetadataConfig {{ database_url: {shown:?} }}"), "{url}");
+            assert!(!got.contains("in-url-pw"), "{got}");
+        }
+    }
 
     fn record(project_id: ProjectId, name: &str) -> DatabaseRecord {
         DatabaseRecord {

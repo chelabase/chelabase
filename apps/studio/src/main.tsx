@@ -3,7 +3,7 @@ import { RouterProvider, createRouter } from "@tanstack/react-router";
 import { AuthProvider } from "react-oidc-context";
 import { routeTree } from "./routeTree.gen";
 import { buildOidcConfig } from "./lib/auth";
-import { readEnv, type StudioEnv } from "./lib/env";
+import { loadEnv, type StudioEnv } from "./lib/env";
 import { EnvContext } from "./lib/env-context";
 import { parseSearch, stringifySearch } from "./lib/search";
 
@@ -23,15 +23,7 @@ declare module "@tanstack/react-router" {
 
 const rootElement = document.getElementById("app")!;
 
-if (!rootElement.innerHTML) {
-  const root = ReactDOM.createRoot(rootElement);
-  let env: StudioEnv;
-  try {
-    env = readEnv(import.meta.env as Record<string, string | undefined>);
-  } catch (err) {
-    root.render(<pre className="p-8 text-sm">{err instanceof Error ? err.message : String(err)}</pre>);
-    throw err;
-  }
+function mount(root: ReactDOM.Root, env: StudioEnv) {
   root.render(
     <AuthProvider
       {...buildOidcConfig(env, window.location.origin)}
@@ -42,5 +34,18 @@ if (!rootElement.innerHTML) {
         <RouterProvider router={router} />
       </EnvContext.Provider>
     </AuthProvider>,
+  );
+}
+
+if (!rootElement.innerHTML) {
+  const root = ReactDOM.createRoot(rootElement);
+  // The runtime config (or, under the workbench's Vite server, the build values) before the
+  // router mounts: the OIDC settings depend on it.
+  loadEnv(import.meta.env as Record<string, string | undefined>).then(
+    (env) => mount(root, env),
+    (err: unknown) => {
+      root.render(<pre className="p-8 text-sm">{err instanceof Error ? err.message : String(err)}</pre>);
+      console.error(err);
+    },
   );
 }

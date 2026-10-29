@@ -11,6 +11,7 @@ mock = ["dep:axum", "dep:tokio"]
 
 [dependencies]
 axum = { workspace = true, optional = true }
+chelabase-http = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 hmac = { workspace = true }

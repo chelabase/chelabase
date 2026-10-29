@@ -50,11 +50,23 @@ done
 [[ -x scripts/sweep-dbs.sh ]] || fail "scripts/sweep-dbs.sh exists"
 
 mapfile -t scripts < <(git ls-files 'scripts/*.sh' 'scripts/lib/*.sh' ':!scripts/tests/**')
+# The self-host e2e scripts test the Compose install on their own throwaway projects, so raw Compose,
+# in-container loopback and their own published ports are expected. Only these patterns exempt them.
+selfhost_e2e=' scripts/selfhost-e2e.sh scripts/selfhost-tls-e2e.sh '
+loopback='127\.0\.0\.1:(5433|1234|6379|8081|8083|4222|7676|9898)'
+hostaddr_loopback='hostaddr=127\.0\.0\.1'
 for pat in 'compose exec' 'cargo run' 'cargo test' \
-  '127\.0\.0\.1:(5433|1234|6379|8081|8083|4222|7676|9898)' 'host\.docker\.internal' \
+  "$loopback" 'host\.docker\.internal' \
   'internal-addr\.sh' 'name=\^chelabase-compute-' '\.chelabase/neon/proxy-ca\.crt' \
-  '\.chelabase/zitadel' 'hostaddr=127\.0\.0\.1' 'just live' 'just dev\b' 'just deps-up'; do
-  hits="$(grep -nE "$pat" "${scripts[@]}" || true)"
+  '\.chelabase/zitadel' "$hostaddr_loopback" 'just live' 'just dev\b' 'just deps-up'; do
+  targets=("${scripts[@]}")
+  if [[ "$pat" == 'compose exec' || "$pat" == "$loopback" || "$pat" == "$hostaddr_loopback" ]]; then
+    targets=()
+    for s in "${scripts[@]}"; do
+      [[ "$selfhost_e2e" == *" $s "* ]] || targets+=("$s")
+    done
+  fi
+  hits="$(grep -nE "$pat" "${targets[@]}" || true)"
   [[ -z "$hits" ]] || fail "scripts still use $pat:
 $hits"
 done
@@ -83,8 +95,17 @@ just --show check | gq 'scripts/tests/workbench-recipes.sh' || fail "just check 
 # proxy's address; inside the runner the name resolves to loopback.
 for f in $(grep -lE 'PROXY_HTTP_PORT|:4444' "${scripts[@]}" || true); do
   if grep -qE '^\s*[^#]*curl ' "$f"; then
-    grep -qE -- '--(connect-to|resolve)[ =][^ ]*PROXY_HOSTADDR' "$f" ||
-      fail "$f curls the proxy's HTTP endpoint without --connect-to/--resolve to \$CHELABASE_PROXY_HOSTADDR"
+    if [[ "$selfhost_e2e" == *" $f "* ]]; then
+      # The self-host e2e scripts have no CHELABASE_PROXY_HOSTADDR: a script that calls the proxy's
+      # SQL-over-HTTP URL (http_url) pins the published loopback address; the TLS script's curls go to the gateway.
+      if grep -qF 'http_url' "$f"; then
+        grep -qF -- '--resolve "$pg_host:$PROXY_HTTP_PORT:127.0.0.1"' "$f" ||
+          fail "$f curls the proxy's HTTP endpoint without --resolve \"\$pg_host:\$PROXY_HTTP_PORT:127.0.0.1\""
+      fi
+    else
+      grep -qE -- '--(connect-to|resolve)[ =][^ ]*PROXY_HOSTADDR' "$f" ||
+        fail "$f curls the proxy's HTTP endpoint without --connect-to/--resolve to \$CHELABASE_PROXY_HOSTADDR"
+    fi
   fi
 done
 # I2: recipe arguments are passed as arguments, never re-split by the shell.
@@ -109,10 +130,12 @@ grep -q 'CHELABASE_ENTRY_API_URL' packages/client/scripts/e2e.mjs || fail "clien
 # (CHELABASE_PROXY_PG_PORT). A script that checks a handed-out URI compares with the host port.
 grep -q 'CHELABASE_PROXY_PORT' scripts/neon-e2e.sh ||
   fail "neon-e2e checks handed-out URIs against the stack's host proxy port (CHELABASE_PROXY_PORT)"
-# End-of-step review I2: the host can't resolve `zitadel`; host-side bootstrap goes through the
-# stack's gateway, as `up` does (P6).
-just --show zitadel-bootstrap | gq 'CHELABASE_ZITADEL_UPSTREAM=http://127.0.0.1:' ||
-  fail "zitadel-bootstrap reaches Zitadel through the stack's gateway (CHELABASE_ZITADEL_UPSTREAM)"
+# m4 (#11): the bootstrap runs `chelabase-init bootstrap` in a container on the stack's compose
+# network (the CLI's `dev bootstrap`), so the host needs no route to Zitadel and the recipe only
+# builds the tool and calls the CLI; the CLI loads the stack env and writes the Zitadel files.
+just --show zitadel-bootstrap | gq 'cargo build -q -p init' || fail "zitadel-bootstrap builds chelabase-init first"
+just --show zitadel-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
+  fail "zitadel-bootstrap runs the CLI's dev bootstrap"
 just --show check | gq 'scripts/tests/retired-names.sh' || fail "just check runs retired-names.sh"
 # W2 live: the worker's live tests share the stack (branch_live restarts its pageserver, roles_live
 # recreates its orchestrator, caps count every database), so they run one at a time, as the

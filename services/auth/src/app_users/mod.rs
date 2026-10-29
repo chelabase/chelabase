@@ -58,7 +58,8 @@ impl AppUsers {
         }
     }
 
-    pub fn from_config(c: &AppConfig, issuer: &str) -> anyhow::Result<Self> {
+    /// `zitadel`: where its admin calls go (see `Config::zitadel`).
+    pub fn from_config(c: &AppConfig, zitadel: &chelabase_types::entry::ZitadelAt) -> anyhow::Result<Self> {
         let verifier = InternalVerifier::from_pem_file(&c.verify_key)
             .map_err(|e| anyhow::anyhow!("CHELABASE_INTERNAL_VERIFY_KEY: {e}"))?;
         let signer = AppTokenSigner::from_pem_files(&c.private_key, &c.public_key)
@@ -73,7 +74,7 @@ impl AppUsers {
             InternalClient::new(&c.internal_url, &c.internal_token),
             signer,
             Arc::new(PgUsersDb::with_server_tls(server_tls)),
-            Zitadel::new(issuer, admin_pat.trim()),
+            Zitadel::new(&zitadel.base, admin_pat.trim()).with_host(zitadel.host.as_deref()),
             c.access_ttl,
         ))
     }

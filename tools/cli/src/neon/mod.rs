@@ -1,6 +1,8 @@
 //! `chelabase neon …`: helpers for the Neon compute path (roadmap step 3).
 
+#[cfg(test)]
 pub mod compute_ca;
+#[cfg(test)]
 pub mod compute_jwt;
 
 #[cfg(test)]

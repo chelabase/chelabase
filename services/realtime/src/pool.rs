@@ -156,11 +156,10 @@ impl ConnLookup {
     /// `base_url` = `CHELABASE_INTERNAL_URL`, `token` = realtime's internal token.
     pub fn new(base_url: &str, token: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
+            http: chelabase_http::client_builder()
                 .timeout(LOOKUP_TIMEOUT)
                 .build()
-                .unwrap_or_default(),
+                .expect("realtime's HTTP client builds"),
             base: base_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             cache: Mutex::new(HashMap::new()),

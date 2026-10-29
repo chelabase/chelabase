@@ -28,6 +28,8 @@ fn the_realtime_tls_dir_comes_from_the_environment() {
             "auth.feat-x.chelabase.localhost:8137".into(),
         ),
         ("CHELABASE_PUBLIC_SCHEME", "http".into()),
+        // #22: the token audiences are required.
+        ("CHELABASE_ZITADEL_AUDIENCES", "p1,c-api".into()),
         (
             "CHELABASE_INTERNAL_VERIFY_KEY",
             "/keys/gateway/internal-verify.pem".into(),

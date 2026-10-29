@@ -11,7 +11,7 @@
 //! (default `chelabase_compute`) and `CHELABASE_CONTROL_PLANE_URI` (default
 //! `http://orchestrator:8083`).
 
-use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend};
+use chelabase_neon::{ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, DockerSettings};
 
 fn compute_image() -> String {
     if let Ok(image) = std::env::var("COMPUTE_NODE_IMAGE") {
@@ -51,13 +51,14 @@ fn backend_with_control(
 ) -> DockerBackend {
     DockerBackend::connect(ComputeSettings {
         image: compute_image(),
-        network: network.to_string(),
         control_plane_uri: control_plane_uri.to_string(),
         stack: stack.to_string(),
-        control_network: control_network.to_string(),
         ca: Some(std::sync::Arc::new(
             chelabase_neon::compute_tls::ComputeCa::generate(std::time::SystemTime::now()).unwrap(),
         )),
+    }, DockerSettings {
+        network: network.to_string(),
+        control_network: control_network.to_string(),
     })
     .unwrap()
 }

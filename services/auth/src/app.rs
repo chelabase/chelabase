@@ -32,6 +32,8 @@ pub mod messages {
     pub const UNAVAILABLE: &str = "Sign-in is unavailable, try again";
     pub const ACCOUNT_EXISTS: &str = "An account with this email already exists";
     pub const SIGN_UP_CLOSED: &str = "Sign-up is closed; ask an administrator for an invite";
+    pub const SETUP_CODE_INVALID: &str =
+        "The setup code is missing or wrong; the first account of a new instance needs it";
     pub const NOT_IN_PLATFORM: &str = "Sign-up isn't available in platform mode";
     pub const INVITE_EXPIRED: &str = "This invite has expired; ask for a new one";
     pub const INVITE_REVOKED: &str = "This invite is no longer valid";
@@ -68,6 +70,8 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
 fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(auth_request))
+        .routes(routes!(instance))
+        .routes(routes!(studio_config))
         .routes(routes!(sign_in))
         .routes(routes!(sign_up))
         .routes(routes!(accept_invite))
@@ -85,6 +89,8 @@ pub fn router(state: Arc<AppState>) -> Router {
     let (platform, _) = platform_router().split_for_parts();
     let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
     platform
+        // Readiness for compose `--wait` and k8s: not ready until the bootstrap's ids are there.
+        .route("/health", axum::routing::get(health))
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
         // Sign-up's `data` may carry a few columns' values.
@@ -165,9 +171,118 @@ struct AuthRequestInfo {
     /// Studio goes to its sign-up page. `false` for a refused sign-up request too, which then
     /// lands on the plain sign-in page.
     sign_up: bool,
-    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet): the
-    /// sign-in page may offer "Create account". Always `false` in platform mode.
+    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a
+    /// setup code is configured): the sign-in page may offer "Create account". Always `false`
+    /// in platform mode.
     sign_up_allowed: bool,
+}
+
+/// Studio's runtime config: the six public values it signs in with. Nothing else is here (no
+/// PAT, key or secret): it is public and cached.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct StudioConfig {
+    /// Zitadel's issuer URL (the OIDC authority).
+    issuer: String,
+    /// Studio's OIDC client id.
+    client_id: String,
+    /// The `chelabase` project id (the API audience Studio asks for).
+    project_id: String,
+    /// The platform org's id.
+    org_id: String,
+    /// The public API base URL.
+    api_url: String,
+    /// Studio's public host.
+    studio_host: String,
+}
+
+/// Every bootstrap output auth waits for, with why it isn't usable yet (`Ok` when it is).
+fn bootstrap_outputs(s: &AppState) -> Vec<Result<&str, chelabase_types::file_value::Unavailable>> {
+    std::iter::once(&s.config.org_id)
+        .chain(s.config.studio.client_id.as_ref())
+        .chain(s.config.studio.project_id.as_ref())
+        .map(|v| v.get())
+        .collect()
+}
+
+/// 200 once every bootstrap output auth reads is there, else 503 naming the variables that
+/// wait (never a value).
+async fn health(State(s): S) -> Response {
+    let waiting: Vec<String> = bootstrap_outputs(&s)
+        .into_iter()
+        .filter_map(|r| r.err())
+        .map(|e| {
+            not_ready(&e);
+            e.to_string()
+        })
+        .collect();
+    if waiting.is_empty() {
+        return reply(StatusCode::OK, json!({"status": "ok"}), Vec::new());
+    }
+    reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"status": "waiting for the bootstrap", "waiting": waiting}),
+        Vec::new(),
+    )
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/v1/studio-config",
+    operation_id = "getStudioConfig",
+    tag = "login",
+    description = "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+    responses(
+        (status = 200, description = "The config (`Cache-Control: public, max-age=60`)", body = StudioConfig),
+        (status = 404, description = "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`", body = ErrorEnvelope),
+        (status = 503, description = "The bootstrap hasn't written the ids yet: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn studio_config(State(s): S) -> Response {
+    let no_store = |mut r: Response| {
+        r.headers_mut()
+            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+        r
+    };
+    let studio = &s.config.studio;
+    let (Some(client_id), Some(project_id)) = (&studio.client_id, &studio.project_id) else {
+        return no_store(error(
+            StatusCode::NOT_FOUND,
+            ErrorCode::NotFound,
+            "Studio's runtime config isn't set up on this instance",
+        ));
+    };
+    let values = (s.config.org_id.get(), client_id.get(), project_id.get());
+    let (Ok(org_id), Ok(client_id), Ok(project_id)) = values else {
+        for e in [values.0.err(), values.1.err(), values.2.err()].into_iter().flatten() {
+            not_ready(&e);
+        }
+        return no_store(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+    };
+    let body = StudioConfig {
+        issuer: s.config.issuer.clone(),
+        client_id: client_id.to_string(),
+        project_id: project_id.to_string(),
+        org_id: org_id.to_string(),
+        api_url: studio.api_url.clone(),
+        studio_host: studio.studio_host.clone(),
+    };
+    let mut r = reply(StatusCode::OK, json!(body), Vec::new());
+    r.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("public, max-age=60"),
+    );
+    r
+}
+
+/// What the sign-up page needs to know about this instance.
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct InstanceInfo {
+    /// The instance is unclaimed (its tenant has no member yet): the first sign-up needs the
+    /// setup code that `chelabase-init secrets` printed. `false` once anyone is in, without a
+    /// configured code (then no first sign-up is taken at all), and in platform mode.
+    setup_required: bool,
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
@@ -207,6 +322,27 @@ fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
 
 fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     ApiError::new(status.as_u16(), code, message).into_response()
+}
+
+/// The platform org's id, or the 503 `unavailable` every route that needs it answers while
+/// the bootstrap hasn't written it (m5: `CHELABASE_ZITADEL_ORG_ID_FILE` may appear after auth
+/// starts). Nothing runs against a missing org: `None` is answered with [`no_org`].
+fn org_id(s: &AppState) -> Option<&str> {
+    s.config.org_id.get().map_err(|e| not_ready(&e)).ok()
+}
+
+fn no_org() -> Response {
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+}
+
+/// Logs why a bootstrap output isn't usable yet: the path, never a value.
+fn not_ready(e: &chelabase_types::file_value::Unavailable) {
+    match e {
+        chelabase_types::file_value::Unavailable::NotYet { .. } => {
+            info!("waiting for the bootstrap: {e}")
+        }
+        chelabase_types::file_value::Unavailable::Refused { .. } => warn!("{e}"),
+    }
 }
 
 fn unavailable(e: &ZError) -> Response {
@@ -323,7 +459,10 @@ async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthR
     }
     match s.zitadel.auth_request(&b.auth_request).await {
         Ok(asked) => {
-            let sign_up_allowed = sign_up_gate(&s).await.is_none();
+            // A fresh install waiting for its code takes a sign-up (with the code).
+            let sign_up_allowed = gate(&s, None)
+                .await
+                .is_ok_and(|a| a.allowed || a.setup_required);
             reply(
                 StatusCode::OK,
                 json!(AuthRequestInfo { sign_up: asked && sign_up_allowed, sign_up_allowed }),
@@ -331,6 +470,36 @@ async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthR
             )
         }
         Err(e) => pending_sign_in_error(e),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/auth/v1/instance",
+    operation_id = "getInstance",
+    tag = "login",
+    description = "Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.",
+    responses(
+        (status = 200, description = "The instance's sign-up state", body = InstanceInfo),
+        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn instance(State(s): S, headers: HeaderMap) -> Response {
+    let ip = client_ip(&headers);
+    if !allowed(&s, &[(format!("instance:ip:{ip}"), 60, MINUTE)]) {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    }
+    if ModePolicy::new(s.config.mode).sign_up() == SignUpRule::Refused {
+        return reply(StatusCode::OK, json!(InstanceInfo { setup_required: false }), Vec::new());
+    }
+    match gate(&s, None).await {
+        Ok(a) => reply(
+            StatusCode::OK,
+            json!(InstanceInfo { setup_required: a.setup_required }),
+            Vec::new(),
+        ),
+        Err(refused) => refused.response(),
     }
 }
 
@@ -386,10 +555,13 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     if !is_auth_request_id(&b.auth_request) {
         return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
     }
-    let user_id = match s.zitadel.find_user_by_email(&s.config.org_id, &email).await {
+    let user_id = match s.zitadel.find_user_by_email(org, &email).await {
         Ok(Some(id)) => id,
         Ok(None) => return refused(),
         Err(e) => return unavailable(&e),
@@ -422,6 +594,10 @@ struct SignUpBody {
     password: String,
     given_name: String,
     family_name: String,
+    /// The setup code that `chelabase-init secrets` printed: the first sign-up of an unclaimed
+    /// instance needs it (case and dashes don't matter). Ignored once the instance is claimed.
+    #[serde(default)]
+    setup_code: Option<String>,
 }
 
 #[utoipa::path(
@@ -437,7 +613,7 @@ struct SignUpBody {
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
+        (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), the unclaimed instance needs its setup code and it is missing or wrong (`setup_code_invalid`; no account is created), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
         (status = 409, description = "An account with this email exists (`email_taken`); only when email verification is off", body = ErrorEnvelope),
         (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
@@ -454,6 +630,9 @@ async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody
 async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
+    let setup_code = b.setup_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    // Code guesses count against these too. No bucket is shared by every client: anyone could
+    // drain it with junk and lock the operator out, and the code's ~98 bits need no global cap.
     if !allowed(
         s,
         &[
@@ -469,23 +648,33 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if !strong_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
         return pending_sign_in_error(e);
     }
-    if let Some(refused) = sign_up_gate(s).await {
-        return refused;
+    let nonce = match sign_up_gate(s, setup_code).await {
+        Ok(nonce) => nonce,
+        Err(refused) => return refused.response(),
+    };
+    // A claim that fails after the account exists is undone by deleting it, which needs the
+    // admin client (the login client can't delete users): without it, no claim is attempted.
+    if nonce.is_some() && s.admin.is_none() {
+        warn!("a setup-code sign-up needs the admin Zitadel client (CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
+        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     }
     // Zitadel checks usernames, not emails, for uniqueness: never make a second account
     // for an email that already has one.
     // Two accounts already sharing the email (made outside this check) count as taken too.
-    match s.zitadel.find_user_in_org(&s.config.org_id, &email).await {
+    match s.zitadel.find_user_in_org(org, &email).await {
         Ok(crate::zitadel::EmailMatch::None) => {}
         Ok(_) => return taken(s, &email, b.auth_request),
         Err(e) => return unavailable(&e),
     }
     let template = verify_template(s);
     let new = NewUser {
-        org_id: &s.config.org_id,
+        org_id: org,
         email: &email,
         given_name: b.given_name.trim(),
         family_name: b.family_name.trim(),
@@ -504,6 +693,11 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         }
         Err(e) => return unavailable(&e),
     };
+    if let Some(nonce) = &nonce
+        && let Some(refused) = bind_claim(s, org, &user_id, nonce).await
+    {
+        return refused.response();
+    }
     let session = match new_user_session(s, &user_id, &b.password).await {
         Ok(session) => session,
         Err(e) => return unavailable(&e),
@@ -514,33 +708,117 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     verify_step(s, &b.auth_request, user_id, session).await
 }
 
-/// `Some(answer)` when sign-up is refused: in platform mode always, otherwise when the
-/// tenant's orchestrator says no. Anything unclear refuses (503).
-async fn sign_up_gate(s: &AppState) -> Option<Response> {
+/// Why the sign-up gate refused; [`Refusal::response`] is its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refusal {
+    Platform,
+    Closed,
+    SetupCodeInvalid,
+    Unavailable,
+}
+
+impl Refusal {
+    fn response(self) -> Response {
+        match self {
+            Self::Platform => error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::NotAvailableInPlatformMode,
+                NOT_IN_PLATFORM,
+            ),
+            Self::Closed => error(StatusCode::FORBIDDEN, ErrorCode::SignUpClosed, SIGN_UP_CLOSED),
+            Self::SetupCodeInvalid => error(
+                StatusCode::FORBIDDEN,
+                ErrorCode::SetupCodeInvalid,
+                SETUP_CODE_INVALID,
+            ),
+            Self::Unavailable => {
+                error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+            }
+        }
+    }
+}
+
+/// The orchestrator's sign-up answer, asked with the visitor's setup code (if any). `Err`
+/// in platform mode and whenever the gate can't answer: anything unclear refuses.
+async fn gate(
+    s: &AppState,
+    setup_code: Option<&str>,
+) -> Result<crate::app_users::internal::SignUpAnswer, Refusal> {
     if ModePolicy::new(s.config.mode).sign_up() == SignUpRule::Refused {
-        return Some(error(
-            StatusCode::FORBIDDEN,
-            ErrorCode::NotAvailableInPlatformMode,
-            NOT_IN_PLATFORM,
-        ));
+        return Err(Refusal::Platform);
     }
     let Some(gate) = &s.signup_gate else {
         warn!("no sign-up gate is configured");
-        return Some(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+        return Err(Refusal::Unavailable);
     };
-    match gate.signup_allowed(&s.config.org_id).await {
-        Ok(a) if a.allowed => None,
-        Ok(a) if a.reason == "platform" => Some(error(
-            StatusCode::FORBIDDEN,
-            ErrorCode::NotAvailableInPlatformMode,
-            NOT_IN_PLATFORM,
-        )),
-        Ok(_) => Some(error(StatusCode::FORBIDDEN, ErrorCode::SignUpClosed, SIGN_UP_CLOSED)),
-        Err(e) => {
-            warn!(error = %e, "the sign-up gate failed");
-            Some(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE))
+    let org = s.config.org_id.get().map_err(|e| {
+        not_ready(&e);
+        Refusal::Unavailable
+    })?;
+    gate.signup_check(org, setup_code).await.map_err(|e| {
+        warn!(error = %e, "the sign-up gate failed");
+        Refusal::Unavailable
+    })
+}
+
+/// `Ok` when sign-up may go on, with the claim nonce of a fresh install's code-gated sign-up;
+/// `Err` when it is refused: in platform mode always, otherwise when the tenant's
+/// orchestrator says no. A `first_member` answer without a nonce is unclear: unavailable.
+async fn sign_up_gate(
+    s: &AppState,
+    setup_code: Option<&str>,
+) -> Result<Option<crate::app_users::internal::ClaimNonce>, Refusal> {
+    let a = gate(s, setup_code).await?;
+    if a.allowed {
+        if a.reason != "first_member" {
+            return Ok(None);
         }
+        return match a.claim_nonce {
+            Some(nonce) => Ok(Some(nonce)),
+            None => {
+                warn!("the sign-up gate allowed a first member without a claim nonce");
+                Err(Refusal::Unavailable)
+            }
+        };
     }
+    Err(match a.reason.as_str() {
+        "platform" => Refusal::Platform,
+        "setup_code_invalid" => Refusal::SetupCodeInvalid,
+        _ => Refusal::Closed,
+    })
+}
+
+/// Binds the fresh-install claim to the account just created. `None` when bound, or when the
+/// instance was claimed meanwhile (the account stays and waits as a newcomer). On any
+/// failure the account is deleted, so a retry with the same email can succeed, and the
+/// answer is `setup_code_invalid` (refused) or `unavailable`.
+async fn bind_claim(
+    s: &AppState,
+    org: &str,
+    user_id: &str,
+    nonce: &crate::app_users::internal::ClaimNonce,
+) -> Option<Refusal> {
+    let failed = match &s.signup_gate {
+        Some(gate) => match gate.signup_claimed(org, user_id, nonce).await {
+            Ok(bound) => {
+                info!(user_id, bound, "fresh-install claim");
+                return None;
+            }
+            Err(e) => e,
+        },
+        None => crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into()),
+    };
+    warn!(user_id, error = %failed, "binding the fresh-install claim failed; deleting the new account");
+    // `sign_up_inner` checked the admin client before creating the account.
+    if let Some(admin) = &s.admin
+        && let Err(e) = admin.delete_user(user_id).await
+    {
+        warn!(user_id, error = %e, "deleting the unclaimed account failed");
+    }
+    Some(match failed {
+        crate::app_users::internal::InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
+        crate::app_users::internal::InternalError::Unavailable(_) => Refusal::Unavailable,
+    })
 }
 
 /// Both fields default to empty, so a missing one is a `not_found` like a wrong one.
@@ -745,6 +1023,9 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         warn!("accept-invite needs CHELABASE_ZITADEL_ADMIN_PAT_FILE");
         return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     };
+    let Some(org) = org_id(s) else {
+        return no_org();
+    };
     // Only failed code attempts count against a user, so a typo'd password or a retry never
     // locks the invitee out.
     let user_key = format!("accept-invite:user:{}", b.user);
@@ -757,7 +1038,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         Err(e) => return unavailable(&e),
     };
     // An invite code for a user of another organization never signs into the platform.
-    if user.org_id != s.config.org_id {
+    if user.org_id != org {
         warn!("accept-invite for a user outside the platform org");
         s.limiter.hit(&user_key, HOUR);
         return bad();
@@ -1042,6 +1323,7 @@ struct EmailBody {
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The instance isn't set up yet (its org id isn't written): `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<EmailBody>) -> Response {
@@ -1056,6 +1338,11 @@ async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Ema
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
+    // Answered the same whether or not the account exists, but never "sent" when the org
+    // (and so the lookup) isn't there yet.
+    if org_id(&s).is_none() {
+        return no_org();
+    }
     spawn_reset_email(&s, email);
     reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
@@ -1069,11 +1356,12 @@ fn spawn_reset_email(s: &Arc<AppState>, email: String) {
             "{}/password-reset?userId={{{{.UserID}}}}&code={{{{.Code}}}}",
             s2.config.studio_url
         );
-        match s2
-            .zitadel
-            .find_user_by_email(&s2.config.org_id, &email)
-            .await
-        {
+        // Every caller has the org already (it is cached once read).
+        let Ok(org) = s2.config.org_id.get() else {
+            warn!("password reset without the org id; nothing sent");
+            return;
+        };
+        match s2.zitadel.find_user_by_email(org, &email).await {
             Ok(Some(user_id)) => {
                 if let Err(e) = s2.zitadel.send_password_reset(&user_id, &template).await {
                     warn!(error = %e, "sending the password reset failed");

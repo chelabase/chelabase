@@ -1,5 +1,6 @@
 //! Shared domain identifiers for Chelabase control plane.
 
+pub mod cli;
 pub mod data_api_schema;
 pub mod data_key;
 pub mod role_name;
@@ -12,6 +13,8 @@ pub mod api_error;
 pub mod table_api;
 pub mod entry;
 pub mod secret_env;
+pub mod file_value;
+pub mod dev_defaults;
 #[cfg(feature = "axum")]
 pub mod api_extract;
 pub use api_error::{ErrorBody, ErrorCode, ErrorEnvelope};

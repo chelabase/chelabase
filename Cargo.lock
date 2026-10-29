@@ -298,6 +298,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-query",
  "chelabase-routes",
  "chelabase-secrets",
@@ -713,8 +714,11 @@ dependencies = [
  "base64 0.23.1",
  "bcrypt",
  "chelabase-auth",
+ "chelabase-http",
+ "chelabase-init",
  "chelabase-neon",
  "chelabase-secrets",
+ "chelabase-typegen",
  "chelabase-types",
  "chelabase-zitadel",
  "chrono",
@@ -739,6 +743,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-types",
  "ed25519-dalek",
  "getrandom 0.4.3",
@@ -752,6 +757,43 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "chelabase-http"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "tokio",
+]
+
+[[package]]
+name = "chelabase-init"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.23.1",
+ "bcrypt",
+ "chelabase-auth",
+ "chelabase-http",
+ "chelabase-metadata",
+ "chelabase-neon",
+ "chelabase-secrets",
+ "chelabase-types",
+ "chelabase-zitadel",
+ "getrandom 0.4.3",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "sqlx",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -800,6 +842,7 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "bollard",
+ "chelabase-http",
  "chelabase-metadata",
  "chrono",
  "ed25519-dalek",
@@ -896,11 +939,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-typegen"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "chelabase-types"
 version = "0.1.0"
 dependencies = [
  "axum",
  "getrandom 0.4.3",
+ "libc",
  "proptest",
  "serde",
  "serde_json",
@@ -916,6 +969,7 @@ name = "chelabase-zitadel"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "chelabase-http",
  "chelabase-zitadel",
  "chrono",
  "hex",
@@ -1743,6 +1797,7 @@ dependencies = [
  "axum",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-routes",
  "chelabase-types",
  "chrono",
@@ -2234,6 +2289,16 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "init"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chelabase-init",
+ "clap",
+ "tempfile",
 ]
 
 [[package]]
@@ -2842,6 +2907,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
@@ -3630,6 +3696,7 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-nats",
  "chelabase-neon",
  "chelabase-query",
@@ -3803,6 +3870,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
@@ -3810,6 +3878,7 @@ dependencies = [
  "chelabase-routes",
  "chelabase-schema",
  "chelabase-secrets",
+ "chelabase-typegen",
  "chelabase-types",
  "chrono",
  "deadpool-postgres",
@@ -3819,6 +3888,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "subtle",
  "thiserror 2.0.21",
@@ -5750,6 +5820,7 @@ dependencies = [
  "base64 0.23.1",
  "bollard",
  "chelabase-auth",
+ "chelabase-http",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",

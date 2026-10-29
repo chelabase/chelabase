@@ -84,6 +84,8 @@ const SESSION_PAGE: u32 = 100;
 pub struct Zitadel {
     http: reqwest::Client,
     base: String,
+    /// The `Host` every call carries, when `base` is Zitadel's in-network address (#24).
+    host: Option<String>,
     token: String,
 }
 
@@ -171,13 +173,25 @@ fn error_text(body: Option<&Value>) -> String {
 impl Zitadel {
     pub fn new(base: &str, token: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
+            // #26: never a redirect. Zitadel answers its REST calls directly; a 3xx (a
+            // misconfigured or compromised upstream) fails the call instead of sending the
+            // token's request, with the forced Host, somewhere else.
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
             base: base.trim_end_matches('/').to_string(),
+            host: None,
             token: token.to_string(),
         }
+    }
+
+    /// Every call carries `host` as its `Host` (Zitadel picks its instance by Host): set when
+    /// `base` is Zitadel's in-network address rather than the public auth URL (#24, see
+    /// `chelabase_types::entry::zitadel_at`). `None` keeps the base URL's own.
+    pub fn with_host(mut self, host: Option<&str>) -> Self {
+        self.host = host.map(str::to_string);
+        self
     }
 
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, ZError> {
@@ -185,6 +199,9 @@ impl Zitadel {
             .http
             .request(method, format!("{}{path}", self.base))
             .bearer_auth(&self.token);
+        if let Some(host) = &self.host {
+            request = request.header(reqwest::header::HOST, host);
+        }
         if let Some(body) = body {
             request = request.json(&body);
         }
@@ -199,6 +216,11 @@ impl Zitadel {
             .map_err(|e| ZError::Unavailable(e.to_string()))?;
         if status.is_server_error() {
             return Err(ZError::Unavailable(format!("{status}")));
+        }
+        // #26: a 3xx (never followed) is a failed call, not an answer: its body may be empty,
+        // which would otherwise read as success.
+        if !status.is_success() && !status.is_client_error() {
+            return Err(ZError::Unavailable(format!("{status}: Zitadel answered with no result (redirects are not followed)")));
         }
         // A proxy may answer a 4xx with HTML; the status alone is still a rejection.
         let parsed = if text.trim().is_empty() {
@@ -487,6 +509,23 @@ impl Zitadel {
         {
             Ok(answer) => Ok(answer.get("user").and_then(parse_user)),
             Err(ZError::Rejected { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Whether Zitadel definitely has no user with this id: `true` only on a 404. An answer
+    /// that can't be read as a user is `Unavailable`, never "gone" (unlike [`Zitadel::get_user`],
+    /// whose `None` covers both), so a caller acting on "gone" fails closed.
+    pub async fn user_is_gone(&self, user_id: &str) -> Result<bool, ZError> {
+        match self
+            .call(Method::GET, &format!("/v2/users/{user_id}"), None)
+            .await
+        {
+            Ok(answer) => match answer.get("user").and_then(parse_user) {
+                Some(_) => Ok(false),
+                None => Err(ZError::Unavailable("the user answer can't be read".into())),
+            },
+            Err(ZError::Rejected { status: 404, .. }) => Ok(true),
             Err(e) => Err(e),
         }
     }

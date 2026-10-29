@@ -1,9 +1,69 @@
 ---
 title: Generated types
-description: Generate Database and types with chelabase gen types, and use other databases of a branch.
+description: Download db.ts from Studio or fetch it over HTTP, fetch the runtime types at startup, and use other databases of a branch.
 ---
 
-`chelabase gen types` reads a branch's data API schema and writes a typed `Database` type and a `types` constant. Pass both to `createClient`: `createClient<Database>({ url, key, types })`. Without them (`createClient({ url, key })`), the client accepts any table, column and function, and types values as `unknown`.
+The data API serves a branch's generated types: a typed `Database` type and a `types` constant, for the schema a secret data key reaches. Pass both to `createClient`: `createClient<Database>({ url, key, types })`. Without them (`createClient({ url, key })`), the client accepts any table, column and function, and types values as `unknown`.
+
+## Download db.ts from Studio
+
+On a database's **Data API** view, choose **Download types** to save `db.ts` for the selected branch. Pick the role (a new secret key's default, `authenticated`, unless your keys use another) and, when the branch serves several databases, the database or **All databases**. The file is what a secret key of that role gets from `GET /data/v1/types` below, byte for byte.
+
+You can download types when you may create a secret key for that role: Developer or above on the project, with the role among the ones you may use (an Admin may use any). Creating the key also refuses a role that would expose every row of a table; types show the schema and no rows, so that check doesn't apply to the download. Behind the button is the Management API's `GET /v1/databases/{id}/branches/{branch_id}/data-api/types`, which takes `role` and the options below.
+
+## Fetch db.ts over HTTP
+
+Any build step can fetch the module with a secret data key (`chk_sec_…`). No checkout or Rust toolchain is needed:
+
+```bash
+export CHELABASE_DATA_KEY=chk_sec_…
+curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+  "http://api.chelabase.localhost:8000/data/v1/types" -o db.ts
+```
+
+Or from Node, in a script your build runs (`node scripts/fetch-types.mjs > db.ts`):
+
+```js
+// scripts/fetch-types.mjs
+const res = await fetch(`${process.env.CHELABASE_URL}/data/v1/types`, {
+  headers: { authorization: `Bearer ${process.env.CHELABASE_DATA_KEY}` },
+});
+if (!res.ok) throw new Error(`GET /data/v1/types answered ${res.status}: ${await res.text()}`);
+process.stdout.write(await res.text());
+```
+
+The file is byte for byte what `chelabase gen types` writes for the same key and options. `GET /data/v1/types` takes these query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `format=ts` | The TypeScript module (the default), as `text/typescript`. |
+| `format=json` | The runtime `types` map alone, as JSON: exactly what the module's `types` constant holds. |
+| `database=<name>` | Generate that database (not the main one) as `Database`. |
+| `all_databases=true` | Generate every database the key reaches (see [Other databases](#other-databases)). Can't be combined with `database`. |
+
+A public key is refused (`401 unauthorized`), as on `GET /data/v1/schema`, and the types never show more than that route shows the key. Each response carries an `ETag` (a hash of the body): send it back as `If-None-Match` to get `304 Not Modified` while the schema is unchanged. Responses are never cached (`Cache-Control: no-store`), since the schema follows the key.
+
+## Fetch the runtime types at startup
+
+A server (an Express app, say) can fetch the runtime `types` map when it starts, so its decoding of `int8` and `numeric` follows the live schema without a rebuild:
+
+```ts
+import { createClient, fetchTypes } from "@chelabase/client";
+import type { Database } from "./db"; // the fetched db.ts, for compile-time checking
+
+const url = process.env.CHELABASE_URL!;
+const secretKey = process.env.CHELABASE_DATA_KEY!; // chk_sec_…, kept on the server
+
+const db = createClient<Database>({ url, key: secretKey, types: await fetchTypes({ url, key: secretKey }) });
+```
+
+`fetchTypes({ url, key, database?, allDatabases?, fetch? })` needs a secret key; a public key is refused before any request is sent, and the key never appears in an error. A failed call throws a `DataApiError`. With `allDatabases: true` it returns the maps keyed by database name (main as `main`, even when it's the only one): `db.database("analytics", types.analytics)`.
+
+The two halves do different jobs. **Compile-time** checking (table, column and argument names, row shapes) comes only from the `Database` type in the fetched `db.ts`, so that file must be in the build: fetch it again and rebuild when the schema changes. **Runtime** decoding needs only the `types` map, which can be fetched live.
+
+## The CLI (contributors)
+
+Contributors with a checkout of this repository can write the same file with its CLI:
 
 ```bash
 export CHELABASE_DATA_KEY=chk_sec_…
@@ -24,12 +84,12 @@ The types follow the key you generate with: what the key's role can't reach isn'
 
 A branch can serve more than its main database (see [Serving more databases](/docs/using/data-api/databases)). `db.database("analytics")` returns a client bound to that database: every request it sends carries the top-level `database` field (a batch carries it once; an operation inside a batch never names one). It keeps the `bigint` mode, and in that mode `db.database(name, types)` needs the `types` (they decode `int8`), which the type system enforces. `database()` siblings share the same [app user session](/docs/using/client/auth).
 
-`--all-databases` writes every database the key reaches: `Databases` (a key per database), `Database` (`= Databases["main"]`) and a `types` map keyed alike. Main is always under the key `main`, whatever its real name, and the key must reach main, since the list of databases comes from main's schema response.
+`all_databases=true` (or `--all-databases`) writes every database the key reaches: `Databases` (a key per database), `Database` (`= Databases["main"]`) and a `types` map keyed alike. Main is always under the key `main`, whatever its real name, and the key must reach main, since the list of databases comes from main's schema response.
 
 ```ts twoslash
 import { createClient, type TypeMap } from "@chelabase/client";
 import { type Database as Main, types as mainTypes } from "./db";
-// What `gen types --all-databases` writes (shortened here):
+// What `GET /data/v1/types?all_databases=true` writes (shortened here):
 type Databases = {
   main: Main;
   analytics: {

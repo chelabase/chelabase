@@ -44,7 +44,10 @@ pub fn policy_is_default(answer: &Value) -> bool {
 
 /// Whether Zitadel's own sign-up (`allowRegister`) is on in a `GET` login-policy answer.
 pub fn registration_allowed(answer: &Value) -> bool {
-    answer.pointer("/policy/allowRegister").and_then(Value::as_bool).unwrap_or(false)
+    answer
+        .pointer("/policy/allowRegister")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// The `PUT` body that turns `allowRegister` off and keeps the rest of the policy as read.
@@ -251,6 +254,36 @@ pub fn machine_user_search(username: &str) -> Value {
     json!({"queries": [{"userNameQuery": {"userName": username, "method": "TEXT_QUERY_METHOD_EQUALS"}}]})
 }
 
+/// The members of an IAM member listing (`POST /admin/v1/members/_search`) that may be human:
+/// all but an explicit `TYPE_MACHINE` (a missing or unknown type is checked, not skipped: the
+/// caller reads the user to tell), how many members it listed, and how many it says exist.
+pub fn iam_humans_from(listed: &Value) -> (Vec<String>, u64, u64) {
+    let members: Vec<&Value> = listed
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect();
+    let humans = members
+        .iter()
+        .filter(|m| m.get("userType").and_then(Value::as_str) != Some("TYPE_MACHINE"))
+        .filter_map(|m| m.get("userId").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let count = members.len() as u64;
+    let total = listed
+        .pointer("/details/totalResult")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse().ok())
+                .or_else(|| v.as_u64())
+        })
+        .unwrap_or(count);
+    (humans, count, total)
+}
+
+/// A deactivated user's state in a `ListUsers` result.
+pub const USER_INACTIVE: &str = "USER_STATE_INACTIVE";
+
 /// Users of one org with this email, compared case-insensitively.
 pub fn user_email_search(org_id: &str, email: &str) -> Value {
     json!({"queries": [
@@ -350,7 +383,8 @@ pub fn actions_target_created(created: &Value) -> Result<(String, String)> {
             .get(k)
             .and_then(Value::as_str)
             .map(str::to_string)
-            .with_context(|| format!("CreateTarget: no {k} in {created}"))
+            // Never the answer itself: it carries the signing key.
+            .with_context(|| format!("CreateTarget: no {k} in the answer"))
     };
     Ok((field("id")?, field("signingKey")?))
 }
@@ -385,7 +419,10 @@ mod tests {
         let listed = json!({"result": [{"id": "o1", "name": "ZITADEL"}]});
         assert_eq!(org_name_from(&listed).as_deref(), Some("ZITADEL"));
         assert_eq!(org_name_from(&json!({"result": [{"id": "o1"}]})), None);
-        assert_eq!(org_name_from(&json!({"result": [{"id": "o1", "name": "  "}]})), None);
+        assert_eq!(
+            org_name_from(&json!({"result": [{"id": "o1", "name": "  "}]})),
+            None
+        );
         assert_eq!(org_name_from(&json!({"result": []})), None);
     }
 
@@ -510,12 +547,10 @@ mod tests {
         assert!(studio_app_lacks_login(&listed(
             json!({"clientId": "c0", "loginVersion": {"loginV1": {}}})
         )));
-        assert!(!studio_app_lacks_login(&listed(
-            json!({
-                "clientId": "c0",
-                "loginVersion": login("http://studio.chelabase.localhost:8000/")
-            })
-        )));
+        assert!(!studio_app_lacks_login(&listed(json!({
+            "clientId": "c0",
+            "loginVersion": login("http://studio.chelabase.localhost:8000/")
+        }))));
         // No Studio app at all: nothing lacks a login (ensure_studio_app creates it first).
         assert!(!studio_app_lacks_login(&json!({})));
     }
@@ -611,15 +646,33 @@ mod tests {
     fn the_studio_app_follows_the_studio_origin() {
         let origin = "https://studio.acme.com";
         let c = studio_app_config(Mode::SelfHosted, origin);
-        assert_eq!(c["redirectUris"], json!(["https://studio.acme.com/callback"]));
-        assert_eq!(c["postLogoutRedirectUris"], json!(["https://studio.acme.com/"]));
-        assert_eq!(c["loginVersion"]["loginV2"]["baseUri"], "https://studio.acme.com/");
-        assert_eq!(studio_app_create("p1", Mode::SelfHosted, origin)["oidcConfiguration"], c);
-        assert_eq!(studio_app_update("p1", "a2", Mode::SelfHosted, origin)["oidcConfiguration"], c);
+        assert_eq!(
+            c["redirectUris"],
+            json!(["https://studio.acme.com/callback"])
+        );
+        assert_eq!(
+            c["postLogoutRedirectUris"],
+            json!(["https://studio.acme.com/"])
+        );
+        assert_eq!(
+            c["loginVersion"]["loginV2"]["baseUri"],
+            "https://studio.acme.com/"
+        );
+        assert_eq!(
+            studio_app_create("p1", Mode::SelfHosted, origin)["oidcConfiguration"],
+            c
+        );
+        assert_eq!(
+            studio_app_update("p1", "a2", Mode::SelfHosted, origin)["oidcConfiguration"],
+            c
+        );
         // An app registered for another Studio origin drifts, so bootstrap updates it.
         let old = json!({"oidcConfiguration": studio_app_config(Mode::SelfHosted, "http://old-studio.example")});
         let drift = studio_app_drift(&old, Mode::SelfHosted, origin);
-        assert!(drift.contains(&"redirectUris") && drift.contains(&"postLogoutRedirectUris"), "{drift:?}");
+        assert!(
+            drift.contains(&"redirectUris") && drift.contains(&"postLogoutRedirectUris"),
+            "{drift:?}"
+        );
         let same = json!({"oidcConfiguration": c});
         assert!(studio_app_drift(&same, Mode::SelfHosted, origin).is_empty());
     }

@@ -40,7 +40,7 @@ async fn build_without_the_compute_ca_names_the_bootstrap() {
         "the setting is named: {err}"
     );
     assert!(
-        err.contains("just zitadel-bootstrap"),
-        "the command that creates the CA is named (like the JWT keys' error): {err}"
+        err.contains("init-secrets") && err.contains("just zitadel-bootstrap"),
+        "both the self-hosted and workbench fixes are named: {err}"
     );
 }

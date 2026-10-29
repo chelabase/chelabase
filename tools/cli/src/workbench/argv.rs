@@ -3,25 +3,30 @@
 
 use std::path::Path;
 
-/// One stack's `docker compose`: every call names its project, file and env file.
+/// One stack's `docker compose`: every call names its project, its files (the base file, then the
+/// workbench overlay) and its env file.
 pub struct Compose<'a> {
     pub project: &'a str,
-    pub file: &'a Path,
+    pub files: Vec<&'a Path>,
     pub env_file: &'a Path,
 }
 
 impl Compose<'_> {
-    /// `docker` arguments: `compose -p <project> -f <file> --env-file <env> <rest…>`.
+    /// `docker` arguments: `compose -p <project> -f <file>… --env-file <env> <rest…>`.
     pub fn args(&self, rest: &[&str]) -> Vec<String> {
         let mut args = vec![
             "compose".to_string(),
             "-p".to_string(),
             self.project.to_string(),
-            "-f".to_string(),
-            self.file.display().to_string(),
+        ];
+        for file in &self.files {
+            args.push("-f".to_string());
+            args.push(file.display().to_string());
+        }
+        args.extend([
             "--env-file".to_string(),
             self.env_file.display().to_string(),
-        ];
+        ]);
         args.extend(rest.iter().map(|s| s.to_string()));
         args
     }

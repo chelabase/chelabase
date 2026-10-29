@@ -9,7 +9,7 @@
 //! | `CHELABASE_REALTIME_INTERNAL_TOKEN` / `_FILE` | required |
 //! | `CHELABASE_REALTIME_TICKET_KEY_FILE` | required, 32 raw bytes |
 //! | `CHELABASE_INTERNAL_VERIFY_KEY` | the gateway's public key (identity on ticket requests) |
-//! | `CHELABASE_AUTH_HOST`, `CHELABASE_ZITADEL_JWKS_URL`, `CHELABASE_ZITADEL_AUDIENCES` | the gateway's OIDC settings |
+//! | `CHELABASE_AUTH_HOST`, `CHELABASE_ZITADEL_INTERNAL_URL`, `CHELABASE_ZITADEL_JWKS_URL`, `CHELABASE_ZITADEL_AUDIENCES` | the gateway's OIDC settings |
 //! | `CHELABASE_NATS_*` | `chelabase_nats::NatsConfig` (user `realtime`, inbox `_INBOX_realtime`) |
 //! | `CHELABASE_VALKEY_URL`, `_USER`, `_PASSWORD[_FILE]`, `CHELABASE_VALKEY_TLS` | `redis://127.0.0.1:6379`, none, none, `off` |
 //! | `CHELABASE_REALTIME_INSTANCE_ID` | a random UUID per start |

@@ -597,7 +597,7 @@ impl MetadataPort for Doc {
     ) -> Result<Option<MemberRecord>, MetadataError> {
         match *self {}
     }
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1166,6 +1166,10 @@ mod tests {
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/data-api/schema",
                 "getDataApiSchema",
+            ),
+            (
+                "GET /v1/databases/{id}/branches/{branch_id}/data-api/types",
+                "getDataApiTypes",
             ),
             (
                 "GET /v1/databases/{id}/branches/{branch_id}/databases",

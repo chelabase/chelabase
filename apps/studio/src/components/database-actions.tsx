@@ -334,7 +334,9 @@ export function DatabaseActions({
           <p className="text-xs text-muted-foreground">
             {details.ca_file && (
               <>
-                Local dev: pass the proxy&apos;s CA with <code>sslrootcert={details.ca_file}</code>.{" "}
+                CA file: pass the proxy&apos;s CA with <code>sslrootcert={details.ca_file}</code>.
+                Self-hosted, fetch it with <code>docker compose cp proxy:/tls/ca.crt {details.ca_file}</code> (install
+                guide, &ldquo;Connect to databases&rdquo;).{" "}
               </>
             )}
             If <code>localtest.me</code> resolves to <code>::1</code> first on your machine, add{" "}

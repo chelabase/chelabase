@@ -1,0 +1,39 @@
+[package]
+name = "chelabase-init"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Generates a Chelabase stack's keys, secrets and auth files (`chelabase-init`)"
+
+[dependencies]
+anyhow = { workspace = true }
+base64 = { workspace = true }
+# The NATS users file holds bcrypt hashes.
+bcrypt = "0.19.3"
+chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-http = { workspace = true }
+chelabase-metadata = { workspace = true }
+chelabase-neon = { workspace = true }
+chelabase-secrets = { workspace = true }
+chelabase-types = { workspace = true }
+chelabase-zitadel = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+libc = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# The path-based generators the CLI's tests use as a baseline (`kinds::stack_secrets::ensure`,
+# `kinds::service_auth::{write_auth_files, write_storage_auth}`); nothing else calls them.
+test-support = []
+
+[dev-dependencies]
+tempfile = { workspace = true }

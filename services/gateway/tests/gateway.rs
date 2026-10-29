@@ -3,6 +3,9 @@
 //! Pingora's server loop never returns, so each test spawns the compiled
 //! binary on a pre-picked free port and kills it on drop.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use axum::extract::Request;
 use axum::{Json, Router};
 use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
@@ -140,7 +143,9 @@ async fn spawn_gateway_with(
             .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
             .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
             .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
-            .env("CHELABASE_ZITADEL_AUDIENCES", "")
+            .env("CHELABASE_ZITADEL_AUDIENCES", chelabase_auth::test_support::MOCK_AUDIENCE)
+            // The development bearers (this test stands in for the workbench).
+            .env("CHELABASE_DEV_DEFAULTS", "1")
             .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
             .env("RUST_LOG", "warn")
             .envs(extra_env.iter().copied())
@@ -558,6 +563,52 @@ async fn forwarded_headers_are_replaced_not_trusted() {
     assert_eq!(seen["x-forwarded-proto"], "http");
     assert_eq!(seen["x-forwarded-for"], std::net::Ipv4Addr::LOCALHOST.to_string());
     assert_eq!(seen["x-forwarded-host"], stack.base.trim_start_matches("http://"));
+}
+
+// m14 (#25): from a trusted proxy (here loopback), the apps see the right-most untrusted
+// `X-Forwarded-For` address, one address only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_trusted_proxy_forwards_the_client_address() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8, ::1")]).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "6.6.6.6, 203.0.113.9, 127.0.0.5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "203.0.113.9");
+    // A malformed header falls back to the peer and still answers.
+    let resp = client
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "203.0.113.9, garbage")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "127.0.0.1");
+}
+
+// m14 (#25) N4: with trusted proxies configured, a peer that isn't one of them gets nothing
+// from a forged header (one naming a trusted hop too): the apps see the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_header_from_an_untrusted_peer_is_ignored() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) =
+        spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")]).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .header("x-forwarded-for", "1.2.3.4, 10.0.0.2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["x-forwarded-for"], "127.0.0.1");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1136,4 +1187,103 @@ async fn a_dead_realtime_upstream_answers_a_socket_upgrade_with_502() {
         .unwrap();
     let head = tokio::time::timeout(Duration::from_secs(10), read_head(&mut sock)).await.unwrap();
     assert!(head.starts_with("HTTP/1.1 502"), "{head}");
+}
+
+/// m16: an upstream serving types as rest and the orchestrator do: a strong `ETag`, and a 304
+/// for an `If-None-Match` naming it. It records the `If-None-Match` it got.
+async fn spawn_types_upstream() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+    let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+    let record = seen.clone();
+    let app = Router::new().fallback(move |req: Request| {
+        let record = record.clone();
+        async move {
+            use axum::response::IntoResponse;
+            let inm = req.headers().get("if-none-match").map(|v| v.to_str().unwrap().to_string());
+            record.lock().unwrap().push(inm.clone());
+            let cache = [("etag", "\"t1\""), ("cache-control", "no-store")];
+            if inm.as_deref() == Some("\"t1\"") {
+                return (axum::http::StatusCode::NOT_MODIFIED, cache).into_response();
+            }
+            (cache, [("content-type", "text/typescript; charset=utf-8")], "export type Database = {};\n").into_response()
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}"), seen)
+}
+
+/// The data key lookup, answering every key as a secret key (the types route takes no other).
+async fn spawn_secret_key_listener() -> String {
+    let app = Router::new().fallback(|req: Request| async move {
+        let bearer = req.headers().get("authorization").and_then(|v| v.to_str().ok());
+        if bearer != Some("Bearer e2e-data-keys-token") {
+            return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+        }
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({
+                "key_id": "11111111-1111-4111-8111-111111111111",
+                "branch_id": "22222222-2222-4222-8222-222222222222",
+                "project_id": E2E_PROJECT,
+                "kind": "secret",
+                "role": "authenticated",
+            })),
+        )
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// m16: `ETag`, `If-None-Match` and the 304 pass through the gateway unchanged, on the data
+/// API's `GET /data/v1/types` and on the management API's types download.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn types_etag_if_none_match_and_304_pass_through() {
+    let jwks = MockJwks::start().await;
+    let (upstream, seen) = spawn_types_upstream().await;
+    let internal = spawn_secret_key_listener().await;
+    let (base, _verify, _gateway) = spawn_gateway_with(
+        &upstream,
+        &jwks,
+        &[
+            ("CHELABASE_REST_URL", &upstream),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ],
+    )
+    .await;
+    let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Secret).key;
+    let management = format!("Bearer {}", jwks.token_for_org("user-1", "org-1", 300));
+    let routes = [
+        (format!("{base}/data/v1/types"), format!("Bearer {key}")),
+        (
+            format!("{base}/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/types"),
+            management,
+        ),
+    ];
+    for (url, auth) in routes {
+        let client = reqwest::Client::new();
+        let resp = client.get(&url).header("authorization", &auth).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{url}");
+        assert_eq!(resp.headers()["etag"], "\"t1\"", "{url}");
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{url}");
+        assert_eq!(resp.headers()["content-type"], "text/typescript; charset=utf-8", "{url}");
+        assert_eq!(resp.text().await.unwrap(), "export type Database = {};\n", "{url}");
+        assert_eq!(seen.lock().unwrap().last().unwrap(), &None, "{url}");
+
+        let resp = client
+            .get(&url)
+            .header("authorization", &auth)
+            .header("if-none-match", "\"t1\"")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 304, "{url}");
+        assert_eq!(resp.headers()["etag"], "\"t1\"", "{url}");
+        assert_eq!(resp.headers()["cache-control"], "no-store", "{url}");
+        assert_eq!(resp.bytes().await.unwrap().len(), 0, "{url}");
+        assert_eq!(seen.lock().unwrap().last().unwrap().as_deref(), Some("\"t1\""), "{url}");
+    }
 }

@@ -17,7 +17,8 @@ pub mod spec;
 pub mod storcon;
 
 pub use backend::{
-    ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, SqlOpts, SqlTimedOut, is_timeout,
+    Backend, BackendKind, ComputeBackend, ComputeSettings, ComputeStatus, DockerBackend, DockerSettings,
+    NotRunning, SqlOpts, SqlTimedOut, is_timeout,
 };
 pub use compute::{ComputeLocator, DEFAULT_STACK, DockerLocator, check_stack};
 pub use id::NeonId;

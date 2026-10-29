@@ -139,18 +139,21 @@ fn write_storage_auth_mints_the_metrics_token_once_and_keeps_it() {
     }
 }
 
-// Edges: a kept token's mode is tightened (it is a bearer), and an empty file is no token.
+// Edges: a kept token with a loose mode is refused, not silently tightened (chelabase-init's
+// rule, selfhost-install m1), and an empty file is no token.
 #[test]
-fn a_kept_metrics_token_is_tightened_and_an_empty_one_is_reminted() {
+fn a_loose_kept_metrics_token_is_refused_and_an_empty_one_is_reminted() {
     let keys = keys_with_pair();
     let path = keys.path().join("neon/storage-tokens/metrics.token");
     write_storage_auth(keys.path()).unwrap();
     assert!(path.is_file(), "first run mints it");
     let first = std::fs::read(&path).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    write_storage_auth(keys.path()).unwrap();
+    let err = format!("{:#}", write_storage_auth(keys.path()).unwrap_err());
+    assert!(err.contains("metrics.token") && err.contains("mode 0644"), "{err}");
     assert_eq!(std::fs::read(&path).unwrap(), first, "kept");
-    assert_eq!(mode(&path), 0o600, "a kept token is tightened to 0600");
+    assert_eq!(mode(&path), 0o644, "left as it is");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(&path, "").unwrap();
     write_storage_auth(keys.path()).unwrap();
     let pem = std::fs::read_to_string(keys.path().join("neon/compute-jwt.pub.pem")).unwrap();

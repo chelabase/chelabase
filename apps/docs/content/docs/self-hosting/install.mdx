@@ -1,0 +1,232 @@
+---
+title: Install
+description: Run Chelabase on your own machine with Docker Compose, claim the instance with its setup code, choose your own secrets, and upgrade.
+---
+
+This page installs Chelabase from its release images with Docker Compose. It is not the workbench: `just workbench up` is the development loop for people who change Chelabase itself (it builds on the host and keeps its own stack per checkout). To run Chelabase, use this page.
+
+## Requirements
+
+- Docker Engine 26.0 or newer and Compose 2.30 or newer: the stack mounts volume sub-paths, which both need. Check with `docker version` and `docker compose version`.
+- A machine that can run about 26 containers. The worker starts each database's compute as a further container, so it needs the Docker socket.
+- The repository checkout, for `infra/compose`.
+
+<Callout type="warn">
+**Do not expose the host before you claim the instance.** A new instance has no admin. The first account that signs up with the setup code becomes the admin of the whole instance, and the code is only a guard against strangers: anyone who can read it, or who can reach the sign-up page and guess it, could claim the instance before you do. By default the gateway is published on `127.0.0.1` only. Keep it that way, claim the instance, and only then put it on a public address.
+</Callout>
+
+## Install in three commands
+
+```bash
+cd infra/compose
+cp .env.example .env
+docker compose up -d --wait
+```
+
+`.env` is required. Every setting has a default, so the copy runs as it is on one machine and serves Studio at `http://studio.chelabase.localhost:8000`, and databases on `127.0.0.1:5432` (see [Connect to databases](#connect-to-databases)). A fresh project is healthy in under a minute once the images are pulled.
+
+Two one-shot containers do the setup, and both must exit 0:
+
+- `init-secrets` makes every secret in the `secrets` volume (database passwords, tokens, keys), never overwriting one, and prints the setup code.
+- `init-bootstrap` configures Zitadel and the metadata database. It is safe to run again.
+
+Running `docker compose up` again with nothing changed recreates nothing and prints no new code. `docker compose down` followed by `up` keeps the secrets.
+
+## Read the setup code
+
+The code is in the logs of `init-secrets`:
+
+```bash
+docker compose logs init-secrets
+```
+
+Look for `Setup code: XXXX-XXXX-XXXX-XXXX-XXXX`. A recreated `init-secrets` container has no log of the code, so print it again with this command, which has to run as user 10001 (as root, `chelabase-init` refuses the secrets directory):
+
+```bash
+docker compose run --rm --no-deps --user 10001:10001 \
+  --entrypoint chelabase-init init-secrets setup-code \
+  --dir /var/lib/chelabase/secrets
+```
+
+## Claim the instance
+
+<Callout type="warn">
+Still local only? Check before you go on: the claim is the moment the instance is open to whoever has the code. Do it on the machine itself, or over a network you trust, before the host is reachable from anywhere else.
+</Callout>
+
+1. Open `http://studio.chelabase.localhost:8000` and choose **Sign in**, then **Create account**.
+2. Fill in the form and enter the setup code. An instance that is still unclaimed shows the code field (`GET /auth/v1/instance` answers `{"setupRequired":true}`).
+3. You become the instance's admin. The code stops mattering: from now on sign-up follows the normal rules.
+
+After the claim, a second sign-up is refused with `sign_up_closed` unless you switch open sign-up on in Studio; people who then sign up wait as pending members for your approval. A sign-up with a missing or wrong code on an unclaimed instance is refused with `setup_code_invalid` and creates no account. If two people claim at the same moment, one becomes the admin and the other is admitted as pending. See [Members and invites](/docs/using/members-and-invites).
+
+## Choose your own secrets (optional)
+
+By default `init-secrets` generates every secret. To pick values yourself, uncomment the `CHELABASE_SEED_*` lines in `.env` and fill them in **before the first `docker compose up`**. The full list is the commented block at the end of `.env.example` (database passwords, the S3 keys, Zitadel's masterkey, the NATS and Valkey passwords, and the internal tokens).
+
+- **First run only.** A seed is written as its secret file when that file does not exist yet. Once the file exists, a different value in `.env` makes `init-secrets` fail and name the key. Changing a secret later is not supported yet (rotation is [chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)). To keep a value you chose, leave the line as it is.
+- **Allowed values.** Printable ASCII with no spaces, quotes (`"` and `'`), backslash, backtick or `$`; at most 1024 characters. Passwords and tokens need at least 16 characters; Zitadel's masterkey must be exactly 32. Three third-party services receive a secret inside a quoted string in their own config, which is why the quote characters are excluded.
+- **Keep `.env` at mode 600** (`chmod 600 .env`) once it holds a seed or an SMTP setting. Don't commit it.
+- Seeds never reach a container's environment. They do not cover key pairs, certificates or signing keys; those are always generated.
+
+Never delete the `secrets` volume while the database volumes exist: the databases keep the old passwords, and new ones would not match.
+
+## Settings people change
+
+Every setting is in `.env.example` with a comment. The ones you are most likely to touch:
+
+| Setting | Default | What it does |
+|---|---|---|
+| `CHELABASE_STUDIO_HOST`, `CHELABASE_API_HOST`, `CHELABASE_AUTH_HOST` | `*.chelabase.localhost:8000` | The three public host names (see [Hosts](/docs/self-hosting/hosts)) |
+| `CHELABASE_STUDIO_HOST_NAME`, `CHELABASE_API_HOST_NAME`, `CHELABASE_AUTH_HOST_NAME` | the localhost names | The same three names without the port |
+| `CHELABASE_PUBLIC_PORT` | `8000` | The port in the hosts (80 for `http`, 443 for `https` when the hosts carry none) |
+| `CHELABASE_PUBLIC_SCHEME` | `http` | `http` or `https`: the scheme of every public URL |
+| `CHELABASE_PUBLIC_SECURE` | `false` | `true` when the scheme is `https` |
+| `CHELABASE_ZITADEL_TLS_MODE` | `disabled` | `disabled` for `http`, `external` for `https` |
+| `CHELABASE_HTTP_ADDR` | `127.0.0.1` | The host address the gateway is published on (`0.0.0.0` for every interface) |
+| `CHELABASE_HTTP_PORT` | `CHELABASE_PUBLIC_PORT` | The host port the gateway is published on |
+| `CHELABASE_PROXY_DOMAIN` | `localtest.me` | The domain of database hosts, `<endpoint>.<domain>` (see [Connect to databases](#connect-to-databases)) |
+| `CHELABASE_PROXY_ADDR` | `127.0.0.1` | The host address the proxy (Postgres and SQL over HTTP) is published on |
+| `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT` | `5432`, `4444` | The host ports of the proxy's Postgres and SQL-over-HTTP listeners |
+| `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the images come from. The compose file pins each release image by digest. Setting either variable replaces every pin: one tag for all images, with no digest check. For testing or images you built only (see [Upgrade](#upgrade)) |
+| `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
+| `CHELABASE_SMTP_*` | unset | Zitadel's email (below) |
+
+Compose cannot split a host into its name and port, so when you change the hosts, `.env` has to repeat what Compose can't derive: the three `*_HOST_NAME` values, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE` and `CHELABASE_ZITADEL_TLS_MODE`. `init-secrets` checks that they match the hosts and, if not, fails and names the exact line to fix. For example, `http` on port 9000:
+
+```bash
+CHELABASE_STUDIO_HOST=studio.chelabase.localhost:9000
+CHELABASE_API_HOST=api.chelabase.localhost:9000
+CHELABASE_AUTH_HOST=auth.chelabase.localhost:9000
+CHELABASE_STUDIO_HOST_NAME=studio.chelabase.localhost
+CHELABASE_API_HOST_NAME=api.chelabase.localhost
+CHELABASE_AUTH_HOST_NAME=auth.chelabase.localhost
+CHELABASE_PUBLIC_PORT=9000
+```
+
+Change the hosts before the first `up`. Zitadel's issuer is derived from the auth host and the scheme and is signed into tokens.
+
+For a real domain with TLS terminated by your proxy in front of the gateway, the hosts carry no port and the public port is 443:
+
+```bash
+CHELABASE_PUBLIC_SCHEME=https
+CHELABASE_STUDIO_HOST=studio.acme.com
+CHELABASE_API_HOST=api.acme.com
+CHELABASE_AUTH_HOST=auth.acme.com
+CHELABASE_STUDIO_HOST_NAME=studio.acme.com
+CHELABASE_API_HOST_NAME=api.acme.com
+CHELABASE_AUTH_HOST_NAME=auth.acme.com
+CHELABASE_PUBLIC_PORT=443
+CHELABASE_PUBLIC_SECURE=true
+CHELABASE_ZITADEL_TLS_MODE=external
+CHELABASE_HTTP_ADDR=127.0.0.1
+CHELABASE_HTTP_PORT=8000
+```
+
+Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network, they reach Zitadel directly (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
+
+Set `CHELABASE_GATEWAY_TRUSTED_PROXIES` to your proxy's address too, so per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
+
+### Email (SMTP)
+
+Without SMTP, invites are handed over as links and Zitadel sends no mail. To send mail, set these lines in `.env`:
+
+```bash
+CHELABASE_SMTP_HOST=smtp.example.com
+CHELABASE_SMTP_PORT=587
+CHELABASE_SMTP_FROM=chelabase@example.com
+CHELABASE_SMTP_USER=chelabase
+CHELABASE_SMTP_PASSWORD_PATH=/etc/chelabase/smtp.password
+```
+
+The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into `init-bootstrap` only. `init-bootstrap` runs as uid 10001 (groups 10001 and 70), so the file must be owned by uid 10001 at mode 0600:
+
+```bash
+sudo install -d /etc/chelabase
+sudo install -m 0600 -o 10001 /dev/null /etc/chelabase/smtp.password
+sudo sh -c 'cat > /etc/chelabase/smtp.password'   # paste the password, then Ctrl-D
+```
+
+Mode 0640 with group 10001 or 70 works too (`sudo chgrp 10001 <file> && sudo chmod 640 <file>`), and keeps the file yours. A looser file (group-writable, readable by others, or a symlink), or one uid 10001 can't read (a root-owned 0600 file, say), makes `init-bootstrap` fail with an error naming the file. `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM` makes `init-bootstrap` exit 1 too, and `docker compose up --wait` fails. A changed SMTP setting or password is applied by the next `docker compose up`.
+
+## Connect to databases
+
+Apps use the [data API](/docs/using/data-api) through the gateway. Postgres clients (migrations, ORMs, admin tools, `psql`) connect through Neon's proxy, which the install publishes on `CHELABASE_PROXY_ADDR` (default `127.0.0.1`): Postgres on `CHELABASE_PROXY_PORT` (default `5432`, the Postgres default, so clients need no port; change it if the host runs its own Postgres) and SQL over HTTP on `CHELABASE_PROXY_HTTP_PORT` (default `4444`). Connection details in Studio and the API name the same host and ports.
+
+The proxy picks the database by the host name a client connects to (its TLS server name): `<endpoint>.CHELABASE_PROXY_DOMAIN`. So every such name must reach the proxy:
+
+- **On one machine**, keep the default `localtest.me`: every `*.localtest.me` name resolves to `127.0.0.1` in public DNS, so `ep-….localtest.me:5432` reaches the published port with nothing to set up.
+- **On a server**, use a domain of yours with a wildcard DNS record pointing at the server, and publish the proxy on its address. For `*.db.example.com`:
+
+  ```bash
+  CHELABASE_PROXY_DOMAIN=db.example.com
+  CHELABASE_PROXY_ADDR=0.0.0.0
+  ```
+
+  Connection details then name `ep-….db.example.com:5432`. The proxy's port is not behind the gateway or your HTTPS proxy: open it in your firewall only to the clients that need it. Every connection is TLS and needs the database's password.
+
+`proxy-tls` issues the proxy's certificate for `*.<CHELABASE_PROXY_DOMAIN>` from a CA the install makes once and keeps in the `neon_proxy_tls` volume. A changed domain gets a new certificate from the same CA at the next `docker compose up` (then `docker compose restart proxy`). Clients verify the certificate against that CA. Fetch it once, in `infra/compose`, under the name the connection details give as `ca_file` (`proxy-ca.crt`; `CHELABASE_PROXY_CA_FILE` changes the name they report):
+
+```bash
+docker compose cp proxy:/tls/ca.crt proxy-ca.crt
+psql "postgresql://postgres:…@ep-….localtest.me:5432/<db>?sslmode=verify-full&sslrootcert=proxy-ca.crt"
+```
+
+With `sslmode=verify-full` the client checks both the CA and the host name. The CA is a public certificate, not a secret; its key never leaves the volume.
+
+## Administering Zitadel
+
+<Callout type="warn">
+Every run of the bootstrap deactivates every active **human** member of Zitadel's instance (IAM) administrators, including one you added on purpose. The bootstrap runs on every `docker compose up` (`init-bootstrap`), so a human instance admin you grant in Zitadel's console is deactivated at the next `up`. Machine users are kept.
+</Callout>
+
+Chelabase manages Zitadel itself; you don't need to sign in to its console for normal use. If you have to administer Zitadel (at `CHELABASE_AUTH_HOST`), do it with a machine user, which the bootstrap leaves alone, not with a person.
+
+## Build from source
+
+To run images built from your clone instead of the release images:
+
+```bash
+cd infra/compose
+docker compose -f docker-compose.yml -f docker-compose.build.yml up --build --wait
+```
+
+This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio from its Dockerfile. The wiring, secrets and health checks are the same.
+
+## Upgrade
+
+A release is a commit of the repository: its `docker-compose.yml` pins each image by digest. Update the checkout to get the new pins, then pull those images and recreate what changed:
+
+```bash
+cd infra/compose
+git pull
+docker compose pull
+docker compose up -d --wait
+```
+
+`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+
+`CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
+
+## Stop, tear down and uninstall
+
+Each database runs in a compute container that the worker starts. Computes are not Compose services, so Compose neither stops nor removes them, and while one runs, the Docker networks it is attached to stay.
+
+- **Stop and keep everything:** `docker compose stop`, later `docker compose start` (or `up -d --wait`). Computes keep running while the rest is stopped; that is harmless. `docker compose down` without `-v` keeps the data too: it reports the networks the computes hold as still in use, and the next `up` reuses them.
+- **Uninstall, deleting every database and every secret:**
+
+  ```bash
+  cd infra/compose
+  docker compose stop
+  docker ps -aq --filter label=chelabase.dev/stack=compose | xargs -r docker rm -f
+  docker compose down -v
+  ```
+
+  `compose` in the label is the Compose project name: the directory's name, unless you set another with `-p` or `COMPOSE_PROJECT_NAME` (`docker compose ls -a` lists it). The stack is stopped first so the worker starts no compute in the meantime. A plain `docker compose down -v` without the middle line removes the services and volumes but leaves the computes and their networks behind (it reports the networks as still in use); run the middle line and `down -v` again to finish. `--remove-orphans` does not help: Compose does not count the computes as its own.
+
+  Deleting the databases in Studio first removes their computes too, but the commands above don't depend on it.
+
+## Known limitations
+
+- **No secret rotation** ([chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)).
+- The install is Docker Compose only. Kubernetes is not covered.

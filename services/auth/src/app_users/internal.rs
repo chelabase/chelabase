@@ -87,12 +87,36 @@ pub struct InviteDescription {
     pub tenant_name: String,
 }
 
-/// The sign-up gate's answer (`GET /internal/signup/allowed`).
+/// The sign-up gate's answer (`POST /internal/signup/check`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SignUpAnswer {
     pub allowed: bool,
-    /// `open`, `first_member`, `closed` or `platform`.
+    /// `open`, `first_member`, `closed`, `setup_code_invalid` or `platform`.
     pub reason: String,
+    /// A fresh install waits for its setup code.
+    #[serde(default)]
+    pub setup_required: bool,
+    /// With `first_member`: what binds the fresh-install claim to the account this sign-up
+    /// creates (`claimed`).
+    #[serde(default)]
+    pub claim_nonce: Option<ClaimNonce>,
+}
+
+/// A one-time claim nonce. `Debug` shows nothing.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(transparent)]
+pub struct ClaimNonce(String);
+
+impl ClaimNonce {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ClaimNonce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClaimNonce(..)")
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +124,7 @@ pub enum InternalError {
     /// The orchestrator answered with a 4xx; `code` is the envelope's error code.
     #[error("orchestrator refused ({status}): {code}")]
     Refused { status: u16, code: String },
-    /// No answer, a 5xx or an unreadable answer.
+    /// No answer, a 5xx, a 3xx (never followed) or an unreadable answer.
     #[error("orchestrator unavailable: {0}")]
     Unavailable(String),
 }
@@ -114,7 +138,8 @@ pub struct InternalClient {
 impl InternalClient {
     pub fn new(base: &str, token: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
+            // Never a redirect (#26): the internal bearer goes to the orchestrator only.
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(10))
                 .build()
                 .expect("reqwest client"),
@@ -162,6 +187,13 @@ impl InternalClient {
                 code,
             });
         }
+        // #26: a 3xx (never followed) is no answer: its empty body would read as success, and a
+        // revoke or sync that met one did nothing.
+        if !status.is_success() {
+            return Err(InternalError::Unavailable(format!(
+                "{status}: the orchestrator answered with no result (redirects are not followed)"
+            )));
+        }
         Ok((status, text))
     }
 
@@ -176,14 +208,41 @@ impl InternalClient {
             .map_err(|e| InternalError::Unavailable(format!("bad answer: {e}")))
     }
 
-    /// Whether the tenant of this Zitadel org lets a visitor create an account.
-    pub async fn signup_allowed(&self, org_id: &str) -> Result<SignUpAnswer, InternalError> {
-        self.json(
-            Method::GET,
-            &format!("/internal/signup/allowed?org={}", percent_encode(org_id)),
-            None,
-        )
-        .await
+    /// Whether the tenant of this Zitadel org lets a visitor create an account, with the setup
+    /// code they gave (a body, never a URL).
+    pub async fn signup_check(
+        &self,
+        org_id: &str,
+        setup_code: Option<&str>,
+    ) -> Result<SignUpAnswer, InternalError> {
+        let mut body = serde_json::json!({ "org": org_id });
+        if let Some(code) = setup_code {
+            body["setup_code"] = Value::from(code);
+        }
+        self.json(Method::POST, "/internal/signup/check", Some(body)).await
+    }
+
+    /// Binds the fresh-install claim to the account just created: `true` when bound, `false`
+    /// when the tenant was already claimed (the account stays, as a newcomer). Any error means
+    /// no claim: the caller deletes the account.
+    pub async fn signup_claimed(
+        &self,
+        org_id: &str,
+        user_id: &str,
+        nonce: &ClaimNonce,
+    ) -> Result<bool, InternalError> {
+        #[derive(Deserialize)]
+        struct Claimed {
+            bound: bool,
+        }
+        let answer: Claimed = self
+            .json(
+                Method::POST,
+                "/internal/signup/claimed",
+                Some(serde_json::json!({ "org": org_id, "user_id": user_id, "nonce": nonce.0 })),
+            )
+            .await?;
+        Ok(answer.bound)
     }
 
     /// The open invite of this Zitadel user whose token hashes to `token_hash` (hex SHA-256);
@@ -287,30 +346,77 @@ impl InternalClient {
     }
 }
 
-/// Everything but RFC 3986 unreserved characters, as `%XX`.
-fn percent_encode(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    for b in raw.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 fn v<T: Serialize>(body: &T) -> Value {
     serde_json::to_value(body).expect("request body serialises")
 }
 
 #[cfg(test)]
 mod tests {
-    use super::percent_encode;
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
-    #[test]
-    fn org_ids_are_percent_encoded() {
-        assert_eq!(percent_encode("2999"), "2999");
-        assert_eq!(percent_encode("a b&c=d/é"), "a%20b%26c%3Dd%2F%C3%A9");
+    /// An "orchestrator" that answers every request with `status` and a `location` elsewhere.
+    async fn answering(status: &'static str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut buf = [0u8; 8192];
+                let _ = sock.read(&mut buf).await;
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\nlocation: http://elsewhere.invalid/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                );
+                let _ = sock.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// #26: a 3xx is never followed, so it is no answer at all: a revoke or a sync that met one
+    /// did nothing, and must not report success.
+    #[tokio::test]
+    async fn a_redirect_is_not_a_successful_revoke_or_sync() {
+        for status in [
+            "301 Moved Permanently",
+            "302 Found",
+            "303 See Other",
+            "307 Temporary Redirect",
+            "308 Permanent Redirect",
+            "304 Not Modified",
+        ] {
+            let c = InternalClient::new(&answering(status).await, "internal-token");
+            let (project_id, user_id) = (Uuid::new_v4(), Uuid::new_v4());
+            let refresh = RefreshRequest {
+                project_id,
+                refresh_token: "rt".into(),
+            };
+            let all = RevokeUserSessions {
+                project_id,
+                keep_session_id: None,
+                created_before: None,
+            };
+            let sync = SyncRequest {
+                project_id,
+                user_id,
+                data: None,
+                origin_branch_id: None,
+            };
+            let results = [
+                ("revoke", c.revoke(Uuid::new_v4(), project_id).await),
+                ("revoke_by_token", c.revoke_by_token(&refresh).await),
+                ("revoke_user_sessions", c.revoke_user_sessions(user_id, &all).await),
+                ("sync", c.sync(&sync).await),
+            ];
+            for (what, r) in results {
+                assert!(
+                    matches!(r, Err(InternalError::Unavailable(_))),
+                    "a {status} from the orchestrator read as a successful {what}: {r:?}"
+                );
+            }
+        }
     }
 }

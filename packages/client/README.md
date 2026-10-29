@@ -6,13 +6,13 @@ dependencies: it's built on `fetch`, so it runs in browsers, Node and edge runti
 ## Install
 
 A workspace package (not published to npm): add `"@chelabase/client": "workspace:*"` to
-your app's `package.json`. Write the types with `chelabase gen types` (see below).
+your app's `package.json`. Fetch the types from the data API (see below).
 
 ## Example
 
 ```ts
 import { createClient } from "@chelabase/client";
-import { type Database, types } from "./db"; // written by `chelabase gen types`
+import { type Database, types } from "./db"; // fetched from GET /data/v1/types
 
 const db = createClient<Database>({ url: "http://api.chelabase.localhost:8000", key: PUBLIC_KEY, types });
 
@@ -25,11 +25,24 @@ const [order, points] = await db.batch((tx) => [
 ]);
 ```
 
-`CHELABASE_DATA_KEY=chk_sec_… chelabase gen types --url <gateway> --out db.ts` writes
-`db.ts`.
+Fetch `db.ts` with a secret data key (the same file `chelabase gen types` writes):
+
+```bash
+curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" "$URL/data/v1/types" -o db.ts
+```
+
+A server can also fetch the runtime `types` map at startup, so decoding follows the live
+schema without a rebuild (compile-time checking still comes from `db.ts` in the build):
+
+```ts
+import { createClient, fetchTypes } from "@chelabase/client";
+
+const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key: secretKey }) });
+```
 
 ## Documentation
 
-The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types,
-other databases and app users (`db.auth`). Run the docs site (`just docs`, on
-http://docs.chelabase.localhost:8000) and open `/docs/using/client`.
+The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types (and
+`fetchTypes`),
+other databases and app users (`db.auth`). Read it in `apps/docs/content/docs/using/client/`, or run the docs site in the workbench
+(`just workbench up --with docs`, then http://docs.chelabase.localhost:8000/docs/using/client).

@@ -30,10 +30,11 @@ grep -qE 'metadata-db:5432' "${files[@]}" ||
 mapfile -t tests < <(printf '%s\n' "${files[@]}" | grep -v '^services/rest/src/conn\.rs$')
 # Loopback that is a test's own fixture, not a host-only dependency: realtime's c4_* tests run a
 # fake compute in the test process and dial it, and the orchestrator's route tests assert the
-# fake locator's address in a response body.
+# fake locator's address in a response body, and the gateway's tests assert that the
+# `x-forwarded-for` an in-process upstream sees is the loopback peer.
 # The exemption covers only the `"127.0.0.1"` rule, and the c4_* files only while none of them is
 # a live test (no `#[ignore`): a live test dialling loopback is still caught.
-in_process='^(services/realtime/tests/c4_[a-z_]*\.rs:[0-9]+:|services/orchestrator/tests/internal\.rs:[0-9]+:.*body\["host"\], "127\.0\.0\.1")'
+in_process='^(services/realtime/tests/c4_[a-z_]*\.rs:[0-9]+:|services/orchestrator/tests/internal\.rs:[0-9]+:.*body\["host"\], "127\.0\.0\.1"|services/gateway/tests/gateway\.rs:[0-9]+:.*\["x-forwarded-for"\], "127\.0\.0\.1")'
 if grep -nE '#\[ignore' services/realtime/tests/c4_*.rs >&2; then
   echo "stack-urls: a c4_* test is live, so its loopback lines are no longer exempt" >&2
   bad=1
@@ -68,7 +69,10 @@ grep -q 'docker' services/worker/tests/roles_live.rs && grep -q -- '--force-recr
 grep -q 'docker-compose-plugin' infra/workbench/Dockerfile ||
   { echo "stack-urls: the runner image has the Compose plugin" >&2; bad=1; }
 fixture=scripts/tests/fixtures/workbench-stack.env
-render() { docker compose -p chelabase-feat-x -f infra/compose/docker-compose.yml --env-file "$fixture" config --format json; }
+render() {
+  docker compose -p chelabase-feat-x -f infra/compose/docker-compose.yml -f infra/compose/docker-compose.workbench.yml \
+    --env-file "$fixture" config --format json
+}
 for knob in CHELABASE_PASSWORD_STRENGTH CHELABASE_BRANCH_DATABASE_CAP; do
   [[ "$(env "$knob=on" bash -c "$(declare -f render); fixture=$fixture; render" | jq -r ".services.orchestrator.environment.$knob // empty")" == on ]] ||
     { echo "stack-urls: the orchestrator takes $knob from the caller's env" >&2; bad=1; }

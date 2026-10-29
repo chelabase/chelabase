@@ -219,7 +219,8 @@ pub struct InternalSource {
 impl InternalSource {
     pub fn new(base_url: &str, token: &str) -> Self {
         InternalSource {
-            http: reqwest::Client::builder()
+            // Never a redirect (#26): the internal bearer goes to the orchestrator only.
+            http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .expect("an HTTP client"),

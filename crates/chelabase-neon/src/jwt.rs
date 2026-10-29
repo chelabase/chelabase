@@ -269,15 +269,17 @@ pub fn load_signer(dir: &std::path::Path) -> anyhow::Result<ComputeSigner> {
         let path = dir.join(name);
         std::fs::read_to_string(&path).with_context(|| {
             format!(
-                "read {} (the compute-JWT key pair; run just zitadel-bootstrap)",
+                "read {} (the compute-JWT key pair; self-hosted: `init-secrets` creates it, see \
+                 `docker compose logs init-secrets`; workbench: run `just zitadel-bootstrap`)",
                 path.display()
             )
         })
     };
     ComputeSigner::new(&read(PRIVATE_KEY_FILE)?, &read(PUBLIC_KEY_FILE)?).with_context(|| {
         format!(
-            "the compute-JWT key pair in {} is corrupt; delete both files and run \
-             just zitadel-bootstrap",
+            "the compute-JWT key pair in {} is corrupt; delete both files, then recreate them \
+             (self-hosted: `docker compose up -d` runs `init-secrets`; workbench: \
+             `just zitadel-bootstrap`)",
             dir.display()
         )
     })
@@ -337,6 +339,7 @@ mod tests {
     fn load_signer_missing_keys_say_to_run_the_bootstrap() {
         let dir = tempfile::tempdir().unwrap();
         let err = format!("{:#}", load_signer(dir.path()).err().expect("no keys"));
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 
@@ -347,6 +350,7 @@ mod tests {
         std::fs::write(dir.path().join(PUBLIC_KEY_FILE), "not a key").unwrap();
         let err = format!("{:#}", load_signer(dir.path()).err().expect("corrupt keys"));
         assert!(err.contains("corrupt"), "{err}");
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 

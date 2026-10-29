@@ -1,0 +1,13 @@
+# Keep build artifacts, dependencies, state and VCS data out of every image build context.
+**/target
+**/node_modules
+**/dist
+**/.git
+.worktrees
+.chelabase
+.claude
+.workbench-stack
+**/.tanstack
+**/*.tsbuildinfo
+**/.env
+**/.env.local

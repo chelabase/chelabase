@@ -1,0 +1,13 @@
+[package]
+name = "chelabase-typegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The data API schema to `@chelabase/client` types: the TypeScript module and the runtime types map"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -11,7 +11,9 @@ use chelabase_neon::compute_tls::ComputeCa;
 use chelabase_neon::jwt::StorageScope;
 use chelabase_neon::proxy_cache::ProxyCache;
 use chelabase_neon::safekeeper::SafekeeperClient;
-use chelabase_neon::{ComputeSettings, DockerBackend, StorconClient};
+use chelabase_neon::{
+    Backend, BackendKind, ComputeSettings, DockerSettings, StorconClient,
+};
 use chelabase_secrets::SecretKey;
 use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
@@ -30,7 +32,7 @@ pub const DEFAULT_CLAIM_REFRESH: Duration = Duration::from_secs(60);
 pub type RealWorker = Worker<
     PublishingMetadata<MetadataClient>,
     RealStorage,
-    StoppingBackend<DockerBackend, MetadataClient>,
+    StoppingBackend<Backend, MetadataClient>,
     ProxyCache,
     HttpPusher,
 >;
@@ -62,6 +64,9 @@ pub struct WorkerConfig {
     pub roles: RoleSettings,
     /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
     pub zitadel_issuer: Option<String>,
+    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
+    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
+    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
     /// session deletes). Read by [`build`].
     pub zitadel_admin_pat_file: Option<PathBuf>,
@@ -133,6 +138,12 @@ impl WorkerConfig {
             Some("true" | "1" | "yes")
         );
         let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
+        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
+        let zitadel_at = zitadel_issuer
+            .as_deref()
+            .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
+            .transpose()
+            .map_err(anyhow::Error::new)?;
         let config = Self {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
@@ -155,8 +166,8 @@ impl WorkerConfig {
             policy: ModePolicy::new(mode),
             owner_superuser_requested,
             roles,
-            zitadel_issuer: chelabase_types::entry::issuer_from_lookup(&get)
-                .map_err(anyhow::Error::new)?,
+            zitadel_issuer,
+            zitadel_at,
             zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
                 .map(PathBuf::from),
             app_users_reconcile_every: reconcile_every(
@@ -364,7 +375,11 @@ pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client
     };
     match std::fs::read_to_string(file) {
         Ok(pat) if !pat.trim().is_empty() => {
-            Some(chelabase_zitadel::client::Zitadel::new(issuer, pat.trim()))
+            let at = config.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
+                base: issuer.clone(),
+                host: None,
+            });
+            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
         }
         Ok(_) => {
             tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty: app users jobs wait until it's set");
@@ -407,10 +422,13 @@ pub fn build(
     publisher: Arc<dyn RtPublisher>,
     attach: AttachSource,
 ) -> anyhow::Result<RealWorker> {
-    build_with(config, metadata, key, publisher, attach, DockerBackend::connect)
+    let kind = BackendKind::from_env()?;
+    build_with(config, metadata, key, publisher, attach, |settings, docker| {
+        Backend::connect(kind, settings, docker)
+    })
 }
 
-/// [`build`] with the Docker backend's constructor given. The real one needs the engine's
+/// [`build`] with the backend's constructor given. The real one needs the engine's
 /// socket file to exist (so `build` fails while Docker is restarting); tests that don't
 /// exercise Docker pass a backend over an unreachable engine instead.
 pub fn build_with(
@@ -419,9 +437,9 @@ pub fn build_with(
     key: SecretKey,
     publisher: Arc<dyn RtPublisher>,
     attach: AttachSource,
-    connect: impl FnOnce(ComputeSettings) -> anyhow::Result<DockerBackend>,
+    connect: impl FnOnce(ComputeSettings, DockerSettings) -> anyhow::Result<Backend>,
 ) -> anyhow::Result<RealWorker> {
-    // First, so a missing key pair names `just zitadel-bootstrap` before anything else fails.
+    // First, so a missing key pair names its fix (`init-secrets` or `just zitadel-bootstrap`) before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
     let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {
         anyhow!(
@@ -432,11 +450,13 @@ pub fn build_with(
     let realtime_logins = config.realtime_logins()?;
     let ca = Arc::new(ComputeCa::load(&config.compute_ca_dir).with_context(|| {
         format!(
-            "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; `just zitadel-bootstrap` creates it)",
+            "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; self-hosted: `init-secrets` creates it, see `docker compose logs init-secrets`; \
+             workbench: `just zitadel-bootstrap`)",
             config.compute_ca_dir.display()
         )
     })?);
-    let http = reqwest::Client::builder()
+    // Never a redirect (#26): compute_ctl's JWT goes to the compute only.
+    let http = chelabase_http::client_builder()
         .timeout(Duration::from_secs(5))
         .build()
         .context("building the compute_ctl HTTP client")?;
@@ -479,14 +499,18 @@ pub fn build_with(
             attach,
         },
         computes: StoppingBackend::new(
-            connect(ComputeSettings {
-                image: config.compute_image.clone(),
-                network: config.compute_network.clone(),
-                control_plane_uri: config.control_plane_uri.clone(),
-                stack: config.stack.clone(),
-                control_network: config.compute_control_network.clone(),
-                ca: Some(ca.clone()),
-            })?,
+            connect(
+                ComputeSettings {
+                    image: config.compute_image.clone(),
+                    control_plane_uri: config.control_plane_uri.clone(),
+                    stack: config.stack.clone(),
+                    ca: Some(ca.clone()),
+                },
+                DockerSettings {
+                    network: config.compute_network.clone(),
+                    control_network: config.compute_control_network.clone(),
+                },
+            )?,
             metadata,
             publisher,
         ),
@@ -527,6 +551,30 @@ pub fn build_with(
     })
 }
 
+/// `CHELABASE_METADATA_DATABASE_URL`: where the metadata database is, with its password from
+/// `CHELABASE_METADATA_DATABASE_PASSWORD_FILE` when that is set (m1's `db/metadata.password`;
+/// the URL then names the user only). Required: there is no development fallback (the
+/// workbench's stack.env always sets it), so a fixed credential is never used by accident.
+/// Errors name the variables, never the URL or the password.
+pub fn metadata_config(
+    get: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<chelabase_metadata::MetadataConfig> {
+    let database_url = chelabase_types::secret_env::url_with_password_file(
+        get,
+        "CHELABASE_METADATA_DATABASE_URL",
+        "CHELABASE_METADATA_DATABASE_PASSWORD_FILE",
+    )
+    .map_err(anyhow::Error::msg)?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "CHELABASE_METADATA_DATABASE_URL is not set: the metadata database's URL \
+             (postgres://user@host:port/database, the password in \
+             CHELABASE_METADATA_DATABASE_PASSWORD_FILE)"
+        )
+    })?;
+    Ok(chelabase_metadata::MetadataConfig { database_url })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,6 +592,179 @@ mod tests {
     }
 
     const IMAGE: (&str, &str) = ("CHELABASE_COMPUTE_IMAGE", "chelabase/compute-node-v17:test");
+
+    // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
+    // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
+    // `postgres://chelabase:chelabase@…`; the workbench always sets it (its stack.env).
+    // m5 fix round: the metadata password from CHELABASE_METADATA_DATABASE_PASSWORD_FILE (m1's
+    // `db/metadata.password`), so it is never in the environment. It goes into the URL's user
+    // info, percent-encoded (as the bootstrap does); the URL then carries none. Both forms, a
+    // missing, empty, symlinked or loosely-moded file are startup errors naming the variables,
+    // and the password is in no error and no `Debug`.
+    #[test]
+    fn the_metadata_password_comes_from_its_file() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::str::FromStr;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("metadata.password");
+        let write = |contents: &str, mode: u32| {
+            let _ = std::fs::remove_file(&file);
+            std::fs::write(&file, contents).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        const SECRET: &str = "p@ss/w:rd%Zz";
+        let path = file.to_str().unwrap().to_string();
+        let config = |url: &str| {
+            let (url, path) = (url.to_string(), path.clone());
+            metadata_config(move |k| match k {
+                "CHELABASE_METADATA_DATABASE_URL" => Some(url.clone()),
+                "CHELABASE_METADATA_DATABASE_PASSWORD_FILE" => Some(path.clone()),
+                _ => None,
+            })
+        };
+        const URL: &str = "postgres://chelabase@metadata-db:5432/chelabase_metadata?sslmode=disable";
+        for mode in [0o600, 0o400, 0o640] {
+            write(&format!("{SECRET}\n"), mode);
+            let c = config(URL).unwrap_or_else(|e| panic!("{mode:o}: {e:#}"));
+            assert_eq!(
+                c.database_url,
+                "postgres://chelabase:p%40ss%2Fw%3Ard%25Zz@metadata-db:5432/chelabase_metadata?sslmode=disable"
+            );
+            // What sqlx connects with: the same user, host and database.
+            let opts = sqlx::postgres::PgConnectOptions::from_str(&c.database_url).unwrap();
+            assert_eq!((opts.get_username(), opts.get_host(), opts.get_database()),
+                ("chelabase", "metadata-db", Some("chelabase_metadata")));
+            assert!(!format!("{c:?}").contains("p%40ss") && !format!("{c:?}").contains(SECRET), "{c:?}");
+        }
+        let refused = |what: &str, url: &str, needles: &[&str]| {
+            let err = match config(url) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{what}: accepted: {c:?}"),
+            };
+            for n in needles {
+                assert!(err.contains(n), "{what}: {err}");
+            }
+            assert!(!err.contains(SECRET) && !err.contains("p%40ss") && !err.contains("in-url-pw"), "{what}: {err}");
+        };
+        write(SECRET, 0o600);
+        refused(
+            "a password in both",
+            "postgres://chelabase:in-url-pw@metadata-db:5432/m",
+            &["CHELABASE_METADATA_DATABASE_URL", "CHELABASE_METADATA_DATABASE_PASSWORD_FILE"],
+        );
+        refused("no user", "postgres://metadata-db:5432/m", &["CHELABASE_METADATA_DATABASE_URL"]);
+        for mode in [0o644, 0o604, 0o660, 0o666] {
+            write(SECRET, mode);
+            refused(&format!("mode {mode:o}"), URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        }
+        write("\n", 0o600);
+        refused("empty", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        std::fs::remove_file(&file).unwrap();
+        refused("missing", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE"]);
+        let real = dir.path().join("real");
+        std::fs::write(&real, SECRET).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&real, &file).unwrap();
+        refused("a symlink", URL, &["CHELABASE_METADATA_DATABASE_PASSWORD_FILE", "symlink"]);
+        // A URL with its own password, and no file, still works (the workbench).
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| "postgres://u:in-url-pw@db:5432/m".to_string())
+        })
+        .unwrap();
+        assert!(!format!("{c:?}").contains("in-url-pw"), "{c:?}");
+    }
+
+    #[test]
+    fn the_metadata_url_is_required() {
+        for pairs in [vec![], vec![("CHELABASE_METADATA_DATABASE_URL", " ")], vec![("CHELABASE_DEV_DEFAULTS", "1")]] {
+            let map: std::collections::HashMap<&str, &str> = pairs.iter().copied().collect();
+            let err = match metadata_config(|k| map.get(k).map(|v| v.to_string())) {
+                Err(e) => format!("{e:#}"),
+                Ok(c) => panic!("{pairs:?}: a fallback metadata URL: {}", c.database_url),
+            };
+            assert!(err.contains("CHELABASE_METADATA_DATABASE_URL"), "{err}");
+        }
+        let c = metadata_config(|k| {
+            (k == "CHELABASE_METADATA_DATABASE_URL").then(|| " postgres://u:p@db:5432/m ".to_string())
+        })
+        .unwrap();
+        assert_eq!(c.database_url, "postgres://u:p@db:5432/m");
+    }
+
+    // Selfhost-install m5 (AC 4): a service with an internal bearer at its development default
+    // refuses to start outside the workbench. The worker holds none (it signs storage JWTs
+    // with its key pair and reaches NATS with its own password, which has no default), so
+    // there is nothing to refuse. This pins that two ways (m5 fix round, N3):
+    // - it reads none of the real bearer variables (`DEV_BEARERS`, plain or `_FILE`), nor
+    //   anything named like one (`_TOKEN`, `_SECRET`, `_BEARER`; a heuristic for new ones);
+    // - its config is destructured field by field, with no `..`: a field added to
+    //   `WorkerConfig` fails to compile here until someone says whether it is a credential
+    //   (and, if it has a development default, adds `DevDefaults::check_bearers`).
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let get = lookup(&[IMAGE]);
+        let c = WorkerConfig::from_lookup(|name| {
+            asked.borrow_mut().push(name.to_string());
+            get(name)
+        })
+        .unwrap();
+        let asked = asked.into_inner();
+        assert!(asked.iter().any(|n| n == "CHELABASE_COMPUTE_IMAGE"), "{asked:?}");
+        let real: Vec<String> = chelabase_types::dev_defaults::DEV_BEARERS
+            .iter()
+            .flat_map(|(var, _)| [var.to_string(), format!("{var}_FILE")])
+            .collect();
+        let bearers: Vec<&String> = asked
+            .iter()
+            .filter(|n| {
+                real.contains(n)
+                    || ["_TOKEN", "_TOKEN_FILE", "_SECRET", "_SECRET_FILE", "_BEARER", "_BEARER_FILE"]
+                        .iter()
+                        .any(|suffix| n.ends_with(suffix))
+            })
+            .collect();
+        assert!(bearers.is_empty(), "the worker reads a bearer without the dev-default check: {bearers:?}");
+        // Every field, none a bearer. Credentials it does hold have no default: the Valkey
+        // password and realtime's role password are files the stack mounts, and the Zitadel
+        // admin PAT is a file too.
+        let WorkerConfig {
+            storcon_url: _,
+            safekeeper_http: _,
+            compute_jwt_dir: _,
+            compute_network: _,
+            control_plane_uri: _,
+            stack: _,
+            valkey_url: _,
+            valkey_user: _,
+            valkey_password_file,
+            compute_image: _,
+            mode: _,
+            policy: _,
+            owner_superuser_requested: _,
+            roles: _,
+            zitadel_issuer: _,
+            zitadel_at: _,
+            zitadel_admin_pat_file,
+            app_users_reconcile_every: _,
+            member_roles_sweep_every: _,
+            identity_sweep_every: _,
+            remove_orphans: _,
+            compute_control_network: _,
+            compute_ca_dir: _,
+            compute_tls_dir: _,
+            member_login_cidrs: _,
+            storage_token_refresh_every: _,
+            realtime_login_cidrs: _,
+            realtime_tls_dir: _,
+            realtime_pg_password_file,
+        } = c;
+        assert_eq!(
+            (valkey_password_file, zitadel_admin_pat_file, realtime_pg_password_file),
+            (None, None, None),
+            "unset, a credential file is absent, never a default"
+        );
+    }
 
     #[test]
     fn defaults_are_for_local_dev() {
@@ -824,6 +1045,35 @@ mod tests {
         assert!(err.contains(VAR), "{err}");
     }
 
+    // #24: the app users jobs reach Zitadel in-network with the auth host as Host; the issuer
+    // stays the public one.
+    #[test]
+    fn zitadel_is_reached_at_the_in_network_url() {
+        let c = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_PUBLIC_SCHEME", "https"),
+            ("CHELABASE_AUTH_HOST", "auth.example.com"),
+            ("CHELABASE_ZITADEL_INTERNAL_URL", "http://zitadel:8080"),
+        ]))
+        .unwrap();
+        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(
+            c.zitadel_at,
+            Some(chelabase_types::entry::ZitadelAt {
+                base: "http://zitadel:8080".into(),
+                host: Some("auth.example.com".into()),
+            })
+        );
+        let err = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_AUTH_HOST", "auth.example.com"),
+            ("CHELABASE_ZITADEL_INTERNAL_URL", "ftp://zitadel"),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
+    }
+
     /// Both settings and a readable file give a client; anything less gives none.
     #[test]
     fn zitadel_client_needs_issuer_and_pat_file() {
@@ -868,6 +1118,7 @@ mod tests {
             Ok(_) => panic!("build succeeded without JWT keys"),
             Err(err) => format!("{err:#}"),
         };
+        assert!(err.contains("init-secrets"), "{err}");
         assert!(err.contains("just zitadel-bootstrap"), "{err}");
     }
 

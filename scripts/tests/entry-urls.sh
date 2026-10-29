@@ -8,6 +8,7 @@ allowed=(
   ':!crates/chelabase-types/src/entry.rs' # the loopback upstream defaults (one place)
   ':!apps/docs/content/docs/self-hosting/hosts.mdx'  # documents those defaults
   ':!infra/compose/docker-compose.yml'   # loopback-bound ports the host gateway reaches (W2 unpublishes them)
+  ':!infra/compose/docker-compose.workbench.yml' # the sites' healthchecks, inside their own containers
   ':!docs/superpowers/**'                # specs, plans and notes: history
   ':!docs/roadmap/**'
   ':!docs/superpowers/landing-highlights.md'

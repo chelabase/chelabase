@@ -174,7 +174,7 @@ impl Scratch {
         let t = TenantId(id);
         let admin = self
             .client
-            .ensure_member(t, "admin", "admin@x.com", "Admin", Admission::Active)
+            .ensure_member_first_comer_for_tests(t, "admin", "admin@x.com", "Admin", Admission::Active)
             .await
             .unwrap();
         let p = self.project(t).await;
@@ -192,7 +192,7 @@ impl Scratch {
     async fn granted(&self, h: &Hub, zid: &str, role: PlatformRole) -> Uuid {
         let m = self
             .client
-            .ensure_member(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
+            .ensure_member_first_comer_for_tests(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
             .await
             .unwrap();
         let g = GrantRow {

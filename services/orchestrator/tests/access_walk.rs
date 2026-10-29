@@ -267,6 +267,9 @@ fn path_of(e: &Endpoint, w: &MemberWorld, role: Option<&str>) -> String {
         (Some(role), chelabase_routes::Method::Get, Access::ActAs(_)) => {
             format!("{path}?role={role}")
         }
+        // The types download refines by key role as createKey does: the walk's members hold
+        // `app`, not the default `authenticated`.
+        _ if e.name == chelabase_routes::orchestrator::DATA_API_TYPES.name => format!("{path}?role=app"),
         _ => path,
     }
 }

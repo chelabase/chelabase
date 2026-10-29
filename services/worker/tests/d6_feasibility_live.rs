@@ -95,7 +95,7 @@ where
         let n = n.to_string();
         async move {
             metadata
-                .ensure_member(
+                .ensure_member_first_comer_for_tests(
                     tenant,
                     &format!("z-{n}-{}", Uuid::new_v4()),
                     &format!("{n}@d6.live"),

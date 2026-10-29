@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
 chelabase-routes = { workspace = true }
 chelabase-types = { workspace = true }
 pingora-core = { workspace = true }

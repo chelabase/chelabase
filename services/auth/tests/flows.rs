@@ -1,3 +1,6 @@
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 mod support;
 
 use chelabase_secrets::SecretKey;
@@ -35,17 +38,30 @@ pub async fn harness_full(
     mode: auth::config::Mode,
     admin: bool,
 ) -> Harness {
+    harness_tweaked(skip, min_ms, mode, admin, |_| {}).await
+}
+
+/// [`harness_full`] with the config changed by `tweak` (m5: ids from files, Studio's config).
+pub async fn harness_tweaked(
+    skip: bool,
+    min_ms: u64,
+    mode: auth::config::Mode,
+    admin: bool,
+    tweak: impl FnOnce(&mut Config),
+) -> Harness {
     let internal = support::internal::FakeInternal::start().await;
     let mock = MockZitadel::start().await;
     mock.set_strict_login(true);
     let cookie_key = SecretKey::generate();
-    let config = Config {
+    let mut config = Config {
         listen: String::new(),
         issuer: mock.base.clone(),
+        zitadel: chelabase_types::entry::ZitadelAt { base: mock.base.clone(), host: None },
         token: TOKEN.into(),
         cookie_key: cookie_key.clone(),
         org_id: "o1".into(),
         studio_url: "http://studio.chelabase.localhost:8000".into(),
+        studio: Default::default(),
         skip_email_verification: skip,
         secure_cookies: false,
         min_response: Duration::from_millis(min_ms),
@@ -53,6 +69,7 @@ pub async fn harness_full(
         // The test client connects from loopback: it stands in for the gateway.
         trusted_proxies: auth::guard::TrustedProxies::parse("127.0.0.1,::1").unwrap(),
     };
+    tweak(&mut config);
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
@@ -219,7 +236,7 @@ async fn auth_request_never_offers_a_closed_sign_up() {
         .post("/auth/v1/auth-request", json!({"authRequest": p.mock.add_auth_request(true)}), None, "1.1.1.1")
         .await;
     assert_eq!(platform.body, json!({"signUp": false, "signUpAllowed": false}));
-    assert!(p.internal.queries("GET /internal/signup/allowed").is_empty());
+    assert!(p.internal.bodies("POST /internal/signup/check").is_empty());
 }
 
 #[tokio::test]
@@ -1168,7 +1185,7 @@ async fn a_decoy_sign_up_emails_the_owner_a_reset_link() {
     assert_eq!(h.mock.emails(), vec![(id, "reset".to_string())]);
 }
 
-const SIGN_UP_CALL: &str = "GET /internal/signup/allowed";
+const SIGN_UP_CALL: &str = "POST /internal/signup/check";
 
 #[tokio::test]
 async fn sign_up_refused_when_closed() {
@@ -1185,8 +1202,8 @@ async fn sign_up_refused_when_closed() {
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "sign_up_closed");
     assert_eq!(h.mock.users_with_email("new@example.com"), 0);
-    let asked = h.internal.queries(SIGN_UP_CALL);
-    assert_eq!(asked, vec!["org=o1".to_string()]);
+    let asked = h.internal.bodies(SIGN_UP_CALL);
+    assert_eq!(asked, vec![json!({"org": "o1"})]);
 }
 
 #[tokio::test]
@@ -1251,7 +1268,7 @@ async fn platform_sign_up_refused() {
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "not_available_in_platform_mode");
     assert_eq!(h.mock.users_with_email("new@example.com"), 0);
-    assert!(h.internal.queries(SIGN_UP_CALL).is_empty());
+    assert!(h.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
 fn accept(ar: &str, user: &str, code: &str, pw: &str) -> Value {
@@ -2154,4 +2171,381 @@ async fn describe_invite_is_rate_limited_and_fails_closed() {
     let down = h.describe(body, "3.3.3.3").await;
     assert_eq!(down.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(down.body["error"]["code"], "unavailable");
+}
+
+// Selfhost-install m3: an unclaimed instance's sign-up needs the setup code, and the account
+// it creates is bound to the fresh-install claim (or deleted when that fails).
+
+const SETUP_CODE: &str = "ABCD-EFGH-JKMN-PQRS-TUVW";
+const CLAIMED_CALL: &str = "POST /internal/signup/claimed";
+
+fn signup_with_code(ar: &str, email: &str, code: Option<&str>) -> Value {
+    let mut body = signup(ar, email, "Secret-pass1");
+    if let Some(code) = code {
+        body["setupCode"] = json!(code);
+    }
+    body
+}
+
+// AC 1: no or a wrong code: 403 `setup_code_invalid`, no Zitadel user, no claim.
+#[tokio::test]
+async fn sign_up_with_bad_code_creates_no_user() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    for (i, code) in [None, Some(""), Some("WRONG-CODE")].into_iter().enumerate() {
+        let a = h
+            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", code), None, &format!("1.1.1.{i}"))
+            .await;
+        assert_eq!(
+            (a.status, a.body),
+            (StatusCode::FORBIDDEN, err("setup_code_invalid", messages::SETUP_CODE_INVALID)),
+            "{code:?}"
+        );
+    }
+    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
+    assert!(h.mock.calls().iter().all(|c| !c.contains("/v2/users/new")), "no create call");
+    assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
+    // The code goes in the gate's body; a blank one is not sent at all.
+    let asked = h.internal.bodies(SIGN_UP_CALL);
+    assert_eq!(asked[0], json!({"org": "o1"}));
+    assert_eq!(asked[1], json!({"org": "o1"}));
+    assert_eq!(asked[2], json!({"org": "o1", "setup_code": "WRONG-CODE"}));
+    assert!(h.internal.queries(SIGN_UP_CALL).iter().all(String::is_empty), "nothing in a URL");
+}
+
+// AC 2 (auth side): the right code creates the account and binds the claim to it with the
+// gate's nonce; the sign-in page offers sign-up while the instance waits for its code.
+#[tokio::test]
+async fn sign_up_with_the_code_binds_the_claim() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let page = h
+        .post("/auth/v1/auth-request", json!({"authRequest": h.mock.add_auth_request(true)}), None, "1.1.1.1")
+        .await;
+    assert_eq!(page.body, json!({"signUp": true, "signUpAllowed": true}));
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
+    let user = h.mock.user("first@example.com").expect("created");
+    assert_eq!(
+        h.internal.bodies(CLAIMED_CALL),
+        vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
+    );
+}
+
+// AC 6 (auth side): the instance was claimed meanwhile (`bound: false`): the account stays.
+#[tokio::test]
+async fn an_unbound_claim_keeps_the_account() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_claimed_unbound();
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "second@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::OK);
+    assert_eq!(h.mock.users_with_email("second@example.com"), 1);
+}
+
+// AC 10: `claimed` fails after the account was created: the account is deleted, and a retry
+// with the same email succeeds.
+#[tokio::test]
+async fn claimed_failure_deletes_user() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    for (status, want, code) in [
+        (500, StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        (403, StatusCode::FORBIDDEN, "setup_code_invalid"),
+    ] {
+        h.internal.set_claimed_status(Some(status));
+        let a = h
+            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, &format!("2.2.2.{status}"))
+            .await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (want, Some(code)), "{status}");
+        assert_eq!(h.mock.users_with_email("first@example.com"), 0, "deleted after a {status}");
+    }
+    h.internal.set_claimed_status(None);
+    let ar = h.mock.add_auth_request(true);
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&ar, "first@example.com", Some(SETUP_CODE)), None, "2.2.2.9")
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(h.mock.users_with_email("first@example.com"), 1);
+    assert_eq!(h.internal.bodies(CLAIMED_CALL).len(), 3);
+}
+
+// Without the admin client a failed claim couldn't be undone: no setup-code sign-up at all.
+#[tokio::test]
+async fn a_setup_sign_up_needs_the_admin_client() {
+    let h = harness_full(false, 1, auth::config::Mode::SelfHosted, false).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
+    assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
+}
+
+// The register page's question: `setupRequired` while the instance waits for its code.
+#[tokio::test]
+async fn instance_says_whether_setup_is_required() {
+    let h = harness().await;
+    let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    h.internal.set_setup_code(SETUP_CODE);
+    let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": true})));
+    // The question carries no code.
+    assert!(h.internal.bodies(SIGN_UP_CALL).iter().all(|b| *b == json!({"org": "o1"})));
+    h.internal.set_signup_status(Some(503));
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+    // Rate-limited per client.
+    h.internal.set_signup_status(None);
+    for _ in 0..57 {
+        assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::OK);
+    }
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(h.get("/auth/v1/instance", "1.1.1.2").await.status, StatusCode::OK);
+    // Platform mode: never, without asking.
+    let p = harness_mode(false, 1, auth::config::Mode::Platform).await;
+    let a = p.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    assert!(p.internal.bodies(SIGN_UP_CALL).is_empty());
+}
+
+// B1 (m3 audit): there is no global setup-code bucket to drain. 300 junk sign-ups with a code
+// from 15 addresses (each under its own limit) leave the operator's right-code sign-up alone;
+// the per-address and per-email limits still apply. The code's ~98 bits need no global cap.
+#[tokio::test]
+async fn junk_setup_sign_ups_never_lock_out_the_code() {
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let mut set = tokio::task::JoinSet::new();
+    for i in 0..300 {
+        let (http, base) = (h.http.clone(), h.base.clone());
+        let ar = if i % 2 == 0 { "junk".to_string() } else { h.mock.add_auth_request(true) };
+        let body = signup_with_code(&ar, &format!("junk{i}@example.com"), Some("X"));
+        set.spawn(async move {
+            http.post(format!("{base}/auth/v1/sign-up"))
+                .json(&body)
+                .header("x-forwarded-for", format!("9.9.9.9, 10.0.1.{}", i % 15))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        });
+    }
+    let statuses = set.join_all().await;
+    assert!(statuses.iter().all(|s| *s != StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
+    let a = h
+        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "owner@example.com", Some(SETUP_CODE)), None, "7.7.7.7")
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "the operator's right-code sign-up: {}", a.body);
+    // The per-address limit still holds for code guesses.
+    for i in 0..20 {
+        let ar = h.mock.add_auth_request(true);
+        let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, &format!("g{i}@example.com"), Some("X")), None, "8.8.8.8").await;
+        assert_eq!(a.status, StatusCode::FORBIDDEN, "{i}");
+    }
+    let ar = h.mock.add_auth_request(true);
+    let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, "g20@example.com", Some("X")), None, "8.8.8.8").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Every log line written on this thread while the guard lives (the test's current-thread
+/// runtime runs the server's tasks here too).
+#[derive(Clone, Default)]
+struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+// The code and the nonce never show in auth's logs or answers.
+#[tokio::test]
+async fn log_and_error_scrub() {
+    let sink = LogSink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let h = harness().await;
+    h.internal.set_setup_code(SETUP_CODE);
+    let wrong = "ZZZZ-YYYY-XXXX-WWWW-VVVV";
+    let mut bodies = Vec::new();
+    for (i, code) in [wrong, SETUP_CODE].into_iter().enumerate() {
+        bodies.push(
+            h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), &format!("u{i}@example.com"), Some(code)), None, "1.1.1.1")
+                .await
+                .body,
+        );
+    }
+    h.internal.set_claimed_status(Some(403));
+    bodies.push(
+        h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "u9@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+            .await
+            .body,
+    );
+    bodies.push(h.get("/auth/v1/instance", "1.1.1.1").await.body);
+    let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("binding the fresh-install claim failed"), "{logs}");
+    for secret in [SETUP_CODE, wrong, support::internal::CLAIM_NONCE, "ABCDEFGHJKMNPQRSTUVW"] {
+        assert!(!logs.to_lowercase().contains(&secret.to_lowercase()), "{secret} in the logs");
+        for body in &bodies {
+            assert!(!body.to_string().contains(secret), "{secret} in {body}");
+        }
+    }
+}
+
+// ---- Selfhost-install m5: the bootstrap's outputs from files ----
+
+fn write_id(path: &std::path::Path, value: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, value).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+fn org_file(path: &std::path::Path) -> chelabase_types::file_value::FileValue {
+    chelabase_types::file_value::FileValue::file(
+        "CHELABASE_ZITADEL_ORG_ID_FILE",
+        path,
+        chelabase_types::file_value::Sensitivity::Public,
+    )
+}
+
+// AC 1: auth starts before the bootstrap has written the org id. Until it is there, sign-in,
+// sign-up (before any gate call or account), the instance probe and password reset answer
+// 503 `unavailable`, and the health check reports not-ready. Once the file appears the next
+// request succeeds, without a restart.
+#[tokio::test]
+async fn sign_in_503_until_org_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("org-id");
+    let p = path.clone();
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.org_id = org_file(&p)
+    })
+    .await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.internal.set_signup(true, "open");
+    let unavailable = || err("unavailable", messages::UNAVAILABLE);
+    for round in ["absent", "empty"] {
+        if round == "empty" {
+            write_id(&path, "\n");
+        }
+        assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
+        let ar = h.mock.add_auth_request(true);
+        let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+        assert!(a.cookies.is_empty(), "{round}: no session without the org");
+        let a = h.post("/auth/v1/sign-up", signup(&ar, "new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+        let a = h.get("/auth/v1/instance", "1.1.1.3").await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
+        let a = h.post("/auth/v1/password-reset", json!({"email": "ada@example.com"}), None, "1.1.1.4").await;
+        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
+    }
+    assert_eq!(h.mock.users_with_email("new@example.com"), 0, "no account was made");
+    assert!(h.internal.bodies(SIGN_UP_CALL).is_empty(), "the gate was never asked");
+
+    write_id(&path, "o1\n");
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
+    let ar = h.mock.add_auth_request(false);
+    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body["next"].clone()), (StatusCode::OK, json!("done")));
+    let a = h
+        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.2")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
+    assert_eq!(h.internal.bodies(SIGN_UP_CALL), vec![json!({"org": "o1"})]);
+}
+
+// A refused org file (a symlink here) is 503 too, never a sign-in against no org.
+#[tokio::test]
+async fn a_refused_org_file_is_503() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    write_id(&real, "o1\n");
+    let link = dir.path().join("org-id");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.org_id = org_file(&link)
+    })
+    .await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    let ar = h.mock.add_auth_request(false);
+    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// AC 5: `GET /auth/v1/studio-config` is exactly the six public values Studio needs, cacheable
+// for 60 s. Not configured here (the workbench) it is 404, so Studio uses its build values;
+// configured but not written yet it is 503, uncached, and auth isn't ready.
+#[tokio::test]
+async fn studio_config_shape() {
+    use chelabase_types::file_value::{FileValue, Sensitivity};
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, |c| {
+        c.studio = auth::config::StudioSettings {
+            client_id: Some("c-studio".into()),
+            project_id: Some("p1".into()),
+            api_url: "http://api.chelabase.localhost:8000".into(),
+            studio_host: "studio.chelabase.localhost:8000".into(),
+        };
+    })
+    .await;
+    let mut a = h.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK);
+    let cache = a.body.as_object_mut().unwrap().remove("_cache_control");
+    assert_eq!(cache, Some(json!("public, max-age=60")));
+    assert_eq!(
+        a.body,
+        json!({
+            "issuer": h.mock.base,
+            "clientId": "c-studio",
+            "projectId": "p1",
+            "orgId": "o1",
+            "apiUrl": "http://api.chelabase.localhost:8000",
+            "studioHost": "studio.chelabase.localhost:8000",
+        })
+    );
+    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
+
+    let plain = harness().await;
+    let a = plain.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::NOT_FOUND);
+    assert_eq!(a.body["error"]["code"], "not_found");
+    assert_eq!(plain.get("/health", "1.1.1.1").await.status, StatusCode::OK, "nothing to wait for");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("studio-client-id");
+    let p = path.clone();
+    let late = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
+        c.studio = auth::config::StudioSettings {
+            client_id: Some(FileValue::file("CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE", &p, Sensitivity::Public)),
+            project_id: Some("p1".into()),
+            api_url: "http://api.chelabase.localhost:8000".into(),
+            studio_host: "studio.chelabase.localhost:8000".into(),
+        };
+    })
+    .await;
+    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(a.body["error"]["code"], "unavailable");
+    assert_eq!(a.body["_cache_control"], "no-store");
+    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
+    write_id(&path, "c-late\n");
+    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
+    assert_eq!((a.status, a.body["clientId"].clone()), (StatusCode::OK, json!("c-late")));
+    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::OK);
 }

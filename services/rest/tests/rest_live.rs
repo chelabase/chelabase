@@ -16,6 +16,9 @@
 //! The runner carries the stack's env (stack.env and the bootstrap's demo.env) and the compute
 //! image.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -2623,6 +2626,263 @@ async fn count_respects_rls_and_filters() {
             l.anon(json!({"v":1,"op":"batch","ops":[{"op":"count","from":"c"},{"op":"select","from":"c","select":["v"],"where":{"col":"v","eq":2}}]})).await.ok(),
             &json!([{"count": 5}, [{"v": 2}]])
         );
+    })
+    .await;
+}
+
+/// `GET /data/v1/types` as a secret key with `authenticated` on main, with `If-None-Match`.
+async fn types_of(l: &Live, query: &str, if_none_match: Option<&str>) -> reqwest::Response {
+    let mut req = l
+        .http
+        .get(format!("http://{}/data/v1/types{query}", l.rest))
+        .header(
+            IDENTITY_HEADER,
+            l.token(l.main_id(), DataKeyKind::Secret, "authenticated"),
+        );
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    req.send().await.unwrap()
+}
+
+/// The generator over what `GET /data/v1/schema` gives the key: `chelabase_typegen`'s
+/// `collect` (the CLI's fetch plan) and `render`, which the route runs too. That the
+/// generator's output is the CLI's, byte for byte, is pinned by the committed goldens
+/// (`packages/client/fixtures/gen/*`): `chelabase-typegen`'s `gen_types_golden`,
+/// `gen_types_golden_for_two_databases` and `render_is_the_cli_module`, and the CLI's own
+/// fetch tests against the same files.
+async fn generated_from_the_schema_route(l: &Live, which: chelabase_typegen::Which, format: chelabase_typegen::Format) -> String {
+    let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
+        let schema = l.schema_of("authenticated", database.as_deref()).await;
+        // The CLI parses the response text, exactly as served.
+        serde_json::from_str::<chelabase_typegen::Schema>(&schema.text)
+            .map_err(|e| format!("{e}: {schema:?}"))
+    })
+    .await
+    .unwrap();
+    chelabase_typegen::render(&schemas, format).unwrap()
+}
+
+/// A schema with what the generator treats specially: int8 and numeric columns, an enum,
+/// a generated column, a set-returning function and a function returning a row.
+const TYPES_DDL: &str = "CREATE TYPE mood AS ENUM ('sad', 'happy');
+     CREATE TABLE orders (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+       total numeric NOT NULL, qty int NOT NULL DEFAULT 1, m mood, note text, \
+       doubled bigint GENERATED ALWAYS AS (qty * 2) STORED);
+     CREATE FUNCTION latest() RETURNS orders LANGUAGE sql AS 'SELECT * FROM orders ORDER BY id DESC LIMIT 1';
+     CREATE FUNCTION bump(n int DEFAULT 1) RETURNS SETOF bigint LANGUAGE sql AS 'SELECT n::bigint';";
+
+/// The body is the generator's output over the key's own `GET /data/v1/schema` answers, byte
+/// for byte, for the default, `database=` and `all_databases=true`, as `ts` and as `json`:
+/// the route reads nothing else. (The generator equals the CLI by the goldens; see
+/// [`generated_from_the_schema_route`].)
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_matches_the_generator_over_the_schema_route() {
+    use chelabase_typegen::{Format, Which};
+    live("types", |l| async move {
+        l.owner(TYPES_DDL).await;
+        l.create_database("analytics").await;
+        l.owner_in(
+            "analytics",
+            "CREATE TABLE events (id bigint PRIMARY KEY, amount numeric, at timestamptz);",
+        )
+        .await;
+        l.enable(l.main_id(), "analytics").await;
+
+        for (query, which) in [
+            ("", Which::Main),
+            ("?database=analytics", Which::One("analytics".into())),
+            ("?all_databases=true", Which::All),
+        ] {
+            for (format, suffix, content_type) in [
+                (Format::Ts, "", "text/typescript; charset=utf-8"),
+                (Format::Ts, "format=ts", "text/typescript; charset=utf-8"),
+                (Format::Json, "format=json", "application/json"),
+            ] {
+                let q = match (query.is_empty(), suffix.is_empty()) {
+                    (_, true) => query.to_string(),
+                    (true, false) => format!("?{suffix}"),
+                    (false, false) => format!("{query}&{suffix}"),
+                };
+                let resp = types_of(&l, &q, None).await;
+                assert_eq!(resp.status(), 200, "{q}");
+                let headers = resp.headers().clone();
+                assert_eq!(headers["content-type"], content_type, "{q}");
+                assert_eq!(headers["cache-control"], "no-store", "{q}");
+                let body = resp.text().await.unwrap();
+                let want = generated_from_the_schema_route(&l, which.clone(), format).await;
+                assert_eq!(body, want, "{q}");
+            }
+        }
+        // The cases differ where they should.
+        let main = generated_from_the_schema_route(&l, Which::Main, Format::Ts).await;
+        let all = generated_from_the_schema_route(&l, Which::All, Format::Ts).await;
+        assert!(main.contains("orders: {") && !main.contains("events"), "{main}");
+        assert!(all.contains("export type Databases = {") && all.contains("events: {"), "{all}");
+        assert!(main.contains("total: string;") && main.contains("id: Int8;"), "{main}");
+    })
+    .await;
+}
+
+/// `format=json` is the runtime map the module's `types` constant holds.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_json_is_the_runtime_map() {
+    live("typesjson", |l| async move {
+        l.owner(TYPES_DDL).await;
+        let module = types_of(&l, "", None).await.text().await.unwrap();
+        let json: Value = serde_json::from_str(&types_of(&l, "?format=json", None).await.text().await.unwrap()).unwrap();
+        let schema: chelabase_typegen::Schema =
+            serde_json::from_str(&l.schema_of("authenticated", None).await.text).unwrap();
+        assert_eq!(json, chelabase_typegen::runtime(&schema).unwrap());
+        assert_eq!(module, chelabase_typegen::generate(&schema).unwrap());
+        assert_eq!(json["defaultSchema"], "public");
+        let public = &json["schemas"]["public"];
+        assert_eq!(
+            public["tables"]["orders"],
+            json!({ "id": "int8", "total": "numeric", "doubled": "int8" })
+        );
+        assert_eq!(public["functions"]["bump"], json!({ "returns": "int8" }));
+        assert_eq!(
+            public["functions"]["latest"],
+            json!({ "columns": { "id": "int8", "total": "numeric", "doubled": "int8" } })
+        );
+        // Every entry's text is in the module's `types` constant.
+        assert!(module.contains("orders: { doubled: \"int8\", id: \"int8\", total: \"numeric\" },"), "{module}");
+    })
+    .await;
+}
+
+/// A 200's ETag and body.
+async fn tag_of(l: &Live, q: &str) -> (String, String) {
+    let resp = types_of(l, q, None).await;
+    assert_eq!(resp.status(), 200);
+    let tag = resp.headers()["etag"].to_str().unwrap().to_owned();
+    (tag, resp.text().await.unwrap())
+}
+
+/// The ETag is the body's: equal for the same schema, a 304 for `If-None-Match`, a new one
+/// once the schema changes.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn types_etag_and_304() {
+    live("typesetag", |l| async move {
+        l.owner(TYPES_DDL).await;
+        let (ts, ts_body) = tag_of(&l, "").await;
+        let (again, again_body) = tag_of(&l, "").await;
+        assert_eq!((&ts, &ts_body), (&again, &again_body));
+        assert!(ts.starts_with('"') && ts.ends_with('"') && !ts.starts_with("W/"), "{ts}");
+        let (json_tag, _) = tag_of(&l, "?format=json").await;
+        assert_ne!(ts, json_tag, "the tag is the body's");
+
+        for header in [ts.clone(), format!("W/{ts}"), format!("\"other\", {ts}"), "*".to_string()] {
+            let resp = types_of(&l, "", Some(&header)).await;
+            assert_eq!(resp.status(), 304, "{header}");
+            assert_eq!(resp.headers()["etag"], ts.as_str());
+            assert_eq!(resp.headers()["cache-control"], "no-store");
+            assert_eq!(resp.text().await.unwrap(), "");
+        }
+        let resp = types_of(&l, "", Some("\"other\"")).await;
+        assert_eq!(resp.status(), 200);
+        // The JSON's tag doesn't match the module.
+        assert_eq!(types_of(&l, "", Some(&json_tag)).await.status(), 200);
+
+        l.owner("ALTER TABLE orders ADD COLUMN extra bigint;").await;
+        let (changed, body) = tag_of(&l, "").await;
+        assert_ne!(changed, ts);
+        assert!(body.contains("extra"), "{body}");
+        assert_eq!(types_of(&l, "", Some(&ts)).await.status(), 200);
+        assert_eq!(types_of(&l, "", Some(&changed)).await.status(), 304);
+    })
+    .await;
+}
+
+/// `GET /internal/types/{branch}?role=…` (the orchestrator's Studio download), with
+/// `If-None-Match`.
+async fn internal_types_of(l: &Live, role: &str, query: &str, if_none_match: Option<&str>) -> reqwest::Response {
+    let sep = if query.is_empty() { "" } else { "&" };
+    let mut req = l
+        .http
+        .get(format!(
+            "http://{}/internal/types/{}?role={role}{sep}{query}",
+            l.internal,
+            l.main_id().as_uuid()
+        ))
+        .bearer_auth(&l.internal_token);
+    if let Some(tag) = if_none_match {
+        req = req.header("if-none-match", tag);
+    }
+    req.send().await.unwrap()
+}
+
+/// The internal types route gives a role what `GET /data/v1/types` gives a secret key of that
+/// role (no database list), byte for byte with the same ETag and headers, for every option;
+/// its `If-None-Match` is the public route's; a role it can't take is refused as the console's.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn internal_types_matches_the_data_api_types() {
+    live("typesint", |l| async move {
+        l.owner(TYPES_DDL).await;
+        l.owner(
+            "CREATE ROLE reporter NOLOGIN;
+             GRANT USAGE ON SCHEMA public TO reporter;
+             GRANT SELECT ON orders TO reporter;
+             CREATE ROLE types_boss NOLOGIN CREATEDB;",
+        )
+        .await;
+        assert!(matches!(
+            l.worker.check_data_role(l.main_id(), "reporter").await,
+            RoleCheck::Ok(_, false)
+        ));
+        l.create_database("analytics").await;
+        l.owner_in("analytics", "CREATE TABLE events (id bigint PRIMARY KEY, at timestamptz);").await;
+        l.enable(l.main_id(), "analytics").await;
+
+        for role in ["authenticated", "reporter"] {
+            for query in [
+                "",
+                "format=json",
+                "database=analytics",
+                "database=analytics&format=json",
+                "all_databases=true",
+                "all_databases=true&format=json",
+            ] {
+                let public = l
+                    .http
+                    .get(format!(
+                        "http://{}/data/v1/types{}{query}",
+                        l.rest,
+                        if query.is_empty() { "" } else { "?" }
+                    ))
+                    .header(IDENTITY_HEADER, l.token(l.main_id(), DataKeyKind::Secret, role))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(public.status(), 200, "{role} {query}");
+                let internal = internal_types_of(&l, role, query, None).await;
+                assert_eq!(internal.status(), 200, "{role} {query}");
+                for name in ["etag", "content-type", "cache-control"] {
+                    assert_eq!(internal.headers().get(name), public.headers().get(name), "{role} {query} {name}");
+                }
+                let tag = internal.headers()["etag"].to_str().unwrap().to_owned();
+                assert_eq!(internal.text().await.unwrap(), public.text().await.unwrap(), "{role} {query}");
+                let resp = internal_types_of(&l, role, query, Some(&tag)).await;
+                assert_eq!(resp.status(), 304, "{role} {query}");
+                assert_eq!(resp.headers()["etag"], tag.as_str());
+                assert_eq!(resp.text().await.unwrap(), "");
+            }
+        }
+        // The two roles' modules differ where their privileges do.
+        let auth = internal_types_of(&l, "authenticated", "", None).await.text().await.unwrap();
+        let reporter = internal_types_of(&l, "reporter", "", None).await.text().await.unwrap();
+        assert_ne!(auth, reporter);
+        assert!(reporter.contains("orders: {"), "{reporter}");
+
+        let answer = Live::answer(internal_types_of(&l, "types_ghost", "", None).await).await;
+        answer.error(404, "unknown_role");
+        let answer = Live::answer(internal_types_of(&l, "types_boss", "", None).await).await;
+        answer.error(403, "role_not_allowed");
     })
     .await;
 }

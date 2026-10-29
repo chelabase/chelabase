@@ -1016,6 +1016,24 @@ where
                 .into_response();
         }
     };
+    // #26: rest's client never follows a redirect, so a 3xx (or a stray 1xx) is no answer to
+    // pass on: with no `location` it would read as an empty success.
+    if !(reply.status.is_success() || reply.status.is_client_error() || reply.status.is_server_error()) {
+        warn!(branch_id = %branch, status = %reply.status, "rest answered with no result (redirects are not followed)");
+        return unavailable("the data API can't be reached right now; try again").into_response();
+    }
+    // rest's internal routes answer 401 only for a bearer that isn't the orchestrator's (a user's
+    // refusal is a 403 `permission_denied` or `role_not_allowed`). Studio signs the user out on
+    // a 401, so rest refusing our credential is a 502 here, never a 401.
+    if reply.status == StatusCode::UNAUTHORIZED {
+        error!(branch_id = %branch, "rest refused the orchestrator's internal bearer");
+        return ApiError::new(
+            502,
+            ErrorCode::Unavailable,
+            "the data API refused the orchestrator's credential; this is a server misconfiguration, not your sign-in",
+        )
+        .into_response();
+    }
     if reply.status == StatusCode::NOT_FOUND && is_unknown_database(&reply.body) {
         return match state.metadata.branch_databases(branch).await {
             Ok(rows) => match pick_database(rows, Some(database)) {

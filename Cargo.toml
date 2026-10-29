@@ -7,6 +7,7 @@ members = [
     "services/auth",
     "services/rest",
     "services/realtime",
+    "services/init",
     "tools/cli",
     "tools/bench-data-api",
     "crates/chelabase-types",
@@ -19,6 +20,9 @@ members = [
     "crates/chelabase-query",
     "crates/chelabase-schema",
     "crates/chelabase-zitadel",
+    "crates/chelabase-init",
+    "crates/chelabase-http",
+    "crates/chelabase-typegen",
 ]
 
 [workspace.package]
@@ -36,8 +40,11 @@ chelabase-routes = { path = "crates/chelabase-routes" }
 chelabase-secrets = { path = "crates/chelabase-secrets" }
 chelabase-neon = { path = "crates/chelabase-neon" }
 chelabase-query = { path = "crates/chelabase-query" }
+chelabase-http = { path = "crates/chelabase-http" }
 chelabase-schema = { path = "crates/chelabase-schema" }
 chelabase-zitadel = { path = "crates/chelabase-zitadel" }
+chelabase-init = { path = "crates/chelabase-init" }
+chelabase-typegen = { path = "crates/chelabase-typegen" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }

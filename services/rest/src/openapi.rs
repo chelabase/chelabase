@@ -167,13 +167,14 @@ mod tests {
         let registry: BTreeSet<(String, String)> = ENDPOINTS
             .iter()
             .filter(|e| {
-                e.service == Service::Rest && matches!(e.name, "rest.query" | "rest.schema")
+                e.service == Service::Rest
+                    && matches!(e.name, "rest.query" | "rest.schema" | "rest.types")
             })
             .map(|e| (e.method.as_str().to_string(), e.path.to_string()))
             .collect();
         assert_eq!(
             registry.len(),
-            2,
+            3,
             "the registry's public data API endpoints"
         );
         assert_eq!(documented, registry);
@@ -194,6 +195,7 @@ mod tests {
         ids.sort();
         let expected = [
             ("GET /data/v1/schema", "getDataSchema"),
+            ("GET /data/v1/types", "getDataTypes"),
             ("POST /data/v1/query", "runQuery"),
         ]
         .map(|(at, id)| (at.to_string(), id.to_string()));
@@ -214,7 +216,7 @@ mod tests {
         assert_eq!(schemes["user"]["in"], "header");
         assert_eq!(schemes["user"]["name"], "Chelabase-User");
         let ops = operations(&doc);
-        assert_eq!(ops.len(), 2, "the document has both operations");
+        assert_eq!(ops.len(), 3, "the document has every operation");
         for (method, path, op) in ops {
             let at = format!("{method} {path}");
             let security = if method == "POST" {

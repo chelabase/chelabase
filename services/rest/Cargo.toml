@@ -17,15 +17,20 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
 chelabase-query = { workspace = true, features = ["openapi"] }
 # The full-cell read's shared code (`cell`, `catalog`, P40).
 chelabase-schema = { workspace = true }
+# `GET /data/v1/types`: the generator `chelabase gen types` runs.
+chelabase-typegen = { workspace = true }
 chelabase-types = { workspace = true, features = ["openapi", "axum"] }
 deadpool-postgres = { workspace = true }
 dotenvy = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
+# The types route's ETag.
+sha2 = { workspace = true }
 # Keeps a bare JSON number's digits (a 30-digit numeric binds exactly). It changes
 # `serde_json::Number` for every crate built with rest; the workspace has no untagged or
 # flattened serde types it would break.

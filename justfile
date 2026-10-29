@@ -21,20 +21,12 @@ default:
 workbench *args:
     cargo run -q -p chelabase -- workbench "$@"
 
-# Idempotent Zitadel IAM ensure (project, API app, demo machine key, tenant bind, tenant admin)
+# Rerun this stack's bootstrap as `workbench up` does: `chelabase-init bootstrap --demo` inside the
+# stack (Zitadel objects, the tenant bind, the demo tenant admin), then the apps' env files
 zitadel-bootstrap admin_email="":
     #!/usr/bin/env bash
     set -euo pipefail
-    set -a
-    # shellcheck disable=SC1090
-    . "$(cargo run -q -p chelabase -- workbench env)"
-    set +a
-    # As `workbench up` runs it: the host can't resolve `zitadel`, so Zitadel is reached through
-    # the stack's gateway, and the tenant bind's `compose exec` uses the stack's project and env.
-    export CHELABASE_ZITADEL_UPSTREAM=http://127.0.0.1:"$CHELABASE_GATEWAY_PORT"
-    export CHELABASE_ROOT="$CHELABASE_CHECKOUT"
-    export COMPOSE_FILE="$CHELABASE_CHECKOUT/infra/compose/docker-compose.yml"
-    export COMPOSE_ENV="$CHELABASE_STACK_DIR/env/stack.env"
+    cargo build -q -p init
     # No address: the stack's own `zitadel-admin@zitadel.<auth host>` (or the pre-W1 name) is used.
     cargo run -q -p chelabase -- dev bootstrap ${1:+--admin-email "$1"}
 
@@ -113,8 +105,15 @@ check:
     scripts/tests/compose-mask-probe.sh
     scripts/tests/compose-neon-uid-probe.sh
     scripts/tests/compose-secret-argv.sh
+    scripts/tests/compose-overlay-equiv.sh
+    scripts/tests/compose-secret-boundary.sh
+    scripts/tests/compose-no-fixed-secrets.sh
+    scripts/tests/compose-env-tunables.sh
+    scripts/tests/compose-zitadel-internal.sh
+    scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
+    scripts/tests/compose-image-pins.sh
     just deny
     cargo check --workspace
     cargo clippy --workspace --all-targets -- -D warnings
@@ -142,6 +141,11 @@ check:
 test:
     cargo nextest run --workspace
     cargo test --workspace --doc
+
+# Build every release image (per-app, chelabase/server, chelabase/studio) from one cargo build.
+# Separate from the workbench, which runs host-built debug binaries. Smoke: scripts/tests/images-smoke.sh
+images:
+    docker buildx bake -f infra/images/docker-bake.hcl
 
 # Delete build artifacts older than `days` from the main checkout's target/ and every worktree's
 # (needs cargo-sweep: cargo install cargo-sweep --locked)
@@ -311,3 +315,14 @@ neon-test:
 # Live sign-up/sign-in/reset/logout through the gateway and auth
 auth-e2e:
     cargo run -q -p chelabase -- workbench run scripts/auth-e2e.sh
+
+# The self-hosted install end to end, on a throwaway Compose project of its own (no workbench).
+# Builds the images from this checkout; SELFHOST_E2E_IMAGES=local uses the ones `just images` built.
+selfhost-e2e:
+    scripts/selfhost-e2e.sh
+
+# The self-hosted install behind a TLS proxy with no port in the hosts (#24): nginx with a
+# throwaway CA in front of a throwaway project, on the local release images (`just images`;
+# CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG pick others). Needs node for its socket client.
+selfhost-tls-e2e:
+    scripts/selfhost-tls-e2e.sh

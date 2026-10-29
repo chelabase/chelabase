@@ -42,6 +42,7 @@ mod branches;
 mod console;
 pub mod compute_tls;
 mod data_api_databases;
+mod data_api_types;
 mod app_user_admin;
 mod app_users;
 mod data_keys;
@@ -599,8 +600,9 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     /// The caller's member row, made (or an invited one activated) on its first request, with
     /// the email and name refreshed from the claims; a removed or pending member comes back as
     /// is. A person with no row becomes what `admission` says, unless the tenant has no active
-    /// admin yet (then they claim it): `Closed` writes nothing and is `NotAdmitted` (R39).
-    fn ensure_member(
+    /// admin and its fresh-install claim binds this person (then they claim it; see
+    /// [`MetadataClient::admit_member`]): `Closed` writes nothing and is `NotAdmitted` (R39).
+    fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1204,7 +1206,7 @@ impl MetadataPort for MetadataClient {
         MetadataClient::member_by_zitadel(self, tenant, zitadel_user_id).await
     }
 
-    async fn ensure_member(
+    async fn admit_member(
         &self,
         tenant: TenantId,
         zitadel_user_id: &str,
@@ -1212,7 +1214,8 @@ impl MetadataPort for MetadataClient {
         name: &str,
         admission: Admission,
     ) -> Result<MemberRecord, MetadataError> {
-        MetadataClient::ensure_member(self, tenant, zitadel_user_id, email, name, admission).await
+        // The setup-bound claim: only the account a code-gated sign-up bound claims the admin.
+        MetadataClient::admit_member(self, tenant, zitadel_user_id, email, name, admission).await
     }
 
     async fn grant_sources(
@@ -1930,10 +1933,11 @@ pub struct AuthPrincipal {
 /// The caller's member row in `tenant`, read once per request in the common case.
 ///
 /// - Self-hosted (`ModePolicy::auto_create_members`), a person in the tenant's org who has no
-///   row yet is admitted on their first request (R39): the first one claims the tenant's admin;
-///   an invited one is activated; anyone else becomes `pending` when the tenant's open sign-up
-///   is on, and otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no
-///   members and only refreshes existing ones.
+///   row yet is admitted on their first request (R39): the account a code-gated sign-up bound
+///   (`setup_claims`) claims the tenant admin while there is none; an invited one is
+///   activated; anyone else becomes `pending` when the tenant's open sign-up is on, and
+///   otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no members and
+///   only refreshes existing ones.
 /// - The email and name come from the token's claims. A claim the token lacks keeps the stored
 ///   value; when there is none (a new member, or one with no email or name stored), the user is
 ///   read once through the admin Zitadel client (ruling R18). A Zitadel failure isn't fatal:
@@ -1949,7 +1953,7 @@ async fn resolve_member<M: MetadataPort, J>(
         ApiError::internal()
     };
     let auto_create = state.policy.auto_create_members();
-    // Both claims at hand: `ensure_member` reads, refreshes or makes the row in one go.
+    // Both claims at hand: `admit_member` reads, refreshes or makes the row in one go.
     if auto_create && let (Some(email), Some(name)) = (&caller.email, &caller.name) {
         return admit(state, tenant, &caller.sub, email, name).await.map_err(failed);
     }
@@ -2006,12 +2010,13 @@ async fn resolve_member<M: MetadataPort, J>(
 }
 
 /// How long after a tenant's admin claim a person with no row is still taken as the other half of
-/// the fresh-install race (R41, M7): the sign-up gate lets everyone in while the tenant has no
-/// member, so two concurrent sign-ups both get accounts, and the second one's first request
+/// the fresh-install race (R41, M7): the sign-up gate lets everyone with the setup code in while
+/// the tenant has no member, so two concurrent sign-ups both get accounts (only one binds the
+/// claim), and the second one's first request
 /// arrives after the first has claimed the admin. Long enough for an email verification.
 const FIRST_MEMBER_WINDOW: chrono::Duration = chrono::Duration::hours(1);
 
-/// [`MetadataPort::ensure_member`] with the tenant's sign-up rule: asked with `Closed` first, so
+/// [`MetadataPort::admit_member`] with the tenant's sign-up rule: asked with `Closed` first, so
 /// a member who already has a row costs no extra read; only a newcomer reads `open_signup`, and
 /// is then admitted as `pending` or not at all (`None`). M7: a newcomer is also `pending` while
 /// the tenant's admin claim is within [`FIRST_MEMBER_WINDOW`], so the loser of the fresh-install
@@ -2023,11 +2028,11 @@ async fn admit<M: MetadataPort, J>(
     email: &str,
     name: &str,
 ) -> Result<Option<MemberRecord>, MetadataError> {
-    match state.metadata.ensure_member(tenant, sub, email, name, Admission::Closed).await {
+    match state.metadata.admit_member(tenant, sub, email, name, Admission::Closed).await {
         Err(MetadataError::NotAdmitted(_)) => {
             let race = || state.metadata.admin_claimed_since(tenant, chrono::Utc::now() - FIRST_MEMBER_WINDOW);
             if state.metadata.open_signup(tenant).await? || race().await? {
-                state.metadata.ensure_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
+                state.metadata.admit_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
             } else {
                 Ok(None)
             }
@@ -2120,7 +2125,7 @@ fn tenant_not_bound() -> ApiError {
     ApiError::new(
         403,
         ErrorCode::TenantNotBound,
-        "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
+        "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
     )
 }
 
@@ -2143,7 +2148,7 @@ where
                 ApiError::new(
                     403,
                     ErrorCode::TenantNotBound,
-                    "no Chelabase tenant bound to this Zitadel org; run just zitadel-bootstrap",
+                    "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
                 )
             })?;
 
@@ -2568,6 +2573,7 @@ where
         .merge(merges::routes())
         .merge(data_keys::routes())
         .merge(data_api_databases::routes())
+        .merge(data_api_types::routes())
         .merge(console::routes())
         .merge(sql_editor::routes())
         .merge(table_api::routes())

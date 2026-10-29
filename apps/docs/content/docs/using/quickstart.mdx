@@ -1,18 +1,18 @@
 ---
 title: Quickstart
-description: Sign up, create a database and connect to it.
+description: Sign in, create a database and a key, and query it from an app with the TypeScript client.
 ---
 
-This takes you from a running stack to a database you can connect to. It uses self-hosted mode, the dev mode, and needs Docker (the worker starts each database's compute container).
+This takes you from a running stack to a database your app reads and writes through the data API. It uses self-hosted mode and needs Docker (the worker starts each database's compute container).
 
 ## 1. Start the stack and sign in
 
-1. Run `just workbench up`, then open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000) and choose **Sign in** as the bootstrap admin: `just zitadel-bootstrap` makes `zitadel-admin@zitadel.<auth host>` (or the email you pass to it, `just zitadel-bootstrap you@example.com`) the tenant admin.
-2. You land in Studio. Set the bootstrap admin before you expose Studio to anyone: until a tenant has its first member, the first person to sign in claims the admin, so run `just zitadel-bootstrap you@example.com` (positional) first; that fresh-install window exists until the first bootstrap. The stack's `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential on self-hosted dev: keep it private. Emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
+1. Install Chelabase with Docker Compose by following [Install](/docs/self-hosting/install): `cp .env.example .env && docker compose up -d --wait` in `infra/compose`. (To work on Chelabase itself, `just workbench up` is the development loop instead; it is not how you run it.)
+2. Read the setup code with `docker compose logs init-secrets`, open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000), choose **Sign in**, then **Create account**, and enter the code. The first account with the code claims the instance and becomes the admin. Don't expose the host before you have claimed it.
 3. On `/app` you see your project, its databases, and a form to create one.
 
 <Callout type="info">
-Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use `http://studio.chelabase.localhost:8000`: the sign-in redirect and the gateway's CORS settings are registered for that host.
+Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use the Studio host you configured (`http://studio.chelabase.localhost:8000` by default): the sign-in redirect and the gateway's CORS settings are registered for that host. On a workbench stack, emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
 </Callout>
 
 When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIRE_EMAIL_VERIFICATION` (`true` requires a code, which lands in Mailpit; `false` turns it off); without it the default follows the mode: off when self-hosted, required in platform mode. Invitees verify their email by accepting the invite.
@@ -21,25 +21,93 @@ When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIR
 
 Enter a name in the form on `/app` and create it. The database shows as provisioning while its Neon tenant, timeline and compute are made, then as ready. Studio polls every 2 seconds until the status settles.
 
-From a terminal, `just create-db-demo demo1` creates one through the gateway (give the name positionally: `name=demo1` would become the literal name). `GET http://api.chelabase.localhost:8000/v1/databases/<id>` reports its `status`.
+`GET http://api.chelabase.localhost:8000/v1/databases/<id>` reports its `status` from a terminal.
 
-## 3. Connect
+## 3. Create a table
 
-Open **Connection details** on the database in Studio, or call `GET /v1/databases/{id}/connection`. You get the owner credentials and a URI such as:
+Choose **SQL** on the database and run, as the owner (the default for an admin):
+
+```sql
+create table todos (
+  id bigint generated always as identity primary key,
+  title text not null,
+  done boolean not null default false
+);
+```
+
+Tables the owner creates in the default schema are open to the data API's roles at once: `authenticated` (behind a secret key) may read and write them, `anon` (behind the public key) only read ([default privileges](/docs/architecture/data-api#default-privileges)). Studio warns that `todos` has no row-level security; add a policy before a public key reaches it from a browser.
+
+## 4. Create a key
+
+On the database, open **Data API**, then under **Secret keys** choose **Create key**. Give it a name and keep the role `authenticated`. The key (`chk_sec_…`) is shown once: save it. The same panel shows the branch's public key (`chk_pub_…`, role `anon`, safe in a browser). See [Keys](/docs/using/data-api/keys), including the API calls that do the same.
+
+## 5. Query it from your app
+
+`@chelabase/client` is the typed client for the data API. It is a workspace package in the repository (`packages/client`), not yet on npm: add it to a workspace app as `"@chelabase/client": "workspace:*"`.
+
+Get the generated types of the branch's schema, `db.ts`: on the **Data API** view, choose **Download types** (keep the role `authenticated`, the key's). Or fetch the same file with the secret key, from a terminal or any build step:
+
+```bash
+export CHELABASE_DATA_KEY=chk_sec_…
+curl -fsS -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+  http://api.chelabase.localhost:8000/data/v1/types -o db.ts
+```
+
+Then write and read rows:
+
+```ts
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+
+const db = createClient<Database>({
+  url: "http://api.chelabase.localhost:8000",
+  key: process.env.CHELABASE_DATA_KEY!,
+  types,
+});
+
+await db.from("todos").insert([{ title: "Try Chelabase" }]).returning("id");
+const open = await db.from("todos").select("id", "title").where({ done: false });
+```
+
+A server can instead fetch the runtime types when it starts, so its value decoding follows the live schema without a rebuild (the `Database` type still comes from `db.ts`):
+
+```ts
+import { createClient, fetchTypes } from "@chelabase/client";
+import type { Database } from "./db";
+
+const url = "http://api.chelabase.localhost:8000";
+const key = process.env.CHELABASE_DATA_KEY!;
+
+const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key }) });
+```
+
+A secret key stays on a server; in a browser use the public key, with row-level security on the tables it reaches. The [TypeScript client](/docs/using/client) covers filters, writes, functions, batches and [generated types](/docs/using/client/types); the [data API](/docs/using/data-api) is the HTTP endpoint underneath, for any other language:
+
+```bash
+curl -s http://api.chelabase.localhost:8000/data/v1/query \
+  -H "Authorization: Bearer $CHELABASE_DATA_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{ "v": 1, "op": "select", "from": "todos", "limit": 10 }'
+```
+
+## Connect with a Postgres client
+
+Migrations, ORMs and admin tools can also connect to the database over the Postgres protocol, through the install's proxy. Open **Connection details** on the database in Studio, or call `GET /v1/databases/{id}/connection`. You get the owner's credentials and a URI such as:
 
 ```txt
-postgresql://postgres:…@<endpoint>.localtest.me:4432/<db>?sslmode=verify-full
+postgresql://postgres:…@<endpoint>.localtest.me:5432/<db>?sslmode=verify-full
 ```
 
-Connect with the proxy's CA certificate:
+The proxy's certificate is issued by the install's own CA. Fetch it once, in `infra/compose`, to the file name the connection details give as `ca_file`:
 
-```sh
-psql "<uri>&sslrootcert=.chelabase/neon/proxy-ca.crt"
+```bash
+docker compose cp proxy:/tls/ca.crt proxy-ca.crt
+psql "<uri>&sslrootcert=proxy-ca.crt"
 ```
 
-If `localtest.me` resolves to `::1` first, also add `&hostaddr=127.0.0.1`. The response's `ca_file` field names the CA file (self-hosted mode; `null` in platform mode). You can show the connection details as often as you like.
+`localtest.me` resolves to the machine itself, where the proxy is published (`127.0.0.1:5432` by default). If it resolves to `::1` first and that fails, add `&hostaddr=127.0.0.1`. For another host, port or a real domain, see [Install: connect to databases](/docs/self-hosting/install#connect-to-databases). On a workbench stack the proxy is on port 4432 (`just workbench status`) and the CA is at `.chelabase/neon/proxy-ca.crt`. You can show the connection details as often as you like.
 
-## 4. Remove it
+## 6. Remove it
 
 Delete the database in Studio (it asks you to type the name) or with `DELETE /v1/databases/{id}`. `just sweep-dbs` removes every database in the dev stack.
 

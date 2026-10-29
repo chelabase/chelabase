@@ -122,7 +122,7 @@ impl Scratch {
 
     async fn active(&self, h: &Hub, name: &str) -> Uuid {
         self.client
-            .ensure_member(h.t, name, "", name, Admission::Active)
+            .ensure_member_first_comer_for_tests(h.t, name, "", name, Admission::Active)
             .await
             .unwrap()
             .id

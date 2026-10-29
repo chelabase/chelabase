@@ -338,6 +338,16 @@ pub mod orchestrator {
         Access::Project(Viewer),
     );
 
+    /// The branch's generated types (`GET /data/v1/types`'s module or map) for a secret key's
+    /// role: who may create a secret key for the role may download them (createKey's checks;
+    /// the handler refines by role).
+    pub const DATA_API_TYPES: Endpoint = key_endpoint(
+        "orchestrator.data_api_types",
+        Method::Get,
+        "/v1/databases/{id}/branches/{branch_id}/data-api/types",
+        Access::Project(Developer),
+    );
+
     /// Starts serving one of the branch's Postgres databases through the data API.
     pub const ENABLE_DATA_API: Endpoint = key_endpoint(
         "orchestrator.enable_data_api",
@@ -1075,6 +1085,14 @@ pub mod rest {
         },
         websocket: false,
     };
+
+    /// The generated types (`chelabase gen types`' output) for the key's schema: a secret
+    /// key only, as the schema route.
+    pub const TYPES: Endpoint = Endpoint {
+        name: "rest.types",
+        path: "/data/v1/types",
+        ..SCHEMA
+    };
 }
 
 /// Studio's sign-in pages, served by `auth`.
@@ -1100,6 +1118,11 @@ pub mod auth {
     }
 
     pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
+    /// Whether the instance is unclaimed (the sign-up page asks for the setup code).
+    pub const INSTANCE: Endpoint = Endpoint { method: Method::Get, ..post("auth.instance", "/auth/v1/instance") };
+    /// Studio's runtime config (its Zitadel ids and public URLs), read before it mounts.
+    pub const STUDIO_CONFIG: Endpoint =
+        Endpoint { method: Method::Get, ..post("auth.studio_config", "/auth/v1/studio-config") };
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
     pub const ACCEPT_INVITE: Endpoint = post("auth.accept_invite", "/auth/v1/accept-invite");
@@ -1235,6 +1258,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::ROTATE_KEY,
     orchestrator::REVOKE_KEY,
     orchestrator::DATA_API_SCHEMA,
+    orchestrator::DATA_API_TYPES,
     orchestrator::ENABLE_DATA_API,
     orchestrator::DISABLE_DATA_API,
     orchestrator::UPDATE_PG_DATABASE,
@@ -1333,7 +1357,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::GET_CELL,
     rest::QUERY,
     rest::SCHEMA,
+    rest::TYPES,
     auth::AUTH_REQUEST,
+    auth::INSTANCE,
+    auth::STUDIO_CONFIG,
     auth::SIGN_IN,
     auth::SIGN_UP,
     auth::ACCEPT_INVITE,
@@ -1726,13 +1753,15 @@ mod tests {
         let platform = |e: &&Endpoint| e.service == Service::Auth && !e.path.starts_with("/auth/v1/app/");
         for ep in ENDPOINTS.iter().filter(platform) {
             // All posts, the accept page's invite description included (M8: its user id and
-            // token go in the body, never a URL).
-            assert_eq!(ep.method, Method::Post, "{}", ep.path);
+            // token go in the body, never a URL); the bodiless instance state and Studio's
+            // runtime config (m5) are the GETs.
+            let want = if matches!(ep.name, "auth.instance" | "auth.studio_config") { Method::Get } else { Method::Post };
+            assert_eq!(ep.method, want, "{}", ep.path);
             assert_eq!(ep.policy.auth, Auth::Public, "{}", ep.path);
             assert_eq!(ep.policy.cors, Cors::StudioCredentials, "{}", ep.path);
             assert!(ep.path.starts_with("/auth/v1/"), "{}", ep.path);
         }
-        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 10);
+        assert_eq!(ENDPOINTS.iter().filter(platform).count(), 12);
         assert!(matches!(match_endpoint(Scope::Api, "POST", "/auth/v1/password-reset/confirm"),
             Match::Found(ep) if ep.name == "auth.password_reset_confirm"));
     }
@@ -1774,6 +1803,8 @@ mod tests {
     fn rest_endpoints_match_and_are_listed() {
         assert_eq!(found("POST", "/data/v1/query"), "rest.query");
         assert_eq!(found("GET", "/data/v1/schema"), "rest.schema");
+        assert_eq!(found("GET", "/data/v1/types"), "rest.types");
+        assert_eq!(rest::TYPES.policy, rest::SCHEMA.policy, "the types route is the schema route's");
         assert_eq!(
             rest::QUERY.policy,
             Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey }
@@ -1782,7 +1813,7 @@ mod tests {
             rest::SCHEMA.policy,
             Policy { auth: Auth::SecretDataKey, cors: Cors::Any, access: Access::DataKey }
         );
-        for ep in [rest::QUERY, rest::SCHEMA] {
+        for ep in [rest::QUERY, rest::SCHEMA, rest::TYPES] {
             assert_eq!(ep.service, Service::Rest);
             assert_eq!(ep.scope, Scope::Api);
             assert!(ENDPOINTS.contains(&ep));
@@ -1795,7 +1826,13 @@ mod tests {
             found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/schema"),
             "orchestrator.data_api_schema"
         );
-        for name in ["list_keys", "create_key", "rotate_key", "revoke_key", "data_api_schema"] {
+        assert_eq!(
+            found("GET", "/v1/databases/6c0f1c2e-2f7e-4c52-9a51-0d8f2f1d7c11/branches/0d8f2f1d-7c11-4c52-9a51-6c0f1c2e2f7e/data-api/types"),
+            "orchestrator.data_api_types"
+        );
+        // Downloading types is creating a key's access, not listing keys'.
+        assert_eq!(orchestrator::DATA_API_TYPES.policy, orchestrator::CREATE_KEY.policy);
+        for name in ["list_keys", "create_key", "rotate_key", "revoke_key", "data_api_schema", "data_api_types"] {
             let ep = ENDPOINTS
                 .iter()
                 .find(|e| e.name == format!("orchestrator.{name}"))
@@ -1982,6 +2019,7 @@ mod tests {
             // Data keys (Admin for a key not bound to an allowed role, refined in the handler).
             ("orchestrator.list_keys", Access::Project(Viewer)),
             ("orchestrator.data_api_schema", Access::Project(Viewer)),
+            ("orchestrator.data_api_types", Access::Project(Developer)),
             ("orchestrator.create_key", Access::Project(Developer)),
             ("orchestrator.rotate_key", Access::Project(Developer)),
             ("orchestrator.update_key", Access::Project(Developer)),
@@ -2091,8 +2129,11 @@ mod tests {
             // Data API.
             ("rest.query", Access::DataKey),
             ("rest.schema", Access::DataKey),
+            ("rest.types", Access::DataKey),
             // Studio sign-in.
             ("auth.auth_request", Access::Public),
+            ("auth.instance", Access::Public),
+            ("auth.studio_config", Access::Public),
             ("auth.sign_in", Access::Public),
             ("auth.sign_up", Access::Public),
             ("auth.accept_invite", Access::Public),

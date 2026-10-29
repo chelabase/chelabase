@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use chelabase_secrets::SecretKey;
-use chelabase_types::entry::Scheme;
+use chelabase_types::dev_defaults::DevDefaults;
+use chelabase_types::entry::{Scheme, ZitadelAt};
+use chelabase_types::file_value::{FileValue, Sensitivity};
 pub use chelabase_types::mode::Mode;
 use chelabase_types::mode_policy::ModePolicy;
 use std::path::PathBuf;
@@ -16,18 +18,69 @@ pub const DEFAULT_MIN_RESPONSE_MS: u64 = 1500;
 #[derive(Clone)]
 pub struct Config {
     pub listen: String,
+    /// The public issuer (what Studio is told; a token's `iss`).
     pub issuer: String,
+    /// Where auth's calls to Zitadel go: `CHELABASE_ZITADEL_INTERNAL_URL` with the auth host as
+    /// `Host`, else the issuer (#24).
+    pub zitadel: ZitadelAt,
     pub token: String,
     pub cookie_key: SecretKey,
-    pub org_id: String,
+    /// `CHELABASE_ZITADEL_ORG_ID`, or the file `CHELABASE_ZITADEL_ORG_ID_FILE` names (the
+    /// bootstrap's `org-id`), read on first use: until it is there, every route that needs the
+    /// org answers 503 and `/health` reports not-ready.
+    pub org_id: FileValue,
     /// The first Studio origin; email links point at its pages.
     pub studio_url: String,
+    /// What `GET /auth/v1/studio-config` serves.
+    pub studio: StudioSettings,
     pub skip_email_verification: bool,
     pub secure_cookies: bool,
     pub min_response: Duration,
     pub mode: Mode,
     /// `CHELABASE_AUTH_TRUSTED_PROXY`: the proxies (the gateway) whose `X-Forwarded-For` counts.
     pub trusted_proxies: crate::guard::TrustedProxies,
+}
+
+/// Studio's runtime config (`GET /auth/v1/studio-config`): its Zitadel ids, each the variable or
+/// the file `<NAME>_FILE` names (the bootstrap's `studio-client-id` and `project-id`), and the
+/// public URLs. Without both ids (the workbench, whose Studio has its build values) the route
+/// answers 404.
+#[derive(Clone, Debug, Default)]
+pub struct StudioSettings {
+    /// `CHELABASE_ZITADEL_STUDIO_CLIENT_ID[_FILE]`: Studio's OIDC client id.
+    pub client_id: Option<FileValue>,
+    /// `CHELABASE_ZITADEL_PROJECT_ID[_FILE]`: the `chelabase` project (the token audience).
+    pub project_id: Option<FileValue>,
+    /// The public API base (`<scheme>://<api host>`).
+    pub api_url: String,
+    /// Studio's public host.
+    pub studio_host: String,
+}
+
+/// The bootstrap's ids auth reads: the org (required, now or later) and Studio's two.
+pub struct ZitadelIds {
+    pub org_id: FileValue,
+    pub studio_client_id: Option<FileValue>,
+    pub project_id: Option<FileValue>,
+}
+
+impl ZitadelIds {
+    /// Each id is `NAME` or `NAME_FILE`, never both; the org id is required.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let id = |name: &str| {
+            FileValue::from_lookup(&get, name, Sensitivity::Public).map_err(anyhow::Error::msg)
+        };
+        let org_id = id("CHELABASE_ZITADEL_ORG_ID")?.with_context(|| {
+            "neither CHELABASE_ZITADEL_ORG_ID nor CHELABASE_ZITADEL_ORG_ID_FILE is set; a self-hosted \
+             stack points CHELABASE_ZITADEL_ORG_ID_FILE at the bootstrap's org-id (it may appear \
+             after auth starts), the workbench sets CHELABASE_ZITADEL_ORG_ID in the stack's zitadel/demo.env"
+        })?;
+        Ok(Self {
+            org_id,
+            studio_client_id: id("CHELABASE_ZITADEL_STUDIO_CLIENT_ID")?,
+            project_id: id("CHELABASE_ZITADEL_PROJECT_ID")?,
+        })
+    }
 }
 
 fn var(name: &str) -> Result<String> {
@@ -102,6 +155,12 @@ fn warn_if_open(path: &str) {
     let _ = path;
 }
 
+/// Where auth's Zitadel calls go ([`Config::zitadel`]): `CHELABASE_ZITADEL_INTERNAL_URL` with
+/// the auth host as `Host`, else the issuer; a malformed internal URL stops auth (#24).
+pub fn zitadel_from_lookup(get: impl Fn(&str) -> Option<String>, issuer: &str) -> Result<ZitadelAt> {
+    chelabase_types::entry::zitadel_at(get, issuer).map_err(anyhow::Error::new)
+}
+
 impl Config {
     pub fn from_env() -> Result<Self> {
         let mode = Mode::from_env().map_err(anyhow::Error::msg)?;
@@ -138,13 +197,22 @@ impl Config {
         )
         .map_err(anyhow::Error::msg)?;
         check_listen(&listen, !trusted_proxies.is_empty())?;
+        let ids = ZitadelIds::from_lookup(|name| std::env::var(name).ok())?;
+        let zitadel = zitadel_from_lookup(|name| std::env::var(name).ok(), &entry.issuer())?;
         Ok(Self {
             listen,
             issuer: entry.issuer(),
+            zitadel,
             token: token.trim().to_string(),
             cookie_key,
-            org_id: var("CHELABASE_ZITADEL_ORG_ID")?,
+            org_id: ids.org_id,
             studio_url: entry.studio_origin(),
+            studio: StudioSettings {
+                client_id: ids.studio_client_id,
+                project_id: ids.project_id,
+                api_url: entry.api_base(),
+                studio_host: entry.studio_host().to_string(),
+            },
             skip_email_verification: !requires_email_verification(
                 mode,
                 std::env::var("CHELABASE_REQUIRE_EMAIL_VERIFICATION")
@@ -211,16 +279,21 @@ impl AppConfig {
         Ok((url, token))
     }
 
-    /// M9: a platform instance doesn't start with the development bearer (the variable unset).
-    pub fn check_internal_token(mode: Mode, token: &str) -> Result<()> {
-        ModePolicy::new(mode)
-            .check_internal_token(token)
-            .map_err(anyhow::Error::msg)
+    /// M9: a platform instance doesn't start with the development bearer (the variable unset);
+    /// m5: nor does a self-hosted one, unless `CHELABASE_DEV_DEFAULTS=1` (the workbench).
+    pub fn check_internal_token(mode: Mode, dev: DevDefaults, token: &str) -> Result<()> {
+        dev.check_bearer(
+            &ModePolicy::new(mode),
+            "CHELABASE_APP_AUTH_INTERNAL_TOKEN",
+            token,
+            &[DEFAULT_APP_AUTH_INTERNAL_TOKEN],
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     /// The admin Zitadel client from `CHELABASE_ZITADEL_ADMIN_PAT_FILE`, independent of the app
     /// keys; `None` (with a warning) when the variable is unset. Accept-invite needs it.
-    pub fn admin_from_env(issuer: &str) -> Result<Option<crate::zitadel::Zitadel>> {
+    pub fn admin_from_env(at: &ZitadelAt) -> Result<Option<crate::zitadel::Zitadel>> {
         let Some(path) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
             .ok()
             .map(|v| v.trim().to_string())
@@ -232,7 +305,7 @@ impl AppConfig {
             return Ok(None);
         };
         let pat = std::fs::read_to_string(&path).with_context(|| format!("read {path}"))?;
-        Ok(Some(crate::zitadel::Zitadel::new(issuer, pat.trim())))
+        Ok(Some(crate::zitadel::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref())))
     }
 
     pub fn from_env() -> Result<Option<Self>> {
@@ -298,6 +371,25 @@ impl AppConfig {
 mod tests {
     use super::*;
 
+    // m13 audit N2: how auth builds `Config.zitadel` (sign-in, invites, app users' admin calls).
+    #[test]
+    fn zitadel_is_reached_at_the_internal_url_else_the_issuer() {
+        let lookup = |v: Option<&'static str>| {
+            move |k: &str| (k == "CHELABASE_ZITADEL_INTERNAL_URL").then(|| v.map(str::to_string)).flatten()
+        };
+        let set = zitadel_from_lookup(lookup(Some("http://zitadel:8080")), "https://auth.example.com").unwrap();
+        assert_eq!(set.base, "http://zitadel:8080");
+        assert_eq!(set.host.as_deref(), Some("auth.example.com"));
+        for unset in [None, Some(""), Some("  ")] {
+            let at = zitadel_from_lookup(lookup(unset), "http://auth.chelabase.localhost:8000").unwrap();
+            assert_eq!((at.base.as_str(), at.host), ("http://auth.chelabase.localhost:8000", None), "{unset:?}");
+        }
+        for bad in ["zitadel:8080", "http://zitadel:8080/x", "http://u@zitadel"] {
+            let err = zitadel_from_lookup(lookup(Some(bad)), "https://auth.example.com").unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{bad}: {err}");
+        }
+    }
+
     fn vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: std::collections::HashMap<String, String> = pairs
             .iter()
@@ -314,14 +406,60 @@ mod tests {
         ("CHELABASE_COMPUTE_CA_FILE", "/k/compute-ca/ca.crt"),
     ];
 
-    // M9: a platform instance refuses the development internal bearer; self-hosted allows it.
+    // M9: a platform instance refuses the development internal bearer, whatever
+    // CHELABASE_DEV_DEFAULTS says.
     #[test]
     fn platform_refuses_the_default_internal_token() {
-        assert!(AppConfig::check_internal_token(Mode::SelfHosted, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_ok());
-        assert!(AppConfig::check_internal_token(Mode::Platform, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_err());
-        assert!(AppConfig::check_internal_token(Mode::Platform, "a-long-random-secret").is_ok());
+        for dev in [DevDefaults::ON, DevDefaults::OFF] {
+            assert!(AppConfig::check_internal_token(Mode::Platform, dev, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_err());
+            assert!(AppConfig::check_internal_token(Mode::Platform, dev, "a-long-random-secret").is_ok());
+        }
         let c = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
-        assert!(AppConfig::check_internal_token(Mode::Platform, &c.internal_token).is_err(), "unset means the default");
+        assert!(
+            AppConfig::check_internal_token(Mode::Platform, DevDefaults::ON, &c.internal_token).is_err(),
+            "unset means the default"
+        );
+    }
+
+    // m5 (AC 4): self-hosted refuses the development bearer (unset or set to it) unless
+    // CHELABASE_DEV_DEFAULTS=1; the message names the variable, never the token.
+    #[test]
+    fn dev_bearer_refused_without_dev_defaults() {
+        let err = AppConfig::check_internal_token(Mode::SelfHosted, DevDefaults::OFF, DEFAULT_APP_AUTH_INTERNAL_TOKEN)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("CHELABASE_APP_AUTH_INTERNAL_TOKEN"), "{err}");
+        assert!(!err.contains(DEFAULT_APP_AUTH_INTERNAL_TOKEN), "{err}");
+        let unset = AppConfig::from_vars(vars(&FULL)).unwrap().unwrap();
+        assert!(AppConfig::check_internal_token(Mode::SelfHosted, DevDefaults::OFF, &unset.internal_token).is_err());
+        assert!(AppConfig::check_internal_token(Mode::SelfHosted, DevDefaults::ON, DEFAULT_APP_AUTH_INTERNAL_TOKEN).is_ok());
+        assert!(AppConfig::check_internal_token(Mode::SelfHosted, DevDefaults::OFF, "a-long-random-secret").is_ok());
+    }
+
+    // m5 (AC 3): each id is the variable or the file it names, not both (the error names the
+    // variable); the org id is required in one form.
+    #[test]
+    fn config_refuses_env_and_file_both() {
+        for name in [
+            "CHELABASE_ZITADEL_ORG_ID",
+            "CHELABASE_ZITADEL_STUDIO_CLIENT_ID",
+            "CHELABASE_ZITADEL_PROJECT_ID",
+        ] {
+            let file = format!("{name}_FILE");
+            let mut pairs = vec![("CHELABASE_ZITADEL_ORG_ID", "o1")];
+            pairs.push((name, "the-id"));
+            pairs.push((file.as_str(), "/out/x"));
+            let err = ZitadelIds::from_lookup(vars(&pairs)).err().expect(name).to_string();
+            assert!(err.contains(&format!("{name} ")) && err.contains("not both"), "{name}: {err}");
+        }
+        let err = ZitadelIds::from_lookup(vars(&[])).err().unwrap().to_string();
+        assert!(err.contains("CHELABASE_ZITADEL_ORG_ID_FILE"), "{err}");
+        let ids = ZitadelIds::from_lookup(vars(&[("CHELABASE_ZITADEL_ORG_ID_FILE", "/out/org-id")])).unwrap();
+        assert_eq!(ids.org_id.var(), "CHELABASE_ZITADEL_ORG_ID_FILE");
+        assert!(ids.org_id.get().is_err(), "not written yet: not ready, not an error at startup");
+        assert!(ids.studio_client_id.is_none() && ids.project_id.is_none());
+        let ids = ZitadelIds::from_lookup(vars(&[("CHELABASE_ZITADEL_ORG_ID", "o1")])).unwrap();
+        assert_eq!(ids.org_id.get(), Ok("o1"));
     }
 
     #[test]

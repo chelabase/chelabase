@@ -16,6 +16,7 @@ import { pollWhile } from "@/lib/query";
 import { CopyButton } from "./copy-button";
 import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
+import { DataApiTypes } from "./data-api-types";
 import { RlsWarning } from "./rls-warning";
 
 export interface DataApiPanelProps {
@@ -155,6 +156,10 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
       {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
       {keys !== null && (
         <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />
+      )}
+      {/* Downloading types is creating a key's access (Developer, by role). */}
+      {canRotate && databases !== null && (
+        <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} />
       )}
       {schemaError && (
         <p role="alert" className="text-destructive">

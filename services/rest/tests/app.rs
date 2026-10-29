@@ -1,6 +1,9 @@
 //! The HTTP edge without a database: identity, the schema route's key check, connection
 //! errors and the body cap. The connection source is a fake; nothing here reaches Postgres.
 
+// Test code: plain clients against local test servers (clippy.toml allows tests only).
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -629,4 +632,213 @@ async fn the_console_route_accepts_the_console_only_forms() {
         assert_eq!(status, 400, "{bad}: {json}");
         assert_eq!(json["error"]["code"], "invalid_query", "{bad}");
     }
+}
+
+/// `GET path` with an identity: status, headers and the raw body.
+async fn get_raw(
+    h: &Harness,
+    path: &str,
+    token: Option<&str>,
+) -> (u16, reqwest::header::HeaderMap, String) {
+    let mut req = h.http.get(format!("http://{}{path}", h.addr));
+    if let Some(token) = token {
+        req = req.header(IDENTITY_HEADER, token);
+    }
+    let resp = req.send().await.unwrap();
+    let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
+    (status, headers, resp.text().await.unwrap())
+}
+
+/// No key, a management identity and a public key: refused exactly as the schema route
+/// refuses them, before any connection.
+#[tokio::test]
+async fn types_refuses_a_public_key() {
+    let h = harness(served).await;
+    let management = h.token("rest", None);
+    let public = h.token("rest", Some(DataKeyKind::Public));
+    let other_audience = h.token("orchestrator", Some(DataKeyKind::Secret));
+    for token in [
+        None,
+        Some(management.as_str()),
+        Some(public.as_str()),
+        Some(other_audience.as_str()),
+    ] {
+        let schema = get_raw(&h, "/data/v1/schema", token).await;
+        assert_eq!(schema.0, 401, "{token:?}");
+        for path in [
+            "/data/v1/types",
+            "/data/v1/types?format=json",
+            "/data/v1/types?all_databases=true",
+            "/data/v1/types?database=analytics",
+        ] {
+            let types = get_raw(&h, path, token).await;
+            assert_eq!((types.0, &types.2), (schema.0, &schema.2), "{path} {token:?}");
+            assert_eq!(
+                types.1.get("content-type"),
+                schema.1.get("content-type"),
+                "{path}"
+            );
+            assert!(types.1.get("etag").is_none(), "{path}");
+        }
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+}
+
+/// A key whose branch rest can't find gets the schema route's answer; no parameter can
+/// name another branch.
+#[tokio::test]
+async fn types_refuses_a_key_for_another_branch() {
+    let h = harness(unknown).await;
+    let token = h.token("rest", Some(DataKeyKind::Secret));
+    let schema = get_raw(&h, "/data/v1/schema", Some(&token)).await;
+    assert_eq!(schema.0, 401);
+    for path in [
+        "/data/v1/types",
+        "/data/v1/types?format=json",
+        "/data/v1/types?all_databases=true",
+    ] {
+        let types = get_raw(&h, path, Some(&token)).await;
+        assert_eq!((types.0, &types.2), (schema.0, &schema.2), "{path}");
+    }
+    let calls = h.calls.load(Ordering::SeqCst);
+    let other = Uuid::new_v4();
+    for path in [
+        format!("/data/v1/types?branch={other}"),
+        format!("/data/v1/types?branch_id={other}"),
+    ] {
+        let (status, _, body) = get_raw(&h, &path, Some(&token)).await;
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!((status, &body["error"]["code"]), (400, &Value::from("invalid_query")), "{path}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), calls, "refused before any connection");
+}
+
+/// A database the key can't reach: the schema route's 404, for one database and for main
+/// under `all_databases`.
+#[tokio::test]
+async fn types_answers_unknown_databases_as_the_schema_route_does() {
+    let h = harness(served).await;
+    for (types, schema, token) in [
+        (
+            "/data/v1/types?database=ghost",
+            "/data/v1/schema?database=ghost",
+            h.token("rest", Some(DataKeyKind::Secret)),
+        ),
+        (
+            "/data/v1/types?database=analytics&format=json",
+            "/data/v1/schema?database=analytics",
+            h.listed(DataKeyKind::Secret, &["main"]),
+        ),
+        (
+            "/data/v1/types?all_databases=true",
+            "/data/v1/schema",
+            h.listed(DataKeyKind::Secret, &["analytics"]),
+        ),
+    ] {
+        let want = get_raw(&h, schema, Some(&token)).await;
+        let got = get_raw(&h, types, Some(&token)).await;
+        assert_eq!(want.0, 404, "{schema}");
+        assert_eq!((got.0, &got.2), (want.0, &want.2), "{types}");
+    }
+}
+
+/// The CLI's refused combinations, a format that isn't `ts` or `json`, and parameters it
+/// doesn't know: 400 `invalid_query` before any connection, with no schema in the text.
+#[tokio::test]
+async fn types_refuses_options_the_cli_refuses() {
+    let h = harness(served).await;
+    let token = h.token("rest", Some(DataKeyKind::Secret));
+    for path in [
+        "/data/v1/types?database=analytics&all_databases=true",
+        "/data/v1/types?all_databases=true&database=main",
+        "/data/v1/types?format=xml",
+        "/data/v1/types?format=TS",
+        "/data/v1/types?format=",
+        "/data/v1/types?all_databases=yes",
+        "/data/v1/types?all_databases=",
+        "/data/v1/types?allDatabases=true",
+        "/data/v1/types?format=ts&format=json",
+        "/data/v1/types?database=main&database=analytics",
+    ] {
+        let (status, headers, text) = get_raw(&h, path, Some(&token)).await;
+        let body: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        assert_eq!(status, 400, "{path}: {text}");
+        assert_eq!(body["error"]["code"], "invalid_query", "{path}: {text}");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "application/json",
+            "{path}"
+        );
+        assert!(!text.contains("reporting") && !text.contains("public"), "{path}: {text}");
+    }
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    // `all_databases=false` is the default; the request reaches the connection (none here).
+    let (status, _, _) = get_raw(&h, "/data/v1/types?all_databases=false&format=ts", Some(&token)).await;
+    assert_eq!(status, 503);
+}
+
+/// `GET /internal/types/{branch_id}?role=…`, as the internal listener answers it.
+async fn internal_types(h: &Harness, query: &str, bearer: Option<&str>) -> (u16, Value) {
+    let path = format!("/internal/types/{}{query}", Uuid::new_v4());
+    let header = bearer.map(|b| ("authorization", format!("Bearer {b}")));
+    h.get(h.internal, &path, header).await
+}
+
+/// The orchestrator's types route: only with the internal bearer, only on the internal
+/// listener, and with exactly one non-empty `role` beside the public route's options. Each
+/// refusal comes before any connection.
+#[tokio::test]
+async fn internal_types_needs_the_bearer_and_one_role() {
+    let h = harness(served).await;
+    for bearer in [None, Some("nope")] {
+        let (status, _) = internal_types(&h, "?role=authenticated", bearer).await;
+        assert_eq!(status, 401, "{bearer:?}");
+    }
+    // Not on the public listener, whatever the identity.
+    let token = h.token("rest", Some(DataKeyKind::Secret));
+    let (status, _, _) =
+        get_raw(&h, &format!("/internal/types/{}?role=authenticated", Uuid::new_v4()), Some(&token)).await;
+    assert_eq!(status, 404);
+    for query in [
+        "",
+        "?role=",
+        "?format=ts",
+        "?role=a&role=b",
+        "?role=authenticated&format=xml",
+        "?role=authenticated&database=main&all_databases=true",
+        "?role=authenticated&format=ts&format=json",
+        "?role=authenticated&branch=x",
+    ] {
+        let (status, body) = internal_types(&h, query, Some(TOKEN)).await;
+        assert_eq!((status, &body["error"]["code"]), (400, &Value::from("invalid_query")), "{query}: {body}");
+    }
+    // The unknown-option message lists what this route takes: `role` too.
+    let (_, body) = internal_types(&h, "?role=authenticated&branch=x", Some(TOKEN)).await;
+    let message = body["error"]["message"].as_str().unwrap();
+    for option in ["`role`", "`format`", "`database`", "`all_databases`"] {
+        assert!(message.contains(option), "{option} missing: {message}");
+    }
+    let (status, _, text) = get_raw(&h, "/data/v1/types?branch=x", Some(&h.token("rest", Some(DataKeyKind::Secret)))).await;
+    assert_eq!(status, 400);
+    assert!(!text.contains("`role`"), "the public route takes no role: {text}");
+    assert_eq!(h.calls.load(Ordering::SeqCst), 0);
+    // A valid request reaches the connection (nothing listens: 503).
+    let (status, _) = internal_types(&h, "?role=authenticated&format=json", Some(TOKEN)).await;
+    assert_eq!(status, 503);
+}
+
+/// The branch's states, as the internal schema route answers them.
+#[tokio::test]
+async fn internal_types_passes_branch_states_through() {
+    let h = harness(not_ready).await;
+    let (status, body) = internal_types(&h, "?role=authenticated", Some(TOKEN)).await;
+    assert_eq!((status, &body["status"]), (409, &Value::from("resetting")), "{body}");
+    let h = harness(unknown).await;
+    let (status, body) = internal_types(&h, "?role=authenticated", Some(TOKEN)).await;
+    assert_eq!((status, &body["error"]["code"]), (404, &Value::from("unknown_branch")), "{body}");
+    // A database the branch doesn't serve: the public route's answer.
+    let h = harness(served).await;
+    let (status, body) = internal_types(&h, "?role=authenticated&database=ghost", Some(TOKEN)).await;
+    assert_eq!((status, &body["error"]["code"]), (404, &Value::from("unknown_database")), "{body}");
 }

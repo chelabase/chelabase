@@ -8,6 +8,7 @@ use auth::zitadel::Zitadel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    chelabase_types::cli::handle("auth", "The Chelabase auth service: sign-in and app-user flows.", env!("CARGO_PKG_VERSION"));
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -25,27 +26,28 @@ async fn main() -> anyhow::Result<()> {
             "required"
         }
     );
+    let dev = chelabase_types::dev_defaults::DevDefaults::from_env().map_err(anyhow::Error::msg)?;
     let listener = tokio::net::TcpListener::bind(&config.listen).await?;
     info!("auth listening on {}", config.listen);
     let app = match AppConfig::from_env()? {
         Some(c) => {
-            AppConfig::check_internal_token(config.mode, &c.internal_token)?;
+            AppConfig::check_internal_token(config.mode, dev, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
-            Some(AppUsers::from_config(&c, &config.issuer)?)
+            Some(AppUsers::from_config(&c, &config.zitadel)?)
         }
         None => None,
     };
     let signup_gate = {
         let c = AppConfig::internal_from_env()?;
-        AppConfig::check_internal_token(config.mode, &c.1)?;
+        AppConfig::check_internal_token(config.mode, dev, &c.1)?;
         auth::app_users::InternalClient::new(&c.0, &c.1)
     };
     let state = Arc::new(AppState {
         app,
         signup_gate: Some(signup_gate),
         used_tickets: Default::default(),
-        admin: AppConfig::admin_from_env(&config.issuer)?,
-        zitadel: Zitadel::new(&config.issuer, &config.token),
+        admin: AppConfig::admin_from_env(&config.zitadel)?,
+        zitadel: Zitadel::new(&config.zitadel.base, &config.token).with_host(config.zitadel.host.as_deref()),
         config,
         limiter: RateLimiter::default(),
     });

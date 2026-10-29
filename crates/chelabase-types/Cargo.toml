@@ -12,6 +12,8 @@ getrandom = { workspace = true }
 sha2 = { workspace = true }
 axum = { workspace = true, optional = true }
 serde_json = { workspace = true }
+# O_NOFOLLOW | O_NONBLOCK for FileValue's open (their values differ per architecture).
+libc = { workspace = true }
 utoipa = { workspace = true, optional = true }
 
 [features]

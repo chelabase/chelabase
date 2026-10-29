@@ -50,6 +50,7 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 409 | `personal_login_exists` | The caller already has a live personal login on this database. Reset its password, or delete it and create a new one to change the name. |
 | 403 | `not_available_in_platform_mode` | The feature (or self-sign-up) isn't designed for platform mode yet. |
 | 403 | `sign_up_closed` | Open sign-up is off and the tenant already has members. |
+| 403 | `setup_code_invalid` | The instance has no member yet and its first sign-up needs the setup code that `chelabase-init secrets` printed; it was missing or wrong. No account is created. |
 | 409 | `last_tenant_admin` | The change would leave the tenant without an active tenant admin (demoting or removing the last one). |
 | 409 | `link_not_allowed` | A link invite (`delivery: "link"`) for someone who already has a way to sign in (a password, passkey, OTP or identity-provider link). Send it by email instead; `error.email_available` says whether email delivery works now. |
 | 409 | `signup_pending` | The person signed up and waits for approval. Approve or decline the sign-up instead of inviting them; `error.member_id` names the member. |
