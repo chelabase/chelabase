@@ -333,6 +333,8 @@ act workflow_dispatch -W .github/workflows/ci.yml
 act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /var/run/docker.sock --artifact-server-path /tmp/act-artifacts   # brings up a workbench stack
 ```
 
+`act` needs a runner image (`-P ubuntu-latest=catthehacker/ubuntu:act-24.04`; the `full` image is about 75 GB) and a GitHub token (`-s GITHUB_TOKEN=…`, a fine-grained token with no access is enough): `proto` resolves the Rust, just and moon versions through the GitHub API, and without a token it fails with "Failed to resolve … to a valid supported version". Don't pass `--bind`: the runner's user (uid 1001) takes ownership of the bound checkout. Neither workflow has been run under `act` yet.
+
 `act` can't prove: that its runner image matches ubuntu-latest (the packages, the Docker and Compose versions: the workbench needs Compose 2.30 or newer), how `actions/cache` and `rust-cache` behave on GitHub's cache service, timing and disk limits on the hosted runner, and the `workflow_dispatch` UI. The first real run at launch checks these.
 
 ## Releasing images
