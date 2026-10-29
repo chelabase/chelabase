@@ -127,8 +127,8 @@ check:
     pnpm --filter @chelabase/studio test
     pnpm --filter @chelabase/client typecheck
     pnpm --filter @chelabase/client test
-    pnpm --filter @chelabase/lagoon typecheck
-    pnpm --filter @chelabase/lagoon test
+    pnpm --filter @chelabase/design typecheck
+    pnpm --filter @chelabase/design test
     pnpm --filter @chelabase/docs typecheck
     pnpm --filter @chelabase/docs build
     pnpm --filter @chelabase/docs test

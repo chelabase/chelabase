@@ -6,7 +6,7 @@ function stripComments(s: string): string {
 }
 
 /**
- * Every font-stack declaration of a css/ts/tsx source that is not exactly the lagoon's
+ * Every font-stack declaration of a css/ts/tsx source that is not exactly the design's
  * `var(--font-sans|serif|mono)` (D8): `font-family` / `fontFamily` values (whole value, so a
  * trailing fallback is a violation), `--font-*` definitions, the `font:` shorthand naming a
  * family, and Tailwind arbitrary `font-[...]` utilities naming a family. Weights are fine.
@@ -33,7 +33,7 @@ export function fontViolations(source: string): string[] {
     if (/["'`,]/.test(rest) || /\d(?:px|rem|em|%|pt|vw|vh)?(?:\/[\w.]+)?\s+[a-zA-Z-]+/.test(rest)) hits.push(m[0].trim());
   }
 
-  // Tailwind arbitrary values: weights and the lagoon var are fine, anything else names a family.
+  // Tailwind arbitrary values: weights and the design vars are fine, anything else names a family.
   for (const m of src.matchAll(/font-\[([^\]]+)\]/g)) {
     const v = m[1]!.trim();
     const ok =

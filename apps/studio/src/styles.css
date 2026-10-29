@@ -1,7 +1,7 @@
 @import "tailwindcss";
-@import "@chelabase/lagoon/tokens.css";
-@import "@chelabase/lagoon/base.css";
-@import "@chelabase/lagoon/tailwind.css";
+@import "@chelabase/design/tokens.css";
+@import "@chelabase/design/base.css";
+@import "@chelabase/design/tailwind.css";
 
 /* Studio is always dark (D4): make `dark:` always apply, not only under prefers-color-scheme. */
 @custom-variant dark (&:where(:root, :root *));
@@ -21,7 +21,7 @@
 }
 
 :root {
-  /* shadcn semantic tokens, remapped onto the lagoon. */
+  /* shadcn semantic tokens, remapped onto the design tokens. */
   --background: var(--ink);
   --foreground: var(--chalk);
   --primary: var(--sand);
@@ -63,7 +63,7 @@ body,
   }
 }
 [role="gridcell"][data-changed="true"][data-motion="flash"] {
-  animation: live-cell-flash 1.4s var(--ease-lagoon) both;
+  animation: live-cell-flash 1.4s var(--ease-design) both;
 }
 [role="gridcell"][data-changed="true"][data-motion="none"] {
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--seafoam) 60%, transparent);

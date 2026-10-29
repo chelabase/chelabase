@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Archive, Braces, Database, DoorOpen, GitBranch, LayoutDashboard, SquareTerminal, Users, type LucideIcon } from "lucide-react";
-import { ClawMark, CrabFigure, Wordmark } from "@chelabase/lagoon/crab-marks";
+import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
 import { ShoreScene } from "./shore-scene";
 import { FOCUS, INSET_LABEL, TideGauge } from "./tide-gauge";
 
@@ -34,7 +34,7 @@ type Ground = "ink" | "sand";
 function plate({ primary = false, small = false, ground = "ink" }: { primary?: boolean; small?: boolean; ground?: Ground }) {
   const base =
     "inline-flex items-center justify-center gap-[0.5em] border-[1.5px] font-sans font-semibold leading-none cursor-pointer " +
-    "transition-[background-color,box-shadow,translate] duration-[180ms,220ms,220ms] ease-lagoon " +
+    "transition-[background-color,box-shadow,translate] duration-[180ms,220ms,220ms] ease-design " +
     "hover:-translate-y-px active:translate-y-0 focus-visible:outline-2 focus-visible:outline-offset-3";
   const size = small ? "min-h-8 px-3 rounded-md text-sm" : "min-h-9.5 px-4 rounded-lg text-[0.9375rem]";
   const glow = "hover:shadow-[0_8px_20px_-8px] hover:shadow-sand/50";
@@ -88,7 +88,7 @@ const CLAW = "-mb-[0.1em] overflow-visible";
 
 export function LandingPage({ studioUrl }: LandingPageProps) {
   return (
-    <div className="lagoon min-h-screen bg-ink text-chalk font-sans leading-[1.6] antialiased overflow-x-clip">
+    <div className="landing min-h-screen bg-ink text-chalk font-sans leading-[1.6] antialiased overflow-x-clip">
       <nav className="sticky top-0 z-20 h-16 bg-ink border-b border-line" aria-label="Chelabase">
         <div className={`${COLUMN} flex items-center justify-between gap-4 h-full`}>
           <a href="/" className={`flex items-center text-[1.25rem] ${FOCUS}`}>

@@ -1,6 +1,6 @@
-/* The landing's leftovers: what Tailwind utilities can't express cleanly. Colours are lagoon tokens only. */
+/* The landing's leftovers: what Tailwind utilities can't express cleanly. Colours are design tokens only. */
 
-:root:has(.lagoon) {
+:root:has(.landing) {
   background: var(--ink);
   color-scheme: dark;
 }
@@ -10,7 +10,7 @@
 .survey {
   stroke-dasharray: var(--len) var(--len);
   stroke-dashoffset: var(--len);
-  animation: survey 1600ms var(--ease-lagoon) forwards;
+  animation: survey 1600ms var(--ease-design) forwards;
   animation-delay: var(--delay, 0ms);
 }
 
@@ -18,7 +18,7 @@
   transform-box: fill-box;
   transform-origin: center;
   opacity: 0;
-  animation: ripple 1800ms var(--ease-lagoon) forwards;
+  animation: ripple 1800ms var(--ease-design) forwards;
 }
 
 @keyframes survey {
@@ -73,11 +73,11 @@
 
 /* ---------- Code insets ---------- */
 
-.lagoon pre::-webkit-scrollbar {
+.landing pre::-webkit-scrollbar {
   height: 8px;
 }
 
-.lagoon pre::-webkit-scrollbar-thumb {
+.landing pre::-webkit-scrollbar-thumb {
   background: var(--line-strong);
   border-radius: 4px;
 }
@@ -123,9 +123,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .lagoon *,
-  .lagoon *::before,
-  .lagoon *::after {
+  .landing *,
+  .landing *::before,
+  .landing *::after {
     animation-duration: 1ms !important;
     animation-delay: 0ms !important;
     transition-duration: 1ms !important;

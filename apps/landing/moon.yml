@@ -13,7 +13,7 @@ tasks:
     inputs:
       - "src/**/*"
       - "vite.config.ts"
-      - "/packages/lagoon/**/*"
+      - "/packages/design/**/*"
     outputs:
       - "dist"
   typecheck:
@@ -21,12 +21,12 @@ tasks:
     args: ["typecheck"]
     inputs:
       - "**/*"
-      - "/packages/lagoon/src/**/*"
+      - "/packages/design/src/**/*"
   test:
     command: "pnpm"
     args: ["test"]
     inputs:
       - "**/*"
-      - "/packages/lagoon/src/**/*"
+      - "/packages/design/src/**/*"
     deps:
       - "~:build"

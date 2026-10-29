@@ -57,7 +57,7 @@ export function RoleSwitch({ checked, onChange, disabled, label, staged }: { che
     >
       <span
         aria-hidden="true"
-        className={cn("block size-4 bg-chalk-dim transition-transform duration-150 ease-lagoon motion-reduce:transition-none", checked && "translate-x-5 bg-seafoam")}
+        className={cn("block size-4 bg-chalk-dim transition-transform duration-150 ease-design motion-reduce:transition-none", checked && "translate-x-5 bg-seafoam")}
       />
     </button>
   );

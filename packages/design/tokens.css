@@ -1,4 +1,6 @@
-/* The lagoon: fonts and design tokens. The single source for every app (D8). */
+/* @chelabase/design: fonts and design tokens. The single source for every app (D8).
+   Two themes share the same unprefixed tokens (--ink, --chalk, ...): Basalt, the default, on :root,
+   and Lagoon, the alternate, on :root[data-theme="lagoon"]. */
 @import "@fontsource/spectral/400.css";
 @import "@fontsource/spectral/400-italic.css";
 @import "@fontsource/spectral/600.css";
@@ -7,7 +9,7 @@
 @import "@fontsource-variable/jetbrains-mono";
 
 :root {
-  /* THEME: Basalt, the default. This bare :root block is the Basalt theme; the Lagoon alternate below
+  /* THEME: Basalt, the default. This bare :root block is the Basalt theme; the Lagoon theme below
      overrides its neutrals under :root[data-theme="lagoon"], so a future picker only sets that attribute. */
   color-scheme: dark;
 
@@ -37,7 +39,7 @@
   --claw-eye: #fff6ee; /* the crab's eye whites */
 
   /* HTTP method tones: each method its own hue, as API docs conventionally do. POST (green, also
-     2xx) = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard).
+     2xx) = seafoam and DELETE (red, also errors) = coral keep their meanings (yes, hazard).
      GET, PUT and PATCH get method-only tones that mean nothing else. Every tone is >= 5.4:1 on
      ink, deep and channel, and on its 10% badge tint. */
   --method-get: #9cc8ea;
@@ -46,11 +48,7 @@
 
   --radius: 0.5rem;
 
-  /* Font stacks. Tailwind's --font-* are mapped onto these in tailwind.css; never define
-     --font-* here (a self-referencing --font-sans would be a cycle). */
-  --lagoon-font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
-  --lagoon-font-serif: Spectral, "Iowan Old Style", Georgia, serif;
-  --lagoon-font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  /* The font stacks are Tailwind's --font-sans/serif/mono, defined in tailwind.css's @theme. */
 }
 
 /* THEME: Lagoon, the alternate. The former default (dusk teal grounds, cool chalk), kept for a future

@@ -11,7 +11,7 @@
     "visual": "playwright test"
   },
   "dependencies": {
-    "@chelabase/lagoon": "workspace:*",
+    "@chelabase/design": "workspace:*",
     "@tanstack/react-router": "1.170.41",
     "@tanstack/react-start": "1.168.60",
     "lucide-react": "^1.50.0",

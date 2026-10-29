@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-/** Every colour comes from a lagoon token (D7): the app's own sources hold no colour literal. */
+/** Every colour comes from a design token (D7): the app's own sources hold no colour literal. */
 
 const srcRoot = resolve(import.meta.dirname, '../src');
 

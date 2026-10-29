@@ -1,6 +1,6 @@
 /*
- * Scalar in the lagoon palette. Rendered in a <style> after Scalar's own CSS, only while the API
- * page is mounted, and every rule is scoped to `.lagoon-scalar` (the page wrapper): nothing global.
+ * Scalar in the design palette. Rendered in a <style> after Scalar's own CSS, only while the API
+ * page is mounted, and every rule is scoped to `.design-scalar` (the page wrapper): nothing global.
  *
  * Scalar declares its colours inside `@layer scalar-base` on `.dark-mode` (set on <body>), so any
  * unlayered rule wins whatever the specificity. The derived variables (sidebar, tooltip, alert,
@@ -9,8 +9,8 @@
  * One Meaning: coral = hazard (red, danger, alert), seafoam = yes (green), sand = action, selection
  * and focus only (accent, button), palm = reserved. Hairline Not Shadow.
  */
-.lagoon-scalar,
-.lagoon-scalar .dark-mode,
+.design-scalar,
+.design-scalar .dark-mode,
 /* Scalar teleports its dropdowns and popovers to <body> (`body > .scalar-app`), outside the wrapper.
    Still page-scoped: this <style> unmounts with the API page. */
 body > .scalar-app {
@@ -36,7 +36,7 @@ body > .scalar-app {
   --scalar-scrollbar-color-active: color-mix(in srgb, var(--chalk) 40%, transparent);
 
   /* Method colours: each method its own hue, as API docs conventionally do. POST (green, also 2xx)
-     = seafoam and DELETE (red, also errors) = coral keep their lagoon meanings (yes, hazard). GET,
+     = seafoam and DELETE (red, also errors) = coral keep their meanings (yes, hazard). GET,
      PUT and PATCH get method-only tones that mean nothing else in Studio. Scalar also paints 3xx
      with yellow and "required" with orange, so those take the PATCH and PUT tones. OPTIONS
      (purple) is chalk-dim like HEAD and TRACE. Sand stays action/selection/focus only, palm

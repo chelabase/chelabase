@@ -20,7 +20,7 @@ export interface ModalProps {
 }
 
 /**
- * The lagoon popup surface, shared by every dialog: deep water, a strong hairline, square, no
+ * The popup surface, shared by every dialog: deep water, a strong hairline, square, no
  * shadow; the page behind dims. Focus is trapped and Escape closes it.
  */
 export const popupSurface = "border border-line-strong bg-deep text-chalk";

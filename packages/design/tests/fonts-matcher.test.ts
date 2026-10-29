@@ -27,7 +27,7 @@ describe("fontViolations", () => {
     ["font-size", "a { font-size: 12px; }"],
     ["Tailwind weight utility", `<p className="font-semibold font-[600] font-sans font-mono" />`],
     ["Tailwind weight type", `<p className="font-[weight:var(--w)]" />`],
-    ["Tailwind lagoon family", `<p className="font-[family-name:var(--font-serif)]" />`],
+    ["Tailwind design family", `<p className="font-[family-name:var(--font-serif)]" />`],
     ["a comment naming a family", "/* font-family: Georgia; */ a { color: red; }"],
   ])("accepts %s", (_name, src) => {
     expect(fontViolations(src)).toEqual([]);

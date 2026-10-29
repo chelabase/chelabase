@@ -77,11 +77,11 @@ describe("one font source (D8)", () => {
         "@fontsource/spectral/700.css",
       ].sort(),
     );
-    const props = customProperties(tokens);
-    expect(props.get("--lagoon-font-sans")).toBe(
+    const props = customProperties(readCss("tailwind.css"));
+    expect(props.get("--font-sans")).toBe(
       '"Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif',
     );
-    expect(props.get("--lagoon-font-serif")).toBe('Spectral, "Iowan Old Style", Georgia, serif');
-    expect(props.get("--lagoon-font-mono")).toBe('"JetBrains Mono Variable", ui-monospace, monospace');
+    expect(props.get("--font-serif")).toBe('Spectral, "Iowan Old Style", Georgia, serif');
+    expect(props.get("--font-mono")).toBe('"JetBrains Mono Variable", ui-monospace, monospace');
   });
 });
