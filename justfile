@@ -80,6 +80,12 @@ create-db-demo name="demo1":
 sweep-dbs:
     cargo run -q -p chelabase -- workbench run scripts/sweep-dbs.sh
 
+# Check that sweep-dbs clears every row that references a database or branch (a populated scratch
+# database on the stack's metadata server; the stack's own data is not touched), and that its list
+# covers every foreign key to them
+sweep-dbs-test:
+    cargo run -q -p chelabase -- workbench run scripts/tests/sweep-dbs.sh
+
 # --- Checks ---
 
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
