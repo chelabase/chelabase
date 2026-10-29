@@ -150,6 +150,7 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
     rest:8085) refused POST http://rest:8085/data/v1/query "the data API" -H 'Content-Type: application/json' -d '{}' ;;
     rest:8086)
       refused GET "http://rest:8086/internal/schema/$uuid" "rest's internal schema route"
+      refused GET "http://rest:8086/internal/types/$uuid?role=authenticated" "rest's internal types route"
       refused POST "http://rest:8086/internal/console/$uuid/query" "rest's internal console route" -d '{}' ;;
     # Studio's sign-in backend: public by design (it is what the gateway serves to anyone), but
     # ruling (e): a compute can't pick its rate-limit key through X-Forwarded-For. 61 lookups of
