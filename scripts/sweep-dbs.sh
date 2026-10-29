@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Removes this stack's Neon computes (label chelabase.dev/stack=$CHELABASE_STACK), deletes their
-# storage-controller tenants, and clears the `databases`, `branches` and `neon_endpoints` rows.
+# storage-controller tenants, and clears every metadata row that belongs to a database
+# (scripts/lib/sweep-dbs.sql): databases, branches, endpoints, roles, keys, merges, app sessions, grants.
 # Does not touch the stack's infrastructure or any other stack. Run it through
 # `just sweep-dbs` (the stack's runner).
 set -euo pipefail
@@ -31,7 +32,7 @@ if psql "$CHELABASE_METADATA_DATABASE_URL" -qtA -c 'SELECT 1' >/dev/null 2>&1; t
     delete_tenant "${tenant}"
   done
   echo "deleted $(echo "${tenants}" | wc -w | tr -d ' ') storage-controller tenant(s)"
-  counts="$(metadata_sql <<<"WITH e AS (DELETE FROM neon_endpoints RETURNING 1), b AS (DELETE FROM branches RETURNING 1), d AS (DELETE FROM databases RETURNING 1) SELECT (SELECT count(*) FROM e) || ' ' || (SELECT count(*) FROM d);")"
+  counts="$(metadata_sql -1 -f scripts/lib/sweep-dbs.sql)"
   echo "cleared ${counts% *} Neon endpoint row(s) and ${counts#* } metadata database row(s)"
 else
   echo "metadata Postgres isn't answering — skipped clearing the databases table (just workbench up, then just sweep-dbs)"

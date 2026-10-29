@@ -59,7 +59,7 @@ jobs:
           failed=()
           for recipe in neon-smoke neon-e2e branch-e2e storage-leak-e2e compute-network-e2e \
                         auth-e2e role-e2e members-e2e personal-logins-e2e teams-e2e \
-                        data-e2e console-e2e app-users-e2e sql-editor-e2e merge-e2e; do
+                        data-e2e console-e2e app-users-e2e sql-editor-e2e merge-e2e sweep-dbs-test; do
             echo "::group::$recipe"
             if just "$recipe"; then echo "PASS $recipe"; else echo "FAIL $recipe"; failed+=("$recipe"); fi
             echo "::endgroup::"

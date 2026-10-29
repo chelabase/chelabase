@@ -25,6 +25,7 @@ done
 just --show bench-data-api | gq 'workbench run --env CHELABASE_BENCH_TEST_BIN=' ||
   fail "the benchmark passes its prebuilt test binary"
 just --show sweep-dbs | gq 'workbench run scripts/sweep-dbs.sh' || fail "sweep-dbs runs in the runner"
+just --show sweep-dbs-test | gq 'workbench run scripts/tests/sweep-dbs.sh' || fail "sweep-dbs-test runs in the runner"
 just --show wt-remove | gq 'workbench purge' || fail "wt-remove purges the worktree's stack"
 ! just --show wt-remove | gq -iE 'sha256|sha256sum|cut -c' || fail "wt-remove lets the CLI resolve the worktree's stack (run from the worktree), never recomputes the slug"
 just --show wt-remove | gq -- '--show-toplevel' || fail "wt-remove checks the directory is still that worktree (git toplevel) before it purges (T5 review I4)"
