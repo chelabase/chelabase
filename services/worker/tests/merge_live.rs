@@ -1356,6 +1356,41 @@ async fn a_recompute_after_a_committed_phase1_stays_half_applied() {
         assert_planned(&m);
         let m = fx.rehearse(m.id).await;
         assert_rehearsed_clean(&m);
+        // A transaction with an xid, open on main: `CREATE INDEX CONCURRENTLY` (the online step)
+        // waits for it, so the merge sits in `online` until it ends, whatever the image speed.
+        let holder = tokio::spawn({
+            let fx = fx.clone();
+            async move {
+                let ep = fx.ep(fx.main).await;
+                let opts = SqlOpts {
+                    timeout: Duration::from_secs(90),
+                    app_name: Some("t14-holder".into()),
+                    ..SqlOpts::admin_default()
+                };
+                fx.worker
+                    .computes
+                    .admin_sql_with(
+                        &ep,
+                        &fx.database,
+                        "BEGIN; SELECT txid_current(); SELECT pg_sleep(25); COMMIT;",
+                        &opts,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:#}"))
+            }
+        });
+        let started = Instant::now();
+        while fx
+            .value(
+                fx.main,
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = 't14-holder' AND query LIKE '%pg_sleep%';",
+            )
+            .await
+            != "1"
+        {
+            assert!(started.elapsed() < Duration::from_secs(60), "the holder never started");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         // Phase 1 commits; the worker goes away before the move on.
         fx.start_apply(m.id).await;
         let apply = tokio::spawn({
@@ -1371,8 +1406,10 @@ async fn a_recompute_after_a_committed_phase1_stays_half_applied() {
                 m.status == MergeStatus::Online || !m.status.is_working()
             })
             .await;
+        assert!(!holder.is_finished(), "the holder ended before the merge reached online");
         apply.abort();
         let _ = apply.await;
+        holder.await.unwrap().expect("the holder");
         assert_eq!(online.status, MergeStatus::Online, "{:?}", online.error);
         // As if phase 1's answer and the marker read were lost: failed in `tx`, then the user's
         // Recompute (`recomputeMerge` moves it to `computing`).
