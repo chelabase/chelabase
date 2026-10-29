@@ -82,7 +82,7 @@ pub struct UserPage {
 const SESSION_PAGE: u32 = 100;
 
 pub struct Zitadel {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base: String,
     /// The `Host` every call carries, when `base` is Zitadel's in-network address (#24).
     host: Option<String>,

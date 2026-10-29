@@ -473,7 +473,7 @@ pub struct InternalState<M, L> {
     /// Signs the tokens compute_ctl accepts, and publishes their JWKS in each spec.
     pub signer: ComputeSigner,
     /// For compute_ctl's `/configure`.
-    pub http: reqwest::Client,
+    pub http: chelabase_http::Client,
     pub proxy_token: String,
     pub storcon_token: String,
     /// The gateway's token for key lookups.

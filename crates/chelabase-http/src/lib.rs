@@ -1,21 +1,93 @@
-//! The one place a `reqwest` client starts (#26).
+//! The one place a `reqwest` client starts (#26, #32).
 //!
 //! Every client a service or tool builds sends a credential (a PAT, a bearer, an internal
 //! token, a NeonJWT, a data key) or a forced Host, so none of them may follow a redirect: it
 //! would take the credential, or the answer the caller trusts, to wherever the upstream points.
 //! `reqwest` follows up to 10 redirects by default.
 //!
-//! [`client_builder`] returns a builder with `redirect(Policy::none())` already set. The
-//! workspace `clippy.toml` disallows every other way to make a client (`Client::new`,
-//! `Client::builder`, `Client::default`, `ClientBuilder::new`, `reqwest::get`, the blocking
-//! constructors) and `ClientBuilder::redirect` itself, so a caller can't build a client that
-//! follows redirects or turn following back on. Only this function is allowed to call them.
+//! [`Client`] wraps a `reqwest::Client` that refuses redirects, and [`client_builder`] is the
+//! only way to make one. The wrapper has no `Default`, no `Deref`, and no conversion to or from
+//! a `reqwest::Client`. [`ClientBuilder`] exposes only `timeout`, `default_headers` and `build`:
+//! nothing that changes the redirect policy.
+//!
+//! The forwarders return a plain `reqwest::RequestBuilder`, and reqwest itself has two ways
+//! across that boundary: `RequestBuilder::build_split` hands back the inner client, and
+//! `RequestBuilder::from_parts` takes any client, an inferred `Default::default()` one (which
+//! follows redirects) included. Neither is used here, and the workspace `clippy.toml`
+//! disallows both, along with the `reqwest::Client` and `reqwest::ClientBuilder` types
+//! themselves (so an inferred `Default::default()` field fails too), every other constructor,
+//! `reqwest::get` and `ClientBuilder::redirect`. This crate is the only production code allowed
+//! to name them; `scripts/tests/http-no-redirects.sh` fails any other opt-out.
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-/// A `reqwest` client builder that never follows a redirect: a 3xx comes back to the caller as
-/// the response. Set timeouts, headers and the like on it, then `build()`.
-#[allow(clippy::disallowed_methods)]
-pub fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+use std::time::Duration;
+
+pub use reqwest::{IntoUrl, Method, RequestBuilder};
+
+/// A `reqwest` client that never follows a redirect: a 3xx comes back to the caller as the
+/// response. Cheap to clone (the connection pool is shared). Built only by [`client_builder`].
+#[derive(Clone, Debug)]
+pub struct Client(reqwest::Client);
+
+impl Client {
+    /// A `GET` to `url`.
+    pub fn get<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.0.get(url)
+    }
+
+    /// A `POST` to `url`.
+    pub fn post<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.0.post(url)
+    }
+
+    /// A `PUT` to `url`.
+    pub fn put<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.0.put(url)
+    }
+
+    /// A `PATCH` to `url`.
+    pub fn patch<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.0.patch(url)
+    }
+
+    /// A `DELETE` to `url`.
+    pub fn delete<U: IntoUrl>(&self, url: U) -> RequestBuilder {
+        self.0.delete(url)
+    }
+
+    /// A request with `method` to `url`.
+    pub fn request<U: IntoUrl>(&self, method: Method, url: U) -> RequestBuilder {
+        self.0.request(method, url)
+    }
+}
+
+/// Builds a [`Client`]. The redirect policy is fixed at `Policy::none()`; only the settings in
+/// use are exposed, and none of them touches redirects.
+#[derive(Debug)]
+#[must_use]
+pub struct ClientBuilder(reqwest::ClientBuilder);
+
+impl ClientBuilder {
+    /// The total timeout for each request.
+    pub fn timeout(self, timeout: Duration) -> Self {
+        Self(self.0.timeout(timeout))
+    }
+
+    /// Headers sent on every request.
+    pub fn default_headers(self, headers: reqwest::header::HeaderMap) -> Self {
+        Self(self.0.default_headers(headers))
+    }
+
+    /// The client.
+    pub fn build(self) -> reqwest::Result<Client> {
+        self.0.build().map(Client)
+    }
+}
+
+/// A [`ClientBuilder`] that never follows a redirect. Set a timeout or headers on it, then
+/// `build()`.
+pub fn client_builder() -> ClientBuilder {
+    ClientBuilder(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))
 }
 
 #[cfg(test)]
@@ -49,6 +121,27 @@ mod tests {
         (format!("http://{addr}/start"), hits)
     }
 
+    /// `req` came back as the `status` response itself, after one request.
+    async fn unfollowed(
+        req: reqwest::RequestBuilder,
+        status: &str,
+        hits: &std::sync::atomic::AtomicUsize,
+        what: &str,
+    ) {
+        let resp = req.send().await.unwrap();
+        assert_eq!(resp.status().as_str(), &status[..3], "{what}");
+        assert_eq!(
+            resp.url().path(),
+            "/start",
+            "{what}: the client followed the redirect"
+        );
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{what}: one request only"
+        );
+    }
+
     #[tokio::test]
     async fn a_redirect_comes_back_as_the_response() {
         for status in [
@@ -59,19 +152,31 @@ mod tests {
             "308 Permanent Redirect",
         ] {
             let (url, hits) = redirecting(status).await;
-            let http = super::client_builder().build().unwrap();
-            let resp = http.get(&url).send().await.unwrap();
-            assert_eq!(resp.status().as_str(), &status[..3], "{status}");
-            assert_eq!(
-                resp.url().path(),
-                "/start",
-                "{status}: the client followed the redirect"
-            );
-            assert_eq!(
-                hits.load(std::sync::atomic::Ordering::SeqCst),
-                1,
-                "{status}: one request only"
-            );
+            let http: super::Client = super::client_builder().build().unwrap();
+            unfollowed(http.get(&url), status, &hits, status).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarded_methods_keep_the_policy() {
+        let http = super::client_builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .default_headers(reqwest::header::HeaderMap::new())
+            .build()
+            .unwrap();
+        type Forwarder = fn(&super::Client, &str) -> reqwest::RequestBuilder;
+        let forwarders: [(&str, Forwarder); 6] = [
+            ("get", |c, u| c.get(u)),
+            ("post", |c, u| c.post(u)),
+            ("put", |c, u| c.put(u)),
+            ("patch", |c, u| c.patch(u)),
+            ("delete", |c, u| c.delete(u)),
+            ("request", |c, u| c.request(super::Method::OPTIONS, u)),
+        ];
+        for (name, forward) in forwarders {
+            let (url, hits) = redirecting("302 Found").await;
+            // A clone shares the inner client, policy included.
+            unfollowed(forward(&http.clone(), &url), "302 Found", &hits, name).await;
         }
     }
 }

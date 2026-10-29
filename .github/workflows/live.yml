@@ -1,0 +1,85 @@
+# The live suites: a workbench stack, the e2e recipes, then the stack down. Heavy (builds the
+# services, pulls the Neon images), so it runs by hand until launch, then nightly or on a label.
+name: live
+
+on:
+  workflow_dispatch:
+  # enable at launch: uncomment the schedule (nightly) for this workflow
+  # schedule:
+  #   - cron: "17 3 * * *"
+  # enable at launch (optional): run on a PR carrying the `run-live` label by uncommenting this
+  # and the `if:` line on the job below
+  # pull_request:
+  #   types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: live-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  live:
+    name: workbench e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    # if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'run-live')
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: System packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang cmake protobuf-compiler postgresql-client jq
+
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Compose version (the workbench needs 2.30 or newer)
+        run: docker compose version
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Stack up
+        run: just workbench up
+
+      # Every suite runs; failures are collected so one broken suite doesn't hide the rest.
+      - name: Live suites
+        run: |
+          failed=()
+          for recipe in neon-smoke neon-e2e branch-e2e storage-leak-e2e compute-network-e2e \
+                        auth-e2e role-e2e members-e2e personal-logins-e2e teams-e2e \
+                        data-e2e console-e2e app-users-e2e sql-editor-e2e merge-e2e; do
+            echo "::group::$recipe"
+            if just "$recipe"; then echo "PASS $recipe"; else echo "FAIL $recipe"; failed+=("$recipe"); fi
+            echo "::endgroup::"
+          done
+          if ((${#failed[@]})); then echo "::error::failed suites: ${failed[*]}"; exit 1; fi
+
+      - name: Collect logs
+        if: always()
+        run: |
+          mkdir -p ci-logs
+          just workbench status > ci-logs/status.txt 2>&1 || true
+          just workbench logs > ci-logs/compose.log 2>&1 || true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: live-logs
+          path: ci-logs/
+          if-no-files-found: warn
+
+      - name: Stack down
+        if: always()
+        run: just workbench down

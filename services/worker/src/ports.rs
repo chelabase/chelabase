@@ -1876,7 +1876,7 @@ pub trait SpecPusher: Send + Sync + 'static {
 
 /// [`SpecPusher`] over compute_ctl's `/configure`.
 pub struct HttpPusher {
-    pub http: reqwest::Client,
+    pub http: chelabase_http::Client,
     pub signer: ComputeSigner,
 }
 

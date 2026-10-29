@@ -58,7 +58,7 @@ pub fn configure_body(config_response: &Value) -> Value {
 /// compute_ctl answers once the compute has applied the spec. Anything but 2xx is an error:
 /// for example 412 while the compute is still starting.
 pub async fn push(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     control_addr: SocketAddr,
     signer: &ComputeSigner,
     endpoint_id: &str,
@@ -123,7 +123,7 @@ pub struct ComputeCtlReport {
 /// compute_ctl's status of `endpoint_id`'s compute, with the token [`push`] uses. An
 /// unreachable compute_ctl or an answer other than 2xx is an error.
 pub async fn status(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     control_addr: SocketAddr,
     signer: &ComputeSigner,
     endpoint_id: &str,
@@ -137,7 +137,7 @@ pub async fn status(
 /// reports `storage_token_refresh: false`; an unreachable one or a body that isn't a status is
 /// an error, never "no capability".
 pub async fn status_report(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     control_addr: SocketAddr,
     signer: &ComputeSigner,
     endpoint_id: &str,
@@ -180,7 +180,7 @@ pub async fn status_report(
 /// with the same bearer [`push`] uses. Any 2xx is success; otherwise the error carries the
 /// status and compute_ctl's body, never the token.
 pub async fn push_storage_token(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     control_addr: SocketAddr,
     signer: &ComputeSigner,
     endpoint_id: &str,

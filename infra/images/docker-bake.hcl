@@ -7,6 +7,23 @@ variable "TAG" { default = "latest" }
 # it goes into the org.opencontainers.image.revision label, which `--push-only` checks.
 variable "REVISION" { default = "" }
 variable "SOURCE" { default = "https://github.com/chelabase/chelabase" }
+# RELEASE (any non-empty value; scripts/publish-images.sh sets it) adds the index annotations.
+# Plain `just images` leaves them out: BuildKit refuses `index:` annotations for a
+# single-manifest export, which is what `--load` into the classic image store makes.
+variable "RELEASE" { default = "" }
+
+# Index annotations: GHCR links a package to its repository from these, not from the labels.
+# The revision one is left out while REVISION is empty.
+function "index_annotations" {
+  params = [release, source, revision]
+  result = release == "" ? [] : concat(
+    [
+      "index:org.opencontainers.image.source=${source}",
+      "index:org.opencontainers.image.licenses=Apache-2.0",
+    ],
+    revision == "" ? [] : ["index:org.opencontainers.image.revision=${revision}"],
+  )
+}
 
 group "default" {
   targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio"]
@@ -19,6 +36,7 @@ target "_app" {
     "org.opencontainers.image.revision" = "${REVISION}"
     "org.opencontainers.image.source"   = "${SOURCE}"
   }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
 }
 
 target "gateway" {
@@ -69,5 +87,6 @@ target "studio" {
     "org.opencontainers.image.revision" = "${REVISION}"
     "org.opencontainers.image.source"   = "${SOURCE}"
   }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags       = ["${REPO}/studio:${TAG}"]
 }

@@ -19,6 +19,8 @@
 #   - `docker compose config --hash '*'`: each service's config hash, the value `up` compares to
 #     decide whether a running container must be recreated. Equal hashes mean an existing stack's
 #     containers stay as they are.
+# The reference takes today's Neon image pins (the `${NEON_IMAGE:-…}` and
+# `${COMPUTE_NODE_IMAGE:-…}` defaults) from the base file, so a `NEON_REF` bump isn't a diff.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
@@ -50,6 +52,13 @@ if git -C "$root" cat-file -e "$rev:infra/compose/docker-compose.workbench.yml" 
   git -C "$root" show "$rev:infra/compose/docker-compose.workbench.yml" >"$tmp/overlay.yml"
   ref+=(-f "$tmp/overlay.yml")
 fi
+for var in NEON_IMAGE COMPUTE_NODE_IMAGE; do
+  pin="$(sed -nE "s/.*\\\$\\{$var:-([^}]+)\\}.*/\\1/p" "$base" | head -n1)"
+  [[ -n "$pin" ]] || fail "no \${$var:-…} default in $base"
+  for f in "$tmp"/*.yml; do
+    sed -i -E "s#(\\\$\\{$var:-)[^}]+\\}#\\1$pin}#g" "$f"
+  done
+done
 
 project="$(sed -n 's/^CHELABASE_COMPOSE_PROJECT=//p' "$env_file")"
 project="${project:-chelabase-feat-x}"

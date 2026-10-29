@@ -257,6 +257,54 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
     Ok(cleaned)
 }
 
+/// Every `(table, column, also)` that holds a value sealed with the secrets key
+/// (`chelabase_secrets::SecretKey`). A row counts as sealed when `column IS NOT NULL` and, if
+/// `also` is set, that SQL condition holds too (a value that can never be opened again doesn't
+/// count). [`MetadataClient::ensure_key_check`] adopts a new key only while no row counts; a
+/// live test fails when a metadata column named like a sealed one is missing here.
+///
+/// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
+/// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`); `data_api_keys.sealed`
+/// (orchestrator data keys, `Purpose::DataKey`); `neon_roles.password_enc` (worker roles, branch
+/// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
+/// (worker member roles, `seal_member_role_password`); `branch_auth_sync.password_sealed`
+/// (worker app users, `seal_role_password`); `app_sessions.grace_refresh_sealed` (orchestrator
+/// app refresh, `seal`; opened only while `grace_until > now()`, see
+/// [`MetadataClient::refresh_app_session`], and nothing clears it once the window is over).
+pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
+    ("branches", "owner_password_enc", None),
+    ("branches", "authenticator_password_enc", None),
+    ("data_api_keys", "sealed", None),
+    ("neon_roles", "password_enc", None),
+    ("member_branch_roles", "password_enc", None),
+    ("branch_auth_sync", "password_sealed", None),
+    ("app_sessions", "grace_refresh_sealed", Some("grace_until > now()")),
+];
+
+/// The one statement summing the sealed values in every column of [`SECRETS_KEY_SEALED`], as
+/// [`MetadataClient::ensure_key_check`] counts them (tests count with it too). Built from the
+/// constant list only.
+pub fn sealed_count_sql() -> String {
+    let counts: Vec<String> = SECRETS_KEY_SEALED
+        .iter()
+        .map(|(t, c, also)| {
+            let also = also.map(|a| format!(" AND {a}")).unwrap_or_default();
+            format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL{also})")
+        })
+        .collect();
+    format!("SELECT {}", counts.join(" + "))
+}
+
+/// The key check's `LOCK TABLE … IN SHARE MODE` over every table in [`SECRETS_KEY_SEALED`]
+/// and [`sealed_count_sql`].
+fn sealed_check_sql() -> (String, String) {
+    let mut tables: Vec<&str> = SECRETS_KEY_SEALED.iter().map(|(t, _, _)| *t).collect();
+    tables.sort_unstable();
+    tables.dedup();
+    let lock = format!("LOCK TABLE {} IN SHARE MODE", tables.join(", "));
+    (lock, sealed_count_sql())
+}
+
 /// Outcome of [`MetadataClient::ensure_key_check`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyCheck {
@@ -608,6 +656,13 @@ impl MetadataClient {
     /// Compare the current secrets key with the one existing credentials were
     /// sealed with. `candidate` is a fresh check value for the current key and
     /// `opens` tells whether a stored check value opens with it.
+    ///
+    /// A key that doesn't open the stored check is adopted only while no column in
+    /// [`SECRETS_KEY_SEALED`] holds a value. The count and the replace run in one transaction
+    /// holding `SHARE` locks on those tables, so no sealed row can be written in between.
+    /// Those locks can deadlock with a writer that holds one listed table and wants another:
+    /// Postgres aborts one side (40P01), and if it is this check the start fails closed and is
+    /// retried on restart. `lock_timeout` bounds the wait behind a long transaction.
     pub async fn ensure_key_check(
         &self,
         candidate: &str,
@@ -631,20 +686,35 @@ impl MetadataClient {
         if opens(&stored) {
             return Ok(KeyCheck::Matches);
         }
-        let sealed_rows: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM branches
-             WHERE owner_password_enc IS NOT NULL",
-        )
-        .fetch_one(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        // A start racing this one may have adopted the same key meanwhile.
+        let stored: String =
+            sqlx::query_scalar("SELECT value FROM control_settings WHERE key = $1 FOR UPDATE")
+                .bind(KEY)
+                .fetch_one(&mut *tx)
+                .await?;
+        if opens(&stored) {
+            tx.commit().await?;
+            return Ok(KeyCheck::Matches);
+        }
+        // SHARE waits for in-flight writers to commit and holds new ones off until the replace
+        // commits. A long transaction fails the start instead of hanging it.
+        sqlx::query("SET LOCAL lock_timeout = '30s'").execute(&mut *tx).await?;
+        let (lock, count) = sealed_check_sql();
+        sqlx::query(sqlx::AssertSqlSafe(lock)).execute(&mut *tx).await?;
+        let sealed_rows: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count))
+            .fetch_one(&mut *tx)
+            .await?;
         if sealed_rows > 0 {
+            tx.rollback().await?;
             return Ok(KeyCheck::Mismatch { sealed_rows });
         }
         sqlx::query("UPDATE control_settings SET value = $2, updated_at = now() WHERE key = $1")
             .bind(KEY)
             .bind(candidate)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(KeyCheck::Replaced)
     }
 
@@ -847,6 +917,36 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // #38 review: the key check counts every listed column, with its condition, and locks
+    // every listed table first.
+    #[test]
+    fn sealed_check_sql_counts_every_listed_column() {
+        let (lock, count) = sealed_check_sql();
+        let terms: Vec<&str> = count
+            .strip_prefix("SELECT ")
+            .expect("one SELECT")
+            .split(" + ")
+            .collect();
+        let expected: Vec<String> = SECRETS_KEY_SEALED
+            .iter()
+            .map(|(t, c, also)| match also {
+                Some(a) => format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL AND {a})"),
+                None => format!("(SELECT count(*) FROM {t} WHERE {c} IS NOT NULL)"),
+            })
+            .collect();
+        assert_eq!(terms, expected);
+        assert!(count.contains("grace_refresh_sealed IS NOT NULL AND grace_until > now()"));
+        let tables = lock
+            .strip_prefix("LOCK TABLE ")
+            .and_then(|l| l.strip_suffix(" IN SHARE MODE"))
+            .expect("one LOCK TABLE … IN SHARE MODE");
+        let tables: Vec<&str> = tables.split(", ").collect();
+        for (t, _, _) in SECRETS_KEY_SEALED {
+            assert_eq!(tables.iter().filter(|x| *x == t).count(), 1, "{t} locked once");
+        }
+        assert_eq!(count, sealed_count_sql());
+    }
 
     // m5 re-audit S2: `Debug` hides a password in the user info and in a `password` query
     // parameter (any position, a percent-encoded key too), and keeps everything else.

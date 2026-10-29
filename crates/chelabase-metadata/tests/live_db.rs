@@ -436,25 +436,376 @@ async fn key_check_records_matches_and_refuses_a_different_key_while_credentials
 #[ignore]
 async fn key_check_adopts_a_new_key_when_nothing_is_encrypted_yet() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let sealed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM branches WHERE owner_password_enc IS NOT NULL",
-    )
-    .fetch_one(client.pool())
-    .await
-    .unwrap();
-    if sealed > 0 {
-        eprintln!("skipping: {sealed} branches hold encrypted credentials in this environment");
-        return;
-    }
-    let saved = saved_key_check(&client).await;
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
+    let empty = sealed_values(client).await;
     client.ensure_key_check("check-a", |v| v == "check-a").await.unwrap();
     let replaced = client.ensure_key_check("check-b", |v| v == "check-b").await.unwrap();
     let again = client.ensure_key_check("check-b2", |v| v == "check-b").await.unwrap();
-    restore_key_check(&client, saved).await;
+    scratch.finish().await;
+    assert_eq!(empty, 0, "a fresh metadata database holds no sealed values");
     assert_eq!(replaced, KeyCheck::Replaced);
     assert_eq!(again, KeyCheck::Matches);
+}
+
+/// Sealed values in every column the key check covers, counted with the check's own statement.
+async fn sealed_values(client: &MetadataClient) -> i64 {
+    // Constant identifiers and conditions from the list.
+    sqlx::query_scalar(sqlx::AssertSqlSafe(chelabase_metadata::sealed_count_sql()))
+        .fetch_one(client.pool())
+        .await
+        .unwrap()
+}
+
+/// A scratch metadata database (`cm_<12 hex>`, the pattern `members_live` sweeps when stale)
+/// with every migration applied, demo tenant and project included. The tests that need no
+/// sealed value anywhere run here: on the shared stack other live binaries write sealed columns
+/// without [`sealed_lock`], so the stack's count is never reliably zero.
+struct KeyCheckScratch {
+    meta: sqlx::PgPool,
+    name: String,
+    client: MetadataClient,
+}
+
+impl KeyCheckScratch {
+    async fn new() -> Self {
+        let base = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+            "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+        });
+        let meta = raw_pool().await;
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let name = format!("cm_{:08x}{}", secs as u32, &hex32()[..4]);
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+            .execute(&meta)
+            .await
+            .unwrap();
+        let (head, tail) = base.rsplit_once('/').expect("a database in the URL");
+        let query = tail.split_once('?').map(|(_, q)| format!("?{q}")).unwrap_or_default();
+        let client = MetadataClient::connect(&MetadataConfig { database_url: format!("{head}/{name}{query}") })
+            .await
+            .unwrap();
+        client.migrate().await.unwrap();
+        KeyCheckScratch { meta, name, client }
+    }
+
+    async fn finish(self) {
+        self.client.pool().close().await;
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP DATABASE {} WITH (FORCE)", self.name)))
+            .execute(&self.meta)
+            .await
+            .unwrap();
+    }
+}
+
+/// An app session in the demo project holding a sealed grace token whose window ends
+/// `grace_secs` from now (negative: already over); returns its id.
+async fn insert_grace_session(client: &MetadataClient, grace_secs: f64) -> uuid::Uuid {
+    let session = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+                                   grace_refresh_sealed, grace_until, expires_at)
+         VALUES ($1, $2, gen_random_uuid(), 'key-check', decode('00', 'hex'), 'v1:x',
+                 now() + make_interval(secs => $3), now() + interval '1 hour')",
+    )
+    .bind(session)
+    .bind(DEMO_PROJECT_ID)
+    .bind(grace_secs)
+    .execute(client.pool())
+    .await
+    .unwrap();
+    session
+}
+
+/// The parent rows one sealed fixture needs, deleted by [`SealedFixture::remove`].
+struct SealedFixture {
+    database: DatabaseId,
+    member: Option<uuid::Uuid>,
+    session: Option<uuid::Uuid>,
+}
+
+impl SealedFixture {
+    /// A fresh database (main branch and endpoint) with one sealed value in `table.column` and
+    /// none in any other listed column.
+    async fn new(client: &MetadataClient, table: &str, column: &str) -> Self {
+        let database = insert_pending(client).await;
+        let endpoint = link_endpoint(client, database).await;
+        let branch = main_of(database).as_uuid();
+        let mut fixture = SealedFixture { database, member: None, session: None };
+        let pool = client.pool();
+        match (table, column) {
+            ("branches", "owner_password_enc" | "authenticator_password_enc") => {
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE branches SET {column} = 'v1:x' WHERE id = $1"
+                )))
+                    .bind(branch)
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            }
+            ("data_api_keys", "sealed") => {
+                sqlx::query(
+                    "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed)
+                     VALUES (gen_random_uuid(), $1, 'public', 'anon', 'key-check', 'p',
+                             sha256(gen_random_uuid()::text::bytea), 'v1:x')",
+                )
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("neon_roles", "password_enc") => {
+                sqlx::query(
+                    "INSERT INTO neon_roles (endpoint_id, name, origin, password_enc)
+                     VALUES ($1, 'key_check_role', 'sql', 'v1:x')",
+                )
+                .bind(&endpoint)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("member_branch_roles", "password_enc") => {
+                let member = uuid::Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO members (id, tenant_id, zitadel_user_id, status)
+                     VALUES ($1, $2, $3, 'active')",
+                )
+                .bind(member)
+                .bind(DEMO_TENANT_ID)
+                .bind(format!("live-test-key-check-{member}"))
+                .execute(pool)
+                .await
+                .unwrap();
+                fixture.member = Some(member);
+                sqlx::query(
+                    "INSERT INTO member_branch_roles (member_id, branch_id, role_name, password_enc)
+                     VALUES ($1, $2, 'key_check_member', 'v1:x')",
+                )
+                .bind(member)
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("branch_auth_sync", "password_sealed") => {
+                sqlx::query(
+                    "INSERT INTO branch_auth_sync (branch_id, pg_database, password_sealed)
+                     VALUES ($1, 'db', 'v1:x')",
+                )
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
+            ("app_sessions", "grace_refresh_sealed") => {
+                // Within its grace window: it can still be opened.
+                fixture.session = Some(insert_grace_session(client, 3600.0).await);
+            }
+            other => panic!("no fixture for sealed column {other:?}: add one here"),
+        }
+        fixture
+    }
+
+    async fn remove(self, client: &MetadataClient) {
+        if let Some(session) = self.session {
+            sqlx::query("DELETE FROM app_sessions WHERE id = $1")
+                .bind(session)
+                .execute(client.pool())
+                .await
+                .unwrap();
+        }
+        // Branch children (keys, roles, member roles, the sync row) cascade with the branch.
+        cleanup(client, self.database).await;
+        if let Some(member) = self.member {
+            sqlx::query("DELETE FROM members WHERE id = $1")
+                .bind(member)
+                .execute(client.pool())
+                .await
+                .unwrap();
+        }
+    }
+}
+
+// #38: a wrong key is refused whichever listed column holds the only sealed value.
+#[tokio::test]
+#[ignore]
+async fn key_check_refuses_when_only_one_column_is_sealed() {
+    use chelabase_metadata::KeyCheck;
+    let client = client().await;
+    let _lock = key_check_lock().await;
+    let saved = saved_key_check(&client).await;
+    let mut wrong = Vec::new();
+    for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
+        // Other live binaries seal values without `sealed_lock`, so the count can move under
+        // a check. A wrong count is retried while the environment moved (or the check lost a
+        // deadlock to a writer), and fails once it is wrong with the environment stable.
+        for attempt in 1..=KEY_CHECK_ATTEMPTS {
+            let before = sealed_values(&client).await;
+            let fixture = SealedFixture::new(&client, table, column).await;
+            restore_key_check(&client, Some("check-a".into())).await;
+            let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
+            let after = sealed_values(&client).await;
+            let stored = saved_key_check(&client).await;
+            fixture.remove(&client).await;
+            let report = format!(
+                "{table}.{column}: {outcome:?} ({before} before, {after} after), stored check {stored:?}"
+            );
+            // With a sealed value present, nothing the environment does may adopt the key.
+            if stored.as_deref() != Some("check-a") {
+                wrong.push(report);
+                break;
+            }
+            // Exact: a value already in the environment must not hide a missed column.
+            if matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows == before + 1) {
+                break;
+            }
+            let moved = after != before + 1 || outcome.is_err();
+            if !moved || attempt == KEY_CHECK_ATTEMPTS {
+                wrong.push(report);
+                break;
+            }
+            eprintln!("retrying {table}.{column}: the environment moved ({report})");
+        }
+    }
+    restore_key_check(&client, saved).await;
+    assert!(wrong.is_empty(), "a wrong key was not refused: {wrong:#?}");
+}
+
+/// Tries per column before a count the environment kept moving counts as wrong.
+const KEY_CHECK_ATTEMPTS: u32 = 5;
+
+// #38: the key is adopted only once no listed column holds a sealed value; the refusal counts
+// them all.
+#[tokio::test]
+#[ignore]
+async fn key_check_adopts_only_with_no_sealed_values() {
+    use chelabase_metadata::KeyCheck;
+    let _lock = key_check_lock().await;
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
+    let empty = sealed_values(client).await;
+    let mut fixtures = Vec::new();
+    for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
+        fixtures.push(SealedFixture::new(client, table, column).await);
+    }
+    restore_key_check(client, Some("check-a".into())).await;
+    let mut outcomes = Vec::new();
+    while let Some(fixture) = fixtures.pop() {
+        let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await.unwrap();
+        outcomes.push((fixtures.len() as i64 + 1, outcome, saved_key_check(client).await));
+        fixture.remove(client).await;
+    }
+    let adopted = client.ensure_key_check("check-b", |v| v == "check-b").await.unwrap();
+    let after = saved_key_check(client).await;
+    scratch.finish().await;
+    assert_eq!(empty, 0, "a fresh metadata database holds no sealed values");
+    for (remaining, outcome, stored) in outcomes {
+        assert_eq!(outcome, KeyCheck::Mismatch { sealed_rows: remaining }, "{remaining} sealed values left");
+        assert_eq!(stored.as_deref(), Some("check-a"), "replaced with {remaining} sealed values left");
+    }
+    assert_eq!(adopted, KeyCheck::Replaced);
+    assert_eq!(after.as_deref(), Some("check-b"));
+}
+
+// #38 audit: a grace token past its window can never be opened again, so it doesn't hold a
+// new key off.
+#[tokio::test]
+#[ignore]
+async fn key_check_ignores_an_expired_grace_token() {
+    use chelabase_metadata::KeyCheck;
+    let _lock = key_check_lock().await;
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
+    let empty = sealed_values(client).await;
+    insert_grace_session(client, -60.0).await;
+    restore_key_check(client, Some("check-a".into())).await;
+    let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
+    let stored = saved_key_check(client).await;
+    scratch.finish().await;
+    assert_eq!(empty, 0, "a fresh metadata database holds no sealed values");
+    assert_eq!(outcome.unwrap(), KeyCheck::Replaced);
+    assert_eq!(stored.as_deref(), Some("check-b"));
+}
+
+// #38 Review Focus: a sealed write still in flight when the key check counts must not be
+// missed (the check waits for it, then refuses).
+#[tokio::test]
+#[ignore]
+async fn key_check_waits_for_an_inflight_sealed_write() {
+    use chelabase_metadata::KeyCheck;
+    let client = client().await;
+    let _lock = key_check_lock().await;
+    let saved = saved_key_check(&client).await;
+    let database = insert_pending(&client).await;
+    restore_key_check(&client, Some("check-a".into())).await;
+    let writer = raw_pool().await;
+    let mut tx = writer.begin().await.unwrap();
+    sqlx::query("UPDATE branches SET authenticator_password_enc = 'v1:x' WHERE id = $1")
+        .bind(main_of(database).as_uuid())
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let check = client.ensure_key_check("check-b", |v| v == "check-b");
+    tokio::pin!(check);
+    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut check).await;
+    let (finished_early, outcome) = match early {
+        Ok(outcome) => {
+            tx.commit().await.unwrap();
+            (true, outcome)
+        }
+        Err(_) => {
+            tx.commit().await.unwrap();
+            (false, check.await)
+        }
+    };
+    let stored = saved_key_check(&client).await;
+    cleanup(&client, database).await;
+    restore_key_check(&client, saved).await;
+    assert!(!finished_early, "the check finished while a sealed write was uncommitted: {outcome:?}");
+    assert!(matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows >= 1), "{outcome:?}");
+    assert_eq!(stored.as_deref(), Some("check-a"));
+}
+
+/// Metadata columns named like sealed ones that don't hold a secrets-key value, each with why.
+const NOT_SECRETS_KEY_SEALED: &[(&str, &str, &str)] = &[];
+
+// #38: a new sealed column must join the key check (or be excluded here, with a reason).
+#[tokio::test]
+#[ignore]
+async fn every_sealed_column_is_checked() {
+    let client = client().await;
+    let columns: Vec<(String, String)> = sqlx::query_as(
+        r"SELECT table_name::text, column_name::text FROM information_schema.columns
+          WHERE table_schema = current_schema()
+            AND (column_name LIKE '%\_enc' OR column_name LIKE '%sealed%')
+          ORDER BY 1, 2",
+    )
+    .fetch_all(client.pool())
+    .await
+    .unwrap();
+    assert!(!columns.is_empty(), "the pattern matched no column: is this the metadata schema?");
+    let missing: Vec<String> = columns
+        .iter()
+        .filter(|(t, c)| {
+            !chelabase_metadata::SECRETS_KEY_SEALED.iter().any(|(lt, lc, _)| (*lt, *lc) == (t.as_str(), c.as_str()))
+                && !NOT_SECRETS_KEY_SEALED.iter().any(|(et, ec, _)| (*et, *ec) == (t.as_str(), c.as_str()))
+        })
+        .map(|(t, c)| format!("{t}.{c}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "sealed-looking columns neither in SECRETS_KEY_SEALED nor excluded: {missing:?}"
+    );
+    // The list names only columns that exist.
+    for (table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
+        assert!(
+            columns.iter().any(|(t, c)| (t.as_str(), c.as_str()) == (*table, *column)),
+            "SECRETS_KEY_SEALED names {table}.{column}, which doesn't exist"
+        );
+    }
 }
 
 // A reset finishing after a delete must not write a password back onto the tombstone, and a

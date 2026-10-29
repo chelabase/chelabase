@@ -31,7 +31,7 @@ async fn status_error(addr: SocketAddr) -> String {
     let signer = ComputeSigner::new(&pem, &x).unwrap();
     format!(
         "{:#}",
-        status_report(&reqwest::Client::new(), addr, &signer, "ep-a")
+        status_report(&chelabase_http::client_builder().build().unwrap(), addr, &signer, "ep-a")
             .await
             .unwrap_err()
     )

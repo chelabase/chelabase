@@ -18,7 +18,7 @@ pub async fn run(url: &str, key: Option<String>, out: Option<&Path>, which: Whic
 }
 
 async fn fetch_schema(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     url: &str,
     key: &str,
     database: Option<&str>,

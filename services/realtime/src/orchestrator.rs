@@ -127,7 +127,7 @@ pub fn projects_result(status: u16, body: &[u8]) -> Result<ProjectView, Projects
 
 #[derive(Clone)]
 pub struct OrchestratorClient {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     base_url: String,
     internal_url: String,
     token: String,
@@ -146,7 +146,7 @@ impl std::fmt::Debug for OrchestratorClient {
 
 /// An HTTP answer: (status, body), or `None` when there was none in time.
 async fn post(
-    http: &reqwest::Client,
+    http: &chelabase_http::Client,
     url: String,
     token: &str,
     body: Value,

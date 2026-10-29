@@ -44,7 +44,7 @@ async fn failing_compute_ctl(body: String) -> SocketAddr {
 
 /// The text of each of our three compute_ctl calls' errors against `addr`.
 async fn errors(addr: SocketAddr) -> Vec<(&'static str, String)> {
-    let http = reqwest::Client::new();
+    let http = chelabase_http::client_builder().build().unwrap();
     let s = signer();
     let config = json!({"spec": {}, "compute_ctl_config": {}});
     vec![
@@ -143,9 +143,14 @@ async fn null_capabilities_are_no_capability() {
             "capabilities": null,
         }))
         .await;
-        let report = status_report(&reqwest::Client::new(), addr, &signer(), "ep-a")
-            .await
-            .unwrap_or_else(|e| panic!("{status}: {e:#}"));
+        let report = status_report(
+            &chelabase_http::client_builder().build().unwrap(),
+            addr,
+            &signer(),
+            "ep-a",
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{status}: {e:#}"));
         let want = match status {
             "running" => ComputeCtlStatus::Running,
             other => ComputeCtlStatus::Other(other.into()),

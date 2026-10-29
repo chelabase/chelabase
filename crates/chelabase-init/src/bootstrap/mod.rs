@@ -256,7 +256,7 @@ pub trait Probe: Send + Sync {
 /// An HTTP readiness probe: a 2xx is ready; no answer, a 404 or a 5xx is "not yet"; any other
 /// answer fails.
 pub struct HttpProbe {
-    http: reqwest::Client,
+    http: chelabase_http::Client,
     url: String,
     what: String,
 }

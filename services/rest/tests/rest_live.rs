@@ -17,7 +17,7 @@
 //! image.
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::future::Future;
 use std::net::SocketAddr;

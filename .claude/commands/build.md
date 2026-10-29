@@ -34,7 +34,10 @@ For each ready milestone whose `touches` don't overlap others already building:
 2. Builder: test-first per `AGENTS.md` Tests; commit with explicit paths; run only the
    issue's Verification and its new/changed live tests; push the milestone branch; report
    commit SHAs, one failing run per new test from before the fix, tests run/skipped,
-   deviations.
+   deviations. **Scope stop:** if the work needs code the design sketch doesn't name
+   (re-implementing what a dependency did, a new validation layer, a diff well past the
+   sketch's size), the builder stops and reports before writing it. Check each builder's
+   `git diff --stat` mid-build; a diff far beyond the sketch gets the same stop.
 3. On green: merge `--no-ff` into `epic/<slug>`, remove the task worktree, set issue label
    `status:landed`. Update the PR checklist.
 4. If `review: whiteroom`, launch the **auditor** agent yourself (same prompt and model rule

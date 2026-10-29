@@ -78,11 +78,12 @@ check "build.sh with an unknown target exits 2" refuses 2 "$here/build.sh" bogus
 check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compute
 
 # --- Compose ------------------------------------------------------------------------------
-# The base file and the workbench overlay, one project (`chelabase`).
+# The base file, the workbench overlay and the self-hosted build overlay, one project (`chelabase`).
 compose_file="$root/infra/compose/docker-compose.yml"
 overlay_file="$root/infra/compose/docker-compose.workbench.yml"
-check "the base Compose file and the workbench overlay" \
-  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$overlay_file $compose_file "
+build_file="$root/infra/compose/docker-compose.build.yml"
+check "the base Compose file and its two overlays" \
+  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$build_file $overlay_file $compose_file "
 check "no hook-relay image or service left" \
   bash -c '! test -e "$1/infra/compose/hook-relay.Dockerfile" && ! grep -q "hook-relay" "$2"' _ "$root" "$compose_file"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \

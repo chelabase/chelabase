@@ -16,7 +16,7 @@
 //! doesn't learn them, as for a role made in SQL before the roles API knew it).
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
-#![allow(clippy::disallowed_methods)]
+#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::future::Future;
 use std::process::Stdio;
