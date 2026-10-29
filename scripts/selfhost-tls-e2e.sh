@@ -78,7 +78,10 @@ remove_leftovers() {
   [[ -z "$ids" ]] || docker rm -f $ids >/dev/null 2>&1 || true
 }
 
+# The install docs' uninstall: stop the stack (so the worker starts no compute), remove the
+# computes by their label (they hold the stack's networks), then down -v.
 teardown() {
+  NOFIX=0 compose stop --timeout 20 >/dev/null 2>&1 || true
   remove_leftovers
   NOFIX=0 compose down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
   remove_leftovers
