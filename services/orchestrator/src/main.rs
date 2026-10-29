@@ -214,9 +214,9 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
             Ok(())
         }
         KeyCheck::Mismatch { sealed_rows } => anyhow::bail!(
-            "CHELABASE_SECRETS_KEY is not the key {sealed_rows} database(s) were encrypted with. \
-             Restore the original .chelabase/secrets/secrets.key; in local dev you can instead \
-             remove every database with `just sweep-dbs`."
+            "CHELABASE_SECRETS_KEY is not the key {sealed_rows} stored credential(s) were \
+             encrypted with. Restore the original .chelabase/secrets/secrets.key; in local dev \
+             you can instead remove every database with `just sweep-dbs`."
         ),
     }
 }
