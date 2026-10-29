@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError, configureManagementClient } from "@chelabase/management-client";
-import { ALL_DATABASES, downloadTypes, typesRequest } from "./types-download";
+import { downloadTypes, typesRequest, type TypesDatabase } from "./types-download";
 
 function serve(body: string, status = 200, type = "text/typescript; charset=utf-8") {
   const f = vi.fn(async () => new Response(body, { status, headers: { "content-type": type } }));
@@ -8,19 +8,29 @@ function serve(body: string, status = 200, type = "text/typescript; charset=utf-
   return f;
 }
 
+const MAIN: TypesDatabase = { kind: "main" };
+const ALL: TypesDatabase = { kind: "all" };
+
 afterEach(() => vi.restoreAllMocks());
 
 describe("typesRequest", () => {
   it("asks for main's module as the role, saved as db.ts", () => {
-    expect(typesRequest({ role: " authenticated ", database: null })).toEqual({
+    expect(typesRequest({ role: " authenticated ", database: MAIN })).toEqual({
       params: { role: "authenticated" },
       filename: "db.ts",
     });
   });
 
   it("names another database, or every database", () => {
-    expect(typesRequest({ role: "reporting", database: "analytics" }).params).toEqual({ role: "reporting", database: "analytics" });
-    expect(typesRequest({ role: "reporting", database: ALL_DATABASES }).params).toEqual({ role: "reporting", all_databases: true });
+    expect(typesRequest({ role: "reporting", database: { kind: "named", name: "analytics" } }).params).toEqual({ role: "reporting", database: "analytics" });
+    expect(typesRequest({ role: "reporting", database: ALL }).params).toEqual({ role: "reporting", all_databases: true });
+  });
+});
+
+describe("typesRequest with a database named like the all-databases choice", () => {
+  it("names a database called *all*, and never reads it as every database", () => {
+    expect(typesRequest({ role: "r", database: { kind: "named", name: "*all*" } }).params).toEqual({ role: "r", database: "*all*" });
+    expect(typesRequest({ role: "r", database: ALL }).params).toEqual({ role: "r", all_databases: true });
   });
 });
 
@@ -29,7 +39,7 @@ describe("downloadTypes", () => {
     const module = "export type Database = {};\n";
     const f = serve(module);
     const save = vi.fn();
-    await downloadTypes("d1", "b1", { role: "authenticated", database: "analytics" }, save);
+    await downloadTypes("d1", "b1", { role: "authenticated", database: { kind: "named", name: "analytics" } }, save);
     const [url, init] = f.mock.calls[0] as unknown as [string, RequestInit];
     expect(url).toBe("https://api.test/v1/databases/d1/branches/b1/data-api/types?role=authenticated&database=analytics");
     expect(init.method).toBe("GET");
@@ -40,7 +50,7 @@ describe("downloadTypes", () => {
   it("every database is one request with all_databases", async () => {
     const f = serve("export type Databases = {};\n");
     const save = vi.fn();
-    await downloadTypes("d1", "b1", { role: "authenticated", database: ALL_DATABASES }, save);
+    await downloadTypes("d1", "b1", { role: "authenticated", database: ALL }, save);
     const [url] = f.mock.calls[0] as unknown as [string];
     expect(url).toBe("https://api.test/v1/databases/d1/branches/b1/data-api/types?role=authenticated&all_databases=true");
     expect(save).toHaveBeenCalledWith("export type Databases = {};\n", "db.ts");
@@ -49,13 +59,13 @@ describe("downloadTypes", () => {
   it("a refusal throws the API error and saves nothing", async () => {
     serve('{"error":{"code":"forbidden","message":"this needs role:x","required":"role:x"}}', 403, "application/json");
     const save = vi.fn();
-    await expect(downloadTypes("d1", "b1", { role: "x", database: null }, save)).rejects.toBeInstanceOf(ApiError);
+    await expect(downloadTypes("d1", "b1", { role: "x", database: MAIN }, save)).rejects.toBeInstanceOf(ApiError);
     expect(save).not.toHaveBeenCalled();
   });
 
   it("an empty role is refused before any request", async () => {
     const f = serve("");
-    await expect(downloadTypes("d1", "b1", { role: "  ", database: null }, vi.fn())).rejects.toThrow("Enter a role");
+    await expect(downloadTypes("d1", "b1", { role: "  ", database: MAIN }, vi.fn())).rejects.toThrow("Enter a role");
     expect(f).not.toHaveBeenCalled();
   });
 });
