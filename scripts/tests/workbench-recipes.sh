@@ -50,11 +50,23 @@ done
 [[ -x scripts/sweep-dbs.sh ]] || fail "scripts/sweep-dbs.sh exists"
 
 mapfile -t scripts < <(git ls-files 'scripts/*.sh' 'scripts/lib/*.sh' ':!scripts/tests/**')
+# The self-host e2e scripts test the Compose install on their own throwaway projects, so raw Compose,
+# in-container loopback and their own published ports are expected. Only these patterns exempt them.
+selfhost_e2e=' scripts/selfhost-e2e.sh scripts/selfhost-tls-e2e.sh '
+loopback='127\.0\.0\.1:(5433|1234|6379|8081|8083|4222|7676|9898)'
+hostaddr_loopback='hostaddr=127\.0\.0\.1'
 for pat in 'compose exec' 'cargo run' 'cargo test' \
-  '127\.0\.0\.1:(5433|1234|6379|8081|8083|4222|7676|9898)' 'host\.docker\.internal' \
+  "$loopback" 'host\.docker\.internal' \
   'internal-addr\.sh' 'name=\^chelabase-compute-' '\.chelabase/neon/proxy-ca\.crt' \
-  '\.chelabase/zitadel' 'hostaddr=127\.0\.0\.1' 'just live' 'just dev\b' 'just deps-up'; do
-  hits="$(grep -nE "$pat" "${scripts[@]}" || true)"
+  '\.chelabase/zitadel' "$hostaddr_loopback" 'just live' 'just dev\b' 'just deps-up'; do
+  targets=("${scripts[@]}")
+  if [[ "$pat" == 'compose exec' || "$pat" == "$loopback" || "$pat" == "$hostaddr_loopback" ]]; then
+    targets=()
+    for s in "${scripts[@]}"; do
+      [[ "$selfhost_e2e" == *" $s "* ]] || targets+=("$s")
+    done
+  fi
+  hits="$(grep -nE "$pat" "${targets[@]}" || true)"
   [[ -z "$hits" ]] || fail "scripts still use $pat:
 $hits"
 done
