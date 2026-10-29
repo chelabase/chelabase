@@ -1,4 +1,5 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, type ComponentProps, type ReactNode } from "react";
+import { Columns3, ListChecks } from "lucide-react";
 import type { ObjectSummary } from "@chelabase/management-client";
 import type { RowAccess } from "@/lib/table-editor/access";
 import type { EditorParams } from "@/lib/table-editor/context";
@@ -46,7 +47,7 @@ export function useUnloadGuard() {
 /**
  * The editor's one right panel (changes, column form, row panel), mounted after the main area.
  * The changes view shows whenever the open table has pending changes and no other view is open.
- * Collapsing keeps the view mounted (a form keeps its draft) behind a 48px strip that names it.
+ * Collapsing keeps the view mounted (a form keeps its draft) behind a 48px icon strip that names it.
  */
 export function EditorPanel({ target, access, object, params, navigate, structureReason = null, totalBytes = null }: EditorPanelProps) {
   useUnloadGuard();
@@ -74,7 +75,7 @@ export function EditorPanel({ target, access, object, params, navigate, structur
     if (count === 0) return null;
     const heading = `Pending changes · ${count}`;
     return (
-      <PanelFrame key={`changes:${target.key}`} label="Pending changes" heading={heading} strip={heading}>
+      <PanelFrame key={`changes:${target.key}`} label="Pending changes" heading={heading} strip={{ text: heading, icon: ListChecks, badge: count }}>
         <ChangesPanel target={target} reason={structureReason} totalBytes={null} onApplied={onApplied} />
       </PanelFrame>
     );
@@ -85,7 +86,7 @@ export function EditorPanel({ target, access, object, params, navigate, structur
   if (panel.kind === "column") {
     const title = panel.column === null ? "New column" : `Edit column ${panel.column}`;
     return (
-      <PanelFrame key={`column:${target.key}:${panel.column ?? ""}`} label={title} heading={title} strip={`${title} · draft, not added yet`}>
+      <PanelFrame key={`column:${target.key}:${panel.column ?? ""}`} label={title} heading={title} strip={{ text: `${title} · draft, not added yet`, icon: Columns3 }}>
         <ColumnFormPanel target={target} column={panel.column} reason={structureReason} totalBytes={totalBytes} />
       </PanelFrame>
     );
@@ -94,7 +95,7 @@ export function EditorPanel({ target, access, object, params, navigate, structur
   if (count === 0) return null;
   const heading = `Pending changes · ${count}`;
   return (
-    <PanelFrame key={`changes:${target.key}`} label="Pending changes" heading={heading} strip={heading}>
+    <PanelFrame key={`changes:${target.key}`} label="Pending changes" heading={heading} strip={{ text: heading, icon: ListChecks, badge: count }}>
       <ChangesPanel target={target} reason={structureReason} totalBytes={totalBytes} onApplied={onApplied} />
     </PanelFrame>
   );
@@ -126,7 +127,7 @@ export function reviewLabel(n: number): string {
   return `Review ${changesWord(n)}`;
 }
 
-function PanelFrame({ label, heading, strip, children }: { label: string; heading: string; strip: string; children: ReactNode }) {
+function PanelFrame({ label, heading, strip, children }: { label: string; heading: string; strip: Omit<ComponentProps<typeof CollapsedStrip>, "onExpand">; children: ReactNode }) {
   const collapsed = useTableEditor((s) => s.panel.collapsed);
   const setCollapsed = useTableEditor((s) => s.setCollapsed);
   // Opened because the previous view went away under the focus ("Add to changes"): focus the heading.
@@ -150,7 +151,7 @@ function PanelFrame({ label, heading, strip, children }: { label: string; headin
         </div>
         {children}
       </aside>
-      {collapsed && <CollapsedStrip text={strip} onExpand={() => setCollapsed(false)} />}
+      {collapsed && <CollapsedStrip {...strip} onExpand={() => setCollapsed(false)} />}
     </>
   );
 }

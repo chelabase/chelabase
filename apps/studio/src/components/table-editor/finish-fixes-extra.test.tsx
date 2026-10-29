@@ -2,7 +2,7 @@ import { screen, within } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Table } from "@chelabase/management-client";
 import { B, bodies, invoices, renderEditor, stubLayout } from "@/test/table-editor-fixtures";
-import { shortType } from "./column-strip";
+import { shortType } from "./column-headers";
 
 const Q = `${B}/console/query`;
 const selects = async (f: Parameters<typeof bodies>[0]) => (await bodies(f, "POST", Q)).filter((b) => b.tree.op === "select");
@@ -33,7 +33,8 @@ describe("finish review fixes (implementer's own)", () => {
   it("clear_sort_returns_to_the_key_order", async () => {
     const { f, user } = renderEditor();
     await within(await screen.findByRole("grid", { name: "public.invoices" })).findByRole("gridcell", { name: "45000" });
-    await user.click(within(await screen.findByRole("grid", { name: "public.invoices" })).getByRole("columnheader", { name: "memo" }));
+    await user.click(within(await screen.findByRole("grid", { name: "public.invoices" })).getByRole("button", { name: "Column actions for memo" }));
+    await user.click(await screen.findByRole("menuitem", { name: "Sort ascending" }));
     await vi.waitFor(async () => expect((await selects(f)).at(-1).tree.orderBy?.[0]).toEqual({ col: "memo", dir: "asc" }));
     await user.click(screen.getByRole("button", { name: "Sort" }));
     expect(screen.getByLabelText("Sort column")).toHaveValue("memo");

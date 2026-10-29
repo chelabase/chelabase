@@ -127,7 +127,7 @@ describe("RowsView (more)", () => {
     ];
     const { f, user } = renderEditor({ table: t as Table, rows: [{ ...ROWS[0], seen: "2026-10-01T12:00:05.123456", paid_at: "2026-10-01T12:00:00+00:00" }] });
     await user.dblClick(await cell("2026-10-01T12:00:05.123456"));
-    const local = await screen.findByLabelText("seen");
+    const local = await screen.findByLabelText("seen", { selector: "input" });
     expect(local).toHaveAttribute("type", "datetime-local");
     await user.keyboard("{Enter}");
     expect(await writes(f)).toHaveLength(0);

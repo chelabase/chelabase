@@ -81,7 +81,7 @@ describe("a view's definition is cached apart from the table queries", () => {
     await s.user.click(screen.getByRole("tab", { name: "Rows" }));
     const again = await screen.findByRole("grid", { name: `public.${name}` });
     expect(await within(again).findByRole("gridcell", { name: "Q3 plan" })).toBeInTheDocument();
-    // still read-only: no column strip or Add column from a cached definition
+    // still read-only: no column chips or Add column from a cached definition
     expect(screen.queryByRole("button", { name: "Add column" })).toBeNull();
     expect(gets()).toHaveLength(1);
     expect(screen.queryByRole("alert")).toBeNull();

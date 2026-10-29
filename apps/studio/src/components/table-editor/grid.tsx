@@ -3,10 +3,11 @@ import { ContextMenu } from "@base-ui/react/context-menu";
 import { Tooltip } from "@base-ui/react/tooltip";
 import { columnResizingFeature, columnSizingFeature, tableFeatures, useTable, type ColumnDef, type ColumnSizingState } from "@tanstack/react-table";
 import { defaultRangeExtractor, useVirtualizer, type Range } from "@tanstack/react-virtual";
-import { ArrowDown, ArrowUp, PanelRightOpen } from "lucide-react";
-import type { Sort } from "@/lib/console";
+import { ArrowDown, ArrowUp, MoreHorizontal, PanelRightOpen } from "lucide-react";
+import type { Sort, SortDir } from "@/lib/console";
 import { cellText, defaultWidth, editText, type Row, type RowColumn } from "@/lib/table-editor/rows";
 import { cn } from "@/lib/utils";
+import { Menu, MenuItem, MenuSeparator } from "@/components/ui/menu";
 import { CellEditor, type CellValue, type Move } from "./cell-editor";
 import { CellMenuPopup, type CellMenuGroups, type CellMenuItem } from "./cell-menu";
 import { Checkbox } from "./panel-bits";
@@ -52,6 +53,8 @@ export const COLUMN_VIRTUALIZE_ABOVE = 40;
 const MIN_WIDTH = 64;
 /** The width of the track of a column added in the pending changes (not in the table yet). */
 export const PENDING_WIDTH = 160;
+/** The track after the last column that holds `headers.end`. */
+export const END_WIDTH = 136;
 const MAX_WIDTH = 960;
 const RESIZE_STEP = 16;
 
@@ -70,15 +73,16 @@ export interface GridProps {
   onToggleRow: (key: string) => void;
   onTogglePage: () => void;
   sort: Sort | null;
-  onSort: (column: string) => void;
+  /** Sorts by a column in a direction, or (null) clears the sort. */
+  onSort: (column: string, dir: SortDir | null) => void;
   /** Whether a column's cells can be edited in place; with `rowKey`, whether that row's cell can be now. */
   canEdit: (column: string, rowKey?: string) => boolean;
   /** Saves one cell of the row with this key; resolves to an error text, or null once saved. */
   onSave: (rowKey: string, column: RowColumn, value: CellValue) => Promise<string | null>;
   /** Changes when the rows shown stop being the same view (table, role, filter, sort, page): an open editor closes. */
   resetKey?: string;
-  /** Rendered sticky above the grid, inside the same scroll container (the column strip): shares its template and columns. */
-  above?: (layout: GridLayout) => ReactNode;
+  /** What the header cells show in place of the plain name (the column chips); without it, a header's click cycles the sort. */
+  headers?: GridHeaders | null;
   /** Ctrl/Cmd+C: the active cell (null on the header or gutter). */
   onCopy: (active: { row: number; column: string } | null) => void;
   /** Enter on a row's gutter. */
@@ -126,13 +130,29 @@ export interface GridMarks {
   fading: (rowKey: string) => boolean;
 }
 
-/** The grid's column geometry, for content that lines up with it (the column strip). */
-export interface GridLayout {
-  /** The CSS grid-template-columns of every row: the gutter, each data column, then each pending column. */
-  template: string;
-  totalWidth: number;
-  /** The indexes (into `columns`) of the data columns rendered now, ascending. */
-  visibleCols: number[];
+/** One header cell's content (a column chip). */
+export interface HeaderView {
+  /** The header's accessible name: the column's name as it will be. */
+  label: string;
+  /** Read after the name: the full type and marks ("bigint, new"). */
+  description?: string;
+  /** The cell's content beside the sort arrow. */
+  content: ReactNode;
+  /** A tooltip (why the column can't be changed). */
+  title?: string;
+  /** A click or Enter on the header; null does nothing (structure is read-only). */
+  onActivate: (() => void) | null;
+  /** Items after the sort items in the header's `⋯` menu. */
+  menu?: ReactNode;
+  className?: string;
+}
+
+/** The header cells' content, by column: the table's columns by their name now, the pending columns by theirs. */
+export interface GridHeaders {
+  column: (name: string) => HeaderView | undefined;
+  pending: (name: string) => HeaderView | undefined;
+  /** In the header row after the last column ("Add column"): outside the grid's cells and keys. */
+  end?: ReactNode;
 }
 
 interface Pos {
@@ -254,32 +274,21 @@ export function Grid(props: GridProps) {
   const headers = table.getHeaderGroups()[0]?.headers ?? [];
   const sizes = headers.map((h) => h.getSize());
   const pending = props.pending ?? [];
-  const template = `${GUTTER_WIDTH}px ${[...sizes, ...pending.map(() => PENDING_WIDTH)].map((s) => `${s}px`).join(" ")}`;
-  const totalWidth = GUTTER_WIDTH + sizes.reduce((a, b) => a + b, 0) + pending.length * PENDING_WIDTH;
+  const headerViews = props.headers ?? null;
+  const endWidth = headerViews?.end ? END_WIDTH : 0;
+  const template = `${GUTTER_WIDTH}px ${[...sizes, ...pending.map(() => PENDING_WIDTH), ...(endWidth ? [endWidth] : [])].map((s) => `${s}px`).join(" ")}`;
+  const totalWidth = GUTTER_WIDTH + sizes.reduce((a, b) => a + b, 0) + pending.length * PENDING_WIDTH + endWidth;
   // A pending column's empty cells: dashed, faintly sand, outside the grid's keyboard model.
   const placeholders = pending.map((name, j) => (
     <div key={`+${name}`} aria-hidden="true" className="h-9 border-l border-dashed border-sand/30 bg-sand/[0.03]" style={{ gridColumn: columns.length + 2 + j }} />
   ));
 
-  // The height of `above`, from its ResizeObserver (0 until measured).
-  const aboveRef = useRef<HTMLDivElement>(null);
-  const [aboveHeight, setAboveHeight] = useState(0);
-  const hasAbove = !!props.above;
-  useEffect(() => {
-    const el = aboveRef.current;
-    if (!el || typeof ResizeObserver === "undefined") return;
-    const ro = new ResizeObserver((entries) => {
-      const h = entries[0]?.contentRect.height;
-      if (typeof h === "number") setAboveHeight(Math.round(h));
-    });
-    ro.observe(el);
-    return () => ro.disconnect();
-  }, [hasAbove]);
   const keysRef = useRef(keys);
   keysRef.current = keys;
   const rowsRef = useRef(rows);
   rowsRef.current = rows;
-  const rowMargin = aboveHeight + ROW_HEIGHT;
+  // The rows start under the one header row.
+  const rowMargin = ROW_HEIGHT;
 
   const activeRow = active.row;
   const rowVirtualizer = useVirtualizer({
@@ -321,7 +330,6 @@ export function Grid(props: GridProps) {
     visibleCols.push(active.col - 1);
     visibleCols.sort((a, b) => a - b);
   }
-  const layout: GridLayout = { template, totalWidth, visibleCols };
   // Where rows and columns sit inside the rows' group: row i at i × ROW_HEIGHT, columns after the gutter.
   const geometry: PresenceGeometry = {
     rowHeight: ROW_HEIGHT,
@@ -337,12 +345,13 @@ export function Grid(props: GridProps) {
   useEffect(() => {
     setActive((a) => {
       const row = Math.min(a.row, rows.length - 1);
-      const col = Math.min(a.col, columns.length);
+      // The header row also reaches the pending columns' headers.
+      const col = Math.min(a.col, a.row === -1 ? columns.length + pending.length : columns.length);
       return row === a.row && col === a.col ? a : { row, col };
     });
     setActiveCell((s) => (s && (s.row >= rows.length || s.col > columns.length) ? null : s));
     setMenuAt((m) => (m && (m.row >= rows.length || m.col > columns.length) ? null : m));
-  }, [rows.length, columns.length]);
+  }, [rows.length, columns.length, pending.length]);
 
   // Another view (table, role, filter, sort, page) puts other rows under the editor and the active cell: drop them.
   useEffect(() => {
@@ -656,23 +665,53 @@ export function Grid(props: GridProps) {
         })
       : [];
 
+  /** Cycles a column's sort: none, ascending, descending, none. */
+  function cycleSort(name: string) {
+    props.onSort(name, sort?.col !== name ? "asc" : sort.dir === "asc" ? "desc" : null);
+  }
+
+  /** A click or Enter on header column `col` (data columns, then pending ones): its chip's action, or the sort. */
+  function activateHeader(col: number) {
+    const c = columns[col - 1];
+    if (c) {
+      const view = headerViews?.column(c.name);
+      if (view) view.onActivate?.();
+      else cycleSort(c.name);
+      return;
+    }
+    const name = pending[col - columns.length - 1];
+    if (name !== undefined) headerViews?.pending(name)?.onActivate?.();
+  }
+
   function onKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    // Keys in a portalled header menu bubble here through React: they're the menu's.
+    if (!e.currentTarget.contains(e.target as Node)) return;
     if (editing || (e.target as HTMLElement).closest("[data-editor]")) return;
+    // A header's `⋯` button (focused by a click) opens its menu itself.
+    if ((e.target as HTMLElement).closest("[data-column-menu]") && (e.key === "Enter" || e.key === " ")) return;
     if (isMenuKey(e)) {
       e.preventDefault();
+      if (active.row === -1) {
+        // On a column header: its `⋯` menu.
+        cellEl(active)?.querySelector<HTMLElement>("[data-column-menu]")?.click();
+        return;
+      }
       menuKeyAt.current = performance.now();
       openMenuFromKeys();
       return;
     }
     const lastRow = rows.length - 1;
     const lastCol = columns.length;
+    // The header row also holds the pending columns' headers.
+    const lastHeaderCol = columns.length + pending.length;
     const mod = e.ctrlKey || e.metaKey;
     const move = (p: Pos) => {
       e.preventDefault();
-      focusCell({ row: Math.max(-1, Math.min(lastRow, p.row)), col: Math.max(0, Math.min(lastCol, p.col)) });
+      const row = Math.max(-1, Math.min(lastRow, p.row));
+      focusCell({ row, col: Math.max(0, Math.min(row === -1 ? lastHeaderCol : lastCol, p.col)) });
     };
     const { row, col } = active;
-    if (e.altKey && row === -1 && col > 0 && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
+    if (e.altKey && row === -1 && col > 0 && col <= columns.length && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
       e.preventDefault();
       const name = columns[col - 1].name;
       const size = sizes[col - 1] + (e.key === "ArrowRight" ? RESIZE_STEP : -RESIZE_STEP);
@@ -698,7 +737,7 @@ export function Grid(props: GridProps) {
       case "Home":
         return move(mod ? { row: lastRow >= 0 ? 0 : -1, col: 1 } : { row, col: 0 });
       case "End":
-        return move(mod ? { row: lastRow, col: lastCol } : { row, col: lastCol });
+        return move(mod ? { row: lastRow, col: lastCol } : { row, col: row === -1 ? lastHeaderCol : lastCol });
       case "PageDown":
         return move({ row: row + 10, col });
       case "PageUp":
@@ -707,7 +746,7 @@ export function Grid(props: GridProps) {
       case "F2":
         e.preventDefault();
         if (row === -1) {
-          if (col > 0) props.onSort(columns[col - 1].name);
+          if (col > 0) activateHeader(col);
           else props.onTogglePage();
         } else if (col === 0) {
           props.onOpenRow?.(row);
@@ -718,8 +757,10 @@ export function Grid(props: GridProps) {
       case " ": {
         if ((e.target as HTMLElement).tagName === "INPUT") return; // the checkbox toggles itself
         e.preventDefault();
-        if (row === -1) props.onTogglePage();
-        else if (keys[row]) props.onToggleRow(keys[row]!);
+        if (row === -1) {
+          if (col > 0) activateHeader(col);
+          else props.onTogglePage();
+        } else if (keys[row]) props.onToggleRow(keys[row]!);
         return;
       }
     }
@@ -750,16 +791,99 @@ export function Grid(props: GridProps) {
   }, [props.pageSelection]);
   const selectable = keys.some((k) => k !== null);
 
+  /**
+   * A column's header cell: its chip (or its plain name), the sort arrow and the `⋯` menu (sort first, then the
+   * chip's items). A click or Enter does the chip's action, or cycles the sort without a chip. A pending column (not
+   * in the table yet) has no sort and no resize grip.
+   */
+  function headerCell(p: Pos, name: string, view: HeaderView | undefined, dir: SortDir | null) {
+    const sortable = p.col <= columns.length;
+    const pendingCol = !sortable;
+    const descId = `${resizeHelpId}-h${p.col}`;
+    const description = view?.description ?? (pendingCol ? "added in your pending changes" : undefined);
+    const hasMenu = sortable || !!view?.menu;
+    const sortTo = (next: SortDir | null) => props.onSort(name, next);
+    return (
+      <div
+        role="columnheader"
+        aria-label={view?.label ?? name}
+        aria-describedby={[description ? descId : null, sortable ? resizeHelpId : null].filter(Boolean).join(" ") || undefined}
+        aria-sort={sortable ? (dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none") : undefined}
+        {...cellProps(p)}
+        title={view?.title ?? (pendingCol && !view ? "Added in your pending changes" : undefined)}
+        onClick={(e) => {
+          // A click in the header's menu (portalled, but inside it in React) isn't a click on the header.
+          if (!e.currentTarget.contains(e.target as Node) || (e.target as HTMLElement).closest("[data-column-menu]")) return;
+          setActive(p);
+          select(p);
+          activateHeader(p.col);
+        }}
+        style={{ gridColumn: p.col + 1, gridRow: 1 }}
+        className={cn(
+          cellBase,
+          "group/head gap-1 pr-0 select-none",
+          (view ? view.onActivate : sortable) ? "cursor-pointer hover:bg-chalk/[0.05]" : "cursor-default",
+          dir && "text-chalk",
+          pendingCol && !view && "border-t-2 border-t-sand/45",
+          view?.className,
+        )}
+      >
+        {description && (
+          <span id={descId} hidden>
+            {description}
+          </span>
+        )}
+        <span className="flex min-w-0 flex-1 items-center gap-1">
+          {view ? <span className="min-w-0 flex-1">{view.content}</span> : <span className="truncate font-mono">{name}</span>}
+          {dir === "asc" && <ArrowUp aria-hidden="true" size={12} strokeWidth={1.5} className="shrink-0 text-chalk" />}
+          {dir === "desc" && <ArrowDown aria-hidden="true" size={12} strokeWidth={1.5} className="shrink-0 text-chalk" />}
+        </span>
+        {hasMenu ? (
+          <Menu
+            align="start"
+            finalFocus={() => cellEl(p)}
+            trigger={
+              <button
+                type="button"
+                tabIndex={-1}
+                data-column-menu=""
+                aria-label={`Column actions for ${view?.label ?? name}`}
+                className="flex h-full w-6 shrink-0 items-center justify-center text-chalk-dim opacity-60 outline-none group-hover/head:opacity-100 hover:text-chalk focus-visible:opacity-100 focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand aria-expanded:opacity-100"
+              >
+                <MoreHorizontal aria-hidden="true" size={14} strokeWidth={1.5} />
+              </button>
+            }
+          >
+            {sortable && (
+              <>
+                <MenuItem onClick={() => sortTo("asc")}>Sort ascending</MenuItem>
+                <MenuItem onClick={() => sortTo("desc")}>Sort descending</MenuItem>
+                {dir && <MenuItem onClick={() => sortTo(null)}>Clear sort</MenuItem>}
+                {view?.menu && <MenuSeparator />}
+              </>
+            )}
+            {view?.menu}
+          </Menu>
+        ) : (
+          <span className="w-2 shrink-0" />
+        )}
+      </div>
+    );
+  }
+
   const virtualRows = rowVirtualizer.getVirtualItems();
   return (
     <div ref={scrollRef} data-grid-scroll="" className="relative min-h-0 flex-1 overflow-auto bg-ink">
-      {props.above && (
-        <div ref={aboveRef} className="sticky top-0 z-30" style={{ width: totalWidth }}>
-          {props.above(layout)}
+      {headerViews?.end && (
+        // Over the header row's last track, outside the grid (it is no column): no height, so the grid starts at the top.
+        <div className="sticky top-0 z-30 h-0" style={{ width: totalWidth }}>
+          <div className="absolute top-0 right-0 flex h-9 items-center px-2" style={{ width: END_WIDTH }}>
+            {headerViews.end}
+          </div>
         </div>
       )}
       <span id={resizeHelpId} hidden>
-        Alt+Left or Alt+Right resizes the column. Click its edge to widen it a step, Shift+click to narrow it; double-click the edge to reset its width.
+        Alt+Left or Alt+Right resizes the column. Click its edge to widen it a step, Shift+click to narrow it; double-click the edge to reset its width. Shift+F10 opens the column menu.
       </span>
       <div
         role="grid"
@@ -768,14 +892,14 @@ export function Grid(props: GridProps) {
         aria-colcount={columns.length + 1 + pending.length}
         onKeyDown={onKeyDown}
       >
-      <div role="rowgroup" className="sticky z-20" style={{ width: totalWidth, top: aboveHeight }}>
+      <div role="rowgroup" className="sticky top-0 z-20" style={{ width: totalWidth }}>
         <div
           role="row"
           aria-rowindex={1}
           className="grid h-9 border-b border-line-strong bg-channel text-xs text-chalk-dim"
           style={{ gridTemplateColumns: template }}
         >
-          <div role="columnheader" {...cellProps({ row: -1, col: 0 })} className={cn(cellBase, "sticky left-0 z-10 justify-center bg-channel px-0")}>
+          <div role="columnheader" {...cellProps({ row: -1, col: 0 })} className={cn(cellBase, "sticky left-0 z-10 bg-channel")}>
             {selectable && (
               <Checkbox
                 ref={pageBox}
@@ -790,25 +914,9 @@ export function Grid(props: GridProps) {
             const c = columns[i];
             const header = headers[i];
             const dir = sort?.col === c.name ? sort.dir : null;
-            const p = { row: -1, col: i + 1 };
             return (
               <Fragment key={c.name}>
-                <div
-                  role="columnheader"
-                  aria-describedby={resizeHelpId}
-                  aria-sort={dir === "asc" ? "ascending" : dir === "desc" ? "descending" : "none"}
-                  {...cellProps(p)}
-                  onClick={() => {
-                    setActive(p);
-                    props.onSort(c.name);
-                  }}
-                  style={{ gridColumn: i + 2, gridRow: 1 }}
-                  className={cn(cellBase, "cursor-pointer gap-1 select-none hover:text-chalk", dir && "text-chalk")}
-                >
-                  <span className="truncate font-mono">{c.name}</span>
-                  {dir === "asc" && <ArrowUp aria-hidden="true" size={12} strokeWidth={1.5} className="shrink-0 text-chalk" />}
-                  {dir === "desc" && <ArrowDown aria-hidden="true" size={12} strokeWidth={1.5} className="shrink-0 text-chalk" />}
-                </div>
+                {headerCell({ row: -1, col: i + 1 }, c.name, headerViews?.column(c.name), dir)}
                 {/* The grip shares the header's grid cell but sits outside it, so the header is named by its label alone. */}
                 {header && (
                   <span
@@ -849,16 +957,7 @@ export function Grid(props: GridProps) {
             );
           })}
           {pending.map((name, j) => (
-            <div
-              key={`+${name}`}
-              role="columnheader"
-              aria-colindex={columns.length + 2 + j}
-              title="Added in your pending changes"
-              style={{ gridColumn: columns.length + 2 + j, gridRow: 1 }}
-              className="flex h-9 min-w-0 items-center border-t-2 border-r border-t-sand/45 border-r-line px-2 text-chalk-dim"
-            >
-              <span className="truncate font-mono">{name}</span>
-            </div>
+            <Fragment key={`+${name}`}>{headerCell({ row: -1, col: columns.length + 1 + j }, name, headerViews?.pending(name), null)}</Fragment>
           ))}
         </div>
       </div>

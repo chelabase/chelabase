@@ -140,7 +140,11 @@ describe("E-M4: a staged drop of the table", () => {
   it("makes_the_rest_of_the_structure_read_only_with_a_reason", async () => {
     draft([{ drop_table: { table: T } }]);
     const { user } = renderEditor();
-    expect(await screen.findByRole("button", { name: "Column actions for memo" })).toBeDisabled();
+    expect(await screen.findByRole("columnheader", { name: "memo" })).toHaveAttribute("title", "public.invoices is dropped in your pending changes");
+    await user.click(screen.getByRole("button", { name: "Column actions for memo" }));
+    await screen.findByRole("menu");
+    expect(screen.queryByRole("menuitem", { name: "Rename" })).toBeNull();
+    await user.keyboard("{Escape}");
     expect(screen.getByRole("button", { name: "Add column" })).toBeDisabled();
     await user.click(screen.getByRole("tab", { name: "Structure" }));
     expect(await screen.findAllByText("public.invoices is dropped in your pending changes")).not.toHaveLength(0);

@@ -30,10 +30,10 @@ describe("finish review fixes", () => {
 
   it("3_chips_show_short_type_names_and_keep_the_full_type_in_the_name", async () => {
     renderEditor();
-    const strip = await screen.findByRole("list", { name: "Columns" });
-    const chip = within(strip).getByRole("button", { name: "amount_cents bigint" });
-    expect(chip).toHaveTextContent(/int8/);
-    expect(chip).not.toHaveTextContent(/bigint/);
+    const chip = await within(await grid()).findByRole("columnheader", { name: "amount_cents" });
+    await vi.waitFor(() => expect(chip).toHaveAccessibleDescription(/^bigint/));
+    // The chip shows the short name; the full one is its tooltip and its description.
+    expect(within(chip).getByTitle("bigint")).toHaveTextContent(/^int8$/);
   });
 
   it("4_a_short_first_page_gives_the_exact_count", async () => {

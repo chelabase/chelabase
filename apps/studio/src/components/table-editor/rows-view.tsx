@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
@@ -48,7 +48,7 @@ import type { CellMenuGroups } from "./cell-menu";
 import { ConflictDialog, type ConflictDialogProps } from "./conflict-dialog";
 import { DeleteDialog, type DeleteTarget } from "./delete-dialog";
 import { FilterPopover } from "./filter-popover";
-import { Grid, type CellMenuTarget, type GridLayout } from "./grid";
+import { Grid, type CellMenuTarget } from "./grid";
 import { LiveBadge, type LiveStatus } from "./live-badge";
 import { LoadValueCell, cellKey, loadedValueKey, useLoadValue } from "./load-value";
 import { AvatarStack, PresenceLayer } from "./presence-layer";
@@ -56,6 +56,7 @@ import { SelectionBar } from "./selection-bar";
 import { SortPopover } from "./sort-popover";
 import type { TableTarget } from "./target";
 import { useTableStructure } from "./use-structure";
+import { useColumnHeaders, type ColumnChips } from "./column-headers";
 
 /**
  * The first key of every rows query. Apply (T5) and every row write (inline edits, the row
@@ -97,8 +98,8 @@ export interface RowsViewProps {
   pageSize: number | null;
   /** Where the view's tools (Filter, Insert row) go: the table bar. Rendered inline without one. */
   toolsSlot: HTMLElement | null;
-  /** Content kept sticky above the grid in its scroll container (the column strip), passed to `Grid`. */
-  above?: (layout: GridLayout) => ReactNode;
+  /** Column chips as the grid's header cells (structure editing), with why structure can't change; omitted, plain headers. */
+  chips?: ColumnChips;
   /** The viewer's `sub`: their own selection is never drawn as presence. */
   selfSub?: string;
 }
@@ -241,7 +242,7 @@ function samePageView(a: readonly unknown[], b: readonly unknown[]): boolean {
   return JSON.stringify(a.slice(0, -1)) === JSON.stringify(b.slice(0, -1));
 }
 
-function RowsData({ target, access, object, pageSize, toolsSlot, above, selfSub = "" }: RowsViewProps) {
+function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub = "" }: RowsViewProps) {
   const { databaseId, branchId, database, schema, table, role } = target;
   const qualified = `${schema}.${table}`;
   const queryClient = useQueryClient();
@@ -266,9 +267,10 @@ function RowsData({ target, access, object, pageSize, toolsSlot, above, selfSub 
       small: (small: string[]) => textSelectItems({ columns: small, pk, originals: originals.filter((c) => small.includes(c)) }),
     };
   }, [tableDef, types.data, pk]);
-  // Columns added in the pending changes get a placeholder track in the grid, under their strip chip.
+  // Columns added in the pending changes get a placeholder track in the grid, under their header chip.
   const { projected } = useTableStructure(target, { enabled: isTable });
   const pendingColumns = useMemo(() => (projected ? projected.columns.filter((c) => c.original === null).map((c) => c.name) : []), [projected]);
+  const headers = useColumnHeaders(target, chips, { enabled: isTable });
 
   const [offset, setOffset] = useState(0);
   const [sort, setSort] = useState<Sort | null>(null);
@@ -1029,7 +1031,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, above, selfSub 
       )}
       {columns.length > 0 && (
           <Grid
-            above={above}
+            headers={headers}
             resetKey={`${view}|${offset}`}
             label={qualified}
             columns={columns}
@@ -1042,9 +1044,9 @@ function RowsData({ target, access, object, pageSize, toolsSlot, above, selfSub 
             // In the all-matching state the header box shows checked: a click clears the selection.
             onTogglePage={() => select(selection.kind === "all_matching" ? { type: "clear" } : { type: "page", keys: pageKeys })}
             sort={sort}
-            onSort={(col) => {
+            onSort={(col, dir) => {
               setOffset(0);
-              setSort(sort?.col !== col ? { col, dir: "asc" } : sort.dir === "asc" ? { col, dir: "desc" } : null);
+              setSort(dir ? { col, dir } : null);
             }}
             canEdit={(col, key) =>
               writable &&

@@ -36,7 +36,7 @@
       "body": { "displayName": "Body", "purpose": "All shell UI text: rail labels, account trigger, menu items, form labels and fields, segments." },
       "note": { "displayName": "Note", "purpose": "A right panel's running text: dry-run lines, warnings, errors, edit labels, explanations." },
       "label": { "displayName": "Label", "purpose": "Tooltips, the account menu's email line, grid header names, field errors." },
-      "micro": { "displayName": "Micro", "purpose": "11px: the grid gutter's row numbers, the column strip's chips (in mono) and tags. Never running text or a control's only label." },
+      "micro": { "displayName": "Micro", "purpose": "11px: the grid gutter's row numbers, the column header chips (in mono) and tags. Never running text or a control's only label." },
       "code": { "displayName": "Code", "purpose": "SQL editor (13px), the row panel's fields and the edit list (13px), hover docs and SQL blocks (12px)." },
       "grid-cell": { "displayName": "Grid Cell", "purpose": "Data-grid cell values and header names: JetBrains Mono 12px." }
     },

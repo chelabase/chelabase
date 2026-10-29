@@ -1,7 +1,7 @@
 import type { DryRunState } from "./use-dry-run";
 import { useId, type ComponentProps } from "react";
 import type { LockLevel } from "@chelabase/management-client";
-import { Check, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Check, PanelRightClose, PanelRightOpen, type LucideIcon } from "lucide-react";
 import { lockText, skipText, type EditStatus, type StatementView } from "@/lib/table-editor/dry-run";
 import { cn } from "@/lib/utils";
 
@@ -52,23 +52,36 @@ export function CollapseButton({ onClick, className }: { onClick: () => void; cl
   );
 }
 
-/** A collapsed panel's 48px strip: the expand control and the vertical name of what it holds. */
-export function CollapsedStrip({ text, onExpand }: { text: string; onExpand: () => void }) {
+/**
+ * A collapsed panel's 48px strip (an activity-bar slot): the expand control, then one icon naming what the panel
+ * holds, with a small badge (a count, or a sand dot for a held draft). The full name is the button's tooltip and its
+ * accessible description; the icon expands too, for the pointer, but is no second tab stop.
+ */
+export function CollapsedStrip({ text, icon: Icon, badge, onExpand }: { text: string; icon: LucideIcon; badge?: number | "dot"; onExpand: () => void }) {
   const stripId = useId();
   return (
-    <div className="flex w-12 shrink-0 flex-col items-center gap-3.5 border-l border-line-strong bg-deep py-3">
+    <div className="flex w-12 shrink-0 flex-col items-center gap-3 border-l border-line-strong bg-deep py-3">
       <button
         type="button"
         aria-label="Expand panel"
         aria-describedby={stripId}
+        title={text}
         onClick={onExpand}
         className="flex size-9 items-center justify-center border border-input text-chalk outline-none hover:border-sand focus-visible:outline-2 focus-visible:outline-sand"
       >
         <PanelRightOpen aria-hidden="true" size={16} strokeWidth={1.5} />
       </button>
-      <span id={stripId} className="flex rotate-180 items-center gap-2.5 text-sm text-chalk [writing-mode:vertical-rl]">
-        <span aria-hidden="true" className="size-2 bg-sand" />
+      <span id={stripId} className="sr-only">
         {text}
+      </span>
+      <span aria-hidden="true" data-testid="strip-icon" title={text} onClick={onExpand} className="relative flex size-9 cursor-pointer items-center justify-center text-chalk-dim hover:text-chalk">
+        <Icon size={18} strokeWidth={1.5} />
+        {badge === "dot" && <span data-testid="strip-badge" className="absolute top-1.5 right-1.5 size-1.5 bg-sand" />}
+        {typeof badge === "number" && (
+          <span data-testid="strip-badge" className="absolute -top-0.5 -right-0.5 min-w-4 bg-sand px-1 text-center font-sans text-[11px] leading-4 text-ink tabular-nums">
+            {badge}
+          </span>
+        )}
       </span>
     </div>
   );

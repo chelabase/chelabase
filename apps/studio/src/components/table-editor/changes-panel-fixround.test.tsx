@@ -70,7 +70,11 @@ describe("T5 fix round", () => {
     await user.click(apply);
     await vi.waitFor(async () => expect((await bodies(f, "POST", SC)).some((b) => !b.dry_run)).toBe(true));
     expect(screen.getByRole("button", { name: "Add column" })).toBeDisabled();
-    expect(screen.getByRole("button", { name: "Column actions for memo" })).toBeDisabled();
+    // The column menu keeps its sort items only.
+    await user.click(screen.getByRole("button", { name: "Column actions for memo" }));
+    await screen.findByRole("menu");
+    expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual(["Sort ascending", "Sort descending"]);
+    await user.keyboard("{Escape}");
     release();
     expect(await screen.findByRole("status")).toHaveTextContent("Applied 1 change to public.invoices");
     expect(screen.getByRole("button", { name: "Add column" })).toBeEnabled();

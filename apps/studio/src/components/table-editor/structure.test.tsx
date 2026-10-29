@@ -4,15 +4,15 @@ import { B, bodies, invoices, meAs, renderEditor, stubLayout } from "@/test/tabl
 
 const SC = `${B}/schema-changes`;
 
-describe("column strip and structure", () => {
+describe("column chips and structure", () => {
   beforeEach(() => { localStorage.clear(); sessionStorage.clear(); stubLayout(); });
 
   it("strip_lists_typed_columns", async () => {
     renderEditor();
-    const strip = await screen.findByRole("list", { name: "Columns" });
-    expect(within(strip).getByRole("button", { name: "amount_cents bigint" })).toBeInTheDocument();
-    expect(within(strip).getByRole("button", { name: "status invoice_status" })).toBeInTheDocument();
-    expect(within(strip).getByRole("button", { name: "Add column" })).toBeInTheDocument();
+    const g = await screen.findByRole("grid", { name: "public.invoices" });
+    await vi.waitFor(() => expect(within(g).getByRole("columnheader", { name: "amount_cents" })).toHaveAccessibleDescription(/^bigint/));
+    expect(within(g).getByRole("columnheader", { name: "status" })).toHaveAccessibleDescription(/^invoice_status/);
+    expect(screen.getByRole("button", { name: "Add column" })).toBeInTheDocument();
   });
 
   it("add_column_flows_into_the_changes_panel", async () => {
@@ -32,8 +32,8 @@ describe("column strip and structure", () => {
     const panel = await screen.findByRole("complementary", { name: "Pending changes" });
     expect(within(panel).getByRole("heading", { name: "Pending changes · 1" })).toBeInTheDocument();
     expect(within(panel).getByRole("button", { name: "Add column discount_cents int8" })).toBeInTheDocument();
-    const strip = screen.getByRole("list", { name: "Columns" });
-    expect(within(strip).getByRole("button", { name: "discount_cents int8, new" })).toBeInTheDocument();
+    const g = screen.getByRole("grid", { name: "public.invoices" });
+    expect(within(g).getByRole("columnheader", { name: "discount_cents" })).toHaveAccessibleDescription(/^int8, new/);
     const apply = within(panel).getByRole("button", { name: "Apply 1 change" });
     await vi.waitFor(() => expect(apply).toBeEnabled());
     await user.click(apply);
@@ -47,7 +47,7 @@ describe("column strip and structure", () => {
 
   it("edit_existing_column_from_its_chip", async () => {
     const { user } = renderEditor();
-    await user.click(await screen.findByRole("button", { name: "memo text" }));
+    await user.click(await within(await screen.findByRole("grid", { name: "public.invoices" })).findByRole("columnheader", { name: "memo" }));
     const form = await screen.findByRole("complementary", { name: "Edit column memo" });
     const name = within(form).getByLabelText("Name");
     await user.clear(name);
@@ -55,7 +55,7 @@ describe("column strip and structure", () => {
     await user.click(within(form).getByRole("button", { name: "Add to changes" }));
     const panel = await screen.findByRole("complementary", { name: "Pending changes" });
     expect(within(panel).getByRole("button", { name: "Rename column memo → note" })).toBeInTheDocument();
-    expect(within(screen.getByRole("list", { name: "Columns" })).getByRole("button", { name: "note text, changed" })).toBeInTheDocument();
+    expect(within(screen.getByRole("grid", { name: "public.invoices" })).getByRole("columnheader", { name: "note" })).toHaveAccessibleDescription(/^text, changed/);
   });
 
   it("drop_from_the_chip_menu_shows_dependents_and_needs_cascade", async () => {
