@@ -438,7 +438,7 @@ fn none_match(headers: &HeaderMap, etag: &str) -> bool {
         (status = 401, description = "`unauthorized`: the key is missing, invalid, revoked or not a secret key, or its branch is gone", body = DataErrorEnvelope),
         (status = 403, description = "`role_not_allowed`: the role is owner-level or has system privileges: superuser, CREATEROLE, CREATEDB, REPLICATION, or a member of a superuser role, `neon_superuser` or a system role (BYPASSRLS alone is allowed)", body = DataErrorEnvelope),
         (status = 404, description = "`unknown_database`: the database (or, with `all_databases`, main) doesn't exist, isn't served or isn't on the key's list", body = DataErrorEnvelope),
-        (status = 409, description = "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it)", body = DataErrorEnvelope),
+        (status = 409, description = "`conflict`: the schema can't be typed: a schema the role reaches has a dot in its name (rename it, or revoke the role's USAGE on it), or with `all_databases` another database is named `main`, the key main always takes (generate it alone with `database=main`)", body = DataErrorEnvelope),
         (status = 429, description = "`rate_limited`: too many requests", body = DataErrorEnvelope),
         (status = 500, description = "`internal`: an unexpected error; the message carries the request id", body = DataErrorEnvelope),
         (status = 503, description = "`unavailable`: the database can't be reached right now; retry after `Retry-After`", body = DataErrorEnvelope,

@@ -2645,9 +2645,13 @@ async fn types_of(l: &Live, query: &str, if_none_match: Option<&str>) -> reqwest
     req.send().await.unwrap()
 }
 
-/// What `chelabase gen types` writes for the same key and options: its fetch plan over
-/// `GET /data/v1/schema` (the CLI's own code, minus the HTTP client), then the generator.
-async fn cli_output(l: &Live, which: chelabase_typegen::Which, format: chelabase_typegen::Format) -> String {
+/// The generator over what `GET /data/v1/schema` gives the key: `chelabase_typegen`'s
+/// `collect` (the CLI's fetch plan) and `render`, which the route runs too. That the
+/// generator's output is the CLI's, byte for byte, is pinned by the committed goldens
+/// (`packages/client/fixtures/gen/*`): `chelabase-typegen`'s `gen_types_golden`,
+/// `gen_types_golden_for_two_databases` and `render_is_the_cli_module`, and the CLI's own
+/// fetch tests against the same files.
+async fn generated_from_the_schema_route(l: &Live, which: chelabase_typegen::Which, format: chelabase_typegen::Format) -> String {
     let schemas = chelabase_typegen::collect(&which, |database: Option<String>| async move {
         let schema = l.schema_of("authenticated", database.as_deref()).await;
         // The CLI parses the response text, exactly as served.
@@ -2668,11 +2672,13 @@ const TYPES_DDL: &str = "CREATE TYPE mood AS ENUM ('sad', 'happy');
      CREATE FUNCTION latest() RETURNS orders LANGUAGE sql AS 'SELECT * FROM orders ORDER BY id DESC LIMIT 1';
      CREATE FUNCTION bump(n int DEFAULT 1) RETURNS SETOF bigint LANGUAGE sql AS 'SELECT n::bigint';";
 
-/// The body is `chelabase gen types`' output byte for byte, for the default, `database=`
-/// and `all_databases=true`, as `ts` and as `json`.
+/// The body is the generator's output over the key's own `GET /data/v1/schema` answers, byte
+/// for byte, for the default, `database=` and `all_databases=true`, as `ts` and as `json`:
+/// the route reads nothing else. (The generator equals the CLI by the goldens; see
+/// [`generated_from_the_schema_route`].)
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
-async fn types_matches_the_cli_output() {
+async fn types_matches_the_generator_over_the_schema_route() {
     use chelabase_typegen::{Format, Which};
     live("types", |l| async move {
         l.owner(TYPES_DDL).await;
@@ -2705,13 +2711,13 @@ async fn types_matches_the_cli_output() {
                 assert_eq!(headers["content-type"], content_type, "{q}");
                 assert_eq!(headers["cache-control"], "no-store", "{q}");
                 let body = resp.text().await.unwrap();
-                let want = cli_output(&l, which.clone(), format).await;
+                let want = generated_from_the_schema_route(&l, which.clone(), format).await;
                 assert_eq!(body, want, "{q}");
             }
         }
         // The cases differ where they should.
-        let main = cli_output(&l, Which::Main, Format::Ts).await;
-        let all = cli_output(&l, Which::All, Format::Ts).await;
+        let main = generated_from_the_schema_route(&l, Which::Main, Format::Ts).await;
+        let all = generated_from_the_schema_route(&l, Which::All, Format::Ts).await;
         assert!(main.contains("orders: {") && !main.contains("events"), "{main}");
         assert!(all.contains("export type Databases = {") && all.contains("events: {"), "{all}");
         assert!(main.contains("total: string;") && main.contains("id: Int8;"), "{main}");

@@ -3,7 +3,8 @@
  * with the HTTP status. A non-2xx answer without that body (a proxy's error page, say)
  * gets a `code` from its status (401 `unauthorized`, 413 `too_large`, 429 `rate_limited`,
  * 502/503 `unavailable`, 504 `timeout`, else `internal`); a 2xx answer that isn't JSON
- * gets `internal`. Network failures are not wrapped: `fetch`'s own error is rethrown.
+ * gets `internal`, as does a redirect (never followed). Network failures are not wrapped:
+ * `fetch`'s own error is rethrown.
  */
 export class DataApiError extends Error {
   override name = "DataApiError";
@@ -51,8 +52,23 @@ export class UnsafeIntegerError extends Error {
   }
 }
 
+/**
+ * How every request the client sends treats a redirect: it isn't followed (each carries a
+ * data key, and maybe an app user's token or a refresh token), and [`toError`] makes the
+ * answer a `DataApiError`. In Node the 3xx itself comes back; in a browser, an
+ * `opaqueredirect` with status 0.
+ */
+export const NO_REDIRECTS: RequestRedirect = "manual";
+
 /** The `DataApiError` for a non-2xx answer (internal: not exported from the package). */
 export function toError(res: Response, text: string): DataApiError {
+  if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+    return new DataApiError({
+      status: res.status,
+      code: "internal",
+      message: `the server answered with a redirect${res.status ? ` (HTTP ${res.status})` : ""}; the client never follows one, so the request was not sent again`,
+    });
+  }
   try {
     const body = JSON.parse(text) as { error?: Record<string, unknown> };
     const e = body.error;

@@ -5,7 +5,7 @@
  * @module
  */
 import { createAuth, SESSION_GONE, USER_HEADER } from "./auth.ts";
-import { plainError, toError } from "./error.ts";
+import { NO_REDIRECTS, plainError, toError } from "./error.ts";
 import { hasSourceText, parseResult, type ResultSpec, stringify } from "./json.ts";
 import { batchOf, callFn, type Runner, selectFrom } from "./query.ts";
 import type { AuthOptions, Client, DatabaseShape, QueryTree, TypeMap } from "./types.ts";
@@ -135,6 +135,7 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
               ...(userToken === undefined ? {} : { [USER_HEADER]: userToken }),
             },
             body: payload,
+            redirect: NO_REDIRECTS,
           });
         let token = await core.accessToken();
         let res = await send(token);
