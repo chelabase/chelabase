@@ -7,7 +7,7 @@
  */
 import { createAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
-import { type CookieOptions, cookieNames, parseCookies, readSession } from "./cookies.ts";
+import { type CookieOptions, cookieNames, parseCookies, readSession, serializeCookie, sessionCookies } from "./cookies.ts";
 import { toError } from "./error.ts";
 import type { BrowserSession, Client, DatabaseShape, TypeMap } from "./types.ts";
 
@@ -53,6 +53,11 @@ export function createBrowserClient<DB extends DatabaseShape, B extends boolean 
     const doc = (globalThis as { document?: { cookie?: string } }).document;
     return readSession(parseCookies(doc?.cookie ?? ""), names).access;
   };
+  const clearAccess = () => {
+    const doc = (globalThis as { document?: { cookie?: string } }).document;
+    // Same name and attributes as the route wrote it, with `Max-Age=0`.
+    if (doc) doc.cookie = serializeCookie(sessionCookies(names, null, opts.cookieOptions)[0]!);
+  };
   try {
     // `createClient` kept the refresh token here; this client never does.
     (globalThis as { localStorage?: Storage }).localStorage?.removeItem(`chelabase.${opts.key.slice(0, 12)}.refresh`);
@@ -60,7 +65,7 @@ export function createBrowserClient<DB extends DatabaseShape, B extends boolean 
     // storage blocked: nothing to remove
   }
   return buildClient<DB, B>("createBrowserClient", opts, (base, doFetch) => ({
-    core: createAuth<DB>({ base, key: opts.key, fetch: doFetch, options: undefined, toError, remote: { path, readAccess } }),
+    core: createAuth<DB>({ base, key: opts.key, fetch: doFetch, options: undefined, toError, remote: { path, readAccess, clearAccess } }),
     retryExpired: true,
   }));
 }

@@ -48,6 +48,8 @@ export interface RemoteSession {
   path: string;
   /** The access cookie's current value. */
   readAccess(): string | undefined;
+  /** Deletes the readable access cookie, so a reload doesn't bring a dropped session back. */
+  clearAccess(): void;
 }
 
 export function memoryStorage(): AuthStorage {
@@ -210,15 +212,25 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     timer = undefined;
   }
 
-  async function clearLocal(emitEvent: boolean) {
+  /** `force`: a sign-out, which drops the access cookie even if it changed meanwhile. */
+  async function clearLocal(emitEvent: boolean, force = false) {
+    const prev = access;
     clearTimer();
     access = undefined;
     expMs = 0;
     started = Promise.resolve();
     await storage.remove(storeKey);
     await srv?.onSession(null);
-    // The route cleared the cookies (or, after a failure, an unchanged cookie is not taken back).
-    if (remote) seen = remote.readAccess();
+    if (remote) {
+      // The route usually cleared the cookies already; when it couldn't (unreachable, or the session
+      // ended on a data request), the readable one goes here. A newer cookie another tab wrote
+      // meanwhile is left alone, and taken up by the next `sync`.
+      const cur = remote.readAccess();
+      if (force || cur === prev) {
+        if (cur !== undefined) remote.clearAccess();
+        seen = remote.readAccess();
+      }
+    }
     if (emitEvent) emit("signed_out", null);
   }
 
@@ -373,7 +385,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
           if (token !== null) await call("sign-out", { body: { refresh_token: token } });
         }
       } finally {
-        await clearLocal(true);
+        await clearLocal(true, true);
       }
     },
     refresh,
