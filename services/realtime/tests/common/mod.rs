@@ -354,6 +354,7 @@ impl Harness {
                 databases: None,
                 project_id: None,
                 role_oid: None,
+                server_vouched: false,
             }),
         };
         Tickets::new(self.key.clone(), self.store.clone())

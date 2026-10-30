@@ -598,16 +598,21 @@ fn valid_email(email: &str) -> bool {
 }
 
 /// Counts one attempt against each `(flow, key kind, value, limit, window)`, stopping at the
-/// first over its limit.
+/// first over its limit. A server-vouched call (#55) skips the `"ip"` checks: its address is
+/// the app server's, shared by all its users; the `"email"` and `"user"` checks still count.
 fn rate_limit(
     s: &AppState,
     caller: &AppCaller,
     checks: &[(&str, &str, &str, u32, Duration)],
 ) -> Flow<()> {
-    let ok = checks.iter().all(|(flow, kind, value, limit, window)| {
-        let key = format!("app:{}:{flow}:{kind}:{value}", caller.project_id);
-        s.limiter.allow(&key, *limit, *window)
-    });
+    let applies = |kind: &str| !(caller.server_vouched && kind == "ip");
+    let ok = checks
+        .iter()
+        .filter(|(_, kind, ..)| applies(kind))
+        .all(|(flow, kind, value, limit, window)| {
+            let key = format!("app:{}:{flow}:{kind}:{value}", caller.project_id);
+            s.limiter.allow(&key, *limit, *window)
+        });
     if ok {
         Ok(())
     } else {

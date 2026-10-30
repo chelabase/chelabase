@@ -893,6 +893,7 @@ pub fn r_identity(branch: uuid::Uuid) -> DataIdentity {
         databases: None,
         project_id: None,
         role_oid: None,
+        server_vouched: false,
     }
 }
 

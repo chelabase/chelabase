@@ -426,6 +426,7 @@ impl Pipeline {
                 databases: resolved.databases,
                 project_id: Some(resolved.project_id),
                 role_oid,
+                server_vouched: false,
             }),
             email: None,
             name: None,

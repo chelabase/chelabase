@@ -35,6 +35,9 @@ pub struct AppCaller {
     pub user: Option<AppUserClaims>,
     pub request_id: String,
     pub ip: String,
+    /// The app's server vouched for this call with the branch's secret key and sent no client
+    /// address (the gateway's `server_vouched`): the per-IP limits don't apply to it.
+    pub server_vouched: bool,
 }
 
 pub(crate) fn unavailable() -> ApiError {
@@ -90,6 +93,7 @@ impl AppCaller {
             user,
             request_id: claims.rid,
             ip: client_ip(headers),
+            server_vouched: data.server_vouched,
         })
     }
 }

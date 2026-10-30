@@ -50,6 +50,12 @@ pub struct DataIdentity {
     /// key not backfilled yet, and in tokens minted before it existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role_oid: Option<i64>,
+    /// The app's server vouched for this app-auth call with the branch's secret key and sent
+    /// no client address: auth skips its per-IP limits (its per-email and per-user ones still
+    /// apply). Only the gateway sets it, only on `/auth/v1/app/*`; absent (false) in tokens
+    /// minted before it existed and from every other minter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub server_vouched: bool,
 }
 
 /// The caller, as established by the gateway. For a data key, `sub` is the key id and
