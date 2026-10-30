@@ -11,10 +11,14 @@ use jsonwebtoken::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
 pub const APP_ISSUER: &str = "chelabase-auth";
 pub const APP_LEEWAY_SECS: u64 = 30;
+/// How long an app session's previous refresh token still gets the answer its rotation gave.
+/// The orchestrator applies it; the auth service bounds its refresh user lookup by it (#59).
+pub const APP_REFRESH_GRACE: Duration = Duration::from_secs(10);
 
 /// The audience of a project's app tokens.
 pub fn app_audience(project: Uuid) -> String {

@@ -5,7 +5,6 @@
 //! Only the SHA-256 of the whole token is stored.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -16,6 +15,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use chelabase_auth::app_token::APP_REFRESH_GRACE;
 use chelabase_metadata::{
     AppSession, BranchKind, BranchStatus, NewAppSession, PeekOutcome, ProjectStatus, RefreshNext,
     RefreshOutcome,
@@ -40,8 +40,6 @@ use super::{BoxFuture, InternalState, NeonMetadataPort, require_any_bearer, requ
 
 /// The role the `auth` service writes the users table as (P7).
 const SYNC_ROLE: &str = "chelabase_auth_sync";
-/// How long the previous refresh token still gets the new one.
-const REFRESH_GRACE: Duration = Duration::from_secs(10);
 /// Zitadel's events are small; this is generous.
 const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 
@@ -359,7 +357,9 @@ where
         new_sealed: seal(&state.secrets, &grace_aad(id), &next_token),
         sliding: state.app_refresh_ttl,
         cap: APP_SESSION_CAP,
-        grace: REFRESH_GRACE,
+        // How long the previous refresh token still gets the new one; auth's user lookup is
+        // bounded by it.
+        grace: APP_REFRESH_GRACE,
     };
     // The project is checked inside the locked transaction, before any write (I5).
     let outcome = match state
