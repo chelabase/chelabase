@@ -414,7 +414,12 @@ where
     // The project is checked in the same read (I5).
     match state
         .metadata
-        .peek_app_session(id, body.project_id, token_hash(&body.refresh_token), APP_SESSION_CAP)
+        .peek_app_session(
+            id,
+            body.project_id,
+            token_hash(&body.refresh_token),
+            APP_SESSION_CAP,
+        )
         .await
     {
         Ok(PeekOutcome::Live(session)) => {
