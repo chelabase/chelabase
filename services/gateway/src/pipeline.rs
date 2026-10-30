@@ -4,7 +4,7 @@
 //! Pure over request parts; `proxy.rs` adapts it to Pingora. Nothing here is
 //! configurable per route except the typed `Policy` from `chelabase-routes`.
 
-use crate::data_keys::{DataKeyResolver, KeyError};
+use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
 use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
@@ -15,7 +15,7 @@ use http::HeaderMap;
 use serde_json::{json, Value};
 use std::net::IpAddr;
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 use uuid::Uuid;
 
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -30,7 +30,20 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// gateway-minted identity.
 /// The end-user token header; checked by the gateway, never forwarded.
 pub const USER_TOKEN_HEADER: &str = "chelabase-user";
-const STRIPPED_REQUEST_HEADERS: &[&str] = &[IDENTITY_HEADER, "authorization", USER_TOKEN_HEADER];
+/// An app server's own secret key, sent beside its public key to vouch for
+/// [`CLIENT_IP_HEADER`]; checked by the gateway, never forwarded.
+pub const SERVER_KEY_HEADER: &str = "chelabase-server-key";
+/// The app user's address as the app's server saw it. Believed only on the app auth routes
+/// (`Auth::PublicDataKey`) and only with the branch's secret key in [`SERVER_KEY_HEADER`];
+/// never forwarded.
+pub const CLIENT_IP_HEADER: &str = "chelabase-client-ip";
+const STRIPPED_REQUEST_HEADERS: &[&str] = &[
+    IDENTITY_HEADER,
+    "authorization",
+    USER_TOKEN_HEADER,
+    SERVER_KEY_HEADER,
+    CLIENT_IP_HEADER,
+];
 const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id";
 const CORS_MAX_AGE_SECS: &str = "600";
 
@@ -63,6 +76,9 @@ pub struct ProxyPlan {
     pub identity: Option<String>,
     /// Headers added to the response returned to the client (CORS).
     pub response_headers: Vec<(&'static str, String)>,
+    /// The address `X-Forwarded-For` names upstream: the request's client address, or on an
+    /// app auth route the one the app's server vouched for with its secret key.
+    pub client_ip: Option<IpAddr>,
 }
 
 /// Header edits for the upstream request: remove first, then set.
@@ -230,6 +246,7 @@ impl Pipeline {
 
         let cors = self.cors_headers(endpoint, req.headers);
 
+        let mut client_ip = req.client_ip;
         let identity = match endpoint.policy.auth {
             Auth::Public => None,
             Auth::DataKey | Auth::SecretDataKey | Auth::PublicDataKey => {
@@ -239,7 +256,10 @@ impl Pipeline {
                     .authenticate_key(endpoint.service, req, secret_only, public_only, request_id)
                     .await
                 {
-                    Ok(token) => Some(token),
+                    Ok((token, vouched)) => {
+                        client_ip = vouched.or(client_ip);
+                        Some(token)
+                    }
                     Err(mut resp) => {
                         resp.headers.extend(cors);
                         return Outcome::Respond(resp);
@@ -264,6 +284,7 @@ impl Pipeline {
             endpoint,
             identity,
             response_headers: cors,
+            client_ip,
         })
     }
 
@@ -338,7 +359,9 @@ impl Pipeline {
     }
 
     /// Resolve the data API key from `Authorization: Bearer` and mint an
-    /// internal identity for `service`. Errors use the data API error body.
+    /// internal identity for `service`. Errors use the data API error body. On a public-only
+    /// route (the app auth routes) it also returns the client address the app's server
+    /// vouched for, if any ([`Self::vouched_client_ip`]).
     async fn authenticate_key(
         &self,
         service: Service,
@@ -346,7 +369,7 @@ impl Pipeline {
         secret_only: bool,
         public_only: bool,
         request_id: &str,
-    ) -> Result<String, GatewayResponse> {
+    ) -> Result<(String, Option<IpAddr>), GatewayResponse> {
         let key = bearer_token(req.headers).ok_or(KeyError::Missing).map_err(key_error)?;
         let resolved = self.keys.resolve(key, req.client_ip).await.map_err(key_error)?;
         if let Some(refused) = key_kind_refusal(secret_only, public_only, resolved.kind) {
@@ -358,7 +381,7 @@ impl Pipeline {
             None if req.headers.contains_key(USER_TOKEN_HEADER) => {
                 return Err(user_token_error(UserTokenError::Invalid));
             }
-            None => (resolved.role, json!({}), resolved.role_oid),
+            None => (resolved.role.clone(), json!({}), resolved.role_oid),
             Some(_) if resolved.kind == DataKeyKind::Secret => {
                 return Err(data_error(
                     400,
@@ -384,6 +407,11 @@ impl Pipeline {
                 )
             }
         };
+        let vouched = if public_only {
+            self.vouched_client_ip(req, &resolved).await
+        } else {
+            None
+        };
         let identity = Identity {
             sub: resolved.key_id.to_string(),
             org_id: String::new(),
@@ -402,10 +430,41 @@ impl Pipeline {
             email: None,
             name: None,
         };
-        self.signer.sign(service.name(), &identity).map_err(|err| {
+        let token = self.signer.sign(service.name(), &identity).map_err(|err| {
             error!("mint internal identity: {err}");
             internal_key_error(request_id)
-        })
+        })?;
+        Ok((token, vouched))
+    }
+
+    /// The address in [`CLIENT_IP_HEADER`] when [`SERVER_KEY_HEADER`] holds the secret key of
+    /// the public key's branch, else None (the request keeps the address the gateway settled
+    /// on). Never an error: a misconfigured app server degrades to its own address. The server
+    /// key is looked up only once the address parses, and its lookup is charged to the real
+    /// client address's miss limit. Logs never hold either header's value.
+    async fn vouched_client_ip(&self, req: &RequestParts<'_>, public: &ResolvedKey) -> Option<IpAddr> {
+        if !req.headers.contains_key(CLIENT_IP_HEADER) {
+            return None;
+        }
+        let Some(ip) = asserted_client_ip(req.headers) else {
+            debug!("ignoring chelabase-client-ip: not one IP address");
+            return None;
+        };
+        let Some(server_key) = single_header(req.headers, SERVER_KEY_HEADER) else {
+            debug!("ignoring chelabase-client-ip: no single chelabase-server-key");
+            return None;
+        };
+        match self.keys.resolve(server_key, req.client_ip).await {
+            Ok(server) if server_key_vouches(public, &server) => Some(ip),
+            Ok(_) => {
+                debug!("ignoring chelabase-client-ip: chelabase-server-key isn't this branch's secret key");
+                None
+            }
+            Err(err) => {
+                debug!(?err, "ignoring chelabase-client-ip: chelabase-server-key didn't resolve");
+                None
+            }
+        }
     }
 
     /// Verify the management token and mint an internal identity for `service`.
@@ -500,6 +559,32 @@ fn data_error(status: u16, code: &str, message: &str) -> GatewayResponse {
 
 fn internal_key_error(request_id: &str) -> GatewayResponse {
     data_error(500, "internal", &format!("internal error (request id {request_id})"))
+}
+
+/// [`CLIENT_IP_HEADER`] when it is exactly one header line holding one IPv4 or IPv6 literal:
+/// no port, brackets, zone, list or whitespace. An IPv4-mapped address comes back as IPv4.
+fn asserted_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let ip: IpAddr = single_header(headers, CLIENT_IP_HEADER)?.parse().ok()?;
+    Some(ip.to_canonical())
+}
+
+/// Whether the server key `server` vouches for a request made with the public key `public`:
+/// a secret key of the same project and branch. (The resolver never answers a revoked key.)
+fn server_key_vouches(public: &ResolvedKey, server: &ResolvedKey) -> bool {
+    public.kind == DataKeyKind::Public
+        && server.kind == DataKeyKind::Secret
+        && server.project_id == public.project_id
+        && server.branch_id == public.branch_id
+}
+
+/// `name`'s value when the request has exactly one line of it, in visible ASCII.
+fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
 }
 
 /// The answer for a resolved key of the wrong kind for the endpoint, if any.
@@ -1715,7 +1800,8 @@ mod tests {
             .pipeline
             .authenticate_key(Service::Auth, &parts(&anon), false, true, "rid")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let data = h.verify.verify(&minted, "auth").unwrap().data.unwrap();
         assert_eq!((data.project_id, data.role.as_str()), (Some(case.project), "anon"));
 
@@ -1724,7 +1810,8 @@ mod tests {
             .pipeline
             .authenticate_key(Service::Auth, &parts(&with_user), false, true, "rid")
             .await
-            .unwrap();
+            .unwrap()
+            .0;
         let data = h.verify.verify(&minted, "auth").unwrap().data.unwrap();
         assert_eq!((data.project_id, data.role.as_str()), (Some(case.project), "authenticated"));
 
@@ -1738,5 +1825,340 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(refused.status, 401);
+    }
+
+    // ---- an app server vouching for its user's address (#49) ----
+
+    const PEER: &str = "198.51.100.7";
+
+    fn peer() -> Option<IpAddr> {
+        Some(PEER.parse().unwrap())
+    }
+
+    /// A public key and the secret key of the same branch, both known to the mock.
+    struct AppKeys {
+        public: String,
+        resolved: ResolvedKey,
+        secret: String,
+    }
+
+    fn app_keys(h: &DataHarness) -> AppKeys {
+        let public = dk::new_key(DataKeyKind::Public);
+        let resolved = dk::resolved(DataKeyKind::Public);
+        h.mock.set(&public, Answer::Known(resolved.clone()));
+        let secret = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&secret, Answer::Known(secret_of(&resolved)));
+        AppKeys { public, resolved, secret }
+    }
+
+    /// A secret key of `public`'s branch.
+    fn secret_of(public: &ResolvedKey) -> ResolvedKey {
+        ResolvedKey {
+            key_id: TestUuid::new_v4(),
+            kind: DataKeyKind::Secret,
+            role: "service".to_string(),
+            ..public.clone()
+        }
+    }
+
+    /// A request from [`PEER`] with `public` as its bearer key plus `extra` headers.
+    async fn app_call(h: &DataHarness, path: &str, public: &str, extra: &[(&str, &str)]) -> Outcome {
+        let bearer = format!("Bearer {public}");
+        let mut pairs = vec![("authorization", bearer.as_str())];
+        pairs.extend_from_slice(extra);
+        let headers = headers(&pairs);
+        h.pipeline
+            .handle(&RequestParts { method: "POST", path, host: Some(API), headers: &headers, client_ip: peer() })
+            .await
+            .outcome
+    }
+
+    const SIGN_IN: &str = "/auth/v1/app/sign-in";
+
+    #[test]
+    fn the_client_ip_header_is_one_ip_literal() {
+        let ip = |raw: &str| asserted_client_ip(&headers(&[(CLIENT_IP_HEADER, raw)]));
+        assert_eq!(ip("203.0.113.9"), Some("203.0.113.9".parse().unwrap()));
+        assert_eq!(ip("2001:db8::1"), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(ip("::ffff:203.0.113.9"), Some("203.0.113.9".parse().unwrap()), "mapped is IPv4");
+        for bad in [
+            "203.0.113.9:443",
+            "203.0.113.9, 10.0.0.1",
+            "203.0.113.9,10.0.0.1",
+            "[2001:db8::1]",
+            "[2001:db8::1]:443",
+            "fe80::1%eth0",
+            "unknown",
+            "",
+            " 203.0.113.9",
+            "203.0.113.9 ",
+            "203.0.113.09",
+            "203.0.113",
+            "localhost",
+        ] {
+            assert_eq!(ip(bad), None, "{bad:?}");
+        }
+        let two = headers(&[(CLIENT_IP_HEADER, "203.0.113.9"), (CLIENT_IP_HEADER, "203.0.113.9")]);
+        assert_eq!(asserted_client_ip(&two), None, "two header lines");
+        assert_eq!(asserted_client_ip(&HeaderMap::new()), None);
+        let mut opaque = HeaderMap::new();
+        opaque.insert(CLIENT_IP_HEADER, HeaderValue::from_bytes(b"203.0.113.9\xff").unwrap());
+        assert_eq!(asserted_client_ip(&opaque), None, "not visible ASCII");
+    }
+
+    #[test]
+    fn only_the_same_branchs_secret_key_vouches() {
+        let public = dk::resolved(DataKeyKind::Public);
+        assert!(server_key_vouches(&public, &secret_of(&public)));
+        let other_public = ResolvedKey { key_id: TestUuid::new_v4(), ..public.clone() };
+        assert!(!server_key_vouches(&public, &other_public), "a public key");
+        let other_project = dk::resolved(DataKeyKind::Secret);
+        assert!(!server_key_vouches(&public, &other_project), "another project's secret key");
+        let other_branch = ResolvedKey { branch_id: TestUuid::new_v4(), ..secret_of(&public) };
+        assert!(!server_key_vouches(&public, &other_branch), "another branch's secret key");
+        let same_branch_other_project = ResolvedKey { project_id: TestUuid::new_v4(), ..secret_of(&public) };
+        assert!(!server_key_vouches(&public, &same_branch_other_project));
+        // Only a public bearer key can be vouched for.
+        let secret = secret_of(&public);
+        assert!(!server_key_vouches(&secret, &secret_of(&public)));
+    }
+
+    #[tokio::test]
+    async fn a_vouched_client_ip_is_forwarded_on_app_auth_routes() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        for (sent, want) in [
+            ("203.0.113.9", "203.0.113.9"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("::ffff:203.0.113.9", "203.0.113.9"),
+        ] {
+            let plan = expect_plan(
+                app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, sent)]).await,
+            );
+            assert_eq!(plan.client_ip, Some(want.parse().unwrap()), "{sent}");
+        }
+        // Every app route that takes the public key, not just sign-in.
+        let plan = expect_plan(
+            app_call(&h, "/auth/v1/app/refresh", &k.public, &[(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9")])
+                .await,
+        );
+        assert_eq!(plan.client_ip, Some("203.0.113.9".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn the_request_is_still_the_public_keys() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let plan = expect_plan(
+            app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9")]).await,
+        );
+        assert_eq!(plan.client_ip, Some("203.0.113.9".parse().unwrap()));
+        let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "auth").unwrap();
+        assert_eq!(claims.sub, k.resolved.key_id.to_string());
+        let data = claims.data.unwrap();
+        assert_eq!(data.key_id, k.resolved.key_id);
+        assert_eq!(data.kind, DataKeyKind::Public);
+        assert_eq!(data.role, "anon");
+        assert_eq!(data.role_oid, None);
+    }
+
+    #[tokio::test]
+    async fn an_unvouched_client_ip_is_ignored() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let other_project = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&other_project, Answer::Known(dk::resolved(DataKeyKind::Secret)));
+        let other_branch = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(
+            &other_branch,
+            Answer::Known(ResolvedKey { branch_id: TestUuid::new_v4(), ..secret_of(&k.resolved) }),
+        );
+        // The listener answers a revoked key as it does an unknown one: 404.
+        let revoked = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&revoked, Answer::NotFound);
+        let unknown = dk::new_key(DataKeyKind::Secret);
+        let failing = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&failing, Answer::ServerError);
+        let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("no server key", vec![(CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("the public key as server key", vec![(SERVER_KEY_HEADER, &k.public), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("another project's secret key", vec![(SERVER_KEY_HEADER, &other_project), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("another branch's secret key", vec![(SERVER_KEY_HEADER, &other_branch), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("a revoked secret key", vec![(SERVER_KEY_HEADER, &revoked), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("an unknown key", vec![(SERVER_KEY_HEADER, &unknown), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("a lookup failure", vec![(SERVER_KEY_HEADER, &failing), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("not a key", vec![(SERVER_KEY_HEADER, "garbage"), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            ("an empty server key", vec![(SERVER_KEY_HEADER, ""), (CLIENT_IP_HEADER, "203.0.113.9")]),
+            (
+                "two server keys",
+                vec![(SERVER_KEY_HEADER, &k.secret), (SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9")],
+            ),
+            ("a port", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9:443")]),
+            ("a list", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9, 10.0.0.1")]),
+            ("brackets", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "[2001:db8::1]")]),
+            ("unknown", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "unknown")]),
+            ("an empty value", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "")]),
+            (
+                "two header lines",
+                vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9"), (CLIENT_IP_HEADER, "203.0.113.9")],
+            ),
+        ];
+        for (case, extra) in cases {
+            // No error to the caller: the request goes through as from the peer.
+            let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
+            assert_eq!(plan.client_ip, peer(), "{case}");
+            let data = h.verify.verify(plan.identity.as_deref().unwrap(), "auth").unwrap().data.unwrap();
+            assert_eq!(data.key_id, k.resolved.key_id, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_key_is_never_looked_up_without_a_valid_client_ip() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let unknown = dk::new_key(DataKeyKind::Secret);
+        expect_plan(app_call(&h, SIGN_IN, &k.public, &[]).await);
+        let before = h.mock.lookups();
+        for extra in [
+            vec![(SERVER_KEY_HEADER, unknown.as_str())],
+            vec![(SERVER_KEY_HEADER, unknown.as_str()), (CLIENT_IP_HEADER, "unknown")],
+        ] {
+            let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
+            assert_eq!(plan.client_ip, peer());
+        }
+        assert_eq!(h.mock.lookups(), before, "an ignored server key costs no lookup");
+    }
+
+    #[tokio::test]
+    async fn a_valid_pair_is_ignored_on_data_routes() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let pair = [(SERVER_KEY_HEADER, k.secret.as_str()), (CLIENT_IP_HEADER, "203.0.113.9")];
+        // The public key's own lookup first; the server key is never looked up.
+        expect_plan(app_call(&h, "/data/v1/query", &k.public, &[]).await);
+        let before = h.mock.lookups();
+        let plan = expect_plan(app_call(&h, "/data/v1/query", &k.public, &pair).await);
+        assert_eq!(plan.client_ip, peer());
+        assert_eq!(h.mock.lookups(), before);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_server_key_is_charged_to_the_real_peer() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let asserted = "203.0.113.9";
+        // Each fresh unknown server key is one lookup charged to someone's miss bucket.
+        for _ in 0..40 {
+            let unknown = dk::new_key(DataKeyKind::Secret);
+            let plan = expect_plan(
+                app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &unknown), (CLIENT_IP_HEADER, asserted)]).await,
+            );
+            assert_eq!(plan.client_ip, peer());
+        }
+        assert!(h.mock.lookups() <= 25, "the misses were limited: {}", h.mock.lookups());
+        // The peer's bucket is empty; the asserted address's is untouched.
+        let miss = async |ip: &str| {
+            let key = dk::new_key(DataKeyKind::Public);
+            let headers = headers(&[("authorization", &format!("Bearer {key}"))]);
+            let parts = RequestParts {
+                method: "POST",
+                path: "/data/v1/query",
+                host: Some(API),
+                headers: &headers,
+                client_ip: Some(ip.parse().unwrap()),
+            };
+            expect_response(h.pipeline.handle(&parts).await.outcome).status
+        };
+        assert_eq!(miss(PEER).await, 429);
+        assert_eq!(miss(asserted).await, 401);
+    }
+
+    #[tokio::test]
+    async fn neither_header_reaches_the_upstream() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let pair = [(SERVER_KEY_HEADER, k.secret.as_str()), (CLIENT_IP_HEADER, "203.0.113.9")];
+        for path in [SIGN_IN, "/data/v1/query"] {
+            let plan = expect_plan(app_call(&h, path, &k.public, &pair).await);
+            let edits = plan.upstream_headers("rid");
+            for name in [SERVER_KEY_HEADER, CLIENT_IP_HEADER] {
+                assert!(edits.remove.contains(&name), "{path}: {name}");
+                assert!(!edits.set.iter().any(|(n, _)| *n == name), "{path}: {name}");
+            }
+        }
+        // Public routes too.
+        let plan = expect_plan(run(&h.pipeline, "GET", "/health", None, &pair).await.outcome);
+        assert!(plan.upstream_headers("rid").remove.contains(&SERVER_KEY_HEADER));
+    }
+
+    #[tokio::test]
+    async fn preflights_allow_neither_header() {
+        let h = data_harness().await;
+        for path in [SIGN_IN, "/data/v1/query"] {
+            let resp = expect_response(
+                run(
+                    &h.pipeline,
+                    "OPTIONS",
+                    path,
+                    None,
+                    &[
+                        ("origin", "https://app.example"),
+                        ("access-control-request-method", "POST"),
+                        ("access-control-request-headers", "chelabase-server-key, chelabase-client-ip"),
+                    ],
+                )
+                .await
+                .outcome,
+            );
+            let allowed = header(&resp.headers, "access-control-allow-headers").unwrap();
+            assert!(!allowed.contains(SERVER_KEY_HEADER) && !allowed.contains(CLIENT_IP_HEADER), "{path}: {allowed}");
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn no_log_line_holds_either_headers_value() {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let other = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&other, Answer::Known(dk::resolved(DataKeyKind::Secret)));
+        let unknown = dk::new_key(DataKeyKind::Secret);
+        let failing = dk::new_key(DataKeyKind::Secret);
+        h.mock.set(&failing, Answer::ServerError);
+        let ips = ["203.0.113.9", "2001:db8::1", "203.0.113.9:443", "unknown-ip-value"];
+        for server in [&k.secret, &k.public, &other, &unknown, &failing] {
+            for ip in ips {
+                expect_plan(app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, server), (CLIENT_IP_HEADER, ip)]).await);
+            }
+        }
+        expect_plan(app_call(&h, SIGN_IN, &k.public, &[(CLIENT_IP_HEADER, "203.0.113.9")]).await);
+        expect_plan(app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &k.secret)]).await);
+
+        let text = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("chelabase-client-ip"), "the decisions are logged:\n{text}");
+        for value in [k.secret.as_str(), k.public.as_str(), &other, &unknown, &failing, "203.0.113", "2001:db8", "unknown-ip-value"] {
+            assert!(!text.contains(value), "{value} logged:\n{text}");
+        }
     }
 }
