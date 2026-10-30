@@ -32,8 +32,8 @@ export interface AuthHandlerOptions {
    */
   clientIp?: (req: Request) => string | undefined;
   cookieOptions?: CookieOptions;
-  /** Where the route is mounted. Default `/api/chelabase/auth`. */
-  path?: string;
+  /** Where the route is mounted: the browser client's `authPath`. Default `/api/chelabase/auth`. */
+  authPath?: string;
   /** Defaults to the global `fetch`. */
   fetch?: typeof fetch;
 }
@@ -56,7 +56,7 @@ function originOf(u: string, what: string): string {
 }
 
 /**
- * A web-standard handler for `POST {path}/{sign-in|sign-up|refresh|change-password|sign-out}`.
+ * A web-standard handler for `POST {authPath}/{sign-in|sign-up|refresh|change-password|sign-out}`.
  * A session answer sets both cookies (the refresh cookie `HttpOnly`) and returns the session
  * without its `refresh_token`. Only a same-site `POST` with a JSON body is served: anything else
  * is refused before the gateway is asked.
@@ -87,7 +87,7 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
     if (!ok) throw new Error("createAuthHandler: `allowedOrigins` entries must be exact origins like https://app.example.com (no `*`, no `null`)");
     origins.add(o);
   }
-  const mount = `/${(opts.path ?? "/api/chelabase/auth").replace(/^\/+|\/+$/g, "")}/`;
+  const mount = `/${(opts.authPath ?? "/api/chelabase/auth").replace(/^\/+|\/+$/g, "")}/`;
   const names = cookieNames(opts.key, opts.cookieOptions);
   const base = opts.url.replace(/\/+$/, "");
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);

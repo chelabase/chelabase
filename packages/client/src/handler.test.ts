@@ -204,7 +204,7 @@ describe("createAuthHandler", () => {
 
   test("a_custom_mount_point", async () => {
     const gw = gateway({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
-    const h = handler(gw, { path: "/auth/" });
+    const h = handler(gw, { authPath: "/auth/" });
     const r = new Request("http://localhost:3000/auth/sign-in", {
       method: "POST",
       headers: { origin: siteUrl, "content-type": "application/json" },

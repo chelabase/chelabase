@@ -237,7 +237,7 @@ describe("createServerClient", () => {
     const j = jar({ [ACCESS]: forged, [REFRESH]: "rt1" });
     const db = createServerClient({ url, key, fetch, cookies: j.cookies });
     // The module and the client expose nothing read from the cookie.
-    expect(Object.keys(serverModule)).toEqual(["createAuthHandler", "createServerClient"]);
+    expect(Object.keys(serverModule).sort()).toEqual(["createAuthHandler", "createServerClient", "parseCookies", "serializeCookie"]);
     expect(Object.keys(db).sort()).toEqual(["auth", "batch", "call", "database", "from"]);
     await expect(db.auth.getUser()).rejects.toMatchObject({ status: 401, code: "user_token_invalid" });
     await expect(db.from("t").select("id")).rejects.toMatchObject({ code: "user_token_invalid" });
@@ -340,6 +340,13 @@ describe("createServerClient", () => {
     expect(noIp).toThrow(/clientIp/);
     expect(noIp).not.toThrow(serverKey.slice(8));
     expect(() => createServerClient({ url, key, clientIp: "203.0.113.9", cookies })).toThrow(/serverKey/);
+  });
+
+  test("an_empty_client_ip_counts_as_missing", () => {
+    const cookies = jar().cookies;
+    const f = () => createServerClient({ url, key, serverKey, clientIp: "", cookies });
+    expect(f).toThrow(/`clientIp` is missing/);
+    expect(f).not.toThrow(serverKey.slice(8));
   });
 
   test("wrong_key_kinds_throw_at_creation", () => {
@@ -498,5 +505,25 @@ describe("@chelabase/client/server resolution", () => {
       expect(bundlerResolve([...set, "import"]), set.join("+")).toBe("./src/server.ts");
     }
     await expect(import("./server-browser.ts")).rejects.toThrow(/only on the server/);
+  });
+});
+
+describe("cookie helpers from @chelabase/client/server", () => {
+  test("parse_cookies_keeps_duplicates_and_raw_bad_escapes", () => {
+    expect(serverModule.parseCookies("a=1; a=2; b=%E0%A4%A; c=x%20y")).toEqual([
+      { name: "a", value: "1" },
+      { name: "a", value: "2" },
+      { name: "b", value: "%E0%A4%A" },
+      { name: "c", value: "x y" },
+    ]);
+  });
+
+  test("serialize_cookie_carries_every_attribute", () => {
+    const line = serverModule.serializeCookie({
+      name: "chelabase.chk_pub_0123.access",
+      value: "a b",
+      options: { path: "/", secure: true, httpOnly: true, sameSite: "strict", maxAge: 60, domain: "example.test" },
+    });
+    expect(line).toBe("chelabase.chk_pub_0123.access=a%20b; Path=/; Max-Age=60; Domain=example.test; Secure; HttpOnly; SameSite=Strict");
   });
 });
