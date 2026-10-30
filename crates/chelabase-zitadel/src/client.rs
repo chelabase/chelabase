@@ -170,6 +170,17 @@ fn error_text(body: Option<&Value>) -> String {
     text
 }
 
+/// Whether a rejection's text (see [`error_text`]) carries Zitadel's error key `key` exactly:
+/// one of its `" | "`-separated parts, without a trailing `" (ID)"`.
+fn has_error_key(message: &str, key: &str) -> bool {
+    message
+        .split(" | ")
+        .any(|part| match part.rsplit_once(" (") {
+            Some((k, id)) if id.ends_with(')') => k == key,
+            _ => part == key,
+        })
+}
+
 impl Zitadel {
     pub fn new(base: &str, token: &str) -> Self {
         Self {
@@ -503,9 +514,11 @@ impl Zitadel {
     }
 
     /// The user (`GET /v2/users/{userId}`). `None` only when Zitadel definitely has no such
-    /// user (a 404). A success answer that can't be read as a user (an empty body, no
-    /// `user.userId`) is `Unavailable`, never "no such user" (#57): callers end sessions and
-    /// delete rows on `None`, so an API change or a misbehaving proxy must fail closed.
+    /// user: a 404 carrying its own `Errors.User.NotFound` error. Any other 404 (a misrouted
+    /// proxy's page, an empty body, another error) and a success answer that can't be read as
+    /// a user (an empty body, no `user.userId`) are `Unavailable`, never "no such user" (#57):
+    /// callers end sessions and delete rows on `None`, so an API change or a misbehaving proxy
+    /// must fail closed.
     pub async fn get_user(&self, user_id: &str) -> Result<Option<ZUser>, ZError> {
         match self
             .call(Method::GET, &format!("/v2/users/{user_id}"), None)
@@ -515,12 +528,21 @@ impl Zitadel {
                 Some(user) => Ok(Some(user)),
                 None => Err(ZError::Unavailable("the user answer can't be read".into())),
             },
-            Err(ZError::Rejected { status: 404, .. }) => Ok(None),
+            Err(ZError::Rejected {
+                status: 404,
+                message,
+            }) if has_error_key(&message, "Errors.User.NotFound") => Ok(None),
+            Err(ZError::Rejected {
+                status: 404,
+                message,
+            }) => Err(ZError::Unavailable(format!(
+                "a 404 that isn't Zitadel's user not found: {message}"
+            ))),
             Err(e) => Err(e),
         }
     }
 
-    /// Whether Zitadel definitely has no user with this id: `true` only on a 404, as
+    /// Whether Zitadel definitely has no user with this id: `true` only on its not-found, as
     /// [`Zitadel::get_user`]'s `None`.
     pub async fn user_is_gone(&self, user_id: &str) -> Result<bool, ZError> {
         Ok(self.get_user(user_id).await?.is_none())

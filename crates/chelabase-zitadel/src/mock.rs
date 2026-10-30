@@ -548,7 +548,7 @@ async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Re
     }
     match inner.users.iter().find(|u| u.id == id) {
         Some(u) => ok(json!({"user": user_json(u, &inner)})),
-        None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
+        None => zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
     }
 }
 

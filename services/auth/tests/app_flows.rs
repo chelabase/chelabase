@@ -948,6 +948,8 @@ enum Zit {
     Inactive,
     OtherOrg,
     NotFound404,
+    /// A 404 that isn't Zitadel's (a misrouted proxy's HTML page).
+    Html404,
     Internal500,
     Empty200,
     NoUserId200,
@@ -970,12 +972,16 @@ fn refresh_model(o: Orch, z: Zit) -> (StatusCode, &'static str, bool) {
             Zit::OtherOrg | Zit::NotFound404 => {
                 (StatusCode::UNAUTHORIZED, "refresh_token_invalid", true)
             }
-            Zit::Internal500 | Zit::Empty200 | Zit::NoUserId200 | Zit::Malformed200 => down,
+            Zit::Html404
+            | Zit::Internal500
+            | Zit::Empty200
+            | Zit::NoUserId200
+            | Zit::Malformed200 => down,
         },
     }
 }
 
-/// #57: every orchestrator answer against every Zitadel answer, checked against
+/// #57: every orchestrator answer against every Zitadel answer (8 x 9), checked against
 /// [`refresh_model`]: the answer the client sees, and whether a revoke call was made.
 #[tokio::test]
 async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
@@ -996,6 +1002,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         Z::Inactive,
         Z::OtherOrg,
         Z::NotFound404,
+        Z::Html404,
         Z::Internal500,
         Z::Empty200,
         Z::NoUserId200,
@@ -1015,6 +1022,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
                 Z::Active | Z::NotFound404 => {}
                 Z::Inactive => h.set_user(&user.to_string(), |u| u.inactive = true),
                 Z::OtherOrg => h.set_user(&user.to_string(), |u| u.org_id = "other".into()),
+                Z::Html404 => h.mock.answer_raw(&get, 404, "<html>not found</html>", 1),
                 Z::Internal500 => h.mock.fail(&get, 500, "Errors.Internal", 1),
                 Z::Empty200 => h.mock.answer_raw(&get, 200, "", 1),
                 Z::NoUserId200 => h.mock.answer_raw(
@@ -1065,7 +1073,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
     }
     assert!(
         wrong.is_empty(),
-        "{} of 64 cases differ from the model:\n{}",
+        "{} of 72 cases differ from the model:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
