@@ -66,7 +66,7 @@ in its description. No mandated brainstorming ritual beyond that.
 
 - No `sleep`, `pgrep -f` or `until …; do …; done` wait loops.
 - `gh pr edit` fails on GitHub's Projects (classic) deprecation (`repository.pullRequest.projectCards`).
-  Edit PRs and issues through REST instead, e.g.
+  Use `gh issue edit N` (it works on PR numbers too) or
   `gh api -X PATCH repos/chelabase/chelabase/pulls/N -F body=@body.md`.
 - Before a long filtered test run, check what the filter selects.
 - One cargo command at a time per checkout (`cargo nextest`, `clippy`, `build` share
