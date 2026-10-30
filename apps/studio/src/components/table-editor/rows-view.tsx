@@ -1099,7 +1099,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
                 <button
                   type="button"
                   onClick={() => openPanel("row", { row: null })}
-                  className="flex h-7 items-center gap-1 border border-input bg-channel px-2 text-[13px] whitespace-nowrap text-chalk outline-none hover:border-sand focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand disabled:cursor-default disabled:opacity-50 disabled:hover:border-input"
+                  className="flex h-9 w-full items-center gap-1.5 border-b border-line px-3 text-[13px] whitespace-nowrap text-chalk-dim outline-none hover:bg-chalk/[0.045] hover:text-chalk focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand"
                 >
                   <Plus aria-hidden="true" size={14} strokeWidth={1.5} />
                   Add row

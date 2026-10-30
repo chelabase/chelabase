@@ -1105,7 +1105,12 @@ export function Grid(props: GridProps) {
       />
       </ContextMenu.Root>
       </div>
-      {props.footer && <div className="sticky left-0 w-fit p-2">{props.footer}</div>}
+      {/* As wide as the view, but no wider than the rows. */}
+      {props.footer && (
+        <div className="sticky left-0 w-full" style={{ maxWidth: totalWidth }}>
+          {props.footer}
+        </div>
+      )}
     </div>
   );
 }
