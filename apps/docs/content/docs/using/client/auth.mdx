@@ -33,9 +33,26 @@ Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `re
 
 - Only the refresh token is stored, under the key `chelabase.<first 12 characters of the key>.refresh`: in `localStorage` when present, otherwise in memory. Pass `auth.storage` (`{ get, set, remove }`, sync or async) for anything else, such as React Native. The access token stays in memory.
 - `database()` siblings share the same session.
+- In a server-rendered app the session lives in cookies instead: see [Server rendering](/docs/using/client/ssr).
 
 ## Refresh and sign-out
 
 - The access token is refreshed 60 seconds before it expires, by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
 - A data request answered `401 user_token_expired` refreshes once and retries once. A returning visitor's first request refreshes lazily first.
 - When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`, or any request carrying the access token (data or `db.auth`) is answered `401 user_session_revoked`, the client signs out locally: it drops the stored refresh token, emits `signed_out` and throws the `DataApiError`.
+
+## A token from elsewhere
+
+If another system owns the session (an SSO layer, a test harness), pass `accessToken` instead of `auth`. The client calls it before every request and sends the result as `chelabase-user`; with no token, no header goes out.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const url = "http://api.chelabase.localhost:8000";
+const key = "chk_pub_…";
+declare function currentToken(): string | undefined;
+// ---cut---
+const db = createClient<Database>({ url, key, types, accessToken: () => currentToken() });
+```
+
+You own the session. The client never refreshes, stores or retries the token, and `db.auth` methods throw. `accessToken` and `auth` can't be used together.
