@@ -31,6 +31,8 @@ For each ready milestone whose `touches` don't overlap others already building:
    `touches`, acceptance criteria, tests to write, out of scope, verification commands.
    Work in `just wt-add epic-<slug>-m<n> epic/<slug>` (records the epic stack). Never
    `isolation: "worktree"`. Never spawn further agents.
+   On launch, claim the issue: `gh issue edit N --add-assignee @me`, label
+   `status:building` (drop `status:ready`).
 2. Builder: test-first per `AGENTS.md` Tests; commit with explicit paths; run only the
    issue's Verification and its new/changed live tests; push the milestone branch; report
    commit SHAs, one failing run per new test from before the fix, tests run/skipped,
