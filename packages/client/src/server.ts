@@ -6,7 +6,14 @@
  */
 import { createAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
-import { type CookieOptions, type CookieToSet, cookieNames, readSession, sessionCookies } from "./cookies.ts";
+import {
+  type CookieOptions,
+  type CookieToSet,
+  checkCookieOptions,
+  cookieNames,
+  readSession,
+  sessionCookies,
+} from "./cookies.ts";
 import { toError } from "./error.ts";
 import type { Client, DatabaseShape, TypeMap } from "./types.ts";
 
@@ -29,11 +36,12 @@ export interface ServerClientOptions {
   /** The project's public (`chk_pub_…`) data key. */
   key: string;
   /**
-   * A secret (`chk_sec_…`) key. With `clientIp`, auth API calls (never data requests) carry
-   * both, so the gateway's rate limits count the end user's address, not the server's.
+   * A secret (`chk_sec_…`) key, given together with `clientIp`: auth API calls (never data
+   * requests) carry both, so the gateway's rate limits count the end user's address, not the
+   * server's.
    */
   serverKey?: string;
-  /** The end user's IP address, sent with `serverKey`. */
+  /** The end user's IP address; requires `serverKey`. */
   clientIp?: string;
   /** Defaults to the global `fetch`. */
   fetch?: typeof fetch;
@@ -63,13 +71,20 @@ export function createServerClient<DB extends DatabaseShape = DatabaseShape, B e
 export function createServerClient<DB extends DatabaseShape, B extends boolean = false>(
   opts: ServerClientOptions & { bigint?: B },
 ): Client<DB, B> {
-  // The messages never quote a key.
-  if (!opts.key.startsWith("chk_pub_")) {
+  // The whole shape (prefix and base62), so a malformed key never reaches `fetch`, whose header
+  // errors quote the value. These messages never quote a key.
+  if (!/^chk_pub_[0-9A-Za-z]+$/.test(opts.key)) {
     throw new Error("createServerClient: `key` must be the public (chk_pub_…) key; a secret key goes in `serverKey`");
   }
-  if (opts.serverKey !== undefined && !opts.serverKey.startsWith("chk_sec_")) {
+  if (opts.serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(opts.serverKey)) {
     throw new Error("createServerClient: `serverKey` must be a secret (chk_sec_…) key");
   }
+  if ((opts.serverKey === undefined) !== (opts.clientIp === undefined)) {
+    throw new Error(
+      `createServerClient: \`serverKey\` and \`clientIp\` go together; \`${opts.serverKey === undefined ? "serverKey" : "clientIp"}\` is missing`,
+    );
+  }
+  checkCookieOptions(opts.cookieOptions);
   const names = cookieNames(opts.key, opts.cookieOptions);
   const { access, refresh } = readSession(opts.cookies.getAll(), names);
   const setAll = opts.cookies.setAll?.bind(opts.cookies);
@@ -99,8 +114,8 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
       server: { access, refresh: setAll === undefined ? undefined : refresh, onSession, headers },
     });
     if (setAll === undefined) {
-      // A session issued here would be lost (and a rotated refresh token revoked): refuse before
-      // asking the server for one.
+      // A session issued here would be lost (and a rotated refresh token revoked), and a sign-out
+      // couldn't clear the cookies: refuse before asking the server.
       const refuse = (method: string) => () =>
         Promise.reject(new Error(`createServerClient: db.auth.${method} needs \`cookies.setAll\` to keep the session`));
       core.auth = {
@@ -109,6 +124,7 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
         signUp: refuse("signUp"),
         changePassword: refuse("changePassword"),
         refresh: refuse("refresh"),
+        signOut: refuse("signOut"),
       };
     }
     return { core, retryExpired: true };

@@ -302,6 +302,7 @@ describe("createServerClient", () => {
       () => db.auth.signUp({ email: "a@b.co", password: "pw" }),
       () => db.auth.changePassword({ currentPassword: "pw", password: "pw2" }),
       () => db.auth.refresh(),
+      () => db.auth.signOut(),
     ]) {
       await expect(call()).rejects.toThrow(/cookies\.setAll/);
     }
@@ -333,12 +334,12 @@ describe("createServerClient", () => {
     expect(JSON.stringify(q.init)).not.toContain(serverKey);
   });
 
-  test("server_key_without_client_ip_is_not_sent", async () => {
-    const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
-    const db = createServerClient({ url, key, serverKey, fetch, cookies: jar().cookies });
-    await db.auth.signIn({ email: "a@b.co", password: "pw" });
-    expect(hdr(fetch.calls[0]!, "chelabase-server-key")).toBeNull();
-    expect(hdr(fetch.calls[0]!, "chelabase-client-ip")).toBeNull();
+  test("server_key_and_client_ip_come_together", () => {
+    const cookies = jar().cookies;
+    const noIp = () => createServerClient({ url, key, serverKey, cookies });
+    expect(noIp).toThrow(/clientIp/);
+    expect(noIp).not.toThrow(serverKey.slice(8));
+    expect(() => createServerClient({ url, key, clientIp: "203.0.113.9", cookies })).toThrow(/serverKey/);
   });
 
   test("wrong_key_kinds_throw_at_creation", () => {
@@ -346,6 +347,14 @@ describe("createServerClient", () => {
     expect(() => createServerClient({ url, key, serverKey: key, cookies })).toThrow(/serverKey/);
     expect(() => createServerClient({ url, key: serverKey, cookies })).toThrow(/key/);
     expect(() => createServerClient({ url, key: "whatever", cookies })).toThrow(/key/);
+    // The full shape: prefix and base62, nothing else.
+    for (const bad of ["chk_pub_", "chk_pub_abc;x", "chk_pub_abc def", "chk_pub_abc\r\n", "chk_pub_ab-c"]) {
+      expect(() => createServerClient({ url, key: bad, cookies }), JSON.stringify(bad)).toThrow(/`key`/);
+    }
+    for (const bad of ["chk_sec_", "chk_sec_abc\n", "chk_sec_abc\0", "chk_sec_ab_c"]) {
+      const f = () => createServerClient({ url, key, serverKey: bad, clientIp: "203.0.113.9", cookies });
+      expect(f, JSON.stringify(bad)).toThrow(/`serverKey`/);
+    }
   });
 
   test("server_key_never_appears_in_an_error", async () => {
@@ -373,12 +382,23 @@ describe("createServerClient", () => {
     const down = (() => Promise.reject(new TypeError("fetch failed"))) as typeof fetch;
     const offline = createServerClient({ url, key, serverKey, clientIp: "203.0.113.9", fetch: down, cookies: jar().cookies });
     await capture(() => offline.auth.signIn({ email: "a@b.co", password: "pw" }));
-    expect(errors).toHaveLength(6);
+    // A malformed key must not reach `fetch`, whose header error quotes the value.
+    const strict = (async (_u: string, init: RequestInit) => {
+      new Headers(init.headers);
+      return new Response(JSON.stringify(session(1)));
+    }) as typeof fetch;
+    for (const bad of [`${serverKey}\r`, `${serverKey}\n`, `${serverKey}\0`]) {
+      await capture(async () => {
+        const c = createServerClient({ url, key, serverKey: bad, clientIp: "203.0.113.9", fetch: strict, cookies: jar().cookies });
+        await c.auth.signIn({ email: "a@b.co", password: "pw" });
+      });
+    }
     const secret = serverKey.slice(8);
     for (const e of errors) {
       const x = e as Error;
       for (const text of [String(x), x.message, x.stack ?? "", JSON.stringify(x)]) expect(text).not.toContain(secret);
     }
+    expect(errors).toHaveLength(9);
   });
 
   test("cookie_options_reach_the_written_cookies", async () => {
@@ -396,6 +416,18 @@ describe("createServerClient", () => {
     for (const c of j.writes[0]!) {
       expect(c.options).toMatchObject({ secure: false, domain: "example.test", maxAge: 3600, sameSite: "lax", path: "/" });
     }
+  });
+});
+
+describe("cookieOptions", () => {
+  test("domain_is_validated_at_creation", () => {
+    const cookies = jar().cookies;
+    for (const domain of ["", "a.test;x", "a.test,b.test", "a .test", "a.test\n", "a.test\0", "\ta.test"]) {
+      expect(() => createServerClient({ url, key, cookies, cookieOptions: { domain } }), JSON.stringify(domain)).toThrow(
+        /cookieOptions\.domain/,
+      );
+    }
+    expect(() => createServerClient({ url, key, cookies, cookieOptions: { domain: "example.test" } })).not.toThrow();
   });
 });
 
