@@ -4,7 +4,7 @@
  *
  * @module
  */
-import { createAuth, SESSION_GONE, USER_HEADER } from "./auth.ts";
+import { createAuth, SESSION_GONE, staticAuth, USER_HEADER } from "./auth.ts";
 import { NO_REDIRECTS, plainError, toError } from "./error.ts";
 import { hasSourceText, parseResult, type ResultSpec, stringify } from "./json.ts";
 import { batchOf, callFn, type Runner, selectFrom } from "./query.ts";
@@ -47,7 +47,7 @@ export type {
   WriteQuery,
 } from "./types.ts";
 
-export interface ClientOptions {
+export type ClientOptions = {
   /** The gateway's base URL, e.g. `http://api.chelabase.localhost:8000`. */
   url: string;
   /** A public (`chk_pub_…`) or secret (`chk_sec_…`) data key, sent as a bearer token. */
@@ -56,9 +56,22 @@ export interface ClientOptions {
   fetch?: typeof fetch;
   /** The generated `types` map: which columns, arguments and returns are int8 or numeric. */
   types?: TypeMap;
-  /** App user sessions (`db.auth`): where the refresh token is kept, and automatic refresh. */
-  auth?: AuthOptions;
-}
+} & (
+  | {
+      /** App user sessions (`db.auth`): where the refresh token is kept, and automatic refresh. */
+      auth?: AuthOptions;
+      accessToken?: undefined;
+    }
+  | {
+      /**
+       * The user's access token, read before every request and sent as `chelabase-user` (no
+       * header when it returns `undefined`). The caller owns the session: the client never
+       * refreshes, stores or times anything, and `db.auth` methods throw. Exclusive with `auth`.
+       */
+      accessToken: () => string | undefined | Promise<string | undefined>;
+      auth?: never;
+    }
+);
 
 const RUNTIMES = "Node 21+, Chrome 114+, Firefox 135+ or Safari 18.4+";
 
@@ -97,7 +110,10 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
   const base = opts.url.replace(/\/+$/, "");
   const endpoint = `${base}/data/v1/query`;
   // One session per client, shared by every `database()` sibling.
-  const core = createAuth<DB>({ base, key: opts.key, fetch: doFetch, options: opts.auth, toError });
+  const core =
+    opts.accessToken !== undefined
+      ? staticAuth<DB>(opts.accessToken)
+      : createAuth<DB>({ base, key: opts.key, fetch: doFetch, options: opts.auth, toError });
 
   // One client per (database, types): `database()` builds a sibling bound to another database.
   const make = (types: TypeMap | undefined, database: string | undefined): unknown => {
@@ -140,8 +156,8 @@ export function createClient<DB extends DatabaseShape, B extends boolean = false
         let token = await core.accessToken();
         let res = await send(token);
         let text = await res.text();
-        if (!res.ok && token !== undefined && res.status === 401 && toError(res, text).code === "user_token_expired") {
-          // One refresh, one retry.
+        if (opts.accessToken === undefined && !res.ok && token !== undefined && res.status === 401 && toError(res, text).code === "user_token_expired") {
+          // One refresh, one retry (never with a caller-owned token).
           token = await core.refreshAfterExpiry(token);
           res = await send(token);
           text = await res.text();
