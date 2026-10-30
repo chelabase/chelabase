@@ -569,7 +569,9 @@ fn asserted_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
 }
 
 /// Whether the server key `server` vouches for a request made with the public key `public`:
-/// a secret key of the same project and branch. (The resolver never answers a revoked key.)
+/// a secret key of the same project and branch. (The resolver never answers a key revoked
+/// before it was cached; one revoked later keeps vouching until its 30 s cache entry expires,
+/// as it keeps working on the data API.)
 fn server_key_vouches(public: &ResolvedKey, server: &ResolvedKey) -> bool {
     public.kind == DataKeyKind::Public
         && server.kind == DataKeyKind::Secret
