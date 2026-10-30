@@ -247,6 +247,11 @@ impl H {
     /// The identity the gateway would mint for this request (a public key, and the user
     /// from `access` when given).
     fn identity_for(&self, access: Option<&str>, kind: DataKeyKind) -> String {
+        self.identity_opts(access, kind, false)
+    }
+
+    /// [`Self::identity_for`], marked server-vouched as the gateway marks it (#55).
+    fn identity_opts(&self, access: Option<&str>, kind: DataKeyKind, server_vouched: bool) -> String {
         let (role, claims) = match access {
             None => ("anon".to_string(), json!({})),
             Some(t) => {
@@ -275,6 +280,7 @@ impl H {
                         databases: None,
                         project_id: Some(self.project),
                         role_oid: None,
+                        server_vouched,
                     }),
                     email: None,
                     name: None,
@@ -301,6 +307,7 @@ impl H {
                         databases: None,
                         project_id: Some(self.project),
                         role_oid: None,
+                        server_vouched: false,
                     }),
                     email: None,
                     name: None,
@@ -331,6 +338,18 @@ impl H {
 
     async fn post(&self, path: &str, body: Value, access: Option<&str>) -> Ans {
         let identity = self.identity_for(access, DataKeyKind::Public);
+        self.send(
+            self.http
+                .post(format!("{}/auth/v1/app/{path}", self.base))
+                .json(&body),
+            Some(identity),
+        )
+        .await
+    }
+
+    /// A call the app's server vouched for with its secret key and no client address.
+    async fn post_vouched(&self, path: &str, body: Value, access: Option<&str>) -> Ans {
+        let identity = self.identity_opts(access, DataKeyKind::Public, true);
         self.send(
             self.http
                 .post(format!("{}/auth/v1/app/{path}", self.base))
@@ -1286,4 +1305,98 @@ async fn change_password_with_an_unverified_email_changes_nothing() {
         PW,
         "the password is unchanged"
     );
+}
+
+// ---- server-vouched calls (#55) ----------------------------------------------------------
+
+const LIMITED: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+
+/// The statuses of `n` calls made by `call(i)`.
+async fn statuses<F: AsyncFn(usize) -> Ans>(n: usize, call: F) -> Vec<StatusCode> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.push(call(i).await.status);
+    }
+    out
+}
+
+#[tokio::test]
+async fn server_vouched_sign_ins_skip_the_ip_limit() {
+    let h = harness().await;
+    let body = |i: usize| json!({"email": format!("u{i}@example.com"), "password": PW});
+    // 11 sign-ins within a minute from one address, each for a different email.
+    let got = statuses(11, async |i| h.post_vouched("sign-in", body(i), None).await).await;
+    assert!(!got.contains(&LIMITED), "{got:?}");
+    // Not vouched (a browser, or an identity without the claim): the 11th is refused.
+    let h = harness().await;
+    let got = statuses(11, async |i| h.post("sign-in", body(i), None).await).await;
+    assert!(!got[..10].contains(&LIMITED), "{got:?}");
+    assert_eq!(got[10], LIMITED);
+}
+
+#[tokio::test]
+async fn server_vouched_sign_in_keeps_the_per_email_failure_limit() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let wrong = json!({"email": "ada@example.com", "password": "Wr0ng!pass"});
+    let got = statuses(6, async |_| h.post_vouched("sign-in", wrong.clone(), None).await).await;
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
+    assert_eq!(got[5], LIMITED);
+}
+
+/// How many of these sign-ups, sent at once (each is padded to about a second), are refused
+/// for a limit.
+async fn limited_sign_ups(h: &H, emails: &[String], vouched: bool) -> usize {
+    let identity = h.identity_opts(None, DataKeyKind::Public, vouched);
+    let mut calls = tokio::task::JoinSet::new();
+    for email in emails {
+        let req = h
+            .http
+            .post(format!("{}/auth/v1/app/sign-up", h.base))
+            .header("x-forwarded-for", "10.1.1.1")
+            .header(IDENTITY_HEADER, identity.clone())
+            .json(&json!({"email": email, "password": PW}));
+        calls.spawn(async move { req.send().await.unwrap().status() });
+    }
+    calls.join_all().await.into_iter().filter(|s| *s == LIMITED).count()
+}
+
+#[tokio::test]
+async fn server_vouched_sign_ups_skip_the_ip_limit_but_keep_the_email_one() {
+    let h = harness().await;
+    let distinct: Vec<String> = (0..21).map(|i| format!("u{i}@example.com")).collect();
+    // Sign-up allows 20 an hour per address; 21 different emails all get through.
+    assert_eq!(limited_sign_ups(&h, &distinct, true).await, 0);
+    // Five an hour per email: one of six for the same email is refused.
+    let same = vec!["same@example.com".to_string(); 6];
+    assert_eq!(limited_sign_ups(&h, &same, true).await, 1);
+    // Not vouched: one of the address's 21 is refused.
+    let h = harness().await;
+    assert_eq!(limited_sign_ups(&h, &distinct, false).await, 1);
+}
+
+#[tokio::test]
+async fn server_vouched_refreshes_skip_the_ip_limit() {
+    let h = harness().await;
+    let refresh = json!({"refresh_token": "nope"});
+    // Refresh allows 120 a minute per address.
+    let got = statuses(121, async |_| h.post_vouched("refresh", refresh.clone(), None).await).await;
+    assert!(!got.contains(&LIMITED), "{got:?}");
+    assert!(got.iter().all(|s| *s == StatusCode::UNAUTHORIZED));
+    let got = statuses(121, async |_| h.post("refresh", refresh.clone(), None).await).await;
+    assert!(!got[..120].contains(&LIMITED));
+    assert_eq!(got[120], LIMITED);
+}
+
+#[tokio::test]
+async fn server_vouched_change_password_keeps_the_per_user_limit() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let token = access(&s).to_string();
+    let wrong = json!({"current_password": "Wr0ng!pass", "password": NEW_PW});
+    // Five a minute per user (per address it is ten).
+    let got = statuses(6, async |_| h.post_vouched("change-password", wrong.clone(), Some(&token)).await).await;
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
+    assert_eq!(got[5], LIMITED);
 }
