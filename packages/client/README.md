@@ -60,16 +60,21 @@ const store = await cookies();
 const sdb = createServerClient<Database>({
   url,
   key: PUBLIC_KEY,
+  // Sign-ins and refreshes are then limited per email and per user, instead of all sharing
+  // this server's IP. `clientIp` (optional, needs `serverKey`) adds per-IP limits on top.
+  serverKey: SECRET_KEY,
   types,
   cookies: {
     getAll: () => store.getAll(),
     setAll: (list) => list.forEach((c) => store.set(c.name, c.value, c.options)),
   },
 });
-const user = await sdb.auth.getUser();
+const user = await sdb.auth.currentUser(); // null when signed out
+// In the proxy/middleware: a request only when the access token is about to expire.
+await sdb.auth.refreshIfNeeded();
 
 // Once, e.g. app/api/chelabase/auth/[...path]/route.ts
-export const POST = createAuthHandler({ url, key: PUBLIC_KEY, siteUrl: "https://app.example.com" });
+export const POST = createAuthHandler({ url, key: PUBLIC_KEY, serverKey: SECRET_KEY, siteUrl: "https://app.example.com" });
 ```
 
 When another system owns the session, `createClient({ url, key, accessToken: () => token })`
