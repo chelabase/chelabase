@@ -24,6 +24,8 @@ change, risky fork C). Say which part triggered the refusal.
 1. Title: `type(area): summary`. From an issue, take type from its `type:*` label and the
    summary from its title. Branch: `<type>/<area>-<short>`.
 2. Worktree: `just wt-add <branch>` from main. Never branch in the main checkout.
+   From an issue, claim it first: `gh issue edit N --add-assignee @me`, label
+   `status:building` (drop `status:ready`/`status:triage`).
 3. Restate the goal and what you're deliberately not changing. Respect Out of scope.
 4. Implement test-first per `AGENTS.md` Tests (skip with a stated reason for pure plumbing);
    keep one failing run per new test from before the fix for the report.
