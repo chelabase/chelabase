@@ -255,3 +255,34 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   return { auth, accessToken, refreshAfterExpiry, dropSession };
 }
+
+/** `accessToken` mode: the caller owns the session. Nothing is stored, refreshed or timed. */
+export function staticAuth<DB extends DatabaseShape>(
+  accessToken: () => string | undefined | Promise<string | undefined>,
+): AuthCore<DB> {
+  const unavailable = () =>
+    new Error("db.auth is unavailable when createClient is given `accessToken`: the caller owns the session");
+  const reject = () => Promise.reject(unavailable());
+  const auth: Auth<DB> = {
+    signUp: reject,
+    signIn: reject,
+    signOut: reject,
+    refresh: reject,
+    getUser: reject,
+    verifyEmail: reject,
+    resendCode: reject,
+    requestPasswordReset: reject,
+    confirmPasswordReset: reject,
+    changeEmail: reject,
+    changePassword: reject,
+    onChange() {
+      throw unavailable();
+    },
+  };
+  return {
+    auth,
+    accessToken: async () => accessToken(),
+    refreshAfterExpiry: async () => undefined,
+    dropSession: async () => {},
+  };
+}

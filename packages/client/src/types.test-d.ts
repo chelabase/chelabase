@@ -279,3 +279,8 @@ void looseDb.auth.signUp({ email: "a@b.co", password: "pw", data: { anything: [1
 // Without `appUsers` in a generated Database the data is the loose record too.
 const plainDb = createClient<Database>({ ...opts, types });
 expectTypeOf<Parameters<typeof plainDb.auth.signUp>[0]["data"]>().toEqualTypeOf<Record<string, Json> | undefined>();
+
+// `accessToken` and `auth` are mutually exclusive.
+createClient({ ...opts, accessToken: () => "t" });
+// @ts-expect-error accessToken replaces the session storage
+createClient({ ...opts, accessToken: () => "t", auth: {} });
