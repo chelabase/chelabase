@@ -60,6 +60,8 @@ pub struct Refreshed {
 pub struct Peeked {
     pub session_id: Uuid,
     pub user_id: Uuid,
+    /// The token is the previous one, inside its grace: reuse once the grace ends.
+    pub grace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

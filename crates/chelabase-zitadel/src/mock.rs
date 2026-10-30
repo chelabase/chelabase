@@ -51,6 +51,11 @@ pub struct Inner {
     pub allow_duplicate_emails: bool,
     /// Every `DELETE /v2/sessions/{id}` waits this long first (a slow Zitadel).
     pub session_delete_delay: std::time::Duration,
+    /// Every `GET /v2/users/{id}` waits this long first (a slow Zitadel).
+    pub user_lookup_delay: std::time::Duration,
+    /// Run when a request whose `"METHOD path"` contains the pattern arrives, before it is
+    /// answered: something that happens elsewhere while Zitadel is still answering.
+    pub on_request: Vec<(String, Arc<dyn Fn() + Send + Sync>)>,
     /// Pending invite codes: user id -> (code, expired).
     pub invites: HashMap<String, (String, bool)>,
     /// The URL template and application name of each user's last invite mail.
@@ -353,6 +358,20 @@ impl MockZitadel {
     pub fn set_down(&self, down: bool) {
         self.inner.lock().unwrap().down = down;
     }
+    pub fn set_user_lookup_delay(&self, delay: std::time::Duration) {
+        self.inner.lock().unwrap().user_lookup_delay = delay;
+    }
+    /// Runs `f` whenever a request matching `pattern` arrives, before it is answered.
+    pub fn on_request(&self, pattern: &str, f: impl Fn() + Send + Sync + 'static) {
+        self.inner
+            .lock()
+            .unwrap()
+            .on_request
+            .push((pattern.into(), Arc::new(f)));
+    }
+    pub fn clear_on_request(&self) {
+        self.inner.lock().unwrap().on_request.clear();
+    }
     pub fn set_session_delete_delay(&self, delay: std::time::Duration) {
         self.inner.lock().unwrap().session_delete_delay = delay;
     }
@@ -377,6 +396,17 @@ type S = State<Arc<Mutex<Inner>>>;
 async fn journal(State(s): S, req: Request, next: Next) -> Response {
     use axum::response::IntoResponse;
     let call = format!("{} {}", req.method(), req.uri().path());
+    let hooks: Vec<_> = s
+        .lock()
+        .unwrap()
+        .on_request
+        .iter()
+        .filter(|(pattern, _)| call.contains(pattern.as_str()))
+        .map(|(_, f)| f.clone())
+        .collect();
+    for hook in hooks {
+        hook();
+    }
     let forced = {
         let mut inner = s.lock().unwrap();
         inner.calls.push(call.clone());
@@ -548,6 +578,10 @@ async fn list_users(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> Re
 }
 
 async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
+    let delay = s.lock().unwrap().user_lookup_delay;
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
         return e;

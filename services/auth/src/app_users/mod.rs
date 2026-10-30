@@ -23,6 +23,13 @@ use uuid::Uuid;
 pub const CODE_TEMPLATE: &str = "{{.Code}}";
 /// How long a branch's settings are reused.
 pub const BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
+/// How long a refresh waits for Zitadel's user answer before it answers 503 (#59 audit B1).
+/// A refresh checks the user between the orchestrator's peek and its rotation, and the
+/// orchestrator keeps a replaced token answerable for only 10 s (`REFRESH_GRACE`): a parallel
+/// request that peeked the current token just before another rotated it must still reach
+/// `refresh` inside that window. So the lookup is bounded well below it, leaving room for the
+/// two orchestrator calls. Other Zitadel calls keep the client's own 10 s timeout.
+pub const REFRESH_USER_LOOKUP: Duration = Duration::from_secs(4);
 
 pub struct AppUsers {
     pub verifier: InternalVerifier,
@@ -33,6 +40,8 @@ pub struct AppUsers {
     pub zitadel_admin: Zitadel,
     pub access_ttl: Duration,
     pub branches: moka::future::Cache<Uuid, Arc<AppBranchInfo>>,
+    /// [`REFRESH_USER_LOOKUP`]; shorter in tests.
+    pub refresh_user_lookup: Duration,
 }
 
 impl AppUsers {
@@ -55,6 +64,7 @@ impl AppUsers {
                 .max_capacity(10_000)
                 .time_to_live(BRANCH_CACHE_TTL)
                 .build(),
+            refresh_user_lookup: REFRESH_USER_LOOKUP,
         }
     }
 

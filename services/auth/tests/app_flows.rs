@@ -4,7 +4,7 @@
 mod support;
 
 use auth::app::{AppState, router};
-use auth::app_users::{AppUsers, InternalClient};
+use auth::app_users::{AppUsers, InternalClient, REFRESH_USER_LOOKUP};
 use auth::config::Config;
 use auth::guard::RateLimiter;
 use auth::zitadel::Zitadel;
@@ -161,6 +161,15 @@ fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
 }
 
 async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
+    harness_full(verification, min_ms, app_on, REFRESH_USER_LOOKUP).await
+}
+
+/// A harness whose refreshes wait at most `lookup` for Zitadel's user answer.
+async fn harness_lookup(lookup: Duration) -> H {
+    harness_full(false, 1, true, lookup).await
+}
+
+async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Duration) -> H {
     let mock = MockZitadel::start().await;
     let internal = FakeInternal::start().await;
     let project = Uuid::new_v4();
@@ -176,14 +185,16 @@ async fn harness_opts(verification: bool, min_ms: u64, app_on: bool) -> H {
         mock: mock.clone(),
     };
     let app = app_on.then(|| {
-        AppUsers::new(
+        let mut app = AppUsers::new(
             InternalVerifier::from_pem(id_pub.as_bytes()).unwrap(),
             InternalClient::new(&internal.base, INTERNAL_TOKEN),
             AppTokenSigner::from_pem(app_priv.as_bytes(), app_pub.as_bytes()).unwrap(),
             Arc::new(db.clone()),
             Zitadel::new(&mock.base, ADMIN_TOKEN),
             Duration::from_secs(900),
-        )
+        );
+        app.refresh_user_lookup = lookup;
+        app
     });
     let config = Config {
         listen: String::new(),
@@ -975,6 +986,15 @@ enum Zit {
     Malformed200,
 }
 
+/// When the grace of the session's previous token ends (#59 audit B1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Timing {
+    /// Not during the refresh.
+    Steady,
+    /// While Zitadel is answering the user lookup.
+    GraceEndsInLookup,
+}
+
 /// What a refresh does, as the client and the orchestrator see it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Outcome {
@@ -993,6 +1013,9 @@ struct Outcome {
 /// `unavailable` and revokes nothing. A peek that finds the token's user checks that user in
 /// Zitadel before anything rotates, so a Zitadel fault never follows a rotation; a peek
 /// verdict goes on to `refresh`, which applies the orchestrator's own rules, as before #59.
+/// So does a grace token (the previous token within its grace, `Orch::Grace`): its refresh
+/// writes nothing, and it must reach the orchestrator before the grace ends (#59 audit B1).
+/// When the grace ends during the lookup changes nothing, so [`Timing`] isn't an input.
 fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
     let answer = |status, code, revoke, refresh| Outcome {
         status,
@@ -1048,7 +1071,7 @@ fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
         | Peek::Unprocessable422
         | Peek::Internal500
         | Peek::Empty200 => down(false),
-        Peek::Live => match user() {
+        Peek::Live if o != Orch::Grace => match user() {
             Err((status, code, revoke)) => answer(status, code, revoke, false),
             Ok(()) => match rotate() {
                 Ok(()) => answer(StatusCode::OK, "", false, true),
@@ -1056,7 +1079,7 @@ fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
             },
         },
         // As before #59: refresh, then the user of a token it accepted.
-        Peek::Invalid401 | Peek::Reused401 => match rotate() {
+        Peek::Live | Peek::Invalid401 | Peek::Reused401 => match rotate() {
             Err(refused) => refused,
             Ok(()) => match user() {
                 Ok(()) => answer(StatusCode::OK, "", false, true),
@@ -1069,10 +1092,15 @@ fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
 /// One case of the matrix: the first refresh against the model, and, when it answered 503,
 /// a retry with the same token once every fault is over and (for a current token) the grace
 /// has ended, as after a long outage (#59). Returns what differs from the model.
-async fn refresh_case(p: Peek, o: Orch, z: Zit) -> Option<String> {
+async fn refresh_case(p: Peek, o: Orch, z: Zit, t: Timing) -> Option<String> {
     use Orch as O;
     use Zit as Z;
     let h = harness().await;
+    if t == Timing::GraceEndsInLookup {
+        let internal = h.internal.clone();
+        h.mock
+            .on_request("GET /v2/users/", move || internal.end_grace());
+    }
     let user = match z {
         // No such user in the mock: its lookup is a real 404.
         Z::NotFound404 => Uuid::new_v4(),
@@ -1164,22 +1192,27 @@ async fn refresh_case(p: Peek, o: Orch, z: Zit) -> Option<String> {
     );
     if got != want_tuple {
         return Some(format!(
-            "{p:?} x {o:?} x {z:?}: got {got:?}, want {want_tuple:?}: {}",
+            "{p:?} x {o:?} x {z:?} x {t:?}: got {got:?}, want {want_tuple:?}: {}",
             a.body
         ));
     }
     if !want.refresh && after.token != current {
         return Some(format!(
-            "{p:?} x {o:?} x {z:?}: rotated without a refresh call"
+            "{p:?} x {o:?} x {z:?} x {t:?}: rotated without a refresh call"
         ));
     }
     // Only a peek verdict followed by a rotation (an orchestrator that contradicts itself)
     // rotates before the user check; its token is the previous one now and may not outlive
     // the grace.
-    if want.status != StatusCode::SERVICE_UNAVAILABLE || (want.refresh && o == O::Rotated) {
+    // A grace token whose grace ended during the lookup is past it on any retry.
+    if want.status != StatusCode::SERVICE_UNAVAILABLE
+        || (want.refresh && o == O::Rotated)
+        || (grace && t == Timing::GraceEndsInLookup)
+    {
         return None;
     }
     // The faults are over; a client that held a current token retries after the grace.
+    h.mock.clear_on_request();
     h.internal.clear_answers();
     h.mock.inner.lock().unwrap().faults.clear();
     if !grace {
@@ -1198,14 +1231,16 @@ async fn refresh_case(p: Peek, o: Orch, z: Zit) -> Option<String> {
     let want = (want.status, want.code, want.revoke);
     (got != want).then(|| {
         format!(
-            "{p:?} x {o:?} x {z:?}, retried later: got {got:?}, want {want:?}: {}",
+            "{p:?} x {o:?} x {z:?} x {t:?}, retried later: got {got:?}, want {want:?}: {}",
             b.body
         )
     })
 }
 
 /// #57, #59: every peek answer against every refresh answer against every Zitadel answer
-/// (8 x 8 x 11), checked against [`refresh_model`], each 503 followed by a later retry.
+/// (8 x 8 x 11), checked against [`refresh_model`], each 503 followed by a later retry; and
+/// again with the grace ending during the user lookup for the two token states a session can
+/// be in (current, grace: 8 x 2 x 11), 880 cases in all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
     use Orch as O;
@@ -1243,7 +1278,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         Z::OtherUser200,
         Z::Malformed200,
     ];
-    let total = peeks.len() * orchs.len() * zits.len();
+    let total = peeks.len() * zits.len() * (orchs.len() + 2);
     // One task per peek answer; each runs its cases in turn.
     let tasks: Vec<_> = peeks
         .into_iter()
@@ -1252,7 +1287,12 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
                 let mut wrong = Vec::new();
                 for o in orchs {
                     for z in zits {
-                        wrong.extend(refresh_case(p, o, z).await);
+                        wrong.extend(refresh_case(p, o, z, Timing::Steady).await);
+                    }
+                }
+                for o in [O::Rotated, O::Grace] {
+                    for z in zits {
+                        wrong.extend(refresh_case(p, o, z, Timing::GraceEndsInLookup).await);
                     }
                 }
                 wrong
@@ -1367,6 +1407,76 @@ async fn refresh_refuses_a_deactivated_user_before_rotating() {
     );
     assert!(h.internal.session(sid).unwrap().revoked);
     assert_eq!(h.internal.count("POST /internal/app/sessions/refresh"), 0);
+}
+
+/// #59 audit B1: two parallel requests share a cookie; one rotated the token and the other
+/// presents the previous one inside the grace. The grace ends while Zitadel answers the user
+/// lookup; the grace token was answered before that, so the session lives. A current token
+/// doesn't care when the old grace ends.
+#[tokio::test]
+async fn refresh_survives_the_grace_ending_during_the_user_lookup() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let t0 = s.body["refresh_token"].clone();
+    let a = h.post("refresh", json!({"refresh_token": t0}), None).await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let internal = h.internal.clone();
+    h.mock
+        .on_request("GET /v2/users/", move || internal.end_grace());
+    let b = h.post("refresh", json!({"refresh_token": t0}), None).await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.body);
+    assert_eq!(
+        b.body["refresh_token"], a.body["refresh_token"],
+        "the grace answer"
+    );
+    assert!(!h.internal.session(sid).unwrap().revoked);
+    // The current token, with the grace ending during its lookup too.
+    let c = h
+        .post(
+            "refresh",
+            json!({"refresh_token": a.body["refresh_token"]}),
+            None,
+        )
+        .await;
+    assert_eq!(c.status, StatusCode::OK, "{}", c.body);
+    assert_ne!(c.body["refresh_token"], a.body["refresh_token"]);
+    assert!(!h.internal.session(sid).unwrap().revoked);
+}
+
+/// #59 audit B1: a Zitadel user lookup slower than the refresh bound is a fault: 503, and the
+/// token the client holds is still current.
+#[tokio::test]
+async fn refresh_user_lookup_slower_than_the_bound_is_unavailable() {
+    let h = harness_lookup(Duration::from_millis(100)).await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let token = s.body["refresh_token"].clone();
+    let held = h.internal.session(sid).unwrap().token;
+    h.mock.set_user_lookup_delay(Duration::from_millis(400));
+    let a = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    assert_eq!(
+        (a.status, code(&a)),
+        (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        "{}",
+        a.body
+    );
+    assert_eq!(h.internal.count("POST /internal/app/sessions/refresh"), 0);
+    assert_eq!(
+        h.internal.session(sid).unwrap().token,
+        held,
+        "nothing rotated"
+    );
+    assert!(!h.internal.session(sid).unwrap().revoked);
+    h.mock.set_user_lookup_delay(Duration::ZERO);
+    let b = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.body);
 }
 
 #[tokio::test]

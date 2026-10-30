@@ -6092,11 +6092,12 @@ async fn peek_answers_like_refresh_and_writes_nothing() {
     cleanup_project(&client, project, &[]).await;
     cleanup_project(&client, other, &[]).await;
 
-    let PeekOutcome::Live(c) = current else { panic!("{current:?}") };
+    let PeekOutcome::Live { session: c, grace: false } = current else { panic!("{current:?}") };
     assert_eq!((c.id, c.user_id, c.project_id), (s.id, user, project));
-    let PeekOutcome::Live(g) = grace else { panic!("{grace:?}") };
+    // #59 audit B1: the previous token within its grace says so.
+    let PeekOutcome::Live { session: g, grace: true } = grace else { panic!("{grace:?}") };
     assert_eq!((g.id, g.user_id), (s.id, user));
-    assert!(matches!(late_current, PeekOutcome::Live(_)), "{late_current:?}");
+    assert!(matches!(late_current, PeekOutcome::Live { grace: false, .. }), "{late_current:?}");
     assert_eq!(
         [old, unknown_hash, unknown_id, elsewhere, dead, past, over_cap],
         [const { PeekOutcome::Invalid }; 7]

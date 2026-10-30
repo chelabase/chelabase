@@ -399,8 +399,8 @@ where
     .into_response()
 }
 
-/// What `refresh` would answer for this token, read without writing (#59): the session and
-/// its user for the current token or the previous one within the grace, else `refresh`'s 401
+/// What `refresh` would answer for this token, read without writing (#59): the session, its
+/// user and whether the token is the previous one within the grace, else `refresh`'s 401
 /// verdict. Unlike `refresh`, it revokes nothing: not on reuse, not on expiry. `auth` checks
 /// the user with it before anything rotates, and sends a verdict on to `refresh`.
 async fn peek<M, L>(State(state): AppState<M, L>, Json(body): Json<TokenBody>) -> Response
@@ -422,9 +422,12 @@ where
         )
         .await
     {
-        Ok(PeekOutcome::Live(session)) => {
-            Json(json!({ "session_id": session.id, "user_id": session.user_id })).into_response()
-        }
+        Ok(PeekOutcome::Live { session, grace }) => Json(json!({
+            "session_id": session.id,
+            "user_id": session.user_id,
+            "grace": grace,
+        }))
+        .into_response(),
         Ok(PeekOutcome::Reused) => ApiError::new(
             401,
             ErrorCode::RefreshTokenReused,
