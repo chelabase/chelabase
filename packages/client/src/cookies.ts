@@ -46,6 +46,13 @@ export function cookieNames(key: string, o: CookieOptions = {}): SessionCookieNa
   return { access: `${base}.access`, refresh: `${base}.refresh` };
 }
 
+/** Refuses a `domain` that could break out of its attribute: empty, or with `;`, `,`, whitespace or a control character. */
+export function checkCookieOptions(o: CookieOptions = {}): void {
+  if (o.domain !== undefined && !/^[^\s;,\x00-\x1f\x7f]+$/.test(o.domain)) {
+    throw new Error("cookieOptions.domain must be a plain domain name (no `;`, `,`, whitespace or control characters)");
+  }
+}
+
 /** Both cookies for a session, or both cleared (`Max-Age=0`) for `null`. The refresh cookie is `HttpOnly`. */
 export function sessionCookies(
   names: SessionCookieNames,
