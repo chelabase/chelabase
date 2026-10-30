@@ -339,22 +339,31 @@ act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /v
 
 ## Releasing images
 
-The install pulls the per-app images and Studio from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
+The install pulls the per-app images and Studio from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Each pin has its own commit, so a release ships only the images it names. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
+
+Every `publish-images.sh` run selects its images:
+
+- `--service <image>` (repeatable) takes exactly those images, even one whose inputs are unchanged since its pin (it prints a note).
+- `--all` takes the images whose inputs changed since their pins. If none did, it says so and builds nothing.
+- With neither, it refuses and prints the changed set. Naming every image with `--service` rebuilds them all.
+
+`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block). `server.Dockerfile`, `docker-bake.hcl`, `.dockerignore` and the release scripts are inputs of every image. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
 
 ```bash
 # 1. Build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a clean HEAD. Nothing is pushed.
-scripts/publish-images.sh
+scripts/publish-images.sh --all               # or: --service studio --service gateway
 
-# 2. Test those images.
-SELFHOST_E2E_IMAGES=local CHELABASE_IMAGE_REPO=ghcr.io/chelabase CHELABASE_IMAGE_TAG=<sha12> \
-  just selfhost-e2e
+# 2. Test the set that will ship: the new images at <sha12>, the rest at their pins.
+SELFHOST_E2E_IMAGES=local CHELABASE_IMAGE_REPO=ghcr.io/chelabase CHELABASE_IMAGE_TAG_STUDIO=<sha12> \
+  just selfhost-e2e                           # one CHELABASE_IMAGE_TAG_<IMAGE> per built image
 
-# 3. Push them without rebuilding. It refuses, before any network call, unless the tree is clean
-#    and every image's revision label is HEAD. It prints one `pin <image> <sha12> sha256:<digest>`
-#    line per image.
-scripts/publish-images.sh --push-only | tee digests.txt
+# 3. Push them without rebuilding, with the same selection. It refuses, before any network call,
+#    unless the tree is clean and each selected image's revision label is HEAD. It prints one
+#    `pin <image> <sha12> sha256:<digest>` line per pushed image.
+scripts/publish-images.sh --push-only --all | tee digests.txt
 
-# 4. Write the pins into docker-compose.yml and .env.example, check them, and commit.
+# 4. Write those pins into docker-compose.yml and .env.example (the other pins stay), check them,
+#    and commit.
 scripts/pin-images.sh digests.txt
 scripts/tests/compose-image-pins.sh digests.txt
 ```

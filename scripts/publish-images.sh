@@ -1,36 +1,62 @@
 #!/usr/bin/env bash
 # Build, test and publish the release images as ghcr.io/chelabase/<image>:<sha12>: the per-app
 # images and Studio (the ones self-host compose pulls by digest). The all-in-one chelabase/server
-# is local only. Build once, test those exact images, push them as they are:
+# is local only. Build once, test those exact images, push them as they are. Every run names its
+# images: --service <image> (repeatable) takes exactly those, even unchanged ones (with a note);
+# --all takes the images whose inputs changed since their pins (scripts/image-inputs.sh) and
+# builds nothing when none did. With neither it refuses and prints the changed set.
 #
-#   scripts/publish-images.sh              build and tag locally at a clean HEAD; nothing leaves
+#   scripts/publish-images.sh --all | --service <image>...
+#                                          build and tag locally at a clean HEAD; nothing leaves
 #                                          this machine
-#   SELFHOST_E2E_IMAGES=local CHELABASE_IMAGE_REPO=ghcr.io/chelabase CHELABASE_IMAGE_TAG=<sha12> \
-#     just selfhost-e2e                    test them
-#   scripts/publish-images.sh --push-only  push the local images without rebuilding. It refuses
+#   SELFHOST_E2E_IMAGES=local CHELABASE_IMAGE_REPO=ghcr.io/chelabase CHELABASE_IMAGE_TAG_<IMAGE>=<sha12> \
+#     just selfhost-e2e                    test them (images without a tag stay at their pins)
+#   scripts/publish-images.sh --push-only <same selection>
+#                                          push the local images without rebuilding. It refuses
 #                                          (before any network call) unless the tree is clean and
-#                                          every image's org.opencontainers.image.revision label is
-#                                          HEAD. Prints one `pin <image> <sha12> sha256:<digest>`
-#                                          line per image: feed those to scripts/pin-images.sh.
-#   scripts/publish-images.sh --push       build and push in one go (no test in between; not the
+#                                          each selected image's org.opencontainers.image.revision
+#                                          label is HEAD. Prints one `pin <image> <sha12>
+#                                          sha256:<digest>` line per pushed image: feed those to
+#                                          scripts/pin-images.sh.
+#   scripts/publish-images.sh --push <selection>
+#                                          build and push in one go (no test in between; not the
 #                                          release path)
 #
 # PUBLISH_IMAGES_REPO replaces ghcr.io/chelabase (a local registry, a test prefix).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+mapfile -t all < <(scripts/image-inputs.sh images)
+usage() {
+  echo "usage: $0 (--all | --service <image>...) [--push | --push-only]" >&2
+  echo "  images: ${all[*]}" >&2
+  exit 2
+}
 mode=build
-case "${1:-}" in
-  "") ;;
-  --push) mode=push ;;
-  --push-only) mode=push-only ;;
-  *) echo "usage: $0 [--push | --push-only]" >&2; exit 2 ;;
-esac
-[[ $# -le 1 ]] || { echo "usage: $0 [--push | --push-only]" >&2; exit 2; }
+pick_all=""
+images=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push | --push-only) [[ "${mode}" == build ]] || usage; mode="${1#--}" ;;
+    --all) pick_all=1 ;;
+    --service)
+      [[ $# -ge 2 ]] || usage
+      [[ " ${all[*]} " == *" $2 "* ]] || { echo "publish-images: unknown image '$2'" >&2; usage; }
+      [[ " ${images[*]} " == *" $2 "* ]] || images+=("$2")
+      shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+[[ -n "${pick_all}" && ${#images[@]} -gt 0 ]] && { echo "publish-images: --all and --service exclude each other" >&2; usage; }
+if [[ -z "${pick_all}" && ${#images[@]} -eq 0 ]]; then
+  changed="$(scripts/image-inputs.sh changed | paste -sd ' ')"
+  echo "publish-images: name the images; changed since their pins: ${changed:-none}" >&2
+  usage
+fi
 
 head_full="$(git rev-parse HEAD)"
 sha="$(git rev-parse --short=12 HEAD)"
-images=(gateway orchestrator worker rest auth realtime init studio)
 REPO="${PUBLISH_IMAGES_REPO:-ghcr.io/chelabase}"
 # RELEASE adds the OCI index annotations (infra/images/docker-bake.hcl); `--load` with them
 # needs the containerd image store.
@@ -40,6 +66,17 @@ bake=(docker buildx bake -f infra/images/docker-bake.hcl)
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "publish-images: the tree has uncommitted changes; the tag ${sha} wouldn't describe the images" >&2
   exit 1
+fi
+
+changed="$(scripts/image-inputs.sh changed)"
+if [[ -n "${pick_all}" ]]; then
+  mapfile -t images <<<"${changed}"
+  [[ -n "${changed}" ]] || { echo "publish-images: nothing changed since the pins; nothing to ${mode/-only/}"; exit 0; }
+  echo "publish-images: changed since their pins: ${images[*]}"
+else
+  for i in "${images[@]}"; do
+    grep -qx "${i}" <<<"${changed}" || echo "publish-images: note: ${i} is unchanged since its pin; taking it anyway" >&2
+  done
 fi
 
 print_pins() { # print_pins: pin lines from the local images' repo digests, after a push

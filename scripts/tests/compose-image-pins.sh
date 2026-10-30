@@ -3,7 +3,9 @@
 # pinned as ghcr.io/chelabase/<image>:<12 hex>@sha256:<64 hex>, in the base compose file (the
 # defaults of CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG on each image line) and in the pin block
 # of .env.example. With a digests file (`pin <image> <tag> <digest>` per line, as
-# `publish-images.sh --push-only` prints them; the `pin ` word is optional), each pin must equal the pushed tag and digest.
+# `publish-images.sh --push-only` prints them; the `pin ` word is optional), the pin of each image
+# it names must equal the pushed tag and digest; images it doesn't name keep their pins. A line
+# for an unknown image fails.
 #
 #   scripts/tests/compose-image-pins.sh [digests-file]
 #
@@ -57,10 +59,11 @@ if [[ -n "$digests" ]]; then
   declare -A want
   while read -r i t d x; do
     [[ "$i" == pin ]] && { i="$t"; t="$d"; d="$x"; }
-    [[ -z "$i" ]] || want[$i]="ghcr.io/chelabase/$i:$t@$d"
+    [[ "$t" =~ ^[0-9a-f]{12}$ && "$d" =~ ^sha256:[0-9a-f]{64}$ ]] || continue
+    if [[ " ${images[*]} " == *" $i "* ]]; then want[$i]="ghcr.io/chelabase/$i:$t@$d"; else err "$digests: unknown image $i"; fi
   done <"$digests"
-  for i in "${images[@]}"; do
-    [[ -n "${want[$i]:-}" ]] || { err "$digests has no line for $i"; continue; }
+  [[ ${#want[@]} -gt 0 ]] || err "$digests has no pin lines"
+  for i in "${!want[@]}"; do
     [[ "${seen_compose[$i]:-}" == "${want[$i]}" ]] || err "$i: compose pin ${seen_compose[$i]:-none} != pushed ${want[$i]}"
     [[ "${seen_env[$i]:-}" == "${want[$i]}" ]] || err "$i: .env.example pin ${seen_env[$i]:-none} != pushed ${want[$i]}"
   done

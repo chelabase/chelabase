@@ -120,6 +120,8 @@ check:
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
     scripts/tests/compose-image-pins.sh
+    scripts/tests/image-inputs.sh
+    scripts/image-inputs.sh copies
     just deny
     cargo check --workspace
     cargo clippy --workspace --all-targets -- -D warnings
@@ -154,8 +156,8 @@ images:
     docker buildx bake -f infra/images/docker-bake.hcl
 
 # Check the built release images' index annotations (GHCR repo link); run `scripts/publish-images.sh` first.
-images-annotations:
-    scripts/tests/images-annotations.sh
+images-annotations *images:
+    scripts/tests/images-annotations.sh {{images}}
 
 # Delete build artifacts older than `days` from the main checkout's target/ and every worktree's
 # (needs cargo-sweep: cargo install cargo-sweep --locked)
