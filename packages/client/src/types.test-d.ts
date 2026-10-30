@@ -1,7 +1,16 @@
 // Type-level tests, checked by `tsc --noEmit` (the package's `typecheck`). Every
 // `@ts-expect-error` must fire; an unused one is itself an error.
 import { expectTypeOf } from "vitest";
-import { type Client, createClient, type DatabaseShape, type Int8, type Json } from "./index.ts";
+import {
+  type AppUser,
+  type Client,
+  createClient,
+  type DatabaseShape,
+  type Int8,
+  type Json,
+  type Session,
+} from "./index.ts";
+import { type BrowserSession, createBrowserClient } from "./browser.ts";
 import { createServerClient } from "./server.ts";
 import { type Database, types } from "./test-db.ts";
 
@@ -305,3 +314,38 @@ createServerClient<Database>({ ...opts, cookies, bigint: true });
 createServerClient({ ...opts, cookies, auth: {} });
 // @ts-expect-error nor a caller-owned token
 createServerClient({ ...opts, cookies, accessToken: () => "t" });
+
+// --- createBrowserClient: query types match `createClient`; sessions come without the refresh token
+const brw = createBrowserClient<Database>({ ...opts, types });
+expectTypeOf(brw).toEqualTypeOf<Client<Database, false, BrowserSession>>();
+expectTypeOf<Omit<typeof brw, "auth" | "database">>().toEqualTypeOf<Omit<typeof db, "auth" | "database">>();
+expectTypeOf(brw.database("other")).toEqualTypeOf<Client<DatabaseShape, false, BrowserSession>>();
+expectTypeOf(createBrowserClient<Database>({ ...opts, bigint: true, types })).toEqualTypeOf<
+  Client<Database, true, BrowserSession>
+>();
+expectTypeOf(createBrowserClient({ ...opts, authPath: "/auth", cookieOptions: { secure: false } })).toEqualTypeOf<
+  Client<DatabaseShape, false, BrowserSession>
+>();
+expectTypeOf<BrowserSession>().toEqualTypeOf<Omit<Session, "refresh_token">>();
+async () => {
+  const creds = { email: "a@b.co", password: "pw" };
+  // createClient and createServerClient still return the full session.
+  expectTypeOf(await db.auth.signIn(creds)).toEqualTypeOf<Session>();
+  expectTypeOf(await srv.auth.refresh()).toEqualTypeOf<Session>();
+  const s = await brw.auth.signIn(creds);
+  expectTypeOf(s).toEqualTypeOf<BrowserSession>();
+  // @ts-expect-error the browser never sees the refresh token
+  void s.refresh_token;
+  expectTypeOf(await brw.auth.refresh()).toEqualTypeOf<BrowserSession>();
+  expectTypeOf(await brw.auth.changePassword({ currentPassword: "a", password: "b" })).toEqualTypeOf<BrowserSession>();
+  expectTypeOf((await brw.auth.signUp(creds)).session).toEqualTypeOf<BrowserSession | null>();
+  expectTypeOf(await brw.auth.getUser()).toEqualTypeOf<AppUser>();
+};
+// @ts-expect-error a generated Database needs its types
+createBrowserClient<Database>(opts);
+// @ts-expect-error bigint: true needs the generated types
+createBrowserClient<Database>({ ...opts, bigint: true });
+// @ts-expect-error the session lives in the app's cookies, not in browser storage
+createBrowserClient({ ...opts, auth: {} });
+// @ts-expect-error nor a caller-owned token
+createBrowserClient({ ...opts, accessToken: () => "t" });

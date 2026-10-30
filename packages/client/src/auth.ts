@@ -38,6 +38,18 @@ export interface ServerSession {
   headers: Record<string, string>;
 }
 
+/**
+ * Remote mode (`@chelabase/client/browser`): the refresh token lives in an `HttpOnly` cookie
+ * only the app's route (`createAuthHandler`) can use. Session flows post to that route; the
+ * access token is read from its readable cookie before every use.
+ */
+export interface RemoteSession {
+  /** The route's mount point, same-origin, without a trailing slash. */
+  path: string;
+  /** The access cookie's current value. */
+  readAccess(): string | undefined;
+}
+
 export function memoryStorage(): AuthStorage {
   const m = new Map<string, string>();
   return {
@@ -57,16 +69,28 @@ function defaultStorage(): AuthStorage {
   };
 }
 
-/** `exp` (ms since the epoch) from a JWT's payload; 0 when unreadable. */
-function expiryMs(jwt: string): number {
+/** A JWT's (unverified) payload; empty when unreadable. */
+function claims(jwt: string): { exp?: unknown; sub?: unknown } {
   try {
     const part = jwt.split(".")[1] ?? "";
     const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
-    const exp = (JSON.parse(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "="))) as { exp?: unknown }).exp;
-    return typeof exp === "number" ? exp * 1000 : 0;
+    const c = JSON.parse(atob(b64.padEnd(Math.ceil(b64.length / 4) * 4, "="))) as unknown;
+    return typeof c === "object" && c !== null ? c : {};
   } catch {
-    return 0;
+    return {};
   }
+}
+
+/** `exp` (ms since the epoch) from a JWT's payload; 0 when unreadable. */
+function expiryMs(jwt: string): number {
+  const exp = claims(jwt).exp;
+  return typeof exp === "number" ? exp * 1000 : 0;
+}
+
+/** Whose token it is: `sub`, or undefined. Unverified: it only decides which event to emit. */
+function subject(jwt: string | undefined): string | undefined {
+  const sub = jwt === undefined ? undefined : claims(jwt).sub;
+  return typeof sub === "string" ? sub : undefined;
 }
 
 export function createAuth<DB extends DatabaseShape>(cfg: {
@@ -77,9 +101,11 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
   /** Turns a non-2xx answer into the client's `DataApiError`. */
   toError: (res: Response, text: string) => DataApiError;
   server?: ServerSession;
+  remote?: RemoteSession;
 }): AuthCore<DB> {
   const srv = cfg.server;
-  const storage = srv ? memoryStorage() : (cfg.options?.storage ?? defaultStorage());
+  const remote = cfg.remote;
+  const storage = srv || remote ? memoryStorage() : (cfg.options?.storage ?? defaultStorage());
   const autoRefresh = !srv && (cfg.options?.autoRefresh ?? true);
   const storeKey = `chelabase.${cfg.key.slice(0, 12)}.refresh`;
 
@@ -95,10 +121,65 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
   let inflight: Promise<Session> | undefined;
   let started: Promise<void> | undefined;
   const listeners = new Set<(event: AuthEvent, user: AppUser | null) => void>();
+  /** Remote mode: the access cookie's value when last looked at. Only a change to it is acted on. */
+  let seen = remote?.readAccess();
+  if (seen !== undefined) {
+    access = seen;
+    expMs = expiryMs(seen);
+    if (expMs - Date.now() >= STALE_MS) schedule(); // a stale one is refreshed on first use
+  }
 
   const emit = (event: AuthEvent, user: AppUser | null) => {
     for (const cb of [...listeners]) cb(event, user);
   };
+
+  /**
+   * Remote mode: picks up a change to the access cookie (another tab signed in, out or
+   * refreshed). `signed_in`/`signed_out` are emitted when the token's `sub` changes, with a
+   * `null` user: the cookie carries no profile (`db.auth.getUser()` fetches it).
+   */
+  function sync() {
+    if (!remote) return;
+    const cur = remote.readAccess();
+    if (cur === seen) return;
+    seen = cur;
+    const before = subject(access);
+    if (cur === undefined) {
+      clearTimer();
+      access = undefined;
+      expMs = 0;
+      if (before !== undefined) emit("signed_out", null);
+      return;
+    }
+    access = cur;
+    expMs = expiryMs(cur);
+    clearTimer();
+    if (expMs - Date.now() >= STALE_MS) schedule();
+    if (subject(cur) !== before) emit("signed_in", null);
+  }
+
+  /** Remote mode: a session flow through the app's route (same-origin; the route adds the key and cookies). */
+  async function routeCall(flow: string, body?: unknown): Promise<unknown> {
+    const res = await cfg.fetch(`${remote!.path}/${flow}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json" },
+      credentials: "same-origin",
+      redirect: NO_REDIRECTS,
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    return answer(res);
+  }
+
+  async function answer(res: Response): Promise<unknown> {
+    const text = await res.text();
+    if (!res.ok) throw cfg.toError(res, text);
+    if (res.status === 204 || text === "") return undefined;
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new DataApiError({ status: res.status, code: "internal", message: "the auth API answered with invalid JSON" });
+    }
+  }
 
   async function call(
     path: string,
@@ -118,15 +199,11 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
       redirect: NO_REDIRECTS,
       ...(method === "POST" ? { body: JSON.stringify(init.body ?? {}) } : {}),
     });
-    const text = await res.text();
-    if (!res.ok) throw cfg.toError(res, text);
-    if (res.status === 204 || text === "") return undefined;
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new DataApiError({ status: res.status, code: "internal", message: "the auth API answered with invalid JSON" });
-    }
+    return answer(res);
   }
+
+  /** A session flow: through the app's route in remote mode, else straight to the auth API. */
+  const flow = (path: string, body?: unknown) => (remote ? routeCall(path, body) : call(path, { body }));
 
   function clearTimer() {
     if (timer !== undefined) clearTimeout(timer);
@@ -140,6 +217,8 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     started = Promise.resolve();
     await storage.remove(storeKey);
     await srv?.onSession(null);
+    // The route cleared the cookies (or, after a failure, an unchanged cookie is not taken back).
+    if (remote) seen = remote.readAccess();
     if (emitEvent) emit("signed_out", null);
   }
 
@@ -148,34 +227,57 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     access = s.access_token;
     expMs = expiryMs(s.access_token) || Date.now() + s.expires_in * 1000;
     started = Promise.resolve();
-    await storage.set(storeKey, s.refresh_token);
-    clearTimer();
-    if (autoRefresh) {
-      const t = setTimeout(() => void refresh().catch(() => {}), Math.max(0, expMs - REFRESH_LEAD_MS - Date.now()));
-      (t as { unref?: () => void }).unref?.();
-      timer = t;
-    }
+    // Remote mode: the route set the cookie to this token, and keeps the refresh token to itself.
+    if (remote) seen = s.access_token;
+    else await storage.set(storeKey, s.refresh_token);
+    schedule();
     emit(event, s.user);
+  }
+
+  function schedule() {
+    clearTimer();
+    if (!autoRefresh || access === undefined) return;
+    const planned = access;
+    const t = setTimeout(() => {
+      sync(); // remote: another tab may have refreshed already
+      if (access === planned) void refresh().catch(() => {});
+    }, Math.max(0, expMs - REFRESH_LEAD_MS - Date.now()));
+    (t as { unref?: () => void }).unref?.();
+    timer = t;
   }
 
   function refresh(): Promise<Session> {
     inflight ??= (async () => {
       try {
-        const token = await storage.get(storeKey);
-        if (token === null) {
-          throw new DataApiError({ status: 401, code: "refresh_token_invalid", message: "there is no session to refresh" });
+        let s: Session;
+        if (remote) s = (await routeCall("refresh")) as Session;
+        else {
+          const token = await storage.get(storeKey);
+          if (token === null) {
+            throw new DataApiError({ status: 401, code: "refresh_token_invalid", message: "there is no session to refresh" });
+          }
+          s = (await call("refresh", { body: { refresh_token: token } })) as Session;
         }
-        const s = (await call("refresh", { body: { refresh_token: token } })) as Session;
         await adopt(s, "refreshed");
         return s;
       } catch (e) {
         if (staleRefresh(e)) {
           // Another request may have rotated past this token and written newer cookies: forget
           // the session here only, and go on anonymously.
+          const prev = access;
           access = undefined;
           expMs = 0;
+          clearTimer();
           started = Promise.resolve();
           await storage.remove(storeKey);
+          if (remote) {
+            // A newer cookie (another tab) is taken up; an unchanged one is the session that ended.
+            const cur = remote.readAccess();
+            if (cur !== undefined && cur !== seen) {
+              access = prev;
+              sync();
+            } else if (prev !== undefined) emit("signed_out", null);
+          }
         } else if (e instanceof DataApiError && FATAL.has(e.code)) await clearLocal(true);
         throw e;
       } finally {
@@ -185,9 +287,9 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     return inflight;
   }
 
-  /** Server mode: a `refresh_token_invalid` leaves the cookies alone and the request anonymous. */
+  /** Server and remote mode: a `refresh_token_invalid` leaves the cookies alone and the request anonymous. */
   function staleRefresh(e: unknown): boolean {
-    return srv !== undefined && e instanceof DataApiError && e.code === "refresh_token_invalid";
+    return (srv !== undefined || remote !== undefined) && e instanceof DataApiError && e.code === "refresh_token_invalid";
   }
 
   /** On the first use, a stored refresh token (a returning visitor) is exchanged for an access token. */
@@ -203,6 +305,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
   }
 
   async function accessToken(): Promise<string | undefined> {
+    sync();
     try {
       await ensureStarted();
       if (access !== undefined && expMs - Date.now() < STALE_MS) await refresh();
@@ -214,6 +317,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   async function refreshAfterExpiry(sent: string): Promise<string | undefined> {
     // Another request may have refreshed already: only refresh if the rejected token is still current.
+    sync();
     try {
       if (access === sent) await refresh();
     } catch (e) {
@@ -227,13 +331,14 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     if (access === sent) await clearLocal(true);
   }
 
-  async function userCall(path: string, init: { method?: "GET" | "POST"; body?: unknown } = {}) {
+  async function userCall(path: string, init: { method?: "GET" | "POST"; body?: unknown } = {}, viaRoute = false) {
     const token = await accessToken();
     if (token === undefined) {
       throw new DataApiError({ status: 401, code: "user_token_invalid", message: "not signed in" });
     }
     try {
-      return await call(path, { ...init, token });
+      // Through the route, the access cookie (just synced and refreshed) carries the token.
+      return await (viaRoute ? routeCall(path, init.body) : call(path, { ...init, token }));
     } catch (e) {
       if (e instanceof DataApiError && e.code === SESSION_GONE) await dropSession(token);
       throw e;
@@ -242,7 +347,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   const auth: Auth<DB> = {
     async signUp(p) {
-      const r = (await call("sign-up", { body: p })) as Session | { user: AppUser; verification_required?: boolean };
+      const r = (await flow("sign-up", p)) as Session | { user: AppUser; verification_required?: boolean };
       if ("access_token" in r) {
         await adopt(r, "signed_in");
         return { user: r.user, session: r, verificationRequired: false };
@@ -250,12 +355,16 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
       return { user: r.user, session: null, verificationRequired: r.verification_required === true };
     },
     async signIn(p) {
-      const s = (await call("sign-in", { body: p })) as Session;
+      const s = (await flow("sign-in", p)) as Session;
       await adopt(s, "signed_in");
       return s;
     },
     async signOut() {
       try {
+        if (remote) {
+          await routeCall("sign-out"); // the route sends the refresh cookie and clears both
+          return;
+        }
         // `call`, not `userCall`: the `finally` below signs out locally (and emits) exactly once.
         const token = access !== undefined ? await accessToken() : undefined;
         if (token !== undefined) await call("sign-out", { token });
@@ -287,9 +396,11 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
       await userCall("change-email", { body: p });
     },
     async changePassword(p) {
-      const s = (await userCall("change-password", {
-        body: { current_password: p.currentPassword, password: p.password },
-      })) as Session;
+      const s = (await userCall(
+        "change-password",
+        { body: { current_password: p.currentPassword, password: p.password } },
+        remote !== undefined,
+      )) as Session;
       await adopt(s, "refreshed"); // the old refresh token is revoked: keep the new pair
       return s;
     },

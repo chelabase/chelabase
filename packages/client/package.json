@@ -14,7 +14,8 @@
       "node": "./src/server.ts",
       "browser": "./src/server-browser.ts",
       "default": "./src/server.ts"
-    }
+    },
+    "./browser": "./src/browser.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

@@ -18,6 +18,7 @@ import { toError } from "./error.ts";
 import type { Client, DatabaseShape, TypeMap } from "./types.ts";
 
 export type { CookieAttributes, CookieOptions, CookieToSet } from "./cookies.ts";
+export { type AuthHandlerOptions, createAuthHandler } from "./handler.ts";
 
 /**
  * The request's cookies. `setAll` must make the new cookies visible to later `getAll` calls
