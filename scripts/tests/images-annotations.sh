@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Checks that each of the eight release images' top-level OCI index carries the
+# Checks that each release image's (the ones named, default all eight) top-level OCI index carries the
 # org.opencontainers.image.{source,revision,licenses} annotations (GHCR links a package to its
 # repo from them; a label alone is ignored when the tag is an index), and that revision == HEAD.
-# Run after `scripts/publish-images.sh` (build mode). Not part of `just check`: it needs the images.
+# Run after `scripts/publish-images.sh` (build mode), on the images it built. Not part of
+# `just check`: it needs the images.
 #
-#   scripts/tests/images-annotations.sh
+#   scripts/tests/images-annotations.sh [<image>...]
 #   SOURCE="" scripts/publish-images.sh ...   (build with a missing source) -> this fails naming it
 #
 # Reads the index straight from the local image store: it streams each image through
@@ -15,11 +16,11 @@
 # Manual check of the push-only path against a scratch registry (never GHCR). Retagging keeps the
 # tested index, so nothing is rebuilt:
 #   docker run -d -p 5055:5000 --name scratch-registry registry:2
-#   scripts/publish-images.sh                                              # build, --load
+#   scripts/publish-images.sh --service gateway                            # build, --load
 #   T=$(git rev-parse --short=12 HEAD)
-#   for i in gateway orchestrator worker rest auth realtime init studio; do
+#   for i in gateway; do
 #     docker tag ghcr.io/chelabase/$i:$T localhost:5055/chelabase/$i:$T; done
-#   PUBLISH_IMAGES_REPO=localhost:5055/chelabase scripts/publish-images.sh --push-only
+#   PUBLISH_IMAGES_REPO=localhost:5055/chelabase scripts/publish-images.sh --push-only --service gateway
 #   docker buildx imagetools inspect --raw localhost:5055/chelabase/gateway:$T | jq .annotations
 #     -> the three keys; the pushed index digest (sha256sum of the raw output) equals
 #        `docker image inspect -f '{{.Descriptor.digest}}' ghcr.io/chelabase/gateway:$T`, so the
@@ -32,6 +33,7 @@ REPO="${REPO:-ghcr.io/chelabase}"
 TAG="${TAG:-$(git rev-parse --short=12 HEAD)}"
 head_full="$(git rev-parse HEAD)"
 images=(gateway orchestrator worker rest auth realtime init studio)
+[[ $# -eq 0 ]] || images=("$@")
 want_source="https://github.com/chelabase/chelabase"
 fail=0
 bad() { echo "FAIL: $*" >&2; fail=1; }

@@ -28,7 +28,9 @@
 # Images: by default `-f docker-compose.build.yml` builds them from this checkout (the cache is
 # shared with `just images`). SELFHOST_E2E_IMAGES=local runs the base file on the images
 # `just images` already built (CHELABASE_IMAGE_REPO / CHELABASE_IMAGE_TAG, default chelabase:latest;
-# nothing is pulled for them).
+# nothing is pulled for them). For a mixed release set, CHELABASE_IMAGE_TAG_<IMAGE> (e.g.
+# CHELABASE_IMAGE_TAG_STUDIO) tags one image; once any is set, the images with neither it nor
+# CHELABASE_IMAGE_TAG stay at their compose pins (pulled by digest when missing).
 #
 # Other switches: SELFHOST_E2E_SKIP_CODE=1 stubs the code check out (step 4 expects 200 instead of
 # 403, so the script must fail there: this shows its failure path). SELFHOST_E2E_KEEP=1 leaves the
@@ -234,6 +236,26 @@ case "${SELFHOST_E2E_IMAGES:-}" in
   "") COMPOSE_FILES=(-f "$dir/docker-compose.yml" -f "$dir/docker-compose.build.yml") ;;
   *) die "SELFHOST_E2E_IMAGES must be unset or 'local' (got '$SELFHOST_E2E_IMAGES')" ;;
 esac
+# Per-image tags: an override naming every app service's image.
+if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]] && compgen -v CHELABASE_IMAGE_TAG_ >/dev/null; then
+  echo "services:" >"$tmp/images.yml"
+  svc=""
+  while IFS= read -r line; do
+    [[ "$line" =~ ^\ \ ([a-z0-9-]+):$ ]] && svc="${BASH_REMATCH[1]}"
+    [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]] || continue
+    img="${BASH_REMATCH[2]}"
+    var="CHELABASE_IMAGE_TAG_${img^^}"
+    if [[ -n "${!var:-}${CHELABASE_IMAGE_TAG:-}" ]]; then
+      ref="${CHELABASE_IMAGE_REPO:-chelabase}/$img:${!var:-$CHELABASE_IMAGE_TAG}"
+    else
+      ref="${BASH_REMATCH[1]}/$img:${BASH_REMATCH[3]}"
+      docker image inspect "$ref" >/dev/null 2>&1 || docker pull -q "$ref" >/dev/null
+    fi
+    printf '  %s:\n    image: %s\n' "$svc" "$ref" >>"$tmp/images.yml"
+    say "$svc: $ref"
+  done <"$dir/docker-compose.yml"
+  COMPOSE_FILES+=(-f "$tmp/images.yml")
+fi
 UP_ARGS=(up -d --wait --wait-timeout 900)
 [[ -n "${SELFHOST_E2E_IMAGES:-}" ]] && UP_ARGS+=(--pull never) || UP_ARGS+=(--build)
 
