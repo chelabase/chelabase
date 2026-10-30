@@ -7,7 +7,7 @@
  */
 import { createAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
-import { type CookieOptions, cookieNames, parseCookies, readSession, serializeCookie, sessionCookies } from "./cookies.ts";
+import { type CookieOptions, checkCookieOptions, cookieNames, parseCookies, readSession, serializeCookie, sessionCookies } from "./cookies.ts";
 import { toError } from "./error.ts";
 import type { BrowserSession, Client, DatabaseShape, TypeMap } from "./types.ts";
 
@@ -47,6 +47,15 @@ export function createBrowserClient<DB extends DatabaseShape = DatabaseShape, B 
 export function createBrowserClient<DB extends DatabaseShape, B extends boolean = false>(
   opts: BrowserClientOptions & { bigint?: B },
 ): Client<DB, B, BrowserSession> {
+  // The whole shape, as on the server; these messages never quote a key.
+  if (!/^chk_pub_[0-9A-Za-z]+$/.test(opts.key)) {
+    throw new Error(
+      opts.key.startsWith("chk_sec_")
+        ? "createBrowserClient: `key` must be the public (chk_pub_…) key; a secret key never belongs in the browser"
+        : "createBrowserClient: `key` must be the public (chk_pub_…) key",
+    );
+  }
+  checkCookieOptions(opts.cookieOptions);
   const names = cookieNames(opts.key, opts.cookieOptions);
   const path = (opts.authPath ?? "/api/chelabase/auth").replace(/\/+$/, "");
   const readAccess = () => {

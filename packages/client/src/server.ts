@@ -19,6 +19,7 @@ import type { Client, DatabaseShape, TypeMap } from "./types.ts";
 
 export type { CookieAttributes, CookieOptions, CookieToSet } from "./cookies.ts";
 export { type AuthHandlerOptions, createAuthHandler } from "./handler.ts";
+export { parseCookies, serializeCookie } from "./cookies.ts";
 
 /**
  * The request's cookies. `setAll` must make the new cookies visible to later `getAll` calls
@@ -80,7 +81,9 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
   if (opts.serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(opts.serverKey)) {
     throw new Error("createServerClient: `serverKey` must be a secret (chk_sec_…) key");
   }
-  if ((opts.serverKey === undefined) !== (opts.clientIp === undefined)) {
+  // An empty `clientIp` (an absent header read as "") counts as missing, as in the handler.
+  const clientIp = opts.clientIp === "" ? undefined : opts.clientIp;
+  if ((opts.serverKey === undefined) !== (clientIp === undefined)) {
     throw new Error(
       `createServerClient: \`serverKey\` and \`clientIp\` go together; \`${opts.serverKey === undefined ? "serverKey" : "clientIp"}\` is missing`,
     );
@@ -90,13 +93,14 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
   const { access, refresh } = readSession(opts.cookies.getAll(), names);
   const setAll = opts.cookies.setAll?.bind(opts.cookies);
   const headers: Record<string, string> =
-    opts.serverKey !== undefined && opts.clientIp !== undefined
-      ? { "chelabase-server-key": opts.serverKey, "chelabase-client-ip": opts.clientIp }
+    opts.serverKey !== undefined && clientIp !== undefined
+      ? { "chelabase-server-key": opts.serverKey, "chelabase-client-ip": clientIp }
       : {};
 
   async function onSession(s: Parameters<typeof sessionCookies>[1]) {
     if (setAll === undefined) {
-      // Nothing to clear without `setAll`; the methods that issue a session are refused below.
+      // Nothing to clear without `setAll`. Unreachable for a session: the methods that issue one
+      // are refused below before the server is asked. Kept as a backstop if that list drifts.
       if (s !== null) throw new Error("createServerClient: db.auth needs `cookies.setAll` to keep a session");
       return;
     }

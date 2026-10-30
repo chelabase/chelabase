@@ -353,3 +353,20 @@ describe("createBrowserClient", () => {
     expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
   });
 });
+
+describe("createBrowserClient options", () => {
+  test("a_secret_or_malformed_key_throws_without_quoting_it", () => {
+    const secret = "chk_sec_zyxwvutsrqponmlkjihgfedcbaZYXWVUTSRQPONMLKJIH";
+    const f = () => createBrowserClient({ url, key: secret });
+    expect(f).toThrow(/secret key never belongs in the browser/);
+    expect(f).not.toThrow(secret.slice(8));
+    for (const bad of ["chk_pub_", "chk_pub_abc;x", "chk_pub_abc\r\n", "whatever"]) {
+      expect(() => createBrowserClient({ url, key: bad }), JSON.stringify(bad)).toThrow(/`key`/);
+    }
+  });
+
+  test("a_bad_cookie_domain_throws", () => {
+    expect(() => createBrowserClient({ url, key, cookieOptions: { domain: "a.test;x" } })).toThrow(/cookieOptions\.domain/);
+    expect(() => createBrowserClient({ url, key, cookieOptions: { domain: "example.test" } })).not.toThrow();
+  });
+});

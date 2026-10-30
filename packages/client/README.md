@@ -53,8 +53,19 @@ import { createAuthHandler, createServerClient } from "@chelabase/client/server"
 // Browser: data goes to the gateway, sign-in and refresh go through your auth route.
 const db = createBrowserClient<Database>({ url, key: PUBLIC_KEY, types });
 
-// Server: one per request. `cookies` is your framework's cookie store.
-const sdb = createServerClient<Database>({ url, key: PUBLIC_KEY, types, cookies });
+// Server: one per request. Wrap the framework's cookie store: Next's `cookies()` has no
+// `setAll`, so passing it as is gives a read-only client that never refreshes. In Next.js,
+// `store.set` works in Server Actions and route handlers, not in Server Components.
+const store = await cookies();
+const sdb = createServerClient<Database>({
+  url,
+  key: PUBLIC_KEY,
+  types,
+  cookies: {
+    getAll: () => store.getAll(),
+    setAll: (list) => list.forEach((c) => store.set(c.name, c.value, c.options)),
+  },
+});
 const user = await sdb.auth.getUser();
 
 // Once, e.g. app/api/chelabase/auth/[...path]/route.ts
@@ -62,8 +73,9 @@ export const POST = createAuthHandler({ url, key: PUBLIC_KEY, siteUrl: "https://
 ```
 
 When another system owns the session, `createClient({ url, key, accessToken: () => token })`
-sends that token and never refreshes it. The full Next.js walkthrough is in the guide's
-Server rendering page (`apps/docs/content/docs/using/client/ssr.mdx`).
+sends that token and never refreshes it. The full Next.js walkthrough is the guide's Server
+rendering page, `/docs/using/client/ssr` on the docs site
+(http://docs.chelabase.localhost:8000/docs/using/client/ssr in the workbench).
 
 ## Documentation
 

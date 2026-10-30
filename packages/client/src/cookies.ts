@@ -89,7 +89,7 @@ export function readSession(
   return { access: a[0]?.value || undefined, refresh: r[0]?.value || undefined };
 }
 
-/** A `Set-Cookie` header value. */
+/** One `Set-Cookie` header value for a cookie `cookies.setAll` was given, every attribute included. */
 export function serializeCookie(c: CookieToSet): string {
   const o = c.options;
   let line = `${c.name}=${encodeURIComponent(c.value)}; Path=${o.path}; Max-Age=${o.maxAge}`;
@@ -99,7 +99,10 @@ export function serializeCookie(c: CookieToSet): string {
   return `${line}; SameSite=${o.sameSite[0]!.toUpperCase()}${o.sameSite.slice(1)}`;
 }
 
-/** A `Cookie` request header's pairs, values decoded (left as is when not valid percent-encoding). */
+/**
+ * A `Cookie` request header's pairs, for a `cookies.getAll` without a framework. A name sent
+ * twice is kept twice; a value that isn't valid percent-encoding is kept raw.
+ */
 export function parseCookies(header: string): { name: string; value: string }[] {
   const out: { name: string; value: string }[] = [];
   for (const part of header.split(";")) {

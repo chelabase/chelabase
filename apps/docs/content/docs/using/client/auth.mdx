@@ -40,6 +40,7 @@ Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `re
 - The access token is refreshed 60 seconds before it expires, by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
 - A data request answered `401 user_token_expired` refreshes once and retries once. A returning visitor's first request refreshes lazily first.
 - When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`, or any request carrying the access token (data or `db.auth`) is answered `401 user_session_revoked`, the client signs out locally: it drops the stored refresh token, emits `signed_out` and throws the `DataApiError`.
+- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request without clearing the cookies, since a stale request must not wipe a newer session; see [Server rendering](/docs/using/client/ssr).
 
 ## A token from elsewhere
 

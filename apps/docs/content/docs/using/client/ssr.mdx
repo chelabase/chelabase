@@ -29,13 +29,18 @@ Next.js 16 calls the proxy file `proxy.ts`. Before 16 it is `middleware.ts`, wit
 import { createBrowserClient } from "@chelabase/client/browser";
 import { type Database, types } from "./db";
 
-export const createClient = () =>
+const create = () =>
   createBrowserClient<Database>({
     url: process.env.NEXT_PUBLIC_CHELABASE_URL!,
     key: process.env.NEXT_PUBLIC_CHELABASE_KEY!,
     types,
   });
+
+let client: ReturnType<typeof create> | undefined;
+export const createClient = () => (client ??= create());
 ```
+
+Keep one browser client per page: each client runs its own refresh timer and keeps its own listeners.
 
 ### Server client
 
@@ -110,9 +115,11 @@ import { type NextRequest, NextResponse } from "next/server";
 
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request });
+  const ip = request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
   const db = createServerClient({
     url: process.env.CHELABASE_URL!,
     key: process.env.CHELABASE_PUBLIC_KEY!,
+    ...(ip ? { serverKey: process.env.CHELABASE_SECRET_KEY!, clientIp: ip } : {}),
     cookies: {
       getAll: () => request.cookies.getAll(),
       setAll(list) {
@@ -131,9 +138,13 @@ export async function proxy(request: NextRequest) {
 }
 
 export const config = {
-  matcher: ["/((?!_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/chelabase/auth).*)"],
 };
 ```
+
+The matcher leaves out the auth route: the handler refreshes on its own, and running the proxy there too would rotate the refresh token twice.
+
+`getUser()` in the proxy makes a gateway round trip on every request the matcher lets through. If that matters, narrow the matcher to the pages that need a fresh session.
 
 ### A page that needs a user
 
@@ -168,8 +179,7 @@ export function SignInForm() {
   return (
     <form
       action={async (form) => {
-        const db = createClient();
-        await db.auth.signIn({ email: String(form.get("email")), password: String(form.get("password")) });
+        await createClient().auth.signIn({ email: String(form.get("email")), password: String(form.get("password")) });
         router.refresh();
         router.push("/dashboard");
       }}
@@ -218,17 +228,15 @@ If your app runs from fixed addresses, there is an alternative: add them to `CHE
 
 `createServerClient` takes a cookie adapter: `getAll()` and, where headers can still be written, `setAll(list)`. Each item in `list` has `name`, `value` and `options` (path, secure, httpOnly, sameSite, maxAge, domain).
 
+`parseCookies` and `serializeCookie` from `@chelabase/client/server` read the `Cookie` header and write each `Set-Cookie` line, so every `cookieOptions` attribute carries through.
+
 ```ts twoslash
-import { createServerClient } from "@chelabase/client/server";
+import { createServerClient, parseCookies, serializeCookie } from "@chelabase/client/server";
 import { type Database, types } from "./db";
 // ---cut---
 export async function handle(req: Request): Promise<Response> {
   // A list, not a map: a duplicated name must reach the client (see Cookies below).
-  let jar: { name: string; value: string }[] = [];
-  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
-    const [name, ...rest] = part.trim().split("=");
-    if (name) jar.push({ name, value: decodeURIComponent(rest.join("=")) });
-  }
+  let jar = parseCookies(req.headers.get("cookie") ?? "");
   const out: string[] = [];
   const db = createServerClient<Database>({
     url: "http://api.chelabase.localhost:8000",
@@ -239,10 +247,7 @@ export async function handle(req: Request): Promise<Response> {
       setAll(list) {
         for (const c of list) {
           jar = [...jar.filter((j) => j.name !== c.name), { name: c.name, value: c.value }];
-          out.push(
-            `${c.name}=${encodeURIComponent(c.value)}; Path=/; Max-Age=${c.options.maxAge}; SameSite=Lax; Secure` +
-              (c.options.httpOnly ? "; HttpOnly" : ""),
-          );
+          out.push(serializeCookie(c));
         }
       },
     },
@@ -254,13 +259,13 @@ export async function handle(req: Request): Promise<Response> {
 }
 ```
 
-`createAuthHandler` is already `(req: Request) => Promise<Response>`. Call it from any router that gives you a web `Request`, and point `authPath` on the browser client at the route.
+`createAuthHandler` is already `(req: Request) => Promise<Response>`. Call it from any router that gives you a web `Request`. If you mount it somewhere other than `/api/chelabase/auth`, set `authPath` on both the handler and the browser client; both must equal the route's mount point.
 
 ## Security notes
 
 - Data requests use the public key only. A secret key with a user token is refused (`user_token_with_secret_key`), so `serverKey` is only sent on auth calls.
 - Make one server client per request. Never keep one at module level.
-- A server client without `setAll` (a Server Component) can't refresh. If the token has expired, it retries once as an anonymous caller. Do writes from Server Actions or route handlers, which have `setAll`.
+- A server client without `setAll` (a Server Component) can't refresh. Once the token has expired, it runs as an anonymous caller. Do writes from Server Actions or route handlers, which have `setAll`.
 - `serverKey` and `clientIp` go together on `createServerClient` and `createAuthHandler`.
 - The handler checks `Origin` against `siteUrl` and `allowedOrigins`, and only accepts JSON `POST`. `req.url` is not used for this, since behind a proxy it is the internal address.
 - Trust `clientIp` headers only from your own platform, and only if a client can't set them.
