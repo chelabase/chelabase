@@ -3,7 +3,7 @@
 //! Runs in the workbench runner, which has `demo.env` (the issuer and the admin PAT):
 //!
 //! ```text
-//! just workbench test -p chelabase-zitadel --test zitadel_live -- --run-ignored only
+//! just workbench test -p chelabase-zitadel --test zitadel_live -- --run-ignored all
 //! ```
 //!
 //! Calls go to `CHELABASE_ZITADEL_INTERNAL_URL` (else the `zitadel` service) with the issuer's

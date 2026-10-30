@@ -953,6 +953,10 @@ enum Zit {
     Internal500,
     Empty200,
     NoUserId200,
+    /// The right `userId`, active, but no `details.resourceOwner`.
+    NoOrg200,
+    /// Another user of the project's org, inactive (a proxy or cache mix-up).
+    OtherUser200,
     Malformed200,
 }
 
@@ -976,12 +980,14 @@ fn refresh_model(o: Orch, z: Zit) -> (StatusCode, &'static str, bool) {
             | Zit::Internal500
             | Zit::Empty200
             | Zit::NoUserId200
+            | Zit::NoOrg200
+            | Zit::OtherUser200
             | Zit::Malformed200 => down,
         },
     }
 }
 
-/// #57: every orchestrator answer against every Zitadel answer (8 x 9), checked against
+/// #57: every orchestrator answer against every Zitadel answer (8 x 11), checked against
 /// [`refresh_model`]: the answer the client sees, and whether a revoke call was made.
 #[tokio::test]
 async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
@@ -1006,6 +1012,8 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         Z::Internal500,
         Z::Empty200,
         Z::NoUserId200,
+        Z::NoOrg200,
+        Z::OtherUser200,
         Z::Malformed200,
     ];
     let mut wrong = Vec::new();
@@ -1031,6 +1039,24 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
                     r#"{"user": {"state": "USER_STATE_ACTIVE", "details": {"resourceOwner": "o"}}}"#,
                     1,
                 ),
+                Z::NoOrg200 => h.mock.answer_raw(
+                    &get,
+                    200,
+                    &format!(r#"{{"user": {{"userId": "{user}", "state": "USER_STATE_ACTIVE"}}}}"#),
+                    1,
+                ),
+                Z::OtherUser200 => {
+                    let other = Uuid::new_v4();
+                    let org = h.org();
+                    h.mock.answer_raw(
+                        &get,
+                        200,
+                        &format!(
+                            r#"{{"user": {{"userId": "{other}", "state": "USER_STATE_INACTIVE", "details": {{"resourceOwner": "{org}"}}}}}}"#
+                        ),
+                        1,
+                    )
+                }
                 Z::Malformed200 => h.mock.answer_raw(&get, 200, r#"{"user": {"userId""#, 1),
             }
             let (sid, token) = h
@@ -1073,7 +1099,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
     }
     assert!(
         wrong.is_empty(),
-        "{} of 72 cases differ from the model:\n{}",
+        "{} of 88 cases differ from the model:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
