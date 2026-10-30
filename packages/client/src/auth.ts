@@ -23,6 +23,21 @@ export interface AuthCore<DB extends DatabaseShape> {
   dropSession(sent: string): Promise<void>;
 }
 
+/**
+ * Server mode (`@chelabase/client/server`): the session lives in the request's cookies. No
+ * timer; nothing is kept beyond this client.
+ */
+export interface ServerSession {
+  /** The access token from the request; used while it has at least 5 s left. */
+  access: string | undefined;
+  /** The refresh token from the request; leave it undefined when the cookies can't be written. */
+  refresh: string | undefined;
+  /** Writes the session's cookies (or clears them). Runs before a new token is used; a throw stops its use. */
+  onSession(s: Session | null): Promise<void>;
+  /** Extra headers for the auth API only (the server key and the end user's IP). */
+  headers: Record<string, string>;
+}
+
 export function memoryStorage(): AuthStorage {
   const m = new Map<string, string>();
   return {
@@ -61,13 +76,21 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
   options: AuthOptions | undefined;
   /** Turns a non-2xx answer into the client's `DataApiError`. */
   toError: (res: Response, text: string) => DataApiError;
+  server?: ServerSession;
 }): AuthCore<DB> {
-  const storage = cfg.options?.storage ?? defaultStorage();
-  const autoRefresh = cfg.options?.autoRefresh ?? true;
+  const srv = cfg.server;
+  const storage = srv ? memoryStorage() : (cfg.options?.storage ?? defaultStorage());
+  const autoRefresh = !srv && (cfg.options?.autoRefresh ?? true);
   const storeKey = `chelabase.${cfg.key.slice(0, 12)}.refresh`;
 
   let access: string | undefined;
   let expMs = 0;
+  if (srv?.refresh !== undefined) void storage.set(storeKey, srv.refresh);
+  if (srv?.access !== undefined && expiryMs(srv.access) - Date.now() >= STALE_MS) {
+    // Its unverified `exp` only decides whether to refresh; the gateway checks the token itself.
+    access = srv.access;
+    expMs = expiryMs(srv.access);
+  }
   let timer: ReturnType<typeof setTimeout> | undefined;
   let inflight: Promise<Session> | undefined;
   let started: Promise<void> | undefined;
@@ -82,6 +105,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     init: { method?: "GET" | "POST"; body?: unknown; token?: string },
   ): Promise<unknown> {
     const headers: Record<string, string> = {
+      ...srv?.headers,
       authorization: `Bearer ${cfg.key}`,
       accept: "application/json",
     };
@@ -115,10 +139,12 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     expMs = 0;
     started = Promise.resolve();
     await storage.remove(storeKey);
+    await srv?.onSession(null);
     if (emitEvent) emit("signed_out", null);
   }
 
   async function adopt(s: Session, event: AuthEvent) {
+    await srv?.onSession(s); // the cookies first: a token the browser won't get back is never used
     access = s.access_token;
     expMs = expiryMs(s.access_token) || Date.now() + s.expires_in * 1000;
     started = Promise.resolve();
@@ -143,13 +169,25 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
         await adopt(s, "refreshed");
         return s;
       } catch (e) {
-        if (e instanceof DataApiError && FATAL.has(e.code)) await clearLocal(true);
+        if (staleRefresh(e)) {
+          // Another request may have rotated past this token and written newer cookies: forget
+          // the session here only, and go on anonymously.
+          access = undefined;
+          expMs = 0;
+          started = Promise.resolve();
+          await storage.remove(storeKey);
+        } else if (e instanceof DataApiError && FATAL.has(e.code)) await clearLocal(true);
         throw e;
       } finally {
         inflight = undefined;
       }
     })();
     return inflight;
+  }
+
+  /** Server mode: a `refresh_token_invalid` leaves the cookies alone and the request anonymous. */
+  function staleRefresh(e: unknown): boolean {
+    return srv !== undefined && e instanceof DataApiError && e.code === "refresh_token_invalid";
   }
 
   /** On the first use, a stored refresh token (a returning visitor) is exchanged for an access token. */
@@ -165,14 +203,22 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
   }
 
   async function accessToken(): Promise<string | undefined> {
-    await ensureStarted();
-    if (access !== undefined && expMs - Date.now() < STALE_MS) await refresh();
+    try {
+      await ensureStarted();
+      if (access !== undefined && expMs - Date.now() < STALE_MS) await refresh();
+    } catch (e) {
+      if (!staleRefresh(e)) throw e;
+    }
     return access;
   }
 
   async function refreshAfterExpiry(sent: string): Promise<string | undefined> {
     // Another request may have refreshed already: only refresh if the rejected token is still current.
-    if (access === sent) await refresh();
+    try {
+      if (access === sent) await refresh();
+    } catch (e) {
+      if (!staleRefresh(e)) throw e;
+    }
     return access;
   }
 

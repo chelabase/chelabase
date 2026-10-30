@@ -2,6 +2,7 @@
 // `@ts-expect-error` must fire; an unused one is itself an error.
 import { expectTypeOf } from "vitest";
 import { type Client, createClient, type DatabaseShape, type Int8, type Json } from "./index.ts";
+import { createServerClient } from "./server.ts";
 import { type Database, types } from "./test-db.ts";
 
 const opts = { url: "http://localhost:8000", key: "chk_pub_x" };
@@ -284,3 +285,23 @@ expectTypeOf<Parameters<typeof plainDb.auth.signUp>[0]["data"]>().toEqualTypeOf<
 createClient({ ...opts, accessToken: () => "t" });
 // @ts-expect-error accessToken replaces the session storage
 createClient({ ...opts, accessToken: () => "t", auth: {} });
+
+// --- createServerClient: `cookies` is required; query types match `createClient`
+const cookies = { getAll: () => [], setAll: () => {} };
+const srv = createServerClient<Database>({ ...opts, cookies, types });
+expectTypeOf(srv).toEqualTypeOf<Client<Database, false>>();
+expectTypeOf(srv).toEqualTypeOf(db);
+expectTypeOf(createServerClient<Database>({ ...opts, cookies, bigint: true, types })).toEqualTypeOf(big);
+expectTypeOf(createServerClient({ ...opts, cookies })).toEqualTypeOf<Client<DatabaseShape, false>>();
+createServerClient({ ...opts, cookies: { getAll: () => [{ name: "a", value: "b" }] } });
+createServerClient({ ...opts, cookies: { getAll: () => [], setAll: async () => {} }, cookieOptions: { sameSite: "strict" } });
+// @ts-expect-error the session lives in cookies
+createServerClient(opts);
+// @ts-expect-error a generated Database needs its types
+createServerClient<Database>({ ...opts, cookies });
+// @ts-expect-error bigint: true needs the generated types
+createServerClient<Database>({ ...opts, cookies, bigint: true });
+// @ts-expect-error the server client has no browser session options
+createServerClient({ ...opts, cookies, auth: {} });
+// @ts-expect-error nor a caller-owned token
+createServerClient({ ...opts, cookies, accessToken: () => "t" });
