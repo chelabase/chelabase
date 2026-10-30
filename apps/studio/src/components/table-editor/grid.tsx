@@ -111,6 +111,8 @@ export interface GridProps {
   overlay?: (geometry: PresenceGeometry) => ReactNode;
   /** The groups of a body cell's context menu; without it, a right-click leaves the browser's own menu. */
   cellMenu?: (cell: CellMenuTarget) => CellMenuGroups;
+  /** After the last row ("Add row"): outside the grid's cells and keys, held at the left when it scrolls sideways. */
+  footer?: ReactNode;
 }
 
 /** The body cell a context menu opened on. */
@@ -1103,6 +1105,7 @@ export function Grid(props: GridProps) {
       />
       </ContextMenu.Root>
       </div>
+      {props.footer && <div className="sticky left-0 w-fit p-2">{props.footer}</div>}
     </div>
   );
 }

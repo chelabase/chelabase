@@ -12,7 +12,7 @@ import {
   type BranchDatabaseView,
   type ObjectSummary,
 } from "@chelabase/management-client";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Menu, MenuItem } from "@/components/ui/menu";
 import { OwnerPasswordNotice } from "@/components/owner-password-notice";
@@ -1094,6 +1094,18 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
             editNotice={(key, column) => editingNotice(members, selfSub, key, column)}
             onPresence={joinable ? onPresence : undefined}
             overlay={joinable ? (geometry) => <PresenceLayer members={members} selfSub={selfSub} rowKeys={keys} geometry={geometry} selfCell={selfCell} /> : undefined}
+            footer={
+              writable && (
+                <button
+                  type="button"
+                  onClick={() => openPanel("row", { row: null })}
+                  className="flex h-7 items-center gap-1 border border-input bg-channel px-2 text-[13px] whitespace-nowrap text-chalk outline-none hover:border-sand focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-sand disabled:cursor-default disabled:opacity-50 disabled:hover:border-input"
+                >
+                  <Plus aria-hidden="true" size={14} strokeWidth={1.5} />
+                  Add row
+                </button>
+              )
+            }
           />
       )}
       {conflict && (
