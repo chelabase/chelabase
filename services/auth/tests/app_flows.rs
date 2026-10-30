@@ -928,8 +928,23 @@ async fn refresh_faults_are_unavailable_not_invalid() {
     assert_eq!(code(&a), "refresh_token_invalid");
 }
 
+/// What the orchestrator answers a peek with (#59).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Peek {
+    /// The fake's own answer from the session: its user (the token is current or in grace).
+    Live,
+    Invalid401,
+    Reused401,
+    Bare401,
+    NotFound404,
+    Unprocessable422,
+    Internal500,
+    /// A 200 with no body: no session, no user.
+    Empty200,
+}
+
 /// What the orchestrator answers a refresh with.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Orch {
     Rotated,
     Grace,
@@ -942,7 +957,7 @@ enum Orch {
 }
 
 /// What Zitadel answers the user lookup with.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Zit {
     Active,
     Inactive,
@@ -960,39 +975,251 @@ enum Zit {
     Malformed200,
 }
 
-/// #57: the invariant on `refresh`, as a model. Only a definitive verdict ends a session: the
-/// orchestrator's 401 `refresh_token_invalid`/`refresh_token_reused`, Zitadel's 404 or a user
-/// of another org, or an inactive user. Anything else is 503 `unavailable` and revokes nothing.
-/// Returns the status, the error code (`""` on success) and whether auth revokes the session.
-fn refresh_model(o: Orch, z: Zit) -> (StatusCode, &'static str, bool) {
-    let down = (StatusCode::SERVICE_UNAVAILABLE, "unavailable", false);
-    match o {
-        Orch::Invalid401 => (StatusCode::UNAUTHORIZED, "refresh_token_invalid", false),
-        Orch::Reused401 => (StatusCode::UNAUTHORIZED, "refresh_token_reused", false),
-        Orch::Bare401 | Orch::NotFound404 | Orch::Unprocessable422 | Orch::Internal500 => down,
-        Orch::Rotated | Orch::Grace => match z {
-            Zit::Active => (StatusCode::OK, "", false),
-            Zit::Inactive => (StatusCode::FORBIDDEN, "user_inactive", true),
-            Zit::OtherOrg | Zit::NotFound404 => {
-                (StatusCode::UNAUTHORIZED, "refresh_token_invalid", true)
-            }
-            Zit::Html404
-            | Zit::Internal500
-            | Zit::Empty200
-            | Zit::NoUserId200
-            | Zit::NoOrg200
-            | Zit::OtherUser200
-            | Zit::Malformed200 => down,
+/// What a refresh does, as the client and the orchestrator see it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Outcome {
+    status: StatusCode,
+    /// The error code, `""` on success.
+    code: &'static str,
+    /// Auth revoked the session.
+    revoke: bool,
+    /// Auth asked the orchestrator to refresh (rotate) the token.
+    refresh: bool,
+}
+
+/// #57's invariant on `refresh`, as a model, with #59's peek in front. Only a definitive verdict
+/// ends a session: the orchestrator's 401 `refresh_token_invalid`/`refresh_token_reused`,
+/// Zitadel's 404 or a user of another org, or an inactive user. Anything else is 503
+/// `unavailable` and revokes nothing. A peek that finds the token's user checks that user in
+/// Zitadel before anything rotates, so a Zitadel fault never follows a rotation; a peek
+/// verdict goes on to `refresh`, which applies the orchestrator's own rules, as before #59.
+fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
+    let answer = |status, code, revoke, refresh| Outcome {
+        status,
+        code,
+        revoke,
+        refresh,
+    };
+    let down = |refresh| {
+        answer(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            false,
+            refresh,
+        )
+    };
+    // The user check, `Ok` when the user may refresh.
+    let user = || match z {
+        Zit::Active => Ok(()),
+        Zit::Inactive => Err((StatusCode::FORBIDDEN, "user_inactive", true)),
+        Zit::OtherOrg | Zit::NotFound404 => {
+            Err((StatusCode::UNAUTHORIZED, "refresh_token_invalid", true))
+        }
+        Zit::Html404
+        | Zit::Internal500
+        | Zit::Empty200
+        | Zit::NoUserId200
+        | Zit::NoOrg200
+        | Zit::OtherUser200
+        | Zit::Malformed200 => Err((StatusCode::SERVICE_UNAVAILABLE, "unavailable", false)),
+    };
+    // The refresh call: `Ok` when it rotated or answered the grace.
+    let rotate = || match o {
+        Orch::Rotated | Orch::Grace => Ok(()),
+        Orch::Invalid401 => Err(answer(
+            StatusCode::UNAUTHORIZED,
+            "refresh_token_invalid",
+            false,
+            true,
+        )),
+        Orch::Reused401 => Err(answer(
+            StatusCode::UNAUTHORIZED,
+            "refresh_token_reused",
+            false,
+            true,
+        )),
+        Orch::Bare401 | Orch::NotFound404 | Orch::Unprocessable422 | Orch::Internal500 => {
+            Err(down(true))
+        }
+    };
+    match p {
+        Peek::Bare401
+        | Peek::NotFound404
+        | Peek::Unprocessable422
+        | Peek::Internal500
+        | Peek::Empty200 => down(false),
+        Peek::Live => match user() {
+            Err((status, code, revoke)) => answer(status, code, revoke, false),
+            Ok(()) => match rotate() {
+                Ok(()) => answer(StatusCode::OK, "", false, true),
+                Err(refused) => refused,
+            },
+        },
+        // As before #59: refresh, then the user of a token it accepted.
+        Peek::Invalid401 | Peek::Reused401 => match rotate() {
+            Err(refused) => refused,
+            Ok(()) => match user() {
+                Ok(()) => answer(StatusCode::OK, "", false, true),
+                Err((status, code, revoke)) => answer(status, code, revoke, true),
+            },
         },
     }
 }
 
-/// #57: every orchestrator answer against every Zitadel answer (8 x 11), checked against
-/// [`refresh_model`]: the answer the client sees, and whether a revoke call was made.
-#[tokio::test]
+/// One case of the matrix: the first refresh against the model, and, when it answered 503,
+/// a retry with the same token once every fault is over and (for a current token) the grace
+/// has ended, as after a long outage (#59). Returns what differs from the model.
+async fn refresh_case(p: Peek, o: Orch, z: Zit) -> Option<String> {
+    use Orch as O;
+    use Zit as Z;
+    let h = harness().await;
+    let user = match z {
+        // No such user in the mock: its lookup is a real 404.
+        Z::NotFound404 => Uuid::new_v4(),
+        _ => h.add_user("ada@example.com", true).parse().unwrap(),
+    };
+    let get = format!("GET /v2/users/{user}");
+    match z {
+        Z::Active | Z::NotFound404 => {}
+        Z::Inactive => h.set_user(&user.to_string(), |u| u.inactive = true),
+        Z::OtherOrg => h.set_user(&user.to_string(), |u| u.org_id = "other".into()),
+        Z::Html404 => h.mock.answer_raw(&get, 404, "<html>not found</html>", 1),
+        Z::Internal500 => h.mock.fail(&get, 500, "Errors.Internal", 1),
+        Z::Empty200 => h.mock.answer_raw(&get, 200, "", 1),
+        Z::NoUserId200 => h.mock.answer_raw(
+            &get,
+            200,
+            r#"{"user": {"state": "USER_STATE_ACTIVE", "details": {"resourceOwner": "o"}}}"#,
+            1,
+        ),
+        Z::NoOrg200 => h.mock.answer_raw(
+            &get,
+            200,
+            &format!(r#"{{"user": {{"userId": "{user}", "state": "USER_STATE_ACTIVE"}}}}"#),
+            1,
+        ),
+        Z::OtherUser200 => {
+            let other = Uuid::new_v4();
+            let org = h.org();
+            h.mock.answer_raw(
+                &get,
+                200,
+                &format!(
+                    r#"{{"user": {{"userId": "{other}", "state": "USER_STATE_INACTIVE", "details": {{"resourceOwner": "{org}"}}}}}}"#
+                ),
+                1,
+            )
+        }
+        Z::Malformed200 => h.mock.answer_raw(&get, 200, r#"{"user": {"userId""#, 1),
+    }
+    let grace = o == O::Grace;
+    let (sid, token) = h.internal.add_session(h.project, user, grace);
+    let current = h.internal.session(sid).unwrap().token;
+    let refused = |status, code| h.internal.set_refresh_answer(status, code);
+    match o {
+        O::Rotated | O::Grace => {}
+        O::Invalid401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_invalid")),
+        O::Reused401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_reused")),
+        O::Bare401 => refused(StatusCode::UNAUTHORIZED, None),
+        O::NotFound404 => refused(StatusCode::NOT_FOUND, None),
+        O::Unprocessable422 => refused(StatusCode::UNPROCESSABLE_ENTITY, None),
+        O::Internal500 => refused(StatusCode::INTERNAL_SERVER_ERROR, Some("internal")),
+    }
+    let peeked = |status, code| h.internal.set_peek_answer(status, code);
+    match p {
+        Peek::Live => {}
+        Peek::Invalid401 => peeked(StatusCode::UNAUTHORIZED, Some("refresh_token_invalid")),
+        Peek::Reused401 => peeked(StatusCode::UNAUTHORIZED, Some("refresh_token_reused")),
+        Peek::Bare401 => peeked(StatusCode::UNAUTHORIZED, None),
+        Peek::NotFound404 => peeked(StatusCode::NOT_FOUND, None),
+        Peek::Unprocessable422 => peeked(StatusCode::UNPROCESSABLE_ENTITY, None),
+        Peek::Internal500 => peeked(StatusCode::INTERNAL_SERVER_ERROR, Some("internal")),
+        Peek::Empty200 => peeked(StatusCode::OK, None),
+    }
+    let refresh_calls = || h.internal.count("POST /internal/app/sessions/refresh");
+    let a = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    let revoked = h
+        .internal
+        .calls()
+        .iter()
+        .any(|(call, _)| call.contains("revoke"));
+    let after = h.internal.session(sid).unwrap();
+    // (status, code, a revoke call was made, a refresh call was made, the session is revoked)
+    let got = (
+        a.status,
+        code(&a),
+        revoked,
+        refresh_calls() > 0,
+        after.revoked,
+    );
+    let want = refresh_model(p, o, z);
+    let want_tuple = (
+        want.status,
+        want.code,
+        want.revoke,
+        want.refresh,
+        want.revoke,
+    );
+    if got != want_tuple {
+        return Some(format!(
+            "{p:?} x {o:?} x {z:?}: got {got:?}, want {want_tuple:?}: {}",
+            a.body
+        ));
+    }
+    if !want.refresh && after.token != current {
+        return Some(format!(
+            "{p:?} x {o:?} x {z:?}: rotated without a refresh call"
+        ));
+    }
+    // Only a peek verdict followed by a rotation (an orchestrator that contradicts itself)
+    // rotates before the user check; its token is the previous one now and may not outlive
+    // the grace.
+    if want.status != StatusCode::SERVICE_UNAVAILABLE || (want.refresh && o == O::Rotated) {
+        return None;
+    }
+    // The faults are over; a client that held a current token retries after the grace.
+    h.internal.clear_answers();
+    h.mock.inner.lock().unwrap().faults.clear();
+    if !grace {
+        h.internal.end_grace();
+    }
+    let healthy = match z {
+        Z::Active | Z::Inactive | Z::OtherOrg | Z::NotFound404 => z,
+        _ => Z::Active,
+    };
+    let natural = if grace { O::Grace } else { O::Rotated };
+    let want = refresh_model(Peek::Live, natural, healthy);
+    let b = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    let got = (b.status, code(&b), h.internal.session(sid).unwrap().revoked);
+    let want = (want.status, want.code, want.revoke);
+    (got != want).then(|| {
+        format!(
+            "{p:?} x {o:?} x {z:?}, retried later: got {got:?}, want {want:?}: {}",
+            b.body
+        )
+    })
+}
+
+/// #57, #59: every peek answer against every refresh answer against every Zitadel answer
+/// (8 x 8 x 11), checked against [`refresh_model`], each 503 followed by a later retry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
     use Orch as O;
     use Zit as Z;
+    let peeks = [
+        Peek::Live,
+        Peek::Invalid401,
+        Peek::Reused401,
+        Peek::Bare401,
+        Peek::NotFound404,
+        Peek::Unprocessable422,
+        Peek::Internal500,
+        Peek::Empty200,
+    ];
     let orchs = [
         O::Rotated,
         O::Grace,
@@ -1016,93 +1243,130 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         Z::OtherUser200,
         Z::Malformed200,
     ];
-    let mut wrong = Vec::new();
-    for o in orchs {
-        for z in zits {
-            let h = harness().await;
-            let user = match z {
-                // No such user in the mock: its lookup is a real 404.
-                Z::NotFound404 => Uuid::new_v4(),
-                _ => h.add_user("ada@example.com", true).parse().unwrap(),
-            };
-            let get = format!("GET /v2/users/{user}");
-            match z {
-                Z::Active | Z::NotFound404 => {}
-                Z::Inactive => h.set_user(&user.to_string(), |u| u.inactive = true),
-                Z::OtherOrg => h.set_user(&user.to_string(), |u| u.org_id = "other".into()),
-                Z::Html404 => h.mock.answer_raw(&get, 404, "<html>not found</html>", 1),
-                Z::Internal500 => h.mock.fail(&get, 500, "Errors.Internal", 1),
-                Z::Empty200 => h.mock.answer_raw(&get, 200, "", 1),
-                Z::NoUserId200 => h.mock.answer_raw(
-                    &get,
-                    200,
-                    r#"{"user": {"state": "USER_STATE_ACTIVE", "details": {"resourceOwner": "o"}}}"#,
-                    1,
-                ),
-                Z::NoOrg200 => h.mock.answer_raw(
-                    &get,
-                    200,
-                    &format!(r#"{{"user": {{"userId": "{user}", "state": "USER_STATE_ACTIVE"}}}}"#),
-                    1,
-                ),
-                Z::OtherUser200 => {
-                    let other = Uuid::new_v4();
-                    let org = h.org();
-                    h.mock.answer_raw(
-                        &get,
-                        200,
-                        &format!(
-                            r#"{{"user": {{"userId": "{other}", "state": "USER_STATE_INACTIVE", "details": {{"resourceOwner": "{org}"}}}}}}"#
-                        ),
-                        1,
-                    )
+    let total = peeks.len() * orchs.len() * zits.len();
+    // One task per peek answer; each runs its cases in turn.
+    let tasks: Vec<_> = peeks
+        .into_iter()
+        .map(|p| {
+            tokio::spawn(async move {
+                let mut wrong = Vec::new();
+                for o in orchs {
+                    for z in zits {
+                        wrong.extend(refresh_case(p, o, z).await);
+                    }
                 }
-                Z::Malformed200 => h.mock.answer_raw(&get, 200, r#"{"user": {"userId""#, 1),
-            }
-            let (sid, token) = h
-                .internal
-                .add_session(h.project, user, matches!(o, O::Grace));
-            let refused = |status, code| h.internal.set_refresh_answer(status, code);
-            match o {
-                O::Rotated | O::Grace => {}
-                O::Invalid401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_invalid")),
-                O::Reused401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_reused")),
-                O::Bare401 => refused(StatusCode::UNAUTHORIZED, None),
-                O::NotFound404 => refused(StatusCode::NOT_FOUND, None),
-                O::Unprocessable422 => refused(StatusCode::UNPROCESSABLE_ENTITY, None),
-                O::Internal500 => refused(StatusCode::INTERNAL_SERVER_ERROR, Some("internal")),
-            }
-            let a = h
-                .post("refresh", json!({"refresh_token": token}), None)
-                .await;
-            let revoked = h
-                .internal
-                .calls()
-                .iter()
-                .any(|(call, _)| call.contains("revoke"));
-            // (status, code, a revoke call was made, the session is revoked)
-            let got = (
-                a.status,
-                code(&a),
-                revoked,
-                h.internal.session(sid).unwrap().revoked,
-            );
-            let (status, code, revoke) = refresh_model(o, z);
-            let want = (status, code, revoke, revoke);
-            if got != want {
-                wrong.push(format!(
-                    "{o:?} x {z:?}: got {got:?}, want {want:?}: {}",
-                    a.body
-                ));
-            }
-        }
+                wrong
+            })
+        })
+        .collect();
+    let mut wrong = Vec::new();
+    for task in tasks {
+        wrong.extend(task.await.unwrap());
     }
     assert!(
         wrong.is_empty(),
-        "{} of 88 cases differ from the model:\n{}",
+        "{} of {total} cases differ from the model:\n{}",
         wrong.len(),
         wrong.join("\n")
     );
+}
+
+/// #59: Zitadel is down for a minute while a user's access token expires. The refreshes during
+/// the outage answer 503 and rotate nothing, so the token the client holds still works after
+/// it, long past the 10 s grace.
+#[tokio::test]
+async fn refresh_survives_a_zitadel_outage() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let token = s.body["refresh_token"].clone();
+    let held = h.internal.session(sid).unwrap().token;
+    h.mock.set_down(true);
+    for _ in 0..3 {
+        let a = h
+            .post("refresh", json!({"refresh_token": token}), None)
+            .await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
+        assert_eq!(code(&a), "unavailable");
+        // The orchestrator saw a peek but no rotation.
+        assert_eq!(h.internal.count("POST /internal/app/sessions/refresh"), 0);
+        assert_eq!(
+            h.internal.session(sid).unwrap().token,
+            held,
+            "nothing rotated"
+        );
+        h.internal.end_grace();
+    }
+    assert_eq!(h.internal.count("POST /internal/app/sessions/peek"), 3);
+    h.mock.set_down(false);
+    let a = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_ne!(a.body["refresh_token"], token);
+    assert!(!h.internal.session(sid).unwrap().revoked);
+}
+
+/// #59: a Zitadel fault after peek found the user leaves the session's current token as it
+/// was, for every kind of fault; a later refresh with it still works.
+#[tokio::test]
+async fn refresh_zitadel_fault_rotates_nothing() {
+    let h = harness().await;
+    let user = h.add_user("ada@example.com", true);
+    let get = format!("GET /v2/users/{user}");
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let token = s.body["refresh_token"].clone();
+    let held = h.internal.session(sid).unwrap().token;
+    h.mock.fail(&get, 500, "Errors.Internal", 1);
+    h.mock.answer_raw(&get, 200, "", 1);
+    h.mock.answer_raw(&get, 404, "<html>not found</html>", 1);
+    for _ in 0..3 {
+        let a = h
+            .post("refresh", json!({"refresh_token": token}), None)
+            .await;
+        assert_eq!(
+            (a.status, code(&a)),
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+            "{}",
+            a.body
+        );
+    }
+    assert_eq!(h.internal.count("POST /internal/app/sessions/peek"), 3);
+    assert_eq!(h.internal.count("POST /internal/app/sessions/refresh"), 0);
+    assert_eq!(h.internal.session(sid).unwrap().token, held);
+    h.internal.end_grace();
+    let a = h
+        .post("refresh", json!({"refresh_token": token}), None)
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+}
+
+/// #59: a deactivated user is refused as before when Zitadel answers, and the check comes
+/// before any rotation.
+#[tokio::test]
+async fn refresh_refuses_a_deactivated_user_before_rotating() {
+    let h = harness().await;
+    let user = h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    h.set_user(&user, |u| u.inactive = true);
+    let a = h
+        .post(
+            "refresh",
+            json!({"refresh_token": s.body["refresh_token"]}),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (a.status, code(&a)),
+        (StatusCode::FORBIDDEN, "user_inactive"),
+        "{}",
+        a.body
+    );
+    assert!(h.internal.session(sid).unwrap().revoked);
+    assert_eq!(h.internal.count("POST /internal/app/sessions/refresh"), 0);
 }
 
 #[tokio::test]

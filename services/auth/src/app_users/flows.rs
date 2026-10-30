@@ -1042,7 +1042,7 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     }
 }
 
-/// Rotates the refresh token and re-reads the user.
+/// Checks the token's user, then rotates the refresh token.
 ///
 /// Invariant (#57): clients drop their cookies on `refresh_token_invalid`,
 /// `refresh_token_reused` and `user_inactive`, so a refresh revokes the session or answers one
@@ -1050,20 +1050,41 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
 /// `refresh_token_reused`, Zitadel's definite "no such user" (a 404) or a user of another org,
 /// or an inactive user. Every other upstream outcome (any other orchestrator status or code,
 /// a Zitadel 5xx or other refusal, a timeout, an unreadable or partial success answer) answers
-/// 503 `unavailable` and revokes nothing. `refresh_ends_a_session_only_on_a_definitive_verdict`
-/// in `tests/app_flows.rs` checks every pair against a model of this.
+/// 503 `unavailable` and revokes nothing.
+///
+/// And (#59): nothing rotates before the user check. The orchestrator's peek names the token's
+/// user without writing; only once Zitadel has answered for that user does `refresh` rotate.
+/// A fault anywhere before the rotation leaves the client's token current, so it can retry at
+/// any time, not only within the 10 s grace. A peek verdict goes on to `refresh`, so the
+/// orchestrator applies its own rules (it revokes on reuse); a user that `refresh` names but
+/// peek didn't is checked after it, as before #59.
+/// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
+/// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     let app = app(s);
     rate_limit(s, caller, &[("refresh", "ip", &caller.ip, 120, MINUTE)])?;
     let info = branch_info(app, caller).await?;
-    let refreshed = match app
-        .internal
-        .refresh(&RefreshRequest {
-            project_id: info.project_id,
-            refresh_token: b.refresh_token,
-        })
-        .await
-    {
+    let request = RefreshRequest {
+        project_id: info.project_id,
+        refresh_token: b.refresh_token,
+    };
+    let peeked = match app.internal.peek(&request).await {
+        Ok(p) => Some(p),
+        Err(InternalError::Refused { status: 401, code })
+            if code == "refresh_token_invalid" || code == "refresh_token_reused" =>
+        {
+            None
+        }
+        Err(e) => return Err(internal_down(&e)),
+    };
+    let checked = match peeked {
+        Some(p) => Some((
+            p.user_id,
+            current_user(s, &info, p.user_id, p.session_id).await?,
+        )),
+        None => None,
+    };
+    let refreshed = match app.internal.refresh(&request).await {
         Ok(r) => r,
         Err(InternalError::Refused { status: 401, code }) if code == "refresh_token_reused" => {
             return Err(fail(
@@ -1084,18 +1105,41 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         }
         Err(e) => return Err(internal_down(&e)),
     };
+    let current = match checked {
+        Some((user, current)) if user == refreshed.user_id => current,
+        // Peek gave a verdict that refresh then didn't, or named someone else: check the user
+        // `refresh` answered for.
+        _ => current_user(s, &info, refreshed.user_id, refreshed.session_id).await?,
+    };
+    let session = session_response(
+        app,
+        info.project_id,
+        refreshed.session_id,
+        refreshed.refresh_token,
+        view(refreshed.user_id, &current),
+    )?;
+    Ok(Json(session).into_response())
+}
+
+/// The session's user as Zitadel has it now, when they may still refresh. Revokes the session
+/// and answers 401 `refresh_token_invalid` when Zitadel definitely has no such user (a 404) or
+/// they belong to another org, and 403 `user_inactive` when inactive; any Zitadel fault
+/// answers 503 and revokes nothing.
+async fn current_user(
+    s: &AppState,
+    info: &AppBranchInfo,
+    user_id: Uuid,
+    session_id: Uuid,
+) -> Flow<ZUser> {
+    let app = app(s);
     let revoke = || async {
-        if let Err(e) = app
-            .internal
-            .revoke(refreshed.session_id, info.project_id)
-            .await
-        {
+        if let Err(e) = app.internal.revoke(session_id, info.project_id).await {
             warn!(error = %e, "revoking the app session failed");
         }
     };
     // `None` is a definite 404; an unreadable answer is an error (503), never "gone".
-    let current = match s.zitadel.get_user(&refreshed.user_id.to_string()).await {
-        Ok(Some(u)) if u.org_id == org(&info) => u,
+    let current = match s.zitadel.get_user(&user_id.to_string()).await {
+        Ok(Some(u)) if u.org_id == org(info) => u,
         Ok(_) => {
             revoke().await;
             return Err(fail(
@@ -1110,14 +1154,7 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         revoke().await;
         return Err(fail(403, ErrorCode::UserInactive, text::INACTIVE));
     }
-    let session = session_response(
-        app,
-        info.project_id,
-        refreshed.session_id,
-        refreshed.refresh_token,
-        view(refreshed.user_id, &current),
-    )?;
-    Ok(Json(session).into_response())
+    Ok(current)
 }
 
 async fn sign_out(s: &AppState, caller: &AppCaller, b: AppSignOutBody) -> Flow {
