@@ -22,7 +22,7 @@ mod schema_bases;
 pub mod teams;
 pub use app_users::{
     AppSession, AppUsersStatus, BeginEnable, BranchAuthSync, NewAppSession, NewProjectAuth, OnDelete,
-    ProjectAuth, RefreshNext, RefreshOutcome,
+    PeekOutcome, ProjectAuth, RefreshNext, RefreshOutcome,
 };
 pub use projects::{
     BeginProjectDelete, ProjectRecord, ProjectStatus, RenameProject, slug_base, valid_project_name,
