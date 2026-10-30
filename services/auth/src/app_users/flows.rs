@@ -1053,11 +1053,21 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
 /// 503 `unavailable` and revokes nothing.
 ///
 /// And (#59): nothing rotates before the user check. The orchestrator's peek names the token's
-/// user without writing; only once Zitadel has answered for that user does `refresh` rotate.
-/// A fault anywhere before the rotation leaves the client's token current, so it can retry at
-/// any time, not only within the 10 s grace. A peek verdict goes on to `refresh`, so the
-/// orchestrator applies its own rules (it revokes on reuse); a user that `refresh` names but
-/// peek didn't is checked after it, as before #59.
+/// user without writing, and says whether the token is the current one or the previous one
+/// inside its 10 s grace.
+/// - A current token: Zitadel is asked about the user first, and only then does `refresh`
+///   rotate. A fault before the rotation (peek, Zitadel, or the lookup taking longer than
+///   [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP)) answers 503 and leaves the token the client holds current, so
+///   a later retry with it works, however late, unless another request rotates it meanwhile.
+/// - A grace token goes to `refresh` first, then the user is checked, as before #59: its
+///   grace answer writes nothing, and holding it through a slow Zitadel could outlast the
+///   grace and turn it into reuse (#59 audit B1). A fault after that answers 503; the client
+///   keeps a grace token, which works again only until its grace ends.
+/// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
+///   revokes on reuse); a user that `refresh` names but peek didn't check is checked after it.
+///
+/// The lookup bound keeps a request that peeked a current token just before a parallel one
+/// rotated it inside that rotation's grace when it reaches `refresh`.
 /// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
 /// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
@@ -1078,11 +1088,11 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         Err(e) => return Err(internal_down(&e)),
     };
     let checked = match peeked {
-        Some(p) => Some((
+        Some(p) if !p.grace => Some((
             p.user_id,
             current_user(s, &info, p.user_id, p.session_id).await?,
         )),
-        None => None,
+        _ => None,
     };
     let refreshed = match app.internal.refresh(&request).await {
         Ok(r) => r,
@@ -1107,8 +1117,8 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     };
     let current = match checked {
         Some((user, current)) if user == refreshed.user_id => current,
-        // Peek gave a verdict that refresh then didn't, or named someone else: check the user
-        // `refresh` answered for.
+        // A grace token, a peek verdict that refresh then didn't give, or another user: check
+        // the user `refresh` answered for.
         _ => current_user(s, &info, refreshed.user_id, refreshed.session_id).await?,
     };
     let session = session_response(
@@ -1123,8 +1133,8 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
 
 /// The session's user as Zitadel has it now, when they may still refresh. Revokes the session
 /// and answers 401 `refresh_token_invalid` when Zitadel definitely has no such user (a 404) or
-/// they belong to another org, and 403 `user_inactive` when inactive; any Zitadel fault
-/// answers 503 and revokes nothing.
+/// they belong to another org, and 403 `user_inactive` when inactive; any Zitadel fault,
+/// including no answer within [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP), answers 503 and revokes nothing.
 async fn current_user(
     s: &AppState,
     info: &AppBranchInfo,
@@ -1138,7 +1148,11 @@ async fn current_user(
         }
     };
     // `None` is a definite 404; an unreadable answer is an error (503), never "gone".
-    let current = match s.zitadel.get_user(&user_id.to_string()).await {
+    let id = user_id.to_string();
+    let answer = tokio::time::timeout(app.refresh_user_lookup, s.zitadel.get_user(&id))
+        .await
+        .unwrap_or_else(|_| Err(ZError::Unavailable("the user lookup timed out".into())));
+    let current = match answer {
         Ok(Some(u)) if u.org_id == org(info) => u,
         Ok(_) => {
             revoke().await;

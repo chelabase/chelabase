@@ -165,7 +165,9 @@ async fn peek(State(s): S, Json(b): Json<Value>) -> Response {
         Some((sid, _, false)) if st.sessions[&sid].grace_over => {
             error(StatusCode::UNAUTHORIZED, "refresh_token_reused")
         }
-        Some((sid, user, _)) => Json(json!({"session_id": sid, "user_id": user})).into_response(),
+        Some((sid, user, current)) => {
+            Json(json!({"session_id": sid, "user_id": user, "grace": !current})).into_response()
+        }
     }
 }
 
