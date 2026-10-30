@@ -1366,18 +1366,22 @@ async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
             .send()
     };
 
-    for (server_key, client_ip, want) in [
-        (secret.as_str(), "203.0.113.9", "203.0.113.9"),
-        (secret.as_str(), "2001:db8::1", "2001:db8::1"),
-        (other_project.as_str(), "203.0.113.9", "127.0.0.1"),
-        (public.as_str(), "203.0.113.9", "127.0.0.1"),
-        (secret.as_str(), "203.0.113.9:443", "127.0.0.1"),
+    // `None`: the header is ignored and auth sees the loopback peer.
+    for (server_key, client_ip, vouched) in [
+        (secret.as_str(), "203.0.113.9", Some("203.0.113.9")),
+        (secret.as_str(), "2001:db8::1", Some("2001:db8::1")),
+        (other_project.as_str(), "203.0.113.9", None),
+        (public.as_str(), "203.0.113.9", None),
+        (secret.as_str(), "203.0.113.9:443", None),
     ] {
         *seen.lock().unwrap() = None;
         let resp = sign_in(server_key, client_ip).await.unwrap();
         assert_eq!(resp.status(), 200, "{client_ip}");
         let saw = seen.lock().unwrap().clone().expect("auth was called");
-        assert_eq!(saw["x-forwarded-for"], want, "{client_ip}");
+        match vouched {
+            Some(ip) => assert_eq!(saw["x-forwarded-for"], ip, "{client_ip}"),
+            None => assert_eq!(saw["x-forwarded-for"], "127.0.0.1", "{client_ip}"),
+        }
         assert!(!saw.contains_key("chelabase-server-key"), "the secret key must not reach auth");
         assert!(!saw.contains_key("chelabase-client-ip"));
         assert!(!saw.contains_key("authorization"));
