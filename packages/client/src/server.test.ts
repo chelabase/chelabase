@@ -419,6 +419,32 @@ describe("createServerClient", () => {
   });
 });
 
+describe("ambiguous cookies", () => {
+  test("a_duplicated_session_cookie_is_no_session", async () => {
+    const access = jwt(nowSecs() + 60, 1);
+    for (const list of [
+      [
+        { name: ACCESS, value: jwt(nowSecs() + 60, 9, "attacker") },
+        { name: ACCESS, value: access },
+        { name: REFRESH, value: "rt1" },
+      ],
+      [
+        { name: ACCESS, value: stale() },
+        { name: REFRESH, value: "planted" },
+        { name: REFRESH, value: "rt1" },
+      ],
+    ]) {
+      const fetch = router({ "/auth/v1/app/refresh": () => ({ body: session(2) }), "/data/v1/query": () => ({ body: [] }) });
+      const writes: CookieToSet[][] = [];
+      const db = createServerClient({ url, key, fetch, cookies: { getAll: () => list, setAll: (l) => void writes.push(l) } });
+      await db.from("t").select("id");
+      expect(fetch.calls.map((c) => new URL(c.url).pathname)).toEqual(["/data/v1/query"]);
+      expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
+      expect(writes).toEqual([]);
+    }
+  });
+});
+
 describe("cookieOptions", () => {
   test("domain_is_validated_at_creation", () => {
     const cookies = jar().cookies;

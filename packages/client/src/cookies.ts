@@ -73,13 +73,20 @@ export function sessionCookies(
   ];
 }
 
-/** The session's tokens from a request's cookies: the exact configured names only. */
+/**
+ * The session's tokens from a request's cookies: the exact configured names only. A name sent
+ * more than once (a sibling subdomain planted its own under a longer path, which browsers list
+ * first) makes the session ambiguous: no session at all.
+ */
 export function readSession(
   list: { name: string; value: string }[],
   names: SessionCookieNames,
 ): { access: string | undefined; refresh: string | undefined } {
-  const get = (name: string) => list.find((c) => c.name === name)?.value || undefined;
-  return { access: get(names.access), refresh: get(names.refresh) };
+  const of = (name: string) => list.filter((c) => c.name === name);
+  const a = of(names.access);
+  const r = of(names.refresh);
+  if (a.length > 1 || r.length > 1) return { access: undefined, refresh: undefined };
+  return { access: a[0]?.value || undefined, refresh: r[0]?.value || undefined };
 }
 
 /** A `Set-Cookie` header value. */

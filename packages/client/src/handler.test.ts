@@ -394,4 +394,34 @@ describe("createAuthHandler", () => {
     expect(hdr(gw.calls[0]!, "chelabase-user")).toBeNull();
     expect(gw.calls[0]!.init.redirect).toBe("manual");
   });
+
+  test("duplicated_session_cookies_are_ambiguous", async () => {
+    // A sibling subdomain planted a same-named cookie under a longer path: it comes first.
+    const twice = (name: string, a: string, b: string) => `${name}=${a}; ${name}=${b}`;
+    const raw = (flow: string, cookie: string, body: unknown = {}) =>
+      new Request(`http://localhost:3000/api/chelabase/auth/${flow}`, {
+        method: "POST",
+        headers: { origin: siteUrl, "content-type": "application/json", cookie },
+        body: JSON.stringify(body),
+      });
+    const gw = gateway({
+      "/auth/v1/app/refresh": () => ({ body: session(2) }),
+      "/auth/v1/app/change-password": () => ({ body: session(2) }),
+      "/auth/v1/app/sign-out": () => ({ status: 204 }),
+    });
+    const h = handler(gw);
+    const dupRefresh = `${twice(REFRESH, "planted", "rt1")}; ${ACCESS}=at1`;
+    const dupAccess = `${twice(ACCESS, "planted", "at1")}; ${REFRESH}=rt1`;
+    for (const cookie of [dupRefresh, dupAccess]) {
+      const r1 = await h(raw("refresh", cookie));
+      expect(r1.status).toBe(401);
+      expect(r1.headers.getSetCookie()).toEqual([]);
+      const r2 = await h(raw("change-password", cookie, { current_password: "a", password: "b" }));
+      expect(r2.status).toBe(401);
+      const r3 = await h(raw("sign-out", cookie));
+      expect(r3.status).toBe(204);
+      expect(cleared(r3)).toBe(true);
+    }
+    expect(gw.calls).toHaveLength(0);
+  });
 });

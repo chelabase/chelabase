@@ -18,9 +18,21 @@ const routeSession = (access: string) => ({ access_token: access, token_type: "b
 
 /** `document.cookie` as the page sees it: readable cookies only, one per name. */
 const cookieJar = new Map<string, string>();
+/** Cookies a sibling subdomain planted under another path: same name, listed as well. */
+const planted: string[] = [];
+/** Every `document.cookie = …` line the client wrote. */
+const written: string[] = [];
 const fakeDocument = {
   get cookie() {
-    return [...cookieJar].map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join("; ");
+    return [...[...cookieJar].map(([k, v]) => `${k}=${encodeURIComponent(v)}`), ...planted].join("; ");
+  },
+  set cookie(line: string) {
+    written.push(line);
+    const [pair] = line.split(";");
+    const eq = pair!.indexOf("=");
+    const name = pair!.slice(0, eq);
+    if (/;\s*Max-Age=0(;|$)/i.test(line)) cookieJar.delete(name);
+    else cookieJar.set(name, decodeURIComponent(pair!.slice(eq + 1)));
   },
 };
 const store = new Map<string, string>();
@@ -33,6 +45,8 @@ const fakeLocalStorage = {
 beforeEach(() => {
   cookieJar.clear();
   store.clear();
+  planted.length = 0;
+  written.length = 0;
   cookieJar.set("other", "x");
   Object.assign(globalThis, { document: fakeDocument, localStorage: fakeLocalStorage });
 });
@@ -269,5 +283,73 @@ describe("createBrowserClient", () => {
       exports: Record<string, unknown>;
     };
     expect(pkg.exports["./browser"]).toBe("./src/browser.ts");
+  });
+
+  test("sign_out_with_the_route_down_still_drops_the_access_cookie", async () => {
+    const a1 = jwt(nowSecs() + 600, 1);
+    cookieJar.set(ACCESS, a1);
+    const fetch = Object.assign(
+      (async (input: string | URL | Request) => {
+        if (String(input).startsWith("/api/")) throw new TypeError("Failed to fetch");
+        return new Response("[]");
+      }) as typeof globalThis.fetch,
+    );
+    const db = createBrowserClient({ url, key, fetch });
+    await expect(db.auth.signOut()).rejects.toThrow(/Failed to fetch/);
+    expect(cookieJar.has(ACCESS)).toBe(false);
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/^__Host-chelabase\.chk_pub_0123\.access=; Path=\/; Max-Age=0; Secure; SameSite=Lax$/);
+    // A reload: a fresh client on the same document is anonymous.
+    const f2 = router({ [Q]: () => ({ body: [] }) });
+    await createBrowserClient({ url, key, fetch: f2 }).from("t").select("id");
+    expect(f2.paths()).toEqual([Q]);
+    expect(hdr(f2.calls[0]!, "chelabase-user")).toBeNull();
+  });
+
+  test("a_revoked_session_drops_the_access_cookie", async () => {
+    const a1 = jwt(nowSecs() + 600, 1);
+    // The plain name (`secure: false`), so the attributes written back differ too.
+    cookieJar.set("chelabase.chk_pub_0123.access", a1);
+    const fetch = router({ [Q]: (c) => (hdr(c, "chelabase-user") ? err(401, "user_session_revoked") : { body: [] }) });
+    const db = createBrowserClient({ url, key, fetch, cookieOptions: { secure: false } });
+    await expect(db.from("t").select("id")).rejects.toMatchObject({ code: "user_session_revoked" });
+    expect(cookieJar.has("chelabase.chk_pub_0123.access")).toBe(false);
+    expect(written[0]).toMatch(/^chelabase\.chk_pub_0123\.access=; Path=\/; Max-Age=0; SameSite=Lax$/);
+    const f2 = router({ [Q]: () => ({ body: [] }) });
+    await createBrowserClient({ url, key, fetch: f2, cookieOptions: { secure: false } }).from("t").select("id");
+    expect(hdr(f2.calls[0]!, "chelabase-user")).toBeNull();
+  });
+
+  test("a_revoked_answer_for_an_older_token_leaves_a_newer_cookie", async () => {
+    const a1 = jwt(nowSecs() + 600, 1);
+    const a2 = jwt(nowSecs() + 600, 2, "u2");
+    cookieJar.set(ACCESS, a1);
+    const fetch = router({
+      [Q]: (c) => {
+        if (hdr(c, "chelabase-user") === a1) {
+          cookieJar.set(ACCESS, a2); // another tab signed in meanwhile
+          return err(401, "user_session_revoked");
+        }
+        return { body: [] };
+      },
+    });
+    const db = createBrowserClient({ url, key, fetch });
+    await expect(db.from("t").select("id")).rejects.toMatchObject({ code: "user_session_revoked" });
+    expect(cookieJar.get(ACCESS)).toBe(a2);
+    expect(written).toEqual([]);
+    // And the newer session is taken up.
+    await db.from("t").select("id");
+    expect(hdr(fetch.calls[1]!, "chelabase-user")).toBe(a2);
+  });
+
+  test("a_duplicated_access_cookie_is_no_session", async () => {
+    const a1 = jwt(nowSecs() + 600, 1);
+    cookieJar.set(ACCESS, a1);
+    planted.push(`${ACCESS}=${jwt(nowSecs() + 600, 9, "attacker")}`);
+    const fetch = router({ [Q]: () => ({ body: [] }) });
+    const db = createBrowserClient({ url, key, fetch });
+    await db.from("t").select("id");
+    expect(fetch.paths()).toEqual([Q]);
+    expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
   });
 });
