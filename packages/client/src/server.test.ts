@@ -199,8 +199,8 @@ describe("createServerClient", () => {
   });
 
   test("invalid_refresh_clears_cookies_whose_access_token_is_long_dead", async () => {
-    // Missing, unreadable, or more than 60 s past its `exp`: cleared, so later pages don't refresh again.
-    for (const access of [undefined, "not-a-jwt", jwt(nowSecs() - 120, 0)]) {
+    // Missing, unreadable, or more than 5 min past its `exp`: cleared, so later pages don't refresh again.
+    for (const access of [undefined, "not-a-jwt", jwt(nowSecs() - 400, 0)]) {
       const fetch = router({
         "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid"),
         "/data/v1/query": () => ({ body: [] }),
@@ -221,14 +221,17 @@ describe("createServerClient", () => {
   });
 
   test("invalid_refresh_keeps_cookies_whose_access_token_expired_recently", async () => {
-    const fetch = router({
-      "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid"),
-      "/data/v1/query": () => ({ body: [] }),
-    });
-    const j = jar({ [ACCESS]: jwt(nowSecs() - 30, 0), [REFRESH]: "rt1" });
-    await createServerClient({ url, key, fetch, cookies: j.cookies }).from("t").select("id");
-    expect(j.writes).toEqual([]);
-    expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
+    // Within 5 min of its `exp` (clock skew between the app server and auth): kept.
+    for (const ago of [30, 240]) {
+      const fetch = router({
+        "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid"),
+        "/data/v1/query": () => ({ body: [] }),
+      });
+      const j = jar({ [ACCESS]: jwt(nowSecs() - ago, 0), [REFRESH]: "rt1" });
+      await createServerClient({ url, key, fetch, cookies: j.cookies }).from("t").select("id");
+      expect(j.writes, String(ago)).toEqual([]);
+      expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
+    }
   });
 
   test("late_invalid_after_a_rotation_keeps_the_newer_cookies", async () => {
