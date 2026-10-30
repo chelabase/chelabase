@@ -210,7 +210,7 @@ The gateway rate-limits sign-in (10 a minute) and refresh (120 a minute) per cli
 | Netlify | `x-nf-client-connection-ip` |
 | Your own reverse proxy | A header it overwrites on every request, such as `X-Real-IP $remote_addr` in nginx |
 
-A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it. `serverKey` and `clientIp` go together; creating a client with only one throws.
+Vercel overwrites these headers with the address it saw, so they only name your user when nothing else sits in front of Vercel. A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it. `serverKey` and `clientIp` go together; creating a client with only one throws.
 
 If your app runs from fixed addresses, there is an alternative: add them to `CHELABASE_GATEWAY_TRUSTED_PROXIES` on the gateway (see [Hosts](/docs/self-hosting/hosts)) and forward the user's address in `X-Forwarded-For`.
 
@@ -223,10 +223,11 @@ import { createServerClient } from "@chelabase/client/server";
 import { type Database, types } from "./db";
 // ---cut---
 export async function handle(req: Request): Promise<Response> {
-  const jar = new Map<string, string>();
+  // A list, not a map: a duplicated name must reach the client (see Cookies below).
+  let jar: { name: string; value: string }[] = [];
   for (const part of (req.headers.get("cookie") ?? "").split(";")) {
     const [name, ...rest] = part.trim().split("=");
-    if (name) jar.set(name, decodeURIComponent(rest.join("=")));
+    if (name) jar.push({ name, value: decodeURIComponent(rest.join("=")) });
   }
   const out: string[] = [];
   const db = createServerClient<Database>({
@@ -234,10 +235,10 @@ export async function handle(req: Request): Promise<Response> {
     key: "chk_pub_…",
     types,
     cookies: {
-      getAll: () => [...jar].map(([name, value]) => ({ name, value })),
+      getAll: () => jar,
       setAll(list) {
         for (const c of list) {
-          jar.set(c.name, c.value);
+          jar = [...jar.filter((j) => j.name !== c.name), { name: c.name, value: c.value }];
           out.push(
             `${c.name}=${encodeURIComponent(c.value)}; Path=/; Max-Age=${c.options.maxAge}; SameSite=Lax; Secure` +
               (c.options.httpOnly ? "; HttpOnly" : ""),
@@ -278,4 +279,5 @@ Both last 400 days; the server decides when the session ends. The `__Host-` pref
 `cookieOptions` changes them: `domain`, `sameSite` (`"lax"`, `"strict"` or `"none"`), `secure` and `maxAge` (seconds).
 
 - Setting `domain` drops the `__Host-` prefix, because the prefix forbids `Domain`. So does `secure: false`, which is for plain-HTTP development only. Prefer the default.
+- A session cookie name that appears twice is treated as no session: the handler and the browser client refuse to pick one, since a planted copy could sign the user into someone else's account. `createServerClient` can only see this if your `getAll()` returns every cookie, duplicates included; adapters that read cookies into a map keep one. This matters mainly once `domain` drops the `__Host-` prefix.
 - The auth handler, `createServerClient` and `createBrowserClient` must all get the same `cookieOptions`. They pick the cookie names from it. If one differs, a sign-in writes cookies the others don't read, and the user ends up signed out.
