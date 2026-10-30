@@ -31,8 +31,8 @@ pub struct FakeState {
     /// `(method path, body)` of every call, in order.
     pub calls: Vec<(String, Value)>,
     pub sessions: HashMap<Uuid, FakeSession>,
-    /// Answer refreshes with 401 and this code.
-    pub refresh_error: Option<String>,
+    /// Answer refreshes with this status and code; no code is a bare answer with no body.
+    pub refresh_error: Option<(StatusCode, Option<String>)>,
     pub next: u64,
     /// The sign-up gate's answer (`allowed`, `reason`); open when unset.
     pub signup: Option<(bool, String)>,
@@ -127,8 +127,11 @@ async fn create_session(State(s): S, Json(b): Json<Value>) -> Response {
 
 async fn refresh(State(s): S, Json(b): Json<Value>) -> Response {
     let mut st = s.lock().unwrap();
-    if let Some(code) = st.refresh_error.clone() {
-        return error(StatusCode::UNAUTHORIZED, &code);
+    if let Some((status, code)) = st.refresh_error.clone() {
+        return match code {
+            Some(code) => error(status, &code),
+            None => status.into_response(),
+        };
     }
     let project: Uuid = b["project_id"].as_str().unwrap().parse().unwrap();
     let token = b["refresh_token"].as_str().unwrap_or("");
@@ -341,6 +344,12 @@ impl FakeInternal {
     }
 
     pub fn set_refresh_error(&self, code: Option<&str>) {
-        self.inner.lock().unwrap().refresh_error = code.map(str::to_string);
+        self.inner.lock().unwrap().refresh_error =
+            code.map(|c| (StatusCode::UNAUTHORIZED, Some(c.to_string())));
+    }
+
+    /// Answer refreshes with `status` and `code`, or a bare `status` with no body.
+    pub fn set_refresh_answer(&self, status: StatusCode, code: Option<&str>) {
+        self.inner.lock().unwrap().refresh_error = Some((status, code.map(str::to_string)));
     }
 }
