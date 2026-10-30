@@ -17,7 +17,8 @@ use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chelabase_metadata::{
-    AppSession, BranchKind, BranchStatus, NewAppSession, ProjectStatus, RefreshNext, RefreshOutcome,
+    AppSession, BranchKind, BranchStatus, NewAppSession, PeekOutcome, ProjectStatus, RefreshNext,
+    RefreshOutcome,
 };
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_neon::ComputeLocator;
@@ -81,6 +82,7 @@ where
             get(branch_info::<M, L>),
         )
         .route("/internal/app/sessions", post(create_session::<M, L>))
+        .route("/internal/app/sessions/peek", post(peek::<M, L>))
         .route("/internal/app/sessions/refresh", post(refresh::<M, L>))
         .route(
             "/internal/app/sessions/revoke-by-token",
@@ -395,6 +397,38 @@ where
         "expires_at": session.expires_at,
     }))
     .into_response()
+}
+
+/// What `refresh` would answer for this token, read without writing (#59): the session and
+/// its user for the current token or the previous one within the grace, else `refresh`'s 401
+/// verdict. Unlike `refresh`, it revokes nothing: not on reuse, not on expiry. `auth` checks
+/// the user with it before anything rotates, and sends a verdict on to `refresh`.
+async fn peek<M, L>(State(state): AppState<M, L>, Json(body): Json<TokenBody>) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let Some(id) = token_session(&body.refresh_token) else {
+        return refresh_invalid();
+    };
+    // The project is checked in the same read (I5).
+    match state
+        .metadata
+        .peek_app_session(id, body.project_id, token_hash(&body.refresh_token), APP_SESSION_CAP)
+        .await
+    {
+        Ok(PeekOutcome::Live(session)) => {
+            Json(json!({ "session_id": session.id, "user_id": session.user_id })).into_response()
+        }
+        Ok(PeekOutcome::Reused) => ApiError::new(
+            401,
+            ErrorCode::RefreshTokenReused,
+            "the refresh token was already used; sign in again",
+        )
+        .into_response(),
+        Ok(PeekOutcome::Invalid) => refresh_invalid(),
+        Err(e) => internal("peeking at an app session", e),
+    }
 }
 
 #[derive(Deserialize)]

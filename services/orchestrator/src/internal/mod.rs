@@ -24,7 +24,7 @@ use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
-    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, ProjectAuth,
+    MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, PeekOutcome, ProjectAuth,
     ProjectRecord, RefreshNext, RefreshOutcome,
 };
 use chelabase_types::{DatabaseId, ProjectId};
@@ -163,6 +163,13 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         presented: [u8; 32],
         next: &RefreshNext,
     ) -> impl Future<Output = Result<RefreshOutcome, MetadataError>> + Send;
+    fn peek_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        cap: std::time::Duration,
+    ) -> impl Future<Output = Result<PeekOutcome, MetadataError>> + Send;
     fn revoke_app_session(
         &self,
         id: Uuid,
@@ -369,6 +376,15 @@ impl NeonMetadataPort for MetadataClient {
         next: &RefreshNext,
     ) -> Result<RefreshOutcome, MetadataError> {
         MetadataClient::refresh_app_session(self, id, project, presented, next).await
+    }
+    async fn peek_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        cap: std::time::Duration,
+    ) -> Result<PeekOutcome, MetadataError> {
+        MetadataClient::peek_app_session(self, id, project, presented, cap).await
     }
     async fn revoke_app_session(
         &self,
