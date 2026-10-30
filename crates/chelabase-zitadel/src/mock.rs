@@ -104,10 +104,16 @@ fn err(status: StatusCode, message: &str) -> Reply {
 /// `details[]` carrying the id and the message key.
 fn zerr(status: StatusCode, key: &str) -> Reply {
     let id = "COMMAND-Dg2z3";
+    // gRPC NOT_FOUND for a 404 (what `get_user` checks), else FAILED_PRECONDITION.
+    let code = if status == StatusCode::NOT_FOUND {
+        5
+    } else {
+        9
+    };
     (
         status,
         Json(json!({
-            "code": 9,
+            "code": code,
             "message": format!("Der Fehler ist aufgetreten ({id})"),
             "details": [{
                 "@type": "type.googleapis.com/zitadel.v1.ErrorDetail",

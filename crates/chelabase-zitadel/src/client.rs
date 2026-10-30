@@ -170,15 +170,25 @@ fn error_text(body: Option<&Value>) -> String {
     text
 }
 
-/// Whether a rejection's text (see [`error_text`]) carries Zitadel's error key `key` exactly:
-/// one of its `" | "`-separated parts, without a trailing `" (ID)"`.
-fn has_error_key(message: &str, key: &str) -> bool {
-    message
-        .split(" | ")
-        .any(|part| match part.rsplit_once(" (") {
-            Some((k, id)) if id.ends_with(')') => k == key,
-            _ => part == key,
-        })
+/// The `@type` of the `details[]` entries in Zitadel's own error answers.
+const ZITADEL_ERROR_DETAIL: &str = "type.googleapis.com/zitadel.v1.ErrorDetail";
+
+/// Whether an error answer is Zitadel's own NOT_FOUND: gRPC `code` 5 with a `details[]` entry
+/// of Zitadel's `ErrorDetail` type. Both `message`s are localized (v4.19.1 answers a missing
+/// user with `{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":
+/// [{"@type":"type.googleapis.com/zitadel.v1.ErrorDetail", "id":"QUERY-Dfbg2", "message":
+/// "User could not be found"}]}`), so no message key is matched.
+fn is_zitadel_not_found(body: Option<&Value>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    body.get("code").and_then(Value::as_u64) == Some(5)
+        && body
+            .get("details")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|d| d.get("@type").and_then(Value::as_str) == Some(ZITADEL_ERROR_DETAIL))
 }
 
 impl Zitadel {
@@ -206,6 +216,26 @@ impl Zitadel {
     }
 
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, ZError> {
+        let (status, parsed) = self.send(method, path, body).await?;
+        if status.is_client_error() {
+            let message = error_text(parsed.as_ref());
+            return Err(ZError::Rejected {
+                status: status.as_u16(),
+                message,
+            });
+        }
+        let value = parsed.ok_or_else(|| ZError::Unavailable(format!("{status}: not JSON")))?;
+        Ok(value)
+    }
+
+    /// One call: a 2xx or 4xx status and its body as JSON (`None` when it isn't JSON, `Null`
+    /// when it's empty). No answer, a 5xx and a 3xx are `Unavailable`.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<(reqwest::StatusCode, Option<Value>), ZError> {
         let mut request = self
             .http
             .request(method, format!("{}{path}", self.base))
@@ -239,15 +269,7 @@ impl Zitadel {
         } else {
             serde_json::from_str::<Value>(&text).ok()
         };
-        if status.is_client_error() {
-            let message = error_text(parsed.as_ref());
-            return Err(ZError::Rejected {
-                status: status.as_u16(),
-                message,
-            });
-        }
-        let value = parsed.ok_or_else(|| ZError::Unavailable(format!("{status}: not JSON")))?;
-        Ok(value)
+        Ok((status, parsed))
     }
 
     /// Whether the pending sign-in asked for sign-up (`prompt=create`).
@@ -514,31 +536,36 @@ impl Zitadel {
     }
 
     /// The user (`GET /v2/users/{userId}`). `None` only when Zitadel definitely has no such
-    /// user: a 404 carrying its own `Errors.User.NotFound` error. Any other 404 (a misrouted
+    /// user: a 404 carrying its own NOT_FOUND error (see [`is_zitadel_not_found`]; checked
+    /// against the real Zitadel by `tests/zitadel_live.rs`). Any other 404 (a misrouted
     /// proxy's page, an empty body, another error) and a success answer that can't be read as
     /// a user (an empty body, no `user.userId`) are `Unavailable`, never "no such user" (#57):
     /// callers end sessions and delete rows on `None`, so an API change or a misbehaving proxy
     /// must fail closed.
     pub async fn get_user(&self, user_id: &str) -> Result<Option<ZUser>, ZError> {
-        match self
-            .call(Method::GET, &format!("/v2/users/{user_id}"), None)
-            .await
-        {
-            Ok(answer) => match answer.get("user").and_then(parse_user) {
-                Some(user) => Ok(Some(user)),
-                None => Err(ZError::Unavailable("the user answer can't be read".into())),
-            },
-            Err(ZError::Rejected {
-                status: 404,
-                message,
-            }) if has_error_key(&message, "Errors.User.NotFound") => Ok(None),
-            Err(ZError::Rejected {
-                status: 404,
-                message,
-            }) => Err(ZError::Unavailable(format!(
-                "a 404 that isn't Zitadel's user not found: {message}"
+        let path = format!("/v2/users/{user_id}");
+        match self.send(Method::GET, &path, None).await? {
+            (status, parsed) if status.is_success() => {
+                match parsed
+                    .as_ref()
+                    .and_then(|a| a.get("user"))
+                    .and_then(parse_user)
+                {
+                    Some(user) => Ok(Some(user)),
+                    None => Err(ZError::Unavailable("the user answer can't be read".into())),
+                }
+            }
+            (reqwest::StatusCode::NOT_FOUND, parsed) if is_zitadel_not_found(parsed.as_ref()) => {
+                Ok(None)
+            }
+            (reqwest::StatusCode::NOT_FOUND, parsed) => Err(ZError::Unavailable(format!(
+                "a 404 that isn't Zitadel's not found: {}",
+                error_text(parsed.as_ref())
             ))),
-            Err(e) => Err(e),
+            (status, parsed) => Err(ZError::Rejected {
+                status: status.as_u16(),
+                message: error_text(parsed.as_ref()),
+            }),
         }
     }
 
