@@ -388,6 +388,15 @@ describe("createBrowserClient refreshIfNeeded and currentUser", () => {
     const f4 = router({ "/auth/v1/app/user": () => err(503, "unavailable") });
     await expect(createBrowserClient({ url, key, fetch: f4 }).auth.currentUser()).rejects.toMatchObject({ status: 503 });
   });
+
+  test("current_user_is_null_when_its_refresh_ends_the_session", async () => {
+    for (const code of ["refresh_token_reused", "user_inactive"]) {
+      cookieJar.set(ACCESS, jwt(nowSecs() - 10, 0));
+      const f = router({ "/api/chelabase/auth/refresh": () => err(401, code) });
+      expect(await createBrowserClient({ url, key, fetch: f }).auth.currentUser(), code).toBeNull();
+      expect(cookieJar.has(ACCESS), code).toBe(false);
+    }
+  });
 });
 
 describe("createBrowserClient options", () => {
