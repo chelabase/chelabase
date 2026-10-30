@@ -1,17 +1,18 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router';
 import appCss from '@/styles.css?url';
 
+const TITLE = 'Chelabase — Manage, collaborate, iterate on Postgres';
 const DESCRIPTION =
-  "Postgres on Neon's storage engine, with copy-on-write branches, point-in-time restore, a typed data API and auth for your app's users, managed from one console.";
+  "An open-source Postgres platform you run yourself: branch, merge and restore databases, give your team access Postgres enforces, and query from your app with a typed client. Chelabase's own services are written in Rust.";
 
 export const Route = createRootRoute({
   head: () => ({
     meta: [
       { charSet: 'utf-8' },
       { name: 'viewport', content: 'width=device-width, initial-scale=1' },
-      { title: 'Chelabase — Postgres that branches' },
+      { title: TITLE },
       { name: 'description', content: DESCRIPTION },
-      { property: 'og:title', content: 'Chelabase — Postgres that branches' },
+      { property: 'og:title', content: TITLE },
       { property: 'og:description', content: DESCRIPTION },
       { property: 'og:type', content: 'website' },
     ],
