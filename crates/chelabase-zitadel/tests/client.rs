@@ -349,6 +349,8 @@ async fn deleting_a_user_ends_their_sessions() {
     assert_eq!(mock.session_count(), 0);
 }
 
+// A 404 that isn't JSON is still a rejection; deletes take it as "already gone". A user
+// lookup doesn't (see `a_404_without_zitadels_not_found_is_not_a_missing_user`).
 #[tokio::test]
 async fn a_404_that_is_not_json_is_still_a_rejection() {
     let app = axum::Router::new()
@@ -360,11 +362,60 @@ async fn a_404_that_is_not_json_is_still_a_rejection() {
     z.delete_user("1").await.unwrap();
     z.delete_org("1").await.unwrap();
     z.delete_session_admin("1").await.unwrap();
-    assert_eq!(z.get_user("1").await.unwrap(), None);
     assert!(matches!(
         z.auth_request("V2_1").await,
         Err(ZError::Rejected { status: 404, .. })
     ));
+}
+
+// #57: a user is missing only on a 404 carrying Zitadel's own NOT_FOUND error (gRPC code 5
+// with a Zitadel `ErrorDetail`; its messages are localized, see `zitadel_live.rs`). Any other
+// 404 (a misrouted proxy's HTML page, an empty body, another error) is `Unavailable`: callers
+// revoke sessions and delete rows on a missing user.
+#[tokio::test]
+async fn a_404_without_zitadels_not_found_is_not_a_missing_user() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user("ada@example.com", "Secret-pass1", true);
+    let get = format!("GET /v2/users/{id}");
+    for body in [
+        "<html>not found</html>",
+        "",
+        "{}",
+        r#"{"code": 404, "message": "Not Found"}"#,
+        r#"{"code": 5, "message": "User could not be found (QUERY-Dfbg2)"}"#,
+        r#"{"code": 5, "message": "x", "details": [{"id": "QUERY-Dfbg2", "message": "x"}]}"#,
+        r#"{"code": "5", "details": [{"@type": "type.googleapis.com/zitadel.v1.ErrorDetail"}]}"#,
+        r#"{"code": 3, "message": "x", "details": [{"@type": "type.googleapis.com/zitadel.v1.ErrorDetail", "id": "QUERY-1", "message": "x"}]}"#,
+        r#"{"code": 5, "message": "Errors.User.NotFound (QUERY-Dfbg2)"}"#,
+    ] {
+        mock.answer_raw(&get, 404, body, 1);
+        assert!(
+            matches!(z.get_user(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+        mock.answer_raw(&get, 404, body, 1);
+        assert!(
+            matches!(z.user_is_gone(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+    }
+    // What Zitadel v4.19.1 answers for a deleted or unknown user, and the mock's own shape.
+    mock.answer_raw(
+        &get,
+        404,
+        r#"{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":[{"@type":"type.googleapis.com/zitadel.v1.ErrorDetail", "id":"QUERY-Dfbg2", "message":"User could not be found"}]}"#,
+        1,
+    );
+    assert_eq!(z.get_user(&id).await.unwrap(), None);
+    mock.fail(&get, 404, "Errors.User.NotFound", 1);
+    assert!(z.user_is_gone(&id).await.unwrap());
+    // Other refusals keep their status.
+    mock.fail(&get, 403, "Errors.Denied", 1);
+    assert!(matches!(
+        z.get_user(&id).await,
+        Err(ZError::Rejected { status: 403, .. })
+    ));
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().id, id);
 }
 
 #[tokio::test]
@@ -668,6 +719,38 @@ async fn user_is_gone_only_on_not_found() {
     assert!(matches!(z.user_is_gone(&other).await, Err(ZError::Rejected { status: 403, .. })));
     mock.set_down(true);
     assert!(z.user_is_gone(&other).await.is_err());
+}
+
+// #57: `None` is a definite 404 only. A success answer that can't be read as a user (an
+// empty body, no `user`, no `user.userId`, malformed JSON) is `Unavailable`, so no caller takes
+// it for a deleted user.
+#[tokio::test]
+async fn get_user_is_none_only_on_not_found() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user("ada@example.com", "Secret-pass1", true);
+    let get = format!("GET /v2/users/{id}");
+    for body in [
+        "",
+        "{}",
+        r#"{"user": null}"#,
+        r#"{"user": {"state": "USER_STATE_ACTIVE"}}"#,
+        r#"{"user": {"userId": 7}}"#,
+        r#"{"user": {"userId""#,
+    ] {
+        mock.answer_raw(&get, 200, body, 1);
+        assert!(
+            matches!(z.get_user(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+        mock.answer_raw(&get, 200, body, 1);
+        assert!(
+            matches!(z.user_is_gone(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+    }
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().id, id);
+    mock.remove_user(&id);
+    assert_eq!(z.get_user(&id).await.unwrap(), None);
 }
 
 // #24: an app reaches Zitadel at its in-network address with the public auth host as `Host`

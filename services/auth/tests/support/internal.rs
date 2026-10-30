@@ -21,6 +21,8 @@ pub struct FakeSession {
     pub user_id: Uuid,
     pub zitadel_session_id: String,
     pub token: String,
+    /// The token before the last rotation: presented again, it gets the grace answer.
+    pub previous: Option<String>,
     pub revoked: bool,
 }
 
@@ -115,6 +117,7 @@ async fn create_session(State(s): S, Json(b): Json<Value>) -> Response {
             user_id: b["user_id"].as_str().unwrap().parse().unwrap(),
             zitadel_session_id: b["zitadel_session_id"].as_str().unwrap().into(),
             token: token.clone(),
+            previous: None,
             revoked: false,
         },
     );
@@ -138,13 +141,24 @@ async fn refresh(State(s): S, Json(b): Json<Value>) -> Response {
     let found = st
         .sessions
         .iter()
-        .find(|(_, x)| x.token == token && x.project_id == project && !x.revoked)
-        .map(|(id, x)| (*id, x.user_id));
-    let Some((sid, user)) = found else {
+        .find(|(_, x)| {
+            (x.token == token || x.previous.as_deref() == Some(token))
+                && x.project_id == project
+                && !x.revoked
+        })
+        .map(|(id, x)| (*id, x.user_id, x.token == token));
+    let Some((sid, user, current)) = found else {
         return error(StatusCode::UNAUTHORIZED, "refresh_token_invalid");
     };
-    let next = new_token(&mut st, sid);
-    st.sessions.get_mut(&sid).unwrap().token = next.clone();
+    // The grace answer hands back the token the earlier rotation made.
+    let next = if current {
+        let next = new_token(&mut st, sid);
+        let x = st.sessions.get_mut(&sid).unwrap();
+        x.previous = Some(std::mem::replace(&mut x.token, next.clone()));
+        next
+    } else {
+        st.sessions[&sid].token.clone()
+    };
     Json(
         json!({"session_id": sid, "user_id": user, "refresh_token": next,
         "expires_at": "2026-11-02T10:00:00Z"}),
@@ -341,6 +355,31 @@ impl FakeInternal {
             .iter()
             .map(|(k, v)| (*k, v.clone()))
             .collect()
+    }
+
+    /// A session made directly: `(session id, refresh token)`. With `rotated`, it was refreshed
+    /// once already and the token returned is the previous one, which gets the grace answer.
+    pub fn add_session(&self, project_id: Uuid, user_id: Uuid, rotated: bool) -> (Uuid, String) {
+        let mut st = self.inner.lock().unwrap();
+        let sid = Uuid::new_v4();
+        let first = new_token(&mut st, sid);
+        let (token, previous) = if rotated {
+            (new_token(&mut st, sid), Some(first.clone()))
+        } else {
+            (first.clone(), None)
+        };
+        st.sessions.insert(
+            sid,
+            FakeSession {
+                project_id,
+                user_id,
+                zitadel_session_id: String::new(),
+                token,
+                previous,
+                revoked: false,
+            },
+        );
+        (sid, first)
     }
 
     pub fn set_refresh_error(&self, code: Option<&str>) {

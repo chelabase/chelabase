@@ -928,6 +928,157 @@ async fn refresh_faults_are_unavailable_not_invalid() {
     assert_eq!(code(&a), "refresh_token_invalid");
 }
 
+/// What the orchestrator answers a refresh with.
+#[derive(Clone, Copy, Debug)]
+enum Orch {
+    Rotated,
+    Grace,
+    Invalid401,
+    Reused401,
+    Bare401,
+    NotFound404,
+    Unprocessable422,
+    Internal500,
+}
+
+/// What Zitadel answers the user lookup with.
+#[derive(Clone, Copy, Debug)]
+enum Zit {
+    Active,
+    Inactive,
+    OtherOrg,
+    NotFound404,
+    /// A 404 that isn't Zitadel's (a misrouted proxy's HTML page).
+    Html404,
+    Internal500,
+    Empty200,
+    NoUserId200,
+    Malformed200,
+}
+
+/// #57: the invariant on `refresh`, as a model. Only a definitive verdict ends a session: the
+/// orchestrator's 401 `refresh_token_invalid`/`refresh_token_reused`, Zitadel's 404 or a user
+/// of another org, or an inactive user. Anything else is 503 `unavailable` and revokes nothing.
+/// Returns the status, the error code (`""` on success) and whether auth revokes the session.
+fn refresh_model(o: Orch, z: Zit) -> (StatusCode, &'static str, bool) {
+    let down = (StatusCode::SERVICE_UNAVAILABLE, "unavailable", false);
+    match o {
+        Orch::Invalid401 => (StatusCode::UNAUTHORIZED, "refresh_token_invalid", false),
+        Orch::Reused401 => (StatusCode::UNAUTHORIZED, "refresh_token_reused", false),
+        Orch::Bare401 | Orch::NotFound404 | Orch::Unprocessable422 | Orch::Internal500 => down,
+        Orch::Rotated | Orch::Grace => match z {
+            Zit::Active => (StatusCode::OK, "", false),
+            Zit::Inactive => (StatusCode::FORBIDDEN, "user_inactive", true),
+            Zit::OtherOrg | Zit::NotFound404 => {
+                (StatusCode::UNAUTHORIZED, "refresh_token_invalid", true)
+            }
+            Zit::Html404
+            | Zit::Internal500
+            | Zit::Empty200
+            | Zit::NoUserId200
+            | Zit::Malformed200 => down,
+        },
+    }
+}
+
+/// #57: every orchestrator answer against every Zitadel answer (8 x 9), checked against
+/// [`refresh_model`]: the answer the client sees, and whether a revoke call was made.
+#[tokio::test]
+async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
+    use Orch as O;
+    use Zit as Z;
+    let orchs = [
+        O::Rotated,
+        O::Grace,
+        O::Invalid401,
+        O::Reused401,
+        O::Bare401,
+        O::NotFound404,
+        O::Unprocessable422,
+        O::Internal500,
+    ];
+    let zits = [
+        Z::Active,
+        Z::Inactive,
+        Z::OtherOrg,
+        Z::NotFound404,
+        Z::Html404,
+        Z::Internal500,
+        Z::Empty200,
+        Z::NoUserId200,
+        Z::Malformed200,
+    ];
+    let mut wrong = Vec::new();
+    for o in orchs {
+        for z in zits {
+            let h = harness().await;
+            let user = match z {
+                // No such user in the mock: its lookup is a real 404.
+                Z::NotFound404 => Uuid::new_v4(),
+                _ => h.add_user("ada@example.com", true).parse().unwrap(),
+            };
+            let get = format!("GET /v2/users/{user}");
+            match z {
+                Z::Active | Z::NotFound404 => {}
+                Z::Inactive => h.set_user(&user.to_string(), |u| u.inactive = true),
+                Z::OtherOrg => h.set_user(&user.to_string(), |u| u.org_id = "other".into()),
+                Z::Html404 => h.mock.answer_raw(&get, 404, "<html>not found</html>", 1),
+                Z::Internal500 => h.mock.fail(&get, 500, "Errors.Internal", 1),
+                Z::Empty200 => h.mock.answer_raw(&get, 200, "", 1),
+                Z::NoUserId200 => h.mock.answer_raw(
+                    &get,
+                    200,
+                    r#"{"user": {"state": "USER_STATE_ACTIVE", "details": {"resourceOwner": "o"}}}"#,
+                    1,
+                ),
+                Z::Malformed200 => h.mock.answer_raw(&get, 200, r#"{"user": {"userId""#, 1),
+            }
+            let (sid, token) = h
+                .internal
+                .add_session(h.project, user, matches!(o, O::Grace));
+            let refused = |status, code| h.internal.set_refresh_answer(status, code);
+            match o {
+                O::Rotated | O::Grace => {}
+                O::Invalid401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_invalid")),
+                O::Reused401 => refused(StatusCode::UNAUTHORIZED, Some("refresh_token_reused")),
+                O::Bare401 => refused(StatusCode::UNAUTHORIZED, None),
+                O::NotFound404 => refused(StatusCode::NOT_FOUND, None),
+                O::Unprocessable422 => refused(StatusCode::UNPROCESSABLE_ENTITY, None),
+                O::Internal500 => refused(StatusCode::INTERNAL_SERVER_ERROR, Some("internal")),
+            }
+            let a = h
+                .post("refresh", json!({"refresh_token": token}), None)
+                .await;
+            let revoked = h
+                .internal
+                .calls()
+                .iter()
+                .any(|(call, _)| call.contains("revoke"));
+            // (status, code, a revoke call was made, the session is revoked)
+            let got = (
+                a.status,
+                code(&a),
+                revoked,
+                h.internal.session(sid).unwrap().revoked,
+            );
+            let (status, code, revoke) = refresh_model(o, z);
+            let want = (status, code, revoke, revoke);
+            if got != want {
+                wrong.push(format!(
+                    "{o:?} x {z:?}: got {got:?}, want {want:?}: {}",
+                    a.body
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of 72 cases differ from the model:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 #[tokio::test]
 async fn refresh_reads_current_email() {
     let h = harness().await;

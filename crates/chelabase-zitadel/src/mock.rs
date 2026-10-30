@@ -78,6 +78,8 @@ pub struct Fault {
     pub pattern: String,
     pub status: u16,
     pub key: String,
+    /// Answer with exactly this body instead of Zitadel's error shape.
+    pub body: Option<String>,
     pub remaining: u32,
 }
 
@@ -102,10 +104,16 @@ fn err(status: StatusCode, message: &str) -> Reply {
 /// `details[]` carrying the id and the message key.
 fn zerr(status: StatusCode, key: &str) -> Reply {
     let id = "COMMAND-Dg2z3";
+    // gRPC NOT_FOUND for a 404 (what `get_user` checks), else FAILED_PRECONDITION.
+    let code = if status == StatusCode::NOT_FOUND {
+        5
+    } else {
+        9
+    };
     (
         status,
         Json(json!({
-            "code": 9,
+            "code": code,
             "message": format!("Der Fehler ist aufgetreten ({id})"),
             "details": [{
                 "@type": "type.googleapis.com/zitadel.v1.ErrorDetail",
@@ -200,6 +208,18 @@ impl MockZitadel {
             pattern: pattern.into(),
             status,
             key: key.into(),
+            body: None,
+            remaining: times,
+        });
+    }
+    /// The next `times` requests whose `"METHOD path"` contains `pattern` get `status` with
+    /// exactly `body` (empty, malformed or unexpected JSON), as a proxy or a changed API might.
+    pub fn answer_raw(&self, pattern: &str, status: u16, body: &str, times: u32) {
+        self.inner.lock().unwrap().faults.push(Fault {
+            pattern: pattern.into(),
+            status,
+            key: String::new(),
+            body: Some(body.into()),
             remaining: times,
         });
     }
@@ -364,7 +384,7 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
             && !is_admin(req.headers())
             && (call.ends_with("/invite_code/verify") || call.starts_with("PATCH /v2/users/"));
         if strict_denied {
-            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied"))
+            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied").into_response())
         } else {
             inner
                 .faults
@@ -372,12 +392,16 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
                 .find(|f| f.remaining > 0 && call.contains(&f.pattern))
                 .map(|f| {
                     f.remaining -= 1;
-                    zerr(StatusCode::from_u16(f.status).unwrap(), &f.key)
+                    let status = StatusCode::from_u16(f.status).unwrap();
+                    match &f.body {
+                        Some(body) => (status, body.clone()).into_response(),
+                        None => zerr(status, &f.key).into_response(),
+                    }
                 })
         }
     };
     match forced {
-        Some(reply) => reply.into_response(),
+        Some(reply) => reply,
         None => next.run(req).await,
     }
 }
@@ -530,7 +554,7 @@ async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Re
     }
     match inner.users.iter().find(|u| u.id == id) {
         Some(u) => ok(json!({"user": user_json(u, &inner)})),
-        None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
+        None => zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
     }
 }
 
