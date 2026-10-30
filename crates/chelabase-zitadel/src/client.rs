@@ -539,9 +539,9 @@ impl Zitadel {
     /// user: a 404 carrying its own NOT_FOUND error (see [`is_zitadel_not_found`]; checked
     /// against the real Zitadel by `tests/zitadel_live.rs`). Any other 404 (a misrouted
     /// proxy's page, an empty body, another error) and a success answer that can't be read as
-    /// a user (an empty body, no `user.userId`) are `Unavailable`, never "no such user" (#57):
-    /// callers end sessions and delete rows on `None`, so an API change or a misbehaving proxy
-    /// must fail closed.
+    /// a user (an empty body, no `user.userId`, no `details.resourceOwner`, another user's
+    /// `userId`) are `Unavailable`, never "no such user" (#57): callers end sessions and delete
+    /// rows on `None`, so an API change or a misbehaving proxy must fail closed.
     pub async fn get_user(&self, user_id: &str) -> Result<Option<ZUser>, ZError> {
         let path = format!("/v2/users/{user_id}");
         match self.send(Method::GET, &path, None).await? {
@@ -551,7 +551,12 @@ impl Zitadel {
                     .and_then(|a| a.get("user"))
                     .and_then(parse_user)
                 {
-                    Some(user) => Ok(Some(user)),
+                    // An answer for another user, or one whose org can't be read, is a fault
+                    // too: callers act on the user's org and state (#57 audit B1, S1).
+                    Some(user) if user.id == user_id && !user.org_id.is_empty() => Ok(Some(user)),
+                    Some(_) => Err(ZError::Unavailable(
+                        "the user answer is for another user or has no organization".into(),
+                    )),
                     None => Err(ZError::Unavailable("the user answer can't be read".into())),
                 }
             }

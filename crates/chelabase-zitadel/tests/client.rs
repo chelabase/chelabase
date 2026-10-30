@@ -729,14 +729,22 @@ async fn get_user_is_none_only_on_not_found() {
     let (mock, z) = setup().await;
     let id = mock.add_user("ada@example.com", "Secret-pass1", true);
     let get = format!("GET /v2/users/{id}");
-    for body in [
-        "",
-        "{}",
-        r#"{"user": null}"#,
-        r#"{"user": {"state": "USER_STATE_ACTIVE"}}"#,
-        r#"{"user": {"userId": 7}}"#,
-        r#"{"user": {"userId""#,
-    ] {
+    let bodies = [
+        String::new(),
+        "{}".into(),
+        r#"{"user": null}"#.into(),
+        r#"{"user": {"state": "USER_STATE_ACTIVE"}}"#.into(),
+        r#"{"user": {"userId": 7}}"#.into(),
+        r#"{"user": {"userId""#.into(),
+        // #57 audit B1: the user's org can't be read (no `details`, no or an empty owner).
+        format!(r#"{{"user": {{"userId": "{id}", "state": "USER_STATE_ACTIVE"}}}}"#),
+        format!(r#"{{"user": {{"userId": "{id}", "details": {{}}}}}}"#),
+        format!(r#"{{"user": {{"userId": "{id}", "details": {{"resourceOwner": ""}}}}}}"#),
+        format!(r#"{{"user": {{"userId": "{id}", "details": {{"resourceOwner": 7}}}}}}"#),
+        // #57 audit S1: an answer for another user.
+        r#"{"user": {"userId": "someone-else", "state": "USER_STATE_ACTIVE", "details": {"resourceOwner": "o1"}}}"#.into(),
+    ];
+    for body in &bodies {
         mock.answer_raw(&get, 200, body, 1);
         assert!(
             matches!(z.get_user(&id).await, Err(ZError::Unavailable(_))),
