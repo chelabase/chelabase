@@ -288,6 +288,42 @@ describe("auth", () => {
     expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(2);
   });
 
+  test("auto_refresh_of_a_60s_token_waits_half_its_life", async () => {
+    // The lead is capped at half the lifetime: a 60 s token refreshes every ~30 s, not in a loop.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+    let n = 1;
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1, 60) }),
+      "/auth/v1/app/refresh": () => ({ body: session(++n, 60) }),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(28_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(2);
+  });
+
+  test("auto_refresh_of_a_15min_token_is_60s_before_exp", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1, 900) }),
+      "/auth/v1/app/refresh": () => ({ body: session(2, 900) }),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await vi.advanceTimersByTimeAsync(839_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+  });
+
   test("memory_storage_without_localStorage", async () => {
     vi.stubGlobal("localStorage", undefined);
     const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });

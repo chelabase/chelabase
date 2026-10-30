@@ -5,11 +5,15 @@ import type { AppUser, Auth, AuthEvent, AuthOptions, AuthStorage, DatabaseShape,
 /** Header carrying the signed-in user's access token. */
 export const USER_HEADER = "chelabase-user";
 
+/** How long before `exp` a token is refreshed: 60 s, or half its lifetime when that is shorter. */
 const REFRESH_LEAD_MS = 60_000;
 /** A token this close to expiry is refreshed before use. */
 const STALE_MS = 5_000;
-/** An access token this long past its `exp` belongs to no rotation still in flight. */
-const DEAD_AFTER_MS = 60_000;
+/**
+ * An access token this long past its `exp` belongs to no rotation still in flight. Minutes, not
+ * seconds: the app server's clock and auth's may disagree.
+ */
+const DEAD_AFTER_MS = 5 * 60_000;
 /** The refresh token is gone for good: sign out locally. */
 const FATAL = new Set(["refresh_token_reused", "refresh_token_invalid", "user_session_revoked", "user_inactive"]);
 /** A request carrying the access token was refused because its session is over. */
@@ -76,7 +80,7 @@ function defaultStorage(): AuthStorage {
 }
 
 /** A JWT's (unverified) payload; empty when unreadable. */
-function claims(jwt: string): { exp?: unknown; sub?: unknown } {
+function claims(jwt: string): { exp?: unknown; iat?: unknown; sub?: unknown } {
   try {
     const part = jwt.split(".")[1] ?? "";
     const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
@@ -93,10 +97,18 @@ function expiryMs(jwt: string): number {
   return typeof exp === "number" ? exp * 1000 : 0;
 }
 
+/** The token's lifetime (`exp` − `iat`, ms); 0 when either is missing. */
+function lifetimeMs(jwt: string): number {
+  const { exp, iat } = claims(jwt);
+  return typeof exp === "number" && typeof iat === "number" && exp > iat ? (exp - iat) * 1000 : 0;
+}
+
 /**
- * After a `refresh_token_invalid`: the access token is missing, unreadable, or more than 60 s
+ * After a `refresh_token_invalid`: the access token is missing, unreadable, or more than 5 min
  * past its `exp`. A token that old can't be part of a rotation still in flight, so its cookies
  * are dead; keeping them would cost a refresh on every page view.
+ * Accepted race: a sign-in from another tab that lands while a long-dead session's refresh is in
+ * flight can be wiped by that late answer (rare; `refresh_token_reused` and sign-out had it too).
  */
 export function longExpired(jwt: string | undefined): boolean {
   return jwt === undefined || expiryMs(jwt) < Date.now() - DEAD_AFTER_MS;
@@ -126,6 +138,8 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   let access: string | undefined;
   let expMs = 0;
+  /** The current token's lifetime as its session answer gave it (`expires_in`), when known. */
+  let lifeMs = 0;
   /** Server mode: the access cookie's value as this client last read or wrote it. */
   let cookieAccess = srv?.access;
   if (srv?.refresh !== undefined) void storage.set(storeKey, srv.refresh);
@@ -255,6 +269,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     cookieAccess = s.access_token;
     access = s.access_token;
     expMs = expiryMs(s.access_token) || Date.now() + s.expires_in * 1000;
+    lifeMs = s.expires_in * 1000;
     started = Promise.resolve();
     // Remote mode: the route set the cookie to this token, and keeps the refresh token to itself.
     if (remote) seen = s.access_token;
@@ -267,10 +282,14 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     clearTimer();
     if (!autoRefresh || access === undefined) return;
     const planned = access;
+    // Half the lifetime at most: a token shorter-lived than twice the lead would otherwise be
+    // refreshed again the moment it arrives, in a loop.
+    const life = lifetimeMs(planned) || lifeMs;
+    const lead = life > 0 ? Math.min(REFRESH_LEAD_MS, life / 2) : REFRESH_LEAD_MS;
     const t = setTimeout(() => {
       sync(); // remote: another tab may have refreshed already
       if (access === planned) void refresh().catch(() => {});
-    }, Math.max(0, expMs - REFRESH_LEAD_MS - Date.now()));
+    }, Math.max(0, expMs - lead - Date.now()));
     (t as { unref?: () => void }).unref?.();
     timer = t;
   }

@@ -879,6 +879,55 @@ async fn refresh_passes_reused_through() {
     assert_eq!(code(&a), "refresh_token_invalid");
 }
 
+/// Only the orchestrator's `refresh_token_invalid` ends a session for good; a bare 401 (a
+/// mismatched internal bearer), a 404 (a missing route) or a 422 (a body the orchestrator
+/// rejects mid-deploy) is a fault on our side, and the client keeps its cookies.
+#[tokio::test]
+async fn refresh_faults_are_unavailable_not_invalid() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let cases = [
+        (StatusCode::UNAUTHORIZED, None),
+        (StatusCode::UNAUTHORIZED, Some("unauthorized")),
+        (StatusCode::NOT_FOUND, None),
+        (StatusCode::NOT_FOUND, Some("not_found")),
+        (StatusCode::UNPROCESSABLE_ENTITY, None),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Some("refresh_token_invalid"),
+        ),
+    ];
+    for (status, answer) in cases {
+        h.internal.set_refresh_answer(status, answer);
+        let a = h
+            .post(
+                "refresh",
+                json!({"refresh_token": s.body["refresh_token"]}),
+                None,
+            )
+            .await;
+        assert_eq!(
+            a.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{status} {answer:?}: {}",
+            a.body
+        );
+        assert_eq!(code(&a), "unavailable", "{status} {answer:?}");
+    }
+    h.internal
+        .set_refresh_answer(StatusCode::UNAUTHORIZED, Some("refresh_token_invalid"));
+    let a = h
+        .post(
+            "refresh",
+            json!({"refresh_token": s.body["refresh_token"]}),
+            None,
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+    assert_eq!(code(&a), "refresh_token_invalid");
+}
+
 #[tokio::test]
 async fn refresh_reads_current_email() {
     let h = harness().await;

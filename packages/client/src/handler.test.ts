@@ -333,16 +333,19 @@ describe("createAuthHandler", () => {
   });
 
   test("refresh_token_invalid_clears_nothing_while_the_access_cookie_is_recent", async () => {
-    const gw = gateway({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
-    const res = await handler(gw)(req("refresh", { cookies: { [ACCESS]: jwt(nowSecs() - 30, 0), [REFRESH]: "rt0" } }));
-    expect(res.status).toBe(401);
-    expect(res.headers.getSetCookie()).toEqual([]);
-    expect(((await res.json()) as { error: { code: string } }).error.code).toBe("refresh_token_invalid");
+    // Within 5 min of its `exp` (clock skew between the app server and auth).
+    for (const ago of [30, 240]) {
+      const gw = gateway({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
+      const res = await handler(gw)(req("refresh", { cookies: { [ACCESS]: jwt(nowSecs() - ago, 0), [REFRESH]: "rt0" } }));
+      expect(res.status).toBe(401);
+      expect(res.headers.getSetCookie(), String(ago)).toEqual([]);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("refresh_token_invalid");
+    }
   });
 
   test("refresh_token_invalid_clears_a_long_dead_session", async () => {
-    // Missing, unreadable, or more than 60 s past its `exp`.
-    for (const access of [undefined, "at0", jwt(nowSecs() - 120, 0)]) {
+    // Missing, unreadable, or more than 5 min past its `exp`.
+    for (const access of [undefined, "at0", jwt(nowSecs() - 400, 0)]) {
       const gw = gateway({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
       const cookies = { ...(access === undefined ? {} : { [ACCESS]: access }), [REFRESH]: "rt0" };
       const res = await handler(gw)(req("refresh", { cookies }));

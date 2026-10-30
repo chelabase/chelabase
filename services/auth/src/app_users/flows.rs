@@ -1062,10 +1062,10 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
                 "This refresh token was used already; the session is ended, sign in again",
             ));
         }
-        Err(InternalError::Refused {
-            status: 401 | 404 | 422,
-            ..
-        }) => {
+        // Only the orchestrator's own verdict ends the session: clients drop their cookies on
+        // it. A bare 401 (a mismatched internal bearer), a 404 or a 422 is our fault, not the
+        // token's, so it answers 503 and the client keeps the session.
+        Err(InternalError::Refused { status: 401, code }) if code == "refresh_token_invalid" => {
             return Err(fail(
                 401,
                 ErrorCode::RefreshTokenInvalid,
