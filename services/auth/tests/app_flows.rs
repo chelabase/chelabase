@@ -991,7 +991,10 @@ enum Zit {
 enum Timing {
     /// Not during the refresh.
     Steady,
-    /// While Zitadel is answering the user lookup.
+    /// While Zitadel is answering the user lookup. Only a grace token (`Orch::Grace`) has a
+    /// previous token whose grace can end; a current token rotated by a parallel request
+    /// during the lookup has its own tests
+    /// (`refresh_of_a_current_token_rotated_during_the_lookup_gets_the_grace_answer`).
     GraceEndsInLookup,
 }
 
@@ -1015,7 +1018,8 @@ struct Outcome {
 /// verdict goes on to `refresh`, which applies the orchestrator's own rules, as before #59.
 /// So does a grace token (the previous token within its grace, `Orch::Grace`): its refresh
 /// writes nothing, and it must reach the orchestrator before the grace ends (#59 audit B1).
-/// When the grace ends during the lookup changes nothing, so [`Timing`] isn't an input.
+/// When a grace token's grace ends during the lookup changes nothing, so [`Timing`] isn't an
+/// input.
 fn refresh_model(p: Peek, o: Orch, z: Zit) -> Outcome {
     let answer = |status, code, revoke, refresh| Outcome {
         status,
@@ -1239,8 +1243,8 @@ async fn refresh_case(p: Peek, o: Orch, z: Zit, t: Timing) -> Option<String> {
 
 /// #57, #59: every peek answer against every refresh answer against every Zitadel answer
 /// (8 x 8 x 11), checked against [`refresh_model`], each 503 followed by a later retry; and
-/// again with the grace ending during the user lookup for the two token states a session can
-/// be in (current, grace: 8 x 2 x 11), 880 cases in all.
+/// again for a grace token with its grace ending during the user lookup (8 x 11), 792 cases
+/// in all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
     use Orch as O;
@@ -1278,7 +1282,7 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
         Z::OtherUser200,
         Z::Malformed200,
     ];
-    let total = peeks.len() * zits.len() * (orchs.len() + 2);
+    let total = peeks.len() * zits.len() * (orchs.len() + 1);
     // One task per peek answer; each runs its cases in turn.
     let tasks: Vec<_> = peeks
         .into_iter()
@@ -1290,10 +1294,8 @@ async fn refresh_ends_a_session_only_on_a_definitive_verdict() {
                         wrong.extend(refresh_case(p, o, z, Timing::Steady).await);
                     }
                 }
-                for o in [O::Rotated, O::Grace] {
-                    for z in zits {
-                        wrong.extend(refresh_case(p, o, z, Timing::GraceEndsInLookup).await);
-                    }
+                for z in zits {
+                    wrong.extend(refresh_case(p, O::Grace, z, Timing::GraceEndsInLookup).await);
                 }
                 wrong
             })
@@ -1443,6 +1445,90 @@ async fn refresh_survives_the_grace_ending_during_the_user_lookup() {
     assert_eq!(c.status, StatusCode::OK, "{}", c.body);
     assert_ne!(c.body["refresh_token"], a.body["refresh_token"]);
     assert!(!h.internal.session(sid).unwrap().revoked);
+}
+
+/// The number of Zitadel user lookups so far.
+fn user_lookups(h: &H) -> usize {
+    h.mock
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("GET /v2/users/"))
+        .count()
+}
+
+/// #59 second audit S1: peek finds the token current, then a parallel request rotates the
+/// session while Zitadel answers this request's user lookup. When this request reaches
+/// `refresh` its token is the previous one, inside the grace: it gets the grace answer (the
+/// parallel request's successor), and the user is looked up only once.
+#[tokio::test]
+async fn refresh_of_a_current_token_rotated_during_the_lookup_gets_the_grace_answer() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let t0 = s.body["refresh_token"].clone();
+    let internal = h.internal.clone();
+    let parallel = Arc::new(Mutex::new(None::<String>));
+    let seen = parallel.clone();
+    h.mock.on_request("GET /v2/users/", move || {
+        let mut seen = seen.lock().unwrap();
+        if seen.is_none() {
+            *seen = Some(internal.rotate(sid));
+        }
+    });
+    let before = user_lookups(&h);
+    let b = h.post("refresh", json!({"refresh_token": t0}), None).await;
+    assert_eq!(b.status, StatusCode::OK, "{}", b.body);
+    let parallel = parallel.lock().unwrap().clone().expect("the hook rotated");
+    assert_eq!(
+        b.body["refresh_token"].as_str(),
+        Some(parallel.as_str()),
+        "the grace answer: the parallel request's successor"
+    );
+    assert_eq!(user_lookups(&h) - before, 1, "one user lookup");
+    assert_eq!(
+        h.internal.session(sid).unwrap().token,
+        parallel,
+        "nothing else rotated"
+    );
+    assert!(!h.internal.session(sid).unwrap().revoked);
+}
+
+/// #59 second audit S1, the accepted residual: as above, but the parallel rotation's grace
+/// also ends before this request reaches `refresh`. Its token is reuse now: 401
+/// `refresh_token_reused`, and the orchestrator revokes the session. Only timing keeps this
+/// away: the lookup is cut at `REFRESH_USER_LOOKUP` (at most half of `APP_REFRESH_GRACE`),
+/// which leaves the rest of the grace for the peek's reply, the `refresh` call and its row
+/// lock.
+#[tokio::test]
+async fn refresh_of_a_current_token_rotated_and_past_its_grace_during_the_lookup_is_reuse() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let s = h.sign_in("ada@example.com", PW).await;
+    let sid = h.session_id(&s);
+    let t0 = s.body["refresh_token"].clone();
+    let internal = h.internal.clone();
+    let rotated = Arc::new(Mutex::new(false));
+    let seen = rotated.clone();
+    h.mock.on_request("GET /v2/users/", move || {
+        let mut seen = seen.lock().unwrap();
+        if !*seen {
+            internal.rotate(sid);
+            internal.end_grace();
+            *seen = true;
+        }
+    });
+    let before = user_lookups(&h);
+    let b = h.post("refresh", json!({"refresh_token": t0}), None).await;
+    assert!(*rotated.lock().unwrap(), "the hook rotated");
+    assert_eq!(
+        (b.status, code(&b)),
+        (StatusCode::UNAUTHORIZED, "refresh_token_reused"),
+        "{}",
+        b.body
+    );
+    assert_eq!(user_lookups(&h) - before, 1, "one user lookup");
+    assert!(h.internal.session(sid).unwrap().revoked);
 }
 
 /// #59 audit B1: a Zitadel user lookup slower than the refresh bound is a fault: 503, and the

@@ -1066,8 +1066,13 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
 /// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
 ///   revokes on reuse); a user that `refresh` names but peek didn't check is checked after it.
 ///
-/// The lookup bound keeps a request that peeked a current token just before a parallel one
-/// rotated it inside that rotation's grace when it reaches `refresh`.
+/// A request that peeked a current token just before a parallel one rotated it reaches
+/// `refresh` holding a grace token. [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP) caps
+/// the lookup at half of [`APP_REFRESH_GRACE`](chelabase_auth::app_token::APP_REFRESH_GRACE)
+/// or less (4 s of 10 s, checked at compile time), so it gets the grace answer provided the
+/// peek's reply, the `refresh` call and its row lock take under the remaining ~6 s. If they
+/// take longer, the grace has ended: `refresh` answers `refresh_token_reused` and revokes the
+/// session, an accepted residual (#59 second audit).
 /// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
 /// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {

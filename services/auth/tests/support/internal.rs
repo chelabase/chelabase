@@ -447,6 +447,17 @@ impl FakeInternal {
         }
     }
 
+    /// Another request refreshes session `id`: its current token becomes the previous one, in
+    /// its grace. Returns the new current token.
+    pub fn rotate(&self, id: Uuid) -> String {
+        let mut st = self.inner.lock().unwrap();
+        let next = new_token(&mut st, id);
+        let x = st.sessions.get_mut(&id).unwrap();
+        x.previous = Some(std::mem::replace(&mut x.token, next.clone()));
+        x.grace_over = false;
+        next
+    }
+
     /// The number of calls to `call` (`"POST /internal/app/sessions/refresh"`).
     pub fn count(&self, call: &str) -> usize {
         self.calls().iter().filter(|(c, _)| c == call).count()

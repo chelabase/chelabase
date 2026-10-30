@@ -11,7 +11,7 @@ pub use internal::{AppBranchInfo, InternalClient};
 use crate::config::AppConfig;
 use crate::zitadel::Zitadel;
 use anyhow::Context;
-use chelabase_auth::app_token::AppTokenSigner;
+use chelabase_auth::app_token::{APP_REFRESH_GRACE, AppTokenSigner};
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_query::app_users::{PgUsersDb, UsersDb};
 use chelabase_query::server_tls::ServerTls;
@@ -25,11 +25,14 @@ pub const CODE_TEMPLATE: &str = "{{.Code}}";
 pub const BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
 /// How long a refresh waits for Zitadel's user answer before it answers 503 (#59 audit B1).
 /// A refresh checks the user between the orchestrator's peek and its rotation, and the
-/// orchestrator keeps a replaced token answerable for only 10 s (`REFRESH_GRACE`): a parallel
-/// request that peeked the current token just before another rotated it must still reach
-/// `refresh` inside that window. So the lookup is bounded well below it, leaving room for the
-/// two orchestrator calls. Other Zitadel calls keep the client's own 10 s timeout.
-pub const REFRESH_USER_LOOKUP: Duration = Duration::from_secs(4);
+/// orchestrator keeps a replaced token answerable for only [`APP_REFRESH_GRACE`] (10 s): a
+/// request that peeked the current token just before a parallel one rotated it must still
+/// reach `refresh` inside that window. So the lookup takes at most 2/5 of the grace (4 s),
+/// leaving the rest (6 s) for the peek's reply, the `refresh` call and its row lock. Other
+/// Zitadel calls keep the client's own 10 s timeout.
+pub const REFRESH_USER_LOOKUP: Duration =
+    Duration::from_millis(APP_REFRESH_GRACE.as_millis() as u64 * 2 / 5);
+const _: () = assert!(REFRESH_USER_LOOKUP.as_millis() * 2 <= APP_REFRESH_GRACE.as_millis());
 
 pub struct AppUsers {
     pub verifier: InternalVerifier,
