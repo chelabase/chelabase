@@ -30,8 +30,9 @@ const MAX_REQUEST_ID_LEN: usize = 128;
 /// gateway-minted identity.
 /// The end-user token header; checked by the gateway, never forwarded.
 pub const USER_TOKEN_HEADER: &str = "chelabase-user";
-/// An app server's own secret key, sent beside its public key to vouch for
-/// [`CLIENT_IP_HEADER`]; checked by the gateway, never forwarded.
+/// An app server's own secret key, sent beside its public key on the app auth routes: with
+/// [`CLIENT_IP_HEADER`] it vouches for that address, without a usable one it marks the call
+/// server-vouched (auth skips its per-IP limits). Checked by the gateway, never forwarded.
 pub const SERVER_KEY_HEADER: &str = "chelabase-server-key";
 /// The app user's address as the app's server saw it. Believed only on the app auth routes
 /// (`Auth::PublicDataKey`) and only with the branch's secret key in [`SERVER_KEY_HEADER`];
@@ -256,8 +257,10 @@ impl Pipeline {
                     .authenticate_key(endpoint.service, req, secret_only, public_only, request_id)
                     .await
                 {
-                    Ok((token, vouched)) => {
-                        client_ip = vouched.or(client_ip);
+                    Ok((token, vouch)) => {
+                        if let Vouch::ClientIp(ip) = vouch {
+                            client_ip = Some(ip);
+                        }
                         Some(token)
                     }
                     Err(mut resp) => {
@@ -360,8 +363,8 @@ impl Pipeline {
 
     /// Resolve the data API key from `Authorization: Bearer` and mint an
     /// internal identity for `service`. Errors use the data API error body. On a public-only
-    /// route (the app auth routes) it also returns the client address the app's server
-    /// vouched for, if any ([`Self::vouched_client_ip`]).
+    /// route (the app auth routes) it also returns what the app's server vouched for, if
+    /// anything ([`Self::server_vouch`]); a server-vouched call is marked in the identity.
     async fn authenticate_key(
         &self,
         service: Service,
@@ -369,7 +372,7 @@ impl Pipeline {
         secret_only: bool,
         public_only: bool,
         request_id: &str,
-    ) -> Result<(String, Option<IpAddr>), GatewayResponse> {
+    ) -> Result<(String, Vouch), GatewayResponse> {
         let key = bearer_token(req.headers).ok_or(KeyError::Missing).map_err(key_error)?;
         let resolved = self.keys.resolve(key, req.client_ip).await.map_err(key_error)?;
         if let Some(refused) = key_kind_refusal(secret_only, public_only, resolved.kind) {
@@ -407,10 +410,10 @@ impl Pipeline {
                 )
             }
         };
-        let vouched = if public_only {
-            self.vouched_client_ip(req, &resolved).await
+        let vouch = if public_only {
+            self.server_vouch(req, &resolved).await
         } else {
-            None
+            Vouch::None
         };
         let identity = Identity {
             sub: resolved.key_id.to_string(),
@@ -426,7 +429,7 @@ impl Pipeline {
                 databases: resolved.databases,
                 project_id: Some(resolved.project_id),
                 role_oid,
-                server_vouched: false,
+                server_vouched: vouch == Vouch::Server,
             }),
             email: None,
             name: None,
@@ -435,35 +438,44 @@ impl Pipeline {
             error!("mint internal identity: {err}");
             internal_key_error(request_id)
         })?;
-        Ok((token, vouched))
+        Ok((token, vouch))
     }
 
-    /// The address in [`CLIENT_IP_HEADER`] when [`SERVER_KEY_HEADER`] holds the secret key of
-    /// the public key's branch, else None (the request keeps the address the gateway settled
-    /// on). Never an error: a misconfigured app server degrades to its own address. The server
-    /// key is looked up only once the address parses, and its lookup is charged to the real
-    /// client address's miss limit. Logs never hold either header's value.
-    async fn vouched_client_ip(&self, req: &RequestParts<'_>, public: &ResolvedKey) -> Option<IpAddr> {
-        if !req.headers.contains_key(CLIENT_IP_HEADER) {
-            return None;
+    /// What the app's server vouches for when [`SERVER_KEY_HEADER`] holds the secret key of the
+    /// public key's branch: the address in [`CLIENT_IP_HEADER`] when that is one IP literal,
+    /// else the call itself ([`Vouch::Server`]; the malformed or absent address is not used).
+    /// Anything less is [`Vouch::None`] (the request keeps the address the gateway settled on).
+    /// Never an error: a misconfigured app server degrades to its own address. The server key
+    /// is looked up whenever it is sent, and its lookup is charged to the real client
+    /// address's miss limit. Logs never hold either header's value.
+    async fn server_vouch(&self, req: &RequestParts<'_>, public: &ResolvedKey) -> Vouch {
+        if !req.headers.contains_key(SERVER_KEY_HEADER) {
+            if req.headers.contains_key(CLIENT_IP_HEADER) {
+                debug!("ignoring chelabase-client-ip: no chelabase-server-key");
+            }
+            return Vouch::None;
         }
-        let Some(ip) = asserted_client_ip(req.headers) else {
-            debug!("ignoring chelabase-client-ip: not one IP address");
-            return None;
-        };
         let Some(server_key) = single_header(req.headers, SERVER_KEY_HEADER) else {
-            debug!("ignoring chelabase-client-ip: no single chelabase-server-key");
-            return None;
+            debug!("ignoring chelabase-server-key: not one header line");
+            return Vouch::None;
         };
         match self.keys.resolve(server_key, req.client_ip).await {
-            Ok(server) if server_key_vouches(public, &server) => Some(ip),
+            Ok(server) if server_key_vouches(public, &server) => match asserted_client_ip(req.headers) {
+                Some(ip) => Vouch::ClientIp(ip),
+                None => {
+                    if req.headers.contains_key(CLIENT_IP_HEADER) {
+                        debug!("ignoring chelabase-client-ip: not one IP address; the call is server-vouched");
+                    }
+                    Vouch::Server
+                }
+            },
             Ok(_) => {
-                debug!("ignoring chelabase-client-ip: chelabase-server-key isn't this branch's secret key");
-                None
+                debug!("ignoring chelabase-server-key: not this branch's secret key");
+                Vouch::None
             }
             Err(err) => {
-                debug!(?err, "ignoring chelabase-client-ip: chelabase-server-key didn't resolve");
-                None
+                debug!(?err, "ignoring chelabase-server-key: it didn't resolve");
+                Vouch::None
             }
         }
     }
@@ -560,6 +572,17 @@ fn data_error(status: u16, code: &str, message: &str) -> GatewayResponse {
 
 fn internal_key_error(request_id: &str) -> GatewayResponse {
     data_error(500, "internal", &format!("internal error (request id {request_id})"))
+}
+
+/// What an app's server vouched for with the branch's secret key ([`Pipeline::server_vouch`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vouch {
+    /// Nothing: no valid server key, or not an app auth route.
+    None,
+    /// The user's address: auth rate-limits it per IP (#49).
+    ClientIp(IpAddr),
+    /// The call, without a usable address: auth skips its per-IP limits (#55).
+    Server,
 }
 
 /// [`CLIENT_IP_HEADER`] when it is exactly one header line holding one IPv4 or IPv6 literal:
@@ -1996,40 +2019,116 @@ mod tests {
                 "two server keys",
                 vec![(SERVER_KEY_HEADER, &k.secret), (SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9")],
             ),
-            ("a port", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9:443")]),
-            ("a list", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9, 10.0.0.1")]),
-            ("brackets", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "[2001:db8::1]")]),
-            ("unknown", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "unknown")]),
-            ("an empty value", vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "")]),
-            (
-                "two header lines",
-                vec![(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9"), (CLIENT_IP_HEADER, "203.0.113.9")],
-            ),
         ];
         for (case, extra) in cases {
-            // No error to the caller: the request goes through as from the peer.
-            let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
-            assert_eq!(plan.client_ip, peer(), "{case}");
+            // No error to the caller: the request goes through as from the peer, and isn't
+            // server-vouched (#55) with or without the client address.
+            for with_ip in [true, false] {
+                let extra: Vec<_> = extra.iter().copied().filter(|(n, _)| with_ip || *n != CLIENT_IP_HEADER).collect();
+                let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
+                assert_eq!(plan.client_ip, peer(), "{case} {with_ip}");
+                let data = h.verify.verify(plan.identity.as_deref().unwrap(), "auth").unwrap().data.unwrap();
+                assert_eq!(data.key_id, k.resolved.key_id, "{case} {with_ip}");
+                assert!(!data.server_vouched, "{case} {with_ip}");
+            }
+        }
+    }
+
+    // ---- an app server vouching for a call without a client address (#55) ----
+
+    /// Whether the plan's minted identity is server-vouched.
+    fn server_vouched(h: &DataHarness, plan: &ProxyPlan) -> bool {
+        h.verify.verify(plan.identity.as_deref().unwrap(), "auth").unwrap().data.unwrap().server_vouched
+    }
+
+    #[tokio::test]
+    async fn the_branchs_secret_key_without_a_client_ip_vouches_for_the_call() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        for path in [SIGN_IN, "/auth/v1/app/refresh", "/auth/v1/app/sign-up"] {
+            let plan = expect_plan(app_call(&h, path, &k.public, &[(SERVER_KEY_HEADER, &k.secret)]).await);
+            assert_eq!(plan.client_ip, peer(), "{path}: the address is unchanged");
+            assert!(server_vouched(&h, &plan), "{path}");
+            // Still the public key's identity.
             let data = h.verify.verify(plan.identity.as_deref().unwrap(), "auth").unwrap().data.unwrap();
-            assert_eq!(data.key_id, k.resolved.key_id, "{case}");
+            assert_eq!((data.key_id, data.kind), (k.resolved.key_id, DataKeyKind::Public), "{path}");
         }
     }
 
     #[tokio::test]
-    async fn a_server_key_is_never_looked_up_without_a_valid_client_ip() {
+    async fn a_malformed_client_ip_with_the_branchs_secret_key_is_server_vouched() {
         let h = data_harness().await;
         let k = app_keys(&h);
-        let unknown = dk::new_key(DataKeyKind::Secret);
-        expect_plan(app_call(&h, SIGN_IN, &k.public, &[]).await);
-        let before = h.mock.lookups();
-        for extra in [
-            vec![(SERVER_KEY_HEADER, unknown.as_str())],
-            vec![(SERVER_KEY_HEADER, unknown.as_str()), (CLIENT_IP_HEADER, "unknown")],
-        ] {
+        let cases: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("a port", vec![(CLIENT_IP_HEADER, "203.0.113.9:443")]),
+            ("a list", vec![(CLIENT_IP_HEADER, "203.0.113.9, 10.0.0.1")]),
+            ("brackets", vec![(CLIENT_IP_HEADER, "[2001:db8::1]")]),
+            ("unknown", vec![(CLIENT_IP_HEADER, "unknown")]),
+            ("an empty value", vec![(CLIENT_IP_HEADER, "")]),
+            ("two header lines", vec![(CLIENT_IP_HEADER, "203.0.113.9"), (CLIENT_IP_HEADER, "203.0.113.9")]),
+        ];
+        for (case, mut extra) in cases {
+            extra.push((SERVER_KEY_HEADER, &k.secret));
+            let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
+            assert_eq!(plan.client_ip, peer(), "{case}: the malformed value is not used");
+            assert!(server_vouched(&h, &plan), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_vouched_client_ip_is_not_server_vouched() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        let plan = expect_plan(
+            app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &k.secret), (CLIENT_IP_HEADER, "203.0.113.9")]).await,
+        );
+        assert_eq!(plan.client_ip, Some("203.0.113.9".parse().unwrap()));
+        assert!(!server_vouched(&h, &plan), "per-IP limits apply to the forwarded address");
+    }
+
+    #[tokio::test]
+    async fn a_browser_call_is_not_server_vouched() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        for extra in [vec![], vec![(CLIENT_IP_HEADER, "203.0.113.9")]] {
             let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &extra).await);
             assert_eq!(plan.client_ip, peer());
+            assert!(!server_vouched(&h, &plan));
         }
-        assert_eq!(h.mock.lookups(), before, "an ignored server key costs no lookup");
+    }
+
+    #[tokio::test]
+    async fn the_claim_is_never_set_on_data_routes() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        expect_plan(app_call(&h, "/data/v1/query", &k.public, &[]).await);
+        let before = h.mock.lookups();
+        for extra in [vec![(SERVER_KEY_HEADER, k.secret.as_str())], vec![]] {
+            let plan = expect_plan(app_call(&h, "/data/v1/query", &k.public, &extra).await);
+            let data = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap().data.unwrap();
+            assert!(!data.server_vouched);
+        }
+        assert_eq!(h.mock.lookups(), before, "the server key is never looked up on a data route");
+    }
+
+    /// The server key is looked up whenever it is sent on an app route, with or without a
+    /// client address; each miss is charged to the real peer.
+    #[tokio::test]
+    async fn an_unknown_server_key_without_a_client_ip_is_charged_to_the_real_peer() {
+        let h = data_harness().await;
+        let k = app_keys(&h);
+        for _ in 0..40 {
+            let unknown = dk::new_key(DataKeyKind::Secret);
+            let plan = expect_plan(app_call(&h, SIGN_IN, &k.public, &[(SERVER_KEY_HEADER, &unknown)]).await);
+            assert_eq!(plan.client_ip, peer());
+            assert!(!server_vouched(&h, &plan));
+        }
+        assert!(h.mock.lookups() <= 25, "the misses were limited: {}", h.mock.lookups());
+        let key = dk::new_key(DataKeyKind::Public);
+        let headers = headers(&[("authorization", &format!("Bearer {key}"))]);
+        let parts =
+            RequestParts { method: "POST", path: "/data/v1/query", host: Some(API), headers: &headers, client_ip: peer() };
+        assert_eq!(expect_response(h.pipeline.handle(&parts).await.outcome).status, 429);
     }
 
     #[tokio::test]

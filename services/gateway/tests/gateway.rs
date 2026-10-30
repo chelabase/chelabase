@@ -1322,7 +1322,8 @@ async fn spawn_key_listener(keys: Vec<(String, serde_json::Value)>) -> String {
 
 /// #49: an app's server signs its user in with its public key, vouches for the user's address
 /// with the branch's secret key, and auth sees that address; a key that doesn't vouch leaves
-/// the peer's. Neither header reaches auth.
+/// the peer's. #55: the secret key without a usable address marks the identity server-vouched.
+/// Neither header reaches auth.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
     use chelabase_types::data_key::{generate, DataKeyKind};
@@ -1356,26 +1357,34 @@ async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
         ],
     )
     .await;
-    let sign_in = |server_key: &str, client_ip: &str| {
-        reqwest::Client::new()
+    let sign_in = |server_key: Option<&str>, client_ip: Option<&str>| {
+        let mut req = reqwest::Client::new()
             .post(format!("{base}/auth/v1/app/sign-in"))
-            .header("authorization", format!("Bearer {public}"))
-            .header("chelabase-server-key", server_key)
-            .header("chelabase-client-ip", client_ip)
-            .body("{}")
-            .send()
+            .header("authorization", format!("Bearer {public}"));
+        if let Some(key) = server_key {
+            req = req.header("chelabase-server-key", key);
+        }
+        if let Some(ip) = client_ip {
+            req = req.header("chelabase-client-ip", ip);
+        }
+        req.body("{}").send()
     };
 
-    // `None`: the header is ignored and auth sees the loopback peer.
-    for (server_key, client_ip, vouched) in [
-        (secret.as_str(), "203.0.113.9", Some("203.0.113.9")),
-        (secret.as_str(), "2001:db8::1", Some("2001:db8::1")),
-        (other_project.as_str(), "203.0.113.9", None),
-        (public.as_str(), "203.0.113.9", None),
-        (secret.as_str(), "203.0.113.9:443", None),
+    // `None`: the header is ignored and auth sees the loopback peer. The last column is
+    // whether the identity is server-vouched (#55).
+    for (server_key, client_ip, vouched, server_vouched) in [
+        (Some(secret.as_str()), Some("203.0.113.9"), Some("203.0.113.9"), false),
+        (Some(secret.as_str()), Some("2001:db8::1"), Some("2001:db8::1"), false),
+        (Some(other_project.as_str()), Some("203.0.113.9"), None, false),
+        (Some(public.as_str()), Some("203.0.113.9"), None, false),
+        (Some(secret.as_str()), Some("203.0.113.9:443"), None, true),
+        (Some(secret.as_str()), None, None, true),
+        (Some(other_project.as_str()), None, None, false),
+        (None, None, None, false),
     ] {
+        let client_ip = client_ip.unwrap_or("-");
         *seen.lock().unwrap() = None;
-        let resp = sign_in(server_key, client_ip).await.unwrap();
+        let resp = sign_in(server_key, (client_ip != "-").then_some(client_ip)).await.unwrap();
         assert_eq!(resp.status(), 200, "{client_ip}");
         let saw = seen.lock().unwrap().clone().expect("auth was called");
         match vouched {
@@ -1387,6 +1396,7 @@ async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
         assert!(!saw.contains_key("authorization"));
         let data = verify.verify(&saw[IDENTITY_HEADER], "auth").unwrap().data.unwrap();
         assert_eq!(data.key_id.to_string(), "11111111-1111-4111-8111-111111111111", "the public key's identity");
+        assert_eq!(data.server_vouched, server_vouched, "{client_ip}");
     }
 
     // The two headers never reach any upstream, even on a public route.
