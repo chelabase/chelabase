@@ -12,6 +12,8 @@ const STALE_MS = 5_000;
 const FATAL = new Set(["refresh_token_reused", "refresh_token_invalid", "user_session_revoked", "user_inactive"]);
 /** A request carrying the access token was refused because its session is over. */
 export const SESSION_GONE = "user_session_revoked";
+/** Answers that mean "signed out" to `currentUser`. */
+const SIGNED_OUT = new Set(["user_token_invalid", "user_token_expired", "user_session_revoked", "refresh_token_invalid"]);
 
 export interface AuthCore<DB extends DatabaseShape> {
   auth: Auth<DB>;
@@ -357,6 +359,26 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     }
   }
 
+  async function currentUser(): Promise<AppUser | null> {
+    try {
+      let token = await accessToken();
+      for (let retry = true; ; retry = false) {
+        if (token === undefined) return null;
+        try {
+          return (await call("user", { method: "GET", token })) as AppUser;
+        } catch (e) {
+          if (!(e instanceof DataApiError)) throw e;
+          if (e.code === SESSION_GONE) await dropSession(token);
+          if (!retry || e.code !== "user_token_expired") throw e;
+          token = await refreshAfterExpiry(token); // one refresh, one retry
+        }
+      }
+    } catch (e) {
+      if (e instanceof DataApiError && SIGNED_OUT.has(e.code)) return null;
+      throw e;
+    }
+  }
+
   const auth: Auth<DB> = {
     async signUp(p) {
       const r = (await flow("sign-up", p)) as Session | { user: AppUser; verification_required?: boolean };
@@ -389,9 +411,18 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
       }
     },
     refresh,
+    async refreshIfNeeded() {
+      try {
+        await accessToken();
+      } catch (e) {
+        // The session ended (and was signed out locally): nothing left to refresh.
+        if (!(e instanceof DataApiError && FATAL.has(e.code))) throw e;
+      }
+    },
     async getUser() {
       return (await userCall("user", { method: "GET" })) as AppUser;
     },
+    currentUser,
     async verifyEmail(p) {
       await call("verify-email", { body: p });
     },
@@ -437,7 +468,9 @@ export function staticAuth<DB extends DatabaseShape>(
     signIn: reject,
     signOut: reject,
     refresh: reject,
+    refreshIfNeeded: reject,
     getUser: reject,
+    currentUser: reject,
     verifyEmail: reject,
     resendCode: reject,
     requestPasswordReset: reject,

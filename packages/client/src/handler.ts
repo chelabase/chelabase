@@ -24,11 +24,15 @@ export interface AuthHandlerOptions {
   siteUrl: string;
   /** More exact origins (`https://host[:port]`) allowed to call the route. No `*`, no `null`. */
   allowedOrigins?: string[];
-  /** A secret (`chk_sec_…`) key; requires `clientIp`. Sent to the gateway only with an IP. */
+  /**
+   * The branch's secret (`chk_sec_…`) key, sent on every upstream call, so sign-ins and
+   * refreshes are limited per email and per user instead of all sharing this server's IP.
+   */
   serverKey?: string;
   /**
-   * The end user's IP for this request, from a header your platform sets and a client can't
-   * forge (e.g. `x-vercel-forwarded-for`). Requires `serverKey`. No header is read by default.
+   * Optional: the end user's IP for this request, from a header your platform sets and a client
+   * can't forge (e.g. `x-vercel-forwarded-for`), to add per-IP limits on top. Requires
+   * `serverKey`. No header is read by default.
    */
   clientIp?: (req: Request) => string | undefined;
   cookieOptions?: CookieOptions;
@@ -69,10 +73,8 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
   if (opts.serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(opts.serverKey)) {
     throw new Error("createAuthHandler: `serverKey` must be a secret (chk_sec_…) key");
   }
-  if ((opts.serverKey === undefined) !== (opts.clientIp === undefined)) {
-    throw new Error(
-      `createAuthHandler: \`serverKey\` and \`clientIp\` go together; \`${opts.serverKey === undefined ? "serverKey" : "clientIp"}\` is missing`,
-    );
+  if (opts.clientIp !== undefined && opts.serverKey === undefined) {
+    throw new Error("createAuthHandler: `clientIp` needs `serverKey`");
   }
   checkCookieOptions(opts.cookieOptions);
   const origins = new Set([originOf(opts.siteUrl, "siteUrl")]);
@@ -129,10 +131,10 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
       "content-type": "application/json",
       accept: "application/json",
     };
-    const ip = clientIp?.(req);
-    if (serverKey !== undefined && ip !== undefined && ip !== "") {
+    if (serverKey !== undefined) {
       headers["chelabase-server-key"] = serverKey;
-      headers["chelabase-client-ip"] = ip;
+      const ip = clientIp?.(req);
+      if (ip !== undefined && ip !== "") headers["chelabase-client-ip"] = ip;
     }
 
     let body: unknown;

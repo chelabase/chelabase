@@ -329,7 +329,20 @@ export interface Auth<DB extends DatabaseShape, S = Session> {
   signIn(p: { email: string; password: string }): Promise<S>;
   signOut(): Promise<void>;
   refresh(): Promise<S>;
+  /**
+   * Makes sure the session is fresh: refreshes only when the access token is missing or about
+   * to expire (on the server, only with `cookies.setAll`), and sends nothing otherwise. Resolves
+   * when there is no session or it has just ended; rejects on other errors.
+   */
+  refreshIfNeeded(): Promise<void>;
+  /** The signed-in user (rejects when signed out). See `currentUser` for `null` instead. */
   getUser(): Promise<AppUser>;
+  /**
+   * The signed-in user, asked of the gateway, or `null` when signed out: no session (no
+   * request is made), or the session is invalid, expired after one refresh, or revoked.
+   * Other errors reject.
+   */
+  currentUser(): Promise<AppUser | null>;
   verifyEmail(p: { email: string; code: string }): Promise<void>;
   resendCode(p: { email: string }): Promise<void>;
   requestPasswordReset(p: { email: string }): Promise<void>;

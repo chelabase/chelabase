@@ -214,16 +214,33 @@ describe("createAuthHandler", () => {
     expect((await h(req("sign-in", { body: {} }))).status).toBe(404);
   });
 
-  test("server_key_without_client_ip_is_refused_and_no_header_is_read", async () => {
-    // Without the clientIp option there is no IP to send, so the server key can't be given alone.
-    expect(() => handler(gateway({}), { serverKey })).toThrow(/serverKey.*clientIp/);
-    // And without either, a forwarded-for header never reaches the gateway.
-    const gw = gateway({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
-    await handler(gw)(req("sign-in", { body: { email: "a@b.co", password: "pw" }, headers: { "x-forwarded-for": "1.2.3.4" } }));
-    expect(gw.calls).toHaveLength(1);
-    expect(hdr(gw.calls[0]!, "chelabase-client-ip")).toBeNull();
-    expect(hdr(gw.calls[0]!, "chelabase-server-key")).toBeNull();
-    expect(hdr(gw.calls[0]!, "x-forwarded-for")).toBeNull();
+  test("server_key_alone_is_sent_without_a_client_ip_and_no_header_is_read", async () => {
+    const gw = gateway({
+      "/auth/v1/app/sign-in": () => ({ body: session(1) }),
+      "/auth/v1/app/refresh": () => ({ body: session(2) }),
+    });
+    const h = handler(gw, { serverKey });
+    const headers = { "x-forwarded-for": "1.2.3.4", "x-vercel-forwarded-for": "203.0.113.9" };
+    await h(req("sign-in", { body: { email: "a@b.co", password: "pw" }, headers }));
+    await h(req("refresh", { cookies: { [REFRESH]: "rt1" }, headers }));
+    expect(gw.calls).toHaveLength(2);
+    for (const c of gw.calls) {
+      expect(hdr(c, "chelabase-server-key")).toBe(serverKey);
+      expect(hdr(c, "chelabase-client-ip")).toBeNull();
+      expect(hdr(c, "x-forwarded-for")).toBeNull();
+    }
+    // Without either, nothing extra reaches the gateway.
+    const plain = gateway({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
+    await handler(plain)(req("sign-in", { body: { email: "a@b.co", password: "pw" }, headers }));
+    expect(hdr(plain.calls[0]!, "chelabase-client-ip")).toBeNull();
+    expect(hdr(plain.calls[0]!, "chelabase-server-key")).toBeNull();
+    expect(hdr(plain.calls[0]!, "x-forwarded-for")).toBeNull();
+  });
+
+  test("client_ip_needs_server_key", () => {
+    const f = () => handler(gateway({}), { clientIp: () => "203.0.113.9" });
+    expect(f).toThrow(/`clientIp` needs `serverKey`/);
+    expect(f).not.toThrow(key.slice(8));
   });
 
   test("client_ip_option_supplies_the_ip_with_the_server_key", async () => {
@@ -237,10 +254,13 @@ describe("createAuthHandler", () => {
     );
     expect(hdr(gw.calls[0]!, "chelabase-client-ip")).toBe("203.0.113.9");
     expect(hdr(gw.calls[0]!, "chelabase-server-key")).toBe(serverKey);
-    // No IP for this request: neither header.
+    // No IP (absent or empty) for this request: the server key alone.
     await h(req("sign-in", { body: { email: "a@b.co", password: "pw" } }));
-    expect(hdr(gw.calls[1]!, "chelabase-client-ip")).toBeNull();
-    expect(hdr(gw.calls[1]!, "chelabase-server-key")).toBeNull();
+    await h(req("sign-in", { body: { email: "a@b.co", password: "pw" }, headers: { "x-vercel-forwarded-for": "" } }));
+    for (const c of gw.calls.slice(1)) {
+      expect(hdr(c, "chelabase-client-ip")).toBeNull();
+      expect(hdr(c, "chelabase-server-key")).toBe(serverKey);
+    }
   });
 
   test("key_shapes_are_checked_without_quoting_them", () => {

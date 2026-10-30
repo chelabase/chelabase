@@ -354,6 +354,42 @@ describe("createBrowserClient", () => {
   });
 });
 
+describe("createBrowserClient refreshIfNeeded and currentUser", () => {
+  test("refresh_if_needed_sends_nothing_for_a_fresh_cookie_and_refreshes_a_stale_one", async () => {
+    cookieJar.set(ACCESS, jwt(nowSecs() + 600, 1));
+    const f1 = router({});
+    await createBrowserClient({ url, key, fetch: f1 }).auth.refreshIfNeeded();
+    expect(f1.calls).toHaveLength(0);
+
+    cookieJar.set(ACCESS, jwt(nowSecs() - 10, 0));
+    const fresh = jwt(nowSecs() + 600, 2);
+    const f2 = router({ "/api/chelabase/auth/refresh": refreshRoute(() => fresh) });
+    const db = createBrowserClient({ url, key, fetch: f2 });
+    await db.auth.refreshIfNeeded();
+    expect(f2.paths()).toEqual(["/api/chelabase/auth/refresh"]);
+    await db.auth.refreshIfNeeded();
+    expect(f2.calls).toHaveLength(1);
+  });
+
+  test("current_user_is_null_without_a_cookie_or_when_revoked", async () => {
+    const f1 = router({});
+    expect(await createBrowserClient({ url, key, fetch: f1 }).auth.currentUser()).toBeNull();
+    expect(f1.calls).toHaveLength(0);
+
+    cookieJar.set(ACCESS, jwt(nowSecs() + 600, 1));
+    const f2 = router({ "/auth/v1/app/user": () => err(401, "user_session_revoked") });
+    expect(await createBrowserClient({ url, key, fetch: f2 }).auth.currentUser()).toBeNull();
+    expect(cookieJar.has(ACCESS)).toBe(false);
+
+    cookieJar.set(ACCESS, jwt(nowSecs() + 600, 1));
+    const f3 = router({ "/auth/v1/app/user": () => ({ body: user }) });
+    expect(await createBrowserClient({ url, key, fetch: f3 }).auth.currentUser()).toEqual(user);
+
+    const f4 = router({ "/auth/v1/app/user": () => err(503, "unavailable") });
+    await expect(createBrowserClient({ url, key, fetch: f4 }).auth.currentUser()).rejects.toMatchObject({ status: 503 });
+  });
+});
+
 describe("createBrowserClient options", () => {
   test("a_secret_or_malformed_key_throws_without_quoting_it", () => {
     const secret = "chk_sec_zyxwvutsrqponmlkjihgfedcbaZYXWVUTSRQPONMLKJIH";

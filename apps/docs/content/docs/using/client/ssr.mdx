@@ -49,18 +49,15 @@ Use two helpers. The Server Component one has no `setAll`. The other one can wri
 ```ts
 // lib/chelabase/server.ts
 import { createServerClient } from "@chelabase/client/server";
-import { cookies, headers } from "next/headers";
+import { cookies } from "next/headers";
 import { type Database, types } from "./db";
 
 const base = {
   url: process.env.CHELABASE_URL!,
   key: process.env.CHELABASE_PUBLIC_KEY!,
+  serverKey: process.env.CHELABASE_SECRET_KEY!, // see "What the secret key does"
   types,
 };
-
-async function clientIp() {
-  return (await headers()).get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
-}
 
 // Server Components: reads the session, never writes cookies.
 export async function createReadOnlyClient() {
@@ -71,10 +68,8 @@ export async function createReadOnlyClient() {
 // Server Actions and route handlers: can sign in and out, and refresh.
 export async function createActionClient() {
   const store = await cookies();
-  const ip = await clientIp();
   return createServerClient<Database>({
     ...base,
-    ...(ip ? { serverKey: process.env.CHELABASE_SECRET_KEY!, clientIp: ip } : {}),
     cookies: {
       getAll: () => store.getAll(),
       setAll: (list) => list.forEach((c) => store.set(c.name, c.value, c.options)),
@@ -98,7 +93,6 @@ export const POST = createAuthHandler({
   key: process.env.CHELABASE_PUBLIC_KEY!,
   siteUrl: process.env.SITE_URL!, // https://app.example.com
   serverKey: process.env.CHELABASE_SECRET_KEY!,
-  clientIp: (req) => req.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
 });
 ```
 
@@ -115,11 +109,10 @@ import { type NextRequest, NextResponse } from "next/server";
 
 export async function proxy(request: NextRequest) {
   let response = NextResponse.next({ request });
-  const ip = request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
   const db = createServerClient({
     url: process.env.CHELABASE_URL!,
     key: process.env.CHELABASE_PUBLIC_KEY!,
-    ...(ip ? { serverKey: process.env.CHELABASE_SECRET_KEY!, clientIp: ip } : {}),
+    serverKey: process.env.CHELABASE_SECRET_KEY!,
     cookies: {
       getAll: () => request.cookies.getAll(),
       setAll(list) {
@@ -129,11 +122,7 @@ export async function proxy(request: NextRequest) {
       },
     },
   });
-  try {
-    await db.auth.getUser(); // refreshes first when the access token is about to expire
-  } catch {
-    // signed out: nothing to refresh
-  }
+  await db.auth.refreshIfNeeded(); // a request only when the access token is about to expire
   return response;
 }
 
@@ -144,11 +133,11 @@ export const config = {
 
 The matcher leaves out the auth route: the handler refreshes on its own, and running the proxy there too would rotate the refresh token twice.
 
-`getUser()` in the proxy makes a gateway round trip on every request the matcher lets through. If that matters, narrow the matcher to the pages that need a fresh session.
+`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. It rejects only when the refresh fails some other way, such as the gateway being down.
 
 ### A page that needs a user
 
-Decide who the user is with `db.auth.getUser()`, which asks the gateway. Never decide from the cookie: its contents are only used to decide whether to refresh, and anyone can set a cookie in their own browser.
+Decide who the user is with `db.auth.currentUser()`, which asks the gateway and gives `null` when nobody is signed in (or the session has ended). Never decide from the cookie: its contents are only used to decide whether to refresh, and anyone can set a cookie in their own browser.
 
 ```tsx
 // app/dashboard/page.tsx
@@ -157,7 +146,7 @@ import { createReadOnlyClient } from "@/lib/chelabase/server";
 
 export default async function Dashboard() {
   const db = await createReadOnlyClient();
-  const user = await db.auth.getUser().catch(() => null);
+  const user = await db.auth.currentUser();
   if (!user) redirect("/sign-in");
   const orders = await db.from("orders").select("id", "total").limit(20);
   return <p>{user.email} has {orders.length} orders.</p>;
@@ -192,7 +181,7 @@ export function SignInForm() {
 }
 ```
 
-From a Server Action, call `db.auth.signIn` on `createActionClient()`. A server client without `setAll` refuses `signIn`, `signUp`, `changePassword`, `refresh` and `signOut`, because a session it can't keep would be lost.
+From a Server Action, call `db.auth.signIn` on `createActionClient()`, and `db.auth.currentUser()` to check who is acting. A server client without `setAll` refuses `signIn`, `signUp`, `changePassword`, `refresh` and `signOut`, because a session it can't keep would be lost.
 
 ## Environment
 
@@ -207,9 +196,35 @@ NEXT_PUBLIC_CHELABASE_KEY=chk_pub_…
 
 The public key may be public. The secret key must stay on the server: never name it `NEXT_PUBLIC_…`.
 
-### Why the secret key is sent
+That's all: the server needs the URL, the public key and the secret key (plus `SITE_URL` for the auth route), and the browser the URL and the public key.
 
-The gateway rate-limits sign-in (10 a minute) and refresh (120 a minute) per client IP. From your server, every user would arrive from the server's IP. With `serverKey` and `clientIp`, the client sends `chelabase-server-key` and `chelabase-client-ip` on auth calls, and the gateway counts the user's address instead. It only does so for a secret key of the same project and branch as the public key; any other combination is ignored. Neither header reaches the auth service, and data requests never carry them.
+### What the secret key does
+
+Chelabase limits how often anyone can try to sign in (for example, 10 sign-ins a minute from one IP address), so nobody can guess passwords at full speed. In a server-rendered app every sign-in and refresh comes from your server, so they all look like one IP address. Without `serverKey` everything still works, but your whole app shares that one IP's limits: the 11th person signing in within a minute is turned away.
+
+With `serverKey`, your server proves the call comes from your app. Chelabase then skips the per-IP limits for it and keeps the ones that follow a person: wrong passwords are still counted per email address, and the other limits per email or per user. Refreshes have no per-user limit, which is safe: a refresh token can't be guessed, and reusing an old one is detected and ends the session.
+
+The secret key is only sent on auth calls, never on data requests, and only counts when it belongs to the same project and branch as the public key; any other key is ignored.
+
+### Also limit per IP
+
+If you want per-IP limits as well, pass the user's IP address as `clientIp` next to `serverKey`. Limits then apply per email, per user and per address.
+
+```ts
+// The auth route
+export const POST = createAuthHandler({
+  // …url, key, siteUrl and serverKey as above
+  clientIp: (req) => req.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+
+// The proxy, and createActionClient (with `(await headers())` from next/headers)
+createServerClient({
+  // …as above
+  clientIp: request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+```
+
+`clientIp` needs `serverKey`: creating a client with only `clientIp` throws. When it is empty or `undefined` for a request, only the secret key is sent.
 
 `clientIp` must come from a header your platform sets and a client can't forge:
 
@@ -220,7 +235,7 @@ The gateway rate-limits sign-in (10 a minute) and refresh (120 a minute) per cli
 | Netlify | `x-nf-client-connection-ip` |
 | Your own reverse proxy | A header it overwrites on every request, such as `X-Real-IP $remote_addr` in nginx |
 
-Vercel overwrites these headers with the address it saw, so they only name your user when nothing else sits in front of Vercel. A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it. `serverKey` and `clientIp` go together; creating a client with only one throws.
+Vercel overwrites these headers with the address it saw, so they only name your user when nothing else sits in front of Vercel. A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it.
 
 If your app runs from fixed addresses, there is an alternative: add them to `CHELABASE_GATEWAY_TRUSTED_PROXIES` on the gateway (see [Hosts](/docs/self-hosting/hosts)) and forward the user's address in `X-Forwarded-For`.
 
@@ -252,7 +267,7 @@ export async function handle(req: Request): Promise<Response> {
       },
     },
   });
-  const user = await db.auth.getUser().catch(() => null);
+  const user = await db.auth.currentUser();
   const res = Response.json({ email: user?.email ?? null });
   for (const c of out) res.headers.append("set-cookie", c);
   return res;
@@ -266,11 +281,11 @@ export async function handle(req: Request): Promise<Response> {
 - Data requests use the public key only. A secret key with a user token is refused (`user_token_with_secret_key`), so `serverKey` is only sent on auth calls.
 - Make one server client per request. Never keep one at module level.
 - A server client without `setAll` (a Server Component) can't refresh. Once the token has expired, it runs as an anonymous caller. Do writes from Server Actions or route handlers, which have `setAll`.
-- `serverKey` and `clientIp` go together on `createServerClient` and `createAuthHandler`.
+- `clientIp` needs `serverKey` on `createServerClient` and `createAuthHandler`; `serverKey` works alone.
 - The handler checks `Origin` against `siteUrl` and `allowedOrigins`, and only accepts JSON `POST`. `req.url` is not used for this, since behind a proxy it is the internal address.
 - Trust `clientIp` headers only from your own platform, and only if a client can't set them.
 - Don't log request headers on the server: they hold the cookies, and on auth calls the secret key.
-- Who the user is comes from `db.auth.getUser()`, never from the readable access cookie.
+- Who the user is comes from `db.auth.currentUser()` (or `getUser()`, which rejects when signed out), never from the readable access cookie.
 
 ## Cookies
 
