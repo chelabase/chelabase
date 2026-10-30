@@ -9,8 +9,10 @@
   "exports": {
     ".": "./src/index.ts",
     "./server": {
+      "edge-light": "./src/server.ts",
+      "workerd": "./src/server.ts",
+      "node": "./src/server.ts",
       "browser": "./src/server-browser.ts",
-      "worker": "./src/server-browser.ts",
       "default": "./src/server.ts"
     }
   },

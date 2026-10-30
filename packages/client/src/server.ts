@@ -80,15 +80,15 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
 
   async function onSession(s: Parameters<typeof sessionCookies>[1]) {
     if (setAll === undefined) {
-      // Nothing to clear without `setAll`; a new session would be lost, so it is refused.
+      // Nothing to clear without `setAll`; the methods that issue a session are refused below.
       if (s !== null) throw new Error("createServerClient: db.auth needs `cookies.setAll` to keep a session");
       return;
     }
     await setAll(sessionCookies(names, s, opts.cookieOptions));
   }
 
-  return buildClient<DB, B>("createServerClient", opts, (base, doFetch) => ({
-    core: createAuth<DB>({
+  return buildClient<DB, B>("createServerClient", opts, (base, doFetch) => {
+    const core = createAuth<DB>({
       base,
       key: opts.key,
       fetch: doFetch,
@@ -97,7 +97,20 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
       // Without `setAll` a refresh could never be written back: the old token would be
       // revoked after the grace window, so the refresh token isn't even looked at.
       server: { access, refresh: setAll === undefined ? undefined : refresh, onSession, headers },
-    }),
-    retryExpired: true,
-  }));
+    });
+    if (setAll === undefined) {
+      // A session issued here would be lost (and a rotated refresh token revoked): refuse before
+      // asking the server for one.
+      const refuse = (method: string) => () =>
+        Promise.reject(new Error(`createServerClient: db.auth.${method} needs \`cookies.setAll\` to keep the session`));
+      core.auth = {
+        ...core.auth,
+        signIn: refuse("signIn"),
+        signUp: refuse("signUp"),
+        changePassword: refuse("changePassword"),
+        refresh: refuse("refresh"),
+      };
+    }
+    return { core, retryExpired: true };
+  });
 }

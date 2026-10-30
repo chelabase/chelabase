@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 import type { CookieToSet } from "./cookies.ts";
@@ -287,12 +288,24 @@ describe("createServerClient", () => {
     expect(j.m.size).toBe(0);
   });
 
-  test("sign_in_without_set_all_throws", async () => {
-    const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }), "/data/v1/query": () => ({ body: [] }) });
-    const db = createServerClient({ url, key, fetch, cookies: jar().readOnly });
-    await expect(db.auth.signIn({ email: "a@b.co", password: "pw" })).rejects.toThrow(/setAll/);
-    await db.from("t").select("id");
-    expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
+  test("session_issuing_auth_without_set_all_rejects_before_any_fetch", async () => {
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1) }),
+      "/auth/v1/app/sign-up": () => ({ status: 201, body: session(1) }),
+      "/auth/v1/app/change-password": () => ({ body: session(2) }),
+      "/auth/v1/app/refresh": () => ({ body: session(2) }),
+    });
+    const access = jwt(nowSecs() + 60, 1);
+    const db = createServerClient({ url, key, fetch, cookies: jar({ [ACCESS]: access, [REFRESH]: "rt1" }).readOnly });
+    for (const call of [
+      () => db.auth.signIn({ email: "a@b.co", password: "pw" }),
+      () => db.auth.signUp({ email: "a@b.co", password: "pw" }),
+      () => db.auth.changePassword({ currentPassword: "pw", password: "pw2" }),
+      () => db.auth.refresh(),
+    ]) {
+      await expect(call()).rejects.toThrow(/cookies\.setAll/);
+    }
+    expect(fetch.calls).toHaveLength(0);
   });
 
   test("server_key_and_client_ip_go_only_to_the_auth_api", async () => {
@@ -388,7 +401,8 @@ describe("createServerClient", () => {
 
 describe("@chelabase/client/server resolution", () => {
   const pkgDir = fileURLToPath(new URL("..", import.meta.url));
-  const resolve = (conditions: string[]) =>
+  /** Node's own resolver, which always adds the `node`, `import` and `default` conditions. */
+  const nodeResolve = (conditions: string[]) =>
     execFileSync(
       process.execPath,
       [
@@ -399,11 +413,32 @@ describe("@chelabase/client/server resolution", () => {
       ],
       { cwd: pkgDir, encoding: "utf8" },
     ).trim();
+  /** A bundler's view: the first key of the `./server` entry in an active condition (or `default`) wins. */
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+    exports: Record<string, string | Record<string, string>>;
+  };
+  const bundlerResolve = (conditions: string[]) => {
+    const entry = pkg.exports["./server"]!;
+    if (typeof entry === "string") return entry;
+    const hit = Object.keys(entry).find((k) => k === "default" || conditions.includes(k));
+    return hit === undefined ? undefined : entry[hit];
+  };
 
-  test("browser_and_worker_resolve_to_the_throwing_stub", async () => {
-    expect(resolve([])).toMatch(/\/src\/server\.ts$/);
-    expect(resolve(["browser"])).toMatch(/\/src\/server-browser\.ts$/);
-    expect(resolve(["worker"])).toMatch(/\/src\/server-browser\.ts$/);
+  test("browser_resolves_to_the_stub_and_server_runtimes_to_server_ts", async () => {
+    expect(nodeResolve([])).toMatch(/\/src\/server\.ts$/);
+    expect(nodeResolve(["worker"])).toMatch(/\/src\/server\.ts$/);
+    expect(bundlerResolve(["browser", "import"])).toBe("./src/server-browser.ts");
+    for (const set of [
+      ["edge-light"],
+      ["workerd"],
+      ["node"],
+      ["worker"],
+      ["edge-light", "worker", "browser"], // Next.js edge (middleware)
+      ["workerd", "worker", "browser"], // wrangler
+      [],
+    ]) {
+      expect(bundlerResolve([...set, "import"]), set.join("+")).toBe("./src/server.ts");
+    }
     await expect(import("./server-browser.ts")).rejects.toThrow(/only on the server/);
   });
 });
