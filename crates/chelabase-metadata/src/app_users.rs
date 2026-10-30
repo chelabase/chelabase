@@ -206,8 +206,10 @@ pub enum RefreshOutcome {
 /// ([`MetadataClient::peek_app_session`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeekOutcome {
-    /// The current token, or the previous one within its grace: a refresh would answer.
-    Live(AppSession),
+    /// The current token (`grace: false`), or the previous one within its grace
+    /// (`grace: true`): a refresh would answer. A grace token's refresh writes nothing, but
+    /// it is reuse once the grace ends, so a caller acts on it before the grace runs out.
+    Live { session: AppSession, grace: bool },
     /// The previous token after its grace: a refresh would revoke the session.
     Reused,
     /// Unknown session, another project's, revoked, expired or a token that matches neither.
@@ -767,14 +769,14 @@ impl MetadataClient {
         let current: Vec<u8> = row.get("refresh_hash");
         let previous: Option<Vec<u8>> = row.get("prev_refresh_hash");
         Ok(if current.as_slice() == presented.as_slice() {
-            PeekOutcome::Live(session)
+            PeekOutcome::Live { session, grace: false }
         } else if previous.as_deref() == Some(presented.as_slice()) {
             // The grace answer needs the sealed token too, as in `refresh_app_session`; peek
             // only checks that it is there and never reads it.
             let grace_until: Option<DateTime<Utc>> = row.get("grace_until");
             let sealed: bool = row.get("has_sealed");
             match grace_until {
-                Some(until) if until > now && sealed => PeekOutcome::Live(session),
+                Some(until) if until > now && sealed => PeekOutcome::Live { session, grace: true },
                 _ => PeekOutcome::Reused,
             }
         } else {
