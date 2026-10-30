@@ -4,8 +4,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { LandingPage } from "./landing-page";
 import { forkCount } from "./shore-scene";
 import { TideGauge } from "./tide-gauge";
+import { GITHUB_URL } from "@/site-urls";
 
-const renderPage = (studioUrl = "https://s.test") => render(<LandingPage studioUrl={studioUrl} />);
+const DOCS = "https://docs.test";
+const renderPage = () => render(<LandingPage docsUrl={DOCS} />);
+
+const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"];
 
 describe("LandingPage", () => {
   it("leads_with_the_chelabase_name", () => {
@@ -13,47 +17,82 @@ describe("LandingPage", () => {
     expect(screen.getByRole("heading", { level: 1, name: "Chelabase" })).toBeInTheDocument();
   });
 
-  it("ctas_link_to_studio", () => {
+  it("ctas_link_to_the_quickstart_and_github", () => {
     renderPage();
-    const starts = screen.getAllByRole("link", { name: "Start free" });
-    const logins = screen.getAllByRole("link", { name: "Log in" });
-    expect(starts.length).toBeGreaterThanOrEqual(2);
-    expect(logins.length).toBeGreaterThanOrEqual(2);
-    for (const a of starts) expect(a.getAttribute("href")).toBe("https://s.test/?signup");
-    for (const a of logins) expect(a.getAttribute("href")).toBe("https://s.test/");
+    const starts = screen.getAllByRole("link", { name: "Get started" });
+    const githubs = screen.getAllByRole("link", { name: "Visit GitHub" });
+    expect(starts.length).toBeGreaterThanOrEqual(3);
+    expect(githubs.length).toBeGreaterThanOrEqual(3);
+    for (const a of starts) expect(a.getAttribute("href")).toBe(`${DOCS}/docs/using/quickstart`);
+    for (const a of githubs) expect(a.getAttribute("href")).toBe(GITHUB_URL);
   });
 
-  it("labels_object_storage_coming_soon", () => {
+  it("get_started_falls_back_to_the_quickstart_mdx_without_a_docs_url", () => {
+    render(<LandingPage />);
+    for (const a of screen.getAllByRole("link", { name: "Get started" })) {
+      expect(a.getAttribute("href")).toBe(`${GITHUB_URL}/blob/main/apps/docs/content/docs/using/quickstart.mdx`);
+    }
+  });
+
+  it("sections_follow_the_agreed_order", () => {
     renderPage();
-    const row = screen.getByRole("listitem", { name: /object storage/i });
-    expect(row).toHaveTextContent(/coming soon/i);
-    expect(row).toHaveTextContent(/SeaweedFS/);
+    const titles = screen.getAllByRole("heading", { level: 2 }).map((h) => h.textContent);
+    expect(titles).toEqual([
+      "Run it on your machine.",
+      "Everything in one place.",
+      "How it compares.",
+      "Manage it from one console.",
+      "Bring your team in.",
+      "Build your app on a typed API.",
+      "Branch it. Reset it. Restore it. Merge it.",
+      "Start with the Quickstart.",
+    ]);
+  });
+
+  it("the_platform_cards_lead_with_databases_studio_auth_and_realtime_and_link_to_their_docs", () => {
+    renderPage();
+    const section = screen.getByRole("region", { name: "Everything in one place." });
+    const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace("Coming soon", ""));
+    expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
+    expect(names.slice(-2)).toEqual(["CLI", "Object storage"]);
+    const gateway = within(section).getByRole("link", { name: /^Gateway/ });
+    expect(gateway.getAttribute("href")).toBe(`${DOCS}/docs/architecture/gateway`);
+    expect(within(section).getAllByRole("link")).toHaveLength(names.length - 2);
+  });
+
+  it("labels_the_cli_and_object_storage_coming_soon_without_links", () => {
+    renderPage();
+    for (const name of ["CLI", "Object storage"]) {
+      const card = screen.getByRole("heading", { level: 3, name: new RegExp(`^${name}`) }).parentElement!;
+      expect(card.tagName).not.toBe("A");
+      expect(card).toHaveTextContent(/coming soon/i);
+    }
+    expect(screen.getByRole("heading", { level: 3, name: /^Object storage/ }).parentElement).toHaveTextContent(/SeaweedFS/);
   });
 
   it("marks_the_comparison_as_a_preview_without_numbers", () => {
     renderPage();
     const table = screen.getByRole("table", { name: /comparison preview/i });
-    for (const name of ["Chelabase", "Supabase", "Firebase", "Vanilla Neon", "PlanetScale"]) {
-      expect(within(table).getByRole("columnheader", { name })).toBeInTheDocument();
-    }
     // Chelabase's own column is set in the wordmark, claw C included
     expect(within(table).getByRole("columnheader", { name: "Chelabase" }).querySelector("svg")).not.toBeNull();
     for (const cell of within(table).getAllByRole("cell")) expect(cell.textContent).not.toMatch(/\d/);
     expect(screen.getByText(/benchmarks coming later/i)).toBeInTheDocument();
   });
 
-  it("comparison_has_five_columns_with_planetscale_to_survey", () => {
+  it("comparison_columns_split_planetscale_and_every_cell_is_surveyed", () => {
     renderPage();
     const table = screen.getByRole("table", { name: /comparison preview/i });
     const headers = within(table)
       .getAllByRole("columnheader")
       // the wordmark header reads "Chelabase" to screen readers (sr-only) and draws "helabase" after the claw
       .map((h) => h.querySelector(".sr-only")?.textContent ?? h.textContent);
-    expect(headers).toEqual(["Chelabase", "Supabase", "Firebase", "Vanilla Neon", "PlanetScale"]);
+    expect(headers).toEqual(COLUMNS);
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows).toHaveLength(8);
-    const cells = rows.map((r) => within(r).getAllByRole("cell")[4]);
-    expect(cells.map((c) => c.textContent)).toEqual(Array(8).fill("To survey"));
+    expect(rows).toHaveLength(12);
+    for (const r of rows) expect(within(r).getAllByRole("cell")).toHaveLength(COLUMNS.length);
+    expect(table.textContent).not.toMatch(/to survey/i);
+    const merge = rows.find((r) => within(r).getByRole("rowheader").textContent === "Schema merge between branches")!;
+    expect(within(merge).getAllByRole("cell").map((c) => c.textContent)).toEqual(["Yes", "Partly", "No", "No", "No", "Yes"]);
   });
 
   it("labels_the_branching_drawings_as_illustrations", () => {
@@ -61,37 +100,38 @@ describe("LandingPage", () => {
     expect(screen.getAllByText(/illustration/i).length).toBeGreaterThanOrEqual(2);
   });
 
-  it("shows_the_readme_setup_path", () => {
+  it("shows_the_docker_compose_install", () => {
     renderPage();
     const steps = screen.getByRole("figure", { name: /your terminal/i });
-    for (const cmd of ["git clone https://github.com/chelabase/chelabase.git", "proto install", "pnpm install", "just dev"]) {
+    for (const cmd of [
+      "git clone https://github.com/chelabase/chelabase.git",
+      "cd chelabase/infra/compose",
+      "cp .env.example .env",
+      "docker compose up -d --wait",
+      "docker compose logs init-secrets",
+    ]) {
       expect(steps).toHaveTextContent(cmd);
     }
+    expect(steps).not.toHaveTextContent("just dev");
   });
 
-  it("puts_the_setup_path_before_branching", () => {
+  it("the_client_snippet_uses_the_server_client", () => {
     renderPage();
-    const setup = screen.getByRole("heading", { level: 2, name: /from clone to a query/i });
-    const branching = screen.getByRole("heading", { level: 2, name: /branch it/i });
-    expect(setup.compareDocumentPosition(branching) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const snippet = screen.getByRole("figure", { name: /your server, with @chelabase\/client/i });
+    expect(snippet).toHaveTextContent('from "@chelabase/client/server"');
+    expect(snippet).toHaveTextContent("createServerClient<Database>({ url, key, types, cookies })");
   });
 
-  it("walkthrough_step_two_says_open_studio_and_sign_up", () => {
+  it("hero_ends_with_the_schema_merge_label", () => {
     const { container } = renderPage();
-    expect(container.textContent).toContain("Open Studio and sign up. Email verification is off in self-hosted mode.");
-    expect(container.textContent).not.toContain("choose Start free");
-  });
-
-  it("hero_ends_with_the_merge_label", () => {
-    const { container } = renderPage();
-    expect(container.textContent).toContain("staging merged into main");
+    expect(container.textContent).toContain("staging's schema merged into main");
     expect(container.textContent).not.toMatch(/promoted/i);
   });
 
-  it("hero_aria_label_describes_the_merge", () => {
+  it("hero_aria_label_describes_the_schema_merge", () => {
     renderPage();
     const scene = screen.getByRole("img", { name: /crab walks main/i });
-    expect(scene).toHaveAccessibleName(/and staging is merged into main, its crab burrowing into main\.$/i);
+    expect(scene).toHaveAccessibleName(/and staging's schema is merged into main, its crab burrowing into the sand\.$/i);
     expect(scene).not.toHaveAccessibleName(/promot/i);
   });
 
@@ -122,7 +162,7 @@ describe("the hero with reduced motion", () => {
       expect(scale).toBeGreaterThan(0.1);
     }
     // the merge note and burrow belong to the animated finish only
-    const notes = [...scene.querySelectorAll(":scope > text")].filter((t) => /^(reset|staging merged into main)$/.test(t.textContent ?? ""));
+    const notes = [...scene.querySelectorAll(":scope > text")].filter((t) => /^(reset|staging's schema merged into main)$/.test(t.textContent ?? ""));
     expect(notes).toHaveLength(2);
     for (const el of [...notes, ...scene.querySelectorAll(":scope > ellipse")]) {
       expect(el.getAttribute("opacity")).toBe("0");
@@ -147,7 +187,7 @@ describe("the hero at phone width", () => {
       const names = [...scene.querySelectorAll(":scope > text")].map((t) => t.textContent);
       expect(names).toEqual(expect.arrayContaining(["main", "preview", "staging"]));
       expect(names).not.toContain("search");
-      expect(names).toContain("staging merged into main");
+      expect(names).toContain("staging's schema merged into main");
       // main + two branches
       expect(scene.querySelectorAll(":scope > g[transform^='translate']")).toHaveLength(3);
       expect(scene.querySelectorAll(":scope > ellipse")).toHaveLength(1);
@@ -185,6 +225,23 @@ describe("TideGauge", () => {
     const slider = screen.getByRole("slider", { name: /point in time/i });
     fireEvent.change(slider, { target: { value: "72" } });
     expect(slider).toHaveAttribute("aria-valuetext", "3 days ago");
+  });
+
+  it("merge_needs_preview_to_have_branched_two_days_ago", async () => {
+    render(<TideGauge />);
+    const slider = screen.getByRole("slider", { name: /point in time/i });
+    fireEvent.change(slider, { target: { value: "12" } });
+    expect(slider).toHaveAttribute("aria-valuetext", "12 hours ago");
+    await userEvent.click(screen.getByRole("radio", { name: "Merge" }));
+    expect(slider).toHaveAttribute("aria-valuetext", "2 days ago");
+    // the staff keeps all seven days; a later pick below two days is clamped
+    expect(slider).toHaveAttribute("min", "0");
+    fireEvent.change(slider, { target: { value: "6" } });
+    expect(slider).toHaveAttribute("aria-valuetext", "2 days ago");
+    expect(screen.getByText(/rows never move/)).toBeInTheDocument();
+    // back on branch, the pick made before the merge clamp stays
+    await userEvent.click(screen.getByRole("radio", { name: "Branch" }));
+    expect(slider).toHaveAttribute("aria-valuetext", "2 days ago");
   });
 
   it("switches_between_branch_reset_and_restore", async () => {

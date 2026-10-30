@@ -315,7 +315,7 @@ export function ShoreScene() {
         height={H}
         viewBox={`0 0 ${W} ${H}`}
         role="img"
-        aria-label={`Illustration: a crab walks main along the beach while smaller crabs fork off down ${trails.length} branches; one branch then resets, and staging is merged into main, its crab burrowing into main.`}
+        aria-label={`Illustration: a crab walks main along the beach while smaller crabs fork off down ${trails.length} branches; one branch then resets, and staging's schema is merged into main, its crab burrowing into the sand.`}
       >
         <defs>
           {[main, ...trails, ...(hop ? [hop] : [])].map((t, i) => (
@@ -405,7 +405,7 @@ export function ShoreScene() {
               className={EVENT_NAME}
               opacity={0}
             >
-              staging merged into main
+              staging's schema merged into main
             </text>
           </>
         )}

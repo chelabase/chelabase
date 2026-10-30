@@ -11,13 +11,14 @@ Mode: **Persuade**. The public landing page; Studio is the console it links to.
 
 ## Audience, job, action
 
-- Developers weighing Supabase, Firebase or plain Neon for a Postgres platform they can run themselves.
-- Job: in seconds, know what Chelabase is and remember branching as its mechanism; then **Start free** (links to `${studioUrl}/?signup`) or **Log in** (links to `${studioUrl}/`). This page has no auth state; the Studio URL comes from `VITE_STUDIO_URL` at build time.
-- Proof is demonstration only: the branching animation, a real `@chelabase/client` snippet, the real feature map, the README's real setup path. Synthetic illustrations are labelled. No customers, logos, numbers or compatibility claims; platform mode is not pitched; object storage is **Coming soon (SeaweedFS)**.
+- Developers choosing a Postgres platform they can run themselves.
+- Theme: **Manage, collaborate, iterate**: Postgres made easy to manage, shared with a team through roles Postgres enforces, and changed safely with branches and merges; built in Rust, end to end.
+- Job: know what Chelabase is, see what it offers against the alternatives, then **Get started** (the docs Quickstart: `${VITE_DOCS_URL}/docs/using/quickstart`, falling back to `quickstart.mdx` on GitHub) or **Visit GitHub** (`https://github.com/chelabase/chelabase`). No Studio links, no auth state.
+- Proof is demonstration and sourced fact only: the hero animation, the real Docker Compose install, real `@chelabase/client` code, the service map, and a comparison drawn from each product's docs (dated, caveats in its footnote). Synthetic illustrations are labelled. No customers, logos, benchmark numbers or invented claims; platform mode is not pitched. The CLI (an installable setup and management script) and S3-compatible object storage (SeaweedFS) are **Coming soon**.
 
 ## Sections
 
-Hero → What it is → From clone to a query (the README path: `git clone` → `proto install` → `pnpm install` → `just dev`) → Branching → Product pieces → Compare (wireframe, labelled preview, no scores, no grid lines; columns Chelabase · Supabase · Firebase · Vanilla Neon) → Final CTA. Docs: no deployed URL; mention `just docs` as text.
+Hero → Run it on your machine (`git clone` → `cd chelabase/infra/compose` → `cp .env.example .env` → `docker compose up -d --wait` → setup code) → Everything in one place (linked cards to each part's docs, in order: Databases, Studio, Auth, Realtime, Gateway, Orchestrator, Worker, Rest, then CLI and Object storage coming soon; tiles without descriptions below 560px) → How it compares (Chelabase · Supabase · Firebase · Neon · PlanetScale Postgres · PlanetScale MySQL, in an ink panel) → Manage it from one console → Bring your team in → Build your app on a typed API → Branch it. Reset it. Restore it. Merge it. (tide gauge with Branch, Reset, Restore and Merge) → Start with the Quickstart.
 
 ## Decisions (user, 2026-10-06)
 
@@ -29,15 +30,23 @@ Hero → What it is → From clone to a query (the README path: `git clone` → 
 - Hero must scale: lagoon, sun and palms visible on 24" (1920–2560 wide) and 34" ultrawide (3440 wide) screens, and on phones.
 - Compare keeps the wireframe idea but loses the grid lines.
 
+## Decisions (user, 2026-10-30)
+
+- Away from "build on Neon" toward Manage, collaborate, iterate; Rust is a line in Everything in one place, not its own section.
+- Section order as above (the user's order); Everything in one place lists the parts, not features the comparison already covers.
+- Grounds below the hero: bands alternate raised (`--deep`) and ink, starting raised; a low swell with a sand tideline crest replaces the tall waves; no seafoam or sand bands. Basalt (`--shallows`) washed out the comparison and was dropped.
+- The comparison was re-surveyed from each product's docs on 2026-10-30; PlanetScale is split because only its MySQL (Vitess) databases merge schema (deploy requests).
+- Mobile polish is deferred.
+
 ## Direction contract
 
 THESIS: A crab walks the shore and every branch is a trail it splits off. Branching is shown as something alive (crabs forking off main and coming back on reset), not a git graph, not a nautical chart. Refuses the dark-SaaS split hero and the feature-card grid.
 
 OWN-WORLD: Dusk on a lagoon beach. Deep lagoon-teal sky, a sand sun low on the right, a seafoam lagoon band, a sand beach; pastel palm silhouettes at the edges. The crab and the claw-C are warm coral with pale claw tips and an ink outline. Trails are footprint dots over a wet-sand tint. Type: Spectral display, Atkinson body. Buttons are plain sand plates; chart furniture is gone except the tide gauge.
 
-STORY: The visitor meets the claw-C wordmark, watches a crab fork branches off main, reads what Chelabase is, sees the real clone-to-query path, plays with branch/reset/restore, scans the pieces and an honest preview comparison, and starts free.
+STORY: The visitor meets the claw-C wordmark and the three verbs, watches a crab fork branches off main, sees the four-command install, scans the parts and an honest sourced comparison, reads how Chelabase manages, shares and builds, plays with branch/reset/restore/merge, and gets started.
 
-FIRST VIEWPORT: Full-width dusk scene built to the viewport width (not cropped). Top-left: the claw-C wordmark at hero scale, one headline, one line, Start free and Log in. Lower band: lagoon and beach across the full width, sun and palms at the right edge, the crab walking main with crabs forking off (two forks on phones, three on desktop, four on ultrawide), branch names in italic, an "illustration" note.
+FIRST VIEWPORT: Full-width dusk scene built to the viewport width (not cropped). Top-left: the claw-C wordmark at hero scale, one headline (Manage, collaborate, iterate. On Postgres.), one line, Get started and Visit GitHub. Lower band: lagoon and beach across the full width, sun and palms at the right edge, the crab walking main with crabs forking off (two forks on phones, three on desktop, four on ultrawide), branch names in italic, a reset note and "staging's schema merged into main", an "illustration" note.
 
 FORM: Crab shore (user-steered replacement of the Admiralty Chart build, seed key 36c8fd97 lineage). Signature interaction: the scuttle-and-fork hero, with a replay control; the tide gauge in Branching stays as the hands-on piece. Motion grammar: crabs walk with a bob, trails reveal behind them, reset retracts and redraws; reduced motion shows the finished scene.
 

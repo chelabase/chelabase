@@ -2,7 +2,7 @@
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { studioUrl } from '../src/studio-url';
+import { docsHref, GITHUB_URL } from '../src/site-urls';
 
 // These tests read the static site that `vite build` writes to dist/client.
 const dist = join(resolve(import.meta.dirname, '..'), 'dist/client');
@@ -28,15 +28,14 @@ describe('the built landing page', () => {
   });
 
   it('prerendered_html_carries_the_copy', () => {
-    expect(html).toContain('Postgres that branches. Host it anywhere.');
-    expect(html).toContain('staging merged into main');
-    expect(html).toContain('<title>Chelabase — Postgres that branches</title>');
+    expect(html).toContain('Manage, collaborate, iterate. On Postgres.');
+    expect(html).toContain('staging&#x27;s schema merged into main');
+    expect(html).toContain('<title>Chelabase — Manage, collaborate, iterate on Postgres</title>');
   });
 
-  it('prerendered_html_links_to_studio', () => {
-    const base = studioUrl(process.env.VITE_STUDIO_URL);
-    expect(html).toContain(`href="${base}/?signup"`);
-    expect(html).toContain(`href="${base}/"`);
+  it('prerendered_html_links_to_the_docs_and_github', () => {
+    expect(html).toContain(`href="${docsHref('using/quickstart', process.env.VITE_DOCS_URL)}"`);
+    expect(html).toContain(`href="${GITHUB_URL}"`);
   });
 
   it('prerendered_html_has_no_render_error', () => {

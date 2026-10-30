@@ -1,16 +1,20 @@
 import { type CSSProperties, useId, useState } from "react";
 
-/** The Branching section's instrument: pick branch, reset or restore, and a point in main's history. */
+/** The Branching section's instrument: pick branch, reset, restore or merge, and a point in main's history. */
 
-type Mode = "branch" | "reset" | "restore";
+type Mode = "branch" | "reset" | "restore" | "merge";
 
 const MODES: Array<{ value: Mode; label: string }> = [
   { value: "branch", label: "Branch" },
   { value: "reset", label: "Reset" },
   { value: "restore", label: "Restore" },
+  { value: "merge", label: "Merge" },
 ];
 
 const WINDOW_HOURS = 168; // the default 7-day history window
+/** A merge needs preview to have branched at least this long ago, so its way back into main has room. */
+const MERGE_MIN_HOURS = 48;
+const PREVIEW_Y = 100;
 const LEFT = 40;
 const NOW = 520;
 const RIGHT = 624;
@@ -54,7 +58,9 @@ function channel(x: number, y: number) {
 export function TideGauge() {
   const id = useId();
   const [mode, setMode] = useState<Mode>("branch");
-  const [hoursAgo, setHoursAgo] = useState(72);
+  const [picked, setHoursAgo] = useState(72);
+  const minHours = mode === "merge" ? MERGE_MIN_HOURS : 0;
+  const hoursAgo = Math.max(picked, minHours);
   const when = describeHoursAgo(hoursAgo);
   const forkX = mode === "reset" ? NOW : xAt(hoursAgo);
   const oldForkX = xAt(hoursAgo);
@@ -64,7 +70,9 @@ export function TideGauge() {
       ? `preview is a copy-on-write copy of main as it was ${when}. It shares main's pages until either side writes.`
       : mode === "reset"
         ? "Reset moves preview to main's latest state. Its connection string and password stay the same."
-        : `Restore takes main back to ${when} on a new timeline. The old one stays as a backup branch; the connection string and password don't change.`;
+        : mode === "restore"
+          ? `Restore takes main back to ${when} on a new timeline. The old one stays as a backup branch; the connection string and password don't change.`
+          : `Merge brings preview's schema changes into main, compared against the schema as it was when preview branched, ${when}. It's rehearsed on a copy first, and rows never move.`;
 
   return (
     <figure className="m-0 border border-line-strong rounded-xl overflow-hidden bg-ink">
@@ -153,14 +161,14 @@ export function TideGauge() {
 
         {/* preview */}
         {mode === "reset" && (
-          <path d={channel(oldForkX, 100)} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 6" fill="none" opacity={0.45} />
+          <path d={channel(oldForkX, PREVIEW_Y)} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 6" fill="none" opacity={0.45} />
         )}
         {mode !== "restore" && (
           <>
-            <path d={channel(forkX, 100)} stroke="var(--seafoam)" strokeOpacity={0.14} strokeWidth={24} fill="none" />
+            <path d={channel(forkX, PREVIEW_Y)} stroke="var(--seafoam)" strokeOpacity={0.14} strokeWidth={24} fill="none" />
             <path
               key={mode}
-              d={channel(forkX, 100)}
+              d={channel(forkX, PREVIEW_Y)}
               stroke="var(--coral)"
               strokeWidth={2.5}
               strokeLinecap="round"
@@ -172,6 +180,27 @@ export function TideGauge() {
             <text x={RIGHT - 4} y={88} textAnchor="end" className="font-serif italic" fontSize="17" fill="var(--coral)">
               preview
             </text>
+          </>
+        )}
+
+        {/* a merge: preview's schema flows back into main now, in preview's colour (sand is the picked point) */}
+        {mode === "merge" && (
+          <>
+            <path
+              key={`merge-${hoursAgo}`}
+              d={`M${NOW - 70} ${PREVIEW_Y} C ${NOW - 35} ${PREVIEW_Y} ${NOW - 35} ${MAIN_Y} ${NOW} ${MAIN_Y}`}
+              stroke="var(--coral)"
+              strokeWidth={2.5}
+              strokeLinecap="round"
+              fill="none"
+              pathLength={1}
+              className="survey"
+              style={style({ "--len": 1, "--delay": "700ms" })}
+            />
+            <text x={NOW - 44} y={(PREVIEW_Y + MAIN_Y) / 2 + 5} textAnchor="end" className="font-serif italic max-[560px]:hidden" fontSize="15" fill="var(--coral)">
+              schema
+            </text>
+            <circle cx={NOW} cy={MAIN_Y} r={4} fill="var(--ink)" stroke="var(--coral)" strokeWidth={2} />
           </>
         )}
 
@@ -207,7 +236,8 @@ export function TideGauge() {
           disabled={mode === "reset"}
           aria-valuetext={when}
           style={{ direction: "rtl" }}
-          onChange={(e) => setHoursAgo(Number(e.target.value))}
+          // the staff draws all seven days, so a merge clamps the pick rather than narrowing the range
+          onChange={(e) => setHoursAgo(Math.max(Number(e.target.value), minHours))}
         />
       </div>
       <p className="m-0 px-5 pb-4.5 min-h-[3.2em] text-chalk text-[0.98rem]" aria-live="polite">
