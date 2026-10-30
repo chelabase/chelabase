@@ -638,6 +638,8 @@ async fn the_auth_host_reaches_zitadel_with_host_and_bearer_unchanged() {
         .header(reqwest::header::HOST, &auth_host)
         .header("authorization", "Bearer zitadel-pat")
         .header("origin", STUDIO)
+        .header("chelabase-server-key", "chk_sec_never-forwarded")
+        .header("chelabase-client-ip", "203.0.113.9")
         .send()
         .await
         .unwrap();
@@ -648,6 +650,9 @@ async fn the_auth_host_reaches_zitadel_with_host_and_bearer_unchanged() {
     assert_eq!(seen["authorization"], "Bearer zitadel-pat");
     assert_eq!(seen[":uri"], "/management/v1/orgs/me");
     assert!(!seen.contains_key(IDENTITY_HEADER));
+    // #49: the app-server headers are the gateway's alone, on a site too.
+    assert!(!seen.contains_key("chelabase-server-key") && !seen.contains_key("chelabase-client-ip"));
+    assert_eq!(seen["x-forwarded-for"], "127.0.0.1");
     assert_eq!(seen["x-forwarded-proto"], "http");
     assert_eq!(seen["x-forwarded-host"], auth_host);
 }
@@ -1286,4 +1291,111 @@ async fn types_etag_if_none_match_and_304_pass_through() {
         assert_eq!(resp.bytes().await.unwrap().len(), 0, "{url}");
         assert_eq!(seen.lock().unwrap().last().unwrap().as_deref(), Some("\"t1\""), "{url}");
     }
+}
+
+/// The data key lookup answering from `keys` (key -> its answer); any other key is unknown.
+async fn spawn_key_listener(keys: Vec<(String, serde_json::Value)>) -> String {
+    let by_hash: HashMap<String, serde_json::Value> = keys
+        .into_iter()
+        .map(|(key, answer)| (hex::encode(chelabase_types::data_key::hash(&key)), answer))
+        .collect();
+    let by_hash = Arc::new(by_hash);
+    let app = Router::new().fallback(move |req: Request| {
+        let by_hash = by_hash.clone();
+        async move {
+            let bearer = req.headers().get("authorization").and_then(|v| v.to_str().ok());
+            if bearer != Some("Bearer e2e-data-keys-token") {
+                return (axum::http::StatusCode::UNAUTHORIZED, Json(serde_json::json!({})));
+            }
+            let hash = req.uri().path().rsplit('/').next().unwrap_or_default();
+            match by_hash.get(hash) {
+                Some(answer) => (axum::http::StatusCode::OK, Json(answer.clone())),
+                None => (axum::http::StatusCode::NOT_FOUND, Json(serde_json::json!({}))),
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
+}
+
+/// #49: an app's server signs its user in with its public key, vouches for the user's address
+/// with the branch's secret key, and auth sees that address; a key that doesn't vouch leaves
+/// the peer's. Neither header reaches auth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
+    use chelabase_types::data_key::{generate, DataKeyKind};
+    let jwks = MockJwks::start().await;
+    let (auth, seen) = spawn_upstream().await;
+    let public = generate(DataKeyKind::Public).key;
+    let secret = generate(DataKeyKind::Secret).key;
+    let other_project = generate(DataKeyKind::Secret).key;
+    let branch = "22222222-2222-4222-8222-222222222222";
+    let answer = |key_id: &str, project: &str, kind: &str| {
+        serde_json::json!({
+            "key_id": key_id, "branch_id": branch, "project_id": project, "kind": kind, "role": "anon",
+        })
+    };
+    let internal = spawn_key_listener(vec![
+        (public.clone(), answer("11111111-1111-4111-8111-111111111111", E2E_PROJECT, "public")),
+        (secret.clone(), answer("44444444-4444-4444-8444-444444444444", E2E_PROJECT, "secret")),
+        (
+            other_project.clone(),
+            answer("55555555-5555-4555-8555-555555555555", "66666666-6666-4666-8666-666666666666", "secret"),
+        ),
+    ])
+    .await;
+    let (base, verify, _gateway) = spawn_gateway_with(
+        &auth,
+        &jwks,
+        &[
+            ("CHELABASE_AUTH_URL", &auth),
+            ("CHELABASE_INTERNAL_URL", &internal),
+            ("CHELABASE_DATA_KEYS_TOKEN", "e2e-data-keys-token"),
+        ],
+    )
+    .await;
+    let sign_in = |server_key: &str, client_ip: &str| {
+        reqwest::Client::new()
+            .post(format!("{base}/auth/v1/app/sign-in"))
+            .header("authorization", format!("Bearer {public}"))
+            .header("chelabase-server-key", server_key)
+            .header("chelabase-client-ip", client_ip)
+            .body("{}")
+            .send()
+    };
+
+    for (server_key, client_ip, want) in [
+        (secret.as_str(), "203.0.113.9", "203.0.113.9"),
+        (secret.as_str(), "2001:db8::1", "2001:db8::1"),
+        (other_project.as_str(), "203.0.113.9", "127.0.0.1"),
+        (public.as_str(), "203.0.113.9", "127.0.0.1"),
+        (secret.as_str(), "203.0.113.9:443", "127.0.0.1"),
+    ] {
+        *seen.lock().unwrap() = None;
+        let resp = sign_in(server_key, client_ip).await.unwrap();
+        assert_eq!(resp.status(), 200, "{client_ip}");
+        let saw = seen.lock().unwrap().clone().expect("auth was called");
+        assert_eq!(saw["x-forwarded-for"], want, "{client_ip}");
+        assert!(!saw.contains_key("chelabase-server-key"), "the secret key must not reach auth");
+        assert!(!saw.contains_key("chelabase-client-ip"));
+        assert!(!saw.contains_key("authorization"));
+        let data = verify.verify(&saw[IDENTITY_HEADER], "auth").unwrap().data.unwrap();
+        assert_eq!(data.key_id.to_string(), "11111111-1111-4111-8111-111111111111", "the public key's identity");
+    }
+
+    // The two headers never reach any upstream, even on a public route.
+    *seen.lock().unwrap() = None;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/health"))
+        .header("chelabase-server-key", &secret)
+        .header("chelabase-client-ip", "203.0.113.9")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let saw = seen.lock().unwrap().clone().expect("the upstream was called");
+    assert!(!saw.contains_key("chelabase-server-key") && !saw.contains_key("chelabase-client-ip"));
+    assert_eq!(saw["x-forwarded-for"], "127.0.0.1");
 }

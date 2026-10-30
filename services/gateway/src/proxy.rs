@@ -2,7 +2,10 @@
 //! decisions live in `pipeline`.
 
 use crate::client_addr::{client_address, TrustedProxies};
-use crate::pipeline::{error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, REQUEST_ID_HEADER};
+use crate::pipeline::{
+    error_json, GatewayResponse, Outcome, Pipeline, ProxyPlan, RequestParts, CLIENT_IP_HEADER, REQUEST_ID_HEADER,
+    SERVER_KEY_HEADER,
+};
 use crate::registry::Site;
 use crate::upstreams::Upstreams;
 use async_trait::async_trait;
@@ -234,8 +237,12 @@ impl ProxyHttp for Gateway {
         ctx: &mut RequestCtx,
     ) -> Result<()> {
         // A site gets the client's request as it came (Host, Authorization, cookies,
-        // Upgrade/Connection); the API gets the plan's edits.
-        if ctx.site.is_none() {
+        // Upgrade/Connection) less the two app-server headers, which are the gateway's alone;
+        // the API gets the plan's edits.
+        if ctx.site.is_some() {
+            upstream.remove_header(SERVER_KEY_HEADER);
+            upstream.remove_header(CLIENT_IP_HEADER);
+        } else {
             let plan = ctx
                 .plan
                 .as_ref()
@@ -250,8 +257,10 @@ impl ProxyHttp for Gateway {
         }
 
         // P4, on every target: the forwarded headers are the gateway's own, never the client's
-        // (`X-Forwarded-For` is the one address `request_filter` settled on).
-        for (name, value) in forwarded_headers(self.forwarded_proto, ctx.client_ip, ctx.host.as_deref()) {
+        // (`X-Forwarded-For` is the one address `request_filter` settled on, or on an app auth
+        // route the one the app's server vouched for: the plan's).
+        let client_ip = ctx.plan.as_ref().map_or(ctx.client_ip, |plan| plan.client_ip);
+        for (name, value) in forwarded_headers(self.forwarded_proto, client_ip, ctx.host.as_deref()) {
             match value {
                 Some(value) => upstream.insert_header(name, value)?,
                 None => {
