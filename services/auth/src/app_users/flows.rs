@@ -1042,6 +1042,16 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     }
 }
 
+/// Rotates the refresh token and re-reads the user.
+///
+/// Invariant (#57): clients drop their cookies on `refresh_token_invalid`,
+/// `refresh_token_reused` and `user_inactive`, so a refresh revokes the session or answers one
+/// of them only on a definitive verdict: the orchestrator's 401 `refresh_token_invalid` or
+/// `refresh_token_reused`, Zitadel's definite "no such user" (a 404) or a user of another org,
+/// or an inactive user. Every other upstream outcome (any other orchestrator status or code,
+/// a Zitadel 5xx or other refusal, a timeout, an unreadable or partial success answer) answers
+/// 503 `unavailable` and revokes nothing. `refresh_ends_a_session_only_on_a_definitive_verdict`
+/// in `tests/app_flows.rs` checks every pair against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     let app = app(s);
     rate_limit(s, caller, &[("refresh", "ip", &caller.ip, 120, MINUTE)])?;
@@ -1083,6 +1093,7 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
             warn!(error = %e, "revoking the app session failed");
         }
     };
+    // `None` is a definite 404; an unreadable answer is an error (503), never "gone".
     let current = match s.zitadel.get_user(&refreshed.user_id.to_string()).await {
         Ok(Some(u)) if u.org_id == org(&info) => u,
         Ok(_) => {
