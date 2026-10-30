@@ -237,7 +237,7 @@ describe("createServerClient", () => {
     const j = jar({ [ACCESS]: forged, [REFRESH]: "rt1" });
     const db = createServerClient({ url, key, fetch, cookies: j.cookies });
     // The module and the client expose nothing read from the cookie.
-    expect(Object.keys(serverModule)).toEqual(["createServerClient"]);
+    expect(Object.keys(serverModule)).toEqual(["createAuthHandler", "createServerClient"]);
     expect(Object.keys(db).sort()).toEqual(["auth", "batch", "call", "database", "from"]);
     await expect(db.auth.getUser()).rejects.toMatchObject({ status: 401, code: "user_token_invalid" });
     await expect(db.from("t").select("id")).rejects.toMatchObject({ code: "user_token_invalid" });

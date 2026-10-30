@@ -2,6 +2,7 @@
 // `@ts-expect-error` must fire; an unused one is itself an error.
 import { expectTypeOf } from "vitest";
 import { type Client, createClient, type DatabaseShape, type Int8, type Json } from "./index.ts";
+import { createBrowserClient } from "./browser.ts";
 import { createServerClient } from "./server.ts";
 import { type Database, types } from "./test-db.ts";
 
@@ -305,3 +306,20 @@ createServerClient<Database>({ ...opts, cookies, bigint: true });
 createServerClient({ ...opts, cookies, auth: {} });
 // @ts-expect-error nor a caller-owned token
 createServerClient({ ...opts, cookies, accessToken: () => "t" });
+
+// --- createBrowserClient: query types match `createClient`
+const brw = createBrowserClient<Database>({ ...opts, types });
+expectTypeOf(brw).toEqualTypeOf<Client<Database, false>>();
+expectTypeOf(brw).toEqualTypeOf(db);
+expectTypeOf(createBrowserClient<Database>({ ...opts, bigint: true, types })).toEqualTypeOf(big);
+expectTypeOf(createBrowserClient({ ...opts, authPath: "/auth", cookieOptions: { secure: false } })).toEqualTypeOf<
+  Client<DatabaseShape, false>
+>();
+// @ts-expect-error a generated Database needs its types
+createBrowserClient<Database>(opts);
+// @ts-expect-error bigint: true needs the generated types
+createBrowserClient<Database>({ ...opts, bigint: true });
+// @ts-expect-error the session lives in the app's cookies, not in browser storage
+createBrowserClient({ ...opts, auth: {} });
+// @ts-expect-error nor a caller-owned token
+createBrowserClient({ ...opts, accessToken: () => "t" });
