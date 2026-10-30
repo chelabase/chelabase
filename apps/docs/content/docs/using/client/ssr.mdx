@@ -1,0 +1,318 @@
+---
+title: Server rendering
+description: Keep app users signed in across server and browser with createServerClient, createBrowserClient and createAuthHandler, with a Next.js App Router walkthrough.
+---
+
+`createClient` keeps the session in the browser. In a server-rendered app the server needs the session too, so it lives in cookies. `@chelabase/client` has three pieces for that:
+
+- `createBrowserClient` (from `@chelabase/client/browser`) for client components.
+- `createServerClient` (from `@chelabase/client/server`), created per request, for Server Components, Server Actions, route handlers and the proxy.
+- `createAuthHandler` (from `@chelabase/client/server`), mounted once as a route. Sign-in, sign-up, refresh, change-password and sign-out go through it.
+
+The examples use Next.js App Router. [Without a framework](#without-a-framework) shows the same pieces on plain `Request` and `Response`.
+
+## How the session moves
+
+- Two cookies hold the session. The refresh cookie is `HttpOnly`, so page scripts never see it. The access cookie is readable, so the browser client can send it to the data API.
+- The browser refreshes through the auth route. The server refreshes in the proxy, where cookies can be written.
+- A refresh rotates the refresh token. The old one stays valid for a 10 second grace window, so a request that is already in flight with the old cookie still works.
+- Server Components can't write cookies, so they never refresh. They use the access token the proxy has already kept fresh.
+
+## Next.js App Router
+
+Next.js 16 calls the proxy file `proxy.ts`. Before 16 it is `middleware.ts`, with `middleware` as the function name. The rest is the same.
+
+### Browser client
+
+```ts
+// lib/chelabase/browser.ts
+import { createBrowserClient } from "@chelabase/client/browser";
+import { type Database, types } from "./db";
+
+const create = () =>
+  createBrowserClient<Database>({
+    url: process.env.NEXT_PUBLIC_CHELABASE_URL!,
+    key: process.env.NEXT_PUBLIC_CHELABASE_KEY!,
+    types,
+  });
+
+let client: ReturnType<typeof create> | undefined;
+export const createClient = () => (client ??= create());
+```
+
+Keep one browser client per page: each client runs its own refresh timer and keeps its own listeners.
+
+### Server client
+
+Use two helpers. The Server Component one has no `setAll`. The other one can write cookies, so use it in Server Actions and route handlers.
+
+```ts
+// lib/chelabase/server.ts
+import { createServerClient } from "@chelabase/client/server";
+import { cookies } from "next/headers";
+import { type Database, types } from "./db";
+
+const base = {
+  url: process.env.CHELABASE_URL!,
+  key: process.env.CHELABASE_PUBLIC_KEY!,
+  serverKey: process.env.CHELABASE_SECRET_KEY!, // see "What the secret key does"
+  types,
+};
+
+// Server Components: reads the session, never writes cookies.
+export async function createReadOnlyClient() {
+  const store = await cookies();
+  return createServerClient<Database>({ ...base, cookies: { getAll: () => store.getAll() } });
+}
+
+// Server Actions and route handlers: can sign in and out, and refresh.
+export async function createActionClient() {
+  const store = await cookies();
+  return createServerClient<Database>({
+    ...base,
+    cookies: {
+      getAll: () => store.getAll(),
+      setAll: (list) => list.forEach((c) => store.set(c.name, c.value, c.options)),
+    },
+  });
+}
+```
+
+Create a client inside each request, never at module level. A module-level client would share one user's cookies with the next request.
+
+### The auth route
+
+Mount the handler once. It serves `POST /api/chelabase/auth/{sign-in,sign-up,refresh,change-password,sign-out}`.
+
+```ts
+// app/api/chelabase/auth/[...path]/route.ts
+import { createAuthHandler } from "@chelabase/client/server";
+
+export const POST = createAuthHandler({
+  url: process.env.CHELABASE_URL!,
+  key: process.env.CHELABASE_PUBLIC_KEY!,
+  siteUrl: process.env.SITE_URL!, // https://app.example.com
+  serverKey: process.env.CHELABASE_SECRET_KEY!,
+});
+```
+
+It only serves a same-origin `POST` with a JSON body. `siteUrl` is your app's public URL; a request's `Origin` has to match it. Add other exact origins with `allowedOrigins: ["https://admin.example.com"]` (no `*`).
+
+### The proxy
+
+The proxy refreshes an expiring session before the page renders. It writes the new cookies to the request, so this render sees them, and to the response, so the browser keeps them. Do both.
+
+```ts
+// proxy.ts (middleware.ts before Next.js 16)
+import { createServerClient } from "@chelabase/client/server";
+import { type NextRequest, NextResponse } from "next/server";
+
+export async function proxy(request: NextRequest) {
+  let response = NextResponse.next({ request });
+  const db = createServerClient({
+    url: process.env.CHELABASE_URL!,
+    key: process.env.CHELABASE_PUBLIC_KEY!,
+    serverKey: process.env.CHELABASE_SECRET_KEY!,
+    cookies: {
+      getAll: () => request.cookies.getAll(),
+      setAll(list) {
+        for (const c of list) request.cookies.set(c.name, c.value);
+        response = NextResponse.next({ request });
+        for (const c of list) response.cookies.set(c.name, c.value, c.options);
+      },
+    },
+  });
+  try {
+    await db.auth.refreshIfNeeded(); // a request only when the access token is about to expire
+  } catch (e) {
+    console.error("chelabase refresh failed", e); // the page's currentUser() decides
+  }
+  return response;
+}
+
+export const config = {
+  matcher: ["/((?!_next/static|_next/image|favicon.ico|api/chelabase/auth).*)"],
+};
+```
+
+The matcher leaves out the auth route: the handler refreshes on its own, and running the proxy there too would rotate the refresh token twice.
+
+`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. An ended session costs a refresh on each page view for up to a few minutes after its access token expires; after that its cookies are cleared, and later requests send nothing. It rejects only when the refresh fails some other way, such as the gateway being down.
+
+The `try`/`catch` lets the page render anyway: a gateway hiccup shouldn't turn every route into an error page, and the page's own `currentUser()` decides who is signed in.
+
+### A page that needs a user
+
+Decide who the user is with `db.auth.currentUser()`, which asks the gateway and gives `null` when nobody is signed in (or the session has ended). Never decide from the cookie: its contents are only used to decide whether to refresh, and anyone can set a cookie in their own browser.
+
+```tsx
+// app/dashboard/page.tsx
+import { redirect } from "next/navigation";
+import { createReadOnlyClient } from "@/lib/chelabase/server";
+
+export default async function Dashboard() {
+  const db = await createReadOnlyClient();
+  const user = await db.auth.currentUser();
+  if (!user) redirect("/sign-in");
+  const orders = await db.from("orders").select("id", "total").limit(20);
+  return <p>{user.email} has {orders.length} orders.</p>;
+}
+```
+
+### Signing in
+
+From the browser, `db.auth.signIn` posts to the auth route, which sets both cookies.
+
+```tsx
+// app/sign-in/form.tsx
+"use client";
+import { useRouter } from "next/navigation";
+import { createClient } from "@/lib/chelabase/browser";
+
+export function SignInForm() {
+  const router = useRouter();
+  return (
+    <form
+      action={async (form) => {
+        await createClient().auth.signIn({ email: String(form.get("email")), password: String(form.get("password")) });
+        router.refresh();
+        router.push("/dashboard");
+      }}
+    >
+      <input name="email" type="email" required />
+      <input name="password" type="password" required />
+      <button>Sign in</button>
+    </form>
+  );
+}
+```
+
+From a Server Action, call `db.auth.signIn` on `createActionClient()`, and `db.auth.currentUser()` to check who is acting. A server client without `setAll` refuses `signIn`, `signUp`, `changePassword`, `refresh` and `signOut`, because a session it can't keep would be lost.
+
+## Environment
+
+```bash
+CHELABASE_URL=https://api.example.com
+CHELABASE_PUBLIC_KEY=chk_pub_…
+CHELABASE_SECRET_KEY=chk_sec_…   # server only
+SITE_URL=https://app.example.com
+NEXT_PUBLIC_CHELABASE_URL=https://api.example.com
+NEXT_PUBLIC_CHELABASE_KEY=chk_pub_…
+```
+
+The public key may be public. The secret key must stay on the server: never name it `NEXT_PUBLIC_…`.
+
+That's all: the server needs the URL, the public key and the secret key (plus `SITE_URL` for the auth route), and the browser the URL and the public key.
+
+### What the secret key does
+
+Chelabase limits how often anyone can try to sign in (for example, 10 sign-ins a minute from one IP address), so nobody can guess passwords at full speed. In a server-rendered app every sign-in and refresh comes from your server, so they all look like one IP address. Without `serverKey` everything still works, but your whole app shares that one IP's limits: the 11th person signing in within a minute is turned away.
+
+With `serverKey`, your server proves the call comes from your app. Chelabase then skips the per-IP limits for it and keeps the ones that follow a person: wrong passwords are still counted per email address, and the other limits per email or per user. Refreshes have no per-user limit, which is safe: a refresh token can't be guessed, and reusing an old one is detected and ends the session.
+
+The per-person limits stay, but your app's sign-in and sign-up route is then limited only per account. So someone could try one password across many accounts, or create many sign-ups, without an IP limit. If that worries you, add `clientIp` (next section), or your own limit or CAPTCHA on that route.
+
+The secret key is only sent on auth calls, never on data requests, and only counts when it belongs to the same project and branch as the public key; any other key is ignored. A blank `CHELABASE_SECRET_KEY=` is treated as unset.
+
+### Also limit per IP
+
+If you want per-IP limits as well, pass the user's IP address as `clientIp` next to `serverKey`. Limits then apply per email, per user and per address.
+
+```ts
+// The auth route
+export const POST = createAuthHandler({
+  // …url, key, siteUrl and serverKey as above
+  clientIp: (req) => req.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+
+// The proxy
+createServerClient({
+  // …as above
+  clientIp: request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+
+// createActionClient: no `request` there, so read the header from next/headers
+import { headers } from "next/headers";
+createServerClient({
+  // …as above
+  clientIp: (await headers()).get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+```
+
+`clientIp` needs `serverKey`: creating a client with only `clientIp` throws. When it is empty or `undefined` for a request, only the secret key is sent.
+
+`clientIp` must come from a header your platform sets and a client can't forge:
+
+| Platform | Header |
+|---|---|
+| Vercel | `x-vercel-forwarded-for` |
+| Cloudflare | `cf-connecting-ip` |
+| Netlify | `x-nf-client-connection-ip` |
+| Your own reverse proxy | A header it overwrites on every request, such as `X-Real-IP $remote_addr` in nginx |
+
+Vercel overwrites these headers with the address it saw, so they only name your user when nothing else sits in front of Vercel. A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it.
+
+If your app runs from fixed addresses, there is an alternative: add them to `CHELABASE_GATEWAY_TRUSTED_PROXIES` on the gateway (see [Hosts](/docs/self-hosting/hosts)) and forward the user's address in `X-Forwarded-For`.
+
+## Without a framework
+
+`createServerClient` takes a cookie adapter: `getAll()` and, where headers can still be written, `setAll(list)`. Each item in `list` has `name`, `value` and `options` (path, secure, httpOnly, sameSite, maxAge, domain).
+
+`parseCookies` and `serializeCookie` from `@chelabase/client/server` read the `Cookie` header and write each `Set-Cookie` line, so every `cookieOptions` attribute carries through.
+
+```ts twoslash
+import { createServerClient, parseCookies, serializeCookie } from "@chelabase/client/server";
+import { type Database, types } from "./db";
+// ---cut---
+export async function handle(req: Request): Promise<Response> {
+  // A list, not a map: a duplicated name must reach the client (see Cookies below).
+  let jar = parseCookies(req.headers.get("cookie") ?? "");
+  const out: string[] = [];
+  const db = createServerClient<Database>({
+    url: "http://api.chelabase.localhost:8000",
+    key: "chk_pub_…",
+    types,
+    cookies: {
+      getAll: () => jar,
+      setAll(list) {
+        for (const c of list) {
+          jar = [...jar.filter((j) => j.name !== c.name), { name: c.name, value: c.value }];
+          out.push(serializeCookie(c));
+        }
+      },
+    },
+  });
+  const user = await db.auth.currentUser();
+  const res = Response.json({ email: user?.email ?? null });
+  for (const c of out) res.headers.append("set-cookie", c);
+  return res;
+}
+```
+
+`createAuthHandler` is already `(req: Request) => Promise<Response>`. Call it from any router that gives you a web `Request`. If you mount it somewhere other than `/api/chelabase/auth`, set `authPath` on both the handler and the browser client; both must equal the route's mount point.
+
+## Security notes
+
+- Data requests use the public key only. A secret key with a user token is refused (`user_token_with_secret_key`), so `serverKey` is only sent on auth calls.
+- Make one server client per request. Never keep one at module level.
+- A server client without `setAll` (a Server Component) can't refresh. Once the token has expired, it runs as an anonymous caller. Do writes from Server Actions or route handlers, which have `setAll`.
+- `clientIp` needs `serverKey` on `createServerClient` and `createAuthHandler`; `serverKey` works alone.
+- The handler checks `Origin` against `siteUrl` and `allowedOrigins`, and only accepts JSON `POST`. `req.url` is not used for this, since behind a proxy it is the internal address.
+- Trust `clientIp` headers only from your own platform, and only if a client can't set them.
+- Don't log request headers on the server: they hold the cookies, and on auth calls the secret key.
+- Who the user is comes from `db.auth.currentUser()` (or `getUser()`, which rejects when signed out), never from the readable access cookie.
+
+## Cookies
+
+| Cookie | Holds | Attributes |
+|---|---|---|
+| `__Host-chelabase.<first 12 characters of the key>.access` | Access token | `Secure; Path=/; SameSite=Lax`, readable by scripts |
+| `__Host-chelabase.<first 12 characters of the key>.refresh` | Refresh token | the same, plus `HttpOnly` |
+
+Both last 400 days; the server decides when the session ends. The `__Host-` prefix makes the browser insist on `Secure`, `Path=/` and no `Domain`, so a sibling subdomain can't plant a cookie.
+
+`cookieOptions` changes them: `domain`, `sameSite` (`"lax"`, `"strict"` or `"none"`), `secure` and `maxAge` (seconds).
+
+- Setting `domain` drops the `__Host-` prefix, because the prefix forbids `Domain`. So does `secure: false`, which is for plain-HTTP development only. Prefer the default.
+- A session cookie name that appears twice is treated as no session: the handler and the browser client refuse to pick one, since a planted copy could sign the user into someone else's account. `createServerClient` can only see this if your `getAll()` returns every cookie, duplicates included; adapters that read cookies into a map keep one. This matters mainly once `domain` drops the `__Host-` prefix.
+- The auth handler, `createServerClient` and `createBrowserClient` must all get the same `cookieOptions`. They pick the cookie names from it. If one differs, a sign-in writes cookies the others don't read, and the user ends up signed out.

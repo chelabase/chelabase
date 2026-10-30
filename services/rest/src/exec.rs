@@ -166,6 +166,7 @@ fn console_identity(branch: Uuid, role: &str) -> DataIdentity {
         databases: None,
         project_id: None,
         role_oid: None,
+        server_vouched: false,
     }
 }
 
@@ -988,6 +989,7 @@ mod tests {
             databases: None,
             project_id: None,
             role_oid: None,
+            server_vouched: false,
         }
     }
 

@@ -55,6 +55,15 @@ pub struct Refreshed {
     pub refresh_token: String,
 }
 
+/// The session a refresh token would refresh, and its user ([`InternalClient::peek`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Peeked {
+    pub session_id: Uuid,
+    pub user_id: Uuid,
+    /// The token is the previous one, inside its grace: reuse once the grace ends.
+    pub grace: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectBody {
     pub project_id: Uuid,
@@ -291,6 +300,13 @@ impl InternalClient {
         body: &CreateSession,
     ) -> Result<SessionCreated, InternalError> {
         self.json(Method::POST, "/internal/app/sessions", Some(v(body)))
+            .await
+    }
+
+    /// What [`InternalClient::refresh`] would do with this token, rotating and revoking
+    /// nothing: the session and its user, or the same `Refused { status: 401, code }` verdict.
+    pub async fn peek(&self, body: &RefreshRequest) -> Result<Peeked, InternalError> {
+        self.json(Method::POST, "/internal/app/sessions/peek", Some(v(body)))
             .await
     }
 

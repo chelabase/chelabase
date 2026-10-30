@@ -15,7 +15,7 @@ use chelabase_metadata::{
     ResyncWrite, RoleLevel, RoleOrigin, SealedChange, SettingsPatch,
     DataApiState, EnableStart, ServedDatabase,
     BeginEnable, BeginProjectDelete, NewAppSession, NewProjectAuth, OnDelete, ProjectStatus, RefreshNext,
-    RefreshOutcome, RenameProject, AppUsersStatus,
+    PeekOutcome, RefreshOutcome, RenameProject, AppUsersStatus,
     SAVED_QUERY_CAP, SavedQuery, SavedQueryEditor, SavedQueryPatch, SavedQueryWrite,
     BaseSource, BranchBusy, MergeCreate, MergeDirection, MergeDraftPatch, MergeEvent, MergeState, MergeStatus, MergeStatusPatch,
     MergeWrite, NewMerge, NewStaticEndpoint, SchemaBase,
@@ -6015,6 +6015,97 @@ async fn unknown_secret_is_invalid_without_revoking() {
     assert_eq!((wrong, missing), (RefreshOutcome::Invalid, RefreshOutcome::Invalid));
     assert_eq!(row.revoked_at, None);
     assert!(matches!(rotated, RefreshOutcome::Rotated(_)));
+}
+
+/// Every column a refresh could write, as text: peek must leave all of them as they were.
+async fn session_row(client: &MetadataClient, id: uuid::Uuid) -> String {
+    sqlx::query_scalar::<_, String>(
+        "SELECT concat_ws('|', encode(refresh_hash, 'hex'), encode(prev_refresh_hash, 'hex'),
+                grace_refresh_sealed, grace_until::text, last_used_at::text, expires_at::text,
+                revoked_at::text)
+         FROM app_sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(client.pool())
+    .await
+    .unwrap()
+}
+
+// #59: peek answers what refresh would, by the same rules, and writes nothing: no rotation,
+// no revocation on reuse, expiry or cap.
+#[tokio::test]
+#[ignore]
+async fn peek_answers_like_refresh_and_writes_nothing() {
+    let client = client().await;
+    let (project, other) = (new_project(&client, "peek").await, new_project(&client, "peek-other").await);
+    let user = uuid::Uuid::new_v4();
+    let cap = std::time::Duration::from_secs(30 * 86400);
+    // `s` rotated twice: 3 is current, 2 previous (within its grace), 1 two rotations old.
+    let s = new_session(project, user, 1);
+    // `late` rotated once and its grace is over: 4 is previous, 5 current.
+    let late = new_session(project, user, 4);
+    let (revoked, expired, capped) =
+        (new_session(project, user, 6), new_session(project, user, 7), new_session(project, user, 8));
+    for x in [&s, &late, &revoked, &expired, &capped] {
+        client.insert_app_session(x).await.unwrap();
+    }
+    client.refresh_app_session(s.id, project, hash(1), &next(2, 60)).await.unwrap();
+    client.refresh_app_session(s.id, project, hash(2), &next(3, 60)).await.unwrap();
+    client.refresh_app_session(late.id, project, hash(4), &next(5, 60)).await.unwrap();
+    sqlx::query("UPDATE app_sessions SET grace_until = now() - interval '1 second' WHERE id = $1")
+        .bind(late.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    client.revoke_app_session(revoked.id, project).await.unwrap();
+    sqlx::query("UPDATE app_sessions SET expires_at = now() - interval '1 second' WHERE id = $1")
+        .bind(expired.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+    backdate_session(&client, capped.id, 31 * 86400).await;
+    let ids = [s.id, late.id, revoked.id, expired.id, capped.id];
+    let mut before = Vec::new();
+    for id in ids {
+        before.push(session_row(&client, id).await);
+    }
+
+    let peek = |id, project, n| client.peek_app_session(id, project, hash(n), cap);
+    let current = peek(s.id, project, 3).await.unwrap();
+    let grace = peek(s.id, project, 2).await.unwrap();
+    let old = peek(s.id, project, 1).await.unwrap();
+    let unknown_hash = peek(s.id, project, 99).await.unwrap();
+    let unknown_id = peek(uuid::Uuid::new_v4(), project, 3).await.unwrap();
+    let elsewhere = peek(s.id, other, 3).await.unwrap();
+    let reused = peek(late.id, project, 4).await.unwrap();
+    let late_current = peek(late.id, project, 5).await.unwrap();
+    let dead = peek(revoked.id, project, 6).await.unwrap();
+    let past = peek(expired.id, project, 7).await.unwrap();
+    let over_cap = peek(capped.id, project, 8).await.unwrap();
+    let mut after = Vec::new();
+    for id in ids {
+        after.push(session_row(&client, id).await);
+    }
+    // The current token still rotates afterwards; the reused one still revokes.
+    let rotated = client.refresh_app_session(s.id, project, hash(3), &next(10, 60)).await.unwrap();
+    let revokes = client.refresh_app_session(late.id, project, hash(4), &next(11, 60)).await.unwrap();
+    cleanup_project(&client, project, &[]).await;
+    cleanup_project(&client, other, &[]).await;
+
+    let PeekOutcome::Live { session: c, grace: false } = current else { panic!("{current:?}") };
+    assert_eq!((c.id, c.user_id, c.project_id), (s.id, user, project));
+    // #59 audit B1: the previous token within its grace says so.
+    let PeekOutcome::Live { session: g, grace: true } = grace else { panic!("{grace:?}") };
+    assert_eq!((g.id, g.user_id), (s.id, user));
+    assert!(matches!(late_current, PeekOutcome::Live { grace: false, .. }), "{late_current:?}");
+    assert_eq!(
+        [old, unknown_hash, unknown_id, elsewhere, dead, past, over_cap],
+        [const { PeekOutcome::Invalid }; 7]
+    );
+    assert_eq!(reused, PeekOutcome::Reused);
+    assert_eq!(before, after, "peek wrote nothing");
+    assert!(matches!(rotated, RefreshOutcome::Rotated(_)), "{rotated:?}");
+    assert!(matches!(revokes, RefreshOutcome::Reused(_)), "{revokes:?}");
 }
 
 #[tokio::test]

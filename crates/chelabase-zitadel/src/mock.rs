@@ -51,6 +51,11 @@ pub struct Inner {
     pub allow_duplicate_emails: bool,
     /// Every `DELETE /v2/sessions/{id}` waits this long first (a slow Zitadel).
     pub session_delete_delay: std::time::Duration,
+    /// Every `GET /v2/users/{id}` waits this long first (a slow Zitadel).
+    pub user_lookup_delay: std::time::Duration,
+    /// Run when a request whose `"METHOD path"` contains the pattern arrives, before it is
+    /// answered: something that happens elsewhere while Zitadel is still answering.
+    pub on_request: Vec<(String, Arc<dyn Fn() + Send + Sync>)>,
     /// Pending invite codes: user id -> (code, expired).
     pub invites: HashMap<String, (String, bool)>,
     /// The URL template and application name of each user's last invite mail.
@@ -78,6 +83,8 @@ pub struct Fault {
     pub pattern: String,
     pub status: u16,
     pub key: String,
+    /// Answer with exactly this body instead of Zitadel's error shape.
+    pub body: Option<String>,
     pub remaining: u32,
 }
 
@@ -102,10 +109,16 @@ fn err(status: StatusCode, message: &str) -> Reply {
 /// `details[]` carrying the id and the message key.
 fn zerr(status: StatusCode, key: &str) -> Reply {
     let id = "COMMAND-Dg2z3";
+    // gRPC NOT_FOUND for a 404 (what `get_user` checks), else FAILED_PRECONDITION.
+    let code = if status == StatusCode::NOT_FOUND {
+        5
+    } else {
+        9
+    };
     (
         status,
         Json(json!({
-            "code": 9,
+            "code": code,
             "message": format!("Der Fehler ist aufgetreten ({id})"),
             "details": [{
                 "@type": "type.googleapis.com/zitadel.v1.ErrorDetail",
@@ -200,6 +213,18 @@ impl MockZitadel {
             pattern: pattern.into(),
             status,
             key: key.into(),
+            body: None,
+            remaining: times,
+        });
+    }
+    /// The next `times` requests whose `"METHOD path"` contains `pattern` get `status` with
+    /// exactly `body` (empty, malformed or unexpected JSON), as a proxy or a changed API might.
+    pub fn answer_raw(&self, pattern: &str, status: u16, body: &str, times: u32) {
+        self.inner.lock().unwrap().faults.push(Fault {
+            pattern: pattern.into(),
+            status,
+            key: String::new(),
+            body: Some(body.into()),
             remaining: times,
         });
     }
@@ -333,6 +358,20 @@ impl MockZitadel {
     pub fn set_down(&self, down: bool) {
         self.inner.lock().unwrap().down = down;
     }
+    pub fn set_user_lookup_delay(&self, delay: std::time::Duration) {
+        self.inner.lock().unwrap().user_lookup_delay = delay;
+    }
+    /// Runs `f` whenever a request matching `pattern` arrives, before it is answered.
+    pub fn on_request(&self, pattern: &str, f: impl Fn() + Send + Sync + 'static) {
+        self.inner
+            .lock()
+            .unwrap()
+            .on_request
+            .push((pattern.into(), Arc::new(f)));
+    }
+    pub fn clear_on_request(&self) {
+        self.inner.lock().unwrap().on_request.clear();
+    }
     pub fn set_session_delete_delay(&self, delay: std::time::Duration) {
         self.inner.lock().unwrap().session_delete_delay = delay;
     }
@@ -357,6 +396,17 @@ type S = State<Arc<Mutex<Inner>>>;
 async fn journal(State(s): S, req: Request, next: Next) -> Response {
     use axum::response::IntoResponse;
     let call = format!("{} {}", req.method(), req.uri().path());
+    let hooks: Vec<_> = s
+        .lock()
+        .unwrap()
+        .on_request
+        .iter()
+        .filter(|(pattern, _)| call.contains(pattern.as_str()))
+        .map(|(_, f)| f.clone())
+        .collect();
+    for hook in hooks {
+        hook();
+    }
     let forced = {
         let mut inner = s.lock().unwrap();
         inner.calls.push(call.clone());
@@ -364,7 +414,7 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
             && !is_admin(req.headers())
             && (call.ends_with("/invite_code/verify") || call.starts_with("PATCH /v2/users/"));
         if strict_denied {
-            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied"))
+            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied").into_response())
         } else {
             inner
                 .faults
@@ -372,12 +422,16 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
                 .find(|f| f.remaining > 0 && call.contains(&f.pattern))
                 .map(|f| {
                     f.remaining -= 1;
-                    zerr(StatusCode::from_u16(f.status).unwrap(), &f.key)
+                    let status = StatusCode::from_u16(f.status).unwrap();
+                    match &f.body {
+                        Some(body) => (status, body.clone()).into_response(),
+                        None => zerr(status, &f.key).into_response(),
+                    }
                 })
         }
     };
     match forced {
-        Some(reply) => reply.into_response(),
+        Some(reply) => reply,
         None => next.run(req).await,
     }
 }
@@ -524,13 +578,17 @@ async fn list_users(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> Re
 }
 
 async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
+    let delay = s.lock().unwrap().user_lookup_delay;
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
     let inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
         return e;
     }
     match inner.users.iter().find(|u| u.id == id) {
         Some(u) => ok(json!({"user": user_json(u, &inner)})),
-        None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
+        None => zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
     }
 }
 

@@ -40,6 +40,48 @@ import { createClient, fetchTypes } from "@chelabase/client";
 const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key: secretKey }) });
 ```
 
+## Browser and server
+
+For a server-rendered app (Next.js and others) the app user's session lives in cookies. Create
+the browser client in client components, a server client per request, and mount the auth
+handler once:
+
+```ts
+import { createBrowserClient } from "@chelabase/client/browser";
+import { createAuthHandler, createServerClient } from "@chelabase/client/server";
+
+// Browser: data goes to the gateway, sign-in and refresh go through your auth route.
+const db = createBrowserClient<Database>({ url, key: PUBLIC_KEY, types });
+
+// Server: one per request. Wrap the framework's cookie store: Next's `cookies()` has no
+// `setAll`, so passing it as is gives a read-only client that never refreshes. In Next.js,
+// `store.set` works in Server Actions and route handlers, not in Server Components.
+const store = await cookies();
+const sdb = createServerClient<Database>({
+  url,
+  key: PUBLIC_KEY,
+  // Sign-ins and refreshes are then limited per email and per user, instead of all sharing
+  // this server's IP. `clientIp` (optional, needs `serverKey`) adds per-IP limits on top.
+  serverKey: SECRET_KEY,
+  types,
+  cookies: {
+    getAll: () => store.getAll(),
+    setAll: (list) => list.forEach((c) => store.set(c.name, c.value, c.options)),
+  },
+});
+const user = await sdb.auth.currentUser(); // null when signed out
+// In the proxy/middleware: a request only when the access token is about to expire.
+await sdb.auth.refreshIfNeeded();
+
+// Once, e.g. app/api/chelabase/auth/[...path]/route.ts
+export const POST = createAuthHandler({ url, key: PUBLIC_KEY, serverKey: SECRET_KEY, siteUrl: "https://app.example.com" });
+```
+
+When another system owns the session, `createClient({ url, key, accessToken: () => token })`
+sends that token and never refreshes it. The full Next.js walkthrough is the guide's Server
+rendering page, `/docs/using/client/ssr` on the docs site
+(http://docs.chelabase.localhost:8000/docs/using/client/ssr in the workbench).
+
 ## Documentation
 
 The guide covers filters, errors, big numbers (`int8`, `numeric`), generated types (and

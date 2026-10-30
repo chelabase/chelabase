@@ -1,4 +1,4 @@
 {
   "title": "TypeScript client",
-  "pages": ["index", "filters", "errors", "big-numbers", "types", "auth"]
+  "pages": ["index", "filters", "errors", "big-numbers", "types", "auth", "ssr"]
 }

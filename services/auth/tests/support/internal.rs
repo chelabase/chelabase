@@ -21,6 +21,10 @@ pub struct FakeSession {
     pub user_id: Uuid,
     pub zitadel_session_id: String,
     pub token: String,
+    /// The token before the last rotation: presented again, it gets the grace answer.
+    pub previous: Option<String>,
+    /// The grace of `previous` is over: presented again, it is reuse (refresh revokes).
+    pub grace_over: bool,
     pub revoked: bool,
 }
 
@@ -31,8 +35,10 @@ pub struct FakeState {
     /// `(method path, body)` of every call, in order.
     pub calls: Vec<(String, Value)>,
     pub sessions: HashMap<Uuid, FakeSession>,
-    /// Answer refreshes with 401 and this code.
-    pub refresh_error: Option<String>,
+    /// Answer refreshes with this status and code; no code is a bare answer with no body.
+    pub refresh_error: Option<(StatusCode, Option<String>)>,
+    /// The same for peeks.
+    pub peek_error: Option<(StatusCode, Option<String>)>,
     pub next: u64,
     /// The sign-up gate's answer (`allowed`, `reason`); open when unset.
     pub signup: Option<(bool, String)>,
@@ -115,6 +121,8 @@ async fn create_session(State(s): S, Json(b): Json<Value>) -> Response {
             user_id: b["user_id"].as_str().unwrap().parse().unwrap(),
             zitadel_session_id: b["zitadel_session_id"].as_str().unwrap().into(),
             token: token.clone(),
+            previous: None,
+            grace_over: false,
             revoked: false,
         },
     );
@@ -125,23 +133,66 @@ async fn create_session(State(s): S, Json(b): Json<Value>) -> Response {
         .into_response()
 }
 
-async fn refresh(State(s): S, Json(b): Json<Value>) -> Response {
-    let mut st = s.lock().unwrap();
-    if let Some(code) = st.refresh_error.clone() {
-        return error(StatusCode::UNAUTHORIZED, &code);
-    }
+fn forced(answer: Option<(StatusCode, Option<String>)>) -> Option<Response> {
+    answer.map(|(status, code)| match code {
+        Some(code) => error(status, &code),
+        None => status.into_response(),
+    })
+}
+
+/// The live session `token` belongs to in `project`: `(id, user, the token is current)`.
+fn find(st: &FakeState, b: &Value) -> Option<(Uuid, Uuid, bool)> {
     let project: Uuid = b["project_id"].as_str().unwrap().parse().unwrap();
     let token = b["refresh_token"].as_str().unwrap_or("");
-    let found = st
-        .sessions
+    st.sessions
         .iter()
-        .find(|(_, x)| x.token == token && x.project_id == project && !x.revoked)
-        .map(|(id, x)| (*id, x.user_id));
-    let Some((sid, user)) = found else {
+        .find(|(_, x)| {
+            (x.token == token || x.previous.as_deref() == Some(token))
+                && x.project_id == project
+                && !x.revoked
+        })
+        .map(|(id, x)| (*id, x.user_id, x.token == token))
+}
+
+/// The orchestrator's peek: refresh's answer, with nothing written.
+async fn peek(State(s): S, Json(b): Json<Value>) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(answer) = forced(st.peek_error.clone()) {
+        return answer;
+    }
+    match find(&st, &b) {
+        None => error(StatusCode::UNAUTHORIZED, "refresh_token_invalid"),
+        Some((sid, _, false)) if st.sessions[&sid].grace_over => {
+            error(StatusCode::UNAUTHORIZED, "refresh_token_reused")
+        }
+        Some((sid, user, current)) => {
+            Json(json!({"session_id": sid, "user_id": user, "grace": !current})).into_response()
+        }
+    }
+}
+
+async fn refresh(State(s): S, Json(b): Json<Value>) -> Response {
+    let mut st = s.lock().unwrap();
+    if let Some(answer) = forced(st.refresh_error.clone()) {
+        return answer;
+    }
+    let Some((sid, user, current)) = find(&st, &b) else {
         return error(StatusCode::UNAUTHORIZED, "refresh_token_invalid");
     };
-    let next = new_token(&mut st, sid);
-    st.sessions.get_mut(&sid).unwrap().token = next.clone();
+    if !current && st.sessions[&sid].grace_over {
+        st.sessions.get_mut(&sid).unwrap().revoked = true;
+        return error(StatusCode::UNAUTHORIZED, "refresh_token_reused");
+    }
+    // The grace answer hands back the token the earlier rotation made.
+    let next = if current {
+        let next = new_token(&mut st, sid);
+        let x = st.sessions.get_mut(&sid).unwrap();
+        x.previous = Some(std::mem::replace(&mut x.token, next.clone()));
+        x.grace_over = false;
+        next
+    } else {
+        st.sessions[&sid].token.clone()
+    };
     Json(
         json!({"session_id": sid, "user_id": user, "refresh_token": next,
         "expires_at": "2026-11-02T10:00:00Z"}),
@@ -239,6 +290,7 @@ impl FakeInternal {
         let app = Router::new()
             .route("/internal/app/branches/{id}", get(branch))
             .route("/internal/app/sessions", post(create_session))
+            .route("/internal/app/sessions/peek", post(peek))
             .route("/internal/app/sessions/refresh", post(refresh))
             .route(
                 "/internal/app/sessions/revoke-by-token",
@@ -340,7 +392,74 @@ impl FakeInternal {
             .collect()
     }
 
+    /// A session made directly: `(session id, refresh token)`. With `rotated`, it was refreshed
+    /// once already and the token returned is the previous one, which gets the grace answer.
+    pub fn add_session(&self, project_id: Uuid, user_id: Uuid, rotated: bool) -> (Uuid, String) {
+        let mut st = self.inner.lock().unwrap();
+        let sid = Uuid::new_v4();
+        let first = new_token(&mut st, sid);
+        let (token, previous) = if rotated {
+            (new_token(&mut st, sid), Some(first.clone()))
+        } else {
+            (first.clone(), None)
+        };
+        st.sessions.insert(
+            sid,
+            FakeSession {
+                project_id,
+                user_id,
+                zitadel_session_id: String::new(),
+                token,
+                previous,
+                grace_over: false,
+                revoked: false,
+            },
+        );
+        (sid, first)
+    }
+
     pub fn set_refresh_error(&self, code: Option<&str>) {
-        self.inner.lock().unwrap().refresh_error = code.map(str::to_string);
+        self.inner.lock().unwrap().refresh_error =
+            code.map(|c| (StatusCode::UNAUTHORIZED, Some(c.to_string())));
+    }
+
+    /// Answer refreshes with `status` and `code`, or a bare `status` with no body.
+    pub fn set_refresh_answer(&self, status: StatusCode, code: Option<&str>) {
+        self.inner.lock().unwrap().refresh_error = Some((status, code.map(str::to_string)));
+    }
+
+    /// Answer peeks with `status` and `code`, or a bare `status` with no body.
+    pub fn set_peek_answer(&self, status: StatusCode, code: Option<&str>) {
+        self.inner.lock().unwrap().peek_error = Some((status, code.map(str::to_string)));
+    }
+
+    /// Peeks and refreshes answer from the sessions again.
+    pub fn clear_answers(&self) {
+        let mut st = self.inner.lock().unwrap();
+        st.refresh_error = None;
+        st.peek_error = None;
+    }
+
+    /// Time passes beyond the grace (10 s): every previous token is now reuse.
+    pub fn end_grace(&self) {
+        for x in self.inner.lock().unwrap().sessions.values_mut() {
+            x.grace_over = x.previous.is_some();
+        }
+    }
+
+    /// Another request refreshes session `id`: its current token becomes the previous one, in
+    /// its grace. Returns the new current token.
+    pub fn rotate(&self, id: Uuid) -> String {
+        let mut st = self.inner.lock().unwrap();
+        let next = new_token(&mut st, id);
+        let x = st.sessions.get_mut(&id).unwrap();
+        x.previous = Some(std::mem::replace(&mut x.token, next.clone()));
+        x.grace_over = false;
+        next
+    }
+
+    /// The number of calls to `call` (`"POST /internal/app/sessions/refresh"`).
+    pub fn count(&self, call: &str) -> usize {
+        self.calls().iter().filter(|(c, _)| c == call).count()
     }
 }

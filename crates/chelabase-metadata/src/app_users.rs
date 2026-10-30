@@ -202,6 +202,20 @@ pub enum RefreshOutcome {
     Invalid,
 }
 
+/// What presenting a refresh token would do, read without locking or writing anything
+/// ([`MetadataClient::peek_app_session`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeekOutcome {
+    /// The current token (`grace: false`), or the previous one within its grace
+    /// (`grace: true`): a refresh would answer. A grace token's refresh writes nothing, but
+    /// it is reuse once the grace ends, so a caller acts on it before the grace runs out.
+    Live { session: AppSession, grace: bool },
+    /// The previous token after its grace: a refresh would revoke the session.
+    Reused,
+    /// Unknown session, another project's, revoked, expired or a token that matches neither.
+    Invalid,
+}
+
 fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
     Ok(ProjectAuth {
         project_id: ProjectId(r.get("project_id")),
@@ -715,6 +729,59 @@ impl MetadataClient {
         };
         tx.commit().await?;
         Ok(outcome)
+    }
+
+    /// What [`MetadataClient::refresh_app_session`] would do with `presented`, by the same
+    /// rules (project, revocation, expiry and `cap`, current token, previous token and grace),
+    /// read in one statement: no lock, no rotation and no revocation. A session past its expiry
+    /// or `cap` is `Invalid` but left for `refresh_app_session` to revoke; the previous token
+    /// after its grace is `Reused` and the session stays live.
+    pub async fn peek_app_session(
+        &self,
+        id: Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        cap: Duration,
+    ) -> Result<PeekOutcome, MetadataError> {
+        let row = sqlx::query(
+            "SELECT id, project_id, user_id, zitadel_session_id, refresh_hash, prev_refresh_hash,
+                    grace_until, grace_refresh_sealed IS NOT NULL AS has_sealed, created_at,
+                    last_used_at, expires_at, revoked_at, now() AS now
+             FROM app_sessions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(PeekOutcome::Invalid);
+        };
+        let session = session_from_row(&row);
+        if session.project_id != project || session.revoked_at.is_some() {
+            return Ok(PeekOutcome::Invalid);
+        }
+        let now: DateTime<Utc> = row.get("now");
+        let cap_end = chrono::Duration::from_std(cap)
+            .ok()
+            .and_then(|cap| session.created_at.checked_add_signed(cap));
+        if now >= session.expires_at || cap_end.is_some_and(|end| now >= end) {
+            return Ok(PeekOutcome::Invalid);
+        }
+        let current: Vec<u8> = row.get("refresh_hash");
+        let previous: Option<Vec<u8>> = row.get("prev_refresh_hash");
+        Ok(if current.as_slice() == presented.as_slice() {
+            PeekOutcome::Live { session, grace: false }
+        } else if previous.as_deref() == Some(presented.as_slice()) {
+            // The grace answer needs the sealed token too, as in `refresh_app_session`; peek
+            // only checks that it is there and never reads it.
+            let grace_until: Option<DateTime<Utc>> = row.get("grace_until");
+            let sealed: bool = row.get("has_sealed");
+            match grace_until {
+                Some(until) if until > now && sealed => PeekOutcome::Live { session, grace: true },
+                _ => PeekOutcome::Reused,
+            }
+        } else {
+            PeekOutcome::Invalid
+        })
     }
 
     /// Revokes a live session of the project. `Some` when it was live and in that project.

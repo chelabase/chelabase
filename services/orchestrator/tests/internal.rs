@@ -12,7 +12,7 @@ use chelabase_metadata::{
     AppSession, AppUsersStatus, BranchAuthSync, BranchConnectionRow, BranchKind, BranchRecord,
     ServedDatabase, BranchStatus, DataApiSettings, DataKeyLookup, DatabaseOrigin, MetadataError,
     NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, OnDelete, ProjectAuth, ProjectRecord,
-    ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
+    PeekOutcome, ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
 use chelabase_metadata::members::InviteDescription;
 use chelabase_metadata::personal_logins::LoginEndpoint;
@@ -866,6 +866,41 @@ impl NeonMetadataPort for FakeNeon {
             }
         } else {
             Ok(RefreshOutcome::Invalid)
+        }
+    }
+
+    /// T1's rules read without writing (#59).
+    async fn peek_app_session(
+        &self,
+        id: uuid::Uuid,
+        project: ProjectId,
+        presented: [u8; 32],
+        cap: std::time::Duration,
+    ) -> Result<PeekOutcome, MetadataError> {
+        self.check()?;
+        let app = self.app.lock().unwrap();
+        let Some(f) = app.sessions.iter().find(|f| f.s.id == id) else {
+            return Ok(PeekOutcome::Invalid);
+        };
+        if f.s.project_id != project || f.s.revoked_at.is_some() {
+            return Ok(PeekOutcome::Invalid);
+        }
+        let now = chrono::Utc::now();
+        let cap_end = f.s.created_at + chrono::Duration::from_std(cap).unwrap();
+        if now >= f.s.expires_at || now >= cap_end {
+            return Ok(PeekOutcome::Invalid);
+        }
+        if f.hash == presented {
+            Ok(PeekOutcome::Live { session: f.s.clone(), grace: false })
+        } else if f.prev == Some(presented) {
+            match (f.grace_until, &f.sealed) {
+                (Some(until), Some(_)) if until > now => {
+                    Ok(PeekOutcome::Live { session: f.s.clone(), grace: true })
+                }
+                _ => Ok(PeekOutcome::Reused),
+            }
+        } else {
+            Ok(PeekOutcome::Invalid)
         }
     }
 
@@ -4191,6 +4226,16 @@ impl AppApp {
             .await
     }
 
+    async fn peek(&self, project: ProjectId, token: &str) -> (u16, Value) {
+        self.app
+            .post_json(
+                "/internal/app/sessions/peek",
+                Some(APP_AUTH_TOKEN),
+                json!({ "project_id": project, "refresh_token": token }),
+            )
+            .await
+    }
+
     fn session(&self, id: uuid::Uuid) -> FakeSession {
         self.neon
             .app
@@ -4261,6 +4306,11 @@ fn auth_routes(w: &AppWorld) -> Vec<(&'static str, String, Value)> {
         (
             "POST",
             "/internal/app/sessions/refresh".into(),
+            json!({ "project_id": w.project, "refresh_token": format!("{sid}.x") }),
+        ),
+        (
+            "POST",
+            "/internal/app/sessions/peek".into(),
             json!({ "project_id": w.project, "refresh_token": format!("{sid}.x") }),
         ),
         (
@@ -4622,6 +4672,124 @@ async fn malformed_refresh_token_invalid() {
         assert_eq!(error_code(&body), "refresh_token_invalid", "{bad:?}");
     }
     assert!(!a.revoked(sid), "garbage never revokes");
+}
+
+// #59: peek answers the session and its user for the current token, and for the previous one
+// within the grace (saying it is the grace token, #59 audit B1), and changes nothing.
+#[tokio::test]
+async fn peek_answers_the_user_and_rotates_nothing() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let user = uuid::Uuid::new_v4();
+    let (sid, t0) = a.create_session(w.project, user, "zs1").await;
+    let (status, body) = a.peek(w.project, &t0).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({ "session_id": sid, "user_id": user, "grace": false }),
+        "no token in the answer"
+    );
+    let before = a.session(sid);
+    assert_eq!(before.hash, sha256(&t0), "unchanged");
+    assert_eq!((before.prev, before.grace_until), (None, None));
+    // The previous token within the grace: the same session and user, as the grace token.
+    let (_, body) = a.refresh(w.project, &t0).await;
+    let t1 = body["refresh_token"].as_str().unwrap().to_string();
+    let rotated = a.session(sid);
+    for (token, grace) in [(&t0, true), (&t1, false)] {
+        let (status, body) = a.peek(w.project, token).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body, json!({ "session_id": sid, "user_id": user, "grace": grace }));
+    }
+    let after = a.session(sid);
+    assert_eq!((after.hash, after.prev, after.grace_until), (rotated.hash, rotated.prev, rotated.grace_until));
+    assert_eq!(after.s, rotated.s, "peek wrote nothing");
+}
+
+// #59: an unknown, revoked or two-rotations-old token is `refresh_token_invalid`, the previous
+// token after the grace `refresh_token_reused`; peek revokes nothing and ends no Zitadel session.
+#[tokio::test]
+async fn peek_gives_refresh_verdicts_without_revoking() {
+    let w = app_world();
+    let z = zitadel_with_sessions(&["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (_, body) = a.refresh(w.project, &t0).await;
+    let t1 = body["refresh_token"].as_str().unwrap().to_string();
+    let (_, body) = a.refresh(w.project, &t1).await;
+    let t2 = body["refresh_token"].as_str().unwrap().to_string();
+    let (dead, dead_token) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs2").await;
+    a.edit_session(dead, |f| f.s.revoked_at = Some(chrono::Utc::now()));
+    let unknown = format!("{}.{}", uuid::Uuid::new_v4(), t0.split_once('.').unwrap().1);
+    for (what, token) in [
+        ("two rotations old", t0.clone()),
+        ("unknown session", unknown),
+        ("wrong secret", format!("{sid}.wrong-secret")),
+        ("garbage", "garbage".to_string()),
+        ("revoked", dead_token),
+    ] {
+        let (status, body) = a.peek(w.project, &token).await;
+        assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{what}: {body}");
+    }
+    a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
+    let before = a.session(sid);
+    let (status, body) = a.peek(w.project, &t1).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"), "{body}");
+    let after = a.session(sid);
+    assert_eq!((after.s, after.hash), (before.s, before.hash), "peek wrote nothing");
+    assert!(!a.revoked(sid), "only refresh revokes on reuse");
+    assert!(
+        !z.calls().iter().any(|c| c.starts_with("DELETE /v2/sessions/")),
+        "peek ended no Zitadel session: {:?}",
+        z.calls()
+    );
+    // The current token still works; the reuse still revokes when it reaches refresh.
+    let (status, _) = a.peek(w.project, &t2).await;
+    assert_eq!(status, 200);
+    let (status, body) = a.refresh(w.project, &t1).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"));
+    assert!(a.revoked(sid));
+}
+
+// #59: peek for another project's session is `refresh_token_invalid`, like refresh.
+#[tokio::test]
+async fn peek_other_project_is_invalid() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let (status, body) = a.peek(w.bare_project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
+    assert!(!a.revoked(sid));
+    let (status, _) = a.peek(w.project, &t0).await;
+    assert_eq!(status, 200);
+}
+
+// #59: an expired session is `refresh_token_invalid` to peek too, but only refresh revokes it.
+#[tokio::test]
+async fn peek_leaves_an_expired_session_to_refresh() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    a.edit_session(sid, |f| f.s.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1));
+    let (status, body) = a.peek(w.project, &t0).await;
+    assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
+    assert!(!a.revoked(sid));
+    let (status, _) = a.refresh(w.project, &t0).await;
+    assert_eq!(status, 401);
+    assert!(a.revoked(sid));
+}
+
+// #59: a metadata fault is a 500 (auth answers 503), never a verdict.
+#[tokio::test]
+async fn peek_metadata_fault_is_not_a_verdict() {
+    let w = app_world();
+    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    *w.neon.fail.lock().unwrap() = true;
+    let (status, body) = a.peek(w.project, &t0).await;
+    *w.neon.fail.lock().unwrap() = false;
+    assert_eq!(status, 500, "{body}");
+    assert!(!a.revoked(sid));
 }
 
 #[tokio::test]

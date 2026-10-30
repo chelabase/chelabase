@@ -151,6 +151,7 @@ fn data_identity_round_trips_in_claims() {
         databases: Some(vec!["main".into(), "analytics".into()]),
         project_id: None,
         role_oid: Some(16390),
+        server_vouched: false,
     };
     let identity = Identity {
         sub: data.key_id.to_string(),
@@ -263,6 +264,39 @@ fn old_identity_tokens_without_project_parse() {
     let with = DataIdentity { project_id: Some(Uuid::new_v4()), ..data };
     let back: DataIdentity = serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
     assert_eq!(back, with);
+}
+
+/// #55: an identity without `server_vouched` (older tokens, other minters) is not
+/// server-vouched; false isn't written, true round-trips through a signed token.
+#[test]
+fn server_vouched_defaults_to_false() {
+    let old = serde_json::json!({
+        "branch_id": Uuid::new_v4(),
+        "key_id": Uuid::new_v4(),
+        "kind": "public",
+        "role": "anon",
+        "claims": {},
+        "project_id": Uuid::new_v4(),
+    });
+    let data: DataIdentity = serde_json::from_value(old).unwrap();
+    assert!(!data.server_vouched);
+    assert!(serde_json::to_value(&data).unwrap().get("server_vouched").is_none());
+
+    let (signer, verifier) = keypair();
+    let vouched = DataIdentity { server_vouched: true, ..data };
+    let identity = Identity {
+        sub: vouched.key_id.to_string(),
+        org_id: String::new(),
+        auth: AuthMethod::DataKey,
+        request_id: "rid-3".into(),
+        data: Some(vouched.clone()),
+        email: None,
+        name: None,
+    };
+    let token = signer.sign("auth", &identity).unwrap();
+    let back = verifier.verify(&token, "auth").unwrap().data.unwrap();
+    assert!(back.server_vouched);
+    assert_eq!(back, vouched);
 }
 
 // #24 follow-up: the claims the verifier checks are required, so a token missing `iss` or

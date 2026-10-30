@@ -288,6 +288,42 @@ describe("auth", () => {
     expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(2);
   });
 
+  test("auto_refresh_of_a_60s_token_waits_half_its_life", async () => {
+    // The lead is capped at half the lifetime: a 60 s token refreshes every ~30 s, not in a loop.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+    let n = 1;
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1, 60) }),
+      "/auth/v1/app/refresh": () => ({ body: session(++n, 60) }),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(28_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(2);
+  });
+
+  test("auto_refresh_of_a_15min_token_is_60s_before_exp", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-03T00:00:00Z"));
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1, 900) }),
+      "/auth/v1/app/refresh": () => ({ body: session(2, 900) }),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await vi.advanceTimersByTimeAsync(839_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+  });
+
   test("memory_storage_without_localStorage", async () => {
     vi.stubGlobal("localStorage", undefined);
     const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
@@ -426,5 +462,71 @@ describe("auth", () => {
     expect(JSON.parse(fetch.calls[0]!.init.body as string)).toEqual({ refresh_token: "rt9" });
     expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
     expect(m.size).toBe(0);
+  });
+});
+
+describe("auth refreshIfNeeded and currentUser", () => {
+  test("refresh_if_needed_only_refreshes_when_needed", async () => {
+    const s2 = session(2);
+    const fetch = router({ "/auth/v1/app/refresh": () => ({ body: s2 }) });
+    const { s, m } = memoryStorage({ [STORE_KEY]: "rt1" });
+    const db = createClient({ url, key, fetch, auth: { storage: s, autoRefresh: false } });
+    await expect(db.auth.refreshIfNeeded()).resolves.toBeUndefined();
+    expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    expect(m.get(STORE_KEY)).toBe("rt2");
+    await db.auth.refreshIfNeeded();
+    expect(fetch.calls).toHaveLength(1);
+    // No stored session: nothing to do.
+    const none = router({});
+    await createClient({ url, key, fetch: none, auth: { storage: memoryStorage().s } }).auth.refreshIfNeeded();
+    expect(none.calls).toHaveLength(0);
+  });
+
+  test("current_user_is_null_when_signed_out", async () => {
+    const none = router({});
+    expect(await createClient({ url, key, fetch: none, auth: { storage: memoryStorage().s } }).auth.currentUser()).toBeNull();
+    expect(none.calls).toHaveLength(0);
+
+    for (const code of ["user_session_revoked", "user_token_invalid"]) {
+      const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }), "/auth/v1/app/user": () => err(401, code) });
+      const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
+      await db.auth.signIn({ email: "a@b.co", password: "pw" });
+      expect(await db.auth.currentUser(), code).toBeNull();
+    }
+    // A stored refresh token the server no longer knows.
+    const stale = router({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
+    const db = createClient({ url, key, fetch: stale, auth: { storage: memoryStorage({ [STORE_KEY]: "rt1" }).s } });
+    expect(await db.auth.currentUser()).toBeNull();
+  });
+
+  test("current_user_is_null_when_its_refresh_ends_the_session", async () => {
+    for (const code of ["refresh_token_reused", "user_inactive"]) {
+      const fetch = router({ "/auth/v1/app/refresh": () => err(401, code) });
+      const { s, m } = memoryStorage({ [STORE_KEY]: "rt1" });
+      const db = createClient({ url, key, fetch, auth: { storage: s, autoRefresh: false } });
+      expect(await db.auth.currentUser(), code).toBeNull();
+      expect(m.has(STORE_KEY), code).toBe(false);
+    }
+  });
+
+  test("current_user_retries_once_after_expired_then_gives_null", async () => {
+    let refreshes = 0;
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1) }),
+      "/auth/v1/app/refresh": () => ({ body: session(10 + refreshes++) }),
+      "/auth/v1/app/user": () => err(401, "user_token_expired"),
+    });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    expect(await db.auth.currentUser()).toBeNull();
+    expect(refreshes).toBe(1);
+    expect(fetch.to("/auth/v1/app/user")).toHaveLength(2);
+  });
+
+  test("current_user_rejects_on_a_503", async () => {
+    const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }), "/auth/v1/app/user": () => err(503, "unavailable") });
+    const db = createClient({ url, key, fetch, auth: { storage: memoryStorage().s, autoRefresh: false } });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    await expect(db.auth.currentUser()).rejects.toBeInstanceOf(DataApiError);
   });
 });

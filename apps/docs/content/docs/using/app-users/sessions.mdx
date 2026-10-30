@@ -23,7 +23,9 @@ const mine = await db.from('users').select('id', 'display_name'); // only the si
 | `signIn({ email, password })` | Returns the session. |
 | `signOut()` | Ends the session on the server and signs out locally, even if the call fails. |
 | `refresh()` | Exchanges the stored refresh token for a new pair. The client does this for you. |
-| `getUser()` | The signed-in user. |
+| `refreshIfNeeded()` | Refreshes only when the access token is missing or about to expire; sends nothing otherwise. |
+| `getUser()` | The signed-in user; rejects when signed out. |
+| `currentUser()` | The signed-in user, or `null` when signed out. |
 | `verifyEmail({ email, code })`, `resendCode({ email })` | Confirm an address with the emailed code, or send it again. |
 | `requestPasswordReset({ email })`, `confirmPasswordReset({ email, code, password })` | Reset a forgotten password with an emailed code. |
 | `changeEmail({ email })`, `changePassword({ currentPassword, password })` | Change the signed-in user's email or password. `changePassword` returns a fresh session. |

@@ -598,16 +598,21 @@ fn valid_email(email: &str) -> bool {
 }
 
 /// Counts one attempt against each `(flow, key kind, value, limit, window)`, stopping at the
-/// first over its limit.
+/// first over its limit. A server-vouched call (#55) skips the `"ip"` checks: its address is
+/// the app server's, shared by all its users; the `"email"` and `"user"` checks still count.
 fn rate_limit(
     s: &AppState,
     caller: &AppCaller,
     checks: &[(&str, &str, &str, u32, Duration)],
 ) -> Flow<()> {
-    let ok = checks.iter().all(|(flow, kind, value, limit, window)| {
-        let key = format!("app:{}:{flow}:{kind}:{value}", caller.project_id);
-        s.limiter.allow(&key, *limit, *window)
-    });
+    let applies = |kind: &str| !(caller.server_vouched && kind == "ip");
+    let ok = checks
+        .iter()
+        .filter(|(_, kind, ..)| applies(kind))
+        .all(|(flow, kind, value, limit, window)| {
+            let key = format!("app:{}:{flow}:{kind}:{value}", caller.project_id);
+            s.limiter.allow(&key, *limit, *window)
+        });
     if ok {
         Ok(())
     } else {
@@ -1037,18 +1042,64 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     }
 }
 
+/// Checks the token's user, then rotates the refresh token.
+///
+/// Invariant (#57): clients drop their cookies on `refresh_token_invalid`,
+/// `refresh_token_reused` and `user_inactive`, so a refresh revokes the session or answers one
+/// of them only on a definitive verdict: the orchestrator's 401 `refresh_token_invalid` or
+/// `refresh_token_reused`, Zitadel's definite "no such user" (a 404) or a user of another org,
+/// or an inactive user. Every other upstream outcome (any other orchestrator status or code,
+/// a Zitadel 5xx or other refusal, a timeout, an unreadable or partial success answer) answers
+/// 503 `unavailable` and revokes nothing.
+///
+/// And (#59): nothing rotates before the user check. The orchestrator's peek names the token's
+/// user without writing, and says whether the token is the current one or the previous one
+/// inside its 10 s grace.
+/// - A current token: Zitadel is asked about the user first, and only then does `refresh`
+///   rotate. A fault before the rotation (peek, Zitadel, or the lookup taking longer than
+///   [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP)) answers 503 and leaves the token the client holds current, so
+///   a later retry with it works, however late, unless another request rotates it meanwhile.
+/// - A grace token goes to `refresh` first, then the user is checked, as before #59: its
+///   grace answer writes nothing, and holding it through a slow Zitadel could outlast the
+///   grace and turn it into reuse (#59 audit B1). A fault after that answers 503; the client
+///   keeps a grace token, which works again only until its grace ends.
+/// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
+///   revokes on reuse); a user that `refresh` names but peek didn't check is checked after it.
+///
+/// A request that peeked a current token just before a parallel one rotated it reaches
+/// `refresh` holding a grace token. [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP) caps
+/// the lookup at half of [`APP_REFRESH_GRACE`](chelabase_auth::app_token::APP_REFRESH_GRACE)
+/// or less (4 s of 10 s, checked at compile time), so it gets the grace answer provided the
+/// peek's reply, the `refresh` call and its row lock take under the remaining ~6 s. If they
+/// take longer, the grace has ended: `refresh` answers `refresh_token_reused` and revokes the
+/// session, an accepted residual (#59 second audit).
+/// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
+/// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     let app = app(s);
     rate_limit(s, caller, &[("refresh", "ip", &caller.ip, 120, MINUTE)])?;
     let info = branch_info(app, caller).await?;
-    let refreshed = match app
-        .internal
-        .refresh(&RefreshRequest {
-            project_id: info.project_id,
-            refresh_token: b.refresh_token,
-        })
-        .await
-    {
+    let request = RefreshRequest {
+        project_id: info.project_id,
+        refresh_token: b.refresh_token,
+    };
+    let peeked = match app.internal.peek(&request).await {
+        Ok(p) => Some(p),
+        Err(InternalError::Refused { status: 401, code })
+            if code == "refresh_token_invalid" || code == "refresh_token_reused" =>
+        {
+            None
+        }
+        Err(e) => return Err(internal_down(&e)),
+    };
+    let checked = match peeked {
+        Some(p) if !p.grace => Some((
+            p.user_id,
+            current_user(s, &info, p.user_id, p.session_id).await?,
+        )),
+        _ => None,
+    };
+    let refreshed = match app.internal.refresh(&request).await {
         Ok(r) => r,
         Err(InternalError::Refused { status: 401, code }) if code == "refresh_token_reused" => {
             return Err(fail(
@@ -1057,10 +1108,10 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
                 "This refresh token was used already; the session is ended, sign in again",
             ));
         }
-        Err(InternalError::Refused {
-            status: 401 | 404 | 422,
-            ..
-        }) => {
+        // Only the orchestrator's own verdict ends the session: clients drop their cookies on
+        // it. A bare 401 (a mismatched internal bearer), a 404 or a 422 is our fault, not the
+        // token's, so it answers 503 and the client keeps the session.
+        Err(InternalError::Refused { status: 401, code }) if code == "refresh_token_invalid" => {
             return Err(fail(
                 401,
                 ErrorCode::RefreshTokenInvalid,
@@ -1069,17 +1120,45 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         }
         Err(e) => return Err(internal_down(&e)),
     };
+    let current = match checked {
+        Some((user, current)) if user == refreshed.user_id => current,
+        // A grace token, a peek verdict that refresh then didn't give, or another user: check
+        // the user `refresh` answered for.
+        _ => current_user(s, &info, refreshed.user_id, refreshed.session_id).await?,
+    };
+    let session = session_response(
+        app,
+        info.project_id,
+        refreshed.session_id,
+        refreshed.refresh_token,
+        view(refreshed.user_id, &current),
+    )?;
+    Ok(Json(session).into_response())
+}
+
+/// The session's user as Zitadel has it now, when they may still refresh. Revokes the session
+/// and answers 401 `refresh_token_invalid` when Zitadel definitely has no such user (a 404) or
+/// they belong to another org, and 403 `user_inactive` when inactive; any Zitadel fault,
+/// including no answer within [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP), answers 503 and revokes nothing.
+async fn current_user(
+    s: &AppState,
+    info: &AppBranchInfo,
+    user_id: Uuid,
+    session_id: Uuid,
+) -> Flow<ZUser> {
+    let app = app(s);
     let revoke = || async {
-        if let Err(e) = app
-            .internal
-            .revoke(refreshed.session_id, info.project_id)
-            .await
-        {
+        if let Err(e) = app.internal.revoke(session_id, info.project_id).await {
             warn!(error = %e, "revoking the app session failed");
         }
     };
-    let current = match s.zitadel.get_user(&refreshed.user_id.to_string()).await {
-        Ok(Some(u)) if u.org_id == org(&info) => u,
+    // `None` is a definite 404; an unreadable answer is an error (503), never "gone".
+    let id = user_id.to_string();
+    let answer = tokio::time::timeout(app.refresh_user_lookup, s.zitadel.get_user(&id))
+        .await
+        .unwrap_or_else(|_| Err(ZError::Unavailable("the user lookup timed out".into())));
+    let current = match answer {
+        Ok(Some(u)) if u.org_id == org(info) => u,
         Ok(_) => {
             revoke().await;
             return Err(fail(
@@ -1094,14 +1173,7 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         revoke().await;
         return Err(fail(403, ErrorCode::UserInactive, text::INACTIVE));
     }
-    let session = session_response(
-        app,
-        info.project_id,
-        refreshed.session_id,
-        refreshed.refresh_token,
-        view(refreshed.user_id, &current),
-    )?;
-    Ok(Json(session).into_response())
+    Ok(current)
 }
 
 async fn sign_out(s: &AppState, caller: &AppCaller, b: AppSignOutBody) -> Flow {

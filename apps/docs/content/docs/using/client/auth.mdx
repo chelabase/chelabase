@@ -23,7 +23,20 @@ const off = db.auth.onChange((event, user) => {
 await db.auth.signOut();
 ```
 
-Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword` and `onChange` (which returns the function that unsubscribes).
+Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword` and `onChange` (which returns the function that unsubscribes).
+
+`getUser()` rejects when nobody is signed in; `currentUser()` gives `null` instead (no session, or one that is invalid, expired after one refresh, revoked, or ended by its refresh) and rejects only on other errors, such as the gateway being down. `refreshIfNeeded()` refreshes only when the access token is missing or about to expire, and sends nothing otherwise.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const url = "http://api.chelabase.localhost:8000";
+const key = "chk_pub_…";
+const db = createClient<Database>({ url, key, types });
+// ---cut---
+const user = await db.auth.currentUser();
+if (user) console.log(user.email);
+```
 
 ## Sign-up data
 
@@ -33,9 +46,27 @@ Methods: `signUp`, `signIn`, `signOut`, `refresh`, `getUser`, `verifyEmail`, `re
 
 - Only the refresh token is stored, under the key `chelabase.<first 12 characters of the key>.refresh`: in `localStorage` when present, otherwise in memory. Pass `auth.storage` (`{ get, set, remove }`, sync or async) for anything else, such as React Native. The access token stays in memory.
 - `database()` siblings share the same session.
+- In a server-rendered app the session lives in cookies instead: see [Server rendering](/docs/using/client/ssr).
 
 ## Refresh and sign-out
 
-- The access token is refreshed 60 seconds before it expires, by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
+- The access token is refreshed 60 seconds before it expires (halfway through its life when it lives under two minutes), by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
 - A data request answered `401 user_token_expired` refreshes once and retries once. A returning visitor's first request refreshes lazily first.
 - When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`, or any request carrying the access token (data or `db.auth`) is answered `401 user_session_revoked`, the client signs out locally: it drops the stored refresh token, emits `signed_out` and throws the `DataApiError`.
+- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request and keep the cookies until the access token is a few minutes past its expiry, since a stale request must not wipe a newer session; older (or missing) ones are cleared. See [Server rendering](/docs/using/client/ssr).
+
+## A token from elsewhere
+
+If another system owns the session (an SSO layer, a test harness), pass `accessToken` instead of `auth`. The client calls it before every request and sends the result as `chelabase-user`; with no token, no header goes out.
+
+```ts twoslash
+import { createClient } from "@chelabase/client";
+import { type Database, types } from "./db";
+const url = "http://api.chelabase.localhost:8000";
+const key = "chk_pub_…";
+declare function currentToken(): string | undefined;
+// ---cut---
+const db = createClient<Database>({ url, key, types, accessToken: () => currentToken() });
+```
+
+You own the session. The client never refreshes, stores or retries the token, and `db.auth` methods throw (`refreshIfNeeded` and `currentUser` included). `accessToken` and `auth` can't be used together.
