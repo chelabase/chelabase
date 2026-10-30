@@ -137,7 +137,7 @@ export const config = {
 
 The matcher leaves out the auth route: the handler refreshes on its own, and running the proxy there too would rotate the refresh token twice.
 
-`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. An ended session costs one refresh attempt: then its cookies are cleared, and later requests send nothing. It rejects only when the refresh fails some other way, such as the gateway being down.
+`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. An ended session costs a refresh on each page view for up to a few minutes after its access token expires; after that its cookies are cleared, and later requests send nothing. It rejects only when the refresh fails some other way, such as the gateway being down.
 
 The `try`/`catch` lets the page render anyway: a gateway hiccup shouldn't turn every route into an error page, and the page's own `currentUser()` decides who is signed in.
 
