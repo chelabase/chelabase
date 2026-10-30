@@ -9,7 +9,9 @@ import { createAuth } from "./auth.ts";
 import { buildClient } from "./client.ts";
 import { type CookieOptions, cookieNames, parseCookies, readSession } from "./cookies.ts";
 import { toError } from "./error.ts";
-import type { Client, DatabaseShape, TypeMap } from "./types.ts";
+import type { BrowserSession, Client, DatabaseShape, TypeMap } from "./types.ts";
+
+export type { BrowserSession } from "./types.ts";
 
 export interface BrowserClientOptions {
   /** The gateway's base URL. */
@@ -30,21 +32,21 @@ export interface BrowserClientOptions {
  * Creates the browser client. Data queries go straight to the gateway with the access token
  * from the readable cookie, read again before every use (so a sign-in, sign-out or refresh in
  * another tab is picked up); session flows go through `authPath`, so `db.auth.signIn` and
- * friends return sessions without `refresh_token`. Other `db.auth` calls go to the gateway.
+ * friends return a `BrowserSession` (no `refresh_token`). Other `db.auth` calls go to the gateway.
  *
  * Types and `bigint` work as in `createClient`.
  */
 export function createBrowserClient<DB extends DatabaseShape = DatabaseShape>(
   opts: BrowserClientOptions & { bigint: true; types: TypeMap },
-): Client<DB, true>;
+): Client<DB, true, BrowserSession>;
 export function createBrowserClient<DB extends DatabaseShape = DatabaseShape, B extends boolean = false>(
   opts: BrowserClientOptions &
     (B extends true ? { bigint: true; types: TypeMap } : { bigint?: false }) &
     (DatabaseShape extends DB ? unknown : { types: TypeMap }),
-): Client<DB, B>;
+): Client<DB, B, BrowserSession>;
 export function createBrowserClient<DB extends DatabaseShape, B extends boolean = false>(
   opts: BrowserClientOptions & { bigint?: B },
-): Client<DB, B> {
+): Client<DB, B, BrowserSession> {
   const names = cookieNames(opts.key, opts.cookieOptions);
   const path = (opts.authPath ?? "/api/chelabase/auth").replace(/\/+$/, "");
   const readAccess = () => {

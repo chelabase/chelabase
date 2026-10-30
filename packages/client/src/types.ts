@@ -304,6 +304,12 @@ export interface Session {
   user: AppUser;
 }
 
+/**
+ * A session as the browser client (`@chelabase/client/browser`) sees it: the refresh token
+ * stays in an `HttpOnly` cookie and never reaches page scripts.
+ */
+export type BrowserSession = Omit<Session, "refresh_token">;
+
 export type AuthEvent = "signed_in" | "signed_out" | "refreshed";
 
 /** `signUp`'s `data`: the app users table's insertable columns, minus the managed ones. */
@@ -313,29 +319,30 @@ export type SignUpData<DB extends DatabaseShape> = DB extends {
   ? Omit<DB["schemas"][S]["tables"][T]["Insert"], "id" | "email" | "email_verified" | "created_at" | "deleted_at">
   : Record<string, Json>;
 
-export interface Auth<DB extends DatabaseShape> {
+/** `S` is what the session flows return: `Session`, or `BrowserSession` in the browser client. */
+export interface Auth<DB extends DatabaseShape, S = Session> {
   signUp(p: {
     email: string;
     password: string;
     data?: SignUpData<DB>;
-  }): Promise<{ user: AppUser; session: Session | null; verificationRequired: boolean }>;
-  signIn(p: { email: string; password: string }): Promise<Session>;
+  }): Promise<{ user: AppUser; session: S | null; verificationRequired: boolean }>;
+  signIn(p: { email: string; password: string }): Promise<S>;
   signOut(): Promise<void>;
-  refresh(): Promise<Session>;
+  refresh(): Promise<S>;
   getUser(): Promise<AppUser>;
   verifyEmail(p: { email: string; code: string }): Promise<void>;
   resendCode(p: { email: string }): Promise<void>;
   requestPasswordReset(p: { email: string }): Promise<void>;
   confirmPasswordReset(p: { email: string; code: string; password: string }): Promise<void>;
   changeEmail(p: { email: string }): Promise<void>;
-  changePassword(p: { currentPassword: string; password: string }): Promise<Session>;
+  changePassword(p: { currentPassword: string; password: string }): Promise<S>;
   /** Subscribe to sign-in, sign-out and refresh; returns the unsubscribe function. */
   onChange(cb: (event: AuthEvent, user: AppUser | null) => void): () => void;
 }
 
-export interface Client<DB extends DatabaseShape, B extends boolean> extends Tx<DB, B> {
+export interface Client<DB extends DatabaseShape, B extends boolean, S = Session> extends Tx<DB, B> {
   /** App user sign-up, sign-in and session handling. Shared by `database()` siblings. */
-  readonly auth: Auth<DB>;
+  readonly auth: Auth<DB, S>;
   /**
    * Runs the operations in order in one transaction, all or nothing (at most 50), and
    * resolves to each one's result.
@@ -350,5 +357,5 @@ export interface Client<DB extends DatabaseShape, B extends boolean> extends Tx<
   database<DB2 extends DatabaseShape = DatabaseShape>(
     name: string,
     ...types: B extends true ? [types: TypeMap] : DatabaseShape extends DB2 ? [types?: TypeMap] : [types: TypeMap]
-  ): Client<DB2, B>;
+  ): Client<DB2, B, S>;
 }
