@@ -38,12 +38,12 @@ export interface ServerClientOptions {
   /** The project's public (`chk_pub_…`) data key. */
   key: string;
   /**
-   * A secret (`chk_sec_…`) key, given together with `clientIp`: auth API calls (never data
-   * requests) carry both, so the gateway's rate limits count the end user's address, not the
-   * server's.
+   * The branch's secret (`chk_sec_…`) key. Auth API calls (never data requests) carry it, so
+   * sign-ins and refreshes are limited per email and per user instead of all sharing this
+   * server's IP.
    */
   serverKey?: string;
-  /** The end user's IP address; requires `serverKey`. */
+  /** Optional: the end user's IP address, to add per-IP limits on top. Requires `serverKey`. */
   clientIp?: string;
   /** Defaults to the global `fetch`. */
   fetch?: typeof fetch;
@@ -82,20 +82,19 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
     throw new Error("createServerClient: `serverKey` must be a secret (chk_sec_…) key");
   }
   // An empty `clientIp` (an absent header read as "") counts as missing, as in the handler.
-  const clientIp = opts.clientIp === "" ? undefined : opts.clientIp;
-  if ((opts.serverKey === undefined) !== (clientIp === undefined)) {
-    throw new Error(
-      `createServerClient: \`serverKey\` and \`clientIp\` go together; \`${opts.serverKey === undefined ? "serverKey" : "clientIp"}\` is missing`,
-    );
+  if (opts.clientIp !== undefined && opts.clientIp !== "" && opts.serverKey === undefined) {
+    throw new Error("createServerClient: `clientIp` needs `serverKey`");
   }
   checkCookieOptions(opts.cookieOptions);
   const names = cookieNames(opts.key, opts.cookieOptions);
   const { access, refresh } = readSession(opts.cookies.getAll(), names);
   const setAll = opts.cookies.setAll?.bind(opts.cookies);
-  const headers: Record<string, string> =
-    opts.serverKey !== undefined && clientIp !== undefined
-      ? { "chelabase-server-key": opts.serverKey, "chelabase-client-ip": clientIp }
-      : {};
+  // Auth calls only. An empty `clientIp` (an absent header read as "") sends the server key alone.
+  const headers: Record<string, string> = {};
+  if (opts.serverKey !== undefined) {
+    headers["chelabase-server-key"] = opts.serverKey;
+    if (opts.clientIp !== undefined && opts.clientIp !== "") headers["chelabase-client-ip"] = opts.clientIp;
+  }
 
   async function onSession(s: Parameters<typeof sessionCookies>[1]) {
     if (setAll === undefined) {

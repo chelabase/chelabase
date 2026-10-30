@@ -334,19 +334,41 @@ describe("createServerClient", () => {
     expect(JSON.stringify(q.init)).not.toContain(serverKey);
   });
 
-  test("server_key_and_client_ip_come_together", () => {
-    const cookies = jar().cookies;
-    const noIp = () => createServerClient({ url, key, serverKey, cookies });
-    expect(noIp).toThrow(/clientIp/);
-    expect(noIp).not.toThrow(serverKey.slice(8));
-    expect(() => createServerClient({ url, key, clientIp: "203.0.113.9", cookies })).toThrow(/serverKey/);
+  test("server_key_alone_goes_only_to_the_auth_api", async () => {
+    const fetch = router({
+      "/auth/v1/app/sign-in": () => ({ body: session(1, 3) }),
+      "/auth/v1/app/refresh": () => ({ body: session(2) }),
+      "/data/v1/query": () => ({ body: [] }),
+    });
+    for (const clientIp of [undefined, ""]) {
+      fetch.calls.length = 0;
+      const db = createServerClient({ url, key, serverKey, ...(clientIp === undefined ? {} : { clientIp }), fetch, cookies: jar().cookies });
+      await db.auth.signIn({ email: "a@b.co", password: "pw" });
+      await db.from("t").select("id"); // the 3 s token refreshes first
+      expect(fetch.calls.map((c) => new URL(c.url).pathname)).toEqual([
+        "/auth/v1/app/sign-in",
+        "/auth/v1/app/refresh",
+        "/data/v1/query",
+      ]);
+      for (const c of fetch.calls.slice(0, 2)) {
+        expect(hdr(c, "chelabase-server-key")).toBe(serverKey);
+        expect(hdr(c, "chelabase-client-ip")).toBeNull();
+      }
+      const q = fetch.calls[2]!;
+      expect(hdr(q, "chelabase-server-key")).toBeNull();
+      expect(hdr(q, "chelabase-client-ip")).toBeNull();
+      expect(JSON.stringify(q.init)).not.toContain(serverKey);
+    }
   });
 
-  test("an_empty_client_ip_counts_as_missing", () => {
+  test("client_ip_needs_server_key", () => {
     const cookies = jar().cookies;
-    const f = () => createServerClient({ url, key, serverKey, clientIp: "", cookies });
-    expect(f).toThrow(/`clientIp` is missing/);
-    expect(f).not.toThrow(serverKey.slice(8));
+    const f = () => createServerClient({ url, key, clientIp: "203.0.113.9", cookies });
+    expect(f).toThrow(/`clientIp` needs `serverKey`/);
+    expect(f).not.toThrow(key.slice(8));
+    // An empty one counts as missing; the server key alone is enough.
+    expect(() => createServerClient({ url, key, clientIp: "", cookies })).not.toThrow();
+    expect(() => createServerClient({ url, key, serverKey, cookies })).not.toThrow();
   });
 
   test("wrong_key_kinds_throw_at_creation", () => {
@@ -423,6 +445,98 @@ describe("createServerClient", () => {
     for (const c of j.writes[0]!) {
       expect(c.options).toMatchObject({ secure: false, domain: "example.test", maxAge: 3600, sameSite: "lax", path: "/" });
     }
+  });
+});
+
+describe("refreshIfNeeded and currentUser", () => {
+  test("refresh_if_needed_with_a_fresh_cookie_sends_nothing", async () => {
+    const fetch = router({});
+    const j = jar({ [ACCESS]: jwt(nowSecs() + 60, 1), [REFRESH]: "rt1" });
+    await expect(createServerClient({ url, key, fetch, cookies: j.cookies }).auth.refreshIfNeeded()).resolves.toBeUndefined();
+    expect(fetch.calls).toHaveLength(0);
+    expect(j.writes).toEqual([]);
+  });
+
+  test("refresh_if_needed_refreshes_a_stale_cookie_once_and_writes_before_resolving", async () => {
+    const log: string[] = [];
+    const s2 = session(2);
+    const fetch = router({ "/auth/v1/app/refresh": () => ({ body: s2 }) }, log);
+    const j = jar({ [ACCESS]: stale(), [REFRESH]: "rt1" }, log);
+    const db = createServerClient({ url, key, serverKey, fetch, cookies: j.cookies });
+    await Promise.all([db.auth.refreshIfNeeded(), db.auth.refreshIfNeeded()]);
+    log.push("resolved");
+    expect(log).toEqual(["/auth/v1/app/refresh", "setAll", "resolved"]);
+    expect(hdr(fetch.calls[0]!, "chelabase-server-key")).toBe(serverKey);
+    expect(j.m.get(ACCESS)).toBe(s2.access_token);
+    // Fresh now: nothing more.
+    await db.auth.refreshIfNeeded();
+    expect(fetch.calls).toHaveLength(1);
+  });
+
+  test("refresh_if_needed_without_set_all_sends_nothing", async () => {
+    const fetch = router({ "/auth/v1/app/refresh": () => ({ body: session(2) }) });
+    const db = createServerClient({ url, key, fetch, cookies: jar({ [ACCESS]: stale(), [REFRESH]: "rt1" }).readOnly });
+    await expect(db.auth.refreshIfNeeded()).resolves.toBeUndefined();
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  test("refresh_if_needed_resolves_when_the_session_has_ended", async () => {
+    for (const code of ["refresh_token_invalid", "refresh_token_reused", "user_inactive"]) {
+      const fetch = router({ "/auth/v1/app/refresh": () => err(401, code) });
+      const db = createServerClient({ url, key, fetch, cookies: jar({ [ACCESS]: stale(), [REFRESH]: "rt1" }).cookies });
+      await expect(db.auth.refreshIfNeeded(), code).resolves.toBeUndefined();
+    }
+    const down = router({ "/auth/v1/app/refresh": () => err(503, "unavailable") });
+    const db = createServerClient({ url, key, fetch: down, cookies: jar({ [ACCESS]: stale(), [REFRESH]: "rt1" }).cookies });
+    await expect(db.auth.refreshIfNeeded()).rejects.toMatchObject({ status: 503 });
+  });
+
+  test("current_user_is_null_without_a_session_and_sends_nothing", async () => {
+    const fetch = router({});
+    for (const cookies of [jar().cookies, jar().readOnly, jar({ [ACCESS]: stale(), [REFRESH]: "rt1" }).readOnly]) {
+      expect(await createServerClient({ url, key, fetch, cookies }).auth.currentUser()).toBeNull();
+    }
+    expect(fetch.calls).toHaveLength(0);
+  });
+
+  test("current_user_returns_the_user_from_the_gateway", async () => {
+    const access = jwt(nowSecs() + 60, 1);
+    const fetch = router({ "/auth/v1/app/user": () => ({ body: user }) });
+    const db = createServerClient({ url, key, serverKey, fetch, cookies: jar({ [ACCESS]: access }).readOnly });
+    expect(await db.auth.currentUser()).toEqual(user);
+    expect(hdr(fetch.calls[0]!, "chelabase-user")).toBe(access);
+  });
+
+  test("current_user_is_null_when_the_session_is_over", async () => {
+    for (const code of ["user_session_revoked", "user_token_invalid", "user_token_expired"]) {
+      const fetch = router({ "/auth/v1/app/user": () => err(401, code) });
+      const j = jar({ [ACCESS]: jwt(nowSecs() + 60, 1) });
+      const db = createServerClient({ url, key, fetch, cookies: j.cookies });
+      expect(await db.auth.currentUser(), code).toBeNull();
+    }
+  });
+
+  test("current_user_refreshes_once_after_an_expired_answer", async () => {
+    const access = jwt(nowSecs() + 60, 1);
+    const s2 = session(2);
+    const log: string[] = [];
+    const fetch = router(
+      {
+        "/auth/v1/app/refresh": () => ({ body: s2 }),
+        "/auth/v1/app/user": (c) => (hdr(c, "chelabase-user") === access ? err(401, "user_token_expired") : { body: user }),
+      },
+      log,
+    );
+    const j = jar({ [ACCESS]: access, [REFRESH]: "rt1" }, log);
+    expect(await createServerClient({ url, key, fetch, cookies: j.cookies }).auth.currentUser()).toEqual(user);
+    expect(log).toEqual(["/auth/v1/app/user", "/auth/v1/app/refresh", "setAll", "/auth/v1/app/user"]);
+    expect(hdr(fetch.calls[2]!, "chelabase-user")).toBe(s2.access_token);
+  });
+
+  test("current_user_rejects_on_other_errors", async () => {
+    const fetch = router({ "/auth/v1/app/user": () => err(503, "unavailable") });
+    const db = createServerClient({ url, key, fetch, cookies: jar({ [ACCESS]: jwt(nowSecs() + 60, 1) }).cookies });
+    await expect(db.auth.currentUser()).rejects.toMatchObject({ status: 503 });
   });
 });
 

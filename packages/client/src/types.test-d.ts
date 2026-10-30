@@ -340,6 +340,12 @@ async () => {
   expectTypeOf(await brw.auth.changePassword({ currentPassword: "a", password: "b" })).toEqualTypeOf<BrowserSession>();
   expectTypeOf((await brw.auth.signUp(creds)).session).toEqualTypeOf<BrowserSession | null>();
   expectTypeOf(await brw.auth.getUser()).toEqualTypeOf<AppUser>();
+  expectTypeOf(brw.auth.currentUser()).toEqualTypeOf<Promise<AppUser | null>>();
+  expectTypeOf(srv.auth.currentUser()).toEqualTypeOf<Promise<AppUser | null>>();
+  expectTypeOf(db.auth.currentUser()).toEqualTypeOf<Promise<AppUser | null>>();
+  expectTypeOf(brw.auth.refreshIfNeeded()).toEqualTypeOf<Promise<void>>();
+  expectTypeOf(srv.auth.refreshIfNeeded()).toEqualTypeOf<Promise<void>>();
+  expectTypeOf(db.auth.refreshIfNeeded()).toEqualTypeOf<Promise<void>>();
 };
 // @ts-expect-error a generated Database needs its types
 createBrowserClient<Database>(opts);
