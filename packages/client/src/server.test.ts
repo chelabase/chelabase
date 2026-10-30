@@ -198,6 +198,39 @@ describe("createServerClient", () => {
     await expect(db.auth.getUser()).rejects.toMatchObject({ code: "user_token_invalid" });
   });
 
+  test("invalid_refresh_clears_cookies_whose_access_token_is_long_dead", async () => {
+    // Missing, unreadable, or more than 60 s past its `exp`: cleared, so later pages don't refresh again.
+    for (const access of [undefined, "not-a-jwt", jwt(nowSecs() - 120, 0)]) {
+      const fetch = router({
+        "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid"),
+        "/data/v1/query": () => ({ body: [] }),
+      });
+      const j = jar({ ...(access === undefined ? {} : { [ACCESS]: access }), [REFRESH]: "rt1" });
+      await createServerClient({ url, key, fetch, cookies: j.cookies }).from("t").select("id");
+      expect(j.writes.map((w) => w.map((c) => [c.name, c.value, c.options.maxAge])), String(access)).toEqual([
+        [
+          [ACCESS, "", 0],
+          [REFRESH, "", 0],
+        ],
+      ]);
+      expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
+      // The next page view has nothing to refresh.
+      await createServerClient({ url, key, fetch, cookies: j.cookies }).from("t").select("id");
+      expect(fetch.to("/auth/v1/app/refresh")).toHaveLength(1);
+    }
+  });
+
+  test("invalid_refresh_keeps_cookies_whose_access_token_expired_recently", async () => {
+    const fetch = router({
+      "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid"),
+      "/data/v1/query": () => ({ body: [] }),
+    });
+    const j = jar({ [ACCESS]: jwt(nowSecs() - 30, 0), [REFRESH]: "rt1" });
+    await createServerClient({ url, key, fetch, cookies: j.cookies }).from("t").select("id");
+    expect(j.writes).toEqual([]);
+    expect(hdr(fetch.to("/data/v1/query")[0]!, "chelabase-user")).toBeNull();
+  });
+
   test("late_invalid_after_a_rotation_keeps_the_newer_cookies", async () => {
     const s2 = session(2);
     let refreshes = 0;
@@ -361,6 +394,18 @@ describe("createServerClient", () => {
     }
   });
 
+  test("a_blank_server_key_counts_as_absent", async () => {
+    const fetch = router({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
+    const cookies = jar().cookies;
+    const db = createServerClient({ url, key, serverKey: "", clientIp: "", fetch, cookies });
+    await db.auth.signIn({ email: "a@b.co", password: "pw" });
+    expect(hdr(fetch.calls[0]!, "chelabase-server-key")).toBeNull();
+    expect(hdr(fetch.calls[0]!, "chelabase-client-ip")).toBeNull();
+    expect(() => createServerClient({ url, key, serverKey: "", clientIp: "203.0.113.9", cookies })).toThrow(
+      /`clientIp` needs `serverKey`/,
+    );
+  });
+
   test("client_ip_needs_server_key", () => {
     const cookies = jar().cookies;
     const f = () => createServerClient({ url, key, clientIp: "203.0.113.9", cookies });
@@ -516,6 +561,15 @@ describe("refreshIfNeeded and currentUser", () => {
     }
   });
 
+  test("current_user_is_null_when_its_refresh_ends_the_session", async () => {
+    for (const code of ["refresh_token_reused", "user_inactive"]) {
+      const fetch = router({ "/auth/v1/app/refresh": () => err(401, code) });
+      const j = jar({ [ACCESS]: stale(), [REFRESH]: "rt1" });
+      expect(await createServerClient({ url, key, fetch, cookies: j.cookies }).auth.currentUser(), code).toBeNull();
+      expect(j.m.size, code).toBe(0);
+    }
+  });
+
   test("current_user_refreshes_once_after_an_expired_answer", async () => {
     const access = jwt(nowSecs() + 60, 1);
     const s2 = session(2);
@@ -561,6 +615,8 @@ describe("ambiguous cookies", () => {
       await db.from("t").select("id");
       expect(fetch.calls.map((c) => new URL(c.url).pathname)).toEqual(["/data/v1/query"]);
       expect(hdr(fetch.calls[0]!, "chelabase-user")).toBeNull();
+      // An explicit refresh has nothing to send: it never clears the (possibly real) cookies.
+      await expect(db.auth.refresh()).rejects.toMatchObject({ code: "refresh_token_invalid" });
       expect(writes).toEqual([]);
     }
   });

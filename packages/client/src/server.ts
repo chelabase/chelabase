@@ -57,7 +57,8 @@ export interface ServerClientOptions {
  * Creates a client for one request. An access cookie with 5 s or more left is used as is;
  * otherwise, given a refresh cookie and `cookies.setAll`, the session is refreshed once and
  * both cookies are written before the new token is used. `db.auth` writes and clears the
- * cookies. Who the user is comes only from the gateway (`db.auth.getUser()`): the cookie's
+ * cookies. Who the user is comes only from the gateway (`db.auth.currentUser()` or
+ * `db.auth.getUser()`): the cookie's
  * own contents decide nothing but whether to refresh.
  *
  * Types and `bigint` work as in `createClient`.
@@ -78,11 +79,13 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
   if (!/^chk_pub_[0-9A-Za-z]+$/.test(opts.key)) {
     throw new Error("createServerClient: `key` must be the public (chk_pub_…) key; a secret key goes in `serverKey`");
   }
-  if (opts.serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(opts.serverKey)) {
+  // An empty `serverKey` (a blank environment variable) counts as missing.
+  const serverKey = opts.serverKey === "" ? undefined : opts.serverKey;
+  if (serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(serverKey)) {
     throw new Error("createServerClient: `serverKey` must be a secret (chk_sec_…) key");
   }
   // An empty `clientIp` (an absent header read as "") counts as missing, as in the handler.
-  if (opts.clientIp !== undefined && opts.clientIp !== "" && opts.serverKey === undefined) {
+  if (opts.clientIp !== undefined && opts.clientIp !== "" && serverKey === undefined) {
     throw new Error("createServerClient: `clientIp` needs `serverKey`");
   }
   checkCookieOptions(opts.cookieOptions);
@@ -91,8 +94,8 @@ export function createServerClient<DB extends DatabaseShape, B extends boolean =
   const setAll = opts.cookies.setAll?.bind(opts.cookies);
   // Auth calls only. An empty `clientIp` (an absent header read as "") sends the server key alone.
   const headers: Record<string, string> = {};
-  if (opts.serverKey !== undefined) {
-    headers["chelabase-server-key"] = opts.serverKey;
+  if (serverKey !== undefined) {
+    headers["chelabase-server-key"] = serverKey;
     if (opts.clientIp !== undefined && opts.clientIp !== "") headers["chelabase-client-ip"] = opts.clientIp;
   }
 

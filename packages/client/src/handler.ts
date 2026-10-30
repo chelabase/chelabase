@@ -1,6 +1,6 @@
 // `createAuthHandler`: the app route the browser client's session flows go through. Exported from
 // `@chelabase/client/server`; the browser entry never imports it.
-import { USER_HEADER } from "./auth.ts";
+import { longExpired, USER_HEADER } from "./auth.ts";
 import {
   type CookieOptions,
   checkCookieOptions,
@@ -45,7 +45,10 @@ export interface AuthHandlerOptions {
 /** The flows the route serves; the upstream path is always one of these constants. */
 const FLOWS = ["sign-in", "sign-up", "refresh", "change-password", "sign-out"] as const;
 type Flow = (typeof FLOWS)[number];
-/** Answers that end the session in the cookies. `refresh_token_invalid` isn't one: a stale request must not wipe a newer session. */
+/**
+ * Answers that end the session in the cookies. `refresh_token_invalid` isn't one: a stale request
+ * must not wipe a newer session (unless the access cookie is long dead, see `longExpired`).
+ */
 const CLEARS = new Set(["refresh_token_reused", "user_inactive", "user_session_revoked"]);
 
 function originOf(u: string, what: string): string {
@@ -70,10 +73,12 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
   if (!/^chk_pub_[0-9A-Za-z]+$/.test(opts.key)) {
     throw new Error("createAuthHandler: `key` must be the public (chk_pub_…) key; a secret key goes in `serverKey`");
   }
-  if (opts.serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(opts.serverKey)) {
+  // An empty `serverKey` (a blank environment variable) counts as missing.
+  const serverKey = opts.serverKey === "" ? undefined : opts.serverKey;
+  if (serverKey !== undefined && !/^chk_sec_[0-9A-Za-z]+$/.test(serverKey)) {
     throw new Error("createAuthHandler: `serverKey` must be a secret (chk_sec_…) key");
   }
-  if (opts.clientIp !== undefined && opts.serverKey === undefined) {
+  if (opts.clientIp !== undefined && serverKey === undefined) {
     throw new Error("createAuthHandler: `clientIp` needs `serverKey`");
   }
   checkCookieOptions(opts.cookieOptions);
@@ -93,7 +98,7 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
   const names = cookieNames(opts.key, opts.cookieOptions);
   const base = opts.url.replace(/\/+$/, "");
   const doFetch = opts.fetch ?? globalThis.fetch.bind(globalThis);
-  const { serverKey, clientIp } = opts;
+  const { clientIp } = opts;
 
   const json = (status: number, body: unknown, cookies: string[] = []) => {
     const headers = new Headers({ "cache-control": "no-store" });
@@ -178,7 +183,14 @@ export function createAuthHandler(opts: AuthHandlerOptions): (req: Request) => P
     }
     if (!res.ok) {
       const e = toError(res, text);
-      const clear = always.length > 0 ? always : (flow === "refresh" || flow === "change-password") && CLEARS.has(e.code) ? setSession(null) : [];
+      let clear = always;
+      if (clear.length === 0 && (flow === "refresh" || flow === "change-password") && CLEARS.has(e.code)) clear = setSession(null);
+      if (clear.length === 0 && flow === "refresh" && e.code === "refresh_token_invalid" && longExpired(access)) {
+        // An access token that old can't be part of a rotation still in flight, and keeping dead
+        // cookies costs a refresh on every page view: clear them. A recent one is left alone, so a
+        // late, stale answer can't wipe the newer session another request wrote.
+        clear = setSession(null);
+      }
       const envelope: Record<string, string> = { code: e.code, message: e.message };
       for (const k of ["detail", "hint"] as const) if (e[k] !== undefined) envelope[k] = e[k];
       return json(res.status, { error: envelope }, clear);

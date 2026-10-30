@@ -8,12 +8,14 @@ export const USER_HEADER = "chelabase-user";
 const REFRESH_LEAD_MS = 60_000;
 /** A token this close to expiry is refreshed before use. */
 const STALE_MS = 5_000;
+/** An access token this long past its `exp` belongs to no rotation still in flight. */
+const DEAD_AFTER_MS = 60_000;
 /** The refresh token is gone for good: sign out locally. */
 const FATAL = new Set(["refresh_token_reused", "refresh_token_invalid", "user_session_revoked", "user_inactive"]);
 /** A request carrying the access token was refused because its session is over. */
 export const SESSION_GONE = "user_session_revoked";
-/** Answers that mean "signed out" to `currentUser`. */
-const SIGNED_OUT = new Set(["user_token_invalid", "user_token_expired", "user_session_revoked", "refresh_token_invalid"]);
+/** Answers that mean "signed out" to `currentUser`: a refused token, or a session that ended (as `refreshIfNeeded` treats it). */
+const SIGNED_OUT = new Set(["user_token_invalid", "user_token_expired", ...FATAL]);
 
 export interface AuthCore<DB extends DatabaseShape> {
   auth: Auth<DB>;
@@ -91,6 +93,15 @@ function expiryMs(jwt: string): number {
   return typeof exp === "number" ? exp * 1000 : 0;
 }
 
+/**
+ * After a `refresh_token_invalid`: the access token is missing, unreadable, or more than 60 s
+ * past its `exp`. A token that old can't be part of a rotation still in flight, so its cookies
+ * are dead; keeping them would cost a refresh on every page view.
+ */
+export function longExpired(jwt: string | undefined): boolean {
+  return jwt === undefined || expiryMs(jwt) < Date.now() - DEAD_AFTER_MS;
+}
+
 /** Whose token it is: `sub`, or undefined. Unverified: it only decides which event to emit. */
 function subject(jwt: string | undefined): string | undefined {
   const sub = jwt === undefined ? undefined : claims(jwt).sub;
@@ -115,6 +126,8 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   let access: string | undefined;
   let expMs = 0;
+  /** Server mode: the access cookie's value as this client last read or wrote it. */
+  let cookieAccess = srv?.access;
   if (srv?.refresh !== undefined) void storage.set(storeKey, srv.refresh);
   if (srv?.access !== undefined && expiryMs(srv.access) - Date.now() >= STALE_MS) {
     // Its unverified `exp` only decides whether to refresh; the gateway checks the token itself.
@@ -223,6 +236,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     started = Promise.resolve();
     await storage.remove(storeKey);
     await srv?.onSession(null);
+    cookieAccess = undefined;
     if (remote) {
       // The route usually cleared the cookies already; when it couldn't (unreachable, or the session
       // ended on a data request), the readable one goes here. A newer cookie another tab wrote
@@ -238,6 +252,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   async function adopt(s: Session, event: AuthEvent) {
     await srv?.onSession(s); // the cookies first: a token the browser won't get back is never used
+    cookieAccess = s.access_token;
     access = s.access_token;
     expMs = expiryMs(s.access_token) || Date.now() + s.expires_in * 1000;
     started = Promise.resolve();
@@ -262,6 +277,8 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
 
   function refresh(): Promise<Session> {
     inflight ??= (async () => {
+      /** Whether a refresh token was actually sent: only the server's own answer can clear cookies. */
+      let sent = false;
       try {
         let s: Session;
         if (remote) s = (await routeCall("refresh")) as Session;
@@ -270,6 +287,7 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
           if (token === null) {
             throw new DataApiError({ status: 401, code: "refresh_token_invalid", message: "there is no session to refresh" });
           }
+          sent = true;
           s = (await call("refresh", { body: { refresh_token: token } })) as Session;
         }
         await adopt(s, "refreshed");
@@ -284,6 +302,13 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
           clearTimer();
           started = Promise.resolve();
           await storage.remove(storeKey);
+          if (srv && sent && longExpired(cookieAccess)) {
+            // A token that old can't be part of a rotation still in flight, and keeping dead
+            // cookies costs a refresh on every page view: clear them (a no-op without `setAll`).
+            // Best effort: the request goes on anonymously either way.
+            await srv.onSession(null).catch(() => {});
+            cookieAccess = undefined;
+          }
           if (remote) {
             // A newer cookie (another tab) is taken up; an unchanged one is the session that ended.
             const cur = remote.readAccess();
@@ -301,7 +326,10 @@ export function createAuth<DB extends DatabaseShape>(cfg: {
     return inflight;
   }
 
-  /** Server and remote mode: a `refresh_token_invalid` leaves the cookies alone and the request anonymous. */
+  /**
+   * Server and remote mode: a `refresh_token_invalid` leaves the request anonymous, and the
+   * cookies alone unless their access token is long dead (`longExpired`).
+   */
   function staleRefresh(e: unknown): boolean {
     return (srv !== undefined || remote !== undefined) && e instanceof DataApiError && e.code === "refresh_token_invalid";
   }

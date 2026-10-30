@@ -10,6 +10,12 @@ const ACCESS = "__Host-chelabase.chk_pub_0123.access";
 const REFRESH = "__Host-chelabase.chk_pub_0123.refresh";
 const user = { id: "u1", email: "a@b.co", email_verified: true, created_at: "2026-10-03T00:00:00Z" };
 
+const nowSecs = () => Math.floor(Date.now() / 1000);
+function jwt(exp: number, n: number): string {
+  const b64 = (o: unknown) => btoa(JSON.stringify(o)).replace(/=+$/, "").replace(/\+/g, "-").replace(/\//g, "_");
+  return `${b64({ alg: "EdDSA" })}.${b64({ exp, sub: "u1", n })}.sig`;
+}
+
 const session = (n: number) => ({
   access_token: `at${n}`,
   token_type: "bearer",
@@ -237,6 +243,14 @@ describe("createAuthHandler", () => {
     expect(hdr(plain.calls[0]!, "x-forwarded-for")).toBeNull();
   });
 
+  test("a_blank_server_key_counts_as_absent", async () => {
+    const gw = gateway({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
+    const h = handler(gw, { serverKey: "" });
+    await h(req("sign-in", { body: { email: "a@b.co", password: "pw" } }));
+    expect(hdr(gw.calls[0]!, "chelabase-server-key")).toBeNull();
+    expect(() => handler(gw, { serverKey: "", clientIp: () => "203.0.113.9" })).toThrow(/`clientIp` needs `serverKey`/);
+  });
+
   test("client_ip_needs_server_key", () => {
     const f = () => handler(gateway({}), { clientIp: () => "203.0.113.9" });
     expect(f).toThrow(/`clientIp` needs `serverKey`/);
@@ -318,12 +332,24 @@ describe("createAuthHandler", () => {
     expect(cleared(r4)).toBe(true);
   });
 
-  test("refresh_token_invalid_clears_nothing", async () => {
+  test("refresh_token_invalid_clears_nothing_while_the_access_cookie_is_recent", async () => {
     const gw = gateway({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
-    const res = await handler(gw)(req("refresh", { cookies: { [ACCESS]: "at0", [REFRESH]: "rt0" } }));
+    const res = await handler(gw)(req("refresh", { cookies: { [ACCESS]: jwt(nowSecs() - 30, 0), [REFRESH]: "rt0" } }));
     expect(res.status).toBe(401);
     expect(res.headers.getSetCookie()).toEqual([]);
     expect(((await res.json()) as { error: { code: string } }).error.code).toBe("refresh_token_invalid");
+  });
+
+  test("refresh_token_invalid_clears_a_long_dead_session", async () => {
+    // Missing, unreadable, or more than 60 s past its `exp`.
+    for (const access of [undefined, "at0", jwt(nowSecs() - 120, 0)]) {
+      const gw = gateway({ "/auth/v1/app/refresh": () => err(401, "refresh_token_invalid") });
+      const cookies = { ...(access === undefined ? {} : { [ACCESS]: access }), [REFRESH]: "rt0" };
+      const res = await handler(gw)(req("refresh", { cookies }));
+      expect(res.status).toBe(401);
+      expect(cleared(res), String(access)).toBe(true);
+      expect(((await res.json()) as { error: { code: string } }).error.code).toBe("refresh_token_invalid");
+    }
   });
 
   test("refresh_uses_the_cookie_never_the_body", async () => {

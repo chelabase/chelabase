@@ -463,6 +463,16 @@ describe("auth refreshIfNeeded and currentUser", () => {
     expect(await db.auth.currentUser()).toBeNull();
   });
 
+  test("current_user_is_null_when_its_refresh_ends_the_session", async () => {
+    for (const code of ["refresh_token_reused", "user_inactive"]) {
+      const fetch = router({ "/auth/v1/app/refresh": () => err(401, code) });
+      const { s, m } = memoryStorage({ [STORE_KEY]: "rt1" });
+      const db = createClient({ url, key, fetch, auth: { storage: s, autoRefresh: false } });
+      expect(await db.auth.currentUser(), code).toBeNull();
+      expect(m.has(STORE_KEY), code).toBe(false);
+    }
+  });
+
   test("current_user_retries_once_after_expired_then_gives_null", async () => {
     let refreshes = 0;
     const fetch = router({

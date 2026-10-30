@@ -25,7 +25,7 @@ await db.auth.signOut();
 
 Methods: `signUp`, `signIn`, `signOut`, `refresh`, `refreshIfNeeded`, `getUser`, `currentUser`, `verifyEmail`, `resendCode`, `requestPasswordReset`, `confirmPasswordReset`, `changeEmail`, `changePassword` and `onChange` (which returns the function that unsubscribes).
 
-`getUser()` rejects when nobody is signed in; `currentUser()` gives `null` instead (no session, or one that is invalid, expired after one refresh, or revoked) and rejects only on other errors, such as the gateway being down. `refreshIfNeeded()` refreshes only when the access token is missing or about to expire, and sends nothing otherwise.
+`getUser()` rejects when nobody is signed in; `currentUser()` gives `null` instead (no session, or one that is invalid, expired after one refresh, revoked, or ended by its refresh) and rejects only on other errors, such as the gateway being down. `refreshIfNeeded()` refreshes only when the access token is missing or about to expire, and sends nothing otherwise.
 
 ```ts twoslash
 import { createClient } from "@chelabase/client";
@@ -53,7 +53,7 @@ if (user) console.log(user.email);
 - The access token is refreshed 60 seconds before it expires, by one shared request. `autoRefresh: false` turns the timer off; a request with a token that has under 5 seconds left still refreshes first.
 - A data request answered `401 user_token_expired` refreshes once and retries once. A returning visitor's first request refreshes lazily first.
 - When a refresh is answered `refresh_token_reused`, `refresh_token_invalid` or `user_inactive`, or any request carrying the access token (data or `db.auth`) is answered `401 user_session_revoked`, the client signs out locally: it drops the stored refresh token, emits `signed_out` and throws the `DataApiError`.
-- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request without clearing the cookies, since a stale request must not wipe a newer session; see [Server rendering](/docs/using/client/ssr).
+- Signing out locally on `refresh_token_invalid` is `createClient` only. The server and browser clients go anonymous for that request and keep the cookies while the access token expired less than a minute ago, since a stale request must not wipe a newer session; older (or missing) ones are cleared. See [Server rendering](/docs/using/client/ssr).
 
 ## A token from elsewhere
 

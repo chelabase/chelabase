@@ -122,7 +122,11 @@ export async function proxy(request: NextRequest) {
       },
     },
   });
-  await db.auth.refreshIfNeeded(); // a request only when the access token is about to expire
+  try {
+    await db.auth.refreshIfNeeded(); // a request only when the access token is about to expire
+  } catch (e) {
+    console.error("chelabase refresh failed", e); // the page's currentUser() decides
+  }
   return response;
 }
 
@@ -133,7 +137,9 @@ export const config = {
 
 The matcher leaves out the auth route: the handler refreshes on its own, and running the proxy there too would rotate the refresh token twice.
 
-`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. It rejects only when the refresh fails some other way, such as the gateway being down.
+`refreshIfNeeded()` sends nothing while the access token has time left, so most requests cost nothing. It resolves when there is no session or the session has just ended. An ended session costs one refresh attempt: then its cookies are cleared, and later requests send nothing. It rejects only when the refresh fails some other way, such as the gateway being down.
+
+The `try`/`catch` lets the page render anyway: a gateway hiccup shouldn't turn every route into an error page, and the page's own `currentUser()` decides who is signed in.
 
 ### A page that needs a user
 
@@ -204,7 +210,9 @@ Chelabase limits how often anyone can try to sign in (for example, 10 sign-ins a
 
 With `serverKey`, your server proves the call comes from your app. Chelabase then skips the per-IP limits for it and keeps the ones that follow a person: wrong passwords are still counted per email address, and the other limits per email or per user. Refreshes have no per-user limit, which is safe: a refresh token can't be guessed, and reusing an old one is detected and ends the session.
 
-The secret key is only sent on auth calls, never on data requests, and only counts when it belongs to the same project and branch as the public key; any other key is ignored.
+The per-person limits stay, but your app's sign-in and sign-up route is then limited only per account. So someone could try one password across many accounts, or create many sign-ups, without an IP limit. If that worries you, add `clientIp` (next section), or your own limit or CAPTCHA on that route.
+
+The secret key is only sent on auth calls, never on data requests, and only counts when it belongs to the same project and branch as the public key; any other key is ignored. A blank `CHELABASE_SECRET_KEY=` is treated as unset.
 
 ### Also limit per IP
 
@@ -217,10 +225,17 @@ export const POST = createAuthHandler({
   clientIp: (req) => req.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
 });
 
-// The proxy, and createActionClient (with `(await headers())` from next/headers)
+// The proxy
 createServerClient({
   // …as above
   clientIp: request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
+});
+
+// createActionClient: no `request` there, so read the header from next/headers
+import { headers } from "next/headers";
+createServerClient({
+  // …as above
+  clientIp: (await headers()).get("x-vercel-forwarded-for")?.split(",")[0]?.trim(),
 });
 ```
 
