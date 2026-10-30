@@ -502,32 +502,28 @@ impl Zitadel {
         Ok(())
     }
 
+    /// The user (`GET /v2/users/{userId}`). `None` only when Zitadel definitely has no such
+    /// user (a 404). A success answer that can't be read as a user (an empty body, no
+    /// `user.userId`) is `Unavailable`, never "no such user" (#57): callers end sessions and
+    /// delete rows on `None`, so an API change or a misbehaving proxy must fail closed.
     pub async fn get_user(&self, user_id: &str) -> Result<Option<ZUser>, ZError> {
         match self
             .call(Method::GET, &format!("/v2/users/{user_id}"), None)
             .await
         {
-            Ok(answer) => Ok(answer.get("user").and_then(parse_user)),
+            Ok(answer) => match answer.get("user").and_then(parse_user) {
+                Some(user) => Ok(Some(user)),
+                None => Err(ZError::Unavailable("the user answer can't be read".into())),
+            },
             Err(ZError::Rejected { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
     }
 
-    /// Whether Zitadel definitely has no user with this id: `true` only on a 404. An answer
-    /// that can't be read as a user is `Unavailable`, never "gone" (unlike [`Zitadel::get_user`],
-    /// whose `None` covers both), so a caller acting on "gone" fails closed.
+    /// Whether Zitadel definitely has no user with this id: `true` only on a 404, as
+    /// [`Zitadel::get_user`]'s `None`.
     pub async fn user_is_gone(&self, user_id: &str) -> Result<bool, ZError> {
-        match self
-            .call(Method::GET, &format!("/v2/users/{user_id}"), None)
-            .await
-        {
-            Ok(answer) => match answer.get("user").and_then(parse_user) {
-                Some(_) => Ok(false),
-                None => Err(ZError::Unavailable("the user answer can't be read".into())),
-            },
-            Err(ZError::Rejected { status: 404, .. }) => Ok(true),
-            Err(e) => Err(e),
-        }
+        Ok(self.get_user(user_id).await?.is_none())
     }
 
     pub async fn find_user_in_org(

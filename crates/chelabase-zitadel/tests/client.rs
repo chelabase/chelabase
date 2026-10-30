@@ -670,6 +670,38 @@ async fn user_is_gone_only_on_not_found() {
     assert!(z.user_is_gone(&other).await.is_err());
 }
 
+// #57: `None` is a definite 404 only. A success answer that can't be read as a user (an
+// empty body, no `user`, no `user.userId`, malformed JSON) is `Unavailable`, so no caller takes
+// it for a deleted user.
+#[tokio::test]
+async fn get_user_is_none_only_on_not_found() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user("ada@example.com", "Secret-pass1", true);
+    let get = format!("GET /v2/users/{id}");
+    for body in [
+        "",
+        "{}",
+        r#"{"user": null}"#,
+        r#"{"user": {"state": "USER_STATE_ACTIVE"}}"#,
+        r#"{"user": {"userId": 7}}"#,
+        r#"{"user": {"userId""#,
+    ] {
+        mock.answer_raw(&get, 200, body, 1);
+        assert!(
+            matches!(z.get_user(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+        mock.answer_raw(&get, 200, body, 1);
+        assert!(
+            matches!(z.user_is_gone(&id).await, Err(ZError::Unavailable(_))),
+            "{body:?}"
+        );
+    }
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().id, id);
+    mock.remove_user(&id);
+    assert_eq!(z.get_user(&id).await.unwrap(), None);
+}
+
 // #24: an app reaches Zitadel at its in-network address with the public auth host as `Host`
 // (Zitadel picks its instance by Host), as the bootstrap does.
 #[tokio::test]
