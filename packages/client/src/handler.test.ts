@@ -60,7 +60,7 @@ function req(
     );
   }
   const method = o.method ?? "POST";
-  return new Request(`${o.base ?? "http://localhost:3000"}/api/chelabase/auth/${flow}`, {
+  return new Request(`${o.base ?? "http://localhost:4000"}/api/chelabase/auth/${flow}`, {
     method,
     headers,
     ...(method === "GET" || method === "HEAD" ? {} : { body: o.body === undefined ? "" : JSON.stringify(o.body) }),
@@ -141,9 +141,9 @@ describe("createAuthHandler", () => {
     const h = handler(gw);
     const body = { email: "a@b.co", password: "pw" };
     // req.url is the internal address; the browser's Origin is the public site.
-    expect((await h(req("sign-in", { body, base: "http://localhost:3000" }))).status).toBe(200);
+    expect((await h(req("sign-in", { body, base: "http://localhost:4000" }))).status).toBe(200);
     // An Origin equal to the internal req.url origin is not the site.
-    expect((await h(req("sign-in", { body, base: "http://localhost:3000", origin: "http://localhost:3000" }))).status).toBe(403);
+    expect((await h(req("sign-in", { body, base: "http://localhost:4000", origin: "http://localhost:4000" }))).status).toBe(403);
     // A siteUrl with a path still compares origins only.
     const h2 = handler(gw, { siteUrl: `${siteUrl}/app/` });
     expect((await h2(req("sign-in", { body }))).status).toBe(200);
@@ -186,7 +186,7 @@ describe("createAuthHandler", () => {
       expect(res.status, flow).toBe(404);
     }
     // Outside the mount point.
-    const outside = new Request("http://localhost:3000/api/chelabase/other/sign-in", {
+    const outside = new Request("http://localhost:4000/api/chelabase/other/sign-in", {
       method: "POST",
       headers: { origin: siteUrl, "content-type": "application/json" },
       body: JSON.stringify(body),
@@ -205,7 +205,7 @@ describe("createAuthHandler", () => {
   test("a_custom_mount_point", async () => {
     const gw = gateway({ "/auth/v1/app/sign-in": () => ({ body: session(1) }) });
     const h = handler(gw, { authPath: "/auth/" });
-    const r = new Request("http://localhost:3000/auth/sign-in", {
+    const r = new Request("http://localhost:4000/auth/sign-in", {
       method: "POST",
       headers: { origin: siteUrl, "content-type": "application/json" },
       body: JSON.stringify({ email: "a@b.co", password: "pw" }),
@@ -377,7 +377,7 @@ describe("createAuthHandler", () => {
     // A body that isn't a JSON object is refused before the gateway.
     const gw2 = gateway({});
     for (const raw of ["not json", "[1]", "\"s\"", "null", ""]) {
-      const r = new Request("http://localhost:3000/api/chelabase/auth/sign-in", {
+      const r = new Request("http://localhost:4000/api/chelabase/auth/sign-in", {
         method: "POST",
         headers: { origin: siteUrl, "content-type": "application/json" },
         body: raw,
@@ -399,7 +399,7 @@ describe("createAuthHandler", () => {
     // A sibling subdomain planted a same-named cookie under a longer path: it comes first.
     const twice = (name: string, a: string, b: string) => `${name}=${a}; ${name}=${b}`;
     const raw = (flow: string, cookie: string, body: unknown = {}) =>
-      new Request(`http://localhost:3000/api/chelabase/auth/${flow}`, {
+      new Request(`http://localhost:4000/api/chelabase/auth/${flow}`, {
         method: "POST",
         headers: { origin: siteUrl, "content-type": "application/json", cookie },
         body: JSON.stringify(body),
