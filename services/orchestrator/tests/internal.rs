@@ -891,10 +891,12 @@ impl NeonMetadataPort for FakeNeon {
             return Ok(PeekOutcome::Invalid);
         }
         if f.hash == presented {
-            Ok(PeekOutcome::Live(f.s.clone()))
+            Ok(PeekOutcome::Live { session: f.s.clone(), grace: false })
         } else if f.prev == Some(presented) {
             match (f.grace_until, &f.sealed) {
-                (Some(until), Some(_)) if until > now => Ok(PeekOutcome::Live(f.s.clone())),
+                (Some(until), Some(_)) if until > now => {
+                    Ok(PeekOutcome::Live { session: f.s.clone(), grace: true })
+                }
                 _ => Ok(PeekOutcome::Reused),
             }
         } else {
@@ -4673,7 +4675,7 @@ async fn malformed_refresh_token_invalid() {
 }
 
 // #59: peek answers the session and its user for the current token, and for the previous one
-// within the grace, and changes nothing.
+// within the grace (saying it is the grace token, #59 audit B1), and changes nothing.
 #[tokio::test]
 async fn peek_answers_the_user_and_rotates_nothing() {
     let w = app_world();
@@ -4682,18 +4684,22 @@ async fn peek_answers_the_user_and_rotates_nothing() {
     let (sid, t0) = a.create_session(w.project, user, "zs1").await;
     let (status, body) = a.peek(w.project, &t0).await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body, json!({ "session_id": sid, "user_id": user }), "no token in the answer");
+    assert_eq!(
+        body,
+        json!({ "session_id": sid, "user_id": user, "grace": false }),
+        "no token in the answer"
+    );
     let before = a.session(sid);
     assert_eq!(before.hash, sha256(&t0), "unchanged");
     assert_eq!((before.prev, before.grace_until), (None, None));
-    // The previous token within the grace: the same answer.
+    // The previous token within the grace: the same session and user, as the grace token.
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     let rotated = a.session(sid);
-    for token in [&t0, &t1] {
+    for (token, grace) in [(&t0, true), (&t1, false)] {
         let (status, body) = a.peek(w.project, token).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body, json!({ "session_id": sid, "user_id": user }));
+        assert_eq!(body, json!({ "session_id": sid, "user_id": user, "grace": grace }));
     }
     let after = a.session(sid);
     assert_eq!((after.hash, after.prev, after.grace_until), (rotated.hash, rotated.prev, rotated.grace_until));
