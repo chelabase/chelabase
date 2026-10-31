@@ -8,67 +8,315 @@ use serde_json::{Value, json};
 use std::io::Write;
 use std::time::Duration;
 
-/// A demo person.
+/// A demo person. `teams` are the Acme teams they join (one or two); [`Person::department`]
+/// is who they work for.
 #[derive(Debug, Clone, Copy)]
 pub struct Person {
     pub email: &'static str,
     pub given: &'static str,
     pub family: &'static str,
     pub department: &'static str,
+    pub teams: &'static [&'static str],
 }
 
-/// The tenant admin, who claims the instance.
+/// The tenant admin, who claims the instance. She is in Leadership and Engineering.
 pub const ADA: Person = Person {
     email: "ada@acme.example",
     given: "Ada",
     family: "Lovelace",
     department: "Engineering",
+    teams: &["Leadership", "Engineering"],
 };
 
-/// Everyone Ada invites.
+/// Everyone Ada invites: 39 people. Grace, Katherine, Hedy, Alan and Rosalind were the first
+/// roster; Bea (Sales) is the one the SQL-editor demo signs in as.
 pub const PEOPLE: &[Person] = &[
     Person {
         email: "grace@acme.example",
         given: "Grace",
         family: "Hopper",
         department: "Engineering",
+        teams: &["Engineering"],
     },
     Person {
         email: "katherine@acme.example",
         given: "Katherine",
         family: "Johnson",
-        department: "Data",
+        department: "Engineering",
+        teams: &["Engineering", "Finance"],
     },
     Person {
-        email: "hedy@acme.example",
-        given: "Hedy",
-        family: "Lamarr",
-        department: "Product",
+        email: "linus@acme.example",
+        given: "Linus",
+        family: "Torvalds",
+        department: "Engineering",
+        teams: &["Engineering"],
     },
     Person {
-        email: "alan@acme.example",
-        given: "Alan",
-        family: "Turing",
-        department: "Security",
+        email: "barbara@acme.example",
+        given: "Barbara",
+        family: "Liskov",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "dennis@acme.example",
+        given: "Dennis",
+        family: "Ritchie",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "ken@acme.example",
+        given: "Ken",
+        family: "Thompson",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "margaret@acme.example",
+        given: "Margaret",
+        family: "Hamilton",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "radia@acme.example",
+        given: "Radia",
+        family: "Perlman",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "tim@acme.example",
+        given: "Tim",
+        family: "Berners-Lee",
+        department: "Engineering",
+        teams: &["Engineering"],
+    },
+    Person {
+        email: "frances@acme.example",
+        given: "Frances",
+        family: "Allen",
+        department: "Engineering",
+        teams: &["Engineering"],
     },
     Person {
         email: "rosalind@acme.example",
         given: "Rosalind",
         family: "Franklin",
         department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "emmy@acme.example",
+        given: "Emmy",
+        family: "Noether",
+        department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "joan@acme.example",
+        given: "Joan",
+        family: "Clarke",
+        department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "luca@acme.example",
+        given: "Luca",
+        family: "Pacioli",
+        department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "blaise@acme.example",
+        given: "Blaise",
+        family: "Pascal",
+        department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "sofia@acme.example",
+        given: "Sofia",
+        family: "Kovalevskaya",
+        department: "Finance",
+        teams: &["Finance"],
+    },
+    Person {
+        email: "carl@acme.example",
+        given: "Carl",
+        family: "Gauss",
+        department: "Finance",
+        teams: &["Finance", "Sales"],
+    },
+    Person {
+        email: "bea@acme.example",
+        given: "Beatrice",
+        family: "Tinsley",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "cecilia@acme.example",
+        given: "Cecilia",
+        family: "Payne",
+        department: "Sales",
+        teams: &["Sales", "Support"],
+    },
+    Person {
+        email: "dorothy@acme.example",
+        given: "Dorothy",
+        family: "Hodgkin",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "elizabeth@acme.example",
+        given: "Elizabeth",
+        family: "Blackwell",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "florence@acme.example",
+        given: "Florence",
+        family: "Nightingale",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "gertrude@acme.example",
+        given: "Gertrude",
+        family: "Elion",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "hypatia@acme.example",
+        given: "Hypatia",
+        family: "Alexandria",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "irene@acme.example",
+        given: "Irene",
+        family: "Joliot-Curie",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "jocelyn@acme.example",
+        given: "Jocelyn",
+        family: "Bell",
+        department: "Sales",
+        teams: &["Sales"],
+    },
+    Person {
+        email: "lise@acme.example",
+        given: "Lise",
+        family: "Meitner",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "maria@acme.example",
+        given: "Maria",
+        family: "Mitchell",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "nettie@acme.example",
+        given: "Nettie",
+        family: "Stevens",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "ynes@acme.example",
+        given: "Ynes",
+        family: "Mexia",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "valentina@acme.example",
+        given: "Valentina",
+        family: "Tereshkova",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "sally@acme.example",
+        given: "Sally",
+        family: "Ride",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "mae@acme.example",
+        given: "Mae",
+        family: "Jemison",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "annie@acme.example",
+        given: "Annie",
+        family: "Cannon",
+        department: "Support",
+        teams: &["Support", "Engineering"],
+    },
+    Person {
+        email: "henrietta@acme.example",
+        given: "Henrietta",
+        family: "Leavitt",
+        department: "Support",
+        teams: &["Support"],
+    },
+    Person {
+        email: "hedy@acme.example",
+        given: "Hedy",
+        family: "Lamarr",
+        department: "Leadership",
+        teams: &["Leadership"],
+    },
+    Person {
+        email: "alan@acme.example",
+        given: "Alan",
+        family: "Turing",
+        department: "Leadership",
+        teams: &["Leadership"],
+    },
+    Person {
+        email: "marie@acme.example",
+        given: "Marie",
+        family: "Curie",
+        department: "Leadership",
+        teams: &["Leadership"],
+    },
+    Person {
+        email: "rachel@acme.example",
+        given: "Rachel",
+        family: "Carson",
+        department: "Leadership",
+        teams: &["Leadership"],
     },
 ];
 
 const RESET: &str = "reset with `down -v`";
 
 /// Claims the instance as Ada (or signs her in) and makes every demo person an active member.
+/// Returns Ada's session for the steps after it.
 /// `second` is how long a `Retry-After` second lasts (shorter in tests).
-pub async fn seed(
+pub async fn seed<'a, H: Http>(
     cfg: &Config,
-    http: &impl Http,
+    http: &'a H,
     second: Duration,
     out: &mut dyn Write,
-) -> Result<()> {
+) -> Result<(Session<'a, H>, Token)> {
     let s = Session::connect(http, cfg.entry.clone(), cfg.timeout, second).await?;
     let mut writes = 0;
     let instance = s
@@ -191,7 +439,7 @@ pub async fn seed(
     for p in PEOPLE {
         writeln!(out, "example:   {:<26} {}", p.email, p.department)?;
     }
-    Ok(())
+    Ok((s, ada))
 }
 
 /// An invited person: a new link (the old one was lost with the run that made it) and the
@@ -282,7 +530,7 @@ mod tests {
         let mut out = Vec::new();
         let r = seed(&fake::config(), f, Duration::from_millis(1), &mut out).await;
         let text = String::from_utf8(out).unwrap();
-        r.map(|()| text)
+        r.map(|_| text)
     }
 
     fn all_active(f: &Fake) {
@@ -396,7 +644,8 @@ mod tests {
         let mut out = Vec::new();
         let e = seed(&fake::config(), &raced, Duration::from_millis(1), &mut out)
             .await
-            .unwrap_err();
+            .err()
+            .expect("the seed fails");
         assert!(
             e.to_string().contains("not this instance's tenant admin"),
             "{e}"
