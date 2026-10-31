@@ -21,6 +21,8 @@ use std::time::Duration;
 pub const SCHEMA_SQL: &str = include_str!("acme.sql");
 
 pub const PROJECT: &str = "Acme";
+/// The tenant's display name: Studio's Members page says "People in Acme".
+pub const TENANT_NAME: &str = "Acme";
 pub const DATABASE: &str = "acme";
 /// The schema a data API request names when it names none: `from("orders")` is `sales.orders`.
 pub const DEFAULT_SCHEMA: &str = "sales";
@@ -126,6 +128,7 @@ pub async fn seed<H: Http>(s: &Session<'_, H>, ada: &Token, out: &mut dyn Write)
         writes: 0,
         out,
     };
+    r.tenant().await?;
     let project = r.project().await?;
     let database = r.database(&project).await?;
     let (branch, pg) = r.main(&database).await?;
@@ -215,6 +218,23 @@ impl<H: Http> Run<'_, '_, H> {
             }
             tokio::time::sleep(second.max(Duration::from_millis(1))).await;
         }
+    }
+
+    /// Names the tenant after the organisation (it shows as its slug until named). Read first:
+    /// a tenant that already has the name is left alone.
+    async fn tenant(&mut self) -> Result<()> {
+        let me = self.get("/v1/me", "GET /v1/me").await?;
+        if me.pointer("/tenant/display_name").and_then(Value::as_str) == Some(TENANT_NAME) {
+            return Ok(());
+        }
+        self.write(
+            Method::PATCH,
+            "/v1/tenant",
+            Some(json!({"display_name": TENANT_NAME})),
+            "PATCH /v1/tenant",
+        )
+        .await?;
+        self.say(&format!("named the tenant {TENANT_NAME}")).await
     }
 
     async fn project(&mut self) -> Result<String> {
@@ -888,6 +908,25 @@ mod tests {
         run(&f).await.unwrap();
         assert_eq!(f.writes(), before, "a rerun writes nothing");
         assert_eq!(f.count("POST /v1/sql"), 2);
+    }
+
+    #[tokio::test]
+    async fn the_tenant_is_named_after_the_organisation_once() {
+        let f = Fake::new();
+        run(&f).await.unwrap();
+        assert_eq!(
+            f.0.lock().unwrap().acme.tenant_name.as_deref(),
+            Some(TENANT_NAME)
+        );
+        assert_eq!(f.count("PATCH /v1/tenant"), 1);
+        let before = f.writes();
+        run(&f).await.unwrap();
+        assert_eq!(f.count("PATCH /v1/tenant"), 1, "a rerun does not rename");
+        assert_eq!(f.writes(), before, "a rerun makes zero writes");
+        // Someone else's name for it is put back: the seed owns the demo's tenant.
+        f.0.lock().unwrap().acme.tenant_name = Some("Other".into());
+        run(&f).await.unwrap();
+        assert_eq!(f.count("PATCH /v1/tenant"), 2);
     }
 
     #[tokio::test]
