@@ -12,6 +12,25 @@ const renderPage = () => render(<LandingPage docsUrl={DOCS} />);
 const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"];
 
 describe("LandingPage", () => {
+  it("each_studio_section_shows_its_screenshots_with_alt_text", () => {
+    renderPage();
+    for (const [id, srcs] of [
+      ["manage", ["manage-table-editor", "manage-rls-warning"]],
+      ["collaborate", ["collaborate-team-access"]],
+      ["iterate", ["iterate-branches"]],
+    ] as const) {
+      const section = document.getElementById(id)!;
+      const imgs = within(section).getAllByRole("img");
+      for (const src of srcs) {
+        const img = imgs.find((i) => i.getAttribute("src") === `/screens/${src}.webp`);
+        expect(img, `${id}: ${src}`).toBeDefined();
+        expect(img!.getAttribute("alt")!.trim().length).toBeGreaterThan(20);
+        expect(img!.getAttribute("loading")).toBe("lazy");
+        expect(img!.closest("figure")!.querySelector("figcaption")!.textContent!.trim()).not.toBe("");
+      }
+    }
+  });
+
   it("leads_with_the_chelabase_name", () => {
     renderPage();
     expect(screen.getByRole("heading", { level: 1, name: "Chelabase" })).toBeInTheDocument();

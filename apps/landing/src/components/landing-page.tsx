@@ -157,6 +157,26 @@ function CodeInset({ label, note, children, className = "" }: { label: ReactNode
   );
 }
 
+/** A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport, and a link to the full-size file. */
+function StudioShot({ src, width, height, alt, caption }: { src: string; width: number; height: number; alt: string; caption: string }) {
+  return (
+    <figure className="m-0 min-w-0">
+      <a href={src} className={`block rounded-xl ${FOCUS}`}>
+        <img
+          src={src}
+          width={width}
+          height={height}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          className="block w-full h-auto rounded-xl border border-line-strong bg-ink"
+        />
+      </a>
+      <figcaption className="mt-2.5 text-[0.9rem] leading-snug text-chalk-dim">{caption}</figcaption>
+    </figure>
+  );
+}
+
 const K = ({ children }: { children: ReactNode }) => <span className="text-coral">{children}</span>;
 const F = ({ children }: { children: ReactNode }) => <span className="text-seafoam">{children}</span>;
 const S = ({ children }: { children: ReactNode }) => <span className="text-sand">{children}</span>;
@@ -415,6 +435,22 @@ function Manage() {
             will run, before it runs.
           </p>
           <Notes notes={MANAGE_NOTES} />
+          <div className="mt-10 grid gap-6">
+            <StudioShot
+              src="/screens/manage-table-editor.webp"
+              width={1152}
+              height={800}
+              alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
+              caption="A staged change shows its SQL and a dry run before anything runs."
+            />
+            <StudioShot
+              src="/screens/manage-rls-warning.webp"
+              width={806}
+              height={126}
+              alt="Studio's RLS warning on the Data API panel: anyone with your public key can read the rows of public.employees, with the ALTER TABLE statement that enables row-level security."
+              caption="Studio flags public.employees, reachable by the data API without row-level security."
+            />
+          </div>
         </div>
         <CodeInset label="Table editor · review changes" note="illustration" className="sticky top-22 max-[900px]:static">
           <C>-- 2 changes to sales.orders, applied in one transaction</C>
@@ -466,6 +502,15 @@ function Collaborate() {
             privileges decide the rest, so a schema can belong to one team.
           </p>
           <Notes notes={COLLABORATE_NOTES} />
+          <div className="mt-10 grid gap-6">
+            <StudioShot
+              src="/screens/collaborate-team-access.webp"
+              width={832}
+              height={542}
+              alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
+              caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
+            />
+          </div>
         </div>
         <CodeInset
           label="SQL editor · Acme, a schema per team"
@@ -531,7 +576,16 @@ function Iterate() {
             </div>
           </dl>
         </div>
-        <TideGauge />
+        <div className="grid gap-6 min-w-0">
+          <TideGauge />
+          <StudioShot
+            src="/screens/iterate-branches.webp"
+            width={1152}
+            height={934}
+            alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
+            caption="Protected main, and feature-discounts branched from it, ready to merge."
+          />
+        </div>
       </div>
     </Band>
   );

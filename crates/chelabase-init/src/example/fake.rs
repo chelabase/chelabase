@@ -83,6 +83,8 @@ pub struct State {
 /// The Acme organisation as the management API holds it.
 #[derive(Default)]
 pub struct Acme {
+    /// The tenant's display name (`GET /v1/me`, `PATCH /v1/tenant`).
+    pub tenant_name: Option<String>,
     /// id, name, app users status
     pub projects: Vec<(String, String, Option<&'static str>)>,
     /// id, name, project id
@@ -114,7 +116,7 @@ pub struct FTeam {
 
 pub struct Fake(pub Mutex<State>);
 
-const WRITES: [&str; 22] = [
+const WRITES: [&str; 23] = [
     "POST /auth/v1/sign-up",
     "POST /v1/invites",
     "POST /v1/invites/resend",
@@ -137,6 +139,7 @@ const WRITES: [&str; 22] = [
     "POST /v1/sql-queries",
     "PATCH /v1/branch",
     "PUT /v1/app-users-settings",
+    "PATCH /v1/tenant",
 ];
 
 impl Fake {
@@ -442,7 +445,7 @@ impl State {
                                 let level = if narrowed { "viewer" } else { "admin" };
                                 let mine: Vec<Value> = self.acme.projects.iter().map(|(id, _, _)| json!({"project_id": id, "platform_role": "admin",
                                     "databases": self.acme.databases.iter().filter(|d| d.2 == *id).map(|d| json!({"database_id": d.0, "platform_role": level})).collect::<Vec<_>>()})).collect();
-                                json!({"member": me.map(|m| json!({"status": m.status, "tenant_admin": m.admin})), "tenant": {"projects": projects}, "projects": mine})
+                                json!({"member": me.map(|m| json!({"status": m.status, "tenant_admin": m.admin})), "tenant": {"display_name": self.acme.tenant_name, "projects": projects}, "projects": mine})
                             }
                         },
                         None,
@@ -661,6 +664,10 @@ impl State {
             "POST /v1/data-api" => {
                 self.acme.data_api_on = true;
                 json_ok(202, json!({"name": "acme"}))
+            }
+            "PATCH /v1/tenant" => {
+                self.acme.tenant_name = body.get("display_name").and_then(Value::as_str).map(str::to_string);
+                json_ok(200, json!({"display_name": self.acme.tenant_name}))
             }
             "PATCH /v1/pg-database" => {
                 self.acme.default_schema = s(body, "default_schema");

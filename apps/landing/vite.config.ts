@@ -40,7 +40,7 @@ export default defineConfig({
   plugins: [
     tailwindcss(),
     tanstackStart({
-      prerender: { enabled: true, crawlLinks: true },
+      prerender: { enabled: true, crawlLinks: false },
       pages: [{ path: '/' }],
     }),
     react(),
