@@ -20,7 +20,7 @@ describe("LandingPage", () => {
   it("ctas_link_to_the_quickstart_and_github", () => {
     renderPage();
     const starts = screen.getAllByRole("link", { name: "Get started" });
-    const githubs = screen.getAllByRole("link", { name: "Visit GitHub" });
+    const githubs = screen.getAllByRole("link", { name: "GitHub" });
     expect(starts.length).toBeGreaterThanOrEqual(3);
     expect(githubs.length).toBeGreaterThanOrEqual(3);
     for (const a of starts) expect(a.getAttribute("href")).toBe(`${DOCS}/docs/using/quickstart`);
