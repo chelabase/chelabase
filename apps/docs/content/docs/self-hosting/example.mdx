@@ -1,0 +1,126 @@
+---
+title: Example organisation
+description: Start a local Chelabase stack with a demo organisation, forty people in five teams, schemas, row-level security, app users and a branch to merge, and what to try in it.
+---
+
+This page starts a local stack with a demo organisation already in place: a project, a database, teams and their access, schemas with row-level security, app users and a branch to merge. It is for trying Chelabase out. For a real instance, see [Install](/docs/self-hosting/install).
+
+<Callout type="warn">
+**Local demo only.** Every account in the demo uses one published password, `Acme-Demo-2026!`. Anyone who can reach the stack can sign in as any of them. Run it on your own machine and do not expose it.
+
+The seed refuses to run unless the three hosts are `localhost` or `*.localhost` and the gateway listens only on loopback (`127.0.0.1`). It also refuses an instance that someone else has already claimed.
+</Callout>
+
+## Start it
+
+The steps are the ones in the header of `infra/compose/docker-compose.example.yml`. Until the published init image includes `chelabase-init example`, build the images locally first, as the header describes:
+
+```bash
+cd infra/compose && cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.build.yml build init-secrets studio
+docker tag chelabase/server:local chelabase/init:local
+CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
+  -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
+```
+
+Once the published pin includes the seed, start the stack without the build steps:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
+docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
+```
+
+The seed claims the instance for Ada, so you don't use a setup code by hand. Its log prints the account list. Then open `http://studio.chelabase.localhost:8000` and sign in as any demo person.
+
+## Reset
+
+```bash
+cd infra/compose
+docker compose -f docker-compose.yml -f docker-compose.example.yml down -v
+```
+
+This deletes every database and every secret. The seed does not run again on an instance it has already claimed, so start again from the top afterwards. Computes are not Compose services, so `down -v` leaves them behind. For a full removal, follow the steps in [Stop, tear down and uninstall](/docs/self-hosting/install#stop-tear-down-and-uninstall).
+
+## Who is in it
+
+Everyone signs in with the password `Acme-Demo-2026!`. Emails are `<first name>@acme.example`, so Bea is `bea@acme.example`. There are 40 people: Ada, and 39 others. Ada is the instance's admin.
+
+The team names below are the Studio names. Members are listed by first name.
+
+| Team | Level on project Acme | Acts as (Postgres role) | Members |
+|---|---|---|---|
+| Engineering | Developer | `engineering` | ada, grace, katherine, linus, barbara, dennis, ken, margaret, radia, tim, frances, annie |
+| Finance | Developer | `finance` | katherine, rosalind, emmy, joan, luca, blaise, sofia, carl |
+| Sales | Developer | `sales` | carl, bea, cecilia, dorothy, elizabeth, florence, gertrude, hypatia, irene, jocelyn |
+| Support | Viewer | `support` | cecilia, lise, maria, nettie, ynes, valentina, sally, mae, annie, henrietta |
+| Leadership | Admin | all roles | ada, hedy, alan, marie, rachel |
+
+A Developer runs SQL as one of the Postgres roles its team is granted. A Viewer can browse but not run SQL. An Admin can act as every role. See [Members and invites](/docs/using/members-and-invites) and [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+
+People can be in more than one team. Carl is in Finance and Sales, so he can act as either role.
+
+**One override.** `alan@acme.example` is an Admin through Leadership, but on the `acme` database he is narrowed to Viewer. The override applies to that database only.
+
+**App users.** `carol@customer.example`, `dave@customer.example` and `erin@customer.example` are customers. They use the same password, and they sign in through the client, not Studio. See [App users](/docs/using/app-users).
+
+## What is in the database
+
+The project is **Acme**, and it has one database, `acme`. Each team works in its own schema, and each schema is owned by its team's Postgres role.
+
+| Schema | Owned by | Tables |
+|---|---|---|
+| `engineering` | `engineering` | none |
+| `finance` | `finance` | `finance.invoices` |
+| `sales` | `sales` | `sales.orders` |
+| `support` | `support` | `support.tickets` |
+| `public` | | `public.customers`, `public.employees` |
+
+Row-level security is on for every table except `public.employees`. That table has none on purpose, so Studio's security warning shows it. See [Studio](/docs/using/studio).
+
+- `public.customers`: an app user sees only their own row.
+- `sales.orders`: an app user sees only their own orders (`customer_id = chelabase.user_id()`). Sales can read and write every order, and Finance can read them.
+- `finance.invoices`: only Finance can reach it.
+- `support.tickets`: an app user sees only their own tickets. The `support` role sees the tickets of the EMEA region.
+
+The data API's default schema is `sales`, so `from("orders")` means `sales.orders`. Other tables need their schema, for example `from("public.customers")`. See [TypeScript client](/docs/using/client) and [Data API](/docs/using/data-api).
+
+**Keys.** The project has the public key and a secret server key named `acme-server`. The seed never prints a secret key. See [Keys](/docs/using/data-api/keys).
+
+**Branches.** `main` is protected. `feature-discounts` is ready to merge. It adds `sales.orders.discount_pct`, a percentage from 0 to 100 that defaults to 0. See [Branches](/docs/using/branches) and [Merging schema](/docs/using/merging-schema).
+
+**Saved queries.** The SQL editor has two, shared across the project: "Revenue by month" and "Open tickets by region". See [SQL editor](/docs/using/sql-editor).
+
+## Things to try
+
+- **Write across teams.** Sign in as `bea@acme.example`. In the SQL editor, set **Run as** to `sales` and run:
+
+  ```sql
+  insert into finance.invoices (order_id, customer_id, amount, issued_on)
+  select id, customer_id, total, current_date from sales.orders limit 1;
+  ```
+
+  Postgres refuses it with a permission error, because the `sales` role has no rights on `finance`. Now run the same kind of insert into `sales.orders`, for example `insert into sales.orders (customer_id, total) select id, 10 from public.customers limit 1;`. It works. `main` is protected, so Studio asks you to confirm each change before it runs.
+
+- **Browse without running SQL.** Sign in as `lise@acme.example`. She is in Support, a Viewer. She can browse the tables, but she cannot run SQL.
+
+- **Find the unprotected table.** Open Studio's security warning. It flags `public.employees`, which has no row-level security.
+
+- **Read orders as a customer.** Sign in as `carol@customer.example` through the client, and read `sales.orders`. You see only Carol's rows. The client needs the generated types (see [Generated types](/docs/using/client/types)). Replace the key with your public key:
+
+  ```ts
+  import { createClient } from "@chelabase/client";
+  import { type Database, types } from "./db";
+
+  const db = createClient<Database>({
+    url: "http://api.chelabase.localhost:8000",
+    key: "chk_pub_…",
+    types,
+  });
+
+  await db.auth.signIn({ email: "carol@customer.example", password: "Acme-Demo-2026!" });
+  const orders = await db.from("orders").select("id", "total", "status", "created_at");
+  ```
+
+- **Merge a branch.** Open the `feature-discounts` branch and merge it into `main`. The merge adds `discount_pct` to `sales.orders`. Follow [Merging schema](/docs/using/merging-schema) for the steps.
+
+- **See the override.** Sign in as `alan@acme.example`. He can read the `acme` database but cannot change it. See [Members and invites](/docs/using/members-and-invites).
