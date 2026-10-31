@@ -35,6 +35,7 @@ docs/                  security notes and benchmarks; roadmap/ and superpowers/ 
 - cmake (Pingora builds zlib-ng): `sudo apt-get install -y cmake`
 - clang and protoc (`pg_query` builds Postgres's parser for the SQL editor's guard): `sudo apt-get install -y clang protobuf-compiler`
 - psql (PostgreSQL client): `sudo apt-get install -y postgresql-client`
+- [gh](https://cli.github.com) 2.83 or newer, from [GitHub's own apt repo](https://github.com/cli/cli/blob/trunk/docs/install_linux.md). Distro packages lag (Ubuntu's is 2.46), and before 2.73 `gh pr edit` fails on the Projects (classic) deprecation.
 - [cargo-nextest](https://nexte.st), the test runner behind `just test`: `cargo install cargo-nextest --locked`
 - sccache as cargo's compiler wrapper: proto installs it, but registering it is one-time machine setup (below).
 
