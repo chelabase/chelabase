@@ -1,0 +1,44 @@
+# The Acme example: a fresh local stack, claimed and seeded with demo people. LOCAL DEMO ONLY.
+#
+#   cd infra/compose && cp .env.example .env
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
+#
+# `example-seed` (`chelabase-init example`) claims the instance as ada@acme.example with the
+# setup code, through the ordinary sign-up, then invites the other demo people with link
+# delivery and accepts each invite. Every account gets the same hard-coded password, which the
+# log prints with the account list. It acts only through the public endpoints (via the gateway,
+# addressed by the public hosts), so the orchestrator's rules apply as they do to a person.
+#
+# It refuses any stack that isn't local (hosts other than localhost / *.localhost, a gateway or
+# proxy published beyond loopback, required email verification), and an instance someone else
+# already claimed: start again with `down -v`. Rerunning `up` changes nothing; a seed that
+# stopped part way is finished by the next `up`. It mounts one secret, the setup code, and no
+# Zitadel credential.
+
+services:
+  example-seed:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-7c0297be4237@sha256:a893bd91643abac68df58c4cefda463d4c67024a2e4301b1e7044f8b13cf2c18}
+    restart: "no"
+    command: ["chelabase-init", "example"]
+    environment:
+      CHELABASE_PUBLIC_SCHEME: ${CHELABASE_PUBLIC_SCHEME:-http}
+      CHELABASE_STUDIO_HOST: ${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}
+      CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
+      CHELABASE_AUTH_HOST: ${CHELABASE_AUTH_HOST:-auth.chelabase.localhost:8000}
+      # For the local-only gate: where the host publishes the gateway and the proxy.
+      CHELABASE_HTTP_ADDR: ${CHELABASE_HTTP_ADDR:-127.0.0.1}
+      CHELABASE_PROXY_ADDR: ${CHELABASE_PROXY_ADDR:-127.0.0.1}
+      CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
+      # The gateway listens on the public port inside the network too.
+      CHELABASE_EXAMPLE_GATEWAY_URL: http://gateway:${CHELABASE_PUBLIC_PORT:-8000}
+      CHELABASE_SETUP_CODE_FILE: /run/chelabase/secrets/setup/setup.code
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/setup/setup.code, read_only: true, volume: {subpath: setup/setup.code}}
+    depends_on:
+      gateway:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy

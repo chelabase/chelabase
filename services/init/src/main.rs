@@ -10,6 +10,9 @@
 //! - `chelabase-init bootstrap --out <dir> [--demo]` makes the product's Zitadel objects and
 //!   binds the seeded tenant, waiting for Zitadel, the metadata migrations and the orchestrator
 //!   (see `chelabase_init::bootstrap`). It writes only into `--out` and creates no key.
+//! - `chelabase-init example` claims a fresh local instance as the demo tenant admin and adds
+//!   the demo people, through the public endpoints only (see `chelabase_init::example`). It
+//!   refuses any stack that isn't local, and prints no code, token or setup code.
 
 use anyhow::Context;
 use chelabase_init::owners::OwnershipMap;
@@ -62,6 +65,9 @@ enum Command {
         #[arg(long, default_value = "10m", value_parser = parse_timeout)]
         timeout: std::time::Duration,
     },
+    /// Seed a fresh local instance with the Acme demo people (local demo only; idempotent).
+    /// Configured from the environment (the example compose overlay).
+    Example,
     /// Print the stored setup code.
     SetupCode {
         /// The secrets directory.
@@ -92,6 +98,7 @@ fn run(args: Args) -> anyhow::Result<()> {
             )
         }
         Command::SetupCode { dir } => cli::setup_code(&dir, &mut out),
+        Command::Example => chelabase_init::example::cli(&mut err),
         Command::Bootstrap {
             out: dir,
             demo,

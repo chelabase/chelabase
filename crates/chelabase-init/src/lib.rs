@@ -7,6 +7,7 @@
 
 pub mod bootstrap;
 pub mod cli;
+pub mod example;
 pub mod fsx;
 pub mod kinds;
 pub mod owners;

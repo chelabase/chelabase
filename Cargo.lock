@@ -2298,6 +2298,7 @@ dependencies = [
  "anyhow",
  "chelabase-init",
  "clap",
+ "serde_json",
  "tempfile",
 ]
 
