@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, UsedTickets, client_ip, email_tag, pad};
 use chelabase_zitadel::rules::{normalize_email, strong_password};
-use crate::zitadel::{NewUser, Session, UserState, ZError, Zitadel};
+use crate::zitadel::{NewUser, Session, UserState, ZError, ZUser, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -997,28 +996,27 @@ fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
     incomplete(s, user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE)
 }
 
-/// One attempt reserved against an address's budget. Dropping it gives the slot back unless
-/// [`failed`](Self::failed) was called, so only the outcomes that say so spend budget and a
-/// new early return can't silently spend or leak it.
-struct IpSlot<'a> {
+/// One attempt reserved against a budget (an address's or an invitee's). It fails closed: the
+/// attempt stays counted unless [`refund`](Self::refund) gives it back, so a slot that is
+/// dropped undecided (a new early return, or the request future dropped because the client hung
+/// up while Zitadel checked the code) spends budget. Only outcomes that must not count refund.
+struct Slot<'a> {
     limiter: &'a RateLimiter,
     key: String,
     /// Start of the window the slot was reserved in; the refund applies only to that window.
     started: Instant,
-    failed: AtomicBool,
 }
 
-impl IpSlot<'_> {
-    fn failed(&self) {
-        self.failed.store(true, Ordering::Relaxed);
+impl<'a> Slot<'a> {
+    /// Counts one attempt against `key`; `None` once its `limit` for the window is used.
+    fn reserve(limiter: &'a RateLimiter, key: String, limit: u32) -> Option<Self> {
+        let started = limiter.allow_slot(&key, limit, HOUR)?;
+        Some(Slot { limiter, key, started })
     }
-}
 
-impl Drop for IpSlot<'_> {
-    fn drop(&mut self) {
-        if !self.failed.load(Ordering::Relaxed) {
-            self.limiter.refund(&self.key, self.started);
-        }
+    /// Gives the attempt back: the outcome isn't a failure of the caller's.
+    fn refund(self) {
+        self.limiter.refund(&self.key, self.started);
     }
 }
 
@@ -1027,20 +1025,14 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     // Only failed attempts count against an address, so an office behind one NAT can accept many
     // invites an hour while guessing codes from it still stops at 20 failures. The attempt is
     // counted up front (concurrent requests can't all pass a check before any failure lands) and
-    // handed back unless the outcome is a failure of the caller's.
-    let ip_key = format!("accept-invite:ip:{ip}");
-    let Some(started) = s.limiter.allow_slot(&ip_key, 20, HOUR) else {
+    // handed back only by the outcomes that aren't a failure of the caller's.
+    let Some(slot) = Slot::reserve(&s.limiter, format!("accept-invite:ip:{ip}"), 20) else {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     };
-    let slot = IpSlot { limiter: &s.limiter, key: ip_key, started, failed: AtomicBool::new(false) };
-    let bad = || {
-        slot.failed();
-        error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE)
-    };
-    let gone = |code, message| {
-        slot.failed();
-        error(StatusCode::GONE, code, message)
-    };
+    let bad = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
+    let gone = |code, message| error(StatusCode::GONE, code, message);
+    let too_many = || error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    let weak = || error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     // Validate before any key is built from the input.
     let code = b.code.as_deref().map(str::trim);
     if !is_user_id(&b.user)
@@ -1054,27 +1046,36 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     }
     // Before the code is spent.
     if !strong_password(&b.password) {
-        return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
+        slot.refund();
+        return weak();
     }
     // Setting a password and marking the email verified need Zitadel's admin token; without it
     // the code would be spent for nothing.
     let Some(admin) = &s.admin else {
         warn!("accept-invite needs CHELABASE_ZITADEL_ADMIN_PAT_FILE");
+        slot.refund();
         return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     };
     let Some(org) = org_id(s) else {
+        slot.refund();
         return no_org();
     };
     // Only failed code attempts count against a user, so a typo'd password or a retry never
     // locks the invitee out.
     let user_key = format!("accept-invite:user:{}", b.user);
     if s.limiter.over(&user_key, 5, HOUR) {
-        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+        slot.refund();
+        return too_many();
     }
     let user = match admin.get_user(&b.user).await {
         Ok(Some(u)) => u,
         Ok(None) => return gone(ErrorCode::InviteRevoked, INVITE_REVOKED),
-        Err(e) => return unavailable(&e),
+        // A refusal is Zitadel's answer and counts; only an outage is free.
+        Err(e @ ZError::Rejected { .. }) => return unavailable(&e),
+        Err(e) => {
+            slot.refund();
+            return unavailable(&e);
+        }
     };
     // An invite code for a user of another organization never signs into the platform.
     if user.org_id != org {
@@ -1082,55 +1083,58 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         s.limiter.hit(&user_key, HOUR);
         return bad();
     }
-    // A reset code is checked by setting the password with it: nothing changes on a wrong one.
     let mut password_set = false;
     match (code, &b.accept_ticket) {
-        (Some(code), _) if b.reset => match admin.set_password(&b.user, code, &b.password).await {
-            Ok(()) => password_set = true,
-            Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
-                info!(status, "accept-invite: the user is gone");
-                return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
+        (Some(code), _) => {
+            // Reserved before the check like the address's slot, so a hang-up can't skip it.
+            let Some(user_slot) = Slot::reserve(&s.limiter, user_key, 5) else {
+                slot.refund();
+                return too_many();
+            };
+            // A reset code is checked by setting the password with it: nothing changes on a
+            // wrong one.
+            let checked = if b.reset {
+                admin.set_password(&b.user, code, &b.password).await
+            } else {
+                admin.verify_invite_code(&b.user, code).await
+            };
+            match checked {
+                Ok(()) => {
+                    user_slot.refund();
+                    password_set = b.reset;
+                }
+                Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
+                    info!(status, "accept-invite: the user is gone");
+                    user_slot.refund();
+                    return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
+                }
+                Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
+                    user_slot.refund();
+                    return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
+                }
+                // The code wasn't spent: no ticket.
+                Err(ZError::Rejected { message, .. }) if b.reset && password_refused(&message) => {
+                    user_slot.refund();
+                    slot.refund();
+                    return weak();
+                }
+                Err(ZError::Rejected { status: status @ (400 | 412), message }) => {
+                    warn!(status, %message, reset = b.reset, "accept-invite: the code was refused");
+                    return bad();
+                }
+                // Any other refusal is Zitadel answering about the code, not an outage: it counts
+                // against the address (the invitee's count stays as before).
+                Err(e @ ZError::Rejected { .. }) => {
+                    user_slot.refund();
+                    return unavailable(&e);
+                }
+                Err(e) => {
+                    user_slot.refund();
+                    slot.refund();
+                    return unavailable(&e);
+                }
             }
-            Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
-                return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
-            }
-            // The code wasn't spent: no ticket.
-            Err(ZError::Rejected { message, .. }) if password_refused(&message) => {
-                return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
-            }
-            Err(ZError::Rejected { status: status @ (400 | 412), message }) => {
-                warn!(status, %message, "accept-invite: the reset code was refused");
-                s.limiter.hit(&user_key, HOUR);
-                return bad();
-            }
-            // Any other refusal is Zitadel answering about the code, not an outage.
-            Err(e @ ZError::Rejected { .. }) => {
-                slot.failed();
-                return unavailable(&e);
-            }
-            Err(e) => return unavailable(&e),
-        },
-        (Some(code), _) => match admin.verify_invite_code(&b.user, code).await {
-            Ok(()) => {}
-            Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
-                info!(status, "accept-invite: the user is gone");
-                return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
-            }
-            Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
-                return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
-            }
-            Err(ZError::Rejected { status: status @ (400 | 412), message }) => {
-                warn!(status, %message, "accept-invite: the code was refused");
-                s.limiter.hit(&user_key, HOUR);
-                return bad();
-            }
-            // Any other refusal is Zitadel answering about the code, not an outage.
-            Err(e @ ZError::Rejected { .. }) => {
-                slot.failed();
-                return unavailable(&e);
-            }
-            Err(e) => return unavailable(&e),
-        },
+        }
         (None, Some(ticket)) => {
             // Claimed up front: a failed attempt hands back a fresh ticket, so this one is
             // spent either way, and two concurrent uses can't both pass.
@@ -1143,8 +1147,21 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         }
         (None, None) => return bad(),
     }
-    // From here the code is spent: any failure hands back a ticket. Every step is safe to
-    // repeat.
+    // From here the code is spent, and no outcome counts against the address.
+    let response = finish_accept(s, admin, b, user, password_set).await;
+    slot.refund();
+    response
+}
+
+/// The steps after a verified code: any failure hands back a ticket, and every step is safe to
+/// repeat.
+async fn finish_accept(
+    s: &AppState,
+    admin: &Zitadel,
+    b: AcceptInviteBody,
+    user: ZUser,
+    password_set: bool,
+) -> Response {
     // I1: a deactivated user (a removed member invited again) comes back only now, with a
     // verified code; the invite itself leaves them deactivated.
     if user.state == UserState::Inactive {
