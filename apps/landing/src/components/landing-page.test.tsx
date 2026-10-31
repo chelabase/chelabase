@@ -115,6 +115,12 @@ describe("LandingPage", () => {
     expect(steps).not.toHaveTextContent("just dev");
   });
 
+  it("the_install_terminal_mentions_the_example_overlay", () => {
+    renderPage();
+    const steps = screen.getByRole("figure", { name: /your terminal/i });
+    expect(steps).toHaveTextContent("docker-compose.example.yml");
+  });
+
   it("the_client_snippet_uses_the_server_client", () => {
     renderPage();
     const snippet = screen.getByRole("figure", { name: /your server, with @chelabase\/client/i });

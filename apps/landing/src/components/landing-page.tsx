@@ -406,14 +406,14 @@ function Manage() {
           <Notes notes={MANAGE_NOTES} />
         </div>
         <CodeInset label="Table editor · review changes" note="illustration" className="sticky top-22 max-[900px]:static">
-          <C>-- 2 changes to public.orders, applied in one transaction</C>
+          <C>-- 2 changes to sales.orders, applied in one transaction</C>
           {"\n"}
-          <K>alter table</K> public.orders{"\n"}
+          <K>alter table</K> sales.orders{"\n"}
           {"  "}
           <K>add column</K> shipped_at <T>timestamptz</T>;{"\n"}
-          <K>create index</K> orders_status_idx{"\n"}
+          <K>create index</K> orders_customer_idx{"\n"}
           {"  "}
-          <K>on</K> public.orders (status);{"\n\n"}
+          <K>on</K> sales.orders (customer_id);{"\n\n"}
           <C>-- dry run: ok</C>
         </CodeInset>
       </div>
@@ -457,17 +457,17 @@ function Collaborate() {
           <Notes notes={COLLABORATE_NOTES} />
         </div>
         <CodeInset
-          label="SQL editor · a schema per team"
+          label="SQL editor · Acme, a schema per team"
           note="from the docs"
           className="sticky top-22 order-first max-[900px]:static max-[900px]:order-none"
         >
-          <K>create role</K> billing <K>nologin</K>;{"\n"}
-          <K>create schema</K> billing <K>authorization</K> billing;{"\n\n"}
-          <C>-- Members › Teams › billing:</C>
+          <K>create role</K> finance <K>nologin</K>;{"\n"}
+          <K>alter schema</K> finance <K>owner to</K> finance;{"\n\n"}
+          <C>-- Members › Teams › Finance:</C>
           {"\n"}
-          <C>-- Developer on the project, acting as billing.</C>
+          <C>-- Developer on the project, acting as finance.</C>
           {"\n"}
-          <C>-- Its members change this schema; nobody else can.</C>
+          <C>-- Its members change finance.invoices; sales can't.</C>
         </CodeInset>
       </div>
     </Band>
@@ -561,7 +561,11 @@ function YourApp() {
           </p>
           <Notes notes={APP_NOTES} />
         </div>
-        <CodeInset label="Your server, with @chelabase/client" note={<code>orders.ts</code>}>
+        <CodeInset
+          label="Your server, with @chelabase/client"
+          note={<code>orders.ts</code>}
+          className="sticky top-22 max-[900px]:static"
+        >
           <K>import</K> {"{ "}
           <F>createServerClient</F>
           {" }"} <K>from</K> <S>"@chelabase/client/server"</S>;{"\n"}
@@ -571,12 +575,11 @@ function YourApp() {
           {"\n\n"}
           <K>const</K> db = <F>createServerClient</F>&lt;<T>Database</T>&gt;({"{ "}url, key, types, cookies{" }"});{"\n"}
           <K>const</K> user = <K>await</K> db.auth.<F>getUser</F>();{"\n\n"}
-          <K>const</K> paid = <K>await</K> db{"\n"}
+          <K>const</K> mine = <K>await</K> db{"\n"}
           {"  "}.<F>from</F>(<S>"orders"</S>){"\n"}
           {"  "}.<F>select</F>(<S>"id"</S>, <S>"total"</S>){"\n"}
-          {"  "}.<F>where</F>({"{ "}status: <S>"paid"</S>
-          {" }"});{"\n"}
-          <C>// paid: {"{ id: bigint; total: string }"}[]</C>
+          {"  "}.<F>where</F>({"{ "}customer_id: user.id{" }"});{"\n"}
+          <C>// sales.orders, only the signed-in customer's rows</C>
         </CodeInset>
       </div>
     </Band>
@@ -618,6 +621,8 @@ function InstallTerminal({ className = "" }: { className?: string }) {
       <F>docker</F> compose up -d --wait{"\n"}
       <F>docker</F> compose logs init-secrets <C># your setup code</C>
       {"\n\n"}
+      <C># want a populated demo? add -f docker-compose.example.yml</C>
+      {"\n"}
       <C># then open http://studio.chelabase.localhost:8000</C>
     </CodeInset>
   );
