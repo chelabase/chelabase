@@ -47,7 +47,7 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Counts this attempt; false once `key` has used `limit` attempts in the current window.
+    /// Counts this attempt; false (and nothing counted) once `key` has used `limit` attempts in the current window.
     pub fn allow(&self, key: &str, limit: u32, window: Duration) -> bool {
         self.allow_slot(key, limit, window).is_some()
     }
@@ -67,8 +67,13 @@ impl RateLimiter {
         if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
         }
+        if entry.1 >= limit {
+            // Turned away: a refused reservation holds nothing, so it must not count (a refund
+            // would never come for it).
+            return None;
+        }
         entry.1 += 1;
-        (entry.1 <= limit).then_some(entry.0)
+        Some(entry.0)
     }
 
     /// Whether `key` has already used `limit` attempts in its current window; counts nothing.
@@ -289,8 +294,9 @@ mod tests {
         let slot = limiter.allow_slot("k", 2, minute).unwrap();
         assert!(limiter.allow("k", 2, minute));
         assert!(!limiter.allow("k", 2, minute));
-        // Three attempts counted; one refund leaves two, so the next is the third again.
+        // The refused third counted nothing; one refund leaves one held, so one more fits.
         limiter.refund("k", slot);
+        assert!(limiter.allow("k", 2, minute));
         assert!(!limiter.allow("k", 2, minute));
         limiter.refund("k", slot);
         limiter.refund("k", slot);
@@ -359,9 +365,11 @@ mod tests {
     }
 
     proptest! {
-        // The invariant on `RateLimiter`: per window, reservations never refunded <= limit.
+        // The invariant on `RateLimiter`: the count for the current window is exactly the
+        // reservations granted in it and not refunded (a refused one counts nothing), and so
+        // never exceeds the limit.
         #[test]
-        fn unrefunded_reservations_never_exceed_the_limit_in_a_window(
+        fn the_count_is_exactly_the_unrefunded_reservations_in_the_window(
             ops in ops(),
             limit in 1u32..6,
         ) {
@@ -391,6 +399,11 @@ mod tests {
                 }
                 for (started, n) in &unrefunded {
                     prop_assert!(*n <= limit, "window {started:?} holds {n} > {limit}");
+                }
+                let current = limiter.windows.lock().unwrap().get("k").copied();
+                if let Some((start, count)) = current {
+                    let expected = unrefunded.get(&start).copied().unwrap_or(0);
+                    prop_assert_eq!(count, expected, "window {:?}", start);
                 }
             }
         }
