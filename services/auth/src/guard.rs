@@ -38,7 +38,9 @@ impl UsedTickets {
 ///
 /// Invariant: within any one window of a key, the number of reservations that are never
 /// refunded is at most `limit`, whatever the interleaving of `allow`, `refund` and window
-/// rollover. (`over` and `hit` are the peek-and-count pair; `hit` counts without a limit.)
+/// rollover. A reservation stays counted until it is refunded: one that is never decided (its
+/// request dropped mid-call) counts. (`over` and `hit` are the peek-and-count pair; `hit`
+/// counts without a limit.)
 #[derive(Default)]
 pub struct RateLimiter {
     windows: Mutex<HashMap<String, (Instant, u32)>>,
@@ -338,6 +340,8 @@ mod tests {
         Reserve,
         /// Refund the n-th (modulo) slot still held.
         Refund(usize),
+        /// Drop the n-th (modulo) slot still held without deciding it: it stays counted.
+        Abandon(usize),
         /// Move the clock forward by this many milliseconds.
         Advance(u64),
     }
@@ -347,6 +351,7 @@ mod tests {
             prop_oneof![
                 4 => Just(Op::Reserve),
                 3 => any::<usize>().prop_map(Op::Refund),
+                1 => any::<usize>().prop_map(Op::Abandon),
                 2 => (0u64..250).prop_map(Op::Advance),
             ],
             0..200,
@@ -378,7 +383,10 @@ mod tests {
                         limiter.refund("k", started);
                         *unrefunded.get_mut(&started).unwrap() -= 1;
                     }
-                    Op::Refund(_) => {}
+                    Op::Abandon(n) if !held.is_empty() => {
+                        held.remove(n % held.len());
+                    }
+                    Op::Refund(_) | Op::Abandon(_) => {}
                     Op::Advance(ms) => now += Duration::from_millis(ms),
                 }
                 for (started, n) in &unrefunded {
