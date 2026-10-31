@@ -998,10 +998,20 @@ fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
 
 async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteBody) -> Response {
     let ip = client_ip(headers);
-    if !allowed(s, &[(format!("accept-invite:ip:{ip}"), 20, HOUR)]) {
+    // Only failed attempts count against an address, so an office behind one NAT can accept many
+    // invites an hour while guessing codes from it still stops at 20 failures.
+    let ip_key = format!("accept-invite:ip:{ip}");
+    if s.limiter.over(&ip_key, 20, HOUR) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    let bad = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
+    let bad = || {
+        s.limiter.hit(&ip_key, HOUR);
+        error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE)
+    };
+    let gone = |code, message| {
+        s.limiter.hit(&ip_key, HOUR);
+        error(StatusCode::GONE, code, message)
+    };
     // Validate before any key is built from the input.
     let code = b.code.as_deref().map(str::trim);
     if !is_user_id(&b.user)
@@ -1011,7 +1021,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         return bad();
     }
     if b.auth_request.as_deref().is_some_and(|ar| !is_auth_request_id(ar)) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
+        return gone(ErrorCode::SignInExpired, GONE);
     }
     // Before the code is spent.
     if !strong_password(&b.password) {
@@ -1034,7 +1044,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     }
     let user = match admin.get_user(&b.user).await {
         Ok(Some(u)) => u,
-        Ok(None) => return error(StatusCode::GONE, ErrorCode::InviteRevoked, INVITE_REVOKED),
+        Ok(None) => return gone(ErrorCode::InviteRevoked, INVITE_REVOKED),
         Err(e) => return unavailable(&e),
     };
     // An invite code for a user of another organization never signs into the platform.
@@ -1050,10 +1060,10 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
             Ok(()) => password_set = true,
             Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
                 info!(status, "accept-invite: the user is gone");
-                return error(StatusCode::GONE, ErrorCode::InviteRevoked, INVITE_REVOKED);
+                return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
             }
             Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
-                return error(StatusCode::GONE, ErrorCode::InviteExpired, INVITE_EXPIRED);
+                return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
             }
             // The code wasn't spent: no ticket.
             Err(ZError::Rejected { message, .. }) if password_refused(&message) => {
@@ -1070,10 +1080,10 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
             Ok(()) => {}
             Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
                 info!(status, "accept-invite: the user is gone");
-                return error(StatusCode::GONE, ErrorCode::InviteRevoked, INVITE_REVOKED);
+                return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
             }
             Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
-                return error(StatusCode::GONE, ErrorCode::InviteExpired, INVITE_EXPIRED);
+                return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
             }
             Err(ZError::Rejected { status: status @ (400 | 412), message }) => {
                 warn!(status, %message, "accept-invite: the code was refused");
