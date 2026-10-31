@@ -1498,6 +1498,41 @@ async fn accept_invite_is_rate_limited_like_sign_up() {
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 }
 
+// A turned-away attempt spends nothing: after a burst over the budget in which no attempt
+// failed, the address is not locked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+async fn accept_invite_concurrent_burst_of_valid_accepts_does_not_lock_the_ip() {
+    let h = Arc::new(harness().await);
+    h.mock.on_request("/invite_code/verify", || std::thread::sleep(Duration::from_millis(300)));
+    let mut tasks = Vec::new();
+    for i in 0..40 {
+        let (id, code) = h.mock.add_invited_user(&format!("b{i}@example.com"));
+        let ar = h.mock.add_auth_request(false);
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            h.post("/auth/v1/accept-invite", accept(&ar, &id, &code, "Secret-pass1"), None, "1.1.1.1")
+                .await
+                .status
+        }));
+    }
+    let mut ok = 0;
+    let mut limited = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            StatusCode::OK => ok += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    h.mock.clear_on_request();
+    // The burst is over and not one attempt failed: a later valid accept must go through.
+    let (id, code) = h.mock.add_invited_user("after@example.com");
+    let a = h
+        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::OK, "burst: {ok} ok, {limited} got 429; afterwards: {}", a.body);
+}
+
 // Only failed attempts spend the per-IP budget: a success needs a valid code for that user, so
 // an office behind one NAT can accept many invites in a minute.
 #[tokio::test]
