@@ -4,12 +4,12 @@
 # below includes it, build the images locally with docker-compose.build.yml and run the seed
 # from the built image:
 #
+#   cd infra/compose && cp .env.example .env
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml build init-secrets studio
 #   docker tag chelabase/server:local chelabase/init:local
 #   CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
 #     -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
 #
-#   cd infra/compose && cp .env.example .env
 #   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
 #   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
 #

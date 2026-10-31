@@ -59,7 +59,7 @@ pub fn check(cfg: &Config) -> Result<()> {
                 let bare = h.trim_start_matches('[').trim_end_matches(']');
                 match bare.parse::<IpAddr>() {
                     Ok(ip) => ip.is_loopback(),
-                    Err(_) => !h.is_empty() && !h.contains('.'),
+                    Err(_) => h == "gateway",
                 }
             })
     });
@@ -151,6 +151,7 @@ mod tests {
     fn the_gateway_must_be_a_service_on_this_network() {
         for v in [
             "http://gateway.evil.com:8000",
+            "http://evil:8000",
             "https://gateway:8000",
             "http://user@gateway:8000",
             "http://10.0.0.1:8000",
