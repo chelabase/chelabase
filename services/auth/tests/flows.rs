@@ -1498,6 +1498,127 @@ async fn accept_invite_is_rate_limited_like_sign_up() {
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
 }
 
+// Only failed attempts spend the per-IP budget: a success needs a valid code for that user, so
+// an office behind one NAT can accept many invites in a minute.
+#[tokio::test]
+async fn accept_invite_successes_do_not_spend_the_ip_budget() {
+    let h = harness().await;
+    for i in 0..25 {
+        let (id, code) = h.mock.add_invited_user(&format!("u{i}@example.com"));
+        let a = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::OK, "accept {i}: {}", a.body);
+    }
+}
+
+#[tokio::test]
+async fn accept_invite_failed_codes_exhaust_the_ip_budget() {
+    let h = harness().await;
+    for i in 0..20 {
+        let (id, _) = h.mock.add_invited_user(&format!("u{i}@example.com"));
+        let a = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, "WRONG", "Secret-pass1"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "guess {i}");
+    }
+    let (id, code) = h.mock.add_invited_user("late@example.com");
+    let late = h
+        .post(
+            "/auth/v1/accept-invite",
+            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+    assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS);
+    // Another address is untouched.
+    let other = h
+        .post(
+            "/auth/v1/accept-invite",
+            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+            None,
+            "2.2.2.2",
+        )
+        .await;
+    assert_eq!(other.status, StatusCode::OK, "{}", other.body);
+}
+
+#[tokio::test]
+async fn accept_invite_unknown_users_and_bad_bodies_count() {
+    for malformed in [false, true] {
+        let h = harness().await;
+        for i in 0..20 {
+            let body = if malformed {
+                accept("V2_1", "not-a-number", "ABC", "Secret-pass1")
+            } else {
+                accept(&h.mock.add_auth_request(false), &format!("9000{i}"), "ABC", "Secret-pass1")
+            };
+            let a = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
+            let want = if malformed { StatusCode::BAD_REQUEST } else { StatusCode::GONE };
+            assert_eq!(a.status, want, "attempt {i}: {}", a.body);
+        }
+        let (id, code) = h.mock.add_invited_user("late@example.com");
+        let late = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "malformed: {malformed}");
+    }
+}
+
+#[tokio::test]
+async fn accept_invite_weak_password_and_outage_do_not_count() {
+    let h = harness().await;
+    let (id, code) = h.mock.add_invited_user("bob@example.com");
+    for i in 0..25 {
+        let a = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, &code, "weak"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(a.body["error"]["code"], "weak_password", "weak {i}");
+    }
+    h.mock.fail("/invite_code/verify", 500, "Errors.Internal", 25);
+    for i in 0..25 {
+        let a = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "outage {i}: {}", a.body);
+    }
+    let ok = h
+        .post(
+            "/auth/v1/accept-invite",
+            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+            None,
+            "1.1.1.1",
+        )
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+}
+
 fn ticket_of(a: &Answer) -> String {
     a.body["error"]["accept_ticket"].as_str().unwrap().to_string()
 }
