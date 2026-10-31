@@ -68,6 +68,18 @@ impl RateLimiter {
     pub fn hit(&self, key: &str, window: Duration) {
         self.allow(key, u32::MAX, window);
     }
+
+    /// Gives back one attempt counted by [`allow`](Self::allow) or [`hit`](Self::hit): never
+    /// below zero, and only while `key`'s window is the current one (nothing for an expired or
+    /// missing window).
+    pub fn refund(&self, key: &str, window: Duration) {
+        let mut windows = self.windows.lock().expect("limiter lock");
+        if let Some((start, n)) = windows.get_mut(key)
+            && start.elapsed() < window
+        {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 /// The client's address for rate limits: the rightmost `X-Forwarded-For` entry (the one the
@@ -253,6 +265,43 @@ mod tests {
         limiter.hit("k", minute);
         assert!(limiter.over("k", 2, minute));
         assert!(!limiter.over("other", 2, minute));
+    }
+
+    #[test]
+    fn a_refund_gives_back_one_attempt_within_the_window() {
+        let limiter = RateLimiter::default();
+        let minute = Duration::from_secs(60);
+        assert!(limiter.allow("k", 2, minute));
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+        // Three attempts counted; one refund leaves two, so the next is the third again.
+        limiter.refund("k", minute);
+        assert!(!limiter.allow("k", 2, minute));
+        limiter.refund("k", minute);
+        limiter.refund("k", minute);
+        limiter.refund("k", minute);
+        // Never below zero: a full budget afterwards, not more.
+        assert!(limiter.allow("k", 2, minute));
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+        // A missing key does nothing.
+        limiter.refund("missing", minute);
+        assert!(limiter.allow("missing", 1, minute));
+        assert!(!limiter.allow("missing", 1, minute));
+    }
+
+    #[test]
+    fn a_refund_does_nothing_for_an_expired_window() {
+        let limiter = RateLimiter::default();
+        let short = Duration::from_millis(1);
+        assert!(limiter.allow("k", 2, short));
+        std::thread::sleep(Duration::from_millis(5));
+        limiter.refund("k", short);
+        // The expired window still holds its one attempt: checked under a long window, the
+        // second is allowed and the third is not.
+        let minute = Duration::from_secs(60);
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
     }
 
     #[tokio::test]

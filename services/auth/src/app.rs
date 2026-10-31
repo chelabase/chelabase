@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 use utoipa::ToSchema;
@@ -996,20 +997,46 @@ fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
     incomplete(s, user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE)
 }
 
+/// One attempt reserved against an address's budget. Dropping it gives the slot back unless
+/// [`failed`](Self::failed) was called, so only the outcomes that say so spend budget and a
+/// new early return can't silently spend or leak it.
+struct IpSlot<'a> {
+    limiter: &'a RateLimiter,
+    key: String,
+    failed: AtomicBool,
+}
+
+impl IpSlot<'_> {
+    fn failed(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for IpSlot<'_> {
+    fn drop(&mut self) {
+        if !self.failed.load(Ordering::Relaxed) {
+            self.limiter.refund(&self.key, HOUR);
+        }
+    }
+}
+
 async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteBody) -> Response {
     let ip = client_ip(headers);
     // Only failed attempts count against an address, so an office behind one NAT can accept many
-    // invites an hour while guessing codes from it still stops at 20 failures.
+    // invites an hour while guessing codes from it still stops at 20 failures. The attempt is
+    // counted up front (concurrent requests can't all pass a check before any failure lands) and
+    // handed back unless the outcome is a failure of the caller's.
     let ip_key = format!("accept-invite:ip:{ip}");
-    if s.limiter.over(&ip_key, 20, HOUR) {
+    if !s.limiter.allow(&ip_key, 20, HOUR) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
+    let slot = IpSlot { limiter: &s.limiter, key: ip_key, failed: AtomicBool::new(false) };
     let bad = || {
-        s.limiter.hit(&ip_key, HOUR);
+        slot.failed();
         error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE)
     };
     let gone = |code, message| {
-        s.limiter.hit(&ip_key, HOUR);
+        slot.failed();
         error(StatusCode::GONE, code, message)
     };
     // Validate before any key is built from the input.
@@ -1074,6 +1101,11 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                 s.limiter.hit(&user_key, HOUR);
                 return bad();
             }
+            // Any other refusal is Zitadel answering about the code, not an outage.
+            Err(e @ ZError::Rejected { .. }) => {
+                slot.failed();
+                return unavailable(&e);
+            }
             Err(e) => return unavailable(&e),
         },
         (Some(code), _) => match admin.verify_invite_code(&b.user, code).await {
@@ -1089,6 +1121,11 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                 warn!(status, %message, "accept-invite: the code was refused");
                 s.limiter.hit(&user_key, HOUR);
                 return bad();
+            }
+            // Any other refusal is Zitadel answering about the code, not an outage.
+            Err(e @ ZError::Rejected { .. }) => {
+                slot.failed();
+                return unavailable(&e);
             }
             Err(e) => return unavailable(&e),
         },
