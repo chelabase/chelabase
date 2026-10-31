@@ -42,3 +42,10 @@ services:
         condition: service_healthy
       orchestrator:
         condition: service_healthy
+
+  # `up --wait` doesn't look at a one-shot's exit code unless something depends on it: Studio
+  # waits for the seed, so a failed seed fails `up`.
+  studio:
+    depends_on:
+      example-seed:
+        condition: service_completed_successfully

@@ -79,7 +79,12 @@ pub async fn seed(
             "GET /auth/v1/instance",
         )
         .await?;
-    let ada = if instance.get("setup_required") == Some(&json!(true)) {
+    // `InstanceInfo` is camelCase; a missing answer is an error, never "claimed".
+    let setup_required = instance
+        .get("setupRequired")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| anyhow!("GET /auth/v1/instance: no setupRequired"))?;
+    let ada = if setup_required {
         let code = read_setup_code(cfg)?;
         writes += 1;
         let token = s

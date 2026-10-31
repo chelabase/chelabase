@@ -239,7 +239,7 @@ impl State {
             ),
             "GET /auth/v1/instance" => (
                 200,
-                json!({"setup_required": self.claimed_by.is_none()}),
+                json!({"setupRequired": self.claimed_by.is_none()}),
                 None,
             ),
             "GET /oauth/v2/authorize" => {
