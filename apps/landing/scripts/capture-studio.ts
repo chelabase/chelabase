@@ -113,15 +113,14 @@ async function main(): Promise<void> {
   await warning.getByText("public.employees").waitFor();
   await save(encoder, "manage-rls-warning", await warning.screenshot());
 
-  // Collaborate: Members > Teams, cropped to the header and the five teams.
+  // Collaborate: the Finance team's project access (Developer on Acme, acting as finance). On the
+  // team page it sits below the member list, so the shot crops the access section.
   await page.goto(`${studio}/app/members?tab=teams`);
-  await page.getByRole("row", { name: /Leadership/ }).waitFor();
-  const last = (await page.getByRole("row", { name: /Support/ }).boundingBox())!;
-  await save(
-    encoder,
-    "collaborate-teams",
-    await page.screenshot({ clip: { x: 0, y: 0, width: VIEWPORT.width, height: Math.ceil(last.y + last.height + 40) } }),
-  );
+  await page.getByRole("row", { name: /Finance/ }).getByText("Finance").click();
+  const access = page.locator("section").filter({ has: page.getByText("Project access", { exact: true }) }).last();
+  await access.getByText("Developer · finance").waitFor();
+  await access.scrollIntoViewIfNeeded();
+  await save(encoder, "collaborate-team-access", await access.screenshot());
 
   // Iterate: the branches list, with protected main and feature-discounts.
   await page.setViewportSize(TALL);

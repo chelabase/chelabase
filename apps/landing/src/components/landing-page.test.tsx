@@ -16,7 +16,7 @@ describe("LandingPage", () => {
     renderPage();
     for (const [id, srcs] of [
       ["manage", ["manage-table-editor", "manage-rls-warning"]],
-      ["collaborate", ["collaborate-teams"]],
+      ["collaborate", ["collaborate-team-access"]],
       ["iterate", ["iterate-branches"]],
     ] as const) {
       const section = document.getElementById(id)!;
