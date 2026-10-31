@@ -309,6 +309,7 @@ dependencies = [
  "hex",
  "http",
  "moka",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",

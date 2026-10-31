@@ -1003,6 +1003,8 @@ fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
 struct IpSlot<'a> {
     limiter: &'a RateLimiter,
     key: String,
+    /// Start of the window the slot was reserved in; the refund applies only to that window.
+    started: Instant,
     failed: AtomicBool,
 }
 
@@ -1015,7 +1017,7 @@ impl IpSlot<'_> {
 impl Drop for IpSlot<'_> {
     fn drop(&mut self) {
         if !self.failed.load(Ordering::Relaxed) {
-            self.limiter.refund(&self.key, HOUR);
+            self.limiter.refund(&self.key, self.started);
         }
     }
 }
@@ -1027,10 +1029,10 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     // counted up front (concurrent requests can't all pass a check before any failure lands) and
     // handed back unless the outcome is a failure of the caller's.
     let ip_key = format!("accept-invite:ip:{ip}");
-    if !s.limiter.allow(&ip_key, 20, HOUR) {
+    let Some(started) = s.limiter.allow_slot(&ip_key, 20, HOUR) else {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
-    }
-    let slot = IpSlot { limiter: &s.limiter, key: ip_key, failed: AtomicBool::new(false) };
+    };
+    let slot = IpSlot { limiter: &s.limiter, key: ip_key, started, failed: AtomicBool::new(false) };
     let bad = || {
         slot.failed();
         error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE)
