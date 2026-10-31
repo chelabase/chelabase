@@ -6,11 +6,14 @@
 //!    sign-up (or, once it is claimed, signs in), and must then be its tenant admin.
 //! 3. Ada invites each demo person with link delivery, and the seed accepts each invite with
 //!    the demo password ([`people`]).
+//! 4. Ada builds the Acme organisation: teams, the project and database, schemas, RLS, app
+//!    users, a key, branches and saved queries ([`acme`]).
 //!
 //! Every step is idempotent, so a run that stopped anywhere is finished by the next one. The
 //! demo password is a constant, never configured, so it is the same on every run. Nothing
 //! printed carries a code, token or the setup code ([`session`]).
 
+pub mod acme;
 pub mod gate;
 pub mod people;
 pub mod session;
@@ -62,7 +65,9 @@ impl Config {
 /// The whole seed: the gate, then the claim and the people, logging to `out`.
 pub async fn run(cfg: &Config, http: &impl session::Http, out: &mut dyn Write) -> Result<()> {
     gate::check(cfg)?;
-    people::seed(cfg, http, Duration::from_secs(1), out).await
+    let (session, ada) = people::seed(cfg, http, Duration::from_secs(1), out).await?;
+    acme::seed(&session, &ada, out).await?;
+    Ok(())
 }
 
 /// `chelabase-init example`, configured from the environment.

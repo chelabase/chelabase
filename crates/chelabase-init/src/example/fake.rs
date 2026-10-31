@@ -77,16 +77,66 @@ pub struct State {
     fail_at: Option<usize>,
     /// Apply the nth (1-based) call with this key, then drop the answer.
     crash: Option<(String, usize)>,
+    pub acme: Acme,
+}
+
+/// The Acme organisation as the management API holds it.
+#[derive(Default)]
+pub struct Acme {
+    /// id, name, app users status
+    pub projects: Vec<(String, String, Option<&'static str>)>,
+    /// id, name, project id
+    pub databases: Vec<(String, String, String)>,
+    pub roles: Vec<String>,
+    pub teams: Vec<FTeam>,
+    /// (member id, database id)
+    pub overrides: Vec<(String, String)>,
+    pub data_api_on: bool,
+    pub default_schema: String,
+    pub users: Vec<(String, String)>,
+    pub schema_done: bool,
+    pub feature: bool,
+    pub feature_col: bool,
+    pub protected: bool,
+    pub keys: Vec<String>,
+    pub queries: Vec<String>,
+    /// Make the next non-probe SQL run end in this error.
+    pub sql_error: Option<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FTeam {
+    pub id: String,
+    pub name: String,
+    pub members: Vec<String>,
+    pub grant: Option<(String, Vec<String>)>,
 }
 
 pub struct Fake(pub Mutex<State>);
 
-const WRITES: [&str; 5] = [
+const WRITES: [&str; 22] = [
     "POST /auth/v1/sign-up",
     "POST /v1/invites",
     "POST /v1/invites/resend",
     "POST /auth/v1/accept-invite",
     "POST /fake/claim",
+    "POST /v1/projects",
+    "POST /v1/databases",
+    "POST /v1/branches",
+    "POST /v1/roles",
+    "POST /v1/data-api",
+    "PATCH /v1/pg-database",
+    "PUT /v1/app-users",
+    "POST /v1/users",
+    "POST /v1/teams",
+    "PUT /v1/team-grant",
+    "PUT /v1/team-member",
+    "PUT /v1/override",
+    "POST /v1/sql",
+    "POST /v1/keys",
+    "POST /v1/sql-queries",
+    "PATCH /v1/branch",
+    "PUT /v1/app-users-settings",
 ];
 
 impl Fake {
@@ -369,14 +419,39 @@ impl State {
                 match key {
                     "GET /v1/me" => (
                         200,
-                        json!({"member": me.map(|m| json!({"status": m.status, "tenant_admin": m.admin}))}),
+                        {
+                            let projects: Vec<Value> = self
+                                .acme
+                                .projects
+                                .iter()
+                                .map(|(id, name, _)| {
+                                    let dbs: Vec<Value> = self
+                                        .acme
+                                        .databases
+                                        .iter()
+                                        .filter(|d| d.2 == *id)
+                                        .map(|d| json!({"database_id": d.0, "name": d.1}))
+                                        .collect();
+                                    json!({"id": id, "name": name, "databases": dbs})
+                                })
+                                .collect();
+                            {
+                                let narrowed = me.as_ref().is_some_and(|m| {
+                                    self.acme.overrides.iter().any(|(who, _)| *who == m.user)
+                                });
+                                let level = if narrowed { "viewer" } else { "admin" };
+                                let mine: Vec<Value> = self.acme.projects.iter().map(|(id, _, _)| json!({"project_id": id, "platform_role": "admin",
+                                    "databases": self.acme.databases.iter().filter(|d| d.2 == *id).map(|d| json!({"database_id": d.0, "platform_role": level})).collect::<Vec<_>>()})).collect();
+                                json!({"member": me.map(|m| json!({"status": m.status, "tenant_admin": m.admin})), "tenant": {"projects": projects}, "projects": mine})
+                            }
+                        },
                         None,
                     ),
                     _ if !me.as_ref().is_some_and(|m| m.status == "active" && m.admin) => {
                         return err(403, "forbidden");
                     }
                     "GET /v1/members" => {
-                        let list: Vec<Value> = self.members.iter().map(|(e, m)| json!({"email": e, "status": m.status, "tenant_admin": m.admin, "invite": m.invite.as_ref().map(|i| json!({"id": i}))})).collect();
+                        let list: Vec<Value> = self.members.iter().map(|(e, m)| json!({"id": m.user, "email": e, "status": m.status, "tenant_admin": m.admin, "invite": m.invite.as_ref().map(|i| json!({"id": i}))})).collect();
                         (200, Value::Array(list), None)
                     }
                     "POST /v1/invites" => {
@@ -411,7 +486,7 @@ impl State {
                         let url = self.invite_link(&email);
                         (200, json!({"id": id, "invite_url": url}), None)
                     }
-                    _ => bail!("the fake has no {key}"),
+                    _ => return self.acme_handle(key, r, &body),
                 }
             }
         })
@@ -427,7 +502,11 @@ impl Http for Fake {
         } else {
             path
         };
-        let key = format!("{} {path}", r.method);
+        let key = if path == "/v1/invites/resend" {
+            format!("{} {path}", r.method)
+        } else {
+            normalise(&r.method, path, r)
+        };
         let site_ok = match path {
             "/oauth/v2/authorize" | "/oauth/v2/token" => r.site == Site::Auth,
             _ => r.site == Site::Api,
@@ -461,11 +540,255 @@ impl Http for Fake {
             status,
             location,
             retry_after: None,
-            body: if body.is_null() {
-                Vec::new()
-            } else {
-                body.to_string().into_bytes()
+            body: match &body {
+                Value::Null => Vec::new(),
+                Value::String(lines) => lines.clone().into_bytes(),
+                _ => body.to_string().into_bytes(),
             },
         })
+    }
+}
+
+/// The key of a request: ids in the path become `{id}`, so one handler serves every id.
+fn normalise(method: &Method, path: &str, r: &Request) -> String {
+    let segs: Vec<&str> = path.split('/').collect();
+    let mut out = Vec::new();
+    for (i, s) in segs.iter().enumerate() {
+        let id = ["prj-", "db-", "br-", "team-", "q-", "k-"]
+            .iter()
+            .any(|p| s.starts_with(p))
+            || (s.len() >= 6 && s.bytes().all(|b| b.is_ascii_digit()));
+        out.push(if id {
+            "{id}".to_string()
+        } else if i > 0 && segs[i - 1] == "pg-databases" {
+            "{name}".to_string()
+        } else {
+            (*s).to_string()
+        });
+    }
+    let key = format!("{method} {}", out.join("/"));
+    // Writes the tests count get one key each; reads and SQL probes stay out of WRITES.
+    let sql_write = matches!(&r.body, Body::Json(v) if !v["sql"].as_str().unwrap_or("select").starts_with("select"));
+    match key.as_str() {
+        k if k.ends_with("/sql") && *method == Method::POST => {
+            if sql_write {
+                "POST /v1/sql".into()
+            } else {
+                "POST /v1/sql-probe".into()
+            }
+        }
+        "POST /v1/databases/{id}/branches" => "POST /v1/branches".into(),
+        "POST /v1/databases/{id}/branches/{id}/roles" => "POST /v1/roles".into(),
+        k if k.ends_with("/data-api") && *method == Method::POST => "POST /v1/data-api".into(),
+        "PATCH /v1/databases/{id}/branches/{id}/pg-databases/{name}" => {
+            "PATCH /v1/pg-database".into()
+        }
+        "PUT /v1/projects/{id}/app-users" => "PUT /v1/app-users".into(),
+        "POST /v1/projects/{id}/users" => "POST /v1/users".into(),
+        "PUT /v1/teams/{id}/grants/{id}" => "PUT /v1/team-grant".into(),
+        "PUT /v1/teams/{id}/members/{id}" => "PUT /v1/team-member".into(),
+        k if k.ends_with("/overrides") => "PUT /v1/override".into(),
+        "POST /v1/databases/{id}/branches/{id}/keys" => "POST /v1/keys".into(),
+        "POST /v1/databases/{id}/sql-queries" => "POST /v1/sql-queries".into(),
+        "PATCH /v1/databases/{id}/branches/{id}" => "PATCH /v1/branch".into(),
+        _ => key,
+    }
+}
+
+impl State {
+    /// The Acme endpoints. The path is read from the request; `key` is its normalised form.
+    fn acme_handle(
+        &mut self,
+        key: &str,
+        r: &Request,
+        body: &Value,
+    ) -> Result<(u16, Value, Option<String>)> {
+        let path = r.path.split('?').next().unwrap_or("");
+        let segs: Vec<&str> = path.split('/').collect();
+        let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let json_ok = |status, v: Value| Ok((status, v, None));
+        let branches = |a: &Acme| {
+            let mut v = vec![
+                json!({"id": "br-main", "name": "main", "kind": "normal", "parent_branch_id": null, "status": "ready", "protected": a.protected}),
+            ];
+            if a.feature {
+                v.push(json!({"id": "br-feature", "name": "feature-discounts", "kind": "normal", "parent_branch_id": "br-main", "status": "ready", "protected": false}));
+            }
+            v
+        };
+        let team_json = |t: &FTeam, project: &str| {
+            json!({"id": t.id, "name": t.name, "member_ids": t.members, "member_count": t.members.len(),
+                "projects": t.grant.iter().map(|(role, pg)| json!({"project_id": project, "platform_role": role, "pg_roles": pg})).collect::<Vec<_>>()})
+        };
+        let project = self
+            .acme
+            .projects
+            .first()
+            .map(|p| p.0.clone())
+            .unwrap_or_default();
+        match key {
+            "POST /v1/projects" => {
+                let id = format!("prj-{}", self.id());
+                self.acme.projects.push((id.clone(), s(body, "name"), None));
+                json_ok(201, json!({"id": id}))
+            }
+            "POST /v1/databases" => {
+                let id = format!("db-{}", self.id());
+                self.acme.databases.push((id.clone(), s(body, "name"), s(body, "project_id")));
+                json_ok(202, json!({"database_id": id, "job_id": "j", "status": "pending"}))
+            }
+            "GET /v1/databases/{id}" => json_ok(200, json!({"status": "ready"})),
+            "GET /v1/databases/{id}/branches" => json_ok(200, Value::Array(branches(&self.acme))),
+            "POST /v1/branches" => {
+                assert_eq!(s(body, "parent_branch_id"), "br-main");
+                self.acme.feature = true;
+                json_ok(202, json!({"id": "br-feature"}))
+            }
+            "GET /v1/databases/{id}/branches/{id}/roles" => json_ok(
+                200,
+                Value::Array(self.acme.roles.iter().map(|r| json!({"name": r})).collect()),
+            ),
+            "POST /v1/roles" => {
+                assert_eq!(body["login"], false);
+                self.acme.roles.push(s(body, "name"));
+                json_ok(201, json!({"name": s(body, "name")}))
+            }
+            "GET /v1/databases/{id}/branches/{id}/databases" => json_ok(
+                200,
+                json!([{"name": "acme", "main": true, "data_api": if self.acme.data_api_on { "on" } else { "off" },
+                    "data_api_error": null, "default_schema": if self.acme.default_schema.is_empty() { "public" } else { &self.acme.default_schema }}]),
+            ),
+            "POST /v1/data-api" => {
+                self.acme.data_api_on = true;
+                json_ok(202, json!({"name": "acme"}))
+            }
+            "PATCH /v1/pg-database" => {
+                self.acme.default_schema = s(body, "default_schema");
+                json_ok(200, json!({"name": "acme"}))
+            }
+            "GET /v1/projects/{id}" => {
+                let app = self.acme.projects.first().and_then(|p| p.2);
+                json_ok(200, json!({"id": project, "app_users": app}))
+            }
+            "PUT /v1/app-users" => {
+                assert!(self.acme.data_api_on, "app users need the data API");
+                self.acme.projects[0].2 = Some("enabled");
+                json_ok(202, json!({"status": "enabling"}))
+            }
+            "GET /v1/projects/{id}/users" => json_ok(
+                200,
+                json!({"users": self.acme.users.iter().map(|(e, i)| json!({"id": i, "email": e})).collect::<Vec<_>>(), "next_page_token": null}),
+            ),
+            "POST /v1/users" => {
+                assert_eq!(body["password"], super::DEMO_PASSWORD);
+                let id = self.id();
+                self.acme.users.push((s(body, "email"), id.clone()));
+                json_ok(201, json!({"id": id, "email": s(body, "email")}))
+            }
+            "GET /v1/teams" => json_ok(
+                200,
+                Value::Array(self.acme.teams.iter().map(|t| team_json(t, &project)).collect()),
+            ),
+            "POST /v1/teams" => {
+                let id = format!("team-{}", self.id());
+                let name = s(body, "name");
+                if self.acme.teams.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+                    return Ok((409, json!({"error": {"code": "conflict", "message": "no"}}), None));
+                }
+                self.acme.teams.push(FTeam { id: id.clone(), name, members: vec![], grant: None });
+                json_ok(201, team_json(self.acme.teams.last().unwrap(), &project))
+            }
+            "GET /v1/teams/{id}" => match self.acme.teams.iter().find(|t| t.id == segs[3]) {
+                Some(t) => json_ok(200, team_json(t, &project)),
+                None => json_ok(404, json!({"error": {"code": "not_found", "message": "no"}})),
+            },
+            "PUT /v1/team-grant" => {
+                let pg: Vec<String> = body["pg_roles"]
+                    .as_array()
+                    .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
+                for role in &pg {
+                    assert!(self.acme.roles.contains(role), "grant names a role that doesn't exist: {role}");
+                }
+                let t = self.acme.teams.iter_mut().find(|t| t.id == segs[3]).unwrap();
+                // Admin holds every role: the names are dropped.
+                let pg = if body["platform_role"] == "admin" { vec![] } else { pg };
+                t.grant = Some((s(body, "platform_role"), pg));
+                json_ok(200, json!({}))
+            }
+            "PUT /v1/team-member" => {
+                let t = self.acme.teams.iter_mut().find(|t| t.id == segs[3]).unwrap();
+                if !t.members.iter().any(|m| m == segs[5]) {
+                    t.members.push(segs[5].to_string());
+                }
+                json_ok(200, json!({}))
+            }
+            "GET /v1/projects/{id}/grants" => json_ok(
+                200,
+                Value::Array(
+                    self.acme.overrides.iter().map(|(m, d)| json!({"member_id": m, "platform_role": "admin", "pg_roles": "all",
+                        "overrides": [{"database_id": d, "platform_role": "viewer", "pg_roles": null}]})).collect(),
+                ),
+            ),
+            "PUT /v1/override" => {
+                self.acme.overrides.push((segs[5].to_string(), s(body, "database_id")));
+                json_ok(200, json!({}))
+            }
+            "POST /v1/sql-probe" => {
+                let sql = s(body, "sql");
+                let done = if sql.contains("discount_pct") {
+                    r.path.contains("br-feature") && self.acme.feature_col
+                } else {
+                    self.acme.schema_done
+                };
+                let on_feature = r.path.contains("br-feature");
+                let done = if sql.contains("discount_pct") { on_feature && self.acme.feature_col } else { done };
+                let rows = json!({"t": "rows", "statement": 0, "rows": [[if done { "true" } else { "false" }]]});
+                json_ok(200, Value::String(format!("{rows}\n{}\n", json!({"t": "done", "outcome": "ok", "duration_ms": 1}))))
+            }
+            "POST /v1/sql" => {
+                let sql = s(body, "sql");
+                assert_eq!(body["confirm"], true);
+                if self.acme.protected {
+                    return Ok((409, json!({"error": {"code": "sql_confirm_required", "message": "no"}}), None));
+                }
+                if let Some(code) = self.acme.sql_error.take() {
+                    let e = json!({"t": "error", "statement": 0, "code": code, "message": "permission denied for schema sales"});
+                    return json_ok(200, Value::String(format!("{e}\n{}\n", json!({"t": "done", "outcome": "error", "duration_ms": 1}))));
+                }
+                if sql.contains("discount_pct") {
+                    assert!(r.path.contains("br-feature"));
+                    self.acme.feature_col = true;
+                } else {
+                    assert!(self.acme.users.len() == 3 && self.acme.roles.len() == 4, "the script needs its roles and app users first");
+                    self.acme.schema_done = true;
+                }
+                json_ok(200, Value::String(format!("{}\n", json!({"t": "done", "outcome": "ok", "duration_ms": 1}))))
+            }
+            "GET /v1/databases/{id}/branches/{id}/keys" => json_ok(
+                200,
+                Value::Array(self.acme.keys.iter().map(|k| json!({"name": k, "kind": "secret"})).collect()),
+            ),
+            "POST /v1/keys" => {
+                let secret = self.secret("chk_sec_");
+                self.acme.keys.push(s(body, "name"));
+                json_ok(201, json!({"name": s(body, "name"), "key": secret, "prefix": "chk_sec_"}))
+            }
+            "GET /v1/databases/{id}/sql-queries" => json_ok(
+                200,
+                Value::Array(self.acme.queries.iter().map(|q| json!({"name": q})).collect()),
+            ),
+            "POST /v1/sql-queries" => {
+                self.acme.queries.push(s(body, "name"));
+                json_ok(201, json!({"name": s(body, "name")}))
+            }
+            "GET /v1/databases/{id}/branches/{id}/review" => json_ok(200, json!({"items": [], "hash": "h"})),
+            "PATCH /v1/branch" => {
+                assert_eq!(body["protected"], true);
+                self.acme.protected = true;
+                json_ok(200, json!({}))
+            }
+            _ => bail!("the fake has no {key}"),
+        }
     }
 }

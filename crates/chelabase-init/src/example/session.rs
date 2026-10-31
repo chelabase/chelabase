@@ -472,6 +472,90 @@ impl<'a, H: Http> Session<'a, H> {
         self.json(method, Site::Api, path, None, body, what).await
     }
 
+    /// How long a call keeps retrying, and the length of one `Retry-After` second: what a
+    /// step that polls a background job uses too.
+    pub fn patience(&self) -> (Duration, Duration) {
+        (self.timeout, self.second)
+    }
+
+    /// Runs SQL on a branch through the management API (`POST …/branches/{b}/sql`), as the
+    /// database's owner or as `role`. The answer is an NDJSON stream; the rows of every
+    /// statement come back as text. A statement that fails is an error naming its SQLSTATE and
+    /// message (our own scripts' errors, never a secret). Never retried: a script may have run.
+    pub async fn sql(
+        &self,
+        token: &Token,
+        (database, branch): (&str, &str),
+        sql: &str,
+        role: Option<&str>,
+        confirm: bool,
+        what: &'static str,
+    ) -> Result<Vec<Vec<Option<String>>>> {
+        let mut body = json!({
+            "run_id": uuid::Uuid::new_v4().to_string(),
+            "sql": sql,
+            "confirm": confirm,
+        });
+        if let Some(role) = role {
+            body["role"] = json!(role);
+        }
+        let r = Request {
+            method: Method::POST,
+            site: Site::Api,
+            path: format!("/v1/databases/{database}/branches/{branch}/sql"),
+            bearer: Some(token.0.clone()),
+            body: Body::Json(body),
+            idempotent: false,
+        };
+        let a = self.send(&r, what).await?;
+        if !(200..300).contains(&a.status) {
+            return Err(CallError {
+                what,
+                status: a.status,
+                code: error_code(&a.body),
+            }
+            .into());
+        }
+        let mut rows = Vec::new();
+        let mut outcome = None;
+        for line in a.body.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+            let event: Value = serde_json::from_slice(line)
+                .map_err(|_| anyhow!("{what}: an event of the answer is not JSON"))?;
+            let field = |k: &str| event.get(k).and_then(Value::as_str).unwrap_or("");
+            match event.get("t").and_then(Value::as_str) {
+                Some("rows") => {
+                    for row in event
+                        .get("rows")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        rows.push(
+                            row.as_array()
+                                .into_iter()
+                                .flatten()
+                                .map(|v| v.as_str().map(str::to_string))
+                                .collect(),
+                        );
+                    }
+                }
+                Some("error") => {
+                    let message: String = field("message").chars().take(300).collect();
+                    bail!("{what}: SQL error {}: {message}", field("code"));
+                }
+                Some("done") => outcome = Some(field("outcome").to_string()),
+                _ => {}
+            }
+        }
+        match outcome.as_deref() {
+            Some("ok") => Ok(rows),
+            other => bail!(
+                "{what}: the run ended {}",
+                other.unwrap_or("without a done event")
+            ),
+        }
+    }
+
     /// Starts a sign-in: `GET /oauth/v2/authorize`, never followed; the pending sign-in's id
     /// from `Location`.
     async fn begin(&self) -> Result<Pending> {
