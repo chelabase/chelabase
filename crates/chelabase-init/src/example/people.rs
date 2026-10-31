@@ -102,7 +102,11 @@ pub async fn seed(
                         Some(&code),
                     )
                     .await?;
-                writeln!(out, "example: signed up {} with the setup code", ADA.email)?;
+                writeln!(
+                    out,
+                    "example: signed up {} with the setup code (the claim is checked next)",
+                    ADA.email
+                )?;
                 token
             }
         }
@@ -393,6 +397,36 @@ mod tests {
         let e = seed(&fake::config(), &raced, Duration::from_millis(1), &mut out)
             .await
             .unwrap_err();
+        assert!(
+            e.to_string().contains("not this instance's tenant admin"),
+            "{e}"
+        );
+        assert_eq!(f.count("POST /v1/invites"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_claim_bound_to_a_human_before_their_first_request_fails() {
+        let f = Fake::new();
+        {
+            let mut s = f.0.lock().unwrap();
+            s.users
+                .insert("human@x.example".into(), ("999".into(), Some("pw".into())));
+            s.claimed_by = Some("human@x.example".into());
+        }
+        let e = run(&f).await.unwrap_err();
+        assert!(
+            e.to_string().contains("not this instance's tenant admin"),
+            "{e}"
+        );
+        assert_eq!(f.count("POST /v1/invites"), 0);
+        assert!(
+            !f.0.lock()
+                .unwrap()
+                .members
+                .get(ADA.email)
+                .is_some_and(|m| m.admin)
+        );
+        let e = run(&f).await.unwrap_err(); // a re-run still refuses
         assert!(
             e.to_string().contains("not this instance's tenant admin"),
             "{e}"
