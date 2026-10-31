@@ -85,18 +85,27 @@ pub async fn seed(
         .and_then(Value::as_bool)
         .ok_or_else(|| anyhow!("GET /auth/v1/instance: no setupRequired"))?;
     let ada = if setup_required {
-        let code = read_setup_code(cfg)?;
-        writes += 1;
-        let token = s
-            .sign_up(
-                ADA.email,
-                DEMO_PASSWORD,
-                (ADA.given, ADA.family),
-                Some(&code),
-            )
-            .await?;
-        writeln!(out, "example: signed up {} with the setup code", ADA.email)?;
-        token
+        // `setupRequired` stays true until Ada's first bearer request makes her member row, so
+        // a run that stopped after her sign-up finds her account already there: sign her in
+        // (no write) and sign up only when that is refused. Her `/v1/me` below then claims the
+        // tenant admin through the bound claim, or the check there fails a lost race.
+        match s.sign_in(ADA.email, DEMO_PASSWORD).await? {
+            SignIn::Token(token) => token,
+            SignIn::Refused => {
+                let code = read_setup_code(cfg)?;
+                writes += 1;
+                let token = s
+                    .sign_up(
+                        ADA.email,
+                        DEMO_PASSWORD,
+                        (ADA.given, ADA.family),
+                        Some(&code),
+                    )
+                    .await?;
+                writeln!(out, "example: signed up {} with the setup code", ADA.email)?;
+                token
+            }
+        }
     } else {
         // Never a sign-up here: on a claimed instance it could only make a newcomer.
         match s.sign_in(ADA.email, DEMO_PASSWORD).await? {
@@ -328,18 +337,35 @@ mod tests {
         all_active(&f);
     }
 
-    #[tokio::test]
-    async fn a_crash_between_the_claim_and_adas_first_request_recovers() {
+    /// The run dies after `key`'s first call is applied; the claim is bound but Ada has no
+    /// member row yet, so the instance still answers `setupRequired: true`. The rerun signs her
+    /// in (her account exists) instead of signing up again into `409 email_taken`.
+    async fn a_crash_before_adas_first_request_recovers(key: &str) {
         let f = Fake::new();
-        f.crash_after("POST /auth/v1/sign-up", 1);
+        f.crash_after(key, 1);
         run(&f).await.unwrap_err();
-        assert_eq!(f.0.lock().unwrap().claimed_by.as_deref(), Some(ADA.email));
-        run(&f).await.unwrap();
+        {
+            let s = f.0.lock().unwrap();
+            assert_eq!(s.claimed_by.as_deref(), Some(ADA.email));
+            assert!(s.members.is_empty(), "{:?}", s.members);
+        }
+        let rerun = run(&f).await;
+        assert!(rerun.is_ok(), "{:#}", rerun.unwrap_err());
         all_active(&f);
         assert_eq!(f.count("POST /auth/v1/sign-up"), 1);
         let before = f.writes();
         run(&f).await.unwrap();
         assert_eq!(f.writes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_crash_after_adas_sign_up_before_her_first_request_recovers() {
+        a_crash_before_adas_first_request_recovers("POST /auth/v1/sign-up").await;
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_adas_token_exchange_recovers() {
+        a_crash_before_adas_first_request_recovers("POST /oauth/v2/token").await;
     }
 
     #[tokio::test]

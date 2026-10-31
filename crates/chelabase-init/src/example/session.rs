@@ -47,14 +47,42 @@ pub enum Site {
     Auth,
 }
 
-#[derive(Debug, Clone)]
+/// A request body. It carries passwords, the setup code, invite codes and the OIDC code, so its
+/// `Debug` shows only the field names.
+#[derive(Clone)]
 pub enum Body {
     Empty,
     Json(Value),
     Form(Vec<(&'static str, String)>),
 }
 
-#[derive(Debug, Clone)]
+impl std::fmt::Debug for Body {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("Empty"),
+            Self::Json(Value::Object(m)) => f
+                .debug_tuple("Json")
+                .field(&m.keys().collect::<Vec<_>>())
+                .finish(),
+            Self::Json(_) => f.write_str("Json(..)"),
+            Self::Form(pairs) => f
+                .debug_tuple("Form")
+                .field(&pairs.iter().map(|(k, _)| k).collect::<Vec<_>>())
+                .finish(),
+        }
+    }
+}
+
+/// The path without its query (which can hold a code or `state`).
+fn path_only(path: &str) -> String {
+    match path.split_once('?') {
+        Some((p, _)) => format!("{p}?.."),
+        None => path.to_string(),
+    }
+}
+
+/// `Debug` hides the query, the bearer and the body's values.
+#[derive(Clone)]
 pub struct Request {
     pub method: Method,
     pub site: Site,
@@ -66,12 +94,37 @@ pub struct Request {
     pub idempotent: bool,
 }
 
-#[derive(Debug, Clone, Default)]
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("site", &self.site)
+            .field("path", &path_only(&self.path))
+            .field("bearer", &self.bearer)
+            .field("body", &self.body)
+            .field("idempotent", &self.idempotent)
+            .finish()
+    }
+}
+
+/// `Debug` shows the status and sizes only: `Location` and the body can hold codes and tokens.
+#[derive(Clone, Default)]
 pub struct Response {
     pub status: u16,
     pub location: Option<String>,
     pub retry_after: Option<u64>,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Response")
+            .field("status", &self.status)
+            .field("location", &self.location.as_ref().map(|_| ".."))
+            .field("retry_after", &self.retry_after)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// One HTTP exchange; the error is a transport failure, already free of any URL.
@@ -163,14 +216,19 @@ pub fn call_error(err: &anyhow::Error) -> Option<&CallError> {
     err.chain().find_map(|e| e.downcast_ref::<CallError>())
 }
 
-/// An error code is a short identifier; anything else is dropped.
+/// An error code is a snake_case identifier (`[a-z0-9_]`, at most 64 bytes); anything else,
+/// which could be an opaque token, is dropped.
 fn error_code(body: &[u8]) -> Option<String> {
     let v: Value = serde_json::from_slice(body).ok()?;
     let code = v
         .pointer("/error/code")
         .or_else(|| v.get("error"))?
         .as_str()?;
-    let ok = code.len() <= 64 && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+    let ok = code.len() <= 64
+        && !code.is_empty()
+        && code
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
     ok.then(|| code.to_string())
 }
 
@@ -657,6 +715,59 @@ mod tests {
             .map(str::to_string)
         })
         .unwrap()
+    }
+
+    #[test]
+    fn debug_of_a_request_or_answer_shows_no_secret() {
+        let code = "SETU-PC0D-E234-5678-9ABC";
+        let password = "demo-Password-1234";
+        let token = "eyJsecretTOKEN123";
+        let json = Body::Json(json!({"setupCode": code, "password": password}));
+        let form = Body::Form(vec![("code", token.to_string())]);
+        let request = Request {
+            method: Method::POST,
+            site: Site::Auth,
+            path: format!("/x?code={code}"),
+            bearer: Some(Secret::new(token)),
+            body: json.clone(),
+            idempotent: false,
+        };
+        let response = Response {
+            status: 302,
+            location: Some(format!("http://studio/callback?code={code}")),
+            retry_after: None,
+            body: json!({"access_token": token}).to_string().into_bytes(),
+        };
+        let shown = format!("{json:?} {form:?} {request:?} {request:#?} {response:?}");
+        for secret in [code, password, token] {
+            assert!(!shown.contains(secret), "{secret} in {shown}");
+        }
+        assert!(shown.contains("POST") && shown.contains("302"), "{shown}");
+    }
+
+    #[test]
+    fn only_snake_case_error_codes_pass_through() {
+        let code = |v: Value| error_code(v.to_string().as_bytes());
+        assert_eq!(
+            code(json!({"error": {"code": "email_taken"}})).as_deref(),
+            Some("email_taken")
+        );
+        assert_eq!(
+            code(json!({"error": "invalid_grant"})).as_deref(),
+            Some("invalid_grant")
+        );
+        assert_eq!(code(json!({"error": "a1_b2"})).as_deref(), Some("a1_b2"));
+        for opaque in [
+            "SETUPC0DE1234",
+            "Invalid",
+            "abcDEF",
+            "a-b",
+            "",
+            &"a".repeat(65),
+        ] {
+            assert_eq!(code(json!({"error": opaque})), None, "{opaque}");
+        }
+        assert_eq!(code(json!({"error": "a".repeat(64)})), Some("a".repeat(64)));
     }
 
     #[test]

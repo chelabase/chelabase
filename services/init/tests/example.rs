@@ -27,8 +27,13 @@ fn example_seed_mounts_exactly_one_secret() {
         .output();
     let out = match rendered {
         Ok(out) => out,
+        // CI has Docker, so there a missing CLI is a failure, not a silent pass.
+        Err(e) if std::env::var_os("CI").is_some() => panic!("no docker CLI on CI: {e}"),
         Err(e) => {
-            eprintln!("skipped: no docker CLI ({e})");
+            eprintln!(
+                "SKIPPED example_seed_mounts_exactly_one_secret: no docker CLI ({e}); \
+                 the example-seed mount check did not run"
+            );
             return;
         }
     };

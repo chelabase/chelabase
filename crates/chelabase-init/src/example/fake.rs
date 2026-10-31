@@ -56,6 +56,8 @@ pub struct Member {
 
 #[derive(Default)]
 pub struct State {
+    /// The email the setup claim is bound to (the orchestrator's `setup_claims` row). A code
+    /// sign-up only binds it; the claimant's first bearer request makes the admin member row.
     pub claimed_by: Option<String>,
     pub open_sign_up: bool,
     /// email -> (user id, password)
@@ -181,9 +183,19 @@ impl State {
         )
     }
 
-    fn create_member(&mut self, email: &str, status: &'static str, admin: bool) -> String {
+    /// `setupRequired` as the orchestrator answers it: no member that isn't removed.
+    fn setup_required(&self) -> bool {
+        self.members.values().all(|m| m.status == "removed")
+    }
+
+    fn create_user(&mut self, email: &str, password: Option<String>) -> String {
         let id = self.id();
-        self.users.insert(email.into(), (id.clone(), None));
+        self.users.insert(email.into(), (id.clone(), password));
+        id
+    }
+
+    fn create_member(&mut self, email: &str, status: &'static str, admin: bool) -> String {
+        let id = self.create_user(email, None);
         self.members.insert(
             email.into(),
             Member {
@@ -204,9 +216,27 @@ impl State {
         format!("{STUDIO}/accept-invite?user={user}&code={code}&t={t}")
     }
 
-    /// The caller of a bearer request; their first request activates an accepted invite.
+    /// The caller of a bearer request. Like the orchestrator's `admit_member`, their first
+    /// request makes their member row: the tenant admin when the setup claim is bound to them
+    /// and the tenant has no active admin, else a pending newcomer. It also activates an
+    /// accepted invite.
     fn caller(&mut self, r: &Request) -> Option<String> {
         let email = self.tokens.get(r.bearer.as_ref()?.expose())?.clone();
+        if !self.members.contains_key(&email) {
+            let user = self.users[&email].0.clone();
+            let has_admin = self
+                .members
+                .values()
+                .any(|m| m.admin && m.status == "active");
+            let admin = !has_admin && self.claimed_by.as_deref() == Some(email.as_str());
+            let member = Member {
+                user,
+                status: if admin { "active" } else { "pending" },
+                admin,
+                invite: None,
+            };
+            self.members.insert(email.clone(), member);
+        }
         let has_password = self.users.get(&email).is_some_and(|u| u.1.is_some());
         if let Some(m) = self.members.get_mut(&email)
             && m.status == "invited"
@@ -237,11 +267,7 @@ impl State {
                 json!({"issuer": "http://auth.chelabase.localhost:8000", "clientId": "studio-1", "projectId": "p1", "orgId": "o1", "apiUrl": "x", "studioHost": "y"}),
                 None,
             ),
-            "GET /auth/v1/instance" => (
-                200,
-                json!({"setupRequired": self.claimed_by.is_none()}),
-                None,
-            ),
+            "GET /auth/v1/instance" => (200, json!({"setupRequired": self.setup_required()}), None),
             "GET /oauth/v2/authorize" => {
                 let url = Url::parse(&format!("http://x{}", r.path))?;
                 let q: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
@@ -268,18 +294,19 @@ impl State {
                 if self.users.contains_key(&email) {
                     return err(409, "email_taken");
                 }
-                match &self.claimed_by {
-                    None if body.get("setupCode").and_then(Value::as_str) == Some(SETUP_CODE) => {
-                        self.create_member(&email, "active", true);
+                // The account only: the member row comes with the first bearer request.
+                if self.setup_required() {
+                    if body.get("setupCode").and_then(Value::as_str) != Some(SETUP_CODE) {
+                        return err(403, "setup_code_invalid");
+                    }
+                    // `bind_claim`: a claim already bound leaves this account a newcomer.
+                    if self.claimed_by.is_none() {
                         self.claimed_by = Some(email.clone());
                     }
-                    None => return err(403, "setup_code_invalid"),
-                    Some(_) if self.open_sign_up => {
-                        self.create_member(&email, "pending", false);
-                    }
-                    Some(_) => return err(403, "sign_up_closed"),
+                } else if !self.open_sign_up {
+                    return err(403, "sign_up_closed");
                 }
-                self.users.get_mut(&email).unwrap().1 = Some(s(&body, "password"));
+                self.create_user(&email, Some(s(&body, "password")));
                 (200, self.done(&s(&body, "authRequest"), &email)?, None)
             }
             "POST /auth/v1/sign-in" => {
