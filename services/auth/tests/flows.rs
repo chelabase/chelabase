@@ -1608,6 +1608,27 @@ async fn accept_invite_weak_password_and_outage_do_not_count() {
             .await;
         assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "outage {i}: {}", a.body);
     }
+    h.mock.fail("GET /v2/users/", 500, "Errors.Internal", 25);
+    for i in 0..25 {
+        let a = h
+            .post(
+                "/auth/v1/accept-invite",
+                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
+                None,
+                "1.1.1.1",
+            )
+            .await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "get_user outage {i}: {}", a.body);
+    }
+    // A reset code with a password Zitadel refuses: the code isn't spent and nothing is guessed.
+    let again = h.mock.add_user("again@example.com", "Old-pass-12", true);
+    h.mock.fail("/password", 400, "Errors.User.PasswordComplexityPolicy.HasSymbol", 25);
+    for i in 0..25 {
+        let mut body = accept(&h.mock.add_auth_request(false), &again, RESET_CODE, "Secret-pass1");
+        body["reset"] = json!(true);
+        let a = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
+        assert_eq!(a.body["error"]["code"], "weak_password", "refused {i}: {}", a.body);
+    }
     let ok = h
         .post(
             "/auth/v1/accept-invite",
@@ -1617,6 +1638,32 @@ async fn accept_invite_weak_password_and_outage_do_not_count() {
         )
         .await;
     assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+}
+
+#[tokio::test]
+async fn accept_invite_concurrent_failures_cannot_exceed_the_ip_budget() {
+    let h = Arc::new(harness().await);
+    let mut tasks = Vec::new();
+    for i in 0..60 {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            h.post(
+                "/auth/v1/accept-invite",
+                accept("V2_1", &format!("8000{i}"), "WRONG", "Secret-pass1"),
+                None,
+                "6.6.6.6",
+            )
+            .await
+            .status
+        }));
+    }
+    let mut answered = 0;
+    for t in tasks {
+        if t.await.unwrap() != StatusCode::TOO_MANY_REQUESTS {
+            answered += 1;
+        }
+    }
+    assert!(answered <= 20, "{answered} of 60 concurrent failed attempts from one IP were answered");
 }
 
 fn ticket_of(a: &Answer) -> String {
