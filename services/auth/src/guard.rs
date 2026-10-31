@@ -36,10 +36,10 @@ impl UsedTickets {
 
 /// Fixed-window counters in memory (one auth process).
 ///
-/// Invariant: within any one window of a key, the number of reservations that are never
-/// refunded is at most `limit`, whatever the interleaving of `allow`, `refund` and window
-/// rollover. A reservation stays counted until it is refunded: one that is never decided (its
-/// request dropped mid-call) counts. (`over` and `hit` are the peek-and-count pair; `hit`
+/// Invariant: within any one window of a key, the count is exactly the reservations granted and
+/// not refunded, so it never exceeds `limit`, whatever the interleaving of `allow`, `refund` and
+/// window rollover. A refused reservation counts nothing. A granted one stays counted until it
+/// is refunded: one that is never decided (its request dropped mid-call) counts. (`over` and `hit` are the peek-and-count pair; `hit`
 /// counts without a limit.)
 #[derive(Default)]
 pub struct RateLimiter {
@@ -47,7 +47,8 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
-    /// Counts this attempt; false (and nothing counted) once `key` has used `limit` attempts in the current window.
+    /// Counts this attempt; false (and nothing counted) once `key` has used `limit` attempts in
+    /// the current window.
     pub fn allow(&self, key: &str, limit: u32, window: Duration) -> bool {
         self.allow_slot(key, limit, window).is_some()
     }

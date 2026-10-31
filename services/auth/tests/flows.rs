@@ -1530,6 +1530,8 @@ async fn accept_invite_concurrent_burst_of_valid_accepts_does_not_lock_the_ip() 
     let a = h
         .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
         .await;
+    // The burst must actually reach the limit, or the check below proves nothing.
+    assert!(limited > 0, "burst: {ok} ok, none got 429: the requests didn't overlap");
     assert_eq!(a.status, StatusCode::OK, "burst: {ok} ok, {limited} got 429; afterwards: {}", a.body);
 }
 
