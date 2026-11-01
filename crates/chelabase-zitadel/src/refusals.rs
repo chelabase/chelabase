@@ -113,6 +113,12 @@ pub const PASSWORD_NO_SYMBOL: Refusal = refusal(400, INVALID_ARGUMENT, "DOMAIN-Z
 /// `POST /v2/users/new` with a password the policy refuses for its length: the id's prefix
 /// differs from `PASSWORD_TOO_SHORT`'s.
 pub const CREATE_USER_PASSWORD_TOO_SHORT: Refusal = refusal(400, INVALID_ARGUMENT, "COMMA-HuJf6");
+/// `POST /v2/users/new`, the password policy's other checks: the same suffixes as the
+/// `PASSWORD_NO_*` ids, with the create path's `COMMA-` prefix.
+pub const CREATE_USER_PASSWORD_NO_UPPER: Refusal = refusal(400, INVALID_ARGUMENT, "COMMA-VoaRj");
+pub const CREATE_USER_PASSWORD_NO_LOWER: Refusal = refusal(400, INVALID_ARGUMENT, "COMMA-co3Xw");
+pub const CREATE_USER_PASSWORD_NO_NUMBER: Refusal = refusal(400, INVALID_ARGUMENT, "COMMA-ZBv4H");
+pub const CREATE_USER_PASSWORD_NO_SYMBOL: Refusal = refusal(400, INVALID_ARGUMENT, "COMMA-ZDLwA");
 
 // --- Other ---------------------------------------------------------------------------------------
 
