@@ -1772,32 +1772,59 @@ async fn accept_invite_weak_password_and_outage_do_not_count() {
     }
 }
 
+/// A user to accept for: an invitee, or for `reset` a user with a pending reset code.
+fn code_holder(h: &Harness, email: &str, reset: bool) -> (String, String) {
+    if reset {
+        (h.mock.add_user(email, "Old-pass-12", true), RESET_CODE.to_string())
+    } else {
+        h.mock.add_invited_user(email)
+    }
+}
+
+fn accept_or_reset(h: &Harness, id: &str, code: &str, reset: bool) -> Value {
+    let mut body = accept(&h.mock.add_auth_request(false), id, code, "Secret-pass1");
+    if reset {
+        body["reset"] = json!(true);
+    }
+    body
+}
+
 #[tokio::test]
 async fn accept_invite_any_rejected_code_check_counts_against_the_ip() {
     // Zitadel answering about the code with a status that isn't 400/412 (here 403) is still a
-    // refused guess, on the invite path and on the reset path.
+    // refused guess, on the invite path and on the reset path. Five per user (their own limit),
+    // four users: the address's 20.
     for reset in [false, true] {
         let h = harness().await;
-        let (id, code) = if reset {
-            (h.mock.add_user("bob@example.com", "Old-pass-12", true), RESET_CODE.to_string())
-        } else {
-            h.mock.add_invited_user("bob@example.com")
-        };
         h.mock.fail(if reset { "/password" } else { "/invite_code/verify" }, 403, "Errors.Forbidden", 20);
-        for i in 0..20 {
-            let mut body = accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1");
-            if reset {
-                body["reset"] = json!(true);
+        for u in 0..4 {
+            let (id, code) = code_holder(&h, &format!("bob{u}@example.com"), reset);
+            for i in 0..5 {
+                let a = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "1.1.1.1").await;
+                assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "reset {reset}, user {u}, attempt {i}: {}", a.body);
             }
-            let a = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
+        }
+        let (id, code) = code_holder(&h, "eve@example.com", reset);
+        let late = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "1.1.1.1").await;
+        assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}");
+    }
+}
+
+// Epic review (5): a refusal of the code check that isn't a wrong code by its captured id never
+// hands the invitee's attempt back, so from new addresses a sixth is still refused (fail closed).
+#[tokio::test]
+async fn accept_invite_any_rejected_code_check_counts_against_the_user() {
+    for reset in [false, true] {
+        let h = harness().await;
+        let (id, code) = code_holder(&h, "bob@example.com", reset);
+        h.mock.fail(if reset { "/password" } else { "/invite_code/verify" }, 403, "Errors.Forbidden", 20);
+        for i in 0..5 {
+            let ip = format!("1.1.1.{i}");
+            let a = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, &ip).await;
             assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "reset {reset}, attempt {i}: {}", a.body);
         }
-        let mut body = accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1");
-        if reset {
-            body["reset"] = json!(true);
-        }
-        let late = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
-        assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}");
+        let sixth = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "2.2.2.2").await;
+        assert_eq!(sixth.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}: {}", sixth.body);
     }
 }
 
@@ -3073,17 +3100,20 @@ fn password_checks(h: &Harness) -> usize {
     h.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count()
 }
 
-/// Sends a sign-in as a client that gives up after 100 ms, from `ip`. Ok(status) when the
-/// answer beat the timeout (a 429 does), Err when the client hung up first.
-async fn hang_up_sign_in(h: &Harness, body: Value, ip: &str) -> Result<StatusCode, reqwest::Error> {
-    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
-    impatient
+/// Sends a sign-in from `ip` and hangs up once Zitadel holds its password check (`hold`), then
+/// lets the check go on.
+async fn hang_up_sign_in(h: &Harness, hold: &mut Hold, body: Value, ip: &str) {
+    let send = reqwest::Client::new()
         .post(format!("{}/auth/v1/sign-in", h.base))
         .json(&body)
         .header("x-forwarded-for", format!("9.9.9.9, {ip}"))
-        .send()
-        .await
-        .map(|r| r.status())
+        .send();
+    tokio::select! {
+        r = send => panic!("{ip}: answered before the password check reached Zitadel: {r:?}"),
+        () = hold.started() => {}
+    }
+    // The request was dropped with the select: the client has hung up mid-check.
+    hold.release();
 }
 
 /// Sends `n` wrong-password sign-ins for ada one at a time, each from its own address, and
@@ -3138,14 +3168,13 @@ async fn sign_in_email_limit_holds_under_concurrency() {
 async fn sign_in_cancelled_password_checks_still_count() {
     let h = harness().await;
     h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    // Only the password check is slow: 300 ms, and the client gives up at 100 ms.
-    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    // Zitadel holds each password check until the client has hung up.
+    let mut hold = h.mock.hold("POST /v2/sessions");
     for i in 0..5 {
         let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
-        let r = hang_up_sign_in(&h, body, &format!("1.3.{i}.1")).await;
-        assert!(r.as_ref().is_err_and(|e| e.is_timeout()), "attempt {i}: {r:?}");
+        hang_up_sign_in(&h, &mut hold, body, &format!("1.3.{i}.1")).await;
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    drop(hold);
     h.mock.clear_on_request();
     // A patient client (no timeout).
     let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
@@ -3311,20 +3340,25 @@ async fn an_orchestrator_outage_never_reactivates() {
 // session (`SESSION-Gj4ko` or `COMMAND-JLK35`), so the answer is `invite_incomplete`.
 #[tokio::test]
 async fn accept_invite_never_signs_in_a_suspended_member() {
-    let h = harness().await;
-    let id = h.mock.add_user("held@example.com", "Old-pass-12", true);
-    h.mock.lock(&id);
-    h.internal.set_open_invite(&id, true);
-    let ar = h.mock.add_auth_request(false);
-    let a = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-    // Suspended, not unfinished: a retry can never succeed, so no ticket invites one.
-    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
-    assert_eq!(a.body["error"]["code"], "member_suspended");
-    assert!(a.body["error"]["accept_ticket"].is_null(), "{}", a.body);
-    assert!(a.cookie("chelabase_session").is_none());
-    let user = h.mock.user_by_id(&id).unwrap();
-    assert!(user.locked && !user.inactive, "still locked");
-    assert!(!h.mock.calls().iter().any(|c| c.ends_with("/unlock") || c.ends_with("/reactivate")));
+    // Zitadel's user check (`SESSION-Gj4ko`) or its password check (`COMMAND-JLK35`).
+    for by_password_check in [false, true] {
+        let h = harness().await;
+        h.mock.set_lock_seen_by_password_check(by_password_check);
+        let id = h.mock.add_user("held@example.com", "Old-pass-12", true);
+        h.mock.lock(&id);
+        h.internal.set_open_invite(&id, true);
+        let ar = h.mock.add_auth_request(false);
+        let a = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
+        let why = format!("by the password check: {by_password_check}");
+        // Suspended, not unfinished: a retry can never succeed, so no ticket invites one.
+        assert_eq!(a.status, StatusCode::FORBIDDEN, "{why}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "member_suspended", "{why}");
+        assert!(a.body["error"]["accept_ticket"].is_null(), "{why}: {}", a.body);
+        assert!(a.cookie("chelabase_session").is_none(), "{why}");
+        let user = h.mock.user_by_id(&id).unwrap();
+        assert!(user.locked && !user.inactive, "{why}: still locked");
+        assert!(!h.mock.calls().iter().any(|c| c.ends_with("/unlock") || c.ends_with("/reactivate")), "{why}");
+    }
 }
 
 // Zitadel answers a wrong and an expired invite code alike (`COMMAND-Wgn4q`). Only then does auth
@@ -3444,4 +3478,75 @@ async fn accept_invite_refuses_a_password_over_72_bytes_before_zitadel() {
         .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, &max), None, "1.1.1.1")
         .await;
     assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+}
+
+// Epic review (10): only Zitadel's captured "no such auth request" (`QUERY-Thee9` on the read,
+// `COMMAND-jae5P` on finishing) is an expired sign-in; any other refusal is unavailability.
+#[tokio::test]
+async fn only_an_unknown_auth_request_is_an_expired_sign_in() {
+    let h = harness().await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    let sign_in = async |ip: &str| {
+        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Secret-pass1");
+        h.post("/auth/v1/sign-in", body, None, ip).await
+    };
+    h.mock.fail("GET /v2/oidc/auth_requests/", 400, "Errors.Something.Else", 1);
+    let a = sign_in("3.1.0.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)), "read refused");
+    h.mock.fail("GET /v2/oidc/auth_requests/", 404, "Errors.AuthRequest.NotFound", 1);
+    let a = sign_in("3.1.0.2").await;
+    assert_eq!((a.status, a.body), (StatusCode::GONE, err("sign_in_expired", messages::GONE)), "read: not found");
+    h.mock.fail("POST /v2/oidc/auth_requests/", 403, "Errors.Something.Else", 1);
+    let a = sign_in("3.1.0.3").await;
+    assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)), "finish refused");
+    h.mock.fail("POST /v2/oidc/auth_requests/", 404, "Errors.AuthRequest.NotFound", 1);
+    let a = sign_in("3.1.0.4").await;
+    assert_eq!((a.status, a.body), (StatusCode::GONE, err("sign_in_expired", messages::GONE)), "finish: not found");
+}
+
+// Epic review (10): after the code is spent, a refusal of finishing the sign-in that isn't the
+// captured "no such auth request" is a step to retry (a ticket), not a finished sign-in.
+#[tokio::test]
+async fn accept_invite_finish_refused_otherwise_hands_back_a_ticket() {
+    let h = harness().await;
+    let (id, code) = h.mock.add_invited_user("bob@example.com");
+    h.mock.fail("POST /v2/oidc/auth_requests/", 400, "Errors.Something.Else", 1);
+    let a = h
+        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
+    assert_eq!(a.body["error"]["code"], "invite_incomplete");
+    let ok = h
+        .post("/auth/v1/accept-invite", with_ticket(&h.mock.add_auth_request(false), &id, &ticket_of(&a), "Secret-pass1"), None, "1.1.1.1")
+        .await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    assert_eq!(ok.body["next"], "done");
+}
+
+// Epic review (9): only Zitadel's captured "username taken" (`V3-DKcYh`) is a taken email at
+// sign-up; another 409 is unavailability.
+#[tokio::test]
+async fn sign_up_reads_only_the_captured_conflict_as_taken() {
+    let h = harness_with(true, 0).await;
+    h.mock.fail("POST /v2/users/new", 409, "Errors.User.AlreadyExists", 1);
+    let a = h.post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("email_taken")), "{}", a.body);
+    h.mock.fail("POST /v2/users/new", 409, "Errors.Something.Else", 1);
+    let a = h.post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
+    assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)));
+}
+
+// Epic review (9): the session API's lag is waited out only on its captured "no such user"
+// (`QUERY-Dfbg2`); another 404 is not retried.
+#[tokio::test]
+async fn accept_invite_retries_only_the_captured_missing_user() {
+    let h = harness().await;
+    let (id, code) = h.mock.add_invited_user("bob@example.com");
+    h.mock.fail("POST /v2/sessions", 404, "Errors.Something.Else", 1);
+    let a = h
+        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
+        .await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
+    assert_eq!(a.body["error"]["code"], "invite_incomplete");
+    assert_eq!(password_checks(&h), 1);
 }

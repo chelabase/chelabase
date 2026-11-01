@@ -1140,6 +1140,14 @@ async fn the_mocks_refusals_carry_the_captured_code_and_id() {
     mock.fail("GET /v2/users/", 403, "Errors.Denied", 1);
     let err = z.get_user(&id).await.unwrap_err();
     assert_eq!(err.detail_id(), Some("TEST-Errors.Denied"), "{err:?}");
+    // A locked user's session refused by the password check instead of the user check.
+    mock.set_lock_seen_by_password_check(true);
+    let body = json!({"checks": {"user": {"userId": locked}, "password": {"password": "Secret-pass1"}}});
+    let (status, err) = mock_answer(&mock, TOKEN, "POST", "/v2/sessions", body).await;
+    assert_eq!(status, 400, "{err:?}");
+    assert!(err.is(refusals::SESSION_USER_LOCKED), "{err:?}");
+    let ZError::Rejected { message, .. } = &err else { panic!("{err:?}") };
+    assert!(!message.contains("Errors.User.Locked"), "{message}");
 }
 
 // #60 audit B2: the mock's own refusals carry captured ids only; the lookup it answers them

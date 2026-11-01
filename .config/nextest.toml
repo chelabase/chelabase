@@ -27,3 +27,14 @@ test-group = "stack-serial"
 [[profile.default.overrides]]
 filter = 'package(auth) & binary(auth_live)'
 test-group = "stack-serial"
+
+# Other live suites that use the stack's Zitadel or its members while `zitadel_live` has the
+# instance's invite code expiry shortened: they never run beside it. Only the orchestrator `api`
+# binary's live Zitadel tests (`live_*`), so its hundreds of mock tests still run in parallel.
+[[profile.default.overrides]]
+filter = 'package(orchestrator) & binary(api) & test(/^live_/)'
+test-group = "stack-serial"
+
+[[profile.default.overrides]]
+filter = 'package(chelabase-metadata) & binary(members_live)'
+test-group = "stack-serial"

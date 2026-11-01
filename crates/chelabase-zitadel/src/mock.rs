@@ -77,6 +77,10 @@ pub struct Inner {
     pub auth_methods: HashMap<String, Vec<String>>,
     /// The URL template of each user's last password-reset mail (`sendLink`).
     pub reset_mails: HashMap<String, String>,
+    /// `POST /v2/sessions` for a locked user is refused by the password check
+    /// (`SESSION_USER_LOCKED`) instead of the user check (`SESSION_USER_NOT_ACTIVE`): Zitadel
+    /// answers either, depending on whether its projection shows the lock yet.
+    pub lock_seen_by_password_check: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +91,23 @@ pub struct Fault {
     /// Answer with exactly this body instead of Zitadel's error shape.
     pub body: Option<String>,
     pub remaining: u32,
+}
+
+/// Requests held by [`MockZitadel::hold`].
+pub struct Hold {
+    started: tokio::sync::mpsc::UnboundedReceiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+impl Hold {
+    /// Resolves when the next held request has arrived.
+    pub async fn started(&mut self) {
+        self.started.recv().await.expect("the hold's hook is installed");
+    }
+    /// Lets one held request (the oldest) go on.
+    pub fn release(&self) {
+        let _ = self.release.send(());
+    }
 }
 
 #[derive(Clone)]
@@ -106,6 +127,11 @@ fn err(status: StatusCode, key: &str) -> Reply {
 
 /// Where a handler's refusal keeps its key until `journal` shapes it.
 const MOCK_KEY: &str = "mockRefusalKey";
+
+/// The mock's key for `Errors.User.Locked` as the password check of `POST /v2/sessions` throws
+/// it (`COMMAND-JLK35`), told apart from the user check's (`SESSION-Gj4ko`), which has the same
+/// key in Zitadel.
+pub const LOCKED_BY_PASSWORD_CHECK: &str = "Errors.User.Locked (COMMAND-JLK35)";
 
 /// The refusal Zitadel v4.19.1 answers for a request (`"METHOD path"`) refused with this old
 /// error key, as `tests/zitadel_live.rs` captured it. `None` for one not captured: the mock
@@ -178,6 +204,8 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
             r::FINISH_AUTH_REQUEST_NOT_FOUND
         }
         "Errors.User.Locked" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_ACTIVE,
+        // The password check's answer to the same lock: Zitadel uses the same key for it.
+        LOCKED_BY_PASSWORD_CHECK if call == "POST /v2/sessions" => r::SESSION_USER_LOCKED,
         "Errors.Token.Invalid" => r::TOKEN_INVALID,
         // Zitadel's authorization check answers the same on every endpoint.
         "Errors.PermissionDenied" => r::NO_PERMISSION,
@@ -212,7 +240,7 @@ fn localized(key: &str) -> &'static str {
         "Errors.Org.NotFound" => "Organisation not found",
         "Errors.User.AlreadyInitialised" => "User is already initialized",
         "Errors.AuthRequest.NotFound" => "Auth Request does not exist",
-        "Errors.User.Locked" => "User is locked",
+        "Errors.User.Locked" | LOCKED_BY_PASSWORD_CHECK => "User is locked",
         "Errors.Token.Invalid" => "Token is invalid",
         "Errors.PermissionDenied" => "No matching permissions found",
         "Errors.Internal" => "An internal error occurred",
@@ -230,6 +258,8 @@ fn localized(key: &str) -> &'static str {
 /// for a refusal no caller matches: it gets a gRPC code for its status and a `TEST-` id. A
 /// refusal of the mock's own with no capture is a mock bug: the test process aborts, naming the
 /// call and the key (a panic here would only drop the connection, which reads as Zitadel down).
+/// Under nextest each test is its own process, so only that test fails; under plain `cargo test`
+/// the abort ends the whole test binary.
 fn zitadel_refusal(call: &str, status: StatusCode, key: &str, forced: bool) -> Response {
     use axum::response::IntoResponse;
     let (status, code, id) = match captured(call, key) {
@@ -510,6 +540,23 @@ impl MockZitadel {
             .on_request
             .push((pattern.into(), Arc::new(f)));
     }
+    /// Holds each request whose `"METHOD path"` contains `pattern` until the test releases it:
+    /// [`Hold::started`] resolves once one has arrived (and is recorded in `calls`). The held
+    /// request blocks its worker thread, so the test's runtime needs more than one. Dropping the
+    /// `Hold` releases every held request.
+    pub fn hold(&self, pattern: &str) -> Hold {
+        let (arrived, started) = tokio::sync::mpsc::unbounded_channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        self.on_request(pattern, move || {
+            let _ = arrived.send(());
+            let _ = released.lock().unwrap().recv();
+        });
+        Hold { started, release }
+    }
+    pub fn set_lock_seen_by_password_check(&self, on: bool) {
+        self.inner.lock().unwrap().lock_seen_by_password_check = on;
+    }
     pub fn clear_on_request(&self) {
         self.inner.lock().unwrap().on_request.clear();
     }
@@ -537,20 +584,23 @@ type S = State<Arc<Mutex<Inner>>>;
 async fn journal(State(s): S, req: Request, next: Next) -> Response {
     use axum::response::IntoResponse;
     let call = format!("{} {}", req.method(), req.uri().path());
-    let hooks: Vec<_> = s
-        .lock()
-        .unwrap()
-        .on_request
-        .iter()
-        .filter(|(pattern, _)| call.contains(pattern.as_str()))
-        .map(|(_, f)| f.clone())
-        .collect();
+    // Recorded on arrival, before any hook runs: a test that holds a request (`hold`) sees it
+    // counted.
+    let hooks: Vec<_> = {
+        let mut inner = s.lock().unwrap();
+        inner.calls.push(call.clone());
+        inner
+            .on_request
+            .iter()
+            .filter(|(pattern, _)| call.contains(pattern.as_str()))
+            .map(|(_, f)| f.clone())
+            .collect()
+    };
     for hook in hooks {
         hook();
     }
     let forced = {
         let mut inner = s.lock().unwrap();
-        inner.calls.push(call.clone());
         let strict_denied = inner.strict_login
             && !is_admin(req.headers())
             && (call.ends_with("/invite_code/verify") || call.starts_with("PATCH /v2/users/"));
@@ -1097,7 +1147,12 @@ async fn create_session(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -
         return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
     };
     if user.locked {
-        return err(StatusCode::PRECONDITION_FAILED, "Errors.User.Locked");
+        let key = if inner.lock_seen_by_password_check {
+            LOCKED_BY_PASSWORD_CHECK
+        } else {
+            "Errors.User.Locked"
+        };
+        return err(StatusCode::PRECONDITION_FAILED, key);
     }
     if user.password.is_empty() || user.password != pw {
         return err(StatusCode::BAD_REQUEST, "Errors.User.Password.Invalid");

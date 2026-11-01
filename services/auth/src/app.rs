@@ -356,12 +356,17 @@ fn unavailable(e: &ZError) -> Response {
     error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
 }
 
-/// A pending sign-in that Zitadel no longer knows is gone; anything else is unavailability.
+/// Zitadel's answers that a pending sign-in doesn't exist: reading it, and finishing it.
+const AUTH_REQUEST_GONE: [refusals::Refusal; 2] =
+    [refusals::AUTH_REQUEST_NOT_FOUND, refusals::FINISH_AUTH_REQUEST_NOT_FOUND];
+
+/// A pending sign-in that Zitadel no longer knows (its captured not-found) is gone; anything
+/// else, another refusal included, is unavailability.
 fn pending_sign_in_error(e: ZError) -> Response {
-    match e {
-        ZError::Rejected { .. } => error(StatusCode::GONE, ErrorCode::SignInExpired, GONE),
-        e => unavailable(&e),
+    if e.is_any(&AUTH_REQUEST_GONE) {
+        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
+    unavailable(&e)
 }
 
 fn verify_template(s: &AppState) -> String {
@@ -652,7 +657,7 @@ struct SignUpBody {
     request_body = SignUpBody,
     responses(
         (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
-        (status = 400, description = "The body is malformed (`invalid_request`) or the password is too weak (`weak_password`)", body = ErrorEnvelope),
+        (status = 400, description = "The body is malformed, a name is blank or over 200 characters, or Zitadel's validation refuses a field (`invalid_request`), or the password is too weak (`weak_password`)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
@@ -736,7 +741,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     };
     let user_id = match s.zitadel.create_user(&new).await {
         Ok(id) => id,
-        Err(ZError::Rejected { status: 409, .. }) => return taken(s, &email, b.auth_request),
+        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => return taken(s, &email, b.auth_request),
         // Only Zitadel's policy, by its captured create-path ids, is the visitor's password (#79).
         Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
@@ -986,7 +991,7 @@ struct AcceptInviteBody {
     request_body = AcceptInviteBody,
     responses(
         (status = 200, description = "Signed in: `next` is `done`, the session cookie is set", body = SignedIn),
-        (status = 400, description = "The body is malformed, the code or ticket is wrong (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)", body = ErrorEnvelope),
+        (status = 400, description = "The body is malformed, the code or ticket is wrong, or the user is inactive with no open invite (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
@@ -1111,19 +1116,28 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         slot.refund();
         return no_org();
     };
-    // Only failed code attempts count against a user, so a typo'd password or a retry never
-    // locks the invitee out.
-    let user_key = format!("accept-invite:user:{}", b.user);
-    if s.limiter.over(&user_key, 5, HOUR) {
+    // Only failed code attempts (and a user of another organization) count against a user, so a
+    // typo'd password or a retry never locks the invitee out. Reserved up front like the
+    // address's slot, so a hang-up can't skip it; every other outcome hands it back.
+    let Some(user_slot) =
+        Slot::reserve(&s.limiter, format!("accept-invite:user:{}", b.user), 5, HOUR)
+    else {
         slot.refund();
         return too_many();
-    }
+    };
     let user = match admin.get_user(&b.user).await {
         Ok(Some(u)) => u,
-        Ok(None) => return gone(ErrorCode::InviteRevoked, INVITE_REVOKED),
-        // A refusal is Zitadel's answer and counts; only an outage is free.
-        Err(e @ ZError::Rejected { .. }) => return unavailable(&e),
+        Ok(None) => {
+            user_slot.refund();
+            return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
+        }
+        // A refusal is Zitadel's answer and counts against the address; only an outage is free.
+        Err(e @ ZError::Rejected { .. }) => {
+            user_slot.refund();
+            return unavailable(&e);
+        }
         Err(e) => {
+            user_slot.refund();
             slot.refund();
             return unavailable(&e);
         }
@@ -1131,17 +1145,11 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     // An invite code for a user of another organization never signs into the platform.
     if user.org_id != org {
         warn!("accept-invite for a user outside the platform org");
-        s.limiter.hit(&user_key, HOUR);
         return bad();
     }
     let mut password_set = false;
     match (code, &b.accept_ticket) {
         (Some(code), _) => {
-            // Reserved before the check like the address's slot, so a hang-up can't skip it.
-            let Some(user_slot) = Slot::reserve(&s.limiter, user_key, 5, HOUR) else {
-                slot.refund();
-                return too_many();
-            };
             // A reset code is checked by setting the password with it: nothing changes on a
             // wrong one.
             let checked = if b.reset {
@@ -1194,11 +1202,8 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     return bad();
                 }
                 // Any other refusal is Zitadel answering about the code, not an outage: it counts
-                // against the address (the invitee's count stays as before).
-                Err(e @ ZError::Rejected { .. }) => {
-                    user_slot.refund();
-                    return unavailable(&e);
-                }
+                // against the address and the invitee (no refund matches a status class).
+                Err(e @ ZError::Rejected { .. }) => return unavailable(&e),
                 Err(e) => {
                     user_slot.refund();
                     slot.refund();
@@ -1207,6 +1212,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
             }
         }
         (None, Some(ticket)) => {
+            user_slot.refund();
             // Claimed up front: a failed attempt hands back a fresh ticket, so this one is
             // spent either way, and two concurrent uses can't both pass.
             match open_ticket(&s.config.cookie_key, ticket, now_secs()) {
@@ -1216,7 +1222,10 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                 _ => return bad(),
             }
         }
-        (None, None) => return bad(),
+        (None, None) => {
+            user_slot.refund();
+            return bad();
+        }
     }
     // From here the code is spent, and no outcome counts against the address.
     let response = finish_accept(s, admin, b, user, password_set).await;
@@ -1278,9 +1287,11 @@ async fn finish_accept(
     match b.auth_request {
         Some(ar) => match s.zitadel.finish(&ar, &session).await {
             Ok(redirect) => signed_in(s, session, redirect),
-            // The account is complete; the pending sign-in just ended, so Studio's sign-in
-            // takes over.
-            Err(ZError::Rejected { .. }) => signed_in(s, session, s.config.studio_url.clone()),
+            // The account is complete; the pending sign-in just ended (Zitadel's captured
+            // not-found), so Studio's sign-in takes over. Another refusal is a step to retry.
+            Err(e) if e.is_any(&AUTH_REQUEST_GONE) => {
+                signed_in(s, session, s.config.studio_url.clone())
+            }
             Err(e) => incomplete_unavailable(s, &b.user, &e),
         },
         None => signed_in(s, session, s.config.studio_url.clone()),
@@ -1325,7 +1336,7 @@ async fn new_user_session(s: &AppState, user_id: &str, password: &str) -> Result
     let mut attempt = 0;
     loop {
         match s.zitadel.create_session(user_id, password).await {
-            Err(ZError::Rejected { status: 404, .. }) if attempt < 10 => {
+            Err(e) if e.is(refusals::SESSION_USER_NOT_FOUND) && attempt < 10 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }

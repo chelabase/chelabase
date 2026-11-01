@@ -2174,21 +2174,24 @@ async fn server_vouched_sign_in_burst_is_limited() {
 async fn app_sign_in_cancelled_password_checks_still_count() {
     let h = harness().await;
     h.add_user("ada@example.com", true);
-    // Only the password check is slow: 300 ms, and the client gives up at 100 ms.
-    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
-    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
+    // Zitadel holds each password check until the client has hung up.
+    let mut hold = h.mock.hold("POST /v2/sessions");
+    let client = reqwest::Client::new();
     for i in 0..5 {
-        let r = impatient
+        let send = client
             .post(format!("{}/auth/v1/app/sign-in", h.base))
             .json(&json!({"email": "ada@example.com", "password": "Wr0ng!pass"}))
             .header("x-forwarded-for", format!("10.3.{i}.1"))
             .header(IDENTITY_HEADER, h.identity_for(None, DataKeyKind::Public))
-            .send()
-            .await
-            .map(|r| r.status());
-        assert!(r.as_ref().is_err_and(|e| e.is_timeout()), "attempt {i}: {r:?}");
+            .send();
+        tokio::select! {
+            r = send => panic!("attempt {i}: answered before the password check reached Zitadel: {r:?}"),
+            () = hold.started() => {}
+        }
+        // The request was dropped with the select: the client has hung up mid-check.
+        hold.release();
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    drop(hold);
     h.mock.clear_on_request();
     // A patient client (no timeout).
     let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.3.9.1", false).await;
@@ -2368,4 +2371,83 @@ async fn zitadel_policy_refusals_are_weak_passwords() {
         .post("change-password", json!({"current_password": PW, "password": NEW_PW}), Some(access(&s)))
         .await;
     assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"), "{}", a.body);
+}
+
+// Epic review (6): change-email reads Zitadel's refusals by their captured ids only.
+#[tokio::test]
+async fn change_email_maps_refusals_by_captured_id() {
+    let h = harness().await;
+    // Each case as its own user: change-email allows a user five an hour.
+    let mut n = 0;
+    let mut change = async |email: Option<&str>| {
+        n += 1;
+        let own = format!("u{n}@example.com");
+        h.add_user(&own, true);
+        let s = h.sign_in(&own, PW).await;
+        h.post("change-email", json!({"email": email.unwrap_or(&own)}), Some(access(&s))).await
+    };
+    // The address the user has already: Zitadel's `COMMAND-Uch5e`.
+    let a = change(None).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "conflict"), "{}", a.body);
+    // The user is gone: `COMMAND-ieJ2e`.
+    h.mock.fail("/email", 404, "Errors.User.NotFound", 1);
+    let a = change(Some("new@example.com")).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNAUTHORIZED, "user_token_invalid"), "{}", a.body);
+    // Zitadel's validation of the field (no id): the caller's input.
+    h.mock.answer_raw(
+        "/email",
+        400,
+        r#"{"code":3,"message":"invalid SetEmailRequest.Email: value must be a valid email address","details":[]}"#,
+        1,
+    );
+    let a = change(Some("new@example.com")).await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"), "{}", a.body);
+    // Refusals nobody captured, whatever their status (a set-email 409 included): unavailable.
+    for status in [400, 404, 409, 412] {
+        h.mock.fail("/email", status, "Errors.Something.Else", 1);
+        let a = change(Some("new@example.com")).await;
+        assert_eq!((a.status, code(&a)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"), "{status}: {}", a.body);
+    }
+    assert_eq!(h.mock.users_with_email("new@example.com"), 0);
+    assert!(h.internal.bodies("POST /internal/app/sync").is_empty());
+}
+
+// Epic review (9): only Zitadel's captured "username taken" (`V3-DKcYh`) is a taken email at
+// sign-up, and only its captured create-path refusals are the caller's input.
+#[tokio::test]
+async fn app_sign_up_reads_refusals_by_captured_id() {
+    let h = harness().await;
+    let sign_up = async |email: &str| h.post("sign-up", json!({"email": email, "password": PW}), None).await;
+    h.mock.fail("POST /v2/users/new", 409, "Errors.User.AlreadyExists", 1);
+    let a = sign_up("a1@example.com").await;
+    assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "email_taken"), "{}", a.body);
+    h.mock.fail("POST /v2/users/new", 409, "Errors.Something.Else", 1);
+    let a = sign_up("a2@example.com").await;
+    assert_eq!((a.status, code(&a)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"), "{}", a.body);
+    h.mock.fail("POST /v2/users/new", 400, "Errors.Something.Else", 1);
+    let a = sign_up("a3@example.com").await;
+    assert_eq!((a.status, code(&a)), (StatusCode::SERVICE_UNAVAILABLE, "unavailable"), "{}", a.body);
+    h.mock.answer_raw(
+        "POST /v2/users/new",
+        400,
+        r#"{"code":3,"message":"invalid AddHumanUserRequest.Email: value must be a valid email address","details":[]}"#,
+        1,
+    );
+    let a = sign_up("a4@example.com").await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"), "{}", a.body);
+}
+
+// Epic review (9): after a sign-up the session API's lag is waited out only on its captured "no
+// such user" (`QUERY-Dfbg2`); another 404 is not retried.
+#[tokio::test]
+async fn app_sign_up_retries_only_the_captured_missing_user() {
+    let h = harness().await;
+    h.mock.fail("POST /v2/sessions", 404, "Errors.Something.Else", 1);
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_ne!(a.status, StatusCode::CREATED, "{}", a.body);
+    assert_eq!(h.password_checks(), 1);
+    let h = harness().await;
+    h.mock.set_new_user_lag(2);
+    let a = h.post("sign-up", json!({"email": "ada@example.com", "password": PW}), None).await;
+    assert_eq!(a.status, StatusCode::CREATED, "{}", a.body);
 }
