@@ -13,21 +13,21 @@ The seed refuses to run unless the three hosts are `localhost` or `*.localhost` 
 
 ## Start it
 
-The steps are the ones in the header of `infra/compose/docker-compose.example.yml`. Until the published init image includes `chelabase-init example`, build the images locally first, as the header describes:
+The steps are the ones in the header of `infra/compose/docker-compose.example.yml`:
 
 ```bash
 cd infra/compose && cp .env.example .env
+docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
+docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
+```
+
+To run the seed from your checkout's code instead of the published image, build the images first:
+
+```bash
 docker compose -f docker-compose.yml -f docker-compose.build.yml build init-secrets studio
 docker tag chelabase/server:local chelabase/init:local
 CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
   -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
-```
-
-Once the published pin includes the seed, start the stack without the build steps:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
-docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
 ```
 
 The seed claims the instance for Ada, so you don't use a setup code by hand. Its log prints the account list. Then open `http://studio.chelabase.localhost:8000` and sign in as any demo person.

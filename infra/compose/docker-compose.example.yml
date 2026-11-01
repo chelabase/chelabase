@@ -1,19 +1,17 @@
 # The Acme example: a fresh local stack, claimed and seeded with demo people. LOCAL DEMO ONLY.
 #
-# The seed needs an init image that includes `chelabase-init example`. Until the published pin
-# below includes it, build the images locally with docker-compose.build.yml and run the seed
-# from the built image:
+# Start it from infra/compose:
 #
-#   cd infra/compose && cp .env.example .env
+#   cp .env.example .env
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
+#
+# To run the seed from this checkout's code instead of the published image, build it first:
+#
 #   docker compose -f docker-compose.yml -f docker-compose.build.yml build init-secrets studio
 #   docker tag chelabase/server:local chelabase/init:local
 #   CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
 #     -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
-#
-# Once the published pin includes the seed, start the stack without the build steps:
-#
-#   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
-#   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
 #
 # `example-seed` (`chelabase-init example`) claims the instance as ada@acme.example with the
 # setup code, through the ordinary sign-up, then invites the other demo people with link
@@ -30,7 +28,7 @@
 
 services:
   example-seed:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-7c0297be4237@sha256:a893bd91643abac68df58c4cefda463d4c67024a2e4301b1e7044f8b13cf2c18}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:4ffd65d1f7bc5b19075f151781852b790656717e19dc25b5d03086d2b9106dcd}
     restart: "no"
     command: ["chelabase-init", "example"]
     environment:
