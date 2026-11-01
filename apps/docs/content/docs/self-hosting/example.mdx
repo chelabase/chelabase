@@ -32,6 +32,8 @@ docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-
 
 The seed claims the instance for Ada, so you don't use a setup code by hand. Its log prints the account list. Then open `http://studio.chelabase.localhost:8000` and sign in as any demo person.
 
+If `up` stops part way, run it again: the seed picks up where it stopped. Its last step marks the demo complete with a comment on the `acme` database's `main` branch. After that, every `up` skips the seed and logs that it made 0 writes, so whatever you change in the demo stays changed. That includes unprotecting `main`, renaming the organisation and removing people from a team.
+
 ## Reset
 
 ```bash
@@ -39,7 +41,7 @@ cd infra/compose
 docker compose -f docker-compose.yml -f docker-compose.example.yml down -v
 ```
 
-This deletes every database and every secret. The seed does not run again on an instance it has already claimed, so start again from the top afterwards. Computes are not Compose services, so `down -v` leaves them behind. For a full removal, follow the steps in [Stop, tear down and uninstall](/docs/self-hosting/install#stop-tear-down-and-uninstall).
+This deletes every database and every secret, the completion mark with them, so the next `up` seeds a fresh demo. Start again from the top afterwards. Computes are not Compose services, so `down -v` leaves them behind. For a full removal, follow the steps in [Stop, tear down and uninstall](/docs/self-hosting/install#stop-tear-down-and-uninstall).
 
 ## Who is in it
 
@@ -77,14 +79,19 @@ The project is **Acme**, and it has one database, `acme`. Each team works in its
 
 Row-level security is on for every table except `public.employees`. That table has none on purpose, so Studio's security warning shows it. See [Studio](/docs/using/studio).
 
-- `public.customers`: an app user sees only their own row.
+- `public.customers`: an app user sees only their own row. The `sales`, `finance` and `support` roles read every customer.
 - `sales.orders`: an app user sees only their own orders (`customer_id = chelabase.user_id()`). Sales can read and write every order, and Finance can read them.
 - `finance.invoices`: only Finance can reach it.
 - `support.tickets`: an app user sees only their own tickets. The `support` role sees the tickets of the EMEA region.
+- `public.employees`: no row-level security. Anyone with the public key can read every row through the data API. App users can't change it: the seed revokes the data API's write grants on it, and on `public.customers`.
+
+Each team's tables are owned by the team's role, and an owner normally skips its own table's policies. The seed forces row-level security on `sales.orders`, `finance.invoices` and `support.tickets`, so the policies apply to their owners too.
+
+Deleting an app user deletes their row in `public.users`. Their customer row, orders, invoices and tickets are deleted with it (`on delete cascade`), so deleting a customer in Studio works.
 
 The data API's default schema is `sales`, so `from("orders")` means `sales.orders`. Other tables need their schema, for example `from("public.customers")`. See [TypeScript client](/docs/using/client) and [Data API](/docs/using/data-api).
 
-**Keys.** The project has the public key and a secret server key named `acme-server`. The seed never prints a secret key. See [Keys](/docs/using/data-api/keys).
+**Keys.** The `main` branch of database `acme` has the public key and a secret server key named `acme-server`. The seed never prints a secret key. See [Keys](/docs/using/data-api/keys).
 
 **Branches.** `main` is protected. `feature-discounts` is ready to merge. It adds `sales.orders.discount_pct`, a percentage from 0 to 100 that defaults to 0. See [Branches](/docs/using/branches) and [Merging schema](/docs/using/merging-schema).
 
@@ -103,7 +110,9 @@ The data API's default schema is `sales`, so `from("orders")` means `sales.order
 
 - **Browse without running SQL.** Sign in as `lise@acme.example`. She is in Support, a Viewer. She can browse the tables, but she cannot run SQL.
 
-- **Find the unprotected table.** Open Studio's security warning. It flags `public.employees`, which has no row-level security.
+- **See Support's region rule.** Support members are Viewers, so try it as Ada. Sign in as `ada@acme.example`, set **Run as** to `support` in the SQL editor and run `select subject, region from support.tickets;`. Only the EMEA tickets come back. Run as yourself (the owner) and you see every region.
+
+- **Find the unprotected table.** Open Studio's security warning. It flags `public.employees`, which has no row-level security. Anyone with the public key can read it, but not change it.
 
 - **Read orders as a customer.** Sign in as `carol@customer.example` through the client, and read `sales.orders`. You see only Carol's rows. The client needs the generated types (see [Generated types](/docs/using/client/types)). Replace the key with your public key:
 

@@ -10,6 +10,8 @@
 #   CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
 #     -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
 #
+# Once the published pin includes the seed, start the stack without the build steps:
+#
 #   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
 #   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
 #
@@ -21,9 +23,10 @@
 #
 # It refuses any stack that isn't local (hosts other than localhost / *.localhost, a gateway or
 # proxy published beyond loopback, required email verification), and an instance someone else
-# already claimed: start again with `down -v`. Rerunning `up` changes nothing; a seed that
-# stopped part way is finished by the next `up`. It mounts one secret, the setup code, and no
-# Zitadel credential.
+# already claimed: start again with `down -v`. A seed that stopped part way is finished by the
+# next `up`. Its last write marks the demo complete (a comment on main's database); from then on
+# `up` skips the seed with 0 writes, so what you change in the demo stays changed. It mounts one
+# secret, the setup code, and no Zitadel credential.
 
 services:
   example-seed:
