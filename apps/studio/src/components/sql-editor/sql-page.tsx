@@ -1,10 +1,11 @@
-import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { ContextBar } from "@/components/table-editor/context-bar";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { LEVELS, readLast, resolveParams, SQL_LAST_KEY, writeLast, type EditorParams } from "@/lib/table-editor/context";
 import { TableEditorStoreContext, createTableEditorStore } from "@/lib/table-editor/store";
+import { useFillViewport } from "@/lib/use-fill-viewport";
 import { usePlace } from "@/lib/table-editor/use-place";
 
 // The editor, CodeMirror and the pgls worker load only when the SQL page opens.
@@ -23,22 +24,6 @@ function browserStorage(kind: "local" | "session"): Storage | null {
   } catch {
     return null;
   }
-}
-
-/** The height that fills the viewport below the element's top, as the table editor does. */
-function useFillViewport() {
-  const ref = useRef<HTMLDivElement>(null);
-  const [top, setTop] = useState<number | null>(null);
-  useLayoutEffect(() => {
-    const measure = () => {
-      const el = ref.current;
-      if (el) setTop(Math.max(0, el.getBoundingClientRect().top + window.scrollY));
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, []);
-  return { ref, style: top === null ? undefined : { height: `calc(100dvh - ${top}px)` } };
 }
 
 /** The place down to the Postgres database: the SQL editor has no schema or table level. */

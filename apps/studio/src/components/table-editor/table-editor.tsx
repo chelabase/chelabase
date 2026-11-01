@@ -1,10 +1,11 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
 import { useListObjects, type ObjectSummary } from "@chelabase/management-client";
 import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { useFillViewport } from "@/lib/use-fill-viewport";
 import { actingCaps } from "@/lib/capabilities";
 import { pageSizeFor } from "@/lib/console";
 import { errorText } from "@/lib/errors";
@@ -60,25 +61,6 @@ export function TableEditor(props: TableEditorProps) {
       <Editor {...props} />
     </TableEditorStoreContext.Provider>
   );
-}
-
-/**
- * The height that fills the viewport below the element's top (the shell header's height isn't
- * hard-coded here): measured on mount and on resize.
- */
-function useFillViewport() {
-  const ref = useRef<HTMLDivElement>(null);
-  const [top, setTop] = useState<number | null>(null);
-  useLayoutEffect(() => {
-    const measure = () => {
-      const el = ref.current;
-      if (el) setTop(Math.max(0, el.getBoundingClientRect().top + window.scrollY));
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, []);
-  return { ref, style: top === null ? undefined : { height: `calc(100dvh - ${top}px)` } };
 }
 
 function Editor({ params, navigate }: TableEditorProps) {
