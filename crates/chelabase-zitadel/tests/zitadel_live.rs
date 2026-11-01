@@ -25,6 +25,22 @@ struct Live {
     base: String,
     host: String,
     pat: String,
+    /// The login client's PAT (the auth service's token).
+    login: String,
+}
+
+fn read_token(var: &str) -> String {
+    let file = PathBuf::from(
+        std::env::var(var).unwrap_or_else(|_| panic!("{var} is unset (source demo.env)")),
+    );
+    let file = if file.is_relative() {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(file)
+    } else {
+        file
+    };
+    std::fs::read_to_string(file).unwrap().trim().to_string()
 }
 
 fn live() -> Live {
@@ -38,28 +54,22 @@ fn live() -> Live {
         .ok()
         .filter(|v| !v.trim().is_empty())
         .unwrap_or_else(|| "http://zitadel:8080".into());
-    let file = PathBuf::from(
-        std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-            .expect("CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset (source demo.env)"),
-    );
-    let file = if file.is_relative() {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .join(file)
-    } else {
-        file
-    };
-    let pat = std::fs::read_to_string(file).unwrap().trim().to_string();
     Live {
         base: base.trim_end_matches('/').to_string(),
         host,
-        pat,
+        pat: read_token("CHELABASE_ZITADEL_ADMIN_PAT_FILE"),
+        login: read_token("CHELABASE_AUTH_TOKEN_FILE"),
     }
 }
 
 impl Live {
     fn client(&self) -> Zitadel {
         Zitadel::new(&self.base, &self.pat).with_host(Some(&self.host))
+    }
+
+    /// A client with the login client's token, as the auth service calls.
+    fn login_client(&self) -> Zitadel {
+        Zitadel::new(&self.base, &self.login).with_host(Some(&self.host))
     }
 
     /// The raw answer to `GET /v2/users/{id}`, to show what Zitadel's not-found looks like.
@@ -443,6 +453,163 @@ async fn the_refusals_callers_map_are_the_captured_ones() {
     .await;
 }
 
+/// Zitadel's request validation: a password over 200 characters is a 400 with gRPC code 3, a
+/// message and no `details`, read as `Rejected` with no id (#60 audit B1), never `Unavailable`.
+/// One of 73 to 200 bytes passes validation and fails bcrypt with a 500.
+#[tokio::test]
+#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+async fn a_password_over_200_characters_is_refused_by_validation() {
+    in_org("validation", |live, org| async move {
+        let z = live.client();
+        let user = new_user(&z, &org, "val").await;
+        let long = |n: usize| format!("Aa1!{}", "x".repeat(n - 4));
+        let new_human = |password: String| {
+            let email = format!("long-{}@example.com", tag());
+            json!({"organizationId": org, "username": email, "human": {
+                "profile": {"givenName": "Long", "familyName": "User"},
+                "email": {"email": email, "isVerified": true},
+                "password": {"password": password, "changeRequired": false}}})
+        };
+        let set = |password: String| json!({"newPassword": {"password": password, "changeRequired": false}});
+        let answers = [
+            live.raw(Method::POST, "/v2/users/new", Some(new_human(long(201)))).await,
+            live.raw(Method::POST, "/v2/users/new", Some(new_human(long(230)))).await,
+            live.raw(Method::POST, &format!("/v2/users/{user}/password"), Some(set(long(201)))).await,
+            live.raw(Method::POST, &format!("/v2/users/{user}/password"), Some(set(long(230)))).await,
+        ];
+        for (status, text) in answers {
+            eprintln!("over 200: {status} {text}");
+            assert_eq!(status, 400, "{text}");
+            let body: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(body["code"], json!(refusals::INVALID_ARGUMENT), "{text}");
+            assert!(body["message"].as_str().is_some_and(|m| m.contains("between 1 and 200 runes")), "{text}");
+            assert!(body.get("details").is_none_or(|d| d.as_array().is_some_and(Vec::is_empty)), "{text}");
+            let got = classify(status, &text);
+            assert!(got.is_invalid_request(), "{got:?}");
+        }
+        // The auditor's case, through the client.
+        let email = format!("long-{}@example.com", tag());
+        let password = long(230);
+        let created = z
+            .create_user(&NewUser {
+                org_id: &org,
+                email: &email,
+                given_name: "Long",
+                family_name: "User",
+                password: Some(&password),
+                user_id: None,
+                username: Some(&email),
+                send_code: false,
+                verified: true,
+                url_template: "",
+            })
+            .await;
+        eprintln!("create with a 230-character password: {created:?}");
+        assert!(!matches!(created, Err(ZError::Unavailable(_))), "{created:?}");
+        assert!(created.is_err_and(|e| e.is_invalid_request()));
+        let set = z.set_password_admin(&user, &password).await;
+        eprintln!("set a 230-character password: {set:?}");
+        assert!(set.is_err_and(|e| e.is_invalid_request()));
+        // At the limit, validation passes.
+        // Below that, Zitadel hashes with bcrypt, which takes 72 bytes at most: 73 to 200 bytes
+        // pass validation and fail with a 500 (`Unavailable`), so callers must cap at 72 bytes.
+        z.set_password_admin(&user, &long(refusals::PASSWORD_MAX_BYTES)).await.unwrap();
+        let over = z.set_password_admin(&user, &long(refusals::PASSWORD_MAX_BYTES + 1)).await;
+        eprintln!("set a 73-byte password: {over:?}");
+        assert!(matches!(over, Err(ZError::Unavailable(_))), "{over:?}");
+        let multibyte = format!("Aa1!{}", "é".repeat(35));
+        assert_eq!((multibyte.chars().count(), multibyte.len()), (39, 74));
+        let over = z.set_password_admin(&user, &multibyte).await;
+        assert!(matches!(over, Err(ZError::Unavailable(_))), "bytes, not characters: {over:?}");
+        let (status, text) = live.raw(Method::POST, "/v2/users/new", Some(new_human(long(73)))).await;
+        eprintln!("create with a 73-byte password: {status} {text}");
+        assert_eq!(status, 500, "{text}");
+    })
+    .await;
+}
+
+/// The refusals the mock answers that m2 and m4 match on: each endpoint's own not-found, the
+/// finish call's unknown auth request, and the permission refusal (#60 audit B2).
+#[tokio::test]
+#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+async fn the_mocks_other_refusals_are_the_captured_ones() {
+    in_org("mock", |live, org| async move {
+        let z = live.client();
+        let missing = format!("{}", tag());
+        assert_refused("set email, unknown user", z.set_email(&missing, "a@example.com", true, None).await, refusals::SET_EMAIL_USER_NOT_FOUND);
+        assert_refused("set email with a code, unknown user", z.set_email(&missing, "a@example.com", false, None).await, refusals::SET_EMAIL_USER_NOT_FOUND);
+        assert_refused("update user, unknown user", z.mark_email_verified(&missing, "a@example.com").await, refusals::UPDATE_USER_NOT_FOUND);
+        assert_refused("return invite code, unknown user", z.return_invite_code(&missing).await, refusals::CREATE_INVITE_USER_NOT_FOUND);
+        assert_refused("send invite code, unknown user", z.create_invite_code(&missing, "http://x/{{.Code}}").await, refusals::CREATE_INVITE_USER_NOT_FOUND);
+        assert_refused("authentication methods, unknown user", z.has_auth_methods(&missing).await, refusals::AUTH_METHODS_USER_NOT_FOUND);
+        // Finishing a sign-in with an unknown auth request (a real session).
+        let user = new_user(&z, &org, "fin").await;
+        let session = new_session(&z, &user).await;
+        assert_refused("finish, unknown auth request", z.finish("V2_0", &session).await, refusals::FINISH_AUTH_REQUEST_NOT_FOUND);
+        let bogus = chelabase_zitadel::client::Session { id: "1".into(), token: "x".into() };
+        assert_refused("finish, unknown auth request and session", z.finish("V2_0", &bogus).await, refusals::FINISH_AUTH_REQUEST_NOT_FOUND);
+        // The login client's token: no permission to delete users or make or delete orgs.
+        let login = live.login_client();
+        assert_refused("login client deletes a user", login.delete_user(&user).await, refusals::NO_PERMISSION);
+        login.delete_user(&missing).await.unwrap();
+        let path = format!("/v2/users/{missing}");
+        let (status, text) = live.raw_as(&live.host, &live.login, Method::DELETE, &path, None).await;
+        eprintln!("login client deletes an unknown user: {status} {text}");
+        assert!(classify(status, &text).is(refusals::DELETE_USER_NOT_FOUND), "{text}");
+        let other = format!("live-login-{}", tag());
+        assert_refused("login client makes an org", login.ensure_org(&other, &other).await, refusals::NO_PERMISSION);
+        assert_refused("login client deletes an org", login.delete_org(&org).await, refusals::NO_PERMISSION);
+        // ...but it may check invite codes, update users and set passwords.
+        assert_refused("login client checks an invite code", login.verify_invite_code(&user, "WRONG1").await, refusals::INVITE_CODE_INVALID);
+        let email = z.get_user(&user).await.unwrap().unwrap().email;
+        login.mark_email_verified(&user, &email).await.unwrap();
+        login.set_password_admin(&user, "An0ther!pass-live").await.unwrap();
+        assert!(z.get_user(&user).await.unwrap().is_some(), "the user is still there");
+    })
+    .await;
+}
+
+/// A user in the Initial state, made by the v1 management API with neither a password nor a
+/// verified email (`POST /v2/users/new` makes none): reactivate and unlock are refused as "not
+/// inactive" and "not locked" and both settle; deactivate is refused and never settles; lock
+/// works, and unlocking then makes the user active.
+#[tokio::test]
+#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+async fn an_initial_user_settles_reactivate_and_unlock() {
+    in_org("initial", |live, org| async move {
+        let z = live.client();
+        let email = format!("initial-{}@example.com", tag());
+        let body = json!({"userName": email, "profile": {"firstName": "Initial", "lastName": "User"},
+            "email": {"email": email, "isEmailVerified": false}});
+        let answer = reqwest::Client::new()
+            .post(format!("{}/management/v1/users/human", live.base))
+            .header(reqwest::header::HOST, &live.host)
+            .header("x-zitadel-orgid", &org)
+            .bearer_auth(&live.pat)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let text = answer.text().await.unwrap();
+        let user = serde_json::from_str::<Value>(&text).unwrap()["userId"].as_str().expect(&text).to_string();
+        assert_eq!(state(&z, &user).await, UserState::Initial);
+        let path = |verb: &str| format!("/v2/users/{user}/{verb}");
+        let empty = || Some(json!({}));
+        live.refused(Method::POST, &path("reactivate"), empty(), refusals::REACTIVATE_NOT_INACTIVE).await;
+        z.reactivate_user_settled(&user).await.unwrap();
+        live.refused(Method::POST, &path("unlock"), empty(), refusals::UNLOCK_NOT_LOCKED).await;
+        z.unlock_user(&user).await.unwrap();
+        live.refused(Method::POST, &path("deactivate"), empty(), refusals::DEACTIVATE_INITIAL).await;
+        assert_refused("deactivate initial", z.deactivate_user_settled(&user).await, refusals::DEACTIVATE_INITIAL);
+        assert_eq!(state(&z, &user).await, UserState::Initial);
+        z.lock_user(&user).await.unwrap();
+        assert_eq!(state(&z, &user).await, UserState::Locked);
+        z.unlock_user(&user).await.unwrap();
+        assert_eq!(state(&z, &user).await, UserState::Active);
+    })
+    .await;
+}
+
 /// The invite code generator, set for the expired-code case and restored.
 const INVITE_GENERATOR: &str = "/admin/v1/secretgenerators/SECRET_GENERATOR_TYPE_INVITE_CODE";
 
@@ -453,6 +620,12 @@ const INVITE_GENERATOR: &str = "/admin/v1/secretgenerators/SECRET_GENERATOR_TYPE
 /// it before anything is asserted. Other tests that make an invite code in that window would
 /// get a short-lived one, so this binary runs in the `stack-serial` group
 /// (`.config/nextest.toml`).
+///
+/// That group only holds tests of one nextest run. Don't run this alongside another suite's
+/// live tests on the same stack (the auth, orchestrator and Studio e2e scripts, another
+/// `workbench test`): an invite they make in that window has already expired. If the process
+/// dies between the two `PUT`s, the instance keeps the 1 ms expiry until a `PUT` to
+/// `INVITE_GENERATOR` restores it.
 #[tokio::test]
 #[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
 async fn an_expired_invite_code_is_refused_as_invalid() {
