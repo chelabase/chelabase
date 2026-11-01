@@ -128,11 +128,12 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.User.NotFound" if verb("reactivate") => r::REACTIVATE_USER_NOT_FOUND,
         "Errors.User.NotFound" if call.ends_with("/invite_code/verify") => r::INVITE_USER_NOT_FOUND,
         "Errors.User.NotFound" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_FOUND,
-        "Errors.User.AlreadyLocked" | "Errors.User.NotActive" => r::LOCK_NOT_ACTIVE,
-        "Errors.User.NotLocked" => r::UNLOCK_NOT_LOCKED,
-        "Errors.User.AlreadyInactive" => r::DEACTIVATE_ALREADY_INACTIVE,
-        "Errors.User.CannotDeactivateInitial" => r::DEACTIVATE_INITIAL,
-        "Errors.User.NotInactive" => r::REACTIVATE_NOT_INACTIVE,
+        // State refusals belong to their own endpoint: the same key on another one isn't captured.
+        "Errors.User.AlreadyLocked" | "Errors.User.NotActive" if verb("lock") => r::LOCK_NOT_ACTIVE,
+        "Errors.User.NotLocked" if verb("unlock") => r::UNLOCK_NOT_LOCKED,
+        "Errors.User.AlreadyInactive" if verb("deactivate") => r::DEACTIVATE_ALREADY_INACTIVE,
+        "Errors.User.CannotDeactivateInitial" if verb("deactivate") => r::DEACTIVATE_INITIAL,
+        "Errors.User.NotInactive" if verb("reactivate") => r::REACTIVATE_NOT_INACTIVE,
         // Zitadel answers a wrong, an expired and a missing invite code alike.
         k if k.starts_with("Errors.User.Code.") && call.ends_with("/invite_code/verify") => {
             r::INVITE_CODE_INVALID

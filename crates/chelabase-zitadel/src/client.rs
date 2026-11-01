@@ -491,8 +491,9 @@ impl Zitadel {
     }
 
     /// Checks an invite code (`POST /v2/users/{userId}/invite_code/verify`, body
-    /// `{"verificationCode"}`). An expired code is `Rejected` with a message naming `Expired`;
-    /// a deleted user is `Rejected { status: 404 }`.
+    /// `{"verificationCode"}`). Zitadel answers a wrong, an expired and a missing code alike
+    /// ([`refusals::INVITE_CODE_INVALID`]), and a deleted or unknown user with a 400
+    /// ([`refusals::INVITE_USER_NOT_FOUND`]), not a 404: both captured by `tests/zitadel_live.rs`.
     pub async fn verify_invite_code(&self, user_id: &str, code: &str) -> Result<(), ZError> {
         self.call(
             Method::POST,
