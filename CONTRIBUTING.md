@@ -350,7 +350,7 @@ Every `publish-images.sh` run selects its images:
 - `--all` takes the images whose inputs changed since their pins. If none did, it says so and builds nothing.
 - With neither, it refuses and prints the changed set. Naming every image with `--service` rebuilds them all.
 
-`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block). `server.Dockerfile`, `docker-bake.hcl`, `.dockerignore` and the release scripts are inputs of every image. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
+`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block). `server.Dockerfile`, `docker-bake.hcl` and `.dockerignore` are inputs of every image; the release scripts aren't, since they only select, push and pin. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
 
 ```bash
 # 1. On main, after the merge: build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a
