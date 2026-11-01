@@ -376,6 +376,26 @@ async fn sign_up_then_verify_finishes() {
     assert!(h.mock.user("new@example.com").unwrap().verified);
 }
 
+// #79: only Zitadel's password-policy refusals on create are `weak_password`; another 400 (a
+// missing org: the instance is misconfigured) or a refusal nobody captured is 503 `unavailable`.
+#[tokio::test]
+async fn sign_up_answers_weak_password_only_for_a_policy_refusal() {
+    let h = harness().await;
+    for (key, status, code) in [
+        ("Errors.User.PasswordComplexityPolicy.HasSymbol", StatusCode::BAD_REQUEST, "weak_password"),
+        ("Errors.User.PasswordComplexityPolicy.MinLength", StatusCode::BAD_REQUEST, "weak_password"),
+        ("Errors.Org.NotFound", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        ("Errors.Test.Uncaptured", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    ] {
+        h.mock.fail("POST /v2/users/new", 400, key, 1);
+        let a = h
+            .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.1")
+            .await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (status, Some(code)), "{key}: {}", a.body);
+    }
+    assert!(h.mock.user("new@example.com").is_none());
+}
+
 #[tokio::test]
 async fn a_taken_email_looks_the_same_and_its_code_never_works() {
     let h = harness().await;

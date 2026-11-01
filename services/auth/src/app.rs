@@ -727,7 +727,10 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     let user_id = match s.zitadel.create_user(&new).await {
         Ok(id) => id,
         Err(ZError::Rejected { status: 409, .. }) => return taken(s, &email, b.auth_request),
-        Err(ZError::Rejected { status: 400, .. }) => {
+        // Zitadel's policy, by its captured create-path ids, or its validation of the field (a
+        // password over 200 runes, which the 72-byte cap already refuses). Any other refusal
+        // (a missing org: the instance is misconfigured) isn't the visitor's password (#79).
+        Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) || e.is_invalid_request() => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
         Err(e) => return unavailable(&e),
