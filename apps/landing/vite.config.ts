@@ -40,6 +40,7 @@ export default defineConfig({
   plugins: [
     tailwindcss(),
     tanstackStart({
+      // Prerender would crawl the screenshot links and overwrite the images with HTML.
       prerender: { enabled: true, crawlLinks: false },
       pages: [{ path: '/' }],
     }),
