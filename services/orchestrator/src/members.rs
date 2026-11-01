@@ -3025,14 +3025,24 @@ fn zitadel_step_failed(what: &str, err: &ZError, retry: &str) -> ApiError {
 /// and Zitadel refuses to lock it (`LOCK_NOT_ACTIVE`, the same answer as for a locked one); left
 /// inactive, accept-invite with a reset code would reactivate it. So it is reactivated, then
 /// locked: it ends active and locked, and a reinstate's unlock gives back a working sign-in. The
-/// caller ends the sessions whatever this returns, so none made in between survives; a failure
-/// leaves the user active or inactive, never locked, and the same call again re-runs the steps.
+/// caller ends the sessions whatever this returns, so none made in between survives. When the lock
+/// fails after the reactivate, the user is deactivated again so the 503 leaves it as closed as
+/// it was (if that fails too, both are logged and the lock's error is still the answer); the
+/// same call again re-runs the steps. A removal running at the same time can have its deactivate
+/// undone by the reactivate: the user then ends active and locked, and a removal retry
+/// deactivates it.
 async fn lock_for_suspension(z: &Zitadel, user: &str) -> Result<(), ZError> {
     match z.lock_user(user).await {
         Err(err) if err.is(refusals::LOCK_NOT_ACTIVE) => match z.get_user(user).await? {
             Some(u) if u.state == UserState::Inactive => {
                 z.reactivate_user_settled(user).await?;
-                z.lock_user(user).await
+                let locked = z.lock_user(user).await;
+                if let Err(lock_err) = &locked {
+                    if let Err(deactivate_err) = z.deactivate_user_settled(user).await {
+                        warn!("suspend member: lock after reactivate failed: {lock_err}; deactivating it again failed too: {deactivate_err}");
+                    }
+                }
+                locked
             }
             _ => Err(err),
         },
