@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   getListKeysQueryKey,
@@ -24,8 +24,6 @@ export interface DataApiPanelProps {
   branch: Branch;
   /** The gateway's base URL (`VITE_API_URL`); the endpoint is `${apiUrl}/data/v1/query`. */
   apiUrl: string;
-  /** Extra content at the end of the second column (the Connect panel's logins line). */
-  aside?: ReactNode;
   /** The Postgres database picked (the Connect panel's header picks it); left out or unknown, the branch's main one. */
   pgDatabase?: string;
 }
@@ -34,7 +32,7 @@ export interface DataApiPanelProps {
  * One branch's data API in two columns that stack on narrow screens: the endpoint, public key and
  * what it reaches, then the secret keys and client setup.
  */
-export function DataApiPanel({ databaseId, branch, apiUrl, aside, pgDatabase }: DataApiPanelProps) {
+export function DataApiPanel({ databaseId, branch, apiUrl, pgDatabase }: DataApiPanelProps) {
   // Rotating the public key is Developer's (rotateKey).
   const canRotate = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
@@ -172,7 +170,6 @@ export function DataApiPanel({ databaseId, branch, apiUrl, aside, pgDatabase }: 
         {canRotate && databases !== null && (
           <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} defaultDatabase={pickedDb?.name} />
         )}
-        {aside}
       </section>
     </div>
   );

@@ -1,7 +1,7 @@
 import { RouterProvider, createMemoryHistory, createRootRoute, createRoute, createRouter } from "@tanstack/react-router";
 import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BranchDatabaseView, DatabaseSummary, MeResponse } from "@chelabase/management-client";
 import { ProjectCapsContext, projectCaps } from "@/lib/capabilities";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
@@ -53,7 +53,7 @@ const dbRow = (name: string, over: Partial<BranchDatabaseView> = {}): BranchData
 });
 const schema = { version: "1", default_schema: "public", schemas: {} };
 
-const me = (role: "viewer" | "developer"): MeResponse =>
+const me = (role: "viewer" | "developer" | "admin"): MeResponse =>
   ({
     email: "a@b.c",
     name: "Ada",
@@ -64,15 +64,22 @@ const me = (role: "viewer" | "developer"): MeResponse =>
   }) as unknown as MeResponse;
 
 const branchRoute = (id: string) => `GET /v1/databases/db/branches/${id}`;
+const conn = (branch: string, pg: string | null) => ({
+  host: `${branch}.host`, port: 4432, database: pg ?? "web1", user: "owner", password: `${branch}-${pg ?? "web1"}-pw`,
+  uri: `postgresql://owner@${branch}.host:4432/${pg ?? "web1"}`, http_url: `https://${branch}.host/sql`, password_state: "generated", ca_file: null,
+});
+const connectionCalls = (f: FakeFetch) => f.calls.filter((r) => new URL(r.url).pathname.endsWith("/connection"));
 const keyPaths = (f: FakeFetch) => f.calls.map((r) => new URL(r.url).pathname).filter((p) => p.endsWith("/keys"));
 
-function setup(list: FakeHandler, role: "viewer" | "developer" = "developer", dbs: BranchDatabaseView[] = [dbRow("web1", { main: true })]) {
+function setup(list: FakeHandler, role: "viewer" | "developer" | "admin" = "developer", dbs: BranchDatabaseView[] = [dbRow("web1", { main: true })]) {
   const caps = projectCaps(me(role), "p1");
   const f = fakeFetch({
     "GET /v1/databases/db/branches": list,
     "GET /v1/me": () => jsonResponse(me(role)),
     [`${branchRoute("id-main")}/keys`]: () => jsonResponse([key("public", "pub-main", "MAIN"), key("secret", "sec-main", "main-secret")]),
     [`${branchRoute("id-dev")}/keys`]: () => jsonResponse([key("public", "pub-dev", "DEV"), key("secret", "sec-dev", "dev-secret")]),
+    [`${branchRoute("id-main")}/connection`]: (req) => jsonResponse(conn("main", new URL(req.url).searchParams.get("database"))),
+    [`${branchRoute("id-dev")}/connection`]: (req) => jsonResponse(conn("dev", new URL(req.url).searchParams.get("database"))),
     [`${branchRoute("id-main")}/databases`]: () => jsonResponse(dbs),
     [`${branchRoute("id-dev")}/databases`]: () => jsonResponse(dbs),
     [`${branchRoute("id-main")}/data-api/schema`]: () => jsonResponse(schema),
@@ -95,6 +102,8 @@ function setup(list: FakeHandler, role: "viewer" | "developer" = "developer", db
 }
 
 const threeBranches = () => jsonResponse([b("dev"), b("main"), b("bak", { kind: "backup" }), b("busy", { status: "provisioning" })]);
+
+afterEach(() => vi.unstubAllGlobals());
 
 describe("ConnectPanel", () => {
   it("shows main's endpoint and keys, and swaps them when another branch is picked", async () => {
@@ -144,6 +153,61 @@ describe("ConnectPanel", () => {
     setup(threeBranches);
     const link = await screen.findByRole("link", { name: /personal Postgres login/ });
     expect(link).toHaveAttribute("href", "/app/members/mem-1#personal-logins");
+  });
+
+
+  it("shows an Admin the owner connection of the picked branch, masked until Show, with the logins link", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    setup(threeBranches, "admin");
+    expect(await screen.findByRole("heading", { name: "Postgres" })).toBeInTheDocument();
+    expect(await screen.findByText("main.host")).toBeInTheDocument();
+    expect(screen.getByText("4432")).toBeInTheDocument();
+    expect(screen.getByText("owner", { selector: "dd" })).toBeInTheDocument();
+    expect(screen.queryByText("main-web1-pw")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
+    expect(screen.getByText("main-web1-pw")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Copy password" }));
+    expect(writeText).toHaveBeenLastCalledWith("main-web1-pw");
+    expect(screen.getByRole("link", { name: /personal Postgres login/ })).toBeInTheDocument();
+  });
+
+  it("re-fetches and re-masks the connection when the header's Branch or Postgres DB changes", async () => {
+    const f = setup(threeBranches, "admin", [dbRow("web1", { main: true }), dbRow("app")]);
+    await userEvent.click(await screen.findByRole("button", { name: "Show password" }));
+    expect(screen.getByText("main-web1-pw")).toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText("Postgres DB"), "app");
+    expect(await screen.findByText("app", { selector: "dd" })).toBeInTheDocument();
+    expect(screen.queryByText("main-web1-pw")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show password" })).toBeInTheDocument();
+    expect(connectionCalls(f).at(-1)!.url).toContain("/id-main/connection?database=app");
+
+    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
+    await userEvent.selectOptions(screen.getByLabelText("Branch"), "dev");
+    expect(await screen.findByText("dev.host")).toBeInTheDocument();
+    expect(screen.queryByText("main-app-pw")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show password" })).toBeInTheDocument();
+    expect(connectionCalls(f).at(-1)!.url).toContain("/id-dev/connection");
+  });
+
+  it("gives a Developer the logins link but no owner connection, and never asks for one", async () => {
+    const f = setup(threeBranches, "developer");
+    expect(await screen.findByRole("link", { name: /personal Postgres login/ })).toBeInTheDocument();
+    await screen.findByText("chk_pub_MAIN");
+    expect(screen.queryByText("main.host")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show password" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy password" })).not.toBeInTheDocument();
+    expect(connectionCalls(f)).toHaveLength(0);
+  });
+
+  it("gives a Viewer neither the owner connection nor the logins link", async () => {
+    const f = setup(threeBranches, "viewer");
+    await screen.findByText("chk_pub_MAIN");
+    expect(screen.queryByRole("heading", { name: "Postgres" })).not.toBeInTheDocument();
+    expect(screen.queryByText("main.host")).not.toBeInTheDocument();
+    expect(screen.queryByRole("link", { name: /personal Postgres login/ })).not.toBeInTheDocument();
+    expect(connectionCalls(f)).toHaveLength(0);
   });
 
   it("says when no branch is ready, and shows no keys", async () => {

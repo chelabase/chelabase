@@ -19,6 +19,7 @@ import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithRouter } from "@/test/render-router";
 import { BranchActions } from "./branch-actions";
 import { BranchRoles } from "./branch-roles";
+import { ConnectPanel } from "./connect-panel";
 import { Dashboard } from "./dashboard";
 import { DataApiDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
@@ -235,7 +236,19 @@ const CONTROLS: Control[] = [
     ready: () => Promise.any([screen.findByRole("button", { name: "Run" }), screen.findByText(/needs the Developer role/)]),
     query: button("Run"),
   },
-  { name: "Connection details", operationId: "getDatabaseConnection", ui: projectPage, ready: projectReady, query: button("Connection details") },
+  { name: "Connection details on a branch", operationId: "getBranchConnection", ui: branchActions(mainOpen), ready: branchReady, query: button("Connection details") },
+  // The owner connection lives in the Connect panel (a branch's, for the header's branch and database).
+  {
+    name: "Owner connection in Connect", operationId: "getBranchConnection",
+    ui: () => <ConnectPanel database={database as never} apiUrl="http://gw" />,
+    routes: {
+      "GET /v1/databases/d1/branches/m/connection": ok({
+        host: "h", port: 4432, database: "web1", user: "o", password: "pw", uri: "postgresql://o@h:4432/web1",
+        http_url: "https://h/sql", password_state: "generated", ca_file: null,
+      }),
+    },
+    ready: () => screen.findByLabelText("Branch"), query: button("Show password"),
+  },
   { name: "Reset database password", operationId: "resetDatabasePassword", ui: projectPage, ready: projectReady, query: button("Reset password") },
   { name: "Delete database", operationId: "deleteDatabase", ui: projectPage, ready: projectReady, query: button("Delete") },
   {

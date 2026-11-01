@@ -53,102 +53,10 @@ const count = (f: FakeFetch, key: string) =>
 afterEach(() => vi.unstubAllGlobals());
 
 describe("DatabaseActions", () => {
-  it("reveals details with the password masked until asked", async () => {
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-
-    expect(await screen.findByText("postgres")).toBeInTheDocument();
-    expect(screen.getByText("web1", { selector: "dd" })).toBeInTheDocument();
-    expect(screen.queryByText("s3cret")).toBeNull();
-    expect(screen.queryByText(/postgres:\/\//)).toBeNull();
-
-    await userEvent.click(screen.getByRole("button", { name: "Show password" }));
-    expect(screen.getByText("s3cret")).toBeInTheDocument();
-    expect(screen.getByText(uriFor("s3cret"))).toBeInTheDocument();
-  });
-
-  it("copies the connection URI", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Copy URI" }));
-    expect(writeText).toHaveBeenCalledWith(uriFor("s3cret"));
-  });
-
-  it("shows_the_http_url_without_the_password", async () => {
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    expect(await screen.findByText(HTTP_URL)).toBeInTheDocument();
-    expect(screen.getByText("HTTP URL")).toBeInTheDocument();
-    expect(screen.queryByText("s3cret")).toBeNull();
-    expect(screen.queryByText(/postgresql:\/\//)).toBeNull();
-  });
-
-  it("copies_the_http_url", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Copy HTTP URL" }));
-    expect(writeText).toHaveBeenCalledWith(HTTP_URL);
-  });
-
-  it("connection_shows_ca_file_hint", async () => {
-    setup({ [CONNECTION]: () => jsonResponse({ ...details("s3cret"), ca_file: ".chelabase/neon/proxy-ca.crt" }) });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    const note = await screen.findByText(/CA file: pass the proxy's CA with/);
-    expect(note).toHaveTextContent(
-      "CA file: pass the proxy's CA with sslrootcert=.chelabase/neon/proxy-ca.crt. Self-hosted, fetch it with docker compose cp proxy:/tls/ca.crt .chelabase/neon/proxy-ca.crt (install guide, “Connect to databases”). If localtest.me resolves to ::1 first on your machine, add hostaddr=127.0.0.1.",
-    );
-  });
-
-  it("no_ca_hint_without_ca_file", async () => {
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    await screen.findByText("postgres");
-    expect(screen.queryByText(/sslrootcert/)).toBeNull();
-    expect(screen.getByText(/hostaddr=127\.0\.0\.1/)).toBeInTheDocument();
-  });
-
-  it("forgets revealed details when the panel is closed", async () => {
-    const { fetch } = setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    await userEvent.click(await screen.findByRole("button", { name: "Show password" }));
-    expect(screen.getByText("s3cret")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    expect(screen.queryByText("s3cret")).toBeNull();
-
-    // Reopening fetches again and starts masked.
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    expect(await screen.findByRole("button", { name: "Show password" })).toBeInTheDocument();
-    expect(screen.queryByText("s3cret")).toBeNull();
-    expect(count(fetch, CONNECTION)).toBe(2);
-  });
-
-  it("has a copy button for every field", async () => {
-    const writeText = vi.fn().mockResolvedValue(undefined);
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
-    setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    for (const [field, value] of [
-      ["host", EP],
-      ["port", "4432"],
-      ["database", "web1"],
-      ["user", "postgres"],
-      ["password", "s3cret"],
-      ["HTTP URL", HTTP_URL],
-    ]) {
-      await userEvent.click(await screen.findByRole("button", { name: `Copy ${field}` }));
-      expect(writeText).toHaveBeenLastCalledWith(value);
-    }
-  });
-
-  it("only offers credentials for ready databases", () => {
+  it("only offers a password reset for ready databases, and no connection details on the database itself", () => {
     setup({}, { ...ready, status: "provisioning" });
-    expect(screen.getByRole("button", { name: "Connection details" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Reset password" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: "Connection details" })).toBeNull();
   });
 
   it("resets the password after confirmation and shows the new details", async () => {
@@ -223,15 +131,6 @@ describe("DatabaseActions", () => {
     await userEvent.click(confirm);
     await vi.waitFor(() => expect(queryClient.getQueryState(getGetMeQueryKey())?.isInvalidated).toBe(true));
     expect(count(fetch, DELETE)).toBe(1);
-  });
-
-  it("reveal_is_never_cached", async () => {
-    const { queryClient } = setup({ [CONNECTION]: connection("s3cret") });
-    await userEvent.click(screen.getByRole("button", { name: "Connection details" }));
-    expect(await screen.findByRole("button", { name: "Show password" })).toBeInTheDocument();
-    const keys = queryClient.getQueryCache().findAll().map((q) => JSON.stringify(q.queryKey));
-    expect(keys.filter((k) => k.includes("connection"))).toEqual([]);
-    expect(JSON.stringify(queryClient.getQueryCache().findAll().map((q) => q.state.data))).not.toContain("s3cret");
   });
 
   it("reset_not_applied_switches_on_code", async () => {

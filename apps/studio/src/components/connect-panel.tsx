@@ -4,6 +4,7 @@ import { useGetMe, useListBranchDatabases, useListBranches, type DatabaseSummary
 import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { DatabasePicker } from "./data-api-databases";
+import { ConnectionDetails } from "./connection-details";
 import { DataApiPanel } from "./data-api-panel";
 
 export interface ConnectPanelProps {
@@ -21,7 +22,10 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
   const error = list.error ? errorText(list.error) : null;
 
   // A personal login is Developer's, on this database (the project page provides the database's caps).
-  const canLogin = useProjectCaps().atLeast("developer");
+  const caps = useProjectCaps();
+  const canLogin = caps.atLeast("developer");
+  // The owner's connection (with its password) is Admin's.
+  const admin = caps.atLeast("admin");
   const memberId = useGetMe().data?.member?.id;
 
   // The data API runs on `normal` branches that are ready.
@@ -68,30 +72,35 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
       )}
       {branches === null && !error && <p className="text-sm text-muted-foreground">Loading branches…</p>}
       {branches !== null && !current && <p className="text-sm text-muted-foreground">No branch is ready yet.</p>}
+      {current && (admin || (canLogin && memberId)) && (
+        <section aria-label="Postgres" className="space-y-2">
+          <h3 className="text-sm font-semibold">Postgres</h3>
+          {/* Once the branch's databases are known, so the owner connection is fetched once. */}
+          {admin && pickedDb && (
+            <ConnectionDetails
+              key={current.id}
+              database={database}
+              branch={current}
+              pgDatabase={pickedDb.main ? null : pickedDb.name}
+            />
+          )}
+          {canLogin && memberId && (
+            <p className="text-sm text-muted-foreground">
+              Connecting with psql or a driver?{" "}
+              <Link
+                to="/app/members/$memberId"
+                params={{ memberId }}
+                hash="personal-logins"
+                className="underline underline-offset-4 hover:text-foreground"
+              >
+                Use your personal Postgres login.
+              </Link>
+            </p>
+          )}
+        </section>
+      )}
       {current && (
-        <DataApiPanel
-          key={current.id}
-          databaseId={id}
-          branch={current}
-          apiUrl={apiUrl}
-          pgDatabase={pickedDb?.name}
-          aside={
-            canLogin &&
-            memberId && (
-              <p className="text-muted-foreground">
-                Connecting with psql or a driver?{" "}
-                <Link
-                  to="/app/members/$memberId"
-                  params={{ memberId }}
-                  hash="personal-logins"
-                  className="underline underline-offset-4 hover:text-foreground"
-                >
-                  Use your personal Postgres login.
-                </Link>
-              </p>
-            )
-          }
-        />
+        <DataApiPanel key={current.id} databaseId={id} branch={current} apiUrl={apiUrl} pgDatabase={pickedDb?.name} />
       )}
     </section>
   );

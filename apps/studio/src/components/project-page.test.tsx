@@ -86,6 +86,16 @@ describe("ProjectPage", () => {
     expect(screen.getByRole("button", { name: "Create database" })).toBeInTheDocument();
   });
 
+  it("offers a ready database's row no Connection details button", async () => {
+    setup({});
+    await screen.findByText("web1");
+    for (const name of ["Reset password", "Delete", "Branches", "Merges", "Connect"]) {
+      expect(screen.getByRole("button", { name })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("link", { name: "Open" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Connection details" })).toBeNull();
+  });
+
   it("fs3_databases_table_scrolls_inside_a_relative_frame", async () => {
     setup({});
     const frame = (await screen.findByRole("table")).closest<HTMLElement>(".overflow-x-auto");

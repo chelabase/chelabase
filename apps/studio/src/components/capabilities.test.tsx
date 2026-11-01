@@ -1,4 +1,5 @@
 import { act, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { MeResponse as Me, PlatformRole, ProjectInfo } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, sequence } from "@/test/fake-fetch";
@@ -62,10 +63,36 @@ describe("capabilities", () => {
 
     renderProject({ ...meAs("admin"), projects: [{ project_id: "p1", platform_role: "admin", roles: [], databases: [] }] });
     row = await databaseRow();
-    expect(within(row).getByRole("button", { name: "Connection details" })).toBeInTheDocument();
+    // The database row has no Connection details; an Admin's owner connection is in its Connect panel.
+    expect(within(row).queryByRole("button", { name: "Connection details" })).toBeNull();
     expect(within(row).getByRole("button", { name: "Reset password" })).toBeInTheDocument();
     expect(within(row).getByRole("button", { name: "Delete" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create database" })).toBeInTheDocument();
+  });
+
+  it("owner_connection_in_connect_admin_only", async () => {
+    const connectionRoutes = {
+      "GET /v1/databases/d1/branches": () => jsonResponse([{ id: "m", name: "main", parent_branch_id: null, kind: "normal", status: "ready", host: "h", port: 1 }]),
+      "GET /v1/databases/d1/branches/m/databases": () => jsonResponse([{ name: "web1", main: true, origin: "main", owner: "o", data_api: "off", data_api_error: null, default_schema: "public" }]),
+      "GET /v1/databases/d1/branches/m/connection": () =>
+        jsonResponse({ host: "h", port: 4432, database: "web1", user: "o", password: "pw", uri: "u", http_url: "x", password_state: "generated", ca_file: null }),
+    };
+    const open = async (role: PlatformRole) => {
+      const f = fakeFetch({ "GET /v1/me": () => jsonResponse(meAs(role)), "GET /v1/projects/p1": () => jsonResponse(info), ...connectionRoutes });
+      const r = renderWithRouter(
+        <ProjectPage projectId="p1" apiUrl="http://gw" tab="databases" onTabChange={() => {}} onGone={() => {}} />,
+        { fetch: f },
+      );
+      await userEvent.click(await screen.findByRole("button", { name: "Connect" }));
+      await screen.findByLabelText("Branch");
+      return { f, r };
+    };
+    const dev = await open("developer");
+    expect(screen.queryByRole("button", { name: "Show password" })).toBeNull();
+    expect(dev.f.calls.some((q) => q.url.includes("/connection"))).toBe(false);
+    dev.r.unmount();
+    await open("admin");
+    expect(await screen.findByRole("button", { name: "Show password" })).toBeInTheDocument();
   });
 
   it("a project URL without access shows the no-access screen and checks again every 30 seconds", async () => {
