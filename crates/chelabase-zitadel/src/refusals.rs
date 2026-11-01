@@ -59,6 +59,12 @@ pub const CREATE_INVITE_USER_NOT_FOUND: Refusal =
     refusal(400, FAILED_PRECONDITION, "COMMAND-Wgvn4");
 /// `GET /v2/oidc/auth_requests/{id}` for an unknown auth request.
 pub const AUTH_REQUEST_NOT_FOUND: Refusal = refusal(404, NOT_FOUND, "QUERY-Thee9");
+/// `POST /v2/users/{id}/password` with a `verificationCode` (a reset) for a deleted or
+/// never-existing user, whether the code is the one Zitadel returned before the delete or a
+/// wrong one: a 400, "Password not found". A wrong code for a user who exists, in any state, is
+/// `PASSWORD_CODE_INVALID` (or `PASSWORD_CODE_NOT_FOUND` with no code pending) instead.
+pub const SET_PASSWORD_USER_NOT_FOUND: Refusal =
+    refusal(400, FAILED_PRECONDITION, "COMMAND-G8dh3");
 /// `POST /v2/oidc/auth_requests/{id}` (finishing the sign-in) for an unknown auth request:
 /// another id than the `GET`'s.
 pub const FINISH_AUTH_REQUEST_NOT_FOUND: Refusal = refusal(404, NOT_FOUND, "COMMAND-jae5P");
@@ -94,8 +100,12 @@ pub const DEACTIVATE_INITIAL: Refusal = refusal(400, FAILED_PRECONDITION, "COMMA
 pub const INVITE_CODE_INVALID: Refusal = refusal(400, INVALID_ARGUMENT, "COMMAND-Wgn4q");
 /// `POST /v2/users/{id}/email/verify` with a wrong code.
 pub const EMAIL_CODE_INVALID: Refusal = refusal(400, INVALID_ARGUMENT, "COMMAND-eis9R");
-/// `POST /v2/users/{id}/password` with a `verificationCode` that isn't the pending one.
+/// `POST /v2/users/{id}/password` with a `verificationCode` for a user with no reset code
+/// pending.
 pub const PASSWORD_CODE_NOT_FOUND: Refusal = refusal(400, FAILED_PRECONDITION, "COMMAND-2M9fs");
+/// `POST /v2/users/{id}/password` with a `verificationCode` that isn't the pending one, whatever
+/// the user's state (active, passwordless, inactive or locked).
+pub const PASSWORD_CODE_INVALID: Refusal = refusal(400, INVALID_ARGUMENT, "CODE-woT0xc");
 /// `POST /v2/users/{id}/invite_code` for a user who can sign in already.
 pub const INVITE_USER_INITIALIZED: Refusal = refusal(400, FAILED_PRECONDITION, "COMMAND-EF34g");
 

@@ -128,6 +128,7 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.User.NotFound" if verb("reactivate") => r::REACTIVATE_USER_NOT_FOUND,
         "Errors.User.NotFound" if call.ends_with("/invite_code/verify") => r::INVITE_USER_NOT_FOUND,
         "Errors.User.NotFound" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("password") => r::SET_PASSWORD_USER_NOT_FOUND,
         // State refusals belong to their own endpoint: the same key on another one isn't captured.
         "Errors.User.AlreadyLocked" | "Errors.User.NotActive" if verb("lock") => r::LOCK_NOT_ACTIVE,
         "Errors.User.NotLocked" if verb("unlock") => r::UNLOCK_NOT_LOCKED,
@@ -141,6 +142,8 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
         k if k.starts_with("Errors.User.Code.") && call.ends_with("/email/verify") => {
             r::EMAIL_CODE_INVALID
         }
+        // A code that isn't the pending one; `NotFound` when none is pending.
+        "Errors.User.Code.Invalid" if call.ends_with("/password") => r::PASSWORD_CODE_INVALID,
         k if k.starts_with("Errors.User.Code.") && call.ends_with("/password") => {
             r::PASSWORD_CODE_NOT_FOUND
         }
@@ -1307,6 +1310,10 @@ async fn set_password(
     }
     let current = b.get("currentPassword").and_then(Value::as_str);
     let code = b.get("verificationCode").and_then(Value::as_str);
+    // A reset for a deleted or never-existing user (captured with a code).
+    if code.is_some() && !inner.users.iter().any(|u| u.id == id) {
+        return err(StatusCode::BAD_REQUEST, "Errors.User.NotFound");
+    }
     match (current, code) {
         (Some(c), _) => {
             let right = inner.users.iter().any(|u| u.id == id && u.password == c);
