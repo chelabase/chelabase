@@ -15,9 +15,9 @@ const props = (over: Partial<ContextBarProps> = {}): ContextBarProps => ({
   ...over,
 });
 
-describe("ContextBar depth", () => {
-  it("pgDatabase_shows_the_place_pickers_and_act_as_but_not_schema_or_table", () => {
-    render(<ContextBar {...props({ depth: "pgDatabase" })} />);
+describe("ContextBar levels", () => {
+  it("shows_the_place_pickers_and_act_as_but_no_schema_or_table_picker", () => {
+    render(<ContextBar {...props()} />);
     for (const label of ["Project", "Database", "Branch", "Postgres db", "Act as"]) expect(screen.getByLabelText(label)).toBeInTheDocument();
     expect(screen.queryByLabelText("Schema")).toBeNull();
     expect(screen.queryByLabelText("Table")).toBeNull();
