@@ -396,6 +396,30 @@ async fn sign_up_answers_weak_password_only_for_a_policy_refusal() {
     assert!(h.mock.user("new@example.com").is_none());
 }
 
+/// A name Zitadel would refuse is refused before it is called, and a validation refusal that
+/// still comes back (code 3, no id) is the visitor's input, never a weak password (#79).
+#[tokio::test]
+async fn sign_up_never_blames_the_password_for_a_bad_name() {
+    let h = harness().await;
+    for given in ["   ", &"x".repeat(201)] {
+        let mut body = signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1");
+        body["givenName"] = json!(given);
+        let a = h.post("/auth/v1/sign-up", body, None, "1.1.1.1").await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "{given:?}: {}", a.body);
+    }
+    assert!(h.mock.calls().iter().all(|c| c != "POST /v2/users/new"), "a bad name never reaches Zitadel");
+    h.mock.answer_raw(
+        "POST /v2/users/new",
+        400,
+        r#"{"code":3,"message":"invalid AddHumanUserRequest.Profile: embedded message failed validation","details":[]}"#,
+        1,
+    );
+    let a = h
+        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "2.2.2.2")
+        .await;
+    assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "{}", a.body);
+}
+
 #[tokio::test]
 async fn a_taken_email_looks_the_same_and_its_code_never_works() {
     let h = harness().await;

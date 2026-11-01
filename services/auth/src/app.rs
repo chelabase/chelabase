@@ -43,6 +43,8 @@ pub mod messages {
         "Your invite was accepted but sign-in did not finish; try again";
     pub const BAD_INVITE: &str = "The invite link is invalid";
     pub const NO_SUCH_INVITE: &str = "No open invite matches this link";
+    pub const BAD_NAME: &str = "Enter a first and a last name, up to 200 characters each";
+    pub const BAD_DETAILS: &str = "Check the details you entered";
 }
 use messages::*;
 
@@ -687,6 +689,12 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if !usable_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
+    // Zitadel's own limit on a name (1–200 runes after trimming), checked here so a bad name
+    // never reaches it and is never answered as a password problem.
+    let usable_name = |n: &str| (1..=200).contains(&n.trim().chars().count());
+    if !usable_name(&b.given_name) || !usable_name(&b.family_name) {
+        return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_NAME);
+    }
     let Some(org) = org_id(s) else {
         return no_org();
     };
@@ -727,12 +735,16 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     let user_id = match s.zitadel.create_user(&new).await {
         Ok(id) => id,
         Err(ZError::Rejected { status: 409, .. }) => return taken(s, &email, b.auth_request),
-        // Zitadel's policy, by its captured create-path ids, or its validation of the field (a
-        // password over 200 runes, which the 72-byte cap already refuses). Any other refusal
-        // (a missing org: the instance is misconfigured) isn't the visitor's password (#79).
-        Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) || e.is_invalid_request() => {
+        // Only Zitadel's policy, by its captured create-path ids, is the visitor's password (#79).
+        Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
+        // Its validation of a field (code 3, no id) is still the visitor's input, but no field
+        // in particular: the name and password checks above catch the known ones first.
+        Err(e) if e.is_invalid_request() => {
+            return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_DETAILS);
+        }
+        // Any other refusal (a missing org: the instance is misconfigured) isn't the visitor's.
         Err(e) => return unavailable(&e),
     };
     if let Some(nonce) = &nonce
