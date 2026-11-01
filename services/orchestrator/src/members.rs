@@ -2805,7 +2805,7 @@ where
     operation_id = "removeMember",
     tag = "members",
     summary = "Remove a member",
-    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended; a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended (one that never finished sign-up can't be deactivated, so it is locked instead); a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Removed"),
@@ -2944,7 +2944,7 @@ where
     operation_id = "declineMember",
     tag = "members",
     summary = "Decline a sign-up",
-    description = "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended; a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+    description = "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended (one that never finished sign-up can't be deactivated, so it is locked instead); a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Declined"),
@@ -3056,7 +3056,7 @@ async fn deactivate_for_removal(z: &Zitadel, user: &str) -> Result<(), ZError> {
     operation_id = "suspendMember",
     tag = "members",
     summary = "Suspend a member",
-    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The suspended member", body = Member),
