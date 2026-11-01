@@ -673,6 +673,48 @@ async fn invited_becomes_active_on_ensure() {
     s.finish().await;
 }
 
+// One Zitadel user in two tenants: each membership sees the other until it is removed; the
+// user's last membership has no other.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn other_membership_is_any_tenants_non_removed_row() {
+    let s = Scratch::new().await;
+    let (t1, t2) = (s.tenant().await, s.tenant().await);
+    let mut admins = Vec::new();
+    let mut zs = Vec::new();
+    for t in [t1, t2] {
+        let admin = s
+            .client
+            .ensure_member_first_comer_for_tests(t, &format!("a-{t:?}"), "", "A", Admission::Active)
+            .await
+            .unwrap();
+        let z = s
+            .client
+            .ensure_member_first_comer_for_tests(t, "z", "", "Z", Admission::Active)
+            .await
+            .unwrap();
+        assert!(!z.tenant_admin);
+        admins.push(admin.id);
+        zs.push(z.id);
+    }
+    // Someone else's row (another Zitadel user) never counts.
+    s.client
+        .ensure_member_first_comer_for_tests(t1, "y", "", "Y", Admission::Active)
+        .await
+        .unwrap();
+    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
+    assert!(s.client.has_other_membership(zs[1]).await.unwrap());
+    assert!(!s.client.has_other_membership(admins[0]).await.unwrap());
+    assert!(!s.client.has_other_membership(Uuid::new_v4()).await.unwrap());
+    s.client.remove_member(admins[0], zs[0]).await.unwrap();
+    // The removed row no longer counts for the other; the removed one still sees the other.
+    assert!(!s.client.has_other_membership(zs[1]).await.unwrap());
+    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
+    s.client.remove_member(admins[1], zs[1]).await.unwrap();
+    assert!(!s.client.has_other_membership(zs[0]).await.unwrap());
+    s.finish().await;
+}
+
 // I1: an invited member becomes active only while an open invite exists. After the invite
 // expired, a sign-in (a password the person already had) changes nothing; a resend opens it
 // again.

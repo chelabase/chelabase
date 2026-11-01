@@ -4205,6 +4205,14 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         })
     }
 
+    async fn has_other_membership(&self, member: uuid::Uuid) -> Result<bool, MetadataError> {
+        let members = self.members.lock().unwrap();
+        let Some(user) = members.iter().find(|m| m.id == member).map(|m| m.zitadel_user_id.clone()) else {
+            return Ok(false);
+        };
+        Ok(members.iter().any(|m| m.id != member && m.zitadel_user_id == user && m.status != MemberStatus::Removed))
+    }
+
     async fn decline_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<String> {
         use chelabase_metadata::members::AccessWriteError;
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().ok_or(AccessWriteError::MemberNotFound)?;

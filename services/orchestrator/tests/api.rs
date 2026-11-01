@@ -17228,3 +17228,93 @@ async fn app_user_reactivate_cannot_reach_a_members_zitadel_user() {
     assert!(!au.mock().calls().iter().any(|c| c.contains("reactivate")), "{:?}", au.mock().calls());
     assert!(au.mock().user_by_id(&member.to_string()).unwrap().locked);
 }
+
+// --- Epic review (#77): reinstate after a failed suspend; deactivate only the last membership ---
+
+/// A suspend whose lock fails after the reactivate deactivates the user again and answers 503.
+/// Reinstating instead of retrying the suspend must give back a working sign-in: the user is
+/// reactivated, not left inactive behind a 200.
+#[tokio::test]
+async fn reinstating_after_a_failed_suspend_reactivates_the_user() {
+    let p = pl_world().await;
+    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
+    p.t.mock.set_inactive(&p.bob.1, true);
+    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
+    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 503);
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive, "the failed suspend deactivated it again");
+    // A reactivate that fails is 503 and the reinstate stays retryable.
+    p.t.mock.fail("/reactivate", 503, "Errors.Internal", 1);
+    let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive);
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
+    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Active);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    assert!(!user.locked && !user.inactive, "active and unlocked: {user:?}");
+    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
+}
+
+/// One Zitadel user can be a member of several tenants. Removing (or declining) one membership
+/// while another isn't removed only ends the user's sessions; the last one deactivates it.
+#[tokio::test]
+async fn removing_or_declining_deactivates_only_the_last_membership() {
+    let t = mw(Mode::SelfHosted).await;
+    let other_tenant = TenantId::new();
+    let z_client = Zitadel::new(&t.mock.base, ADMIN_TOKEN);
+    // Removal.
+    let z = t.mock.add_user_in("org-1", "kim@x.com", "Secret-pass1", true);
+    let kim = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
+    let elsewhere = t.w.metadata.add_member(other_tenant, &z, MemberStatus::Active, false);
+    z_client.create_session(&z, "Secret-pass1").await.unwrap();
+    let path = format!("/v1/members/{kim}");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.w.metadata.member(t.w.tenant, &z).unwrap().status, MemberStatus::Removed);
+    let user = t.mock.user_by_id(&z).unwrap();
+    assert!(!user.inactive && !user.locked, "still a member elsewhere: {user:?}");
+    assert_eq!(t.mock.session_count(), 0, "its sessions ended");
+    // Once the other membership is removed too, the retry deactivates.
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == elsewhere).unwrap().status = MemberStatus::Removed;
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&z).unwrap().inactive, "the last membership deactivates");
+    // Decline.
+    let zp = t.mock.add_user_in("org-1", "pia@x.com", "Secret-pass1", true);
+    let pia = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
+    let elsewhere = t.w.metadata.add_member(other_tenant, &zp, MemberStatus::Suspended, false);
+    let path = format!("/v1/members/{pia}/decline");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert_eq!(t.w.metadata.member(t.w.tenant, &zp).unwrap().status, MemberStatus::Removed);
+    assert!(!t.mock.user_by_id(&zp).unwrap().inactive, "decline: still a member elsewhere");
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == elsewhere).unwrap().status = MemberStatus::Removed;
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&zp).unwrap().inactive, "decline: the last membership deactivates");
+    // An Initial user with another membership isn't locked either.
+    let zi = t.mock.add_user_in("org-1", "ian@x.com", "", false);
+    t.mock.set_initial(&zi);
+    let ian = t.w.metadata.add_member(t.w.tenant, &zi, MemberStatus::Pending, false);
+    t.w.metadata.add_member(other_tenant, &zi, MemberStatus::Invited, false);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{ian}/decline"), None).await.status(), 204);
+    assert!(!t.mock.user_by_id(&zi).unwrap().locked, "initial: still invited elsewhere");
+}
+
+/// Revoking an invite of a user who is a member of another tenant leaves the Zitadel user alone
+/// (neither deactivated nor deleted).
+#[tokio::test]
+async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
+    let t = mw(Mode::SelfHosted).await;
+    let other_tenant = TenantId::new();
+    // Once had a password (deactivated otherwise).
+    let zr = t.mock.add_user_in("org-1", "ray@x.com", "Secret-pass1", true);
+    let ray = t.w.metadata.add_member(t.w.tenant, &zr, MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, &zr, |m| m.email = Some("ray@x.com".into()));
+    t.w.metadata.add_member(other_tenant, &zr, MemberStatus::Active, false);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{ray}"), None).await.status(), 204);
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "ray@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
+    assert!(!t.mock.user_by_id(&zr).unwrap().inactive, "revoke: still a member elsewhere");
+}

@@ -1612,6 +1612,20 @@ impl MetadataClient {
         .transpose()?)
     }
 
+    /// Whether `member`'s Zitadel user has another member row, in any tenant, that isn't
+    /// removed: a removal then leaves the user active (only its sessions end). An unknown
+    /// `member` is `false`.
+    pub async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM members m JOIN members o
+                              ON o.zitadel_user_id = m.zitadel_user_id AND o.id <> m.id
+                            WHERE m.id = $1 AND o.status <> 'removed')",
+        )
+        .bind(member)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// The caller's member row, made on its first request. Runs on every request, so an active
     /// member whose claims didn't change costs one read: no lock, no write. A changed name
     /// alone is refreshed by a plain UPDATE; a changed email takes the tenant row and the
