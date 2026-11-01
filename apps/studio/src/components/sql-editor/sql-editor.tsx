@@ -348,7 +348,8 @@ function SqlWorkspace({
           </div>
         </div>
         <div className="flex min-h-0 flex-1">
-          <div className="min-w-0 flex-1 overflow-auto">{codeEditor}</div>
+          {/* CodeMirror takes the drawer body's height (the page theme caps it at 24rem); the same mounted editor, no remount. */}
+          <div className="min-h-0 min-w-0 flex-1 overflow-hidden [&>[data-testid=sql-editor]]:h-full [&_.cm-editor]:h-full [&_.cm-editor]:max-h-none">{codeEditor}</div>
           <div aria-label="Output" role="group" className="w-[42%] min-w-0 space-y-2 overflow-auto border-l border-line p-2">
             {noRoleNote}
             {ownerWarning && <p className="border border-destructive/40 p-1.5 text-xs">{ownerWarning}</p>}

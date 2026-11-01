@@ -222,6 +222,16 @@ describe("the SQL drawer", () => {
     expect(within(drawer).queryByText(/Running as owner/)).toBeNull();
   });
 
+  it("below_40rem_with_sql_in_the_url_the_button_is_not_pressed_and_still_opens_the_full_editor", async () => {
+    narrow(true);
+    const { navigate, openSqlEditor, user } = mount({ sql: true });
+    const button = await screen.findByRole("button", { name: "SQL" });
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    await user.click(button);
+    expect(openSqlEditor).toHaveBeenCalledWith(FULL);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("below_40rem_an_open_drawer_from_the_url_stays_closed", async () => {
     narrow(true);
     mount({ sql: true });
