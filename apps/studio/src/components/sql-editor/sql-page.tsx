@@ -14,6 +14,8 @@ const SqlEditor = lazy(() => import("./sql-editor").then((m) => ({ default: m.Sq
 export interface SqlPageProps {
   params: EditorParams;
   navigate: (p: EditorParams, opts?: { replace?: boolean }) => void;
+  /** Quick view: the table editor at this place with the SQL drawer open. */
+  openTables?: (p: EditorParams) => void;
   /** Starts the pgls worker (tests inject a fake). */
   createClient?: () => Promise<PglsClient>;
 }
@@ -30,6 +32,13 @@ function browserStorage(kind: "local" | "session"): Storage | null {
 const PLACE_LEVELS = LEVELS.slice(0, 4);
 const sameLevels = (a: EditorParams, b: EditorParams) => PLACE_LEVELS.every((l) => (a[l] || undefined) === (b[l] || undefined));
 
+/** Quick view's place: the table last open in the table editor when it was at this place, else this place's table list. */
+function quickViewTarget(current: EditorParams): EditorParams {
+  const place: EditorParams = Object.fromEntries(PLACE_LEVELS.flatMap((l) => (current[l] ? [[l, current[l]]] : [])));
+  const last = readLast(browserStorage("local"));
+  return last?.table && sameLevels(last, place) ? { ...place, schema: last.schema, table: last.table } : place;
+}
+
 /**
  * Studio's SQL editor page: the shared context bar in the header (the place and Act as are the
  * table editor's, from `usePlace`), saved queries and history on the left, the editor and results
@@ -45,7 +54,7 @@ export function SqlPage(props: SqlPageProps) {
   );
 }
 
-function Page({ params, navigate, createClient }: SqlPageProps) {
+function Page({ params, navigate, openTables, createClient }: SqlPageProps) {
   const fill = useFillViewport();
   const [last] = useState(() => readLast(browserStorage("local"), SQL_LAST_KEY));
   const place = usePlace(params);
@@ -113,6 +122,7 @@ function Page({ params, navigate, createClient }: SqlPageProps) {
           branchProtected={branch.protected}
           onPgDatabase={(name) => navigate({ ...current, pgDatabase: name })}
           onRole={place.setActAs}
+          onQuickView={openTables && (() => openTables(quickViewTarget(current)))}
           createClient={createClient}
         />
       </Suspense>

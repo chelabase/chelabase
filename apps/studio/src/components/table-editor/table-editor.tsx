@@ -13,6 +13,7 @@ import { rowAccess, structureAccess } from "@/lib/table-editor/access";
 import { changesetKey } from "@/lib/table-editor/changeset";
 import { editorPath, readLast, resolveParams, writeLast, type EditorParams, type Resolution } from "@/lib/table-editor/context";
 import { formatBytes } from "@/lib/table-editor/dry-run";
+import type { PglsClient } from "@/lib/pgls/client";
 import { TableEditorStoreContext, createTableEditorStore, useTableEditor } from "@/lib/table-editor/store";
 import { usePlace } from "@/lib/table-editor/use-place";
 import { ContextBar } from "./context-bar";
@@ -23,11 +24,19 @@ import { NewTableView } from "./new-table";
 import { StructureView } from "./structure-view";
 import { TableList } from "./table-list";
 import { TypesView } from "./types-view";
+import { SqlDrawer } from "./sql-drawer";
 import type { TableTarget } from "./target";
 
 export interface TableEditorProps {
   params: EditorParams;
-  navigate: (p: EditorParams, opts?: { replace?: boolean }) => void;
+  /** `sql` opens or closes the SQL drawer (the URL's `?sql=1`); left out, the drawer stays as it is. */
+  navigate: (p: EditorParams, opts?: { replace?: boolean; sql?: boolean }) => void;
+  /** The SQL drawer is open (`?sql=1`). */
+  sql?: boolean;
+  /** The SQL tab at this place (the drawer's Full editor, and SQL on a narrow screen). */
+  openSqlEditor?: (p: EditorParams) => void;
+  /** Starts the drawer's pgls worker (tests inject a fake). */
+  createSqlClient?: () => Promise<PglsClient>;
   /** Rendered inside the editor's store (the route's blocker for a dirty row draft); the editor stays router-free. */
   leaveGuard?: ComponentType;
 }
@@ -63,7 +72,10 @@ export function TableEditor(props: TableEditorProps) {
   );
 }
 
-function Editor({ params, navigate }: TableEditorProps) {
+/** Below the 40rem breakpoint SQL opens the full editor: there is no room for a drawer. */
+const narrow = () => typeof window.matchMedia === "function" && window.matchMedia("(width < 40rem)").matches;
+
+function Editor({ params, navigate, sql = false, openSqlEditor, createSqlClient }: TableEditorProps) {
   const fill = useFillViewport();
   // The last place, read once: it only matters for the levels this visit leaves out.
   const [last] = useState(() => readLast(browserStorage("local")));
@@ -156,6 +168,31 @@ function Editor({ params, navigate }: TableEditorProps) {
   const pageSize = detail.isPending ? null : pageSizeFor(detail.data?.max_rows);
   const exactRows = useTableEditor((s) => (target ? (s.exactRows[target.key] ?? null) : null));
 
+  // The SQL drawer: Developer and up, once the place is known. Leaving for the SQL tab asks about a row draft first.
+  const canSql = caps.atLeast("developer");
+  const openFull = () => openSqlEditor && guardDiscard(() => openSqlEditor(current));
+  const toggleSql = () => (!sql && narrow() ? openFull() : navigate(current, { sql: !sql, replace: true }));
+  const drawer =
+    sql && canSql && ready && branch && pg && current.databaseId && current.branchId ? (
+      <SqlDrawer
+        databaseId={current.databaseId}
+        branchId={current.branchId}
+        branchName={branch.name}
+        branchProtected={branch.protected}
+        pg={pg}
+        pgDatabases={(pgList ?? []).map((d) => d.name)}
+        role={actAs}
+        allowed={allowed}
+        rolesReady={actAsReady}
+        onPgDatabase={(name) => go({ ...current, pgDatabase: name, schema: undefined, table: undefined })}
+        onRole={(role) => guardDiscard(() => place.setActAs(role))}
+        table={target && !draftTarget ? { schema: target.schema, table: target.table } : null}
+        onFullEditor={openFull}
+        onClose={() => navigate(current, { sql: false, replace: true })}
+        createClient={createSqlClient}
+      />
+    ) : null;
+
   let main;
   if (resolution.kind === "not_found") {
     main = <p className="p-6 text-sm">{NOT_FOUND[resolution.level]} not found</p>;
@@ -246,8 +283,13 @@ function Editor({ params, navigate }: TableEditorProps) {
         objects={branchOk && pg ? objects.data?.objects : undefined}
         noDatabase={ready && !current.pgDatabase}
         exactRows={exactRows}
+        sql={canSql ? { open: sql, onToggle: toggleSql } : undefined}
       />
-      <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">{main}</div>
+      {/* The grid and the drawer share the filled height (the drawer's share is the store's `sqlHeight`). */}
+      <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">
+        <div className="flex min-h-0 flex-1 flex-col">{main}</div>
+        {drawer}
+      </div>
       <EditorPanel
         target={draftTarget ?? target}
         access={draftTarget ? null : rows}
