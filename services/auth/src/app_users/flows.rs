@@ -967,6 +967,7 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
         Err(ZError::Rejected {
             status: 400,
             message,
+            ..
         }) => {
             pending_insert.rollback().await;
             info!(%message, "zitadel refused the new app user");

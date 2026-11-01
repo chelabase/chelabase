@@ -7,6 +7,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use crate::refusals::{self, Refusal};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -98,35 +99,98 @@ type Reply = (StatusCode, Json<Value>);
 fn ok(v: Value) -> Reply {
     (StatusCode::OK, Json(v))
 }
-fn err(status: StatusCode, message: &str) -> Reply {
-    (
-        status,
-        Json(json!({"code": status.as_u16(), "message": message})),
-    )
+/// A refusal by its old error key. `journal` answers it in Zitadel's shape (`zitadel_refusal`).
+fn err(status: StatusCode, key: &str) -> Reply {
+    (status, Json(json!({ MOCK_KEY: key })))
 }
 
-/// Zitadel v4's error shape: a gRPC `code`, a localized `message` ending in the error id, and
-/// `details[]` carrying the id and the message key.
-fn zerr(status: StatusCode, key: &str) -> Reply {
-    let id = "COMMAND-Dg2z3";
-    // gRPC NOT_FOUND for a 404 (what `get_user` checks), else FAILED_PRECONDITION.
-    let code = if status == StatusCode::NOT_FOUND {
-        5
-    } else {
-        9
+/// Where a handler's refusal keeps its key until `journal` shapes it.
+const MOCK_KEY: &str = "mockRefusalKey";
+
+/// The refusal Zitadel v4.19.1 answers for a request (`"METHOD path"`) refused with this old
+/// error key, as `tests/zitadel_live.rs` captured it. `None` for one not captured.
+fn captured(call: &str, key: &str) -> Option<Refusal> {
+    use refusals as r;
+    let verb = |v: &str| call.starts_with("POST /v2/users/") && call.ends_with(&format!("/{v}"));
+    Some(match key {
+        "Errors.User.NotFound" if call.starts_with("GET /v2/users/") => r::GET_USER_NOT_FOUND,
+        "Errors.User.NotFound" if call.starts_with("DELETE /v2/users/") => r::DELETE_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("lock") => r::LOCK_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("unlock") => r::UNLOCK_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("deactivate") => r::DEACTIVATE_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("reactivate") => r::REACTIVATE_USER_NOT_FOUND,
+        "Errors.User.NotFound" if call.ends_with("/invite_code/verify") => r::INVITE_USER_NOT_FOUND,
+        "Errors.User.NotFound" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_FOUND,
+        "Errors.User.AlreadyLocked" | "Errors.User.NotActive" => r::LOCK_NOT_ACTIVE,
+        "Errors.User.NotLocked" => r::UNLOCK_NOT_LOCKED,
+        "Errors.User.AlreadyInactive" => r::DEACTIVATE_ALREADY_INACTIVE,
+        "Errors.User.NotInactive" => r::REACTIVATE_NOT_INACTIVE,
+        // Zitadel answers a wrong, an expired and a missing invite code alike.
+        k if k.starts_with("Errors.User.Code.") && call.ends_with("/invite_code/verify") => {
+            r::INVITE_CODE_INVALID
+        }
+        k if k.starts_with("Errors.User.Code.") && call.ends_with("/email/verify") => {
+            r::EMAIL_CODE_INVALID
+        }
+        k if k.starts_with("Errors.User.Code.") && call.ends_with("/password") => {
+            r::PASSWORD_CODE_NOT_FOUND
+        }
+        "Errors.User.Password.Invalid" => r::PASSWORD_INVALID,
+        "Errors.User.PasswordComplexityPolicy.MinLength" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_TOO_SHORT
+        }
+        "Errors.User.PasswordComplexityPolicy.MinLength" => r::PASSWORD_TOO_SHORT,
+        "Errors.User.PasswordComplexityPolicy.HasUpper" => r::PASSWORD_NO_UPPER,
+        "Errors.User.PasswordComplexityPolicy.HasLower" => r::PASSWORD_NO_LOWER,
+        "Errors.User.PasswordComplexityPolicy.HasNumber" => r::PASSWORD_NO_NUMBER,
+        "Errors.User.PasswordComplexityPolicy.HasSymbol" => r::PASSWORD_NO_SYMBOL,
+        k if k.starts_with("Errors.User.Email.NotChanged") => r::EMAIL_NOT_CHANGED,
+        "Errors.User.AlreadyExists" => r::USER_ALREADY_EXISTS,
+        "Errors.Org.AlreadyExists" => r::ORG_ALREADY_EXISTS,
+        "Errors.Org.NotFound" if call == "POST /v2/users/new" => r::CREATE_USER_ORG_NOT_FOUND,
+        "Errors.User.AlreadyInitialised" => r::INVITE_USER_INITIALIZED,
+        "Errors.AuthRequest.NotFound" => r::AUTH_REQUEST_NOT_FOUND,
+        "Errors.User.Locked" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_ACTIVE,
+        "Errors.Token.Invalid" => r::TOKEN_INVALID,
+        _ => return None,
+    })
+}
+
+/// Zitadel v4.19.1's error body for a refusal: the gRPC `code`, a `message` ending in the
+/// detail id, and one `details[]` entry carrying the id (a `CredentialsCheckError` for a wrong
+/// password, else an `ErrorDetail`). Until m2 the messages are the old error key, not
+/// Zitadel's localized text, so callers that still match keys keep working. A refusal that
+/// wasn't captured gets a gRPC code for its status and a `MOCK-` id.
+fn zitadel_refusal(call: &str, status: StatusCode, key: &str, forced: bool) -> Response {
+    use axum::response::IntoResponse;
+    let (status, code, id) = match captured(call, key) {
+        // A forced fault keeps the status the test chose.
+        Some(r) if forced => (status, r.code, r.id.to_string()),
+        Some(r) => (StatusCode::from_u16(r.status).unwrap(), r.code, r.id.to_string()),
+        None => {
+            let code = match status.as_u16() {
+                401 => refusals::UNAUTHENTICATED,
+                403 => 7,
+                404 => refusals::NOT_FOUND,
+                409 => refusals::ALREADY_EXISTS,
+                429 => 8,
+                400 | 412 => refusals::FAILED_PRECONDITION,
+                _ => 2,
+            };
+            (status, code, format!("MOCK-{key}"))
+        }
     };
-    (
-        status,
-        Json(json!({
-            "code": code,
-            "message": format!("Der Fehler ist aufgetreten ({id})"),
-            "details": [{
-                "@type": "type.googleapis.com/zitadel.v1.ErrorDetail",
-                "id": id,
-                "message": key,
-            }],
-        })),
-    )
+    let detail = if id == refusals::PASSWORD_INVALID.id {
+        "type.googleapis.com/zitadel.v1.CredentialsCheckError"
+    } else {
+        "type.googleapis.com/zitadel.v1.ErrorDetail"
+    };
+    let body = json!({
+        "code": code,
+        "message": format!("{key} ({id})"),
+        "details": [{"@type": detail, "id": id, "message": key}],
+    });
+    (status, Json(body)).into_response()
 }
 
 impl MockZitadel {
@@ -414,7 +478,7 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
             && !is_admin(req.headers())
             && (call.ends_with("/invite_code/verify") || call.starts_with("PATCH /v2/users/"));
         if strict_denied {
-            Some(zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied").into_response())
+            Some(zitadel_refusal(&call, StatusCode::FORBIDDEN, "Errors.PermissionDenied", false))
         } else {
             inner
                 .faults
@@ -425,14 +489,32 @@ async fn journal(State(s): S, req: Request, next: Next) -> Response {
                     let status = StatusCode::from_u16(f.status).unwrap();
                     match &f.body {
                         Some(body) => (status, body.clone()).into_response(),
-                        None => zerr(status, &f.key).into_response(),
+                        None => zitadel_refusal(&call, status, &f.key, true),
                     }
                 })
         }
     };
     match forced {
         Some(reply) => reply,
-        None => next.run(req).await,
+        None => shaped(&call, next.run(req).await).await,
+    }
+}
+
+/// A handler's refusal (`err`) in Zitadel's shape; any other answer as it is.
+async fn shaped(call: &str, reply: Response) -> Response {
+    use axum::response::IntoResponse;
+    let status = reply.status();
+    if !status.is_client_error() {
+        return reply;
+    }
+    let (parts, body) = reply.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap_or_default();
+    match serde_json::from_slice::<Value>(&bytes)
+        .ok()
+        .and_then(|v| v.get(MOCK_KEY)?.as_str().map(str::to_string))
+    {
+        Some(key) => zitadel_refusal(call, status, &key, false),
+        None => (parts, bytes).into_response(),
     }
 }
 
@@ -459,7 +541,7 @@ fn guard(headers: &HeaderMap, inner: &Inner) -> Option<Reply> {
         return Some(err(StatusCode::SERVICE_UNAVAILABLE, "down"));
     }
     (!matches!(bearer(headers), Some(TOKEN | ADMIN_TOKEN)))
-        .then(|| err(StatusCode::UNAUTHORIZED, "no token"))
+        .then(|| err(StatusCode::UNAUTHORIZED, "Errors.Token.Invalid"))
 }
 
 async fn get_auth_request(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
@@ -588,7 +670,7 @@ async fn get_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> Re
     }
     match inner.users.iter().find(|u| u.id == id) {
         Some(u) => ok(json!({"user": user_json(u, &inner)})),
-        None => zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
+        None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
     }
 }
 
@@ -608,11 +690,12 @@ async fn authentication_methods(
     }
     let domain = query.get("domainQuery.domain").map(|d| d.chars().count()).unwrap_or(0);
     if query.keys().any(|k| k.starts_with("domainQuery.")) && !(1..=200).contains(&domain) {
-        return err(
+        // A request that fails validation: no error detail (captured).
+        return (
             StatusCode::BAD_REQUEST,
-            "invalid ListAuthenticationMethodTypesRequest.DomainQuery: embedded message failed \
-             validation | caused by: invalid DomainQuery.Domain: value length must be between 1 \
-             and 200 runes, inclusive",
+            Json(json!({"code": 3, "message": "invalid ListAuthenticationMethodTypesRequest.\
+                DomainQuery: embedded message failed validation | caused by: invalid \
+                DomainQuery.Domain: value length must be between 1 and 200 runes, inclusive"})),
         );
     }
     let Some(u) = inner.users.iter().find(|u| u.id == id) else {
@@ -649,6 +732,7 @@ async fn set_active(s: S, headers: HeaderMap, id: String, inactive: bool) -> Rep
         return e;
     }
     // Zitadel v4.19.1: a precondition refusal (400) when the user is already in that state.
+    // Deactivating a locked user succeeds, and it is then inactive, not locked.
     match inner.users.iter_mut().find(|u| u.id == id) {
         Some(u) if inactive && u.inactive => {
             err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyInactive")
@@ -658,6 +742,7 @@ async fn set_active(s: S, headers: HeaderMap, id: String, inactive: bool) -> Rep
         }
         Some(u) => {
             u.inactive = inactive;
+            u.locked = false;
             ok(json!({}))
         }
         None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
@@ -673,7 +758,8 @@ async fn reactivate(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
 }
 
 /// `POST /v2/users/{id}/lock` and `/unlock`: as `set_active`, a precondition refusal (400) when
-/// the user is already in that state, 404 for an unknown user.
+/// the user is already in that state, 404 for an unknown user. As in Zitadel v4.19.1, only an
+/// active user can be locked: an inactive one gets the same refusal as a locked one.
 async fn set_locked(s: S, headers: HeaderMap, id: String, locked: bool) -> Reply {
     let mut inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
@@ -681,6 +767,7 @@ async fn set_locked(s: S, headers: HeaderMap, id: String, locked: bool) -> Reply
     }
     match inner.users.iter_mut().find(|u| u.id == id) {
         Some(u) if locked && u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyLocked"),
+        Some(u) if locked && u.inactive => err(StatusCode::BAD_REQUEST, "Errors.User.NotActive"),
         Some(u) if !locked && !u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.NotLocked"),
         Some(u) => {
             u.locked = locked;
@@ -800,11 +887,8 @@ async fn delete_org(State(s): S, headers: HeaderMap, Path(id): Path<String>) -> 
     if let Some(e) = admin_only(&headers) {
         return e;
     }
-    let before = inner.orgs.len();
+    // Zitadel v4.19.1 answers 200 for an org deleted before or never created.
     inner.orgs.retain(|o| *o != id);
-    if inner.orgs.len() == before {
-        return err(StatusCode::NOT_FOUND, "Errors.Org.NotFound");
-    }
     inner.users.retain(|u| u.org_id != id);
     let users: Vec<String> = inner.users.iter().map(|u| u.id.clone()).collect();
     inner.sessions.retain(|_, (uid, _)| users.contains(uid));
@@ -903,10 +987,7 @@ async fn create_session(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -
         .unwrap_or("");
     if let Some(left) = inner.hidden.get_mut(uid).filter(|n| **n > 0) {
         *left -= 1;
-        return err(
-            StatusCode::NOT_FOUND,
-            "User could not be found (QUERY-Dfbg2)",
-        );
+        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
     }
     let Some(user) = inner.users.iter().find(|u| u.id == uid).cloned() else {
         return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
@@ -938,9 +1019,8 @@ async fn delete_session(
     if let Some(e) = guard(&headers, &inner) {
         return e;
     }
-    if inner.sessions.remove(&id).is_none() {
-        return err(StatusCode::NOT_FOUND, "Errors.Session.NotFound");
-    }
+    // Zitadel v4.19.1 answers 200 for a session ended before or never created.
+    inner.sessions.remove(&id);
     ok(json!({}))
 }
 
@@ -981,10 +1061,10 @@ async fn create_invite_code(
         return e;
     }
     let Some(user) = inner.users.iter().find(|u| u.id == id) else {
-        return zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
     };
     if !user.password.is_empty() || inner.auth_methods.get(&id).is_some_and(|m| !m.is_empty()) {
-        return zerr(StatusCode::BAD_REQUEST, "Errors.User.AlreadyInitialised");
+        return err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyInitialised");
     }
     inner.next += 1;
     let code = format!("INV{}", inner.next);
@@ -1067,16 +1147,16 @@ async fn verify_invite_code(
         return e;
     }
     if !inner.users.iter().any(|u| u.id == id) {
-        return zerr(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
     }
     let Some((code, expired)) = inner.invites.get(&id).cloned() else {
-        return zerr(StatusCode::BAD_REQUEST, "Errors.User.Code.NotFound");
+        return err(StatusCode::BAD_REQUEST, "Errors.User.Code.NotFound");
     };
     if b.get("verificationCode").and_then(Value::as_str) != Some(code.as_str()) {
-        return zerr(StatusCode::BAD_REQUEST, "Errors.User.Code.Invalid");
+        return err(StatusCode::BAD_REQUEST, "Errors.User.Code.Invalid");
     }
     if expired {
-        return zerr(StatusCode::PRECONDITION_FAILED, "Errors.User.Code.Expired");
+        return err(StatusCode::PRECONDITION_FAILED, "Errors.User.Code.Expired");
     }
     inner.invites.remove(&id);
     ok(json!({"details": {}}))
@@ -1137,7 +1217,7 @@ async fn set_password(
         // (the login client holds user.credential.write, so either token may)
         (None, None) => {
             if inner.strict_login && !is_admin(&headers) {
-                return zerr(StatusCode::FORBIDDEN, "Errors.PermissionDenied");
+                return err(StatusCode::FORBIDDEN, "Errors.PermissionDenied");
             }
         }
     }

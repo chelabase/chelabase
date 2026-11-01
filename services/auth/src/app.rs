@@ -1103,7 +1103,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     user_slot.refund();
                     password_set = b.reset;
                 }
-                Err(ZError::Rejected { status, message }) if has_key(&message, "Errors.User.NotFound") => {
+                Err(ZError::Rejected { status, message, .. }) if has_key(&message, "Errors.User.NotFound") => {
                     info!(status, "accept-invite: the user is gone");
                     user_slot.refund();
                     return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
@@ -1118,7 +1118,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     slot.refund();
                     return weak();
                 }
-                Err(ZError::Rejected { status: status @ (400 | 412), message }) => {
+                Err(ZError::Rejected { status: status @ (400 | 412), message, .. }) => {
                     warn!(status, %message, reset = b.reset, "accept-invite: the code was refused");
                     return bad();
                 }
