@@ -2104,16 +2104,16 @@ async fn invite_expiry_follows_the_unclosed_invite() {
     };
     let open = stored("SELECT expires_at FROM invites WHERE id = $1").await;
     assert!(open > Utc::now());
-    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some(open));
-    // Expired: still answered, with its past expiry.
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some((open, true)));
+    // Expired: still answered, with its past expiry, not open (by the database's clock).
     let past = stored("UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1 RETURNING expires_at").await;
-    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some(past));
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some((past, false)));
     assert!(c.open_invite_for_user("zi").await.unwrap().is_none());
     // Another user's invite isn't this user's.
     assert_eq!(c.invite_expiry_for_user("zother").await.unwrap(), None);
     // Revoked: nothing.
     c.resend_invite(a.id, invite, week(), [9; 32]).await.unwrap();
-    assert!(c.invite_expiry_for_user("zi").await.unwrap().unwrap() > Utc::now());
+    assert!(c.invite_expiry_for_user("zi").await.unwrap().unwrap().1);
     c.revoke_invite(a.id, invite).await.unwrap();
     assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), None);
     s.finish().await;

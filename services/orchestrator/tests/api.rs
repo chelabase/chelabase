@@ -16937,11 +16937,42 @@ async fn a_lock_failing_after_the_reactivate_is_503_and_the_retry_locks() {
     assert_eq!(p.t.mock.session_count(), 0, "the sessions end even when the lock fails");
     assert_eq!(p.zitadel_calls(&p.bob.1, "reactivate"), 1);
     let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
-    assert!(!user.locked && !user.inactive, "reactivated, not locked: {user:?}");
+    assert!(user.locked || user.inactive, "the failed suspend left the user open: {user:?}");
     let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
     assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
     let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
     assert!(user.locked && !user.inactive, "active and locked: {user:?}");
+}
+
+/// Re-audit S1: a lock that fails after the reactivate must not leave the suspended member with a
+/// working sign-in, with or without the deactivate that restores the old state succeeding.
+#[tokio::test]
+async fn audit_failed_lock_after_reactivate_leaves_a_working_sign_in() {
+    let p = pl_world().await;
+    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
+    p.t.mock.set_inactive(&p.bob.1, true);
+    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
+    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    assert_eq!(resp.status(), 503);
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    let after = client.create_session(&p.bob.1, "Secret-pass1").await;
+    assert!(
+        user.inactive || user.locked,
+        "the failed suspend left the user more open than before: {user:?}, session {:?}",
+        after.is_ok()
+    );
+    // When the deactivate fails too, the answer is the lock's 503 all the same.
+    let carl = p.add_person("carl", p.t.w.project, PlatformRole::Viewer);
+    p.t.mock.set_inactive(&carl.1, true);
+    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
+    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
+    p.t.mock.fail("/deactivate", 503, "Errors.Internal", 1);
+    let err = error_of(p.member_action(DEFAULT_SUB, carl.0, "suspend").await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert_eq!(p.member_action(DEFAULT_SUB, carl.0, "suspend").await.status(), 200, "a retry");
+    assert!(p.t.mock.user_by_id(&carl.1).unwrap().locked);
 }
 
 /// A member whose Zitadel user is in the Initial state (it can't be deactivated, only deleted)
