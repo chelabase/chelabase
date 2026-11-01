@@ -3,7 +3,9 @@
 use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
+use chelabase_zitadel::refusals;
 use chelabase_zitadel::rules::{normalize_email, strong_password};
+use crate::app_users::internal::OpenInvite;
 use crate::zitadel::{NewUser, Session, UserState, ZError, ZUser, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -682,7 +684,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if !is_auth_request_id(&b.auth_request) {
         return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
     let Some(org) = org_id(s) else {
@@ -987,29 +989,47 @@ async fn accept_invite(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Acce
     answer
 }
 
-/// The error keys in a `ZError::Rejected` message: its `" | "`-separated parts (the top-level
-/// message, then each `details[]` id and message), each without a trailing `" (ID)"`.
-fn keys(message: &str) -> impl Iterator<Item = &str> {
-    message.split(" | ").map(|part| match part.rsplit_once(" (") {
-        Some((key, id)) if id.ends_with(')') => key,
-        _ => part,
-    })
+/// Zitadel's password-policy refusals on `POST /v2/users/{id}/password` (a reset, a change or an
+/// admin set), by their captured ids: Zitadel localizes the message.
+pub(crate) const SET_PASSWORD_POLICY: [refusals::Refusal; 5] = [
+    refusals::PASSWORD_TOO_SHORT,
+    refusals::PASSWORD_NO_UPPER,
+    refusals::PASSWORD_NO_LOWER,
+    refusals::PASSWORD_NO_NUMBER,
+    refusals::PASSWORD_NO_SYMBOL,
+];
+
+/// The same checks on `POST /v2/users/new`, with that endpoint's ids.
+pub(crate) const CREATE_PASSWORD_POLICY: [refusals::Refusal; 5] = [
+    refusals::CREATE_USER_PASSWORD_TOO_SHORT,
+    refusals::CREATE_USER_PASSWORD_NO_UPPER,
+    refusals::CREATE_USER_PASSWORD_NO_LOWER,
+    refusals::CREATE_USER_PASSWORD_NO_NUMBER,
+    refusals::CREATE_USER_PASSWORD_NO_SYMBOL,
+];
+
+/// A password Zitadel can take: the policy's checks, and at most bcrypt's 72 bytes (counted in
+/// bytes, so 39 characters can be too many). A longer one passes Zitadel's validation and then
+/// fails with a 500 (`refusals::PASSWORD_MAX_BYTES`).
+pub(crate) fn usable_password(password: &str) -> bool {
+    password.len() <= refusals::PASSWORD_MAX_BYTES && strong_password(password)
 }
 
-/// Whether one of Zitadel's error keys is exactly `key`.
-fn has_key(message: &str, key: &str) -> bool {
-    keys(message).any(|k| k == key)
+/// Zitadel refused a new password on `POST /v2/users/{id}/password`: its policy, or its own
+/// validation of the field.
+fn set_password_refused(e: &ZError) -> bool {
+    e.is_any(&SET_PASSWORD_POLICY) || e.is_invalid_request()
 }
 
-fn invite_expired(message: &str) -> bool {
-    has_key(message, "Errors.User.Code.Expired")
-}
-
-/// Zitadel's password policy keys: `Errors.User.PasswordComplexityPolicy.*` (for example
-/// `.MinLength`) and `Errors.User.Password.*`.
-fn password_refused(message: &str) -> bool {
-    keys(message).any(|k| {
-        k.starts_with("Errors.User.PasswordComplexityPolicy.") || k.starts_with("Errors.User.Password.")
+/// What the orchestrator stores about the user's latest member invite. Unconfigured or failing
+/// is an error: callers fail closed.
+async fn open_invite(s: &AppState, user: &str) -> Result<OpenInvite, ()> {
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("accept-invite needs the orchestrator's internal client");
+        return Err(());
+    };
+    orchestrator.open_invite(user).await.map_err(|e| {
+        warn!(error = %e, "accept-invite: the open-invite check failed");
     })
 }
 
@@ -1058,7 +1078,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         return gone(ErrorCode::SignInExpired, GONE);
     }
     // Before the code is spent.
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         slot.refund();
         return weak();
     }
@@ -1116,20 +1136,31 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     user_slot.refund();
                     password_set = b.reset;
                 }
-                Err(ZError::Rejected { status, message, .. }) if has_key(&message, "Errors.User.NotFound") => {
-                    info!(status, "accept-invite: the user is gone");
+                // An arm that hands an attempt back matches one exact captured refusal. A wrong
+                // code is `INVITE_CODE_INVALID` or `PASSWORD_CODE_NOT_FOUND`, never one of them,
+                // so guessing stays counted.
+                Err(e) if !b.reset && e.is(refusals::INVITE_USER_NOT_FOUND) => {
+                    info!("accept-invite: the user is gone");
                     user_slot.refund();
                     return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
                 }
-                Err(ZError::Rejected { message, .. }) if invite_expired(&message) => {
-                    user_slot.refund();
-                    return gone(ErrorCode::InviteExpired, INVITE_EXPIRED);
-                }
-                // The code wasn't spent: no ticket.
-                Err(ZError::Rejected { message, .. }) if b.reset && password_refused(&message) => {
+                // The policy refused the password: the code wasn't spent, so no ticket.
+                Err(e) if b.reset && e.is_any(&SET_PASSWORD_POLICY) => {
                     user_slot.refund();
                     slot.refund();
                     return weak();
+                }
+                // Zitadel's validation of the field has no id to match exactly: it counts.
+                Err(e) if b.reset && e.is_invalid_request() => return weak(),
+                // A wrong, an expired and a missing code get the same answer from Zitadel; the
+                // stored invite tells an expired one apart. Read only now, and counted either way.
+                Err(e) if !b.reset && e.is(refusals::INVITE_CODE_INVALID) => {
+                    return match open_invite(s, &b.user).await {
+                        Ok(OpenInvite { open: false, expires_at: Some(_) }) => {
+                            gone(ErrorCode::InviteExpired, INVITE_EXPIRED)
+                        }
+                        _ => bad(),
+                    };
                 }
                 Err(ZError::Rejected { status: status @ (400 | 412), message, .. }) => {
                     warn!(status, %message, reset = b.reset, "accept-invite: the code was refused");
@@ -1176,17 +1207,29 @@ async fn finish_accept(
     password_set: bool,
 ) -> Response {
     // I1: a deactivated user (a removed member invited again) comes back only now, with a
-    // verified code; the invite itself leaves them deactivated.
+    // verified code; the invite itself leaves them deactivated. #78: and only while Chelabase has
+    // an open invite for them. Anyone can have a reset code mailed, a deactivated user too, so a
+    // checked code alone never reactivates. A suspended member is locked, not inactive, and stays
+    // locked: Zitadel refuses their session below.
     if user.state == UserState::Inactive {
-        match admin.reactivate_user(&b.user).await {
-            Ok(()) | Err(ZError::Rejected { status: 400 | 412, .. }) => {}
-            Err(e) => return incomplete_unavailable(s, &b.user, &e),
+        match open_invite(s, &b.user).await {
+            Ok(OpenInvite { open: true, .. }) => {}
+            Ok(_) => {
+                info!("accept-invite: an inactive user with no open invite stays inactive");
+                return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
+            }
+            Err(()) => {
+                return incomplete(s, &b.user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE);
+            }
+        }
+        if let Err(e) = admin.reactivate_user_settled(&b.user).await {
+            return incomplete_unavailable(s, &b.user, &e);
         }
     }
     if !password_set {
         match admin.set_password_admin(&b.user, &b.password).await {
             Ok(()) => {}
-            Err(ZError::Rejected { message, .. }) if password_refused(&message) => {
+            Err(e) if set_password_refused(&e) => {
                 return incomplete(s, &b.user, StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
             }
             Err(e) => return incomplete_unavailable(s, &b.user, &e),
@@ -1197,6 +1240,11 @@ async fn finish_accept(
     }
     let session = match new_user_session(s, &b.user, &b.password).await {
         Ok(session) => session,
+        // A suspended member: locked until reinstated.
+        Err(e) if e.is_any(&[refusals::SESSION_USER_NOT_ACTIVE, refusals::SESSION_USER_LOCKED]) => {
+            info!("accept-invite: the user is locked; no session");
+            return incomplete(s, &b.user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE);
+        }
         Err(e) => return incomplete_unavailable(s, &b.user, &e),
     };
     match b.auth_request {
@@ -1498,7 +1546,7 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     // Checked before Zitadel sees the user id, so this answer can't tell ids apart.
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
     if !is_user_id(user_id) {
