@@ -12,8 +12,9 @@
 #                                                   Dockerfiles; part of `just check`)
 #
 # Inputs:
-#   every image   infra/images/{docker-bake.hcl,server.Dockerfile}, .dockerignore and the release
-#                 scripts (this one, publish-images.sh, pin-images.sh)
+#   every image   infra/images/{docker-bake.hcl,server.Dockerfile} and .dockerignore. Not the
+#                 release scripts: they select, push and pin images, and publish-images.sh reaches
+#                 the build only through bake variables whose effect lives in docker-bake.hcl
 #   Rust images   the service's closure of workspace path crates (normal and build deps, from
 #                 `cargo metadata`), the manifest of every crate any Rust image builds (one cargo
 #                 build unifies features across them), Cargo.toml, Cargo.lock, rust-toolchain*,
@@ -29,8 +30,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 images=(gateway orchestrator worker rest auth realtime init studio)
 rust=(gateway orchestrator worker rest auth realtime init)
 envex=infra/compose/.env.example
-common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore
-  scripts/image-inputs.sh scripts/publish-images.sh scripts/pin-images.sh)
+common=(infra/images/docker-bake.hcl infra/images/server.Dockerfile .dockerignore)
 
 die() { echo "image-inputs: $*" >&2; exit 2; }
 known() { [[ " ${images[*]} " == *" $1 "* ]]; }

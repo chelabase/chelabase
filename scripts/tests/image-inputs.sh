@@ -154,9 +154,13 @@ done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
 all="gateway orchestrator worker rest auth realtime init studio"
-for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore scripts/publish-images.sh scripts/pin-images.sh scripts/image-inputs.sh; do
+for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"
+done
+for f in scripts/publish-images.sh scripts/pin-images.sh scripts/image-inputs.sh; do
+  case_ edit "$f"
+  expect "$f (release tooling, not image content) -> nothing" "" "$(changed)"
 done
 case_ sed -i 's#/worker:${CHELABASE_IMAGE_TAG:-[0-9a-f]*#/worker:${CHELABASE_IMAGE_TAG:-deadbeef0000#' infra/compose/docker-compose.yml
 expect "a pin commit missing from history -> changed" "worker" "$(changed)"
