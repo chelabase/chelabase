@@ -397,22 +397,31 @@ async fn the_refusals_callers_map_are_the_captured_ones() {
         ] {
             assert_refused(password, z.set_password_admin(&user, password).await, want);
         }
-        let weak = format!("weak-{}@example.com", tag());
-        let created = z
-            .create_user(&NewUser {
-                org_id: &org,
-                email: &weak,
-                given_name: "Weak",
-                family_name: "User",
-                password: Some("Sh0rt!"),
-                user_id: None,
-                username: Some(&weak),
-                send_code: false,
-                verified: true,
-                url_template: "",
-            })
-            .await;
-        assert_refused("new user, short password", created, refusals::CREATE_USER_PASSWORD_TOO_SHORT);
+        // On create each check has its own `COMMA-` id.
+        for (password, want) in [
+            ("Sh0rt!", refusals::CREATE_USER_PASSWORD_TOO_SHORT),
+            ("abcdefgh1!", refusals::CREATE_USER_PASSWORD_NO_UPPER),
+            ("ABCDEFGH1!", refusals::CREATE_USER_PASSWORD_NO_LOWER),
+            ("Abcdefgh!!", refusals::CREATE_USER_PASSWORD_NO_NUMBER),
+            ("Abcdefgh12", refusals::CREATE_USER_PASSWORD_NO_SYMBOL),
+        ] {
+            let weak = format!("weak-{}@example.com", tag());
+            let created = z
+                .create_user(&NewUser {
+                    org_id: &org,
+                    email: &weak,
+                    given_name: "Weak",
+                    family_name: "User",
+                    password: Some(password),
+                    user_id: None,
+                    username: Some(&weak),
+                    send_code: false,
+                    verified: true,
+                    url_template: "",
+                })
+                .await;
+            assert_refused(&format!("new user, {password}"), created, want);
+        }
         assert_refused("wrong current password", z.change_password(&user, "wrong", "An0ther!pass").await, refusals::PASSWORD_INVALID);
         assert_refused("wrong reset code", z.set_password(&user, "NOPE12", "An0ther!pass").await, refusals::PASSWORD_CODE_NOT_FOUND);
         assert_refused("wrong email code", z.verify_email(&user, "NOPE12").await, refusals::EMAIL_CODE_INVALID);

@@ -5436,6 +5436,18 @@ struct Au {
 }
 
 async fn au_env(with_zitadel: bool) -> Au {
+    let (mock, zitadel) = if with_zitadel {
+        let mock = MockZitadel::start().await;
+        let z = Zitadel::new(&mock.base, ADMIN_TOKEN);
+        (Some(mock), Some(z))
+    } else {
+        (None, None)
+    };
+    au_env_on(mock, zitadel).await
+}
+
+/// [`au_env`] with this Zitadel client (the mock's, or a real one with no mock).
+async fn au_env_on(mock: Option<MockZitadel>, zitadel: Option<Zitadel>) -> Au {
     let metadata = FakeMetadata::default();
     let jobs = FakeJobs::default();
     let tenant = TenantId::new();
@@ -5447,14 +5459,9 @@ async fn au_env(with_zitadel: bool) -> Au {
     metadata.add_branch_db(main, "web1", "owner", DatabaseOrigin::Main);
     metadata.set_data_api(main, "web1", chelabase_metadata::DataApiState::On);
     let udb = FakeUsersDb::default();
-    let (mock, zitadel) = if with_zitadel {
-        let mock = MockZitadel::start().await;
+    if let Some(mock) = &mock {
         *udb.probe.lock().unwrap() = Some(mock.inner.clone());
-        let z = Zitadel::new(&mock.base, ADMIN_TOKEN);
-        (Some(mock), Some(z))
-    } else {
-        (None, None)
-    };
+    }
     let app = spawn_app_parts(
         metadata.clone(),
         jobs.clone(),
@@ -5481,6 +5488,11 @@ impl Au {
     }
 
     fn set_auth(&self, status: AppUsersStatus) {
+        self.set_auth_in(status, AU_ORG);
+    }
+
+    /// [`Au::set_auth`] with the project's users in Zitadel org `org`.
+    fn set_auth_in(&self, status: AppUsersStatus, org: &str) {
         let now = chrono::Utc::now();
         self.metadata.project_auths.lock().unwrap().insert(
             self.project.id,
@@ -5488,7 +5500,7 @@ impl Au {
                 project_id: self.project.id,
                 status,
                 error: None,
-                zitadel_org_id: Some(AU_ORG.into()),
+                zitadel_org_id: Some(org.into()),
                 database_id: self.db,
                 pg_database: "web1".into(),
                 schema_name: "public".into(),
@@ -16874,14 +16886,13 @@ async fn a_deactivate_that_isnt_zitadels_answer_is_503_and_retriable() {
     assert!(t.mock.user_by_id(&zr).unwrap().inactive);
 }
 
-/// An inactive user can't sign in, so suspending their member completes: the sessions end, and
-/// the retry has nothing left to do.
+/// Suspending a member whose Zitadel user is inactive reactivates it, locks it, then ends its
+/// sessions: the user ends active and locked (an inactive user could be reactivated by a reset
+/// code's accept-invite, a locked one can't), and reinstating gives back a working sign-in.
 #[tokio::test]
-async fn suspending_a_member_whose_zitadel_user_is_inactive_completes() {
+async fn suspending_a_member_whose_zitadel_user_is_inactive_locks_it() {
     let p = pl_world().await;
-    p.t.mock.set_inactive(&p.bob.1, true);
     let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
-    p.t.mock.set_inactive(&p.bob.1, false);
     client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
     p.t.mock.set_inactive(&p.bob.1, true);
     assert_eq!(p.t.mock.session_count(), 1);
@@ -16889,13 +16900,120 @@ async fn suspending_a_member_whose_zitadel_user_is_inactive_completes() {
     assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
     assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
     assert_eq!(p.t.mock.session_count(), 0, "its sessions ended");
-    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    assert!(user.locked && !user.inactive, "active and locked: {user:?}");
+    assert!(client.create_session(&p.bob.1, "Secret-pass1").await.is_err(), "no sign-in");
     assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200, "a retry");
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
+    // Reinstating unlocks it: a working sign-in.
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "reinstate").await;
+    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    assert!(!user.locked && !user.inactive, "active and unlocked: {user:?}");
+    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
     // A refusal that isn't Zitadel's still fails the suspend.
     let carl = p.add_person("carl", p.t.w.project, PlatformRole::Viewer);
     p.t.mock.fail("/lock", 400, "Errors.Odd", 1);
     assert_eq!(p.member_action(DEFAULT_SUB, carl.0, "suspend").await.status(), 503);
     assert!(!p.t.mock.user_by_id(&carl.1).unwrap().locked);
+}
+
+/// A lock that fails after the reactivate answers 503, still ends the sessions, and leaves a
+/// state the retry completes from (the same steps again).
+#[tokio::test]
+async fn a_lock_failing_after_the_reactivate_is_503_and_the_retry_locks() {
+    let p = pl_world().await;
+    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
+    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
+    p.t.mock.set_inactive(&p.bob.1, true);
+    // The first lock gets Zitadel's own answer for an inactive user; the one after the
+    // reactivate fails.
+    p.t.mock.fail("/lock", 400, "Errors.User.NotActive", 1);
+    p.t.mock.fail("/lock", 503, "Errors.Internal", 1);
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    let err = error_of(resp, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
+    assert_eq!(p.t.mock.session_count(), 0, "the sessions end even when the lock fails");
+    assert_eq!(p.zitadel_calls(&p.bob.1, "reactivate"), 1);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    assert!(!user.locked && !user.inactive, "reactivated, not locked: {user:?}");
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
+    let user = p.t.mock.user_by_id(&p.bob.1).unwrap();
+    assert!(user.locked && !user.inactive, "active and locked: {user:?}");
+}
+
+/// A member whose Zitadel user is in the Initial state (it can't be deactivated, only deleted)
+/// is removed or declined all the same: the user is locked, so it can't finish sign-up, and the
+/// removal is done (204), not a 409 on every retry.
+#[tokio::test]
+async fn removing_or_declining_a_member_whose_zitadel_user_is_initial_locks_it() {
+    let t = mw(Mode::SelfHosted).await;
+    let z = t.mock.add_user_in("org-1", "ini@x.com", "", false);
+    t.mock.set_initial(&z);
+    let ini = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
+    let path = format!("/v1/members/{ini}");
+    let resp = t.send(DEFAULT_SUB, Method::DELETE, &path, None).await;
+    assert_eq!(resp.status(), 204, "{}", body_of(resp).await);
+    assert!(t.mock.user_by_id(&z).unwrap().locked, "remove: locked");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204, "a retry");
+    // Decline.
+    let zp = t.mock.add_user_in("org-1", "inip@x.com", "", false);
+    t.mock.set_initial(&zp);
+    let pat = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
+    let path = format!("/v1/members/{pat}/decline");
+    let resp = t.send(DEFAULT_SUB, Method::POST, &path, None).await;
+    assert_eq!(resp.status(), 204, "{}", body_of(resp).await);
+    assert!(t.mock.user_by_id(&zp).unwrap().locked, "decline: locked");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204, "a retry");
+}
+
+const PROXY_404: &str = "<html><head><title>404 Not Found</title></head><body>nginx</body></html>";
+const PROXY_400: &str = "<html><head><title>400 Bad Request</title></head><body>nginx</body></html>";
+
+/// A proxy's HTML 404 or 400 on the Zitadel step of a removal or a suspension is 503, with the
+/// Zitadel user untouched; the retry completes it.
+#[tokio::test]
+async fn a_proxys_html_answer_on_remove_or_suspend_is_503() {
+    let p = pl_world().await;
+    let path = format!("/v1/members/{}", p.vera.0);
+    for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
+        p.t.mock.answer_raw("/deactivate", status, body, 1);
+        let err = error_of(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+        assert_eq!(code_of(&err), "unavailable", "remove {status}");
+        assert!(!p.t.mock.user_by_id(&p.vera.1).unwrap().inactive, "remove {status}: still active");
+    }
+    assert_eq!(p.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(p.t.mock.user_by_id(&p.vera.1).unwrap().inactive);
+    for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
+        p.t.mock.answer_raw("/lock", status, body, 1);
+        let err = error_of(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await, 503).await;
+        assert_eq!(code_of(&err), "unavailable", "suspend {status}");
+        assert!(!p.t.mock.user_by_id(&p.bob.1).unwrap().locked, "suspend {status}: not locked");
+    }
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200);
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().locked);
+}
+
+/// The same for the app-user delete and deactivate routes.
+#[tokio::test]
+async fn a_proxys_html_answer_on_app_user_delete_or_deactivate_is_503() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    for (what, method, path, verb) in [
+        ("deactivate", Method::POST, format!("/users/{id}/deactivate"), "/deactivate"),
+        ("delete", Method::DELETE, format!("/users/{id}"), "DELETE /v2/users/"),
+    ] {
+        for (status, body) in [(404, PROXY_404), (400, PROXY_400)] {
+            au.mock().answer_raw(verb, status, body, 1);
+            let (got, answer) = au.call(method.clone(), &path, None).await;
+            assert_eq!((got, code_of(&answer)), (503, "unavailable"), "{what} {status}: {answer}");
+        }
+    }
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert!(!user.inactive, "the user is untouched");
 }
 
 /// An invite code asked for a user Zitadel doesn't have is a 400 (`COMMAND-Wgvn4`); the resend
@@ -16940,6 +17058,104 @@ async fn app_user_passwords_over_72_bytes_are_422_before_zitadel() {
     let exact = "Aa1!".repeat(18);
     let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": exact}))).await;
     assert_eq!(status, 200, "{body}");
+}
+
+/// Zitadel's create-path password-policy refusals (one `COMMA-` id per check, as
+/// `tests/zitadel_live.rs` captured them) are 422 `weak_password`, not 503.
+#[tokio::test]
+async fn app_user_create_maps_every_password_policy_refusal_to_weak_password() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    for id in ["COMMA-HuJf6", "COMMA-VoaRj", "COMMA-co3Xw", "COMMA-ZBv4H", "COMMA-ZDLwA"] {
+        let body = json!({
+            "code": 3,
+            "message": format!("Errors.User.PasswordComplexityPolicy ({id})"),
+            "details": [{"@type": "type.googleapis.com/zitadel.v1.ErrorDetail", "id": id, "message": "policy"}],
+        });
+        au.mock().answer_raw("POST /v2/users/new", 400, &body.to_string(), 1);
+        let (status, answer) = au.call(Method::POST, "/users", Some(json!({"email": "w@x.test", "password": AU_PASSWORD}))).await;
+        assert_eq!((status, code_of(&answer)), (422, "weak_password"), "{id}: {answer}");
+    }
+}
+
+/// Reactivating an app user in the Initial state (it never finished sign-up, so it was never
+/// deactivated) is a 409, not a 200 that shows it `inactive`.
+#[tokio::test]
+async fn reactivating_an_initial_app_user_is_409() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "i@x.test");
+    au.mock().set_initial(&id.to_string());
+    let (status, body) = au.call(Method::POST, &format!("/users/{id}/reactivate"), None).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "{body}");
+}
+
+/// The app-user routes' answers for the refusals the real Zitadel gives, through the routes
+/// (create, update, state changes, delete). Runs in the workbench runner, which has `demo.env`:
+///
+/// ```text
+/// just workbench test -p orchestrator --test api -- --run-ignored only live_app_user_routes
+/// ```
+#[tokio::test]
+#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[allow(clippy::disallowed_methods)]
+async fn live_app_user_routes_answer_zitadels_refusals() {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset (source demo.env)"));
+    let issuer = var("CHELABASE_ZITADEL_ISSUER");
+    let host = issuer.split_once("://").map(|(_, h)| h.trim_end_matches('/').to_string()).unwrap();
+    let base = std::env::var("CHELABASE_ZITADEL_INTERNAL_URL")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "http://zitadel:8080".into());
+    let base = base.trim_end_matches('/').to_string();
+    let pat_file = std::path::PathBuf::from(var("CHELABASE_ZITADEL_ADMIN_PAT_FILE"));
+    let pat_file = if pat_file.is_relative() { std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(pat_file) } else { pat_file };
+    let pat = std::fs::read_to_string(pat_file).unwrap().trim().to_string();
+    let z = Zitadel::new(&base, &pat).with_host(Some(&host));
+    let tag = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let org = format!("live-routes-{tag}");
+    z.ensure_org(&org, &org).await.unwrap();
+    let au = au_env_on(None, Some(Zitadel::new(&base, &pat).with_host(Some(&host)))).await;
+    au.set_auth_in(AppUsersStatus::Enabled, &org);
+    au.seal_sync_role();
+    let strong = "Str0ng!pass-live";
+    let email = format!("a-{tag}@example.com");
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": email, "password": strong}))).await;
+    assert_eq!(status, 201, "create: {body}");
+    let id = body["id"].as_str().unwrap().to_string();
+    let user = format!("/users/{id}");
+    let expect = |what: &str, got: (u16, Value), status: u16, code: &str| {
+        assert_eq!((got.0, code_of(&got.1)), (status, code), "{what}: {}", got.1);
+    };
+    // Every password-policy check, on create and on a password change.
+    for weak in ["Sh0rt!", "abcdefgh1!", "ABCDEFGH1!", "Abcdefgh!!", "Abcdefgh12"] {
+        let new = json!({"email": format!("w-{tag}-{}@example.com", weak.len()), "password": weak});
+        expect(&format!("create, {weak}"), au.call(Method::POST, "/users", Some(new)).await, 422, "weak_password");
+        expect(&format!("update, {weak}"), au.call(Method::PATCH, &user, Some(json!({"password": weak}))).await, 422, "weak_password");
+    }
+    expect("create, email taken", au.call(Method::POST, "/users", Some(json!({"email": email, "password": strong}))).await, 409, "email_taken");
+    // State changes.
+    let (status, body) = au.call(Method::POST, &format!("{user}/deactivate"), None).await;
+    assert_eq!((status, body["state"].as_str()), (200, Some("inactive")), "deactivate: {body}");
+    expect("deactivate again", au.call(Method::POST, &format!("{user}/deactivate"), None).await, 409, "conflict");
+    let (status, body) = au.call(Method::POST, &format!("{user}/reactivate"), None).await;
+    assert_eq!((status, body["state"].as_str()), (200, Some("active")), "reactivate: {body}");
+    expect("reactivate again", au.call(Method::POST, &format!("{user}/reactivate"), None).await, 409, "conflict");
+    // A user Zitadel doesn't have.
+    let unknown = format!("/users/{}", uuid::Uuid::new_v4());
+    expect("update, not found", au.call(Method::PATCH, &unknown, Some(json!({"password": strong}))).await, 404, "not_found");
+    expect("deactivate, not found", au.call(Method::POST, &format!("{unknown}/deactivate"), None).await, 404, "not_found");
+    expect("delete, not found", au.call(Method::DELETE, &unknown, None).await, 404, "not_found");
+    // A token Zitadel refuses is 503.
+    let bogus = au_env_on(None, Some(Zitadel::new(&base, "not-a-token").with_host(Some(&host)))).await;
+    bogus.set_auth_in(AppUsersStatus::Enabled, &org);
+    expect("a token Zitadel refuses", bogus.call(Method::POST, &format!("{user}/deactivate"), None).await, 503, "unavailable");
+    // Delete, then again.
+    let (status, body) = au.call(Method::DELETE, &user, None).await;
+    assert_eq!(status, 204, "delete: {body}");
+    expect("delete again", au.call(Method::DELETE, &user, None).await, 404, "not_found");
+    z.delete_org(&org).await.unwrap();
 }
 
 /// The app-user routes answer 503 for a refusal that isn't Zitadel's own, never 404 or 409.

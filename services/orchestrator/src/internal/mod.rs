@@ -227,6 +227,13 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         zitadel_user_id: &str,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
 
+    /// [`MetadataClient::invite_expiry_for_user`]: the stored expiry of this Zitadel user's
+    /// unclosed member invite, expired or not (`None` when it has none).
+    fn invite_expiry_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, MetadataError>> + Send;
+
     /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
     fn tenant_by_org(
         &self,
@@ -416,6 +423,9 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError> {
         MetadataClient::open_invite_for_user(self, zitadel_user_id).await
     }
+    async fn invite_expiry_for_user(&self, zitadel_user_id: &str) -> Result<Option<DateTime<Utc>>, MetadataError> {
+        MetadataClient::invite_expiry_for_user(self, zitadel_user_id).await
+    }
     async fn signup_facts(&self, zitadel_org_id: &str) -> Result<Option<SignUpFacts>, MetadataError> {
         let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
             return Ok(None);
@@ -586,6 +596,7 @@ where
         .route("/internal/signup/check", post(signup::check::<M, L>))
         .route("/internal/signup/claimed", post(signup::claimed::<M, L>))
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
+        .route("/internal/invites/open", post(invite::open::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
     let rest_tokens: Arc<[Arc<str>]> =
         Arc::new([state.rest_token.as_str().into(), realtime_token]);

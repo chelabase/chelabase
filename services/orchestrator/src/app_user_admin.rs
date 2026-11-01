@@ -171,6 +171,10 @@ const PASSWORD_POLICY: &[refusals::Refusal] = &[
     refusals::PASSWORD_NO_NUMBER,
     refusals::PASSWORD_NO_SYMBOL,
     refusals::CREATE_USER_PASSWORD_TOO_SHORT,
+    refusals::CREATE_USER_PASSWORD_NO_UPPER,
+    refusals::CREATE_USER_PASSWORD_NO_LOWER,
+    refusals::CREATE_USER_PASSWORD_NO_NUMBER,
+    refusals::CREATE_USER_PASSWORD_NO_SYMBOL,
 ];
 
 /// A Zitadel failure the route didn't map itself, by the refusal's captured status, code and id
@@ -236,6 +240,10 @@ mod tests {
             (zitadel(r::PASSWORD_TOO_SHORT), 422, ErrorCode::WeakPassword),
             (zitadel(r::PASSWORD_NO_SYMBOL), 422, ErrorCode::WeakPassword),
             (zitadel(r::CREATE_USER_PASSWORD_TOO_SHORT), 422, ErrorCode::WeakPassword),
+            (zitadel(r::CREATE_USER_PASSWORD_NO_UPPER), 422, ErrorCode::WeakPassword),
+            (zitadel(r::CREATE_USER_PASSWORD_NO_LOWER), 422, ErrorCode::WeakPassword),
+            (zitadel(r::CREATE_USER_PASSWORD_NO_NUMBER), 422, ErrorCode::WeakPassword),
+            (zitadel(r::CREATE_USER_PASSWORD_NO_SYMBOL), 422, ErrorCode::WeakPassword),
             (zitadel(r::TOKEN_INVALID), 503, ErrorCode::Unavailable),
             (zitadel(r::NO_PERMISSION), 503, ErrorCode::Unavailable),
             (ZError::Unavailable("timeout".into()), 503, ErrorCode::Unavailable),
@@ -273,73 +281,6 @@ mod tests {
             let api = zitadel_failed("test", &err);
             assert_eq!((api.status, api.code), (503, ErrorCode::Unavailable), "{err}");
         }
-    }
-
-    fn live_user<'a>(org: &'a str, email: &'a str, password: Option<&'a str>) -> NewUser<'a> {
-        NewUser {
-            org_id: org,
-            email,
-            given_name: "Live",
-            family_name: "User",
-            password,
-            user_id: None,
-            username: Some(email),
-            send_code: false,
-            verified: true,
-            url_template: "",
-        }
-    }
-
-    /// The routes' answers for the refusals the real Zitadel gives (the ids `zitadel_failed`
-    /// matches are the captured ones). Runs in the workbench runner, which has `demo.env`:
-    ///
-    /// ```text
-    /// just workbench test -p orchestrator --lib -- --run-ignored only app_user_admin::tests::live
-    /// ```
-    #[tokio::test]
-    #[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
-    #[allow(clippy::disallowed_methods)]
-    async fn live_zitadel_refusals_map_to_the_routes_answers() {
-        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is unset (source demo.env)"));
-        let issuer = var("CHELABASE_ZITADEL_ISSUER");
-        let host = issuer.split_once("://").map(|(_, h)| h.trim_end_matches('/').to_string()).unwrap();
-        let base = std::env::var("CHELABASE_ZITADEL_INTERNAL_URL")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "http://zitadel:8080".into());
-        let pat_file = std::path::PathBuf::from(var("CHELABASE_ZITADEL_ADMIN_PAT_FILE"));
-        let pat_file = if pat_file.is_relative() { std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").join(pat_file) } else { pat_file };
-        let pat = std::fs::read_to_string(pat_file).unwrap().trim().to_string();
-        let z = Zitadel::new(base.trim_end_matches('/'), &pat).with_host(Some(&host));
-        let tag = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
-        let org = format!("live-admin-{tag}");
-        z.ensure_org(&org, &org).await.unwrap();
-        let email = format!("a-{tag}@example.com");
-        let user = z.create_user(&live_user(&org, &email, Some("Str0ng!pass-live"))).await.unwrap();
-        let unknown = format!("{tag}");
-        let answer = |what: &str, err: Option<ZError>, status: u16, code: ErrorCode| {
-            let err = err.unwrap_or_else(|| panic!("{what}: Zitadel accepted it"));
-            let api = zitadel_failed(what, &err);
-            assert_eq!((api.status, api.code), (status, code), "{what}: {err}");
-        };
-        answer("email not changed", z.set_email(&user, &email, true, None).await.err(), 409, ErrorCode::Conflict);
-        z.deactivate_user(&user).await.unwrap();
-        answer("already inactive", z.deactivate_user(&user).await.err(), 409, ErrorCode::Conflict);
-        z.reactivate_user(&user).await.unwrap();
-        answer("not inactive", z.reactivate_user(&user).await.err(), 409, ErrorCode::Conflict);
-        answer("already exists", z.create_user(&live_user(&org, &email, Some("Str0ng!pass-live"))).await.err(), 409, ErrorCode::Conflict);
-        answer("set email, not found", z.set_email(&unknown, "x@example.com", true, None).await.err(), 404, ErrorCode::NotFound);
-        answer("update, not found", z.mark_email_verified(&unknown, "x@example.com").await.err(), 404, ErrorCode::NotFound);
-        answer("deactivate, not found", z.deactivate_user(&unknown).await.err(), 404, ErrorCode::NotFound);
-        answer("reactivate, not found", z.reactivate_user(&unknown).await.err(), 404, ErrorCode::NotFound);
-        answer("invite code, not found", z.return_invite_code(&unknown).await.err(), 404, ErrorCode::NotFound);
-        answer("weak password", z.set_password_admin(&user, "Sh0rt!").await.err(), 422, ErrorCode::WeakPassword);
-        answer("weak password on create", z.create_user(&live_user(&org, &format!("w-{tag}@example.com"), Some("Sh0rt!"))).await.err(), 422, ErrorCode::WeakPassword);
-        answer("invalid email", z.create_user(&live_user(&org, "not-an-email", Some("Str0ng!pass-live"))).await.err(), 422, ErrorCode::InvalidRequest);
-        answer("password over 200 characters", z.set_password_admin(&user, &"Aa1!".repeat(60)).await.err(), 422, ErrorCode::InvalidRequest);
-        let bogus = Zitadel::new(base.trim_end_matches('/'), "not-a-token").with_host(Some(&host));
-        answer("a token Zitadel refuses", bogus.deactivate_user(&user).await.err(), 503, ErrorCode::Unavailable);
-        z.delete_org(&org).await.unwrap();
     }
 
     /// Zitadel's bcrypt limit: 72 bytes, not characters.
@@ -945,6 +886,11 @@ where
     if user.state == if active { UserState::Active } else { UserState::Inactive } {
         let state = if active { "active" } else { "inactive" };
         return Err(conflict(ErrorCode::Conflict, format!("the user is already {state}")));
+    }
+    // An Initial user never finished signing up, so it was never deactivated: nothing to
+    // reactivate (Zitadel's settled reactivate would call it done and show it `inactive`).
+    if active && user.state == UserState::Initial {
+        return Err(conflict(ErrorCode::Conflict, "the user hasn't finished signing up, so it isn't inactive"));
     }
     let done = if active { z.reactivate_user_settled(&uid).await } else { z.deactivate_user_settled(&uid).await };
     done.map_err(|err| zitadel_failed("change the user's state", &err))?;
