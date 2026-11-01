@@ -79,7 +79,7 @@ impl AppUser {
             state: match user.state {
                 UserState::Active => AppUserState::Active,
                 UserState::Locked => AppUserState::Locked,
-                UserState::Inactive | UserState::Other => AppUserState::Inactive,
+                UserState::Inactive | UserState::Initial | UserState::Other => AppUserState::Inactive,
             },
             created_at: user.created_at.unwrap_or_else(Utc::now),
         })

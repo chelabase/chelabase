@@ -10,7 +10,8 @@ use std::time::Duration;
 pub enum ZError {
     /// Zitadel understood and refused (a 4xx carrying its own error body). `code` is the gRPC
     /// code and `id` the first error detail's id (`QUERY-Dfbg2`): both stable, so match on
-    /// them (see [`crate::refusals`]). `message` is the error text (localized, then each
+    /// them (see [`crate::refusals`]). `id` is `None` only for Zitadel's request validation
+    /// ([`ZError::is_invalid_request`]). `message` is the error text (localized, then each
     /// detail's id and message), logged and never shown to users.
     #[error("zitadel rejected the request ({status}): {message}")]
     Rejected {
@@ -21,6 +22,7 @@ pub enum ZError {
     },
     /// No answer, a timeout, a 5xx, an unreadable answer, or a 4xx whose body isn't Zitadel's
     /// own error (a proxy's page, an empty body): it never reached Zitadel's logic.
+    /// Zitadel's request validation (a 400 with code 3 and no detail) is `Rejected` with no id.
     #[error("zitadel unavailable: {0}")]
     Unavailable(String),
 }
@@ -48,6 +50,20 @@ impl ZError {
             if *status == refusal.status
                 && *code == Some(refusal.code)
                 && id.as_deref() == Some(refusal.id))
+    }
+
+    /// Whether this is Zitadel's request validation refusing a field (a password over 200
+    /// characters): a 400 with gRPC code 3 and no detail id (see [`crate::refusals`]).
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(
+            self,
+            ZError::Rejected {
+                status: 400,
+                code: Some(refusals::INVALID_ARGUMENT),
+                id: None,
+                ..
+            }
+        )
     }
 
     /// Whether this is one of those captured refusals.
@@ -84,6 +100,9 @@ pub enum UserState {
     Active,
     Inactive,
     Locked,
+    /// `USER_STATE_INITIAL`: made by the v1 management API with neither a password nor a
+    /// verified email, and never signed in (see [`crate::refusals`]).
+    Initial,
     Other,
 }
 
@@ -164,6 +183,7 @@ fn parse_user(v: &Value) -> Option<ZUser> {
             Some("USER_STATE_ACTIVE") => UserState::Active,
             Some("USER_STATE_INACTIVE") => UserState::Inactive,
             Some("USER_STATE_LOCKED") => UserState::Locked,
+            Some("USER_STATE_INITIAL") => UserState::Initial,
             _ => UserState::Other,
         },
         created_at: details
@@ -218,11 +238,8 @@ const ZITADEL_DETAILS: [&str; 2] = [
 ];
 
 /// Zitadel's own error, read from an error body: its gRPC `code` and the `id` of the first
-/// `details[]` entry of Zitadel's detail types. `None` for any other body (HTML, empty, JSON
-/// without such a detail, such as a wrong `Host`'s "instance not found" or a request that
-/// failed validation): it never reached Zitadel's logic, or can't be told apart from a
-/// proxy's answer. Both `message`s are localized (v4.19.1 answers a missing user with
-/// `{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":
+/// `details[]` entry of Zitadel's detail types. Both `message`s are localized (v4.19.1 answers a
+/// missing user with `{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":
 /// [{"@type":"type.googleapis.com/zitadel.v1.ErrorDetail", "id":"QUERY-Dfbg2", "message":
 /// "User could not be found"}]}`), so no message is read.
 fn zitadel_error(body: Option<&Value>) -> Option<(u32, String)> {
@@ -243,21 +260,46 @@ fn zitadel_error(body: Option<&Value>) -> Option<(u32, String)> {
     Some((code, id.to_string()))
 }
 
-/// What a 4xx answer means: Zitadel's own refusal is `Rejected` with its code and detail id;
-/// any other body is `Unavailable`.
+/// Whether a 400's body is Zitadel's request validation refusing a field (captured live, see
+/// [`crate::refusals`]): gRPC code 3 as a number, a string `message`, and a `details` that is
+/// missing or an empty array. It has no id.
+fn invalid_request(status: u16, body: Option<&Value>) -> bool {
+    let Some(body) = body else {
+        return false;
+    };
+    status == 400
+        && body.get("code").and_then(Value::as_u64) == Some(u64::from(refusals::INVALID_ARGUMENT))
+        && body.get("message").is_some_and(Value::is_string)
+        && body
+            .get("details")
+            .is_none_or(|d| d.as_array().is_some_and(Vec::is_empty))
+}
+
+/// What a 4xx answer means: Zitadel's own refusal is `Rejected` with its code and detail id,
+/// or with no id for its request validation (a 400, code 3, no detail). Any other body (HTML,
+/// empty, JSON without Zitadel's detail, such as a wrong `Host`'s "instance not found") is
+/// `Unavailable`: it never reached Zitadel's logic, or can't be told apart from a proxy's answer.
 fn refused(status: u16, body: Option<&Value>) -> ZError {
-    match zitadel_error(body) {
-        Some((code, id)) => ZError::Rejected {
+    if let Some((code, id)) = zitadel_error(body) {
+        return ZError::Rejected {
             status,
             code: Some(code),
             id: Some(id),
             message: error_text(body),
-        },
-        None => ZError::Unavailable(format!(
-            "a {status} that isn't Zitadel's own error: {}",
-            error_text(body)
-        )),
+        };
     }
+    if invalid_request(status, body) {
+        return ZError::Rejected {
+            status,
+            code: Some(refusals::INVALID_ARGUMENT),
+            id: None,
+            message: error_text(body),
+        };
+    }
+    ZError::Unavailable(format!(
+        "a {status} that isn't Zitadel's own error: {}",
+        error_text(body)
+    ))
 }
 
 /// How the client reads a 4xx answer with this body (for tests against captured answers).
@@ -738,7 +780,8 @@ impl Zitadel {
     }
 
     /// Deactivates the user, settled: one already inactive, or gone, is done (see
-    /// [`Self::call_settled`]). Deactivating a locked user succeeds; it becomes inactive.
+    /// [`Self::call_settled`]). Deactivating a locked user succeeds; it becomes inactive. A user
+    /// in the Initial state can't be deactivated ([`refusals::DEACTIVATE_INITIAL`]): an error.
     pub async fn deactivate_user_settled(&self, user_id: &str) -> Result<(), ZError> {
         self.call_settled(
             user_id,
@@ -750,13 +793,14 @@ impl Zitadel {
     }
 
     /// Reactivates the user, settled: one already active, or gone, is done (see
-    /// [`Self::call_settled`]).
+    /// [`Self::call_settled`]). So is a user in the Initial state (never signed in): Zitadel
+    /// refuses to reactivate it as "not inactive", and it was never deactivated.
     pub async fn reactivate_user_settled(&self, user_id: &str) -> Result<(), ZError> {
         self.call_settled(
             user_id,
             "reactivate",
             refusals::REACTIVATE_USER_NOT_FOUND,
-            |state| state == UserState::Active,
+            |state| matches!(state, UserState::Active | UserState::Initial),
         )
         .await
     }
@@ -783,10 +827,11 @@ impl Zitadel {
     }
 
     /// Unlocks the user (`POST /v2/users/{id}/unlock`), settled as [`Self::lock_user`]: one
-    /// that isn't locked (active or inactive), or gone, is done.
+    /// that is active, inactive or initial, or gone, is done. A state `get_user` can't read is
+    /// an error.
     pub async fn unlock_user(&self, user_id: &str) -> Result<(), ZError> {
         self.call_settled(user_id, "unlock", refusals::UNLOCK_USER_NOT_FOUND, |state| {
-            state != UserState::Locked
+            matches!(state, UserState::Active | UserState::Inactive | UserState::Initial)
         })
         .await
     }
