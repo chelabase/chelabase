@@ -317,6 +317,19 @@ pub async fn seed<'a, H: Http>(
     second: Duration,
     out: &mut dyn Write,
 ) -> Result<(Session<'a, H>, Token)> {
+    let (s, ada, writes) = claim(cfg, http, second, out).await?;
+    admit(&s, &ada, writes, out).await?;
+    Ok((s, ada))
+}
+
+/// Claims the instance as Ada, or signs her in, and checks she is its tenant admin. Writes
+/// only her sign-up, on an unclaimed instance. Returns her session and the writes made.
+pub async fn claim<'a, H: Http>(
+    cfg: &Config,
+    http: &'a H,
+    second: Duration,
+    out: &mut dyn Write,
+) -> Result<(Session<'a, H>, Token, usize)> {
     let s = Session::connect(http, cfg.entry.clone(), cfg.timeout, second).await?;
     let mut writes = 0;
     let instance = s
@@ -374,7 +387,18 @@ pub async fn seed<'a, H: Http>(
             ADA.email
         );
     }
-    let members = list(&s, &ada).await?;
+    Ok((s, ada, writes))
+}
+
+/// Invites and admits every demo person who isn't an active member yet. `writes` counts on
+/// from [`claim`].
+pub async fn admit<H: Http>(
+    s: &Session<'_, H>,
+    ada: &Token,
+    mut writes: usize,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let members = list(s, ada).await?;
     for p in PEOPLE {
         let member = members
             .iter()
@@ -389,7 +413,7 @@ pub async fn seed<'a, H: Http>(
                     .api(
                         Method::POST,
                         "/v1/invites",
-                        &ada,
+                        ada,
                         Some(body),
                         "POST /v1/invites",
                     )
@@ -408,7 +432,7 @@ pub async fn seed<'a, H: Http>(
                     .ok_or_else(|| {
                         anyhow!("{} is invited without an open invite ({RESET})", p.email)
                     })?;
-                admit_invited(&s, &ada, p, id, &mut writes).await?
+                admit_invited(s, ada, p, id, &mut writes).await?
             }
             Some(other) => bail!("{} is {other} ({RESET})", p.email),
         };
@@ -421,7 +445,7 @@ pub async fn seed<'a, H: Http>(
         }
         writeln!(out, "example: {} joined", p.email)?;
     }
-    let members = list(&s, &ada).await?;
+    let members = list(s, ada).await?;
     for p in std::iter::once(&ADA).chain(PEOPLE) {
         let ok = members.iter().any(|m| {
             m.get("email").and_then(Value::as_str) == Some(p.email)
@@ -431,15 +455,21 @@ pub async fn seed<'a, H: Http>(
             bail!("{} is not an active member after the seed", p.email);
         }
     }
+    writeln!(out, "example: {writes} writes.")?;
+    roster(out)
+}
+
+/// The account list, with the demo password.
+pub fn roster(out: &mut dyn Write) -> Result<()> {
     writeln!(
         out,
-        "example: {writes} writes. LOCAL DEMO ONLY: these accounts all sign in with the password {DEMO_PASSWORD}"
+        "example: LOCAL DEMO ONLY: these accounts all sign in with the password {DEMO_PASSWORD}"
     )?;
     writeln!(out, "example:   {:<26} tenant admin", ADA.email)?;
     for p in PEOPLE {
         writeln!(out, "example:   {:<26} {}", p.email, p.department)?;
     }
-    Ok((s, ada))
+    Ok(())
 }
 
 /// An invited person: a new link (the old one was lost with the run that made it) and the

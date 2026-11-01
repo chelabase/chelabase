@@ -5,7 +5,11 @@
 //! Ada drives it through the public management API only; the schema and rows are one checked-in
 //! script ([`SCHEMA_SQL`]) that the SQL endpoint runs as the database's owner. Every step looks
 //! first (by name, or with a read-only query) and writes only what is missing, so a run that
-//! stopped anywhere is finished by the next one, and a finished seed makes no write.
+//! stopped anywhere is finished by the next one.
+//!
+//! The last write is the completion marker, a comment on `main`'s Postgres database
+//! ([`MARKER`]). Once [`complete`] finds it, the demo belongs to whoever uses it: the seed is
+//! skipped, so a later `up` never puts back what someone changed, renamed or removed.
 
 use super::DEMO_PASSWORD;
 use super::people::{ADA, PEOPLE};
@@ -28,6 +32,8 @@ pub const DATABASE: &str = "acme";
 pub const DEFAULT_SCHEMA: &str = "sales";
 pub const FEATURE_BRANCH: &str = "feature-discounts";
 pub const KEY_NAME: &str = "acme-server";
+/// The comment on `main`'s Postgres database that says the seed finished.
+pub const MARKER: &str = "chelabase example seed: complete v1";
 
 /// A team and its grant on the project.
 pub struct TeamDef {
@@ -105,6 +111,15 @@ const PROBE_FEATURE: &str = "select exists (select 1 from information_schema.col
 const ADD_DISCOUNT: &str = "alter table sales.orders add column if not exists discount_pct \
     numeric(5, 2) not null default 0 check (discount_pct between 0 and 100);";
 
+/// True when `main`'s database carries [`MARKER`].
+const PROBE_MARKER: &str = "select (coalesce(shobj_description(d.oid, 'pg_database'), '') \
+    = 'chelabase example seed: complete v1')::text from pg_database d \
+    where d.datname = current_database()";
+
+/// Writes [`MARKER`]. `COMMENT ON DATABASE` takes a name, not an expression, hence the `DO`.
+const MARK_COMPLETE: &str = "do $$ begin execute format('comment on database %I is %L', \
+    current_database(), 'chelabase example seed: complete v1'); end $$;";
+
 struct Ids {
     project: String,
     database: String,
@@ -149,6 +164,7 @@ pub async fn seed<H: Http>(s: &Session<'_, H>, ada: &Token, out: &mut dyn Write)
     r.key(&ids).await?;
     r.queries(&ids).await?;
     r.protect_main(&ids).await?;
+    r.mark_complete(&ids).await?;
     writeln!(
         r.out,
         "example: acme: {} writes. {PROJECT}/{DATABASE}: teams {}, customers {} (demo password), branches main (protected) and {FEATURE_BRANCH}",
@@ -157,6 +173,67 @@ pub async fn seed<H: Http>(s: &Session<'_, H>, ada: &Token, out: &mut dyn Write)
         CUSTOMERS.join(", "),
     )?;
     Ok(r.writes)
+}
+
+/// True when an earlier run finished the seed: project Acme's database `acme` has a ready
+/// `main` whose Postgres database carries [`MARKER`]. Reads only.
+pub async fn complete<H: Http>(s: &Session<'_, H>, ada: &Token) -> Result<bool> {
+    let me = s
+        .api(Method::GET, "/v1/me", ada, None, "GET /v1/me")
+        .await?;
+    let database = me
+        .pointer("/tenant/projects")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|p| text(p, "name") == PROJECT)
+        .flat_map(|p| {
+            p.get("databases")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .find(|d| text(d, "name") == DATABASE)
+        .map(|d| text(d, "database_id").to_string());
+    let Some(database) = database else {
+        return Ok(false);
+    };
+    let database = seg(&database)?.to_string();
+    let branches = array(
+        s.api(
+            Method::GET,
+            &format!("/v1/databases/{database}/branches"),
+            ada,
+            None,
+            "GET …/branches",
+        )
+        .await?,
+        "branches",
+    )?;
+    let main = branches.iter().find(|b| {
+        text(b, "kind") == "normal"
+            && b.get("parent_branch_id").is_some_and(Value::is_null)
+            && text(b, "status") == "ready"
+    });
+    let Some(main) = main else {
+        return Ok(false);
+    };
+    let branch = seg(text(main, "id"))?.to_string();
+    let probe = s
+        .sql(
+            ada,
+            (&database, &branch),
+            PROBE_MARKER,
+            None,
+            false,
+            "POST …/sql (marker probe)",
+        )
+        .await?;
+    Ok(probe
+        .first()
+        .and_then(|r| r.first())
+        .and_then(Option::as_deref)
+        == Some("true"))
 }
 
 fn text<'v>(v: &'v Value, k: &str) -> &'v str {
@@ -807,6 +884,23 @@ impl<H: Http> Run<'_, '_, H> {
             .await?;
         self.say("main is protected").await
     }
+
+    /// After every other step: the marker that makes later runs skip the seed. `main` is
+    /// protected by now, so the run is confirmed (Ada is an Admin).
+    async fn mark_complete(&mut self, ids: &Ids) -> Result<()> {
+        self.writes += 1;
+        self.s
+            .sql(
+                self.ada,
+                (&ids.database, &ids.branch),
+                MARK_COMPLETE,
+                None,
+                true,
+                "POST …/sql (marker)",
+            )
+            .await?;
+        self.say("marked complete: later runs skip the seed").await
+    }
 }
 
 /// True when the error is the server saying the call was refused (for tests and callers that
@@ -869,6 +963,67 @@ mod tests {
     }
 
     #[test]
+    fn the_marker_queries_name_the_marker() {
+        assert!(PROBE_MARKER.contains(&format!("'{MARKER}'")));
+        assert!(MARK_COMPLETE.contains(&format!("'{MARKER}'")));
+    }
+
+    /// An owner skips its table's policies unless RLS is forced: every table a team role owns
+    /// forces it, so `support`'s region rule filters `support` itself.
+    #[test]
+    fn every_team_owned_table_forces_rls() {
+        let sql = SCHEMA_SQL.to_lowercase();
+        let owned: Vec<&str> = sql
+            .lines()
+            .filter_map(|l| l.strip_prefix("alter table "))
+            .filter_map(|l| l.split_once(" owner to "))
+            .map(|(table, _)| table)
+            .collect();
+        assert_eq!(owned.len(), 3, "{owned:?}");
+        for table in owned {
+            assert!(
+                sql.contains(&format!("alter table {table} force row level security;")),
+                "{table} is owned by a team role but doesn't force RLS"
+            );
+        }
+    }
+
+    /// Deleting an app user deletes their `public.users` row: everything that hangs off it
+    /// goes with it, or the delete fails.
+    #[test]
+    fn every_reference_to_a_customer_cascades() {
+        let sql = SCHEMA_SQL.to_lowercase();
+        let refs: Vec<&str> = sql
+            .lines()
+            .filter(|l| {
+                l.contains(" references public.users")
+                    || l.contains(" references public.customers")
+                    || l.contains(" references sales.orders")
+            })
+            .collect();
+        assert_eq!(refs.len(), 5, "{refs:?}");
+        for r in refs {
+            assert!(r.contains("on delete cascade"), "{r}");
+        }
+    }
+
+    /// Staff read customers, and the data API's roles can't write the unprotected directory.
+    #[test]
+    fn staff_read_customers_and_app_users_cannot_write_employees() {
+        let sql = SCHEMA_SQL.to_lowercase();
+        assert!(
+            sql.contains("on public.customers for select to sales, finance, support"),
+            "no staff policy on customers"
+        );
+        assert!(sql.contains(
+            "revoke insert, update, delete, truncate on public.employees from anon, authenticated;"
+        ));
+        assert!(sql.contains(
+            "revoke insert, update, delete, truncate on public.customers from anon, authenticated;"
+        ));
+    }
+
+    #[test]
     fn the_script_leaves_exactly_one_table_without_rls() {
         let tables = SCHEMA_SQL.matches("create table if not exists").count();
         let rls = SCHEMA_SQL.matches("enable row level security").count();
@@ -907,7 +1062,11 @@ mod tests {
         let before = f.writes();
         run(&f).await.unwrap();
         assert_eq!(f.writes(), before, "a rerun writes nothing");
-        assert_eq!(f.count("POST /v1/sql"), 2);
+        assert_eq!(
+            f.count("POST /v1/sql"),
+            3,
+            "the script, the branch's column, the marker"
+        );
     }
 
     #[tokio::test]
@@ -923,10 +1082,80 @@ mod tests {
         run(&f).await.unwrap();
         assert_eq!(f.count("PATCH /v1/tenant"), 1, "a rerun does not rename");
         assert_eq!(f.writes(), before, "a rerun makes zero writes");
-        // Someone else's name for it is put back: the seed owns the demo's tenant.
+        // A name someone gave it after the seed finished is theirs: it stays.
         f.0.lock().unwrap().acme.tenant_name = Some("Other".into());
         run(&f).await.unwrap();
-        assert_eq!(f.count("PATCH /v1/tenant"), 2);
+        assert_eq!(f.count("PATCH /v1/tenant"), 1);
+        assert_eq!(
+            f.0.lock().unwrap().acme.tenant_name.as_deref(),
+            Some("Other")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_after_completion_writes_nothing_even_when_the_demo_was_changed() {
+        let f = Fake::new();
+        run(&f).await.unwrap();
+        assert!(
+            f.0.lock().unwrap().acme.complete,
+            "the seed marks itself complete"
+        );
+        let removed = PEOPLE[3].email;
+        let sales_members = {
+            let mut s = f.0.lock().unwrap();
+            s.acme.protected = false;
+            s.acme.tenant_name = Some("Other".into());
+            let sales = s.acme.teams.iter_mut().find(|t| t.name == "Sales").unwrap();
+            sales.members.pop();
+            let left = sales.members.len();
+            s.members.remove(removed);
+            left
+        };
+        let before = f.writes();
+        let out = run(&f).await.unwrap();
+        assert_eq!(
+            f.writes(),
+            before,
+            "a run after completion writes nothing:\n{out}"
+        );
+        assert!(out.contains("already complete"), "{out}");
+        let s = f.0.lock().unwrap();
+        assert!(!s.acme.protected, "main stays as the user left it");
+        assert_eq!(s.acme.tenant_name.as_deref(), Some("Other"));
+        let sales = s.acme.teams.iter().find(|t| t.name == "Sales").unwrap();
+        assert_eq!(sales.members.len(), sales_members);
+        assert!(!s.members.contains_key(removed), "nobody is invited again");
+    }
+
+    #[tokio::test]
+    async fn a_run_interrupted_before_the_marker_is_finished_by_the_next() {
+        let f = Fake::new();
+        // Main is protected, but the answer is lost: the marker is never written.
+        f.crash_after("PATCH /v1/branch", 1);
+        run(&f).await.unwrap_err();
+        {
+            let s = f.0.lock().unwrap();
+            assert!(s.acme.protected && !s.acme.complete);
+        }
+        let out = run(&f).await.unwrap();
+        assert!(!out.contains("already complete"), "{out}");
+        assert!(f.0.lock().unwrap().acme.complete);
+        let before = f.writes();
+        run(&f).await.unwrap();
+        assert_eq!(f.writes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_run_that_lost_the_markers_answer_is_complete() {
+        let f = Fake::new();
+        // The third script is the marker: it is applied, then the answer is lost.
+        f.crash_after("POST /v1/sql", 3);
+        run(&f).await.unwrap_err();
+        assert!(f.0.lock().unwrap().acme.complete);
+        let before = f.writes();
+        let out = run(&f).await.unwrap();
+        assert!(out.contains("already complete"), "{out}");
+        assert_eq!(f.writes(), before);
     }
 
     #[tokio::test]
@@ -934,15 +1163,20 @@ mod tests {
         let f = Fake::new();
         run(&f).await.unwrap();
         assert_eq!(f.count("POST /v1/teams"), TEAMS.len());
-        // Sales is gone; everything else, tables included, is still there.
-        f.0.lock().unwrap().acme.teams.retain(|t| t.name != "Sales");
+        // An unfinished seed (no marker) whose Sales team is gone; everything else, tables
+        // included, is still there.
+        {
+            let mut s = f.0.lock().unwrap();
+            s.acme.complete = false;
+            s.acme.teams.retain(|t| t.name != "Sales");
+        }
         run(&f).await.unwrap();
         assert_eq!(f.count("POST /v1/teams"), TEAMS.len() + 1);
         assert_eq!(f.count("PUT /v1/team-grant"), TEAMS.len() + 1);
         assert_eq!(
             f.count("POST /v1/sql"),
-            2,
-            "the tables exist: no script ran"
+            4,
+            "the tables exist: no script ran, only the marker again"
         );
         assert_eq!(f.count("POST /v1/roles"), PG_ROLES.len());
         assert_eq!(f.count("POST /v1/users"), CUSTOMERS.len());
