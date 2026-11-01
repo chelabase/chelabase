@@ -2097,10 +2097,11 @@ impl MetadataClient {
         ))
     }
 
-    /// The stored expiry of this Zitadel user's latest invite that isn't revoked or accepted,
-    /// while its member is still invited, and whether it is open (`expires_at > now()`, the
-    /// database clock, as [`Self::open_invite_for_user`] decides): that method's invite, without
-    /// its expiry filter, so an expired one answers its past expiry. Read-only.
+    /// The stored expiry of this Zitadel user's invite that isn't revoked or accepted, while its
+    /// member is still invited, and whether it is open (`expires_at > now()`, the database clock,
+    /// as [`Self::open_invite_for_user`] decides). An open invite wins over a newer expired one
+    /// (in another tenant), so a user with any open invite is answered open; with none open, the
+    /// latest answers its past expiry. Read-only.
     pub async fn invite_expiry_for_user(
         &self,
         zitadel_user_id: &str,
@@ -2111,7 +2112,7 @@ impl MetadataClient {
              JOIN members m ON m.id = i.member_id
              WHERE i.zitadel_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
                AND m.status = 'invited'
-             ORDER BY i.created_at DESC, i.id LIMIT 1",
+             ORDER BY (i.expires_at > now()) DESC, i.created_at DESC, i.id LIMIT 1",
         )
         .bind(zitadel_user_id)
         .fetch_optional(&self.pool)

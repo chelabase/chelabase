@@ -2119,6 +2119,48 @@ async fn invite_expiry_follows_the_unclosed_invite() {
     s.finish().await;
 }
 
+// An open invite in one tenant wins over a newer expired one in another: the user still has an
+// invite to accept (#78's reactivation gate reads this).
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn invite_expiry_prefers_an_open_invite_to_a_newer_expired_one() {
+    let s = Scratch::new().await;
+    let c = &s.client;
+    let zid = format!("z-{}", uuid::Uuid::new_v4().simple());
+    let (t1, t2) = (s.tenant().await, s.tenant().await);
+    let a1 = c.ensure_member_first_comer_for_tests(t1, "a1", "a1@x.com", "A1", Admission::Active).await.unwrap();
+    let a2 = c.ensure_member_first_comer_for_tests(t2, "a2", "a2@x.com", "A2", Admission::Active).await.unwrap();
+    let (_, older) = c.create_invited_member(a1.id, t1, new_invite(&zid, "i@x.com", &[])).await.unwrap();
+    let (_, newer) = c.create_invited_member(a2.id, t2, new_invite(&zid, "i@x.com", &[])).await.unwrap();
+    // The newer one is the latest by creation time, whatever the clock's resolution.
+    sqlx::query("UPDATE invites SET created_at = created_at + interval '1 minute' WHERE id = $1")
+        .bind(newer)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    let open: chrono::DateTime<Utc> = sqlx::query_scalar("SELECT expires_at FROM invites WHERE id = $1")
+        .bind(older)
+        .fetch_one(c.pool())
+        .await
+        .unwrap();
+    let past: chrono::DateTime<Utc> = sqlx::query_scalar(
+        "UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1 RETURNING expires_at",
+    )
+    .bind(newer)
+    .fetch_one(c.pool())
+    .await
+    .unwrap();
+    assert_eq!(c.invite_expiry_for_user(&zid).await.unwrap(), Some((open, true)));
+    // With both expired, the latest is answered.
+    sqlx::query("UPDATE invites SET expires_at = now() - interval '2 minutes' WHERE id = $1")
+        .bind(older)
+        .execute(c.pool())
+        .await
+        .unwrap();
+    assert_eq!(c.invite_expiry_for_user(&zid).await.unwrap(), Some((past, false)));
+    s.finish().await;
+}
+
 // R36: the display name is nullable, never empty or padded, and a change writes one event.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
