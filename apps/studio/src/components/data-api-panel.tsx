@@ -1,4 +1,4 @@
-import { useId, useState } from "react";
+import { useId, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   getListKeysQueryKey,
@@ -24,10 +24,15 @@ export interface DataApiPanelProps {
   branch: Branch;
   /** The gateway's base URL (`VITE_API_URL`); the endpoint is `${apiUrl}/data/v1/query`. */
   apiUrl: string;
+  /** Extra content at the end of the second column (the Connect panel's logins line). */
+  aside?: ReactNode;
 }
 
-/** One branch's data API: endpoint, public key, secret keys and the RLS warning. */
-export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) {
+/**
+ * One branch's data API in two columns that stack on narrow screens: the endpoint, public key and
+ * what it reaches, then the secret keys and client setup.
+ */
+export function DataApiPanel({ databaseId, branch, apiUrl, aside }: DataApiPanelProps) {
   // Rotating the public key is Developer's (rotateKey).
   const canRotate = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
@@ -83,7 +88,12 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
   }
 
   return (
-    <section aria-label={`Data API for ${branch.name}`} className="space-y-3 border p-3 text-sm">
+    <div
+      aria-label={`Data API for ${branch.name}`}
+      role="group"
+      className="grid gap-4 text-sm [grid-template-columns:repeat(auto-fit,minmax(320px,1fr))]"
+    >
+      <section aria-label="Data API" className="min-w-0 space-y-3 border p-3">
       <h3 className="font-medium">Data API</h3>
       <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
         <dt className="text-muted-foreground">Endpoint</dt>
@@ -148,6 +158,14 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
           />
         </section>
       )}
+      {schemaError && (
+        <p role="alert" className="text-destructive">
+          {schemaError}
+        </p>
+      )}
+      {schema && <RlsWarning schema={schema} />}
+      </section>
+      <section aria-label="Secret keys and client setup" className="min-w-0 space-y-3 border p-3">
       {error && (
         <p role="alert" className="text-destructive">
           {error}
@@ -161,12 +179,8 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
       {canRotate && databases !== null && (
         <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} />
       )}
-      {schemaError && (
-        <p role="alert" className="text-destructive">
-          {schemaError}
-        </p>
-      )}
-      {schema && <RlsWarning schema={schema} />}
-    </section>
+      {aside}
+      </section>
+    </div>
   );
 }
