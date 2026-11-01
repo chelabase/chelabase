@@ -3317,8 +3317,10 @@ async fn accept_invite_never_signs_in_a_suspended_member() {
     h.internal.set_open_invite(&id, true);
     let ar = h.mock.add_auth_request(false);
     let a = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
+    // Suspended, not unfinished: a retry can never succeed, so no ticket invites one.
+    assert_eq!(a.status, StatusCode::FORBIDDEN, "{}", a.body);
+    assert_eq!(a.body["error"]["code"], "member_suspended");
+    assert!(a.body["error"]["accept_ticket"].is_null(), "{}", a.body);
     assert!(a.cookie("chelabase_session").is_none());
     let user = h.mock.user_by_id(&id).unwrap();
     assert!(user.locked && !user.inactive, "still locked");

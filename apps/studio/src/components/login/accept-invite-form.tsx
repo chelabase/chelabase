@@ -161,6 +161,12 @@ export function AcceptInviteForm({
         field.current?.focus();
       } else if (code_ === "invite_incomplete") {
         setProblem({ message: "Your invite code is confirmed, but setting up your account didn't finish. Try again.", retry: true });
+      } else if (code_ === "member_suspended") {
+        // The invite is accepted and the password set; only the suspension stands in the way.
+        setProblem({
+          message: "Your invite is accepted, but your access is suspended. Once an admin reinstates you, sign in with the password you just set.",
+          retry: false,
+        });
       } else if (code_ === "rate_limited") {
         setProblem({ message: "Too many attempts. Wait a minute, then try again.", retry: false });
         field.current?.focus();

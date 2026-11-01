@@ -128,6 +128,17 @@ describe("AcceptInviteForm", () => {
     }
   });
 
+  it("a suspended member is told why, not asked to retry", async () => {
+    const r = renderAccept(<AcceptInviteForm user="z1" code="c1" t="tok" authRequest="V2_1" startSignIn={vi.fn()} go={vi.fn()} />, {
+      "POST /auth/v1/accept-invite": err("member_suspended", "suspended", 403),
+    });
+    await submit("Secret-pass1");
+    expect(await screen.findByText(/your access is suspended/i)).toBeInTheDocument();
+    expect(screen.getByText(/sign in with the password you just set/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /try again/i })).toBeNull();
+    expect((await bodies(r.f)).length).toBe(1);
+  });
+
   // M8: the code and token leave the address bar (and so the history) as soon as the page has
   // read them, not at the first submit; the page keeps working from what it read.
   it("the code and token leave the address bar on mount and never enter a query key", async () => {

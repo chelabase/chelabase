@@ -45,6 +45,8 @@ pub mod messages {
     pub const NO_SUCH_INVITE: &str = "No open invite matches this link";
     pub const BAD_NAME: &str = "Enter a first and a last name, up to 200 characters each";
     pub const BAD_DETAILS: &str = "Check the details you entered";
+    pub const MEMBER_SUSPENDED: &str =
+        "Your access is suspended. Once an administrator reinstates you, sign in with this password";
 }
 use messages::*;
 
@@ -990,6 +992,7 @@ struct AcceptInviteBody {
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 410, description = "The invite expired (`invite_expired`) or was revoked (`invite_revoked`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
+        (status = 403, description = "The member is suspended (`member_suspended`): the invite is accepted and the password set, but there is no sign-in until an admin reinstates them", body = ErrorEnvelope),
         (status = 503, description = "Zitadel is unavailable (`unavailable`), or a step after the code check failed (`invite_incomplete`, with `accept_ticket`)", body = ErrorEnvelope),
     ),
 )]
@@ -1264,10 +1267,11 @@ async fn finish_accept(
     }
     let session = match new_user_session(s, &b.user, &b.password).await {
         Ok(session) => session,
-        // A suspended member: locked until reinstated.
+        // A suspended member: locked until reinstated. The password is set and the email
+        // verified, so nothing is left to retry: no ticket, and the answer says why.
         Err(e) if e.is_any(&[refusals::SESSION_USER_NOT_ACTIVE, refusals::SESSION_USER_LOCKED]) => {
             info!("accept-invite: the user is locked; no session");
-            return incomplete(s, &b.user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE);
+            return error(StatusCode::FORBIDDEN, ErrorCode::MemberSuspended, MEMBER_SUSPENDED);
         }
         Err(e) => return incomplete_unavailable(s, &b.user, &e),
     };
