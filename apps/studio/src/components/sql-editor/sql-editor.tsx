@@ -1,15 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  ApiError,
-  cancelSqlRun,
-  useGetMe,
-  useGetSqlSchema,
-  useListBranchDatabases,
-  useListBranches,
-  useListRoles,
-  type SavedQuery,
-} from "@chelabase/management-client";
-import { DATA_API_ROLES, actAsRoles, dataApiActAs, useProjectCaps } from "@/lib/capabilities";
+import { ApiError, cancelSqlRun, useGetMe, useGetSqlSchema, type SavedQuery } from "@chelabase/management-client";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";
@@ -22,8 +12,25 @@ import { SqlResults } from "./sql-results";
 import { SqlToolbar } from "./sql-toolbar";
 import { addHistory, clearHistory, loadBuffer, loadHistory, loadTimeout, saveBuffer, saveTimeout, type HistoryEntry } from "./run-history";
 
+/** Where the editor runs, as the page's context bar has it: the editor takes the place and Act as, and picks none of its own. */
 export interface SqlEditorProps {
   databaseId: string;
+  branchId: string;
+  /** The Postgres database to run in; null is the branch's main one. */
+  pgDatabase: string | null;
+  /** The Postgres databases of the branch (a saved query may name one). */
+  pgDatabases: string[];
+  /** The role acted as; null is the owner. */
+  role: string | null;
+  /** What the caller may act as here. */
+  allowed: { owner: boolean; roles: string[] };
+  /** The roles have loaded (until then nothing runs and no schema is read). */
+  rolesReady: boolean;
+  branchProtected?: boolean;
+  /** A saved query or history entry names a Postgres database on this branch: the caller moves the context there. */
+  onPgDatabase: (name: string) => void;
+  /** A saved query or history entry names a role the caller may act as. */
+  onRole: (role: string) => void;
   /** Starts the pgls worker (tests inject a fake). The default imports the client lazily, so the wasm stays out of the main bundle. */
   createClient?: () => Promise<PglsClient>;
 }
@@ -43,42 +50,29 @@ const defaultCreateClient = () => import("@/lib/pgls/client").then((m) => m.crea
 /** The stand-in user id for storage keys when the caller's identity can't be read. */
 const FALLBACK_SUB = "anonymous";
 
-export function SqlEditor({ databaseId, createClient }: SqlEditorProps) {
+export function SqlEditor({ createClient, ...place }: SqlEditorProps) {
   const me = useGetMe();
-  if (me.isPending) return <p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>;
-  return <SqlWorkspace databaseId={databaseId} sub={me.data?.user.sub ?? FALLBACK_SUB} createClient={createClient ?? defaultCreateClient} />;
+  if (me.isPending) return <p className="p-6 text-sm text-chalk-dim">Loading the editor…</p>;
+  return <SqlWorkspace {...place} sub={me.data?.user.sub ?? FALLBACK_SUB} createClient={createClient ?? defaultCreateClient} />;
 }
 
-
-function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; sub: string; createClient: () => Promise<PglsClient> }) {
-  const branches = useListBranches(databaseId);
-  const eligible = (branches.data ?? []).filter((b) => b.kind === "normal" && b.status === "ready");
-  const [pickedBranch, setPickedBranch] = useState<string | null>(null);
-  const branch = eligible.find((b) => b.id === pickedBranch) ?? eligible.find((b) => b.parent_branch_id === null) ?? eligible[0] ?? null;
-  const branchId = branch?.id ?? null;
-
-  const dbs = useListBranchDatabases(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
-  const dbList = (dbs.data ?? []).filter((d) => d.origin !== "system").sort((a, b) => Number(b.main) - Number(a.main));
-  const [pickedDb, setPickedDb] = useState<string | null>(null);
-  const db = dbList.find((d) => d.name === pickedDb) ?? dbList[0] ?? null;
-  const dbParam = db && !db.main ? db.name : null;
-
-  const rolesQuery = useListRoles(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
-  // Only the roles the caller may act as: Admin has the owner and every role; below Admin the
-  // granted roles and their chains (the API decides; this only hides what it would refuse). The
-  // data API's anon and authenticated only when a grant names them (R18), whatever the level.
-  const caps = useProjectCaps();
-  const allowed = actAsRoles(caps, rolesQuery.data ?? []);
-  const roleOptionsFor = (d: typeof db) => {
-    const api: string[] = DATA_API_ROLES.filter((n) => dataApiActAs(caps).includes(n) || allowed.roles.includes(n));
-    const own = allowed.roles.filter((n) => !api.includes(n));
-    return d?.data_api === "on" ? [...api, ...own] : own;
-  };
-  const roleOptions = roleOptionsFor(db);
-  const [pickedRole, setPickedRole] = useState("");
-  // "" is the owner; without it the first allowed role is the default.
-  const role = roleOptions.includes(pickedRole) ? pickedRole : allowed.owner ? "" : (roleOptions[0] ?? "");
-  const noRole = !allowed.owner && role === "";
+function SqlWorkspace({
+  databaseId,
+  branchId,
+  pgDatabase: dbParam,
+  pgDatabases,
+  role: roleParam,
+  allowed,
+  rolesReady,
+  branchProtected,
+  onPgDatabase,
+  onRole,
+  sub,
+  createClient,
+}: Omit<SqlEditorProps, "createClient"> & { sub: string; createClient: () => Promise<PglsClient> }) {
+  // "" is the owner in the schema key and the notes below; the run body and history use null.
+  const role = roleParam ?? "";
+  const noRole = !allowed.owner && roleParam === null;
 
   const [timeoutMs, setTimeoutMs] = useState(loadTimeout);
 
@@ -108,8 +102,8 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
   // The schema read follows the chosen role's USAGE (T9): `?role=` unless it's the owner.
   const schemaKey = `${branchId}|${dbParam}|${role}`;
   const schemaParams = { ...(dbParam ? { database: dbParam } : {}), ...(role !== "" ? { role } : {}) };
-  const schemaQuery = useGetSqlSchema(databaseId, branchId ?? "", schemaParams, {
-    query: { enabled: branchId !== null && db !== null && rolesQuery.isSuccess && !noRole, staleTime: Infinity, retry: false },
+  const schemaQuery = useGetSqlSchema(databaseId, branchId, schemaParams, {
+    query: { enabled: rolesReady && !noRole, staleTime: Infinity, retry: false },
   });
   const schemaData = schemaQuery.data;
   const [pglsSchema, setPglsSchema] = useState<{ key: string; ok: boolean } | null>(null);
@@ -174,14 +168,13 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
   );
 
   async function execute(text: RunText, confirm: boolean) {
-    if (branchId === null) return;
     controller.current?.abort();
     const abort = new AbortController();
     controller.current = abort;
     const token = ++tokens.current;
     const id = crypto.randomUUID();
     const forBranch = branchId;
-    const cur: RunInFlight = { id, token, text, startedAt: Date.now(), branchId: forBranch, database: dbParam, role: role === "" ? null : role, finished: false };
+    const cur: RunInFlight = { id, token, text, startedAt: Date.now(), branchId: forBranch, database: dbParam, role: roleParam, finished: false };
     current.current = cur;
     lastText.current = text;
     setFailure(null);
@@ -251,16 +244,12 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
 
   function applyHints(hints: { database?: string | null; role?: string | null }) {
     const notes: string[] = [];
-    let target = db;
     if (hints.database) {
-      const found = dbList.find((d) => d.name === hints.database);
-      if (found) {
-        setPickedDb(found.name);
-        target = found;
-      } else notes.push(`The saved database "${hints.database}" isn't on this branch; the selected one is kept.`);
+      if (pgDatabases.includes(hints.database)) onPgDatabase(hints.database);
+      else notes.push(`The saved database "${hints.database}" isn't on this branch; the selected one is kept.`);
     }
     if (hints.role) {
-      if (roleOptionsFor(target).includes(hints.role)) setPickedRole(hints.role);
+      if (allowed.roles.includes(hints.role)) onRole(hints.role);
       else notes.push(`The saved role "${hints.role}" isn't available here; running as ${role === "" ? "the owner" : role}.`);
     }
     setLoadNote(notes.length > 0 ? notes.join(" ") : null);
@@ -271,70 +260,15 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
     setDoc(sql);
   };
 
-  const gone = !branches.isPending && branch === null;
-  const fatal = branches.error ?? dbs.error ?? rolesQuery.error;
   const basicNote = !pglsReady;
 
   return (
-    <div className="space-y-3 py-3">
-      <SqlToolbar
-        branches={eligible.map((b) => ({ id: b.id, name: b.name }))}
-        branchId={branchId}
-        onBranch={(id) => {
-          setPickedBranch(id);
-          setPickedDb(null);
-          setPickedRole("");
-        }}
-        databases={dbList.map((d) => d.name)}
-        database={db?.name ?? null}
-        onDatabase={setPickedDb}
-        roles={roleOptions}
-        ownerAllowed={allowed.owner}
-        role={role}
-        onRole={setPickedRole}
-        timeoutMs={timeoutMs}
-        onTimeout={(ms) => {
-          setTimeoutMs(ms);
-          saveTimeout(ms);
-        }}
-        running={run?.running === true}
-        canRun={branchId !== null && db !== null && !noRole}
-        onRun={start}
-        onCancel={() => void cancel()}
-        onRefreshSchema={() => void schemaQuery.refetch()}
-      />
-
-      {noRole ? (
-        rolesQuery.isSuccess && (
-          <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>
-        )
-      ) : role === "" ? (
-        <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
-      ) : !allowed.owner ? (
-        <p className="border p-2 text-sm">
-          Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.
-        </p>
-      ) : (
-        <p className="border p-2 text-sm">
-          Running as <code>{role}</code> (SET ROLE). This previews that role&apos;s view; it isn&apos;t a security boundary, since a script can RESET ROLE.
-        </p>
-      )}
-      {branch?.protected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
-      {fatal && (
-        <p role="alert" className="text-sm text-destructive">
-          {errorText(fatal)}
-        </p>
-      )}
-      {gone && !fatal && <p className="text-sm text-muted-foreground">This database has no ready branch yet.</p>}
-      {(ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && branchId && (
-        <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
-      )}
-
-      <div className="grid gap-4 md:grid-cols-[16rem_1fr]">
+    <div className="flex min-h-0 flex-1 max-[40rem]:flex-col">
+      <aside className="w-64 shrink-0 overflow-y-auto border-r border-line p-3 max-[40rem]:w-auto max-[40rem]:border-r-0 max-[40rem]:border-b">
         <SavedQueriesPanel
           databaseId={databaseId}
           sql={doc}
-          hints={{ pg_database: dbParam, role: role === "" ? null : role }}
+          hints={{ pg_database: dbParam, role: roleParam }}
           active={active}
           onActiveChange={setActive}
           onLoad={(q: SavedQuery) => {
@@ -351,19 +285,52 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
             setHistory([]);
           }}
         />
-        <div className="min-w-0 space-y-3">
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>{loadNote}</span>
-            {basicNote && <span>Basic completion</span>}
-          </div>
-          <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />
-          {failure && (
-            <p role="alert" className="text-sm text-destructive">
-              {failure}
-            </p>
-          )}
-          {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
-        </div>
+      </aside>
+      <div className="min-w-0 flex-1 space-y-3 overflow-y-auto p-3">
+      <SqlToolbar
+        timeoutMs={timeoutMs}
+        onTimeout={(ms) => {
+          setTimeoutMs(ms);
+          saveTimeout(ms);
+        }}
+        running={run?.running === true}
+        canRun={rolesReady && !noRole}
+        onRun={start}
+        onCancel={() => void cancel()}
+        onRefreshSchema={() => void schemaQuery.refetch()}
+      />
+
+      {noRole ? (
+        rolesReady && (
+          <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>
+        )
+      ) : role === "" ? (
+        <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
+      ) : !allowed.owner ? (
+        <p className="border p-2 text-sm">
+          Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.
+        </p>
+      ) : (
+        <p className="border p-2 text-sm">
+          Running as <code>{role}</code> (SET ROLE). This previews that role&apos;s view; it isn&apos;t a security boundary, since a script can RESET ROLE.
+        </p>
+      )}
+      {branchProtected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
+      {(ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && (
+        <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
+      )}
+
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <span>{loadNote}</span>
+        {basicNote && <span>Basic completion</span>}
+      </div>
+      <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          {failure}
+        </p>
+      )}
+      {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
       </div>
 
       <SqlConfirmDialog

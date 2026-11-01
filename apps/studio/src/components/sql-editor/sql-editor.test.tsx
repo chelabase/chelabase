@@ -5,13 +5,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PglsClient } from "@/lib/pgls/client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
-import { SqlEditor } from "./sql-editor";
+import { SqlEditor, type SqlEditorProps } from "./sql-editor";
 
-const B = "/v1/databases/d1/branches";
-const BR = `${B}/b1`;
-const dbView = (name: string, main: boolean, data_api = "on") => ({ name, main, data_api, data_api_error: null, default_schema: "public", origin: main ? "main" : "sql", owner: "o" });
-const role = (name: string, origin = "sql") => ({ name, level: "plain", login: false, origin, password: "none", pending: false, blocked_keys: [], created_at: "2026-10-01T00:00:00Z" });
-const branch = (over: Record<string, unknown> = {}) => ({ id: "b1", name: "main", kind: "normal", status: "ready", parent_branch_id: null, created_at: "2026-10-01T00:00:00Z", protected: false, ...over });
+const BR = "/v1/databases/d1/branches/b1";
 
 const ndjson = (...events: unknown[]) => new Response(events.map((e) => JSON.stringify(e)).join("\n") + "\n", { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
 const selectRun = (): Response =>
@@ -26,20 +22,29 @@ const failure = (code: string, status: number, extra: Record<string, unknown> = 
 
 interface Opts {
   run?: FakeHandler;
-  branches?: unknown[];
-  databases?: unknown[];
+  /** Overrides the controlled props the page passes. */
+  props?: Partial<SqlEditorProps>;
   schema?: FakeHandler;
   createClient?: () => Promise<PglsClient>;
   routes?: Record<string, FakeHandler>;
   /** Answers the cancel route (default: 202 at once). */
   cancel?: () => Promise<Response>;
 }
+/** What the page passes: branch b1, the main database, the owner, one extra role. */
+const baseProps = (): SqlEditorProps => ({
+  databaseId: "d1",
+  branchId: "b1",
+  pgDatabase: null,
+  pgDatabases: ["app", "analytics"],
+  role: null,
+  allowed: { owner: true, roles: ["reporter"] },
+  rolesReady: true,
+  onPgDatabase: vi.fn(),
+  onRole: vi.fn(),
+});
 function setup(opts: Opts = {}) {
   const f: FakeFetch = fakeFetch({
     "GET /v1/me": () => jsonResponse({ tenant: null, user: { org_id: "o", sub: "u1" } }),
-    [`GET ${B}`]: () => jsonResponse(opts.branches ?? [branch()]),
-    [`GET ${BR}/databases`]: () => jsonResponse(opts.databases ?? [dbView("app", true), dbView("analytics", false)]),
-    [`GET ${BR}/roles`]: () => jsonResponse([role("app_owner", "owner"), role("reporter")]),
     [`GET ${BR}/sql/schema`]: opts.schema ?? (() => jsonResponse({ schemas: [] })),
     [`POST ${BR}/sql`]: opts.run ?? (() => selectRun()),
     "GET /v1/databases/d1/sql-queries": () => jsonResponse([]),
@@ -57,8 +62,10 @@ function setup(opts: Opts = {}) {
     },
     { calls: f.calls },
   );
-  const result = renderWithQuery(<SqlEditor databaseId="d1" createClient={opts.createClient ?? (() => Promise.reject(new Error("no worker")))} />, { fetch: wrapped });
-  return { ...result, f, user: userEvent.setup() };
+  const props: SqlEditorProps = { ...baseProps(), createClient: opts.createClient ?? (() => Promise.reject(new Error("no worker"))), ...opts.props };
+  const result = renderWithQuery(<SqlEditor {...props} />, { fetch: wrapped });
+  const rerenderWith = (over: Partial<SqlEditorProps>) => result.rerender(<SqlEditor {...props} {...over} />);
+  return { ...result, f, user: userEvent.setup(), props, rerenderWith };
 }
 const view = () => EditorView.findFromDOM(document.querySelector(".cm-editor") as HTMLElement)!;
 async function setDoc(text: string) {
@@ -209,13 +216,11 @@ describe("SqlEditor", () => {
 
   it("history_keeps_the_role_the_run_used", async () => {
     const stream = openRun();
-    const { user } = setup({ run: () => stream.response() });
-    await screen.findByRole("option", { name: "reporter" });
-    await user.selectOptions(screen.getByLabelText("Run as"), "reporter");
+    const { user, rerenderWith } = setup({ run: () => stream.response(), props: { role: "reporter" } });
     await setDoc("select 1");
     await user.click(await screen.findByRole("button", { name: "Run" }));
     await screen.findByRole("button", { name: "Cancel" });
-    await user.selectOptions(screen.getByLabelText("Run as"), "Owner");
+    rerenderWith({ role: null });
     stream.push({ t: "done", outcome: "ok", duration_ms: 3 });
     stream.close();
     await screen.findByText(/ok in 3 ms/);
@@ -249,10 +254,9 @@ describe("SqlEditor", () => {
   });
 
   it("owner_banner_and_role_banner_copy", async () => {
-    const { user } = setup();
+    const { rerenderWith } = setup();
     expect(await screen.findByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
-    await screen.findByRole("option", { name: "reporter" });
-    await user.selectOptions(screen.getByLabelText("Run as"), "reporter");
+    rerenderWith({ role: "reporter" });
     const banner = await screen.findByText(/Running as/);
     expect(textOf(banner)).toBe("Running as reporter (SET ROLE). This previews that role's view; it isn't a security boundary, since a script can RESET ROLE.");
     expect(banner.querySelector("code")?.textContent).toBe("reporter");
@@ -260,27 +264,14 @@ describe("SqlEditor", () => {
   });
 
   it("protected_banner_shows_on_protected_branches", async () => {
-    setup({ branches: [branch({ protected: true })] });
+    setup({ props: { branchProtected: true } });
     expect(await screen.findByText("Protected branch: every change asks for confirmation.")).toBeInTheDocument();
   });
 
   it("no_protected_banner_on_plain_branches", async () => {
     setup();
-    await screen.findByLabelText("Branch");
     await screen.findByText(/Running as owner/);
     expect(screen.queryByText(/Protected branch/)).not.toBeInTheDocument();
-  });
-
-  // R18 (user, 2026-10-14): an Admin doesn't run as the data API's roles unless a grant names
-  // them; previewing the data API is TE-B2's View as.
-  it("admins_dont_run_as_anon_without_a_named_grant", async () => {
-    const { user } = setup({ databases: [dbView("app", true), dbView("analytics", false, "off")] });
-    const sel = await screen.findByLabelText("Run as");
-    await screen.findByRole("option", { name: "reporter" });
-    const names = () => Array.from(sel.querySelectorAll("option")).map((o) => o.textContent);
-    expect(names()).toEqual(["Owner", "reporter"]);
-    await user.selectOptions(screen.getByLabelText("Database"), "analytics");
-    await waitFor(() => expect(names()).toEqual(["Owner", "reporter"]));
   });
 
   it("owner_password_unknown_shows_the_notice", async () => {
@@ -292,7 +283,7 @@ describe("SqlEditor", () => {
   });
 
   it("schema_refetches_after_ddl", async () => {
-    const { f, user } = setup({
+    const { f, user, rerenderWith } = setup({
       run: () =>
         ndjson({ t: "complete", statement: 0, tag: "CREATE TABLE", rows: 0, truncated: false }, { t: "done", outcome: "ok", duration_ms: 2 }),
     });
@@ -302,7 +293,7 @@ describe("SqlEditor", () => {
     await vi.waitFor(() => expect(schemaCalls(f)).toHaveLength(2));
     await user.click(screen.getByRole("button", { name: "Refresh schema" }));
     await vi.waitFor(() => expect(schemaCalls(f)).toHaveLength(3));
-    await user.selectOptions(screen.getByLabelText("Database"), "analytics");
+    rerenderWith({ pgDatabase: "analytics" });
     await vi.waitFor(() => expect(schemaCalls(f)).toHaveLength(4));
     expect(new URL(schemaCalls(f)[3].url).searchParams.get("database")).toBe("analytics");
   });
@@ -343,5 +334,71 @@ describe("SqlEditor", () => {
     await setDoc("select 1");
     await user.click(await screen.findByRole("button", { name: "Run" }));
     expect(await screen.findByRole("alert")).toBeInTheDocument();
+  });
+
+  it("run_uses_the_controlled_branch_database_and_role", async () => {
+    const { f, user } = setup({ props: { pgDatabase: "analytics", role: "reporter" } });
+    await vi.waitFor(() => expect(schemaCalls(f)).toHaveLength(1));
+    const q = new URL(schemaCalls(f)[0].url).searchParams;
+    expect([q.get("database"), q.get("role")]).toEqual(["analytics", "reporter"]);
+    await setDoc("select 1");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    await screen.findByRole("tab", { name: "SELECT 2" });
+    expect((await runBodies(f))[0]).toMatchObject({ database: "analytics", role: "reporter" });
+  });
+
+  it("another_branch_reloads_the_schema_and_the_next_run_goes_there", async () => {
+    const { f, user, rerenderWith } = setup({
+      routes: {
+        "GET /v1/databases/d1/branches/b2/sql/schema": () => jsonResponse({ schemas: [] }),
+        "POST /v1/databases/d1/branches/b2/sql": () => selectRun(),
+      },
+    });
+    await vi.waitFor(() => expect(schemaCalls(f)).toHaveLength(1));
+    rerenderWith({ branchId: "b2" });
+    await vi.waitFor(() => expect(schemaCalls(f).filter((r) => r.url.includes("/b2/"))).toHaveLength(1));
+    await setDoc("select 1");
+    await user.click(screen.getByRole("button", { name: "Run" }));
+    await screen.findByRole("tab", { name: "SELECT 2" });
+    expect(f.calls.filter((r) => r.method === "POST" && r.url.endsWith("/b2/sql"))).toHaveLength(1);
+    expect(runs(f)).toHaveLength(0);
+  });
+
+  it("the_toolbar_has_no_pickers_of_its_own", async () => {
+    setup();
+    await screen.findByRole("button", { name: "Run" });
+    for (const label of ["Branch", "Database", "Run as"]) expect(screen.queryByLabelText(label)).toBeNull();
+    expect(screen.getByLabelText("Timeout")).toBeInTheDocument();
+  });
+
+  const savedHistory = (over: Record<string, unknown>) =>
+    localStorage.setItem("chelabase.sql.history.u1.d1", JSON.stringify([{ sql: "select 9", branchId: "b1", database: null, role: null, at: "2026-10-01T00:00:00Z", outcome: "ok", durationMs: 1, ...over }]));
+  const openHistory = async (user: ReturnType<typeof userEvent.setup>) => {
+    await user.click(await screen.findByRole("tab", { name: /history/i }));
+    await user.click(await screen.findByRole("button", { name: /^Open/ }));
+  };
+
+  it("a_saved_role_that_is_not_available_is_kept_out_with_a_note", async () => {
+    savedHistory({ role: "ghost" });
+    const { user, props } = setup({ props: { role: "reporter" } });
+    await openHistory(user);
+    expect(await screen.findByText(/The saved role "ghost" isn't available here; running as reporter\./)).toBeInTheDocument();
+    expect(props.onRole).not.toHaveBeenCalled();
+  });
+
+  it("a_saved_role_and_database_that_are_available_move_the_context", async () => {
+    savedHistory({ role: "reporter", database: "analytics" });
+    const { user, props } = setup();
+    await openHistory(user);
+    await vi.waitFor(() => expect(props.onRole).toHaveBeenCalledWith("reporter"));
+    expect(props.onPgDatabase).toHaveBeenCalledWith("analytics");
+  });
+
+  it("a_saved_database_that_is_not_here_keeps_the_selected_one_with_a_note", async () => {
+    savedHistory({ database: "gone" });
+    const { user, props } = setup();
+    await openHistory(user);
+    expect(await screen.findByText(/The saved database "gone" isn't on this branch/)).toBeInTheDocument();
+    expect(props.onPgDatabase).not.toHaveBeenCalled();
   });
 });
