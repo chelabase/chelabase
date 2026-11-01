@@ -5,7 +5,9 @@ use super::internal::{
     AppBranchInfo, CreateSession, InternalError, RefreshRequest, RevokeUserSessions, SyncRequest,
 };
 use super::{AppUsers, CODE_TEMPLATE};
-use crate::app::{AppState, SIGN_UP_EXTRA};
+use crate::app::{
+    AppState, CREATE_PASSWORD_POLICY, SET_PASSWORD_POLICY, SIGN_UP_EXTRA, usable_password,
+};
 use crate::guard::{Slot, email_tag, pad};
 use crate::zitadel::{EmailMatch, NewUser, Session, UserState, ZError, ZUser};
 use axum::Json;
@@ -16,7 +18,7 @@ use chelabase_auth::app_token::{APP_ISSUER, AppClaims, app_audience};
 use chelabase_query::app_users::{NewUserRow, UserRowError};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::api_extract::ApiJson;
-use chelabase_zitadel::rules::{normalize_email, strong_password};
+use chelabase_zitadel::rules::normalize_email;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -903,7 +905,7 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
     if !valid_email(&email) {
         return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
     }
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let data = match b.data {
@@ -986,14 +988,10 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
             pending_insert.rollback().await;
             return taken(s, &info, &email, None).await;
         }
-        Err(ZError::Rejected {
-            status: 400,
-            message,
-            ..
-        }) => {
+        Err(e @ ZError::Rejected { status: 400, .. }) => {
             pending_insert.rollback().await;
-            info!(%message, "zitadel refused the new app user");
-            return Err(if policy_refusal(&message) {
+            info!(error = %e, "zitadel refused the new app user");
+            return Err(if e.is_any(&CREATE_PASSWORD_POLICY) {
                 weak_password()
             } else {
                 fail(
@@ -1370,7 +1368,7 @@ async fn password_reset_confirm(
         ],
     )?;
     // Before Zitadel sees the email, so this answer can't tell accounts apart.
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let info = branch_info(app, caller).await?;
@@ -1383,9 +1381,7 @@ async fn password_reset_confirm(
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { message, .. }) if policy_refusal(&message) => {
-            return Err(weak_password());
-        }
+        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
         // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
         Err(ZError::Rejected { .. }) => return Err(bad_code()),
         Err(e) => return Err(zitadel_down(&e)),
@@ -1480,7 +1476,7 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
             ("change-password", "user", &sub, 5, MINUTE),
         ],
     )?;
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let info = branch_info(app, caller).await?;
@@ -1502,9 +1498,7 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { message, .. }) if policy_refusal(&message) => {
-            return Err(weak_password());
-        }
+        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
         // A wrong current password, or a user Zitadel no longer has.
         Err(ZError::Rejected { .. }) => return Err(refused()),
         Err(e) => return Err(zitadel_down(&e)),
@@ -1532,27 +1526,4 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         warn!(error = %e, user = %claims.sub, "revoking the other app sessions failed");
     }
     Ok(Json(session).into_response())
-}
-
-/// Zitadel's password-policy refusals (`Errors.User.PasswordComplexityPolicy.*`).
-fn policy_refusal(message: &str) -> bool {
-    message.contains("PasswordComplexityPolicy")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::policy_refusal;
-
-    #[test]
-    fn password_policy_rejections_are_told_apart() {
-        assert!(policy_refusal(
-            "Errors.User.PasswordComplexityPolicy.MinLength"
-        ));
-        assert!(policy_refusal(
-            "Errors.User.PasswordComplexityPolicy.HasUpper"
-        ));
-        assert!(!policy_refusal("Errors.User.Password.Invalid"));
-        assert!(!policy_refusal("Errors.User.Code.Invalid"));
-        assert!(!policy_refusal("Errors.User.NotFound"));
-    }
 }

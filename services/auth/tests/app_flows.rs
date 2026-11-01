@@ -2300,3 +2300,72 @@ async fn app_unknown_email_counts_like_a_wrong_password() {
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], LIMITED, "{got:?}");
 }
+
+// ---- password refusals (#61) -----------------------------------------------------------------
+
+// Zitadel hashes passwords with bcrypt, which takes 72 bytes at most: a longer one would pass its
+// validation and fail with a 500. Refused before Zitadel, in bytes: 39 characters can be 74.
+#[tokio::test]
+async fn passwords_over_72_bytes_are_refused_before_zitadel() {
+    let h = harness().await;
+    let long = format!("Aa1!{}", "é".repeat(35));
+    assert_eq!((long.chars().count(), long.len()), (39, 74));
+    let a = h
+        .post("sign-up", json!({"email": "ada@example.com", "password": long}), None)
+        .await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", a.body);
+    assert_eq!(code(&a), "weak_password");
+    assert_eq!(h.mock.calls(), Vec::<String>::new(), "Zitadel is never called");
+    let id = h.add_user("bob@example.com", true);
+    let a = h
+        .post(
+            "password-reset/confirm",
+            json!({"email": "bob@example.com", "code": RESET_CODE, "password": long}),
+            None,
+        )
+        .await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", a.body);
+    assert_eq!(code(&a), "weak_password");
+    assert_eq!(h.mock.user_by_id(&id).unwrap().password, PW);
+    let s = h.sign_in("bob@example.com", PW).await;
+    let a = h
+        .post("change-password", json!({"current_password": PW, "password": long}), Some(access(&s)))
+        .await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", a.body);
+    assert_eq!(code(&a), "weak_password");
+    assert!(!h.mock.calls().iter().any(|c| c.ends_with("/password")), "{:?}", h.mock.calls());
+}
+
+// Zitadel's own password-policy refusals, by their captured ids (`COMMA-…` on create, `DOMAIN-…`
+// on a set or change), are `weak_password`; any other refusal is not.
+#[tokio::test]
+async fn zitadel_policy_refusals_are_weak_passwords() {
+    let h = harness().await;
+    h.mock.fail("POST /v2/users/new", 400, "Errors.User.PasswordComplexityPolicy.HasSymbol", 1);
+    let a = h
+        .post("sign-up", json!({"email": "ada@example.com", "password": PW}), None)
+        .await;
+    assert_eq!(a.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", a.body);
+    assert_eq!(code(&a), "weak_password");
+    h.mock.fail("POST /v2/users/new", 400, "Errors.Org.NotFound", 1);
+    let a = h
+        .post("sign-up", json!({"email": "ada@example.com", "password": PW}), None)
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "invalid_request"), "{}", a.body);
+    h.add_user("bob@example.com", true);
+    h.mock.fail("/password", 400, "Errors.User.PasswordComplexityPolicy.HasUpper", 1);
+    let a = h
+        .post(
+            "password-reset/confirm",
+            json!({"email": "bob@example.com", "code": RESET_CODE, "password": NEW_PW}),
+            None,
+        )
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"), "{}", a.body);
+    let s = h.sign_in("bob@example.com", PW).await;
+    h.mock.fail("/password", 400, "Errors.User.PasswordComplexityPolicy.MinLength", 1);
+    let a = h
+        .post("change-password", json!({"current_password": PW, "password": NEW_PW}), Some(access(&s)))
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::UNPROCESSABLE_ENTITY, "weak_password"), "{}", a.body);
+}

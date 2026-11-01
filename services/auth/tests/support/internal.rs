@@ -57,6 +57,11 @@ pub struct FakeState {
     pub invites: HashMap<(String, String), Value>,
     /// Answer the invite description with this status instead.
     pub describe_status: Option<u16>,
+    /// User id → `/internal/invites/open`'s `{open, expires_at}`; a user not here has none
+    /// (`{open: false, expires_at: null}`).
+    pub open_invites: HashMap<String, Value>,
+    /// Answer the open check with this status instead.
+    pub open_status: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -280,6 +285,18 @@ async fn describe_invite(State(s): S, Json(q): Json<HashMap<String, String>>) ->
     }
 }
 
+async fn open_invite(State(s): S, Json(q): Json<HashMap<String, String>>) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(status) = st.open_status {
+        return error(StatusCode::from_u16(status).unwrap(), "unavailable");
+    }
+    let user = q.get("user").cloned().unwrap_or_default();
+    match st.open_invites.get(&user) {
+        Some(v) => Json(v.clone()).into_response(),
+        None => Json(json!({"open": false, "expires_at": null})).into_response(),
+    }
+}
+
 async fn sync() -> StatusCode {
     StatusCode::ACCEPTED
 }
@@ -305,6 +322,7 @@ impl FakeInternal {
             .route("/internal/signup/check", post(signup_check))
             .route("/internal/signup/claimed", post(signup_claimed))
             .route("/internal/invites/describe", post(describe_invite))
+            .route("/internal/invites/open", post(open_invite))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -327,6 +345,20 @@ impl FakeInternal {
             .unwrap()
             .invites
             .insert((user.into(), token_hash.into()), description);
+    }
+
+    /// The user's latest invite: open (expiring in 72 h), or expired an hour ago.
+    pub fn set_open_invite(&self, user: &str, open: bool) {
+        let at = chrono::Utc::now()
+            + if open { chrono::Duration::hours(72) } else { chrono::Duration::hours(-1) };
+        self.inner.lock().unwrap().open_invites.insert(
+            user.into(),
+            json!({"open": open, "expires_at": at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)}),
+        );
+    }
+
+    pub fn set_open_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().open_status = status;
     }
 
     pub fn set_describe_status(&self, status: Option<u16>) {

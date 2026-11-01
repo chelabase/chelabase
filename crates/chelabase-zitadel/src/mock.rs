@@ -148,6 +148,18 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.User.PasswordComplexityPolicy.MinLength" if call == "POST /v2/users/new" => {
             r::CREATE_USER_PASSWORD_TOO_SHORT
         }
+        "Errors.User.PasswordComplexityPolicy.HasUpper" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_UPPER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasLower" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_LOWER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasNumber" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_NUMBER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasSymbol" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_SYMBOL
+        }
         "Errors.User.PasswordComplexityPolicy.MinLength" => r::PASSWORD_TOO_SHORT,
         "Errors.User.PasswordComplexityPolicy.HasUpper" => r::PASSWORD_NO_UPPER,
         "Errors.User.PasswordComplexityPolicy.HasLower" => r::PASSWORD_NO_LOWER,
@@ -170,10 +182,46 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
     })
 }
 
-/// Zitadel v4.19.1's error body for a refusal: the gRPC `code`, a `message` ending in the
-/// detail id, and one `details[]` entry carrying the id (a `CredentialsCheckError` for a wrong
-/// password, else an `ErrorDetail`). Until m2 the messages are the old error key, not
-/// Zitadel's localized text, so callers that still match keys keep working.
+/// The English text Zitadel v4.19.1 answers for an old error key (its `i18n/en.yaml`, or the
+/// literal message where Zitadel has no key). Callers match ids, never this text.
+fn localized(key: &str) -> &'static str {
+    match key {
+        "Errors.User.NotFound" => "User could not be found",
+        "Errors.User.AlreadyLocked" | "Errors.User.NotActive" => "User is not active or initial",
+        "Errors.User.NotLocked" => "User is not locked",
+        "Errors.User.AlreadyInactive" => "User already inactive",
+        "Errors.User.CannotDeactivateInitial" => {
+            "User with state initial can only be deleted not deactivated"
+        }
+        "Errors.User.NotInactive" => "User is not inactive",
+        "Errors.User.Code.Invalid" => "Code is invalid",
+        "Errors.User.Code.Expired" => "Code is expired",
+        "Errors.User.Code.NotFound" => "Code not found",
+        "Errors.User.Password.Invalid" => "Password is invalid",
+        "Errors.User.PasswordComplexityPolicy.MinLength" => "Password is too short",
+        "Errors.User.PasswordComplexityPolicy.HasUpper" => "Password must contain upper case",
+        "Errors.User.PasswordComplexityPolicy.HasLower" => "Password must contain lower case",
+        "Errors.User.PasswordComplexityPolicy.HasNumber" => "Password must contain number",
+        "Errors.User.PasswordComplexityPolicy.HasSymbol" => "Password must contain symbol",
+        k if k.starts_with("Errors.User.Email.NotChanged") => "Email not changed",
+        "Errors.User.AlreadyExists" => "User already exists",
+        "Errors.Org.AlreadyExists" => "Organisation's name or id already taken",
+        "Errors.Org.NotFound" => "Organisation not found",
+        "Errors.User.AlreadyInitialised" => "User is already initialized",
+        "Errors.AuthRequest.NotFound" => "Auth Request does not exist",
+        "Errors.User.Locked" => "User is locked",
+        "Errors.Token.Invalid" => "Token is invalid",
+        "Errors.PermissionDenied" => "No matching permissions found",
+        "Errors.Internal" => "An internal error occurred",
+        // A test's own stand-in key (`MockZitadel::fail`): still never the key itself.
+        _ => "The request was refused",
+    }
+}
+
+/// Zitadel v4.19.1's error body for a refusal: the gRPC `code`, a `message` that is the
+/// localized text followed by the detail id, and one `details[]` entry carrying the id and the
+/// text (a `CredentialsCheckError` for a wrong password, else an `ErrorDetail`). The error key
+/// appears nowhere, as on the real Zitadel, so no caller can match on it.
 ///
 /// A forced fault (`MockZitadel::fail`) whose key no capture names is the test's own stand-in
 /// for a refusal no caller matches: it gets a gRPC code for its status and a `TEST-` id. A
@@ -210,10 +258,11 @@ fn zitadel_refusal(call: &str, status: StatusCode, key: &str, forced: bool) -> R
     } else {
         "type.googleapis.com/zitadel.v1.ErrorDetail"
     };
+    let text = localized(key);
     let body = json!({
         "code": code,
-        "message": format!("{key} ({id})"),
-        "details": [{"@type": detail, "id": id, "message": key}],
+        "message": format!("{text} ({id})"),
+        "details": [{"@type": detail, "id": id, "message": text}],
     });
     (status, Json(body)).into_response()
 }
