@@ -2,6 +2,9 @@
 //! `CHELABASE_APP_AUTH_INTERNAL_TOKEN`, as for `/internal/app/*`): the `auth` service asks for it
 //! on behalf of the accept page, before any code is spent. The hash travels in the body so no
 //! request log or trace span carries it.
+//!
+//! The open check (`POST /internal/invites/open {user}`, the same bearer): whether this Zitadel
+//! user has an open member invite, and its stored expiry, for auth's accept-invite gate (#61).
 
 use std::sync::Arc;
 
@@ -10,6 +13,7 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::response::{IntoResponse, Response};
 use chelabase_neon::ComputeLocator;
+use chrono::{SecondsFormat, Utc};
 use chelabase_types::api_error::ApiError;
 use serde::Deserialize;
 use serde_json::json;
@@ -88,4 +92,39 @@ where
         }
         _ => not_found(),
     }
+}
+
+#[derive(Deserialize)]
+pub(super) struct Open {
+    /// The invitee's Zitadel user id.
+    user: String,
+}
+
+/// `{open, expires_at}`: whether this Zitadel user's latest member invite that isn't revoked or
+/// accepted (its member still invited) is open, i.e. not expired, and its stored expiry (RFC 3339,
+/// `null` with no such invite). Nothing else about the invite or the member is returned. A body
+/// that isn't `{user: string}` is the same as a user with no invite.
+pub(super) async fn open<M, L>(
+    State(state): State<Arc<InternalState<M, L>>>,
+    body: Result<Json<Open>, JsonRejection>,
+) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    let expires_at = match body {
+        Ok(Json(q)) => match state.metadata.invite_expiry_for_user(&q.user).await {
+            Ok(found) => found,
+            Err(e) => {
+                error!("open invite: {e}");
+                return ApiError::internal().into_response();
+            }
+        },
+        Err(_) => None,
+    };
+    Json(json!({
+        "open": expires_at.is_some_and(|at| at > Utc::now()),
+        "expires_at": expires_at.map(|at| at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+    }))
+    .into_response()
 }

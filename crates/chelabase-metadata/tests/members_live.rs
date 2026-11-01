@@ -2088,6 +2088,37 @@ async fn invite_description_follows_the_open_invite() {
     s.finish().await;
 }
 
+// #76: the stored expiry of a user's latest invite that isn't revoked or accepted, while its
+// member is still invited, whether or not it has expired.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn invite_expiry_follows_the_unclosed_invite() {
+    let s = Scratch::new().await;
+    let t = s.tenant().await;
+    let c = &s.client;
+    let a = c.ensure_member_first_comer_for_tests(t, "a", "a@x.com", "Alice", Admission::Active).await.unwrap();
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), None);
+    let (_, invite) = c.create_invited_member(a.id, t, new_invite("zi", "i@x.com", &[])).await.unwrap();
+    let stored = |sql: &'static str| async move {
+        sqlx::query_scalar::<_, chrono::DateTime<Utc>>(sql).bind(invite).fetch_one(c.pool()).await.unwrap()
+    };
+    let open = stored("SELECT expires_at FROM invites WHERE id = $1").await;
+    assert!(open > Utc::now());
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some(open));
+    // Expired: still answered, with its past expiry.
+    let past = stored("UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = $1 RETURNING expires_at").await;
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), Some(past));
+    assert!(c.open_invite_for_user("zi").await.unwrap().is_none());
+    // Another user's invite isn't this user's.
+    assert_eq!(c.invite_expiry_for_user("zother").await.unwrap(), None);
+    // Revoked: nothing.
+    c.resend_invite(a.id, invite, week(), [9; 32]).await.unwrap();
+    assert!(c.invite_expiry_for_user("zi").await.unwrap().unwrap() > Utc::now());
+    c.revoke_invite(a.id, invite).await.unwrap();
+    assert_eq!(c.invite_expiry_for_user("zi").await.unwrap(), None);
+    s.finish().await;
+}
+
 // R36: the display name is nullable, never empty or padded, and a change writes one event.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
