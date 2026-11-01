@@ -28,11 +28,12 @@ export interface SqlEditorProps {
   /** The roles have loaded (until then nothing runs and no schema is read). */
   rolesReady: boolean;
   branchProtected?: boolean;
-  /** A saved query or history entry names a Postgres database on this branch: the caller moves the context there. */
-  onPgDatabase: (name: string) => void;
-  /** A saved query or history entry names a role the caller may act as. */
-  onRole: (role: string) => void;
-  /** A run that changed the schema finished (the caller refreshes what it shows of it). */
+  /**
+   * A saved query or history entry names a Postgres database on this branch, a role the caller may act as, or both:
+   * the caller moves the context there, both at once (one question about a row draft, not two).
+   */
+  onHints: (hints: { database?: string; role?: string }) => void;
+  /** A run that changed the schema finished: the caller refreshes what it shows of it, the editor's schema read included. Without it the editor reads its schema again itself. */
   onSchemaChange?: () => void;
   /** The SQL tab's Quick view: to the table editor with the drawer open. */
   onQuickView?: () => void;
@@ -79,8 +80,7 @@ function SqlWorkspace({
   allowed,
   rolesReady,
   branchProtected,
-  onPgDatabase,
-  onRole,
+  onHints,
   onSchemaChange,
   onQuickView,
   drawer,
@@ -217,8 +217,8 @@ function SqlWorkspace({
       if (acc.done) {
         record(cur, acc.done.outcome, acc.done.duration_ms);
         if (changesSchema(acc.statements.flatMap((s) => (s.tag ? [s.tag] : [])))) {
-          void schemaQuery.refetch();
-          onSchemaChange?.();
+          if (onSchemaChange) onSchemaChange();
+          else void schemaQuery.refetch();
         }
       } else {
         setRun({ ...acc, running: false });
@@ -263,14 +263,16 @@ function SqlWorkspace({
 
   function applyHints(hints: { database?: string | null; role?: string | null }) {
     const notes: string[] = [];
+    const move: { database?: string; role?: string } = {};
     if (hints.database) {
-      if (pgDatabases.includes(hints.database)) onPgDatabase(hints.database);
+      if (pgDatabases.includes(hints.database)) move.database = hints.database;
       else notes.push(`The saved database "${hints.database}" isn't on this branch; the selected one is kept.`);
     }
     if (hints.role) {
-      if (allowed.roles.includes(hints.role)) onRole(hints.role);
+      if (allowed.roles.includes(hints.role)) move.role = hints.role;
       else notes.push(`The saved role "${hints.role}" isn't available here; running as ${role === "" ? "the owner" : role}.`);
     }
+    if (move.database || move.role) onHints(move);
     setLoadNote(notes.length > 0 ? notes.join(" ") : null);
   }
 
@@ -298,6 +300,7 @@ function SqlWorkspace({
   const ownerNotice = (ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && (
     <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
   );
+  const ownerWarning = !noRole && role === "" ? "Running as owner: row-level security is bypassed." : null;
   const noRoleNote = noRole && rolesReady && <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>;
   const output = (
     <>
@@ -348,6 +351,7 @@ function SqlWorkspace({
           <div className="min-w-0 flex-1 overflow-auto">{codeEditor}</div>
           <div aria-label="Output" role="group" className="w-[42%] min-w-0 space-y-2 overflow-auto border-l border-line p-2">
             {noRoleNote}
+            {ownerWarning && <p className="border border-destructive/40 p-1.5 text-xs">{ownerWarning}</p>}
             {branchProtected && <p className="text-xs text-chalk-dim">Protected branch: every change asks for confirmation.</p>}
             {ownerNotice}
             {loadNote && <p className="text-xs text-chalk-dim">{loadNote}</p>}
@@ -404,8 +408,8 @@ function SqlWorkspace({
 
       {noRole ? (
         noRoleNote
-      ) : role === "" ? (
-        <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
+      ) : ownerWarning ? (
+        <p className="border border-destructive/40 p-2 text-sm">{ownerWarning}</p>
       ) : !allowed.owner ? (
         <p className="border p-2 text-sm">
           Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.

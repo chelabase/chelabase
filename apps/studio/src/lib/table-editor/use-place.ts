@@ -45,7 +45,7 @@ function withDataApiRoles(caps: ProjectCaps, allowed: { owner: boolean; roles: s
  * The project's `project:` channel (§5.3): its events invalidate exactly the queries they concern;
  * a rejoin after a reconnect, or a `resync`, invalidates everything the editor shows. True while joined.
  */
-export function useProjectChannel(projectId: string | undefined, databaseId: string | undefined, branchId: string | undefined): boolean {
+function useProjectChannel(projectId: string | undefined, databaseId: string | undefined, branchId: string | undefined): boolean {
   const realtime = useRealtime();
   const queryClient = useQueryClient();
   const [live, setLive] = useState(false);

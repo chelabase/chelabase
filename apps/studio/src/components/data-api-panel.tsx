@@ -1,5 +1,4 @@
 import { useId, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   getListKeysQueryKey,
@@ -15,7 +14,7 @@ import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { pollWhile } from "@/lib/query";
 import { CopyButton } from "./copy-button";
-import { DataApiDatabases, DatabasePicker, KeyDatabases } from "./data-api-databases";
+import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
 import { DataApiTypes } from "./data-api-types";
 import { RlsWarning } from "./rls-warning";
@@ -27,15 +26,15 @@ export interface DataApiPanelProps {
   apiUrl: string;
   /** Extra content at the end of the second column (the Connect panel's logins line). */
   aside?: ReactNode;
-  /** Where to render the Postgres DB picker (the Connect panel's header); without it the picker sits in the first column. */
-  pickerSlot?: HTMLElement | null;
+  /** The Postgres database picked (the Connect panel's header picks it); left out or unknown, the branch's main one. */
+  pgDatabase?: string;
 }
 
 /**
  * One branch's data API in two columns that stack on narrow screens: the endpoint, public key and
  * what it reaches, then the secret keys and client setup.
  */
-export function DataApiPanel({ databaseId, branch, apiUrl, aside, pickerSlot }: DataApiPanelProps) {
+export function DataApiPanel({ databaseId, branch, apiUrl, aside, pgDatabase }: DataApiPanelProps) {
   // Rotating the public key is Developer's (rotateKey).
   const canRotate = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
@@ -46,8 +45,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl, aside, pickerSlot }: 
     query: { refetchInterval: pollWhile<BranchDatabaseView[]>((ds) => ds.some((d) => d.data_api === "enabling")) },
   });
   const databases = dbList.data ?? null;
-  const [pickedName, setPickedName] = useState<string | null>(null);
-  const pickedDb = databases?.find((d) => d.name === pickedName) ?? databases?.find((d) => d.main) ?? databases?.[0];
+  const pickedDb = databases?.find((d) => d.name === pgDatabase) ?? databases?.find((d) => d.main) ?? databases?.[0];
   // The schema (and the RLS warning) are read from a served database only.
   const schemaQuery = useGetDataApiSchema(
     databaseId,
@@ -139,20 +137,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl, aside, pickerSlot }: 
             </div>
           </div>
         )}
-        {pickerSlot && databases !== null && pickedDb && createPortal(
-          <DatabasePicker label="Postgres DB" databases={databases} value={pickedDb.name} onPick={setPickedName} />,
-          pickerSlot,
-        )}
-        {databases !== null && databases.length > 0 && pickedDb && (
-          <DataApiDatabases
-            hidePicker={!!pickerSlot}
-            databaseId={databaseId}
-            branchId={branchId}
-            databases={databases}
-            picked={pickedDb.name}
-            onPick={setPickedName}
-          />
-        )}
+        {pickedDb && <DataApiDatabases databaseId={databaseId} branchId={branchId} database={pickedDb} />}
         {publicKey && databases && (
           <section aria-label="Public key databases" className="space-y-1">
             <h4 className="text-muted-foreground">Public key databases</h4>

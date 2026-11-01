@@ -1,9 +1,8 @@
 import { lazy, Suspense, useRef, type KeyboardEvent, type PointerEvent } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { getGetTableQueryKey, getListObjectsQueryKey, getListTypesQueryKey } from "@chelabase/management-client";
 import type { PglsClient } from "@/lib/pgls/client";
+import { invalidateSchemaQueries } from "@/lib/table-editor/query-keys";
 import { SQL_HEIGHT, useTableEditor } from "@/lib/table-editor/store";
-import { rowWriteKeys } from "./rows-view";
 
 // The editor, CodeMirror and the pgls worker load only when the drawer first opens.
 const SqlEditor = lazy(() => import("@/components/sql-editor/sql-editor").then((m) => ({ default: m.SqlEditor })));
@@ -20,10 +19,8 @@ export interface SqlDrawerProps {
   role: string | null;
   allowed: { owner: boolean; roles: string[] };
   rolesReady: boolean;
-  onPgDatabase: (name: string) => void;
-  onRole: (role: string) => void;
-  /** The open table, refreshed after a run that changes the schema; null on the table list. */
-  table: { schema: string; table: string } | null;
+  /** A saved query or history entry moves the Postgres database, the role, or both (see `SqlEditorProps.onHints`). */
+  onHints: (hints: { database?: string; role?: string }) => void;
   onFullEditor: () => void;
   onClose: () => void;
   createClient?: () => Promise<PglsClient>;
@@ -35,24 +32,15 @@ const STEP = 0.05;
  * The SQL drawer under the table: a resize handle over the compact SQL editor. Its height is a share of the editor's
  * column (the store's `sqlHeight`); resizing only restyles it, so the code editor (and its undo history) stays mounted.
  */
-export function SqlDrawer({ databaseId, branchId, branchName, branchProtected, pg, table, onFullEditor, onClose, createClient, ...run }: SqlDrawerProps) {
+export function SqlDrawer({ databaseId, branchId, branchName, branchProtected, pg, onFullEditor, onClose, createClient, ...run }: SqlDrawerProps) {
   const height = useTableEditor((s) => s.sqlHeight);
   const setHeight = useTableEditor((s) => s.setSqlHeight);
   const section = useRef<HTMLElement>(null);
   const queryClient = useQueryClient();
-  const params = pg.main ? undefined : { database: pg.name };
-
-  // Realtime sends no DDL: after a run that changed the schema, the open table's structure, the object list, the types
-  // and the rows (a column added or dropped) are read again. Rows written by plain DML arrive live.
-  const refresh = () => {
-    const keys = [
-      getListObjectsQueryKey(databaseId, branchId, params),
-      getListTypesQueryKey(databaseId, branchId, params),
-      ...(table ? [getGetTableQueryKey(databaseId, branchId, table.schema, table.table, params)] : []),
-      ...rowWriteKeys(databaseId, branchId),
-    ];
-    for (const queryKey of keys) void queryClient.invalidateQueries({ queryKey });
-  };
+  // Realtime sends no DDL: after a run that changed the schema, what the table editor shows of it is read again.
+  const refresh = () => invalidateSchemaQueries(queryClient, databaseId, branchId, pg.main ? undefined : { database: pg.name });
+  // The role acted as; "no role" when there is none to act as (nothing runs then).
+  const as = run.role !== null ? `as ${run.role}` : run.allowed.owner ? "as owner" : run.rolesReady ? "no role" : null;
 
   const dragTo = (clientY: number) => {
     const box = section.current?.parentElement?.getBoundingClientRect();
@@ -96,7 +84,7 @@ export function SqlDrawer({ databaseId, branchId, branchName, branchProtected, p
           branchProtected={branchProtected}
           {...run}
           onSchemaChange={refresh}
-          drawer={{ place: `on ${branchName} · ${pg.name} · as ${run.role ?? "owner"}`, onFullEditor, onClose }}
+          drawer={{ place: [`on ${branchName}`, pg.name, as].filter(Boolean).join(" · "), onFullEditor, onClose }}
           createClient={createClient}
         />
       </Suspense>
