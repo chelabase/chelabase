@@ -2964,3 +2964,174 @@ async fn accept_invite_unconfigured_503s_do_not_count() {
     };
     tokio::join!(no_admin, no_org);
 }
+
+// ---- #74: the sign-in email limit under concurrency and hang-ups ------------------------------
+
+/// How many password checks (`POST /v2/sessions`, not its `/search`) reached Zitadel.
+fn password_checks(h: &Harness) -> usize {
+    h.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count()
+}
+
+/// Sends a sign-in as a client that gives up after 100 ms, from `ip`. Ok(status) when the
+/// answer beat the timeout (a 429 does), Err when the client hung up first.
+async fn hang_up_sign_in(h: &Harness, body: Value, ip: &str) -> Result<StatusCode, reqwest::Error> {
+    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
+    impatient
+        .post(format!("{}/auth/v1/sign-in", h.base))
+        .json(&body)
+        .header("x-forwarded-for", format!("9.9.9.9, {ip}"))
+        .send()
+        .await
+        .map(|r| r.status())
+}
+
+/// Sends `n` wrong-password sign-ins for ada one at a time, each from its own address, and
+/// returns their statuses.
+async fn wrong_sign_ins(h: &Harness, n: usize, tag: &str) -> Vec<StatusCode> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+        out.push(h.post("/auth/v1/sign-in", body, None, &format!("6.{tag}.{i}.1")).await.status);
+    }
+    out
+}
+
+/// The budget is whole: five wrong passwords are checked (401), and the sixth is refused.
+async fn assert_budget_unspent(h: &Harness, tag: &str) {
+    let got = wrong_sign_ins(h, 6, tag).await;
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{tag}: {got:?}");
+    assert_eq!(got[5], StatusCode::TOO_MANY_REQUESTS, "{tag}: {got:?}");
+}
+
+// AC 1: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+async fn sign_in_email_limit_holds_under_concurrency() {
+    let h = Arc::new(harness().await);
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    // A slow password check, so every request is in flight before the first answer.
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    let mut tasks = Vec::new();
+    for i in 0..30 {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+            h.post("/auth/v1/sign-in", body, None, &format!("1.2.{i}.1")).await.status
+        }));
+    }
+    let (mut refused, mut limited) = (0, 0);
+    for t in tasks {
+        match t.await.unwrap() {
+            StatusCode::UNAUTHORIZED => refused += 1,
+            StatusCode::TOO_MANY_REQUESTS => limited += 1,
+            other => panic!("unexpected {other}"),
+        }
+    }
+    h.mock.clear_on_request();
+    let checks = password_checks(&h);
+    assert!(checks <= 5, "{checks} password checks reached Zitadel ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (5, 25));
+}
+
+// AC 3: a client that hangs up while Zitadel checks the password still spends the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn sign_in_cancelled_password_checks_still_count() {
+    let h = harness().await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    // Only the password check is slow: 300 ms, and the client gives up at 100 ms.
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    for i in 0..5 {
+        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+        let r = hang_up_sign_in(&h, body, &format!("1.3.{i}.1")).await;
+        assert!(r.as_ref().is_err_and(|e| e.is_timeout()), "attempt {i}: {r:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    h.mock.clear_on_request();
+    // A patient client (no timeout).
+    let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+    let a = h.post("/auth/v1/sign-in", body, None, "1.3.9.1").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
+    assert_eq!(password_checks(&h), 5);
+}
+
+// AC 7: correct passwords at once all sign in and spend nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn concurrent_correct_sign_ins_do_not_spend_the_email_budget() {
+    let h = Arc::new(harness().await);
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(200)));
+    let mut tasks = Vec::new();
+    for i in 0..5 {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Secret-pass1");
+            let a = h.post("/auth/v1/sign-in", body, None, &format!("1.4.{i}.1")).await;
+            (a.status, a.body)
+        }));
+    }
+    for t in tasks {
+        let (status, body) = t.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    h.mock.clear_on_request();
+    assert_budget_unspent(&h, "1").await;
+}
+
+// AC 8: outages and sign-ins that are dead before the password check spend nothing; Zitadel's
+// own refusals of the input (its request validation) count like a wrong password.
+#[tokio::test]
+async fn sign_in_outages_do_not_spend_the_email_budget() {
+    let h = harness().await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    let mut ip = 0;
+    let mut sign_in = async |ar: &str, expect: StatusCode, why: &str| {
+        ip += 1;
+        let body = signin(ar, "ada@example.com", "Wrong-pass1");
+        let a = h.post("/auth/v1/sign-in", body, None, &format!("2.4.{ip}.1")).await;
+        assert_eq!(a.status, expect, "{why}: {}", a.body);
+    };
+    h.mock.set_down(true);
+    for _ in 0..6 {
+        sign_in("V2_1", StatusCode::SERVICE_UNAVAILABLE, "down").await;
+    }
+    h.mock.set_down(false);
+    // The password check itself fails: a 5xx, and a 4xx that isn't Zitadel's own answer.
+    h.mock.fail("POST /v2/sessions", 503, "Errors.Internal", 3);
+    h.mock.answer_raw("POST /v2/sessions", 404, "<html>not found</html>", 3);
+    for _ in 0..6 {
+        sign_in(&h.mock.add_auth_request(false), StatusCode::SERVICE_UNAVAILABLE, "check down").await;
+    }
+    // The user lookup fails.
+    h.mock.fail("/v2/users", 503, "Errors.Internal", 6);
+    for _ in 0..6 {
+        sign_in(&h.mock.add_auth_request(false), StatusCode::SERVICE_UNAVAILABLE, "lookup down").await;
+    }
+    // A sign-in Zitadel doesn't know, and one that isn't an id at all.
+    for ar in ["V2_999999", "V2_999998", "V2_999997", "nope", "nope", "nope"] {
+        sign_in(ar, StatusCode::GONE, "dead sign-in").await;
+    }
+    assert_budget_unspent(&h, "2").await;
+
+    // Zitadel's request validation (a password over 200 characters): the caller's input counts.
+    let h = harness().await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.mock.answer_raw(
+        "POST /v2/sessions",
+        400,
+        r#"{"code":3,"message":"invalid CreateSessionRequest.Checks: embedded message failed validation","details":[]}"#,
+        5,
+    );
+    let got = wrong_sign_ins(&h, 6, "3").await;
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
+    assert_eq!(got[5], StatusCode::TOO_MANY_REQUESTS, "{got:?}");
+
+    // No org yet: 503 before any Zitadel call, and free.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("org-id");
+    let p = path.clone();
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| c.org_id = org_file(&p)).await;
+    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    let got = wrong_sign_ins(&h, 6, "4").await;
+    assert!(got.iter().all(|s| *s == StatusCode::SERVICE_UNAVAILABLE), "{got:?}");
+    write_id(&path, "o1\n");
+    assert_budget_unspent(&h, "5").await;
+}

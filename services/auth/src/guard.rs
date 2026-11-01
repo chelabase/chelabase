@@ -103,6 +103,32 @@ impl RateLimiter {
     }
 }
 
+/// One attempt reserved against a [`RateLimiter`] key (an address's, an invitee's, an email's).
+/// It fails closed: the attempt stays counted unless [`refund`](Self::refund) gives it back, so a
+/// slot that is dropped undecided (a new early return, or the request future dropped because the
+/// client hung up while Zitadel checked a code or password) spends budget. Only outcomes that
+/// must not count refund.
+pub struct Slot<'a> {
+    limiter: &'a RateLimiter,
+    key: String,
+    /// Start of the window the slot was reserved in; the refund applies only to that window.
+    started: Instant,
+}
+
+impl<'a> Slot<'a> {
+    /// Counts one attempt against `key`; `None` (and nothing counted) once its `limit` for the
+    /// `window` is used.
+    pub fn reserve(limiter: &'a RateLimiter, key: String, limit: u32, window: Duration) -> Option<Self> {
+        let started = limiter.allow_slot(&key, limit, window)?;
+        Some(Slot { limiter, key, started })
+    }
+
+    /// Gives the attempt back: the outcome isn't a failure of the caller's.
+    pub fn refund(self) {
+        self.limiter.refund(&self.key, self.started);
+    }
+}
+
 /// The client's address for rate limits: the rightmost `X-Forwarded-For` entry (the one the
 /// gateway appended from its TCP peer) when `peer` is a trusted proxy, else `peer` itself. A
 /// compute on the compute network reaches auth directly, so its forwarded header never counts
@@ -338,6 +364,28 @@ mod tests {
         limiter.refund("k", old);
         // The new window's failure must still count.
         assert!(!limiter.allow("k", 1, w), "refund of a stale slot freed the new window's failure");
+    }
+
+    // #74 AC 5: a slot reserved with a minute window spends that minute only.
+    #[test]
+    fn a_slot_with_a_minute_window_can_try_again_after_it() {
+        let limiter = RateLimiter::default();
+        let minute = Duration::from_secs(60);
+        for _ in 0..5 {
+            assert!(Slot::reserve(&limiter, "k".into(), 5, minute).is_some());
+        }
+        assert!(Slot::reserve(&limiter, "k".into(), 5, minute).is_none());
+        // 61 s later (the window's start moved back instead of waiting).
+        let back = Duration::from_secs(61);
+        for (start, _) in limiter.windows.lock().unwrap().values_mut() {
+            *start = start.checked_sub(back).expect("an instant 61 s back");
+        }
+        let slot = Slot::reserve(&limiter, "k".into(), 5, minute).expect("a new window");
+        slot.refund();
+        for _ in 0..5 {
+            assert!(Slot::reserve(&limiter, "k".into(), 5, minute).is_some());
+        }
+        assert!(Slot::reserve(&limiter, "k".into(), 5, minute).is_none());
     }
 
     use proptest::prelude::*;
