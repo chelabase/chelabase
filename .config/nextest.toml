@@ -16,3 +16,8 @@ test-group = "stack-serial"
 [[profile.default.overrides]]
 filter = 'package(chelabase-schema) & binary(catalog_live)'
 test-group = "stack-serial"
+
+# The Zitadel live tests shorten the instance's invite code expiry for one call (#60).
+[[profile.default.overrides]]
+filter = 'package(chelabase-zitadel) & binary(zitadel_live)'
+test-group = "stack-serial"
