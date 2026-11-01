@@ -2287,3 +2287,16 @@ async fn app_sign_in_outages_do_not_spend_the_email_budget() {
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], LIMITED, "{got:?}");
 }
+
+/// An unknown email spends the budget like a wrong password: otherwise six wrong sign-ins
+/// would get a 429 only for real accounts, so anyone could enumerate an app's users.
+#[tokio::test]
+async fn app_unknown_email_counts_like_a_wrong_password() {
+    let h = harness().await;
+    let mut got = Vec::new();
+    for i in 0..6 {
+        got.push(h.sign_in_from("nobody@example.com", "Wr0ng!pass", &format!("10.9.0.{i}"), false).await.status);
+    }
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
+    assert_eq!(got[5], LIMITED, "{got:?}");
+}
