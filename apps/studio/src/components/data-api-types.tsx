@@ -59,7 +59,7 @@ export function DataApiTypes({ databaseId, branchId, databases, defaultDatabase 
 
   const field = "h-8 border border-input bg-background px-2 text-sm";
   return (
-    <section aria-label="Generated types" className="space-y-2">
+    <section aria-label="Generated types" className="min-w-0 space-y-2">
       <h3 className="text-sm font-medium">Generated types</h3>
       <p className="text-xs text-muted-foreground">
         <code>db.ts</code> for this branch: the tables, views and functions a secret key with this role can reach.
@@ -103,12 +103,12 @@ export function DataApiTypes({ databaseId, branchId, databases, defaultDatabase 
           {error}
         </p>
       )}
-      <div className="space-y-1">
+      <div className="min-w-0 max-w-full space-y-1">
         <div className="flex items-center gap-2">
           <span className="text-xs text-muted-foreground">On a server, load the runtime types at startup:</span>
           <CopyButton value={SNIPPET} label="Copy snippet" />
         </div>
-        <pre className="overflow-x-auto bg-muted p-2 text-xs">
+        <pre className="max-w-full min-w-0 overflow-x-auto bg-muted p-2 text-xs">
           <code>{SNIPPET}</code>
         </pre>
       </div>

@@ -96,7 +96,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl, aside, pgDatabase }: 
     >
       <section aria-label="Data API" className="min-w-0 space-y-3 border p-3">
         <h3 className="font-medium">Data API</h3>
-        <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1">
           <dt className="text-muted-foreground">Endpoint</dt>
           <dd className="font-mono break-all">{endpoint}</dd>
           <dd>
