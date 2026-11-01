@@ -144,7 +144,7 @@ pub(crate) fn zitadel_unavailable() -> ApiError {
 /// `404`. Zitadel's message is an error id, logged and never shown.
 pub(crate) fn zitadel_failed(what: &str, err: &ZError) -> ApiError {
     match err {
-        ZError::Rejected { status, message } => {
+        ZError::Rejected { status, message, .. } => {
             warn!("zitadel refused: {what}: {err}");
             match *status {
                 404 => ApiError::not_found("user not found"),
@@ -171,7 +171,7 @@ mod tests {
     use super::*;
 
     fn rejected(status: u16, message: &str) -> ZError {
-        ZError::Rejected { status, message: message.into() }
+        ZError::Rejected { status, code: None, id: None, message: message.into() }
     }
 
     /// Only an unreachable Zitadel (or one refusing Chelabase's own credential) is `503`.
@@ -555,7 +555,7 @@ where
         pending.rollback().await;
         return Err(match err {
             ZError::Rejected { status: 409, .. } => email_taken(),
-            ZError::Rejected { status: 400, message } if is_password_policy(&message) => weak_password(),
+            ZError::Rejected { status: 400, message, .. } if is_password_policy(&message) => weak_password(),
             err => zitadel_failed("create user", &err),
         });
     }
@@ -697,7 +697,7 @@ where
     if let Some(password) = &body.password {
         match z.set_password_admin(&uid, password).await {
             Ok(()) => {}
-            Err(ZError::Rejected { status: 400, message }) if is_password_policy(&message) => return Err(weak_password()),
+            Err(ZError::Rejected { status: 400, message, .. }) if is_password_policy(&message) => return Err(weak_password()),
             Err(err) => return Err(zitadel_failed("set password", &err)),
         }
         revoke_sessions(state, z, &ctx.project, user_id).await?;
@@ -811,7 +811,7 @@ where
     match done {
         Ok(()) => {}
         Err(ZError::Rejected { status: 404, .. }) => return Err(ApiError::not_found("user not found")),
-        Err(ZError::Rejected { status, message }) if is_state_precondition(status, &message) => {
+        Err(ZError::Rejected { status, message, .. }) if is_state_precondition(status, &message) => {
             let state = if active { "active" } else { "inactive" };
             return Err(conflict(ErrorCode::Conflict, format!("the user is already {state}")));
         }
