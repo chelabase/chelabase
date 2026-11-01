@@ -334,7 +334,11 @@ impl H {
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, identity: Option<String>) -> Ans {
-        let mut req = req.header("x-forwarded-for", "10.1.1.1");
+        self.send_from(req, identity, "10.1.1.1").await
+    }
+
+    async fn send_from(&self, req: reqwest::RequestBuilder, identity: Option<String>, ip: &str) -> Ans {
+        let mut req = req.header("x-forwarded-for", ip);
         if let Some(i) = identity {
             req = req.header(IDENTITY_HEADER, i);
         }
@@ -2085,4 +2089,201 @@ async fn server_vouched_change_password_keeps_the_per_user_limit() {
     let got = statuses(6, async |_| h.post_vouched("change-password", wrong.clone(), Some(&token)).await).await;
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], LIMITED);
+}
+
+// ---- #74: the sign-in email limit under concurrency and hang-ups ------------------------------
+
+impl H {
+    /// A sign-in from `ip`, vouched for by the app's server or not.
+    async fn sign_in_from(&self, email: &str, password: &str, ip: &str, vouched: bool) -> Ans {
+        let identity = self.identity_opts(None, DataKeyKind::Public, vouched);
+        self.send_from(
+            self.http
+                .post(format!("{}/auth/v1/app/sign-in", self.base))
+                .json(&json!({"email": email, "password": password})),
+            Some(identity),
+            ip,
+        )
+        .await
+    }
+
+    /// How many password checks (`POST /v2/sessions`, not its `/search`) reached Zitadel.
+    fn password_checks(&self) -> usize {
+        self.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count()
+    }
+}
+
+/// `n` wrong-password sign-ins for ada at once, each from its own address; (401s, 429s).
+async fn wrong_sign_in_burst(h: &Arc<H>, n: usize, vouched: bool) -> (usize, usize) {
+    // A slow password check, so every request is in flight before the first answer.
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    let mut tasks = Vec::new();
+    for i in 0..n {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.2.{i}.1"), vouched).await
+        }));
+    }
+    let (mut refused, mut limited) = (0, 0);
+    for t in tasks {
+        let a = t.await.unwrap();
+        match a.status {
+            StatusCode::UNAUTHORIZED => refused += 1,
+            LIMITED => limited += 1,
+            other => panic!("unexpected {other}: {}", a.body),
+        }
+    }
+    h.mock.clear_on_request();
+    (refused, limited)
+}
+
+/// The budget is whole: five wrong passwords are checked (401), and the sixth is refused.
+async fn assert_app_budget_unspent(h: &H, tag: &str) {
+    let mut got = Vec::new();
+    for i in 0..6 {
+        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.6.{tag}.{i}"), false).await.status);
+    }
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{tag}: {got:?}");
+    assert_eq!(got[5], LIMITED, "{tag}: {got:?}");
+}
+
+// AC 2: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+async fn app_sign_in_email_limit_holds_under_concurrency() {
+    let h = Arc::new(harness().await);
+    h.add_user("ada@example.com", true);
+    let (refused, limited) = wrong_sign_in_burst(&h, 30, false).await;
+    let checks = h.password_checks();
+    assert!(checks <= 5, "{checks} password checks reached Zitadel ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (5, 25));
+}
+
+// AC 4: a server-vouched caller has no address limit; the email limit still holds at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
+async fn server_vouched_sign_in_burst_is_limited() {
+    let h = Arc::new(harness().await);
+    h.add_user("ada@example.com", true);
+    let (refused, limited) = wrong_sign_in_burst(&h, 30, true).await;
+    let checks = h.password_checks();
+    assert!(checks <= 5, "{checks} password checks reached Zitadel ({refused} got 401, {limited} got 429)");
+    assert_eq!((refused, limited), (5, 25));
+}
+
+// AC 3: a client that hangs up while Zitadel checks the password still spends the attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn app_sign_in_cancelled_password_checks_still_count() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    // Only the password check is slow: 300 ms, and the client gives up at 100 ms.
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
+    for i in 0..5 {
+        let r = impatient
+            .post(format!("{}/auth/v1/app/sign-in", h.base))
+            .json(&json!({"email": "ada@example.com", "password": "Wr0ng!pass"}))
+            .header("x-forwarded-for", format!("10.3.{i}.1"))
+            .header(IDENTITY_HEADER, h.identity_for(None, DataKeyKind::Public))
+            .send()
+            .await
+            .map(|r| r.status());
+        assert!(r.as_ref().is_err_and(|e| e.is_timeout()), "attempt {i}: {r:?}");
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    h.mock.clear_on_request();
+    // A patient client (no timeout).
+    let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", "10.3.9.1", false).await;
+    assert_eq!(a.status, LIMITED, "{}", a.body);
+    assert_eq!(h.password_checks(), 5);
+}
+
+// AC 6: the orchestrator down or the branch disabled spend nothing.
+#[tokio::test]
+async fn app_sign_in_internal_down_or_disabled_does_not_spend() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let mut disabled = info(h.project, h.branch, false);
+    disabled["status"] = json!("enabling");
+    h.internal.set_branch(h.branch, disabled);
+    for i in 0..6 {
+        let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.4.0.{i}"), false).await;
+        assert_eq!(a.status, StatusCode::CONFLICT, "disabled {i}: {}", a.body);
+    }
+    // An answer the client can't read is the orchestrator being unavailable.
+    h.internal.set_branch(h.branch, json!("not branch info"));
+    for i in 0..6 {
+        let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.4.1.{i}"), false).await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "internal down {i}: {}", a.body);
+    }
+    h.internal.set_branch(h.branch, info(h.project, h.branch, false));
+    assert_app_budget_unspent(&h, "1").await;
+}
+
+// AC 7: correct passwords at once all sign in and spend nothing; nor does a correct password
+// whose account then can't sign in (unverified).
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn app_concurrent_correct_sign_ins_do_not_spend_the_email_budget() {
+    let h = Arc::new(harness().await);
+    h.add_user("ada@example.com", true);
+    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(200)));
+    let mut tasks = Vec::new();
+    for i in 0..5 {
+        let h = h.clone();
+        tasks.push(tokio::spawn(async move {
+            h.sign_in_from("ada@example.com", PW, &format!("10.5.{i}.1"), false).await
+        }));
+    }
+    for t in tasks {
+        let a = t.await.unwrap();
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    }
+    h.mock.clear_on_request();
+    assert_app_budget_unspent(&h, "2").await;
+
+    let h = harness_opts(true, 1, true).await;
+    h.add_user("ada@example.com", false);
+    for i in 0..6 {
+        let a = h.sign_in_from("ada@example.com", PW, &format!("10.5.9.{i}"), false).await;
+        assert_eq!(a.status, StatusCode::FORBIDDEN, "unverified {i}: {}", a.body);
+    }
+    assert_app_budget_unspent(&h, "3").await;
+}
+
+// AC 8: Zitadel outages spend nothing; its request validation counts like a wrong password.
+#[tokio::test]
+async fn app_sign_in_outages_do_not_spend_the_email_budget() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    let mut ip = 0;
+    let mut sign_in = async |expect: StatusCode, why: &str| {
+        ip += 1;
+        let a = h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.7.0.{ip}"), false).await;
+        assert_eq!(a.status, expect, "{why}: {}", a.body);
+    };
+    h.mock.set_down(true);
+    for _ in 0..6 {
+        sign_in(StatusCode::SERVICE_UNAVAILABLE, "down").await;
+    }
+    h.mock.set_down(false);
+    // The password check itself fails: a 5xx, and a 4xx that isn't Zitadel's own answer.
+    h.mock.fail("POST /v2/sessions", 503, "Errors.Internal", 3);
+    h.mock.answer_raw("POST /v2/sessions", 404, "<html>not found</html>", 3);
+    for _ in 0..6 {
+        sign_in(StatusCode::SERVICE_UNAVAILABLE, "check down").await;
+    }
+    assert_app_budget_unspent(&h, "4").await;
+
+    let h = harness().await;
+    h.add_user("ada@example.com", true);
+    h.mock.answer_raw(
+        "POST /v2/sessions",
+        400,
+        r#"{"code":3,"message":"invalid CreateSessionRequest.Checks: embedded message failed validation","details":[]}"#,
+        5,
+    );
+    let mut got = Vec::new();
+    for i in 0..6 {
+        got.push(h.sign_in_from("ada@example.com", "Wr0ng!pass", &format!("10.7.1.{i}"), false).await.status);
+    }
+    assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
+    assert_eq!(got[5], LIMITED, "{got:?}");
 }

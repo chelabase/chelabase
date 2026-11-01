@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::cookie::*;
-use crate::guard::{RateLimiter, UsedTickets, client_ip, email_tag, pad};
+use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
 use chelabase_zitadel::rules::{normalize_email, strong_password};
 use crate::zitadel::{NewUser, Session, UserState, ZError, ZUser, Zitadel};
 use axum::extract::{DefaultBodyLimit, State};
@@ -540,39 +540,76 @@ async fn sign_in(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignInBody
 async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
-    // Per email, only failures count: signing in as someone takes their password, so nobody
-    // can use up a known account's attempts.
-    let email_key = format!("sign-in:email:{}", email_tag(&email));
-    if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)])
-        || s.limiter.over(&email_key, 5, MINUTE)
-    {
+    if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    let refused = || {
-        s.limiter.hit(&email_key, MINUTE);
-        error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS)
+    // Per email, only failed password checks count: signing in as someone takes their password,
+    // so nobody can use up a known account's attempts. The attempt is reserved up front, so
+    // concurrent requests can't all pass a check before any failure lands, and a client that
+    // hangs up during the check still spends it. Only these outcomes give it back:
+    //
+    // | Outcome                                                        | Answer  | Email slot |
+    // |----------------------------------------------------------------|---------|------------|
+    // | the email's 5 a minute are used                                | 429     | none held  |
+    // | `authRequest` isn't an auth request id                         | 410     | refunded   |
+    // | no org yet (the bootstrap hasn't written it)                   | 503     | refunded   |
+    // | Zitadel refuses the auth request, or is unavailable            | 410/503 | refunded   |
+    // | the user lookup fails                                          | 503     | refunded   |
+    // | no user has this email                                         | 401     | counts     |
+    // | the password check is refused (any `Rejected`, see below)      | 401     | counts     |
+    // | the password check is unavailable (`Unavailable`)              | 503     | refunded   |
+    // | the password is right (refunded before anything else awaits)   | any     | refunded   |
+    // | the request is dropped undecided (the client hung up)          | none    | counts     |
+    //
+    // A refused password check is any refusal of Zitadel's own: a wrong password
+    // (`refusals::PASSWORD_INVALID`), no such user (`SESSION_USER_NOT_FOUND`), a locked or
+    // inactive user (`SESSION_USER_LOCKED`, `SESSION_USER_NOT_ACTIVE`), or its request validation
+    // (`ZError::is_invalid_request`, e.g. a password over 200 characters: the caller's input).
+    // `Unavailable` is no answer, a 5xx, or a 4xx that isn't Zitadel's own error. An unknown
+    // email and a wrong password both count and answer the same 401, padded alike.
+    let Some(slot) = Slot::reserve(
+        &s.limiter,
+        format!("sign-in:email:{}", email_tag(&email)),
+        5,
+        MINUTE,
+    ) else {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     };
+    // Counts: the slot is dropped without a refund.
+    let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
     if !is_auth_request_id(&b.auth_request) {
+        slot.refund();
         return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     }
     let Some(org) = org_id(s) else {
+        slot.refund();
         return no_org();
     };
     if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
+        slot.refund();
         return pending_sign_in_error(e);
     }
     let user_id = match s.zitadel.find_user_by_email(org, &email).await {
         Ok(Some(id)) => id,
         Ok(None) => return refused(),
-        Err(e) => return unavailable(&e),
+        Err(e) => {
+            slot.refund();
+            return unavailable(&e);
+        }
     };
     let session = match s.zitadel.create_session(&user_id, &b.password).await {
-        Ok(session) => session,
+        Ok(session) => {
+            slot.refund();
+            session
+        }
         Err(ZError::Rejected { .. }) => {
             info!(email = %email_tag(&email), "sign-in refused");
             return refused();
         }
-        Err(e) => return unavailable(&e),
+        Err(e @ ZError::Unavailable(_)) => {
+            slot.refund();
+            return unavailable(&e);
+        }
     };
     match s.zitadel.email_verified(&user_id).await {
         Ok(true) => finish(s, &b.auth_request, session).await,
@@ -996,37 +1033,13 @@ fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
     incomplete(s, user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE)
 }
 
-/// One attempt reserved against a budget (an address's or an invitee's). It fails closed: the
-/// attempt stays counted unless [`refund`](Self::refund) gives it back, so a slot that is
-/// dropped undecided (a new early return, or the request future dropped because the client hung
-/// up while Zitadel checked the code) spends budget. Only outcomes that must not count refund.
-struct Slot<'a> {
-    limiter: &'a RateLimiter,
-    key: String,
-    /// Start of the window the slot was reserved in; the refund applies only to that window.
-    started: Instant,
-}
-
-impl<'a> Slot<'a> {
-    /// Counts one attempt against `key`; `None` once its `limit` for the window is used.
-    fn reserve(limiter: &'a RateLimiter, key: String, limit: u32) -> Option<Self> {
-        let started = limiter.allow_slot(&key, limit, HOUR)?;
-        Some(Slot { limiter, key, started })
-    }
-
-    /// Gives the attempt back: the outcome isn't a failure of the caller's.
-    fn refund(self) {
-        self.limiter.refund(&self.key, self.started);
-    }
-}
-
 async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteBody) -> Response {
     let ip = client_ip(headers);
     // Only failed attempts count against an address, so an office behind one NAT can accept many
     // invites an hour while guessing codes from it still stops at 20 failures. The attempt is
     // counted up front (concurrent requests can't all pass a check before any failure lands) and
     // handed back only by the outcomes that aren't a failure of the caller's.
-    let Some(slot) = Slot::reserve(&s.limiter, format!("accept-invite:ip:{ip}"), 20) else {
+    let Some(slot) = Slot::reserve(&s.limiter, format!("accept-invite:ip:{ip}"), 20, HOUR) else {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     };
     let bad = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
@@ -1087,7 +1100,7 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     match (code, &b.accept_ticket) {
         (Some(code), _) => {
             // Reserved before the check like the address's slot, so a hang-up can't skip it.
-            let Some(user_slot) = Slot::reserve(&s.limiter, user_key, 5) else {
+            let Some(user_slot) = Slot::reserve(&s.limiter, user_key, 5, HOUR) else {
                 slot.refund();
                 return too_many();
             };
