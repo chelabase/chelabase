@@ -136,7 +136,7 @@ services:
   # `docker compose run --rm --no-deps --user 10001:10001 --entrypoint chelabase-init init-secrets setup-code --dir /var/lib/chelabase/secrets`
   # (the code is in the logs of the container that made it; a recreated init-secrets has none).
   init-secrets:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:4ffd65d1f7bc5b19075f151781852b790656717e19dc25b5d03086d2b9106dcd}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:f1129ed38bcaac909efec6a0fe457055cc7f0605e28334ae427af73d9036ed0d}
     restart: "no"
     user: "0"
     network_mode: none
@@ -239,7 +239,7 @@ services:
   # m4); retries readiness on its own and is never restarted, so `up --wait` reports a failure.
   # Writes only bootstrap/ in the secrets volume.
   init-bootstrap:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:4ffd65d1f7bc5b19075f151781852b790656717e19dc25b5d03086d2b9106dcd}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:f1129ed38bcaac909efec6a0fe457055cc7f0605e28334ae427af73d9036ed0d}
     restart: "no"
     group_add: ["70"]
     command: ["chelabase-init", "bootstrap", "--out", "/run/chelabase/secrets/bootstrap"]
@@ -880,7 +880,7 @@ services:
   # CHELABASE_IMAGE_TAG pick the images (docker-compose.build.yml builds them from the clone).
 
   orchestrator:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:5c90bf037624ce2b808649d21372947eda8bfbb15e8561f4b0487ee77009b813}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:7b025a936a3c9c899bf0109720acc8089f4819d23a5d242c987372599c455b5b}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -966,7 +966,7 @@ services:
         condition: service_healthy
 
   worker:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:2c5ada6742dfad9b3136c0a29788dff960965ded78e5dfc9a2a17f109c40a99b}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/worker:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:d06e3da222111b988c119d3a85aada99521bc82f49bf4f0919c6088853b0e260}
     restart: unless-stopped
     user: "0"
     entrypoint: *app-with-docker
@@ -1081,7 +1081,7 @@ services:
   # computes reach it directly: only the gateway's X-Forwarded-For counts
   # (CHELABASE_AUTH_TRUSTED_PROXY=gateway, ruling (e)).
   auth:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:ad82fc19246a7706f3ea53a4bacb973451264ad66fed9a330e0c33aacdb80d8b}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/auth:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:83a1a1768e9ea5a1a0d17206148e720b2955045a5aa695c5a4a9da3ff7cd7eb4}
     restart: unless-stopped
     # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
     environment:
@@ -1144,7 +1144,7 @@ services:
   # /health, which waits for the OIDC audiences. It verifies the gateway's identity on ticket
   # requests.
   realtime:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:82c4728d537eab96f5f1ad56383ae8c5ba5634d9e1310249c870e557be8322f9}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/realtime:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:51bb75b8a099e88946b8b82755ceed2b1a62cd7b3eee18383bf5880c83816dbf}
     restart: unless-stopped
     # S1: its own credentials, from its own files below; Valkey TLS is platform mode's (S7).
     environment:
@@ -1192,7 +1192,7 @@ services:
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:d6be5b6a056d938fcfd3e9ba599c226a779e67f3b6d5520ca18059abfced82c3}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:7a4737761e00da98b69c6586104eb12ed2485fddc57b5ccd01e4ed1acba2c754}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
