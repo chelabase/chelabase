@@ -670,3 +670,44 @@ async fn an_expired_invite_code_is_refused_as_invalid() {
     })
     .await;
 }
+
+/// `POST /v2/users/{id}/password` with a reset code, for a user deleted after the code was
+/// returned (and for one that never existed): the auth service's reset path answers it as a
+/// revoked invite and hands the attempt back, so a wrong code for a user who exists, whatever
+/// their state, must never get this answer.
+#[tokio::test]
+#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+async fn a_reset_code_for_a_deleted_user_is_refused_as_not_found() {
+    in_org("reset-gone", |live, org| async move {
+        let z = live.client();
+        let reset_code = |user: String| {
+            let live = live.clone();
+            async move {
+                let (status, text) = live
+                    .raw(Method::POST, &format!("/v2/users/{user}/password_reset"), Some(json!({"returnCode": {}})))
+                    .await;
+                assert_eq!(status, 200, "a reset code: {text}");
+                serde_json::from_str::<Value>(&text).unwrap()["verificationCode"].as_str().unwrap().to_string()
+            }
+        };
+        // A wrong code for a user who exists, with a reset code pending: active, passwordless (an
+        // invitee), inactive, locked. (With none pending it is `PASSWORD_CODE_NOT_FOUND`.)
+        let active = new_user(&z, &org, "active").await;
+        let invitee = z.create_user_without_password(&org, &format!("inv-{}@example.com", tag())).await.unwrap();
+        let inactive = new_user(&z, &org, "inactive").await;
+        z.deactivate_user(&inactive).await.unwrap();
+        let locked = new_user(&z, &org, "locked").await;
+        z.lock_user(&locked).await.unwrap();
+        for (what, user) in [("active", &active), ("passwordless", &invitee), ("inactive", &inactive), ("locked", &locked)] {
+            reset_code(user.clone()).await;
+            assert_refused(what, z.set_password(user, "NOPE12", "An0ther!pass-live").await, refusals::PASSWORD_CODE_INVALID);
+        }
+        let user = new_user(&z, &org, "gone").await;
+        let code = reset_code(user.clone()).await;
+        z.delete_user(&user).await.unwrap();
+        assert_refused("deleted user, the right code", z.set_password(&user, &code, "An0ther!pass-live").await, refusals::SET_PASSWORD_USER_NOT_FOUND);
+        assert_refused("deleted user, a wrong code", z.set_password(&user, "NOPE12", "An0ther!pass-live").await, refusals::SET_PASSWORD_USER_NOT_FOUND);
+        assert_refused("unknown user", z.set_password(&format!("{}", tag()), "NOPE12", "An0ther!pass-live").await, refusals::SET_PASSWORD_USER_NOT_FOUND);
+    })
+    .await;
+}

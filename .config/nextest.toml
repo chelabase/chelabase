@@ -21,3 +21,9 @@ test-group = "stack-serial"
 [[profile.default.overrides]]
 filter = 'package(chelabase-zitadel) & binary(zitadel_live)'
 test-group = "stack-serial"
+
+# Auth's live tests invite and remove members of the demo tenant, make a project with app users,
+# and spend the runner address's accept-invite failures (#61).
+[[profile.default.overrides]]
+filter = 'package(auth) & binary(auth_live)'
+test-group = "stack-serial"
