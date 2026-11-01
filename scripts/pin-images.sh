@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Write the pushed image pins into the self-host compose defaults and .env.example.
+# Write the pushed image pins into the self-host compose defaults (and the overlays that reuse them)
+# and .env.example.
 #
 #   scripts/pin-images.sh <digests-file>
 #
@@ -12,6 +13,8 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
 envex="$root/infra/compose/.env.example"
+# Overlays that reuse base images (the example seed) get the same pins.
+overlays=("$root/infra/compose/docker-compose.example.yml")
 [[ $# -eq 1 && -f "$1" ]] || { echo "usage: $0 <digests-file>" >&2; exit 2; }
 images=(gateway orchestrator worker rest auth realtime init studio)
 declare -A ref
@@ -42,7 +45,7 @@ pinned=()
 for i in "${images[@]}"; do
   [[ -n "${ref[$i]:-}" ]] || continue
   pinned+=("$i")
-  sed -i -E "s#^(\s*image: )\\$\{CHELABASE_IMAGE_REPO:-[^}]*\}/$i:\\$\{CHELABASE_IMAGE_TAG:-[^}]*\}\$#\1\${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/$i:\${CHELABASE_IMAGE_TAG:-${ref[$i]}}#" "$compose"
+  sed -i -E "s#^(\s*image: )\\$\{CHELABASE_IMAGE_REPO:-[^}]*\}/$i:\\$\{CHELABASE_IMAGE_TAG:-[^}]*\}\$#\1\${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/$i:\${CHELABASE_IMAGE_TAG:-${ref[$i]}}#" "$compose" "${overlays[@]}"
 done
 block="$(for i in "${images[@]}"; do echo "# ghcr.io/chelabase/$i:${ref[$i]:-${old[$i]}}"; done)"
 tmp="$(mktemp)"
