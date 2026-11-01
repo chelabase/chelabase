@@ -57,6 +57,10 @@ When every milestone is integrated (and whiteroom ones audited):
 3. Fill the PR Review record and Test plan; mark the PR ready for review.
 4. Report PR URL, what ran, what's left for the human (merge).
 
+Never publish images from the epic branch: merges are squash-only, so its commits leave no
+history. When the epic needs new images, test with locally built ones, and after the human
+merges, publish and pin from `main` in a follow-up PR (CONTRIBUTING "Releasing images").
+
 ## Rules
 
 - Fix findings where they're found; never defer them to a later combined round.

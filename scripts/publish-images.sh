@@ -13,9 +13,9 @@
 #     just selfhost-e2e                    test them (images without a tag stay at their pins)
 #   scripts/publish-images.sh --push-only <same selection>
 #                                          push the local images without rebuilding. It refuses
-#                                          (before any network call) unless the tree is clean and
-#                                          each selected image's org.opencontainers.image.revision
-#                                          label is HEAD. Prints one `pin <image> <sha12>
+#                                          (before any push) unless HEAD is on origin/main, the
+#                                          tree is clean and each selected image's
+#                                          org.opencontainers.image.revision label is HEAD. Prints one `pin <image> <sha12>
 #                                          sha256:<digest>` line per pushed image: feed those to
 #                                          scripts/pin-images.sh.
 #   scripts/publish-images.sh --push <selection>
@@ -66,6 +66,18 @@ bake=(docker buildx bake -f infra/images/docker-bake.hcl)
 if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
   echo "publish-images: the tree has uncommitted changes; the tag ${sha} wouldn't describe the images" >&2
   exit 1
+fi
+
+# A public push is from a commit on origin/main. A squash merge drops a branch's commits, so
+# images built on a branch would carry a revision, and get pins, that no history has: merge
+# first, then build, test, push and pin from main.
+if [[ "${mode}" != build && -z "${PUBLISH_IMAGES_REPO:-}" ]]; then
+  git fetch -q origin main ||
+    { echo "publish-images: refusing to push: can't fetch origin/main to check HEAD is on it" >&2; exit 1; }
+  if ! git merge-base --is-ancestor "${head_full}" origin/main; then
+    echo "publish-images: refusing to push: HEAD ${sha} is not on origin/main; merge first, then publish from main" >&2
+    exit 1
+  fi
 fi
 
 changed="$(scripts/image-inputs.sh changed)"
