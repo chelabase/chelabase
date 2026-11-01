@@ -20,6 +20,11 @@ export interface ActAsChoice {
 
 export interface ContextBarProps {
   params: EditorParams;
+  /**
+   * The deepest level the view works at (default `"table"`). `"pgDatabase"` stops at the Postgres
+   * database: a view with no schema or table (the SQL editor) shows no Schema or Table level.
+   */
+  depth?: "pgDatabase" | "table";
   navigate: (p: EditorParams) => void;
   /** Each list is absent until it has loaded; its picker shows a placeholder until then. */
   projects?: Project[];
