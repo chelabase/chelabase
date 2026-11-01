@@ -446,9 +446,7 @@ async fn an_unchanged_email_is_refused_and_marked_verified_through_update_user()
     let (mock, z) = setup().await;
     let id = mock.add_user_in("p1", "hal@example.com", "Secret-pass1", false);
     match z.set_email(&id, "hal@example.com", true, None).await {
-        Err(ZError::Rejected { status: 400, message, .. }) => {
-            assert!(message.contains("Errors.User.Email.NotChanged"), "{message}")
-        }
+        Err(e) => assert!(e.is(refusals::EMAIL_NOT_CHANGED), "{e:?}"),
         other => panic!("{other:?}"),
     }
     z.mark_email_verified(&id, "hal@example.com").await.unwrap();
@@ -649,16 +647,12 @@ async fn deactivating_twice_is_a_precondition_refusal() {
     let (mock, z) = setup().await;
     let id = mock.add_user_in("p1", "ivy@example.com", "Secret-pass1", true);
     match z.reactivate_user(&id).await {
-        Err(ZError::Rejected { status: 400, message, .. }) => {
-            assert!(message.contains("Errors.User.NotInactive"), "{message}")
-        }
+        Err(e) => assert!(e.is(refusals::REACTIVATE_NOT_INACTIVE), "{e:?}"),
         other => panic!("{other:?}"),
     }
     z.deactivate_user(&id).await.unwrap();
     match z.deactivate_user(&id).await {
-        Err(ZError::Rejected { status: 400, message, .. }) => {
-            assert!(message.contains("Errors.User.AlreadyInactive"), "{message}")
-        }
+        Err(e) => assert!(e.is(refusals::DEACTIVATE_ALREADY_INACTIVE), "{e:?}"),
         other => panic!("{other:?}"),
     }
 }
@@ -1117,8 +1111,9 @@ async fn the_mocks_refusals_carry_the_captured_code_and_id() {
         let what = format!("{method} {path} ({key})");
         assert!((400..500).contains(&status), "{what}: {status}");
         assert_eq!((err.zitadel_code(), err.detail_id()), (Some(want.code), Some(want.id)), "{what}: {err:?}");
+        // The message is Zitadel's localized text, never the key: nothing may match on it.
         let ZError::Rejected { message, .. } = &err else { panic!("{what}: {err:?}") };
-        assert!(message.contains(key), "{what}: {message}");
+        assert!(!message.contains(key), "{what}: {message}");
     }
     // A forced refusal carries the endpoint's captured id for its key, so each endpoint's own
     // not-found reads as gone.
