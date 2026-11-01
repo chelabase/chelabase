@@ -94,27 +94,31 @@ export function DataApiPanel({ databaseId, branch, apiUrl, pgDatabase }: DataApi
     >
       <section aria-label="Data API" className="min-w-0 space-y-3 border p-3">
         <h3 className="font-medium">Data API</h3>
-        <dl className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-x-4 gap-y-1">
+        <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2">
           <dt className="text-muted-foreground">Endpoint</dt>
-          <dd className="font-mono break-all">{endpoint}</dd>
-          <dd>
-            <CopyButton value={endpoint} label="Copy endpoint" />
+          <dd className="min-w-0 space-y-1">
+            <div className="font-mono break-all">{endpoint}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              <CopyButton value={endpoint} label="Copy endpoint" />
+            </div>
           </dd>
           <dt className="text-muted-foreground">Public key</dt>
-          <dd className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</dd>
-          <dd className="flex items-center gap-2">
-            {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
-            {canRotate && (
-            <Button
-              size="xs"
-              variant="outline"
-              disabled={rotateReason !== null}
-              aria-describedby={rotateReason ? reasonId : undefined}
-              onClick={() => setRotating(true)}
-            >
-              Rotate public key
-            </Button>
-            )}
+          <dd className="min-w-0 space-y-1">
+            <div className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</div>
+            <div className="flex flex-wrap items-center gap-2">
+              {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
+              {canRotate && (
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={rotateReason !== null}
+                  aria-describedby={rotateReason ? reasonId : undefined}
+                  onClick={() => setRotating(true)}
+                >
+                  Rotate public key
+                </Button>
+              )}
+            </div>
           </dd>
         </dl>
         {rotateReason && (

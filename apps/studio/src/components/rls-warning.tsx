@@ -121,7 +121,7 @@ export function RlsWarning({ schema }: { schema: DataApiSchema }) {
             {t.appUsers && <p className="text-xs text-muted-foreground">This is the app users table.</p>}
             {t.note !== "" && <p className="text-xs text-muted-foreground">{t.note}</p>}
             <div className="flex flex-wrap items-center gap-2">
-              <code className="rounded bg-muted px-1.5 py-0.5 text-xs break-all">{t.sql}</code>
+              <code className="rounded bg-muted min-w-0 px-1.5 py-0.5 text-xs break-words whitespace-pre-wrap">{t.sql}</code>
               <CopyButton value={t.sql} label={t.copyLabel} />
             </div>
           </li>
