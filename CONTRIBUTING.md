@@ -342,6 +342,8 @@ act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /v
 
 The install pulls the per-app images and Studio from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Each pin has its own commit, so a release ships only the images it names. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
 
+Publish only from `main`. Merge the change first (merges are squash-only, which drops a branch's commits), then build, test, push and pin from a clean `main` checkout, and land the pins in their own small PR (`chore(infra): pin images at <sha12>`). `--push` and `--push-only` refuse unless HEAD is on `origin/main`; a push to `PUBLISH_IMAGES_REPO` (a local registry or test prefix) is exempt.
+
 Every `publish-images.sh` run selects its images:
 
 - `--service <image>` (repeatable) takes exactly those images, even one whose inputs are unchanged since its pin (it prints a note).
@@ -351,7 +353,8 @@ Every `publish-images.sh` run selects its images:
 `scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block). `server.Dockerfile`, `docker-bake.hcl`, `.dockerignore` and the release scripts are inputs of every image. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
 
 ```bash
-# 1. Build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a clean HEAD. Nothing is pushed.
+# 1. On main, after the merge: build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a
+#    clean HEAD. Nothing is pushed.
 scripts/publish-images.sh --all               # or: --service studio --service gateway
 
 # 2. Test the set that will ship: the new images at <sha12>, the rest at their pins.

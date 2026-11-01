@@ -96,6 +96,10 @@ built="$(git rev-parse --short=12 HEAD)"
 write_pins "$built"
 git commit -qam pinned
 base="$(git rev-parse HEAD)"
+# A local origin holding main at the pin commit, so the publish tests can tell main from a branch.
+git init -q --bare "$work/origin.git"
+git remote add origin "$work/origin.git"
+git push -q origin HEAD:main
 
 # docker stub: logs its arguments; `image inspect` answers from STUB_REVISION and a fake digest.
 cat >"$work/bin/docker" <<'EOF'
@@ -177,6 +181,15 @@ expect "--all -> bake studio" "buildx bake -f infra/images/docker-bake.hcl --loa
 publish --service gateway --service rest
 expect "--service builds exactly the named images" "buildx bake -f infra/images/docker-bake.hcl --load gateway rest" "$(cat "$STUB_LOG")"
 has "--service on an unchanged image -> a note" "gateway is unchanged since its pin" "$out"
+# A public push must be from a commit on origin/main: a squash merge drops branch commits, and
+# the pins would name a revision that's in no history.
+STUB_REVISION="$(g rev-parse HEAD)" publish --push-only --service studio --service init
+expect "--push-only off origin/main -> refused" 1 "$rc"
+has "--push-only off origin/main -> says why" "not on origin/main" "$out"
+expect "--push-only off origin/main -> nothing pushed" "" "$(grep '^push' "$STUB_LOG" || true)"
+STUB_REVISION="$(g rev-parse HEAD)" PUBLISH_IMAGES_REPO=localhost:5000/test publish --push-only --service studio
+expect "--push-only to a test registry -> allowed off main" 0 "$rc"
+g push -q origin HEAD:main
 STUB_REVISION="$(g rev-parse HEAD)" publish --push-only --service studio --service init
 expect "--push-only pushes the selection" 0 "$rc"
 names() { awk "/$1/"' {print $NF}' "$STUB_LOG" | sed -E 's#.*/([a-z]+):.*#\1#' | sort -u | tr '\n' ' ' | sed 's/ $//'; }
