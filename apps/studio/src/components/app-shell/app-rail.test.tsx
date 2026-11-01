@@ -22,7 +22,7 @@ beforeAll(() => {
  * Renders the rail at `path` inside a memory router that knows the routes it links to.
  * The behaviour lives in state, like the shell's, so `setBehaviour` re-renders the same rail.
  */
-async function renderRail(initial: RailBehaviour, path = "/app", badges?: { members?: number }) {
+async function renderRail(initial: RailBehaviour, path = "/app", badges?: { members?: number }, hidden?: readonly ("sql")[]) {
   const onBehaviourChange = vi.fn();
   let setter: (next: RailBehaviour) => void = () => {};
   function Layout() {
@@ -33,6 +33,7 @@ async function renderRail(initial: RailBehaviour, path = "/app", badges?: { memb
         <AppRail
           behaviour={behaviour}
           badges={badges}
+          hidden={hidden}
           onBehaviourChange={(next) => {
             onBehaviourChange(next);
             setBehaviourState(next);
@@ -314,5 +315,14 @@ describe("AppRail", () => {
 
     await renderRail("expanded", "/app", { members: 0 });
     expect(screen.getByRole("link", { name: "Members" })).toBeInTheDocument();
+  });
+
+  it("sql_item_links_between_table_editor_and_api_reference_and_can_be_hidden", async () => {
+    await renderRail("expanded");
+    expect(screen.getByRole("link", { name: "SQL editor" })).toHaveAttribute("href", "/app/sql");
+    cleanup();
+    await renderRail("expanded", "/app", undefined, ["sql"]);
+    expect(screen.queryByRole("link", { name: "SQL editor" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Table editor" })).toBeInTheDocument();
   });
 });

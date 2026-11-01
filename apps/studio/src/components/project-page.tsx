@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useOverflowFocusable } from "@/lib/use-overflow-focusable";
 import { Link } from "@tanstack/react-router";
 import {
@@ -27,9 +27,6 @@ import { MergesList } from "./merges/merges-list";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectSettings } from "./project-settings";
 import { UsersTab } from "./users-tab";
-
-// The editor, CodeMirror and the pgls worker load only when a SQL view opens.
-const SqlEditor = lazy(() => import("./sql-editor/sql-editor").then((m) => ({ default: m.SqlEditor })));
 
 const pollDatabases = pollWhile<Me>((m) =>
   (m.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status))),
@@ -189,7 +186,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   );
 }
 
-type DatabaseView = "branches" | "merges" | "data-api" | "sql";
+type DatabaseView = "branches" | "merges" | "data-api";
 
 function DatabasesTable({
   projectId,
@@ -231,7 +228,6 @@ function DatabasesTable({
           // Each database is shown with what the caller may do there: the project's caps, or the
           // narrower ones of an override on that database.
           const dbCaps = projectCaps(me, projectId, db.database_id);
-          const canSql = dbCaps.atLeast("developer");
           return (
           <ProjectCapsContext.Provider key={db.database_id} value={dbCaps}>
           <Fragment>
@@ -282,18 +278,6 @@ function DatabasesTable({
                       Tables
                     </Button>
                   )}
-                  {/* The SQL editor needs Developer; Viewers read through Tables. */}
-                  {canSql && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={db.status !== "ready"}
-                      aria-expanded={open?.id === db.database_id && open.view === "sql"}
-                      onClick={() => toggle(db.database_id, "sql")}
-                    >
-                      SQL
-                    </Button>
-                  )}
                 </div>
               </td>
             </tr>
@@ -309,10 +293,6 @@ function DatabasesTable({
                     />
                   ) : open.view === "merges" ? (
                     <MergesList projectId={projectId} databaseId={db.database_id} />
-                  ) : open.view === "sql" && canSql ? (
-                    <Suspense fallback={<p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>}>
-                      <SqlEditor databaseId={db.database_id} />
-                    </Suspense>
                   ) : (
                     <DatabaseDataApi apiUrl={apiUrl} database={db} />
                   )}

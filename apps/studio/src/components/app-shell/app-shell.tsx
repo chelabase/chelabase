@@ -6,13 +6,14 @@ import { AppHeader } from "./app-header";
 import { AppRail } from "./app-rail";
 import { CrumbLabelsProvider } from "./crumbs";
 import { RailDrawer } from "./rail-drawer";
-import type { RailBadges } from "./rail-items";
+import type { RailBadges, RailLink } from "./rail-items";
 
 export interface AppShellProps {
   profile: { name?: string; email?: string };
   onSignOut: () => void;
   /** Counts on rail items (Members: sign-up requests waiting). */
   badges?: RailBadges;
+  hidden?: readonly RailLink["id"][];
   children: ReactNode;
 }
 
@@ -21,7 +22,7 @@ export interface AppShellProps {
  * left, the header and the routed page on the right. Only `expanded` widens the
  * rail's column; in `hover` mode the rail overlays the page instead.
  */
-export function AppShell({ profile, onSignOut, badges, children }: AppShellProps) {
+export function AppShell({ profile, onSignOut, badges, hidden, children }: AppShellProps) {
   const [behaviour, setBehaviour] = useRailBehaviour();
   // Below the breakpoint the rail isn't docked: it opens as a drawer from the header's menu button.
   const narrow = useMediaQuery(NARROW_QUERY);
@@ -53,13 +54,13 @@ export function AppShell({ profile, onSignOut, badges, children }: AppShellProps
           variant="drawer"
           behaviour={behaviour}
           onBehaviourChange={setBehaviour}
-          badges={badges}
+          badges={badges} hidden={hidden}
           onNavigate={() => setDrawerOpen(false)}
         />
       </RailDrawer>
       {!narrow && (
         <div className="sticky top-0 z-30 h-screen">
-          <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} badges={badges} />
+          <AppRail behaviour={behaviour} onBehaviourChange={setBehaviour} badges={badges} hidden={hidden} />
         </div>
       )}
       <div className="flex min-w-0 flex-col">

@@ -224,17 +224,10 @@ describe("ProjectPage", () => {
     expect(await screen.findByRole("link", { name: "Tables" })).toHaveAttribute("href", "/app/tables/p1/d1");
   });
 
-  it("opens the SQL editor of a database", async () => {
-    setup({
-      "GET /v1/databases/d1/branches/b-main/databases": () =>
-        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "main", owner: "o" }]),
-      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
-      "GET /v1/databases/d1/branches/b-main/sql/schema": () => jsonResponse({}),
-      "GET /v1/databases/d1/sql-queries": () => jsonResponse([]),
-    });
-    await userEvent.click(await screen.findByRole("button", { name: "SQL" }));
-    expect(await screen.findByLabelText("Run as", {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(screen.getByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
+  it("database_rows_have_no_sql_button", async () => {
+    setup({});
+    await screen.findByRole("link", { name: "Tables" });
+    expect(screen.queryByRole("button", { name: "SQL" })).toBeNull();
   });
 
   it("access_tab_is_in_the_strip", async () => {

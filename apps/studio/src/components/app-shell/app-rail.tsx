@@ -15,7 +15,7 @@ import type { RailBehaviour } from "@/lib/rail-preference";
 import { cn } from "@/lib/utils";
 import { RailBehaviourMenu } from "./rail-behaviour-menu";
 import { RailItem } from "./rail-item";
-import { RAIL_ENTRIES, type RailBadges } from "./rail-items";
+import { RAIL_ENTRIES, type RailBadges, type RailLink } from "./rail-items";
 
 /** Hover mode: how long the pointer must rest on the rail before it widens. */
 export const HOVER_OPEN_DELAY_MS = 150;
@@ -27,6 +27,8 @@ export interface AppRailProps {
   onBehaviourChange: (next: RailBehaviour) => void;
   /** Counts on rail items (Members: sign-up requests waiting). */
   badges?: RailBadges;
+  /** Items left out of the rail (the SQL editor, for a caller who isn't a Developer anywhere). */
+  hidden?: readonly RailLink["id"][];
   /** `drawer`: the overlay below the narrow breakpoint. Always expanded with labels, ignores `behaviour`, no setting menu. */
   variant?: "docked" | "drawer";
   /** Called when any link, the home link included, is clicked. */
@@ -63,7 +65,7 @@ function HomeLink({ children, onNavigate }: { children: ReactNode; onNavigate?: 
  * rail keeps a 56px slot in the grid and its panel widens over the page when the
  * pointer rests on it, focus enters it, or its behaviour menu is open.
  */
-export function AppRail({ behaviour: chosen, onBehaviourChange, badges, variant = "docked", onNavigate }: AppRailProps) {
+export function AppRail({ behaviour: chosen, onBehaviourChange, badges, hidden, variant = "docked", onNavigate }: AppRailProps) {
   const drawer = variant === "drawer";
   // The drawer always shows labels, whatever the stored setting (which it leaves untouched).
   const behaviour: RailBehaviour = drawer ? "expanded" : chosen;
@@ -192,7 +194,7 @@ export function AppRail({ behaviour: chosen, onBehaviourChange, badges, variant 
 
   const items = (
     <ul className="flex flex-col gap-1 py-2">
-      {RAIL_ENTRIES.map((entry) => (
+      {RAIL_ENTRIES.filter((entry) => entry.kind !== "link" || !hidden?.includes(entry.id)).map((entry) => (
         <RailItem
           key={entry.id}
           entry={entry}

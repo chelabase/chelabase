@@ -28,6 +28,7 @@ import { MembersPage, type MembersTab } from "./members/members-page";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectPage } from "./project-page";
 import { ProjectSettings } from "./project-settings";
+import { SqlPage } from "./sql-editor/sql-page";
 import { MergePage } from "./merges/merge-page";
 import { branchOf, detailOf, devBranch, mergeOf } from "@/test/merge-fixtures";
 
@@ -222,7 +223,18 @@ const accessReady = async () => {
 
 const CONTROLS: Control[] = [
   { name: "Create database", operationId: "createDatabase", ui: projectPage, ready: projectReady, query: button("Create database") },
-  { name: "SQL editor", operationId: "runSql", ui: projectPage, ready: projectReady, query: button("SQL") },
+  {
+    name: "SQL editor", operationId: "runSql",
+    routes: {
+      "GET /v1/projects": ok([info]),
+      "GET /v1/databases/d1/branches/m/sql/schema": ok({ schemas: [] }),
+      "GET /v1/databases/d1/sql-queries": ok([]),
+    },
+    ui: () => <SqlPage params={{ projectId: "p1", databaseId: "d1", branchId: "m", pgDatabase: "web1" }} navigate={() => {}} createClient={() => Promise.reject(new Error("no worker"))} />,
+    // Either the editor or the no-access message has rendered.
+    ready: () => Promise.any([screen.findByRole("button", { name: "Run" }), screen.findByText(/needs the Developer role/)]),
+    query: button("Run"),
+  },
   { name: "Connection details", operationId: "getDatabaseConnection", ui: projectPage, ready: projectReady, query: button("Connection details") },
   { name: "Reset database password", operationId: "resetDatabasePassword", ui: projectPage, ready: projectReady, query: button("Reset password") },
   { name: "Delete database", operationId: "deleteDatabase", ui: projectPage, ready: projectReady, query: button("Delete") },

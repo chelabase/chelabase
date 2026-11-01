@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { RAIL_ENTRIES, isRailItemActive } from "./rail-items";
+import { meAs } from "@/test/table-editor-fixtures";
+import { RAIL_ENTRIES, canUseSql, isRailItemActive } from "./rail-items";
 
 describe("isRailItemActive", () => {
   it("tables_item_active_on_editor_routes", () => {
@@ -7,6 +8,15 @@ describe("isRailItemActive", () => {
     expect(isRailItemActive("tables", "/app/tables/p1/d1")).toBe(true);
     expect(isRailItemActive("tables", "/app/tablesx")).toBe(false);
     expect(isRailItemActive("projects", "/app/tables/p1")).toBe(false);
+  });
+
+  it("sql_item_active_on_sql_routes", () => {
+    expect(isRailItemActive("sql", "/app/sql")).toBe(true);
+    expect(isRailItemActive("sql", "/app/sql/p1/d1/b1")).toBe(true);
+    expect(isRailItemActive("sql", "/app/sqlx")).toBe(false);
+    expect(isRailItemActive("sql", "/app/tables/p1")).toBe(false);
+    expect(isRailItemActive("tables", "/app/sql/p1")).toBe(false);
+    expect(isRailItemActive("projects", "/app/sql")).toBe(false);
   });
 
   it("projects is active on /app, /app/ and /app/projects/p1", () => {
@@ -40,13 +50,23 @@ describe("isRailItemActive", () => {
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, Table editor, API reference and Members (last) in order", () => {
+  it("lists Projects, Table editor, SQL editor, API reference and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
       ["link", "tables", "Table editor"],
+      ["link", "sql", "SQL editor"],
       ["link", "api", "API reference"],
       ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/api", "/app/members"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/api", "/app/members"]);
+  });
+});
+
+describe("canUseSql", () => {
+  it("is_for_a_developer_on_some_database_not_a_viewer", () => {
+    expect(canUseSql(meAs("developer") as never)).toBe(true);
+    expect(canUseSql(meAs("admin") as never)).toBe(true);
+    expect(canUseSql(meAs("viewer") as never)).toBe(false);
+    expect(canUseSql(undefined)).toBe(false);
   });
 });
