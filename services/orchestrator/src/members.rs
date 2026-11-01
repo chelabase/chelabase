@@ -38,6 +38,7 @@ use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::role_name::check_any_role_name;
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
 use chelabase_zitadel::client::{EmailMatch, UserState, ZError, ZUser, Zitadel};
+use chelabase_zitadel::refusals;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -2316,7 +2317,7 @@ where
             .await
         {
             Ok(user) => user,
-            Err(ZError::Rejected { status: 409, .. }) => {
+            Err(err) if err.is(refusals::USER_ALREADY_EXISTS) => {
                 return Err(ApiError::new(
                     409,
                     ErrorCode::EmailInUseElsewhere,
@@ -2334,12 +2335,7 @@ where
             let result = if created {
                 z.delete_user(&user).await
             } else {
-                match z.deactivate_user(&user).await {
-                    Err(ZError::Rejected {
-                        status: 400 | 412, ..
-                    }) => Ok(()),
-                    other => other,
-                }
+                z.deactivate_user_settled(&user).await
             };
             if let Err(err) = result {
                 error!(user_id = %user, "invite: undoing the Zitadel user after {why} failed: {err}");
@@ -2435,13 +2431,7 @@ where
 async fn clean_up_revoked_user(z: &Zitadel, user: &str) -> Result<(), ZError> {
     match z.get_user(user).await? {
         None => Ok(()),
-        Some(u) if u.has_password => match z.deactivate_user(user).await {
-            Err(ZError::Rejected {
-                status: 400 | 404 | 412,
-                ..
-            }) => Ok(()),
-            other => other,
-        },
+        Some(u) if u.has_password => z.deactivate_user_settled(user).await,
         Some(_) => z.delete_user(user).await,
     }
 }
@@ -2861,14 +2851,9 @@ where
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let z = tri!(admin_zitadel(&state));
-    match z.deactivate_user(&m.zitadel_user_id).await {
-        // Already inactive (a retry), or already gone: fine.
-        Ok(())
-        | Err(ZError::Rejected {
-            status: 400 | 404 | 412,
-            ..
-        }) => {}
-        Err(err) => return zitadel_failed("remove member: deactivate user", &err).into_response(),
+    // Already inactive (a retry), or already gone, is done; any other refusal is 503.
+    if let Err(err) = z.deactivate_user_settled(&m.zitadel_user_id).await {
+        return zitadel_failed("remove member: deactivate user", &err).into_response();
     }
     if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
         return zitadel_failed("remove member: end sessions", &err).into_response();
@@ -3004,13 +2989,8 @@ where
         access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
     }
     let z = tri!(admin_zitadel(&state));
-    match z.deactivate_user(&m.zitadel_user_id).await {
-        Ok(())
-        | Err(ZError::Rejected {
-            status: 400 | 404 | 412,
-            ..
-        }) => {}
-        Err(err) => return zitadel_failed("decline member: deactivate user", &err).into_response(),
+    if let Err(err) = z.deactivate_user_settled(&m.zitadel_user_id).await {
+        return zitadel_failed("decline member: deactivate user", &err).into_response();
     }
     if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
         return zitadel_failed("decline member: end sessions", &err).into_response();
@@ -3038,6 +3018,19 @@ fn zitadel_step_failed(what: &str, err: &ZError, retry: &str) -> ApiError {
         ErrorCode::Unavailable,
         format!("done in Chelabase, but the user service couldn't finish it; {retry} again to retry"),
     )
+}
+
+/// Locks a suspended member's Zitadel user. An inactive user (removed earlier, or never
+/// activated) can't sign in, and Zitadel refuses to lock it (`LOCK_NOT_ACTIVE`, the same answer
+/// as for a locked one), so it counts as locked: the suspension completes and its sessions end.
+async fn lock_for_suspension(z: &Zitadel, user: &str) -> Result<(), ZError> {
+    match z.lock_user(user).await {
+        Err(err) if err.is(refusals::LOCK_NOT_ACTIVE) => match z.get_user(user).await? {
+            Some(u) if u.state != UserState::Inactive => Err(err),
+            _ => Ok(()),
+        },
+        other => other,
+    }
 }
 
 #[utoipa::path(
@@ -3093,7 +3086,7 @@ where
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let z = tri!(admin_zitadel(&state));
-    if let Err(err) = z.lock_user(&m.zitadel_user_id).await {
+    if let Err(err) = lock_for_suspension(z, &m.zitadel_user_id).await {
         return zitadel_step_failed("suspend member: lock user", &err, "suspend").into_response();
     }
     if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
@@ -3422,7 +3415,8 @@ where
         match z.has_auth_methods(&m.zitadel_user_id).await {
             Ok(true) => return link_refused(z).await.into_response(),
             // Gone: the code call below says so.
-            Ok(false) | Err(ZError::Rejected { status: 404, .. }) => {}
+            Ok(false) => {}
+            Err(err) if err.is(refusals::AUTH_METHODS_USER_NOT_FOUND) => {}
             Err(err) => return zitadel_failed("resend invite: read auth methods", &err).into_response(),
         }
     } else {

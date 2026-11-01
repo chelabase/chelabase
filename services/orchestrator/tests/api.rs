@@ -16823,3 +16823,161 @@ mod t23_teams {
         assert_eq!(resp.status(), 422);
     }
 }
+
+// --- Zitadel refusals are read by their captured id, never by status or text (#76) -------------
+
+/// A removal, a decline and an invite revoke whose deactivate gets a 404 or 400 that isn't the
+/// endpoint's captured answer (an id nobody captured) are 503 with the Zitadel user still active; the retry
+/// completes them.
+#[tokio::test]
+async fn a_deactivate_that_isnt_zitadels_answer_is_503_and_retriable() {
+    let t = mw(Mode::SelfHosted).await;
+    // Removal.
+    let z = t.mock.add_user_in("org-1", "ivy@x.com", "Secret-pass1", true);
+    let ivy = t.w.metadata.add_granted(t.w.tenant, &z, t.w.project, PlatformRole::Developer, &["app"]);
+    let path = format!("/v1/members/{ivy}");
+    for status in [404, 400] {
+        t.mock.fail("/deactivate", status, "Errors.Odd", 1);
+        let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+        assert_eq!(code_of(&err), "unavailable", "remove {status}");
+        assert!(!t.mock.user_by_id(&z).unwrap().inactive, "remove {status}: still active");
+    }
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&z).unwrap().inactive);
+    // Decline.
+    let zp = t.mock.add_user_in("org-1", "pat2@x.com", "", false);
+    let pat = t.w.metadata.add_member(t.w.tenant, &zp, MemberStatus::Pending, false);
+    let path = format!("/v1/members/{pat}/decline");
+    t.mock.fail("/deactivate", 404, "Errors.Odd", 1);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "decline");
+    assert!(!t.mock.user_by_id(&zp).unwrap().inactive, "decline: still active");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&zp).unwrap().inactive);
+    // Revoking the open invite of a user who once had a password.
+    let zr = t.mock.add_user_in("org-1", "rob@x.com", "Secret-pass1", true);
+    let rob = t.w.metadata.add_member(t.w.tenant, &zr, MemberStatus::Active, false);
+    t.w.metadata.set_member(t.w.tenant, &zr, |m| m.email = Some("rob@x.com".into()));
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{rob}"), None).await.status(), 204);
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "rob@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    t.mock.set_inactive(&zr, false);
+    t.mock.fail("/deactivate", 404, "Errors.Odd", 1);
+    let revoke = format!("/v1/invites/{invite}");
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &revoke, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "revoke");
+    assert!(!t.mock.user_by_id(&zr).unwrap().inactive, "revoke: still active");
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &revoke, None).await.status(), 204);
+    assert!(t.mock.user_by_id(&zr).unwrap().inactive);
+}
+
+/// An inactive user can't sign in, so suspending their member completes: the sessions end, and
+/// the retry has nothing left to do.
+#[tokio::test]
+async fn suspending_a_member_whose_zitadel_user_is_inactive_completes() {
+    let p = pl_world().await;
+    p.t.mock.set_inactive(&p.bob.1, true);
+    let client = Zitadel::new(&p.t.mock.base, ADMIN_TOKEN);
+    p.t.mock.set_inactive(&p.bob.1, false);
+    client.create_session(&p.bob.1, "Secret-pass1").await.unwrap();
+    p.t.mock.set_inactive(&p.bob.1, true);
+    assert_eq!(p.t.mock.session_count(), 1);
+    let resp = p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await;
+    assert_eq!(resp.status(), 200, "{}", body_of(resp).await);
+    assert_eq!(p.status_of(p.bob.0), MemberStatus::Suspended);
+    assert_eq!(p.t.mock.session_count(), 0, "its sessions ended");
+    assert!(p.t.mock.user_by_id(&p.bob.1).unwrap().inactive);
+    assert_eq!(p.member_action(DEFAULT_SUB, p.bob.0, "suspend").await.status(), 200, "a retry");
+    // A refusal that isn't Zitadel's still fails the suspend.
+    let carl = p.add_person("carl", p.t.w.project, PlatformRole::Viewer);
+    p.t.mock.fail("/lock", 400, "Errors.Odd", 1);
+    assert_eq!(p.member_action(DEFAULT_SUB, carl.0, "suspend").await.status(), 503);
+    assert!(!p.t.mock.user_by_id(&carl.1).unwrap().locked);
+}
+
+/// An invite code asked for a user Zitadel doesn't have is a 400 (`COMMAND-Wgvn4`); the resend
+/// answers 404, and a 404 with another id on the auth-methods read answers 503.
+#[tokio::test]
+async fn invite_callers_read_the_captured_missing_user_and_auth_methods_answers() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = body_of(
+        t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "gone@x.com", "viewer", &[]))).await,
+    )
+    .await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let user = t.mock.user("gone@x.com").unwrap();
+    let resend = format!("/v1/invites/{invite}/resend");
+    t.mock.fail("authentication_methods", 404, "Errors.Odd", 1);
+    let err = error_of(
+        t.send(DEFAULT_SUB, Method::POST, &resend, Some(json!({ "delivery": "link" }))).await,
+        503,
+    )
+    .await;
+    assert_eq!(code_of(&err), "unavailable");
+    t.mock.remove_user(&user.id);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &resend, None).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+}
+
+/// Zitadel's bcrypt limit is 72 bytes: a longer app-user password is 422 before Zitadel is asked.
+#[tokio::test]
+async fn app_user_passwords_over_72_bytes_are_422_before_zitadel() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    au.seal_sync_role();
+    let long = "Aa1!".repeat(19);
+    assert_eq!(long.len(), 76);
+    let (status, body) = au.call(Method::POST, "/users", Some(json!({"email": "n@x.test", "password": long}))).await;
+    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
+    assert!(au.mock().calls().is_empty(), "{:?}", au.mock().calls());
+    let id = au.add_user(AU_ORG, "a@x.test");
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": long}))).await;
+    assert_eq!((status, code_of(&body)), (422, "invalid_request"), "{body}");
+    assert!(!au.mock().calls().iter().any(|c| c.ends_with("/password")), "{:?}", au.mock().calls());
+    let exact = "Aa1!".repeat(18);
+    let (status, body) = au.call(Method::PATCH, &format!("/users/{id}"), Some(json!({"password": exact}))).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+/// The app-user routes answer 503 for a refusal that isn't Zitadel's own, never 404 or 409.
+#[tokio::test]
+async fn app_user_state_and_delete_routes_answer_503_for_a_foreign_refusal() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user(AU_ORG, "a@x.test");
+    for (what, method, path) in [
+        ("deactivate", Method::POST, format!("/users/{id}/deactivate")),
+        ("delete", Method::DELETE, format!("/users/{id}")),
+    ] {
+        for status in [404, 400] {
+            let verb = if what == "delete" { "DELETE /v2/users/" } else { "/deactivate" };
+            au.mock().fail(verb, status, "Errors.Odd", 1);
+            let (got, answer) = au.call(method.clone(), &path, None).await;
+            assert_eq!(got, 503, "{what} {status}: {answer}");
+            assert_eq!(code_of(&answer), "unavailable", "{what} {status}: {answer}");
+        }
+    }
+    let user = au.mock().user_by_id(&id.to_string()).unwrap();
+    assert!(!user.inactive, "the user is untouched");
+    // Zitadel's own not-found on delete (the user vanished after the org check) is done.
+    au.mock().fail("DELETE /v2/users/", 404, "Errors.User.NotFound", 1);
+    let (status, body) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
+    assert_eq!(status, 204, "{body}");
+}
+
+/// A member's Zitadel user lives in the tenant's org, not a project's app-user org, so the
+/// app-user routes can't reactivate it (a suspended member never gets a working sign-in).
+#[tokio::test]
+async fn app_user_reactivate_cannot_reach_a_members_zitadel_user() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let member = au.add_user("org-members", "m@x.test");
+    au.mock().lock(&member.to_string());
+    let (status, body) = au.call(Method::POST, &format!("/users/{member}/reactivate"), None).await;
+    assert_eq!((status, code_of(&body)), (404, "not_found"), "{body}");
+    assert!(!au.mock().calls().iter().any(|c| c.contains("reactivate")), "{:?}", au.mock().calls());
+    assert!(au.mock().user_by_id(&member.to_string()).unwrap().locked);
+}
