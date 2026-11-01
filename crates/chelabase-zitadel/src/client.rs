@@ -203,8 +203,9 @@ fn as_u64(v: &Value) -> Option<u64> {
 }
 
 /// An error body's text: Zitadel's `message` (localized, with the error id appended) followed
-/// by each `details[]` entry's `id` and `message`, so the stable error key
-/// (`Errors.User.Code.Expired`) and id survive a localized top-level message.
+/// by each `details[]` entry's `id` and `message`, so the detail's id (`COMMAND-Wgn4q`) survives
+/// in logs whatever the top-level message's language. Zitadel v4 sends no error key; callers
+/// match the id ([`ZError::is`]), never this text.
 fn error_text(body: Option<&Value>) -> String {
     let Some(body) = body else {
         return String::new();
@@ -303,6 +304,7 @@ fn refused(status: u16, body: Option<&Value>) -> ZError {
 }
 
 /// How the client reads a 4xx answer with this body (for tests against captured answers).
+#[cfg(any(test, feature = "mock"))]
 pub fn classify(status: u16, body: &str) -> ZError {
     let parsed = if body.trim().is_empty() {
         Some(Value::Null)
