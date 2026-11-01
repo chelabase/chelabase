@@ -20,7 +20,7 @@ import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
-import { DatabaseDataApi } from "./database-data-api";
+import { ConnectPanel } from "./connect-panel";
 
 import { NO_ACCESS_POLL_MS, NoAccess } from "./no-access";
 import { MergesList } from "./merges/merges-list";
@@ -186,7 +186,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   );
 }
 
-type DatabaseView = "branches" | "merges" | "data-api";
+type DatabaseView = "branches" | "merges" | "connect";
 
 function DatabasesTable({
   projectId,
@@ -260,10 +260,10 @@ function DatabasesTable({
                     size="sm"
                     variant="outline"
                     disabled={db.status !== "ready"}
-                    aria-expanded={open?.id === db.database_id && open.view === "data-api"}
-                    onClick={() => toggle(db.database_id, "data-api")}
+                    aria-expanded={open?.id === db.database_id && open.view === "connect"}
+                    onClick={() => toggle(db.database_id, "connect")}
                   >
-                    Data API
+                    Connect
                   </Button>
                   {db.status === "ready" ? (
                     <Link
@@ -271,11 +271,11 @@ function DatabasesTable({
                       params={{ projectId, databaseId: db.database_id }}
                       className={buttonVariants({ size: "sm", variant: "outline" })}
                     >
-                      Tables
+                      Open <span aria-hidden="true">↗</span>
                     </Link>
                   ) : (
                     <Button size="sm" variant="outline" disabled>
-                      Tables
+                      Open <span aria-hidden="true">↗</span>
                     </Button>
                   )}
                 </div>
@@ -294,7 +294,7 @@ function DatabasesTable({
                   ) : open.view === "merges" ? (
                     <MergesList projectId={projectId} databaseId={db.database_id} />
                   ) : (
-                    <DatabaseDataApi apiUrl={apiUrl} database={db} />
+                    <ConnectPanel apiUrl={apiUrl} database={db} />
                   )}
                   </div>
                 </td>

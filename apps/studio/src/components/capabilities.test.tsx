@@ -47,7 +47,7 @@ describe("capabilities", () => {
   it("viewer_has_no_sql_editor", async () => {
     renderProject(meAs("viewer"));
     const row = await databaseRow();
-    expect(within(row).getByRole("link", { name: "Tables" })).toBeInTheDocument();
+    expect(within(row).getByRole("link", { name: /^Open/ })).toBeInTheDocument();
     expect(within(row).queryByRole("button", { name: "SQL" })).toBeNull();
   });
 
