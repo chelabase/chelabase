@@ -10,6 +10,7 @@ use crate::app::{
 };
 use crate::guard::{Slot, email_tag, pad};
 use crate::zitadel::{EmailMatch, NewUser, Session, UserState, ZError, ZUser};
+use chelabase_zitadel::refusals;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -455,7 +456,7 @@ async fn app_password_reset_confirm(
         (status = 204, description = "Changed"),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
         (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
-        (status = 409, description = "The email is taken (`email_taken`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
+        (status = 409, description = "The email is taken (`email_taken`), it is the user's email already (`conflict`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
         (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "Invalid input: `invalid_request`", body = ErrorEnvelope),
@@ -541,6 +542,7 @@ mod text {
     pub const INACTIVE: &str = "This account is deactivated or locked";
     pub const NO_USER: &str = "This needs a signed-in user (the Chelabase-User header)";
     pub const BAD_EMAIL: &str = "email is not a valid address";
+    pub const EMAIL_NOT_CHANGED: &str = "This is already the account's email";
 }
 
 type Flow<T = Response> = Result<T, ApiError>;
@@ -753,7 +755,7 @@ async fn check_password(
     loop {
         match s.zitadel.create_session(&zid, password).await {
             Ok(session) => return Ok(session),
-            Err(ZError::Rejected { status: 404, .. }) if fresh && attempt < 10 => {
+            Err(e) if fresh && e.is(refusals::SESSION_USER_NOT_FOUND) && attempt < 10 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
@@ -984,11 +986,17 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
         .await;
     match created {
         Ok(_) => {}
-        Err(ZError::Rejected { status: 409, .. }) => {
+        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => {
             pending_insert.rollback().await;
             return taken(s, &info, &email, None).await;
         }
-        Err(e @ ZError::Rejected { status: 400, .. }) => {
+        // Zitadel's create-path refusals of the caller's input, by their captured ids, and its
+        // field validation (no id). A missing organization stays here too, as it always has.
+        Err(e)
+            if e.is_any(&CREATE_PASSWORD_POLICY)
+                || e.is_invalid_request()
+                || e.is(refusals::CREATE_USER_ORG_NOT_FOUND) =>
+        {
             pending_insert.rollback().await;
             info!(error = %e, "zitadel refused the new app user");
             return Err(if e.is_any(&CREATE_PASSWORD_POLICY) {
@@ -1439,12 +1447,15 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { status: 404, .. }) => return Err(no_user()),
-        Err(ZError::Rejected { status: 409, .. }) => {
-            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
+        // Matched by captured id only. Zitadel has no captured set-email 409 (a taken address
+        // is found by the lookup above), so any 409 here is a refusal nobody captured: 503.
+        Err(e) if e.is(refusals::SET_EMAIL_USER_NOT_FOUND) => return Err(no_user()),
+        Err(e) if e.is(refusals::EMAIL_NOT_CHANGED) => {
+            return Err(fail(409, ErrorCode::Conflict, text::EMAIL_NOT_CHANGED));
         }
-        Err(ZError::Rejected { message, .. }) => {
-            info!(%message, "zitadel refused the new email");
+        // Zitadel's validation of the field (no id): the caller's input.
+        Err(e) if e.is_invalid_request() => {
+            info!(error = %e, "zitadel refused the new email");
             return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
         }
         Err(e) => return Err(zitadel_down(&e)),
