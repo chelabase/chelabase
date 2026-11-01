@@ -2,6 +2,7 @@ import { Tooltip } from "@base-ui/react/tooltip";
 import { useEffect, useRef, useState, type ReactElement } from "react";
 import type { Key, PresenceMember } from "@/lib/realtime/types";
 import { avatarLabels, avatarStack, displayName, drawnMembers, people, presenceColor } from "@/lib/realtime/presence";
+import { usePresence } from "@/lib/realtime/presence-store";
 import { useMediaQuery } from "@/lib/use-media-query";
 import { cn } from "@/lib/utils";
 
@@ -294,4 +295,16 @@ export function AvatarStack({ members, selfSub = "" }: { members: PresenceMember
       {extra > 0 && <span className="ml-1.5 font-sans text-xs text-chalk-dim tabular-nums">+{extra}</span>}
     </div>
   );
+}
+
+/** The `PresenceLayer` of the open table: its members come from the table's presence store. */
+export function TablePresenceLayer(props: Omit<PresenceLayerProps, "members">) {
+  const members = usePresence((s) => s.members);
+  return <PresenceLayer members={members} {...props} />;
+}
+
+/** The `AvatarStack` of the open table: its members come from the table's presence store. */
+export function TableAvatarStack({ selfSub }: { selfSub?: string }) {
+  const members = usePresence((s) => s.members);
+  return <AvatarStack members={members} selfSub={selfSub} />;
 }

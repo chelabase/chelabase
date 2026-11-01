@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useStore } from "zustand";
 import {
   ApiError,
   consoleQueryExact,
@@ -23,7 +24,8 @@ import { useRealtime } from "@/lib/realtime/context";
 import { insertedKey, textSelectItems, whereByTextKey, whereByTextKeys } from "@/lib/realtime/keys";
 import { INITIAL_LIVE, createLiveController, type LiveController, type LiveState } from "@/lib/realtime/live-rows";
 import { applyPresenceDiff, editingNotice, presenceColor } from "@/lib/realtime/presence";
-import type { Key, PresenceMember, TableSubscription } from "@/lib/realtime/types";
+import { PresenceStoreContext, createPresenceStore } from "@/lib/realtime/presence-store";
+import type { Key, TableSubscription } from "@/lib/realtime/types";
 import { useMediaQuery } from "@/lib/use-media-query";
 import type { RowAccess } from "@/lib/table-editor/access";
 import {
@@ -51,7 +53,7 @@ import { FilterPopover } from "./filter-popover";
 import { Grid, type CellMenuTarget } from "./grid";
 import { LiveBadge, type LiveStatus } from "./live-badge";
 import { LoadValueCell, cellKey, loadedValueKey, useLoadValue } from "./load-value";
-import { AvatarStack, PresenceLayer } from "./presence-layer";
+import { TableAvatarStack, TablePresenceLayer } from "./presence-layer";
 import { SelectionBar } from "./selection-bar";
 import { SortPopover } from "./sort-popover";
 import type { TableTarget } from "./target";
@@ -426,9 +428,11 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
   const reducedMotion = useMediaQuery("(prefers-reduced-motion: reduce)");
   const [live, setLive] = useState<LiveState>(INITIAL_LIVE);
   const [liveStatus, setLiveStatus] = useState<LiveStatus | null>(null);
-  const [members, setMembers] = useState<PresenceMember[]>([]);
+  // Presence lives in its own store: a presence frame re-renders the presence layer and the avatar stack, not this view.
+  const [presence] = useState(createPresenceStore);
+  const setMembers = presence.setState;
   // The viewer's own presence colour: the active cell's outline (sand until the viewer's own entry arrives).
-  const ownSeed = selfSub ? members.find((m) => m.sub === selfSub)?.color_seed : undefined;
+  const ownSeed = useStore(presence, (s) => (selfSub ? s.members.find((m) => m.sub === selfSub)?.color_seed : undefined));
   const activeColor = ownSeed === undefined ? undefined : presenceColor(ownSeed);
   // Cells a splice changed, by row key (cleared after FLASH_MS).
   const [flash, setFlash] = useState<Record<Key, string[]>>({});
@@ -518,7 +522,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
         onStatus: (s) => {
           setLiveStatus(s);
           // The socket is down: nobody's presence is known until the rejoin's `presence_state`.
-          if (s.reason === "reconnecting") setMembers([]);
+          if (s.reason === "reconnecting") setMembers({ members: [] });
           c.dispatch({ type: "status", live: s.live });
         },
         // Only a lost channel pauses live updates (review I1): `forbidden`/`not_found`. Any other error
@@ -528,8 +532,8 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
           setLiveStatus((s) => (err.code === "forbidden" || err.code === "not_found" || s === null ? { live: false, reason: err.code } : s)),
         onRows: (f) => c.dispatch({ type: "rows", seq: f.seq, changes: f.changes }),
         onResync: () => c.dispatch({ type: "resync" }),
-        onPresenceState: setMembers,
-        onPresenceDiff: (d) => setMembers((m) => applyPresenceDiff(m, d)),
+        onPresenceState: (members) => setMembers({ members }),
+        onPresenceDiff: (d) => setMembers((s) => ({ members: applyPresenceDiff(s.members, d) })),
       },
     );
     subscription.current = sub;
@@ -547,7 +551,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
       controller.current = null;
       setLive(INITIAL_LIVE);
       setLiveStatus(null);
-      setMembers([]);
+      setMembers({ members: [] });
       sentPresence.current = "";
       sentView.current = "";
     };
@@ -904,7 +908,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
   const tools = (
     <div className="flex items-center gap-2">
       {liveStatus && <LiveBadge status={liveStatus} />}
-      <AvatarStack members={members} selfSub={selfSub} />
+      <TableAvatarStack selfSub={selfSub} />
       <SortPopover
         columns={columns}
         value={sort}
@@ -941,7 +945,7 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
     </div>
   );
 
-  return (
+  const content = (
     <div className="flex min-h-0 flex-1 flex-col">
       {toolsSlot ? createPortal(tools, toolsSlot) : <div className="flex justify-end border-b border-line px-4 py-2">{tools}</div>}
       {insertError && (
@@ -1091,9 +1095,9 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
               fading: (key) => live.fading.includes(key),
             }}
             motion={reducedMotion ? "none" : "flash"}
-            editNotice={(key, column) => editingNotice(members, selfSub, key, column)}
+            editNotice={(key, column) => editingNotice(presence.getState().members, selfSub, key, column)}
             onPresence={joinable ? onPresence : undefined}
-            overlay={joinable ? (geometry) => <PresenceLayer members={members} selfSub={selfSub} rowKeys={keys} geometry={geometry} selfCell={selfCell} /> : undefined}
+            overlay={joinable ? (geometry) => <TablePresenceLayer selfSub={selfSub} rowKeys={keys} geometry={geometry} selfCell={selfCell} /> : undefined}
             footer={
               writable && (
                 <button
@@ -1163,4 +1167,5 @@ function RowsData({ target, access, object, pageSize, toolsSlot, chips, selfSub 
       )}
     </div>
   );
+  return <PresenceStoreContext.Provider value={presence}>{content}</PresenceStoreContext.Provider>;
 }
