@@ -1,4 +1,5 @@
 import { useId, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   getListKeysQueryKey,
@@ -14,7 +15,7 @@ import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { pollWhile } from "@/lib/query";
 import { CopyButton } from "./copy-button";
-import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
+import { DataApiDatabases, DatabasePicker, KeyDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
 import { DataApiTypes } from "./data-api-types";
 import { RlsWarning } from "./rls-warning";
@@ -26,13 +27,15 @@ export interface DataApiPanelProps {
   apiUrl: string;
   /** Extra content at the end of the second column (the Connect panel's logins line). */
   aside?: ReactNode;
+  /** Where to render the Postgres DB picker (the Connect panel's header); without it the picker sits in the first column. */
+  pickerSlot?: HTMLElement | null;
 }
 
 /**
  * One branch's data API in two columns that stack on narrow screens: the endpoint, public key and
  * what it reaches, then the secret keys and client setup.
  */
-export function DataApiPanel({ databaseId, branch, apiUrl, aside }: DataApiPanelProps) {
+export function DataApiPanel({ databaseId, branch, apiUrl, aside, pickerSlot }: DataApiPanelProps) {
   // Rotating the public key is Developer's (rotateKey).
   const canRotate = useProjectCaps().atLeast("developer");
   const queryClient = useQueryClient();
@@ -94,92 +97,97 @@ export function DataApiPanel({ databaseId, branch, apiUrl, aside }: DataApiPanel
       className="grid gap-4 text-sm [grid-template-columns:repeat(auto-fit,minmax(320px,1fr))]"
     >
       <section aria-label="Data API" className="min-w-0 space-y-3 border p-3">
-      <h3 className="font-medium">Data API</h3>
-      <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
-        <dt className="text-muted-foreground">Endpoint</dt>
-        <dd className="font-mono break-all">{endpoint}</dd>
-        <dd>
-          <CopyButton value={endpoint} label="Copy endpoint" />
-        </dd>
-        <dt className="text-muted-foreground">Public key</dt>
-        <dd className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</dd>
-        <dd className="flex items-center gap-2">
-          {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
-          {canRotate && (
-          <Button
-            size="xs"
-            variant="outline"
-            disabled={rotateReason !== null}
-            aria-describedby={rotateReason ? reasonId : undefined}
-            onClick={() => setRotating(true)}
-          >
-            Rotate public key
-          </Button>
-          )}
-        </dd>
-      </dl>
-      {rotateReason && (
-        <p id={reasonId} className="text-xs text-muted-foreground">
-          {rotateReason}
-        </p>
-      )}
-      {rotating && (
-        <div className="space-y-2 border p-3">
-          <p>Rotate the public key? The current key stops working within 30 seconds.</p>
-          <div className="flex gap-2">
-            <Button size="sm" disabled={busy} onClick={() => void rotatePublic()}>
-              Confirm rotate public key
+        <h3 className="font-medium">Data API</h3>
+        <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
+          <dt className="text-muted-foreground">Endpoint</dt>
+          <dd className="font-mono break-all">{endpoint}</dd>
+          <dd>
+            <CopyButton value={endpoint} label="Copy endpoint" />
+          </dd>
+          <dt className="text-muted-foreground">Public key</dt>
+          <dd className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</dd>
+          <dd className="flex items-center gap-2">
+            {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
+            {canRotate && (
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={rotateReason !== null}
+              aria-describedby={rotateReason ? reasonId : undefined}
+              onClick={() => setRotating(true)}
+            >
+              Rotate public key
             </Button>
-            <Button size="sm" variant="outline" onClick={() => setRotating(false)}>
-              Cancel
-            </Button>
+            )}
+          </dd>
+        </dl>
+        {rotateReason && (
+          <p id={reasonId} className="text-xs text-muted-foreground">
+            {rotateReason}
+          </p>
+        )}
+        {rotating && (
+          <div className="space-y-2 border p-3">
+            <p>Rotate the public key? The current key stops working within 30 seconds.</p>
+            <div className="flex gap-2">
+              <Button size="sm" disabled={busy} onClick={() => void rotatePublic()}>
+                Confirm rotate public key
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => setRotating(false)}>
+                Cancel
+              </Button>
+            </div>
           </div>
-        </div>
-      )}
-      {databases !== null && databases.length > 0 && pickedDb && (
-        <DataApiDatabases
-          databaseId={databaseId}
-          branchId={branchId}
-          databases={databases}
-          picked={pickedDb.name}
-          onPick={setPickedName}
-        />
-      )}
-      {publicKey && databases && (
-        <section aria-label="Public key databases" className="space-y-1">
-          <h4 className="text-muted-foreground">Public key databases</h4>
-          <KeyDatabases
-            key={`${publicKey.id}/${(publicKey.databases ?? ["*"]).join(",")}`}
+        )}
+        {pickerSlot && databases !== null && pickedDb && createPortal(
+          <DatabasePicker label="Postgres DB" databases={databases} value={pickedDb.name} onPick={setPickedName} />,
+          pickerSlot,
+        )}
+        {databases !== null && databases.length > 0 && pickedDb && (
+          <DataApiDatabases
+            hidePicker={!!pickerSlot}
             databaseId={databaseId}
             branchId={branchId}
-            keyId={publicKey.id}
-            value={publicKey.databases}
             databases={databases}
+            picked={pickedDb.name}
+            onPick={setPickedName}
           />
-        </section>
-      )}
-      {schemaError && (
-        <p role="alert" className="text-destructive">
-          {schemaError}
-        </p>
-      )}
-      {schema && <RlsWarning schema={schema} />}
+        )}
+        {publicKey && databases && (
+          <section aria-label="Public key databases" className="space-y-1">
+            <h4 className="text-muted-foreground">Public key databases</h4>
+            <KeyDatabases
+              key={`${publicKey.id}/${(publicKey.databases ?? ["*"]).join(",")}`}
+              databaseId={databaseId}
+              branchId={branchId}
+              keyId={publicKey.id}
+              value={publicKey.databases}
+              databases={databases}
+            />
+          </section>
+        )}
+        {schemaError && (
+          <p role="alert" className="text-destructive">
+            {schemaError}
+          </p>
+        )}
+        {schema && <RlsWarning schema={schema} />}
       </section>
       <section aria-label="Secret keys and client setup" className="min-w-0 space-y-3 border p-3">
-      {error && (
-        <p role="alert" className="text-destructive">
-          {error}
-        </p>
-      )}
-      {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
-      {keys !== null && (
-        <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />
-      )}
-      {/* Downloading types is creating a key's access (Developer, by role). */}
-      {canRotate && databases !== null && (
-        <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} />
-      )}
-      {aside}
+        {error && (
+          <p role="alert" className="text-destructive">
+            {error}
+          </p>
+        )}
+        {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
+        {keys !== null && (
+          <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />
+        )}
+        {/* Downloading types is creating a key's access (Developer, by role). */}
+        {canRotate && databases !== null && (
+          <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} defaultDatabase={pickedDb?.name} />
+        )}
+        {aside}
       </section>
     </div>
   );

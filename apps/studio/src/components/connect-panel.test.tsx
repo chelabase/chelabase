@@ -115,13 +115,17 @@ describe("ConnectPanel", () => {
 
   it("follows the Postgres database picked in the Data API column", async () => {
     const f = setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("app")]);
-    const picker = (await screen.findByLabelText("Database")) as HTMLSelectElement;
+    const picker = (await screen.findByLabelText("Postgres DB")) as HTMLSelectElement;
     expect(picker).toHaveValue("web1");
     await userEvent.selectOptions(picker, "app");
     await waitFor(() => {
       const schemas = f.calls.map((r) => new URL(r.url)).filter((u) => u.pathname.endsWith("/data-api/schema"));
       expect(schemas.at(-1)?.searchParams.get("database")).toBe("app");
     });
+    // One picker only: the Data API column no longer carries its own, and the types follow the header.
+    expect(screen.getAllByLabelText(/^(Postgres DB|Database)$/)).toHaveLength(1);
+    const types = screen.getByLabelText("Types database") as HTMLSelectElement;
+    expect(types.options[types.selectedIndex].text).toBe("app");
     expect(screen.getByRole("button", { name: /Download types/i })).toBeInTheDocument();
   });
 

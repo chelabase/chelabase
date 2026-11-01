@@ -16,6 +16,7 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
   const id = database.database_id;
   const list = useListBranches(id);
   const [picked, setPicked] = useState<string | null>(null);
+  const [pickerSlot, setPickerSlot] = useState<HTMLElement | null>(null);
   const branches = list.data ?? null;
   const error = list.error ? errorText(list.error) : null;
 
@@ -32,20 +33,23 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <h2 className="text-base font-semibold">Connect to {database.name}</h2>
         {current && (
-          <label className="flex items-center gap-2 text-sm">
-            <span>Branch</span>
-            <select
-              value={current.id}
-              onChange={(e) => setPicked(e.target.value)}
-              className="h-8 rounded-lg border border-input bg-background px-2 text-sm"
-            >
-              {ready.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            <label className="flex items-center gap-2">
+              <span>Branch</span>
+              <select
+                value={current.id}
+                onChange={(e) => setPicked(e.target.value)}
+                className="h-8 rounded-lg border border-input bg-background px-2 text-sm"
+              >
+                {ready.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div ref={setPickerSlot} />
+          </div>
         )}
       </div>
       {error && (
@@ -61,6 +65,7 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
           databaseId={id}
           branch={current}
           apiUrl={apiUrl}
+          pickerSlot={pickerSlot}
           aside={
             canLogin &&
             memberId && (

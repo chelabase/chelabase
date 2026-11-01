@@ -42,27 +42,46 @@ export interface DataApiDatabasesProps {
   databases: BranchDatabaseView[];
   picked: string;
   onPick: (name: string) => void;
+  /** The parent renders the picker (see `DatabasePicker`); only the picked database's controls show. */
+  hidePicker?: boolean;
+}
+
+/** The picker for a branch's databases, each with its state. */
+export function DatabasePicker({
+  label,
+  databases,
+  value,
+  onPick,
+}: {
+  label: string;
+  databases: BranchDatabaseView[];
+  value: string;
+  onPick: (name: string) => void;
+}) {
+  return (
+    <label className="flex items-center gap-2">
+      <span>{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onPick(e.target.value)}
+        className="h-8 border border-input bg-background px-2 text-sm"
+      >
+        {databases.map((d) => (
+          <option key={d.name} value={d.name}>
+            {optionText(d)}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
 }
 
 /** The branch's databases: a picker with each state, and the picked one's controls. */
-export function DataApiDatabases({ databaseId, branchId, databases, picked, onPick }: DataApiDatabasesProps) {
+export function DataApiDatabases({ databaseId, branchId, databases, picked, onPick, hidePicker }: DataApiDatabasesProps) {
   const current = databases.find((d) => d.name === picked) ?? databases[0];
   return (
     <div className="space-y-2">
-      <label className="flex items-center gap-2">
-        <span>Database</span>
-        <select
-          value={current?.name ?? ""}
-          onChange={(e) => onPick(e.target.value)}
-          className="h-8 border border-input bg-background px-2 text-sm"
-        >
-          {databases.map((d) => (
-            <option key={d.name} value={d.name}>
-              {optionText(d)}
-            </option>
-          ))}
-        </select>
-      </label>
+      {!hidePicker && <DatabasePicker label="Database" databases={databases} value={current?.name ?? ""} onPick={onPick} />}
       {current && (
         <DatabaseControls
           // A fresh form per database, and per saved schema.
