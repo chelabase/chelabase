@@ -271,11 +271,11 @@ function DatabasesTable({
                       params={{ projectId, databaseId: db.database_id }}
                       className={buttonVariants({ size: "sm", variant: "outline" })}
                     >
-                      Open <span aria-hidden="true">↗</span>
+                      Open
                     </Link>
                   ) : (
                     <Button size="sm" variant="outline" disabled>
-                      Open <span aria-hidden="true">↗</span>
+                      Open
                     </Button>
                   )}
                 </div>

@@ -44,10 +44,11 @@ const ROTATE = "POST /v1/databases/db/branches/br/keys/pub/rotate";
 const never: FakeHandler = () => new Promise<never>(() => {});
 const sent = (f: FakeFetch) => f.calls.map((r) => `${r.method} ${new URL(r.url).pathname}`);
 
-function setup(routes: Record<string, FakeHandler> = {}) {
+function setup(routes: Record<string, FakeHandler> = {}, pgDatabase?: string) {
   const f = fakeFetch({ [DATABASES]: () => jsonResponse(databases), [KEYS]: () => jsonResponse(keys), [SCHEMA]: () => jsonResponse(emptySchema), ...routes });
-  const result = renderWithQuery(<DataApiPanel databaseId="db" branch={branch} apiUrl="http://gw/" />, { fetch: f });
-  return { ...result, fetch: f };
+  const ui = (pg?: string) => <DataApiPanel databaseId="db" branch={branch} apiUrl="http://gw/" pgDatabase={pg} />;
+  const result = renderWithQuery(ui(pgDatabase), { fetch: f });
+  return { ...result, fetch: f, pick: (pg: string) => result.rerender(ui(pg)) };
 }
 
 afterEach(() => vi.unstubAllGlobals());
@@ -132,15 +133,15 @@ describe("DataApiPanel", () => {
   });
 
   it("reads the schema of the picked database, and only a served one", async () => {
-    const { fetch } = setup({ [SCHEMA]: (r) => jsonResponse(new URL(r.url).searchParams.get("database") === "app" ? openSchema : emptySchema) });
+    const { fetch, pick } = setup({ [SCHEMA]: (r) => jsonResponse(new URL(r.url).searchParams.get("database") === "app" ? openSchema : emptySchema) });
     await screen.findByText(PUB);
     const schemaDbs = () =>
       fetch.calls.filter((r) => new URL(r.url).pathname.endsWith("/data-api/schema")).map((r) => new URL(r.url).searchParams.get("database"));
     await waitFor(() => expect(schemaDbs()).toEqual(["web1"]));
     expect(screen.queryByText(/Anyone with your public key/)).not.toBeInTheDocument();
-    await userEvent.selectOptions(screen.getByLabelText("Database"), "app");
+    pick("app");
     expect(await screen.findByText(/Anyone with your public key/)).toBeInTheDocument();
-    await userEvent.selectOptions(screen.getByLabelText("Database"), "later");
+    pick("later");
     await waitFor(() => expect(screen.queryByText(/Anyone with your public key/)).not.toBeInTheDocument());
     expect(schemaDbs()).toEqual(["web1", "app"]);
   });
@@ -150,9 +151,8 @@ describe("DataApiPanel", () => {
       () => jsonResponse([dbRow("web1", { origin: "main", main: true }), dbRow("later", { data_api: "enabling" })]),
       () => jsonResponse([dbRow("web1", { origin: "main", main: true }), dbRow("later", { data_api: "on" })]),
     );
-    const { fetch } = setup({ [DATABASES]: list });
-    await userEvent.selectOptions(await screen.findByLabelText("Database"), "later");
-    expect(screen.getByText("Enabling the data API…")).toBeInTheDocument();
+    const { fetch } = setup({ [DATABASES]: list }, "later");
+    expect(await screen.findByText("Enabling the data API…")).toBeInTheDocument();
     await vi.waitFor(() => expect(screen.getByRole("button", { name: "Disable data API" })).toBeInTheDocument(), { timeout: 5000 });
     expect(fetch.calls.filter((r) => new URL(r.url).pathname.endsWith("/branches/br/databases"))).toHaveLength(2);
   });

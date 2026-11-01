@@ -1,8 +1,9 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { useGetMe, useListBranches, type DatabaseSummary } from "@chelabase/management-client";
+import { useGetMe, useListBranchDatabases, useListBranches, type DatabaseSummary } from "@chelabase/management-client";
 import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
+import { DatabasePicker } from "./data-api-databases";
 import { DataApiPanel } from "./data-api-panel";
 
 export interface ConnectPanelProps {
@@ -16,7 +17,6 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
   const id = database.database_id;
   const list = useListBranches(id);
   const [picked, setPicked] = useState<string | null>(null);
-  const [pickerSlot, setPickerSlot] = useState<HTMLElement | null>(null);
   const branches = list.data ?? null;
   const error = list.error ? errorText(list.error) : null;
 
@@ -27,6 +27,13 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
   // The data API runs on `normal` branches that are ready.
   const ready = (branches ?? []).filter((b) => b.kind === "normal" && b.status === "ready");
   const current = ready.find((b) => b.id === picked) ?? ready.find((b) => b.parent_branch_id === null) ?? ready[0];
+  // The branch's Postgres databases (the Data API panel's own query: no extra request); main unless one is picked
+  // on this branch.
+  const dbList = useListBranchDatabases(id, current?.id ?? "", { query: { enabled: !!current } });
+  const [pickedPg, setPickedPg] = useState<{ branchId: string; name: string } | null>(null);
+  const databases = current ? (dbList.data ?? null) : null;
+  const pickedName = pickedPg?.branchId === current?.id ? pickedPg?.name : undefined;
+  const pickedDb = databases?.find((d) => d.name === pickedName) ?? databases?.find((d) => d.main) ?? databases?.[0];
 
   return (
     <section aria-label={`Connect to ${database.name}`} className="space-y-3 py-3">
@@ -48,7 +55,9 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
                 ))}
               </select>
             </label>
-            <div ref={setPickerSlot} />
+            {current && databases && pickedDb && (
+              <DatabasePicker label="Postgres DB" databases={databases} value={pickedDb.name} onPick={(name) => setPickedPg({ branchId: current.id, name })} />
+            )}
           </div>
         )}
       </div>
@@ -65,7 +74,7 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
           databaseId={id}
           branch={current}
           apiUrl={apiUrl}
-          pickerSlot={pickerSlot}
+          pgDatabase={pickedDb?.name}
           aside={
             canLogin &&
             memberId && (

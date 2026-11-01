@@ -260,17 +260,17 @@ const CONTROLS: Control[] = [
   },
   {
     name: "Enable data API", operationId: "enableDataApi",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "off")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "off")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Enable data API"),
   },
   {
     name: "Disable data API", operationId: "disableDataApi",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "on")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "on")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Disable data API"),
   },
   {
     name: "Save default schema", operationId: "updatePgDatabase",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "on")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "on")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Save default schema"),
   },
   {

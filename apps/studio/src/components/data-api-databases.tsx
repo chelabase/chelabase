@@ -39,11 +39,8 @@ const optionText = (d: BranchDatabaseView) =>
 export interface DataApiDatabasesProps {
   databaseId: string;
   branchId: string;
-  databases: BranchDatabaseView[];
-  picked: string;
-  onPick: (name: string) => void;
-  /** The parent renders the picker (see `DatabasePicker`); only the picked database's controls show. */
-  hidePicker?: boolean;
+  /** The picked Postgres database (the Connect panel's header picks it). */
+  database: BranchDatabaseView;
 }
 
 /** The picker for a branch's databases, each with its state. */
@@ -76,22 +73,16 @@ export function DatabasePicker({
   );
 }
 
-/** The branch's databases: a picker with each state, and the picked one's controls. */
-export function DataApiDatabases({ databaseId, branchId, databases, picked, onPick, hidePicker }: DataApiDatabasesProps) {
-  const current = databases.find((d) => d.name === picked) ?? databases[0];
+/** The picked database's data API: its state and, for an Admin, its controls. */
+export function DataApiDatabases({ databaseId, branchId, database }: DataApiDatabasesProps) {
   return (
-    <div className="space-y-2">
-      {!hidePicker && <DatabasePicker label="Database" databases={databases} value={current?.name ?? ""} onPick={onPick} />}
-      {current && (
-        <DatabaseControls
-          // A fresh form per database, and per saved schema.
-          key={`${current.name}/${current.default_schema}`}
-          databaseId={databaseId}
-          branchId={branchId}
-          database={current}
-        />
-      )}
-    </div>
+    <DatabaseControls
+      // A fresh form per database, and per saved schema.
+      key={`${database.name}/${database.default_schema}`}
+      databaseId={databaseId}
+      branchId={branchId}
+      database={database}
+    />
   );
 }
 
