@@ -174,7 +174,7 @@ function Editor({ params, navigate, sql = false, openSqlEditor, createSqlClient 
   const drawerOpen = sql && canSql && !narrow();
   const openFull = () => openSqlEditor && guardDiscard(() => openSqlEditor(current));
   // Opening or closing the drawer stays at the URL's place: it never moves elsewhere past the row draft question.
-  const toggleSql = () => (!sql && narrow() ? openFull() : navigate(params, { sql: !sql, replace: true }));
+  const toggleSql = () => (narrow() ? openFull() : navigate(params, { sql: !sql, replace: true }));
   // The drawer's place once it is known. While the next place resolves (another branch or Postgres database), the last
   // one stays mounted with nothing to run, so a run in flight, its output and undo survive the switch.
   const drawerShown = useRef<{ place: EditorParams; props: SqlDrawerProps } | null>(null);
@@ -297,7 +297,7 @@ function Editor({ params, navigate, sql = false, openSqlEditor, createSqlClient 
         objects={branchOk && pg ? objects.data?.objects : undefined}
         noDatabase={ready && !current.pgDatabase}
         exactRows={exactRows}
-        sql={canSql ? { open: sql, onToggle: toggleSql } : undefined}
+        sql={canSql ? { open: drawerOpen, onToggle: toggleSql } : undefined}
       />
       {/* The grid and the drawer share the filled height (the drawer's share is the store's `sqlHeight`). */}
       <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">
