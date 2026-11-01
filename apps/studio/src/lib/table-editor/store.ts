@@ -31,8 +31,12 @@ export interface TableEditorState {
   setDialogOpen(open: boolean): void;
   changesets: Record<string, Changeset>;
   panel: PanelState;
-  /** Key `${databaseId}/${branchId}`; null = the owner. */
+  /** Key `${databaseId}/${branchId}`; null = the owner. Kept in the given storage, so the SQL tab and the table editor share it. */
   actAs: Record<string, string | null>;
+  /** The SQL drawer's share of the editor's height (whether it is open is the URL's `?sql=1`). */
+  sqlHeight: number;
+  /** Clamped to `SQL_HEIGHT`. */
+  setSqlHeight(fraction: number): void;
   selection: SelectionState;
   /** Creates the changeset with `base = tableFingerprint(base)`, folds the edit in, and drops the changeset when it ends up empty. */
   addEdit(key: string, base: Table | null, edit: Edit): void;
@@ -130,6 +134,21 @@ export interface Applied {
 let focusSeq = 0;
 
 export const DRAFTS_KEY = "chelabase.studio.tables.drafts";
+export const ACT_AS_KEY = "chelabase.studio.tables.actAs";
+
+/** The SQL drawer's height bounds and default, as fractions of the editor's height. */
+export const SQL_HEIGHT = { min: 0.25, max: 0.7, initial: 0.4 } as const;
+export const clampSqlHeight = (f: number) => Math.min(SQL_HEIGHT.max, Math.max(SQL_HEIGHT.min, f));
+
+function loadActAs(storage: Storage | null): Record<string, string | null> {
+  try {
+    const parsed: unknown = JSON.parse(storage?.getItem(ACT_AS_KEY) ?? "{}");
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter((e): e is [string, string | null] => e[1] === null || typeof e[1] === "string"));
+  } catch {
+    return {};
+  }
+}
 
 function loadDrafts(storage: Storage | null): Record<string, Changeset> {
   if (!storage) return {};
@@ -161,7 +180,9 @@ export function createTableEditorStore(storage: Storage | null): StoreApi<TableE
   const store = createStore<TableEditorState>()((set, get) => ({
     changesets: loadDrafts(storage),
     panel: CLOSED,
-    actAs: {},
+    actAs: loadActAs(storage),
+    sqlHeight: SQL_HEIGHT.initial,
+    setSqlHeight: (fraction) => set({ sqlHeight: clampSqlHeight(fraction) }),
     selection: NO_SELECTION,
     view: "table",
     setView: (view) => {
@@ -299,11 +320,11 @@ export function createTableEditorStore(storage: Storage | null): StoreApi<TableE
 
   if (storage) {
     store.subscribe((state, prev) => {
-      if (state.changesets === prev.changesets) return;
       try {
-        storage.setItem(DRAFTS_KEY, JSON.stringify(state.changesets));
+        if (state.changesets !== prev.changesets) storage.setItem(DRAFTS_KEY, JSON.stringify(state.changesets));
+        if (state.actAs !== prev.actAs) storage.setItem(ACT_AS_KEY, JSON.stringify(state.actAs));
       } catch {
-        // A draft that can't be saved is still kept in memory.
+        // A draft or role that can't be saved is still kept in memory.
       }
     });
   }

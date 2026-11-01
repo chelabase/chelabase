@@ -1,4 +1,5 @@
 import { screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { B, BRANCHES, D, PG_DATABASES, PROJECTS, ROLES, meAs, type Level } from "@/test/table-editor-fixtures";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
@@ -21,8 +22,9 @@ function setup(level: Level, params: EditorParams = PLACE, extra: Record<string,
     ...extra,
   });
   const navigate = vi.fn();
-  const result = renderWithQuery(<SqlPage params={params} navigate={navigate} createClient={() => Promise.reject(new Error("no worker"))} />, { fetch: f });
-  return { ...result, f, navigate };
+  const openTables = vi.fn();
+  const result = renderWithQuery(<SqlPage params={params} navigate={navigate} openTables={openTables} createClient={() => Promise.reject(new Error("no worker"))} />, { fetch: f });
+  return { ...result, f, navigate, openTables, user: userEvent.setup() };
 }
 const schemaCalls = (f: ReturnType<typeof fakeFetch>) => f.calls.filter((r) => r.url.includes("/sql/schema"));
 
@@ -57,5 +59,20 @@ describe("SqlPage", () => {
     setup("admin");
     await waitFor(() => expect(JSON.parse(localStorage.getItem("chelabase.studio.sql.last") ?? "null")).toEqual(PLACE));
     expect(localStorage.getItem("chelabase.studio.tables.last")).toBeNull();
+  });
+
+  // m4 (#86): Quick view opens the table editor with the drawer, on the table last open at this place, else the list.
+  it("quick_view_opens_the_remembered_table_at_this_place", async () => {
+    localStorage.setItem("chelabase.studio.tables.last", JSON.stringify({ ...PLACE, schema: "public", table: "orders" }));
+    const { openTables, user } = setup("admin");
+    await user.click(await screen.findByRole("button", { name: "Quick view" }));
+    expect(openTables).toHaveBeenCalledWith({ ...PLACE, schema: "public", table: "orders" });
+  });
+
+  it("quick_view_opens_the_table_list_when_the_last_table_was_elsewhere", async () => {
+    localStorage.setItem("chelabase.studio.tables.last", JSON.stringify({ ...PLACE, branchId: "b2", schema: "public", table: "orders" }));
+    const { openTables, user } = setup("admin");
+    await user.click(await screen.findByRole("button", { name: "Quick view" }));
+    expect(openTables).toHaveBeenCalledWith(PLACE);
   });
 });

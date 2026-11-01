@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ApiError, cancelSqlRun, useGetMe, useGetSqlSchema, type SavedQuery } from "@chelabase/management-client";
+import { ApiError, cancelSqlRun, getSavedQuery, useGetMe, useGetSqlSchema, useListSavedQueries, type SavedQuery } from "@chelabase/management-client";
+import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";
@@ -31,8 +32,21 @@ export interface SqlEditorProps {
   onPgDatabase: (name: string) => void;
   /** A saved query or history entry names a role the caller may act as. */
   onRole: (role: string) => void;
+  /** A run that changed the schema finished (the caller refreshes what it shows of it). */
+  onSchemaChange?: () => void;
+  /** The SQL tab's Quick view: to the table editor with the drawer open. */
+  onQuickView?: () => void;
+  /** The table editor's drawer: a compact layout (a saved-query picker, output beside the editor). */
+  drawer?: SqlDrawerSlot;
   /** Starts the pgls worker (tests inject a fake). The default imports the client lazily, so the wasm stays out of the main bundle. */
   createClient?: () => Promise<PglsClient>;
+}
+
+export interface SqlDrawerSlot {
+  /** "on <branch> · <db> · as <role>". */
+  place: string;
+  onFullEditor: () => void;
+  onClose: () => void;
 }
 
 type RunInFlight = {
@@ -67,6 +81,9 @@ function SqlWorkspace({
   branchProtected,
   onPgDatabase,
   onRole,
+  onSchemaChange,
+  onQuickView,
+  drawer,
   sub,
   createClient,
 }: Omit<SqlEditorProps, "createClient"> & { sub: string; createClient: () => Promise<PglsClient> }) {
@@ -135,13 +152,12 @@ function SqlWorkspace({
     }, 300);
     return () => clearTimeout(t);
   }, [doc, sub, databaseId]);
-  useEffect(
-    () => () => {
-      if (unsaved.current !== null) saveBuffer(sub, databaseId, unsaved.current);
-      unsaved.current = null;
-    },
-    [sub, databaseId],
-  );
+  // Also called before leaving for the other view: its editor reads the buffer while it mounts, before this one's cleanup runs.
+  const flush = useCallback(() => {
+    if (unsaved.current !== null) saveBuffer(sub, databaseId, unsaved.current);
+    unsaved.current = null;
+  }, [sub, databaseId]);
+  useEffect(() => flush, [flush]);
   const [active, setActive] = useState<ActiveQuery | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory(sub, databaseId));
   const [loadNote, setLoadNote] = useState<string | null>(null);
@@ -200,7 +216,10 @@ function SqlWorkspace({
       cur.finished = true;
       if (acc.done) {
         record(cur, acc.done.outcome, acc.done.duration_ms);
-        if (changesSchema(acc.statements.flatMap((s) => (s.tag ? [s.tag] : [])))) void schemaQuery.refetch();
+        if (changesSchema(acc.statements.flatMap((s) => (s.tag ? [s.tag] : [])))) {
+          void schemaQuery.refetch();
+          onSchemaChange?.();
+        }
       } else {
         setRun({ ...acc, running: false });
         setFailure("The connection closed before the run finished.");
@@ -261,6 +280,85 @@ function SqlWorkspace({
   };
 
   const basicNote = !pglsReady;
+  const loadQuery = (q: SavedQuery) => {
+    loadSql(q.sql);
+    applyHints({ database: q.pg_database ?? null, role: q.role ?? null });
+  };
+  const confirmDialog = (
+    <SqlConfirmDialog
+      statements={held}
+      onCancel={() => setHeld(null)}
+      onConfirm={() => {
+        const text = lastText.current;
+        setHeld(null);
+        if (text) void execute(text, true);
+      }}
+    />
+  );
+  const ownerNotice = (ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && (
+    <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
+  );
+  const noRoleNote = noRole && rolesReady && <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>;
+  const output = (
+    <>
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          {failure}
+        </p>
+      )}
+      {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
+    </>
+  );
+  const codeEditor = <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />;
+
+  if (drawer) {
+    // The drawer: one header row (saved queries, the place, Full editor, Run, close), the editor beside its output.
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line px-3 py-1.5 text-sm">
+          <span className="font-medium">SQL</span>
+          <SavedQueryPicker databaseId={databaseId} onLoad={loadQuery} />
+          <span className="min-w-0 truncate text-xs text-chalk-dim">{drawer.place}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                flush();
+                drawer.onFullEditor();
+              }}
+            >
+              Full editor
+            </Button>
+            {run?.running ? (
+              <Button size="sm" variant="destructive" onClick={() => void cancel()}>
+                Cancel
+              </Button>
+            ) : (
+              <Button size="sm" disabled={!rolesReady || noRole} onClick={start} title="Ctrl/Cmd+Enter runs the selection, or everything">
+                Run <kbd aria-hidden="true" className="font-sans text-[11px] opacity-70">Ctrl ↵</kbd>
+              </Button>
+            )}
+            <Button size="icon-sm" variant="ghost" aria-label="Close SQL" onClick={drawer.onClose}>
+              <span aria-hidden="true">×</span>
+            </Button>
+          </div>
+        </div>
+        <div className="flex min-h-0 flex-1">
+          <div className="min-w-0 flex-1 overflow-auto">{codeEditor}</div>
+          <div aria-label="Output" role="group" className="w-[42%] min-w-0 space-y-2 overflow-auto border-l border-line p-2">
+            {noRoleNote}
+            {branchProtected && <p className="text-xs text-chalk-dim">Protected branch: every change asks for confirmation.</p>}
+            {ownerNotice}
+            {loadNote && <p className="text-xs text-chalk-dim">{loadNote}</p>}
+            {output}
+            {!run && !failure && <p className="text-xs text-chalk-dim">Each statement&apos;s output shows here.</p>}
+          </div>
+        </div>
+        {confirmDialog}
+      </div>
+    );
+  }
 
   return (
     <div className="flex min-h-0 flex-1 max-[40rem]:flex-col">
@@ -271,10 +369,7 @@ function SqlWorkspace({
           hints={{ pg_database: dbParam, role: roleParam }}
           active={active}
           onActiveChange={setActive}
-          onLoad={(q: SavedQuery) => {
-            loadSql(q.sql);
-            applyHints({ database: q.pg_database ?? null, role: q.role ?? null });
-          }}
+          onLoad={loadQuery}
           history={history}
           onOpenHistory={(h) => {
             loadSql(h.sql);
@@ -298,12 +393,17 @@ function SqlWorkspace({
         onRun={start}
         onCancel={() => void cancel()}
         onRefreshSchema={() => void schemaQuery.refetch()}
+        onQuickView={
+          onQuickView &&
+          (() => {
+            flush();
+            onQuickView();
+          })
+        }
       />
 
       {noRole ? (
-        rolesReady && (
-          <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>
-        )
+        noRoleNote
       ) : role === "" ? (
         <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
       ) : !allowed.owner ? (
@@ -316,32 +416,54 @@ function SqlWorkspace({
         </p>
       )}
       {branchProtected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
-      {(ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && (
-        <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
-      )}
+      {ownerNotice}
 
       <div className="flex items-center justify-between text-xs text-muted-foreground">
         <span>{loadNote}</span>
         {basicNote && <span>Basic completion</span>}
       </div>
-      <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />
-      {failure && (
-        <p role="alert" className="text-sm text-destructive">
-          {failure}
-        </p>
-      )}
-      {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
+      {codeEditor}
+      {output}
       </div>
 
-      <SqlConfirmDialog
-        statements={held}
-        onCancel={() => setHeld(null)}
-        onConfirm={() => {
-          const text = lastText.current;
-          setHeld(null);
-          if (text) void execute(text, true);
-        }}
-      />
+      {confirmDialog}
     </div>
+  );
+}
+
+/** The drawer's saved queries: a picker that loads the chosen one (saving stays in the full editor). */
+function SavedQueryPicker({ databaseId, onLoad }: { databaseId: string; onLoad: (q: SavedQuery) => void }) {
+  const list = useListSavedQueries(databaseId);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <>
+      <select
+        aria-label="Saved query"
+        value=""
+        disabled={!list.data?.length}
+        onChange={async (e) => {
+          const id = e.target.value;
+          setError(null);
+          try {
+            onLoad(await getSavedQuery(databaseId, id));
+          } catch (err) {
+            setError(errorText(err));
+          }
+        }}
+        className="h-7 max-w-48 border border-input bg-background px-2 text-sm"
+      >
+        <option value="">{list.data?.length ? "Saved queries…" : "No saved queries"}</option>
+        {(list.data ?? []).map((q) => (
+          <option key={q.id} value={q.id}>
+            {q.name}
+          </option>
+        ))}
+      </select>
+      {error && (
+        <span role="alert" className="text-xs text-destructive">
+          {error}
+        </span>
+      )}
+    </>
   );
 }

@@ -9,6 +9,8 @@ export interface SqlToolbarProps {
   onRun: () => void;
   onCancel: () => void;
   onRefreshSchema: () => void;
+  /** To the table editor with the SQL drawer open, at the same place. */
+  onQuickView?: () => void;
 }
 
 const field = "h-8 border border-input bg-background px-2 text-sm";
@@ -39,6 +41,11 @@ export function SqlToolbar(p: SqlToolbarProps) {
       <Button variant="outline" onClick={p.onRefreshSchema}>
         Refresh schema
       </Button>
+      {p.onQuickView && (
+        <Button variant="outline" onClick={p.onQuickView} title="The table editor, with this query in a drawer under the table">
+          Quick view
+        </Button>
+      )}
     </div>
   );
 }
