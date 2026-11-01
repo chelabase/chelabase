@@ -14,7 +14,10 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
 envex="$root/infra/compose/.env.example"
 # Overlays that reuse base images (the example seed) get the same pins.
-overlays=("$root/infra/compose/docker-compose.example.yml")
+overlays=()
+for f in "$root/infra/compose/docker-compose.example.yml"; do
+  if [[ -f "$f" ]]; then overlays+=("$f"); fi
+done
 [[ $# -eq 1 && -f "$1" ]] || { echo "usage: $0 <digests-file>" >&2; exit 2; }
 images=(gateway orchestrator worker rest auth realtime init studio)
 declare -A ref

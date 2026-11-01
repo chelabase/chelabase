@@ -14,7 +14,10 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
 envex="$root/infra/compose/.env.example"
-overlays=("$root/infra/compose/docker-compose.example.yml")
+overlays=()
+for f in "$root/infra/compose/docker-compose.example.yml"; do
+  if [[ -f "$f" ]]; then overlays+=("$f"); fi
+done
 digests="${1:-}"
 images=(gateway orchestrator worker rest auth realtime init studio)
 re='^ghcr\.io/chelabase/([a-z]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
