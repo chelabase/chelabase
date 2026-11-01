@@ -4,14 +4,16 @@
 //! 1. [`gate::check`] refuses anything that isn't a local stack, before any request.
 //! 2. Ada (`ada@acme.example`) claims the instance with the setup code through the ordinary
 //!    sign-up (or, once it is claimed, signs in), and must then be its tenant admin.
-//! 3. Ada invites each demo person with link delivery, and the seed accepts each invite with
+//! 3. If an earlier run finished (the completion marker, [`acme::complete`]), it stops here:
+//!    no invite, rename, grant or schema change, whatever the demo looks like now.
+//! 4. Ada invites each demo person with link delivery, and the seed accepts each invite with
 //!    the demo password ([`people`]).
-//! 4. Ada builds the Acme organisation: teams, the project and database, schemas, RLS, app
-//!    users, a key, branches and saved queries ([`acme`]).
+//! 5. Ada builds the Acme organisation: teams, the project and database, schemas, RLS, app
+//!    users, a key, branches and saved queries, then writes the marker ([`acme`]).
 //!
-//! Every step is idempotent, so a run that stopped anywhere is finished by the next one. The
-//! demo password is a constant, never configured, so it is the same on every run. Nothing
-//! printed carries a code, token or the setup code ([`session`]).
+//! Until the marker is written every step is idempotent, so a run that stopped anywhere is
+//! finished by the next one. The demo password is a constant, never configured, so it is the
+//! same on every run. Nothing printed carries a code, token or the setup code ([`session`]).
 
 pub mod acme;
 pub mod gate;
@@ -65,7 +67,15 @@ impl Config {
 /// The whole seed: the gate, then the claim and the people, logging to `out`.
 pub async fn run(cfg: &Config, http: &impl session::Http, out: &mut dyn Write) -> Result<()> {
     gate::check(cfg)?;
-    let (session, ada) = people::seed(cfg, http, Duration::from_secs(1), out).await?;
+    let (session, ada, writes) = people::claim(cfg, http, Duration::from_secs(1), out).await?;
+    if acme::complete(&session, &ada).await? {
+        writeln!(
+            out,
+            "example: the seed is already complete on this instance: skipped, 0 writes. Changes made since are kept; reset with `down -v` to seed again"
+        )?;
+        return people::roster(out);
+    }
+    people::admit(&session, &ada, writes, out).await?;
     acme::seed(&session, &ada, out).await?;
     Ok(())
 }

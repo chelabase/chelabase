@@ -9,9 +9,10 @@ create schema if not exists finance authorization finance;
 create schema if not exists sales authorization sales;
 create schema if not exists support authorization support;
 
--- Customers are the app users: a row per signed-up customer, with the same id.
+-- Customers are the app users: a row per signed-up customer, with the same id. Deleting an app
+-- user deletes their public.users row, so everything that hangs off a customer cascades.
 create table if not exists public.customers (
-  id uuid primary key references public.users (id),
+  id uuid primary key references public.users (id) on delete cascade,
   name text not null,
   email text not null unique,
   region text not null
@@ -29,7 +30,7 @@ create table if not exists public.employees (
 
 create table if not exists sales.orders (
   id bigint generated always as identity primary key,
-  customer_id uuid not null references public.customers (id),
+  customer_id uuid not null references public.customers (id) on delete cascade,
   total numeric(10, 2) not null check (total >= 0),
   status text not null default 'open' check (status in ('open', 'paid', 'shipped')),
   created_at timestamptz not null default now()
@@ -37,8 +38,8 @@ create table if not exists sales.orders (
 
 create table if not exists finance.invoices (
   id bigint generated always as identity primary key,
-  order_id bigint not null references sales.orders (id),
-  customer_id uuid not null references public.customers (id),
+  order_id bigint not null references sales.orders (id) on delete cascade,
+  customer_id uuid not null references public.customers (id) on delete cascade,
   amount numeric(10, 2) not null,
   issued_on date not null,
   paid boolean not null default false
@@ -46,7 +47,7 @@ create table if not exists finance.invoices (
 
 create table if not exists support.tickets (
   id bigint generated always as identity primary key,
-  customer_id uuid not null references public.customers (id),
+  customer_id uuid not null references public.customers (id) on delete cascade,
   subject text not null,
   region text not null,
   status text not null default 'open' check (status in ('open', 'pending', 'closed')),
@@ -62,6 +63,10 @@ alter table support.tickets enable row level security;
 drop policy if exists customers_own on public.customers;
 create policy customers_own on public.customers for select to authenticated
   using (id = chelabase.user_id());
+-- Staff read every customer (Sales takes orders for them).
+drop policy if exists customers_staff on public.customers;
+create policy customers_staff on public.customers for select to sales, finance, support
+  using (true);
 
 -- A signed-in customer sees only their own orders and tickets; the data API runs them as
 -- `authenticated` with their id in the claims.
@@ -100,6 +105,13 @@ grant usage on all sequences in schema finance to finance;
 grant select, insert, update, delete on all tables in schema support to support;
 grant usage on all sequences in schema support to support;
 grant select on public.employees to engineering, finance, sales, support;
+
+-- The data API's default privileges in `public` gave its roles every table there: `anon` can
+-- select, `authenticated` can also insert, update and delete. Customers are read-only through
+-- it, and so is the directory: without RLS a write grant would let any signed-in customer
+-- change it. Both keep their select (on the directory, the public key reads every row).
+revoke insert, update, delete, truncate on public.customers from anon, authenticated;
+revoke insert, update, delete, truncate on public.employees from anon, authenticated;
 
 -- Seed rows. Customers come from the app users already made.
 insert into public.customers (id, name, email, region)
@@ -187,7 +199,11 @@ join (values
 ) as v (email, subject, status, opened_at) on c.email = v.email
 where not exists (select 1 from support.tickets);
 
--- Each team's role owns its schema's tables.
+-- Each team's role owns its schema's tables. An owner skips its table's policies unless RLS is
+-- forced, so it is: `support` sees only EMEA tickets, even on its own table.
+alter table sales.orders force row level security;
+alter table finance.invoices force row level security;
+alter table support.tickets force row level security;
 alter table sales.orders owner to sales;
 alter table finance.invoices owner to finance;
 alter table support.tickets owner to support;

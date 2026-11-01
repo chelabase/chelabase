@@ -102,6 +102,8 @@ pub struct Acme {
     pub protected: bool,
     pub keys: Vec<String>,
     pub queries: Vec<String>,
+    /// The completion marker (the comment on the main branch's database) is set.
+    pub complete: bool,
     /// Make the next non-probe SQL run end in this error.
     pub sql_error: Option<&'static str>,
 }
@@ -743,6 +745,11 @@ impl State {
             }
             "POST /v1/sql-probe" => {
                 let sql = s(body, "sql");
+                if sql.contains("shobj_description") {
+                    assert!(r.path.contains("br-main"), "the marker is on main");
+                    let rows = json!({"t": "rows", "statement": 0, "rows": [[if self.acme.complete { "true" } else { "false" }]]});
+                    return json_ok(200, Value::String(format!("{rows}\n{}\n", json!({"t": "done", "outcome": "ok", "duration_ms": 1}))));
+                }
                 let done = if sql.contains("discount_pct") {
                     r.path.contains("br-feature") && self.acme.feature_col
                 } else {
@@ -756,6 +763,12 @@ impl State {
             "POST /v1/sql" => {
                 let sql = s(body, "sql");
                 assert_eq!(body["confirm"], true);
+                // The marker: an Admin's confirmed run passes on a protected branch.
+                if sql.contains("comment on database") {
+                    assert!(r.path.contains("br-main") && self.acme.protected, "the marker comes last");
+                    self.acme.complete = true;
+                    return json_ok(200, Value::String(format!("{}\n", json!({"t": "done", "outcome": "ok", "duration_ms": 1}))));
+                }
                 if self.acme.protected {
                     return Ok((409, json!({"error": {"code": "sql_confirm_required", "message": "no"}}), None));
                 }
