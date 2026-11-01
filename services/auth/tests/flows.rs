@@ -676,6 +676,39 @@ async fn confirm_sets_the_new_password() {
     );
 }
 
+// Zitadel hashes with bcrypt (72 bytes at most): platform sign-up and reset confirm refuse a
+// longer password before Zitadel sees it, counted in bytes (39 characters can be 74), and take
+// one of exactly 72.
+#[tokio::test]
+async fn platform_sign_up_and_confirm_refuse_a_password_over_72_bytes_before_zitadel() {
+    let h = harness().await;
+    let long = format!("Aa1!{}", "é".repeat(35));
+    let max = format!("Aa1!{}", "é".repeat(34));
+    assert_eq!((long.chars().count(), long.len(), max.len()), (39, 74, 72));
+    let a = h
+        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", &long), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    assert!(!h.mock.calls().iter().any(|c| c == "POST /v2/users/new"), "{:?}", h.mock.calls());
+    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
+    let a = h
+        .post("/auth/v1/password-reset/confirm", json!({"userId": id, "code": RESET_CODE, "password": long}), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    assert!(!h.mock.calls().iter().any(|c| c.ends_with("/password")), "{:?}", h.mock.calls());
+    assert_eq!(h.mock.user("ada@example.com").unwrap().password, "Old-pass-1");
+    // 72 bytes is fine on both.
+    let a = h
+        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "max@example.com", &max), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
+    let a = h
+        .post("/auth/v1/password-reset/confirm", json!({"userId": id, "code": RESET_CODE, "password": max}), None, "1.1.1.1")
+        .await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({})));
+    assert_eq!(h.mock.user("ada@example.com").unwrap().password, max);
+}
+
 // Review Focus 3.
 #[tokio::test]
 async fn confirm_with_a_weak_password_says_so() {
@@ -1751,6 +1784,24 @@ async fn accept_invite_user_deleted_after_lookup_counts_against_the_ip() {
         )
         .await;
     assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn accept_invite_reset_user_deleted_after_lookup_is_revoked_and_counts_against_the_ip() {
+    // get_user finds the user but the reset's POST /password answers Zitadel's captured
+    // not-found (deleted in between): 410 invite_revoked, the invitee's attempt handed back (no
+    // 429 after five), the address's counted (the 21st is 429).
+    let h = harness().await;
+    let id = h.mock.add_user("bob@example.com", "Old-pass-12", true);
+    h.mock.fail("/password", 400, "Errors.User.NotFound", 20);
+    let reset = || reset_accept(&h.mock.add_auth_request(false), &id, RESET_CODE, "Secret-pass1");
+    for i in 0..20 {
+        let a = h.post("/auth/v1/accept-invite", reset(), None, "1.1.1.1").await;
+        assert_eq!(a.status, StatusCode::GONE, "attempt {i}: {}", a.body);
+        assert_eq!(a.body["error"]["code"], "invite_revoked", "attempt {i}");
+    }
+    let late = h.post("/auth/v1/accept-invite", reset(), None, "1.1.1.1").await;
+    assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "{}", late.body);
 }
 
 #[tokio::test]

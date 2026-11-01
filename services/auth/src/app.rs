@@ -1137,9 +1137,15 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     password_set = b.reset;
                 }
                 // An arm that hands an attempt back matches one exact captured refusal. A wrong
-                // code is `INVITE_CODE_INVALID` or `PASSWORD_CODE_NOT_FOUND`, never one of them,
-                // so guessing stays counted.
+                // code is `INVITE_CODE_INVALID`, `PASSWORD_CODE_INVALID` or
+                // `PASSWORD_CODE_NOT_FOUND`, never one of them, so guessing stays counted. The
+                // user-gone arms hand back only the invitee's attempt: the address's counts.
                 Err(e) if !b.reset && e.is(refusals::INVITE_USER_NOT_FOUND) => {
+                    info!("accept-invite: the user is gone");
+                    user_slot.refund();
+                    return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
+                }
+                Err(e) if b.reset && e.is(refusals::SET_PASSWORD_USER_NOT_FOUND) => {
                     info!("accept-invite: the user is gone");
                     user_slot.refund();
                     return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
@@ -1150,7 +1156,10 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
                     slot.refund();
                     return weak();
                 }
-                // Zitadel's validation of the field has no id to match exactly: it counts.
+                // Zitadel's validation of the field has no id to match exactly: it counts. The
+                // 72-byte cap above keeps the password out of reach of its 200-rune check, but a
+                // validation failure on another field of the request lands here too, so the arm
+                // stays.
                 Err(e) if b.reset && e.is_invalid_request() => return weak(),
                 // A wrong, an expired and a missing code get the same answer from Zitadel; the
                 // stored invite tells an expired one apart. Read only now, and counted either way.
