@@ -10057,7 +10057,7 @@
           "members"
         ],
         "summary": "Revoke an invite",
-        "description": "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again). Revoking an invite whose member is still removed retries the Zitadel step.",
+        "description": "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.",
         "operationId": "revokeInvite",
         "parameters": [
           {
@@ -10420,7 +10420,7 @@
           "members"
         ],
         "summary": "Remove a member",
-        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended; a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
         "operationId": "removeMember",
         "parameters": [
           {
@@ -10798,7 +10798,7 @@
           "members"
         ],
         "summary": "Decline a sign-up",
-        "description": "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended; a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+        "description": "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
         "operationId": "declineMember",
         "parameters": [
           {
@@ -11187,7 +11187,7 @@
           "members"
         ],
         "summary": "Suspend a member",
-        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
         "operationId": "suspendMember",
         "parameters": [
           {

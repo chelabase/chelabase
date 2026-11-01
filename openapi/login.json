@@ -37,7 +37,17 @@
             }
           },
           "400": {
-            "description": "The body is malformed, the code or ticket is wrong (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)",
+            "description": "The body is malformed, the code or ticket is wrong, or the user is inactive with no open invite (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The member is suspended (`member_suspended`): the invite is accepted and the password set, but there is no sign-in until an admin reinstates them",
             "content": {
               "application/json": {
                 "schema": {
@@ -151,7 +161,7 @@
             }
           },
           "409": {
-            "description": "The email is taken (`email_taken`), or app users are off (`app_users_disabled`)",
+            "description": "The email is taken (`email_taken`), it is the user's email already (`conflict`), or app users are off (`app_users_disabled`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1966,7 +1976,7 @@
             }
           },
           "400": {
-            "description": "The body is malformed (`invalid_request`) or the password is too weak (`weak_password`)",
+            "description": "The body is malformed, a name is blank or over 200 characters, or Zitadel's validation refuses a field (`invalid_request`), or the password is too weak (`weak_password`)",
             "content": {
               "application/json": {
                 "schema": {

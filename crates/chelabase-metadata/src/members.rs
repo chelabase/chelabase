@@ -1612,6 +1612,20 @@ impl MetadataClient {
         .transpose()?)
     }
 
+    /// Whether `member`'s Zitadel user has another member row, in any tenant, that isn't
+    /// removed: a removal then leaves the user active (only its sessions end). An unknown
+    /// `member` is `false`.
+    pub async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM members m JOIN members o
+                              ON o.zitadel_user_id = m.zitadel_user_id AND o.id <> m.id
+                            WHERE m.id = $1 AND o.status <> 'removed')",
+        )
+        .bind(member)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// The caller's member row, made on its first request. Runs on every request, so an active
     /// member whose claims didn't change costs one read: no lock, no write. A changed name
     /// alone is refreshed by a plain UPDATE; a changed email takes the tenant row and the
@@ -2095,6 +2109,28 @@ impl MetadataClient {
                 }
             },
         ))
+    }
+
+    /// The stored expiry of this Zitadel user's invite that isn't revoked or accepted, while its
+    /// member is still invited, and whether it is open (`expires_at > now()`, the database clock,
+    /// as [`Self::open_invite_for_user`] decides). An open invite wins over a newer expired one
+    /// (in another tenant), so a user with any open invite is answered open; with none open, the
+    /// latest answers its past expiry. Read-only.
+    pub async fn invite_expiry_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
+        Ok(sqlx::query_as(
+            "SELECT i.expires_at, i.expires_at > now()
+             FROM invites i
+             JOIN members m ON m.id = i.member_id
+             WHERE i.zitadel_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL
+               AND m.status = 'invited'
+             ORDER BY (i.expires_at > now()) DESC, i.created_at DESC, i.id LIMIT 1",
+        )
+        .bind(zitadel_user_id)
+        .fetch_optional(&self.pool)
+        .await?)
     }
 
     /// A member by id, whatever its status (callers check its tenant).

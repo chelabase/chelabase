@@ -96,6 +96,16 @@ pub struct InviteDescription {
     pub tenant_name: String,
 }
 
+/// What the orchestrator stores about a Zitadel user's latest member invite
+/// (`POST /internal/invites/open`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct OpenInvite {
+    /// The invite is open: not revoked, accepted or expired.
+    pub open: bool,
+    /// Its stored expiry; `None` when the user has no such invite.
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// The sign-up gate's answer (`POST /internal/signup/check`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SignUpAnswer {
@@ -274,6 +284,17 @@ impl InternalClient {
             Err(InternalError::Refused { status: 404, .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Whether this Zitadel user has an open member invite, and its stored expiry. Any refusal
+    /// (a wrong token, a 404) is an error, never "no invite".
+    pub async fn open_invite(&self, user: &str) -> Result<OpenInvite, InternalError> {
+        self.json(
+            Method::POST,
+            "/internal/invites/open",
+            Some(serde_json::json!({ "user": user })),
+        )
+        .await
     }
 
     /// `None` when the branch is unknown or its project has no app users.

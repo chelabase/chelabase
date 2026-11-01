@@ -7522,7 +7522,7 @@ export const getRevokeInviteUrl = (inviteId: string,) => {
 }
 
 /**
- * The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again). Revoking an invite whose member is still removed retries the Zitadel step.
+ * The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.
  * @summary Revoke an invite
  */
 export const revokeInvite = async (inviteId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -7890,7 +7890,7 @@ export const getRemoveMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended; a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.
+ * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.
  * @summary Remove a member
  */
 export const removeMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8145,7 +8145,7 @@ export const getDeclineMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended; a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.
+ * The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.
  * @summary Decline a sign-up
  */
 export const declineMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8472,7 +8472,7 @@ export const getSuspendMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked with its sessions ended. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.
+ * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.
  * @summary Suspend a member
  */
 export const suspendMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {

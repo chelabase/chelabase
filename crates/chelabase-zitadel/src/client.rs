@@ -1,5 +1,6 @@
 //! Zitadel v4's Session, User, Organization and OIDC v2 REST APIs.
 
+use crate::refusals::{self, Refusal};
 use chrono::{DateTime, Utc};
 use reqwest::Method;
 use serde_json::{Value, json};
@@ -7,13 +8,68 @@ use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ZError {
-    /// Zitadel understood and refused (4xx). `message` is Zitadel's error id, e.g.
-    /// `Errors.User.Code.Invalid`; never shown to users.
+    /// Zitadel understood and refused (a 4xx carrying its own error body). `code` is the gRPC
+    /// code and `id` the first error detail's id (`QUERY-Dfbg2`): both stable, so match on
+    /// them (see [`crate::refusals`]). `id` is `None` only for Zitadel's request validation
+    /// ([`ZError::is_invalid_request`]). `message` is the error text (localized, then each
+    /// detail's id and message), logged and never shown to users.
     #[error("zitadel rejected the request ({status}): {message}")]
-    Rejected { status: u16, message: String },
-    /// No answer, a timeout, a 5xx or an unreadable answer.
+    Rejected {
+        status: u16,
+        code: Option<u32>,
+        id: Option<String>,
+        message: String,
+    },
+    /// No answer, a timeout, a 5xx, an unreadable answer, or a 4xx whose body isn't Zitadel's
+    /// own error (a proxy's page, an empty body): it never reached Zitadel's logic.
+    /// Zitadel's request validation (a 400 with code 3 and no detail) is `Rejected` with no id.
     #[error("zitadel unavailable: {0}")]
     Unavailable(String),
+}
+
+impl ZError {
+    /// The gRPC code of Zitadel's refusal.
+    pub fn zitadel_code(&self) -> Option<u32> {
+        match self {
+            ZError::Rejected { code, .. } => *code,
+            ZError::Unavailable(_) => None,
+        }
+    }
+
+    /// The id of the refusal's first error detail (`COMMAND-bd4ir1mblj`).
+    pub fn detail_id(&self) -> Option<&str> {
+        match self {
+            ZError::Rejected { id, .. } => id.as_deref(),
+            ZError::Unavailable(_) => None,
+        }
+    }
+
+    /// Whether this is exactly that captured refusal: its status, code and detail id.
+    pub fn is(&self, refusal: Refusal) -> bool {
+        matches!(self, ZError::Rejected { status, code, id, .. }
+            if *status == refusal.status
+                && *code == Some(refusal.code)
+                && id.as_deref() == Some(refusal.id))
+    }
+
+    /// Whether this is Zitadel's request validation refusing a field (a password over 200
+    /// characters): a 400 with gRPC code 3 and no detail id (see [`crate::refusals`]).
+    pub fn is_invalid_request(&self) -> bool {
+        matches!(
+            self,
+            ZError::Rejected {
+                status: 400,
+                code: Some(refusals::INVALID_ARGUMENT),
+                id: None,
+                ..
+            }
+        )
+    }
+
+    /// Whether this is one of those captured refusals.
+    pub fn is_any(&self, refusals: &[Refusal]) -> bool {
+        refusals.iter().any(|r| self.is(*r))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +100,9 @@ pub enum UserState {
     Active,
     Inactive,
     Locked,
+    /// `USER_STATE_INITIAL`: made by the v1 management API with neither a password nor a
+    /// verified email, and never signed in (see [`crate::refusals`]).
+    Initial,
     Other,
 }
 
@@ -124,6 +183,7 @@ fn parse_user(v: &Value) -> Option<ZUser> {
             Some("USER_STATE_ACTIVE") => UserState::Active,
             Some("USER_STATE_INACTIVE") => UserState::Inactive,
             Some("USER_STATE_LOCKED") => UserState::Locked,
+            Some("USER_STATE_INITIAL") => UserState::Initial,
             _ => UserState::Other,
         },
         created_at: details
@@ -143,8 +203,9 @@ fn as_u64(v: &Value) -> Option<u64> {
 }
 
 /// An error body's text: Zitadel's `message` (localized, with the error id appended) followed
-/// by each `details[]` entry's `id` and `message`, so the stable error key
-/// (`Errors.User.Code.Expired`) and id survive a localized top-level message.
+/// by each `details[]` entry's `id` and `message`, so the detail's id (`COMMAND-Wgn4q`) survives
+/// in logs whatever the top-level message's language. Zitadel v4 sends no error key; callers
+/// match the id ([`ZError::is`]), never this text.
 fn error_text(body: Option<&Value>) -> String {
     let Some(body) = body else {
         return String::new();
@@ -170,25 +231,87 @@ fn error_text(body: Option<&Value>) -> String {
     text
 }
 
-/// The `@type` of the `details[]` entries in Zitadel's own error answers.
-const ZITADEL_ERROR_DETAIL: &str = "type.googleapis.com/zitadel.v1.ErrorDetail";
+/// The `@type`s of the `details[]` entries in Zitadel's own error answers: an `ErrorDetail`,
+/// or a `CredentialsCheckError` for a wrong password (`tests/zitadel_live.rs`).
+const ZITADEL_DETAILS: [&str; 2] = [
+    "type.googleapis.com/zitadel.v1.ErrorDetail",
+    "type.googleapis.com/zitadel.v1.CredentialsCheckError",
+];
 
-/// Whether an error answer is Zitadel's own NOT_FOUND: gRPC `code` 5 with a `details[]` entry
-/// of Zitadel's `ErrorDetail` type. Both `message`s are localized (v4.19.1 answers a missing
-/// user with `{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":
+/// Zitadel's own error, read from an error body: its gRPC `code` and the `id` of the first
+/// `details[]` entry of Zitadel's detail types. Both `message`s are localized (v4.19.1 answers a
+/// missing user with `{"code":5, "message":"User could not be found (QUERY-Dfbg2)", "details":
 /// [{"@type":"type.googleapis.com/zitadel.v1.ErrorDetail", "id":"QUERY-Dfbg2", "message":
-/// "User could not be found"}]}`), so no message key is matched.
-fn is_zitadel_not_found(body: Option<&Value>) -> bool {
+/// "User could not be found"}]}`), so no message is read.
+fn zitadel_error(body: Option<&Value>) -> Option<(u32, String)> {
+    let body = body?;
+    let code = u32::try_from(body.get("code")?.as_u64()?).ok()?;
+    let id = body
+        .get("details")?
+        .as_array()?
+        .iter()
+        .find(|d| {
+            d.get("@type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| ZITADEL_DETAILS.contains(&t))
+        })?
+        .get("id")?
+        .as_str()
+        .filter(|id| !id.is_empty())?;
+    Some((code, id.to_string()))
+}
+
+/// Whether a 400's body is Zitadel's request validation refusing a field (captured live, see
+/// [`crate::refusals`]): gRPC code 3 as a number, a string `message`, and a `details` that is
+/// missing or an empty array. It has no id.
+fn invalid_request(status: u16, body: Option<&Value>) -> bool {
     let Some(body) = body else {
         return false;
     };
-    body.get("code").and_then(Value::as_u64) == Some(5)
+    status == 400
+        && body.get("code").and_then(Value::as_u64) == Some(u64::from(refusals::INVALID_ARGUMENT))
+        && body.get("message").is_some_and(Value::is_string)
         && body
             .get("details")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|d| d.get("@type").and_then(Value::as_str) == Some(ZITADEL_ERROR_DETAIL))
+            .is_none_or(|d| d.as_array().is_some_and(Vec::is_empty))
+}
+
+/// What a 4xx answer means: Zitadel's own refusal is `Rejected` with its code and detail id,
+/// or with no id for its request validation (a 400, code 3, no detail). Any other body (HTML,
+/// empty, JSON without Zitadel's detail, such as a wrong `Host`'s "instance not found") is
+/// `Unavailable`: it never reached Zitadel's logic, or can't be told apart from a proxy's answer.
+fn refused(status: u16, body: Option<&Value>) -> ZError {
+    if let Some((code, id)) = zitadel_error(body) {
+        return ZError::Rejected {
+            status,
+            code: Some(code),
+            id: Some(id),
+            message: error_text(body),
+        };
+    }
+    if invalid_request(status, body) {
+        return ZError::Rejected {
+            status,
+            code: Some(refusals::INVALID_ARGUMENT),
+            id: None,
+            message: error_text(body),
+        };
+    }
+    ZError::Unavailable(format!(
+        "a {status} that isn't Zitadel's own error: {}",
+        error_text(body)
+    ))
+}
+
+/// How the client reads a 4xx answer with this body (for tests against captured answers).
+#[cfg(any(test, feature = "mock"))]
+pub fn classify(status: u16, body: &str) -> ZError {
+    let parsed = if body.trim().is_empty() {
+        Some(Value::Null)
+    } else {
+        serde_json::from_str::<Value>(body).ok()
+    };
+    refused(status, parsed.as_ref())
 }
 
 impl Zitadel {
@@ -218,11 +341,7 @@ impl Zitadel {
     async fn call(&self, method: Method, path: &str, body: Option<Value>) -> Result<Value, ZError> {
         let (status, parsed) = self.send(method, path, body).await?;
         if status.is_client_error() {
-            let message = error_text(parsed.as_ref());
-            return Err(ZError::Rejected {
-                status: status.as_u16(),
-                message,
-            });
+            return Err(refused(status.as_u16(), parsed.as_ref()));
         }
         let value = parsed.ok_or_else(|| ZError::Unavailable(format!("{status}: not JSON")))?;
         Ok(value)
@@ -263,7 +382,7 @@ impl Zitadel {
         if !status.is_success() && !status.is_client_error() {
             return Err(ZError::Unavailable(format!("{status}: Zitadel answered with no result (redirects are not followed)")));
         }
-        // A proxy may answer a 4xx with HTML; the status alone is still a rejection.
+        // A proxy may answer a 4xx with HTML: `refused` tells it from Zitadel's own error.
         let parsed = if text.trim().is_empty() {
             Some(Value::Null)
         } else {
@@ -374,8 +493,9 @@ impl Zitadel {
     }
 
     /// Checks an invite code (`POST /v2/users/{userId}/invite_code/verify`, body
-    /// `{"verificationCode"}`). An expired code is `Rejected` with a message naming `Expired`;
-    /// a deleted user is `Rejected { status: 404 }`.
+    /// `{"verificationCode"}`). Zitadel answers a wrong, an expired and a missing code alike
+    /// ([`refusals::INVITE_CODE_INVALID`]), and a deleted or unknown user with a 400
+    /// ([`refusals::INVITE_USER_NOT_FOUND`]), not a 404: both captured by `tests/zitadel_live.rs`.
     pub async fn verify_invite_code(&self, user_id: &str, code: &str) -> Result<(), ZError> {
         self.call(
             Method::POST,
@@ -536,41 +656,37 @@ impl Zitadel {
     }
 
     /// The user (`GET /v2/users/{userId}`). `None` only when Zitadel definitely has no such
-    /// user: a 404 carrying its own NOT_FOUND error (see [`is_zitadel_not_found`]; checked
-    /// against the real Zitadel by `tests/zitadel_live.rs`). Any other 404 (a misrouted
-    /// proxy's page, an empty body, another error) and a success answer that can't be read as
-    /// a user (an empty body, no `user.userId`, no `details.resourceOwner`, another user's
-    /// `userId`) are `Unavailable`, never "no such user" (#57): callers end sessions and delete
-    /// rows on `None`, so an API change or a misbehaving proxy must fail closed.
+    /// user: its own not-found for this endpoint ([`refusals::GET_USER_NOT_FOUND`], checked
+    /// against the real Zitadel by `tests/zitadel_live.rs`). Any other refusal is `Rejected`
+    /// (another object's not-found too), a 4xx that isn't Zitadel's own error (a misrouted
+    /// proxy's page, an empty body, a wrong `Host`'s "instance not found") is `Unavailable`,
+    /// and so is a success answer that can't be read as a user (an empty body, no
+    /// `user.userId`, no `details.resourceOwner`, another user's `userId`), never "no such
+    /// user" (#57, #60): callers end sessions and delete rows on `None`, so an API change or a
+    /// misbehaving proxy must fail closed.
     pub async fn get_user(&self, user_id: &str) -> Result<Option<ZUser>, ZError> {
         let path = format!("/v2/users/{user_id}");
-        match self.send(Method::GET, &path, None).await? {
-            (status, parsed) if status.is_success() => {
-                match parsed
-                    .as_ref()
-                    .and_then(|a| a.get("user"))
-                    .and_then(parse_user)
-                {
-                    // An answer for another user, or one whose org can't be read, is a fault
-                    // too: callers act on the user's org and state (#57 audit B1, S1).
-                    Some(user) if user.id == user_id && !user.org_id.is_empty() => Ok(Some(user)),
-                    Some(_) => Err(ZError::Unavailable(
-                        "the user answer is for another user or has no organization".into(),
-                    )),
-                    None => Err(ZError::Unavailable("the user answer can't be read".into())),
-                }
-            }
-            (reqwest::StatusCode::NOT_FOUND, parsed) if is_zitadel_not_found(parsed.as_ref()) => {
+        let (status, parsed) = self.send(Method::GET, &path, None).await?;
+        if status.is_client_error() {
+            let err = refused(status.as_u16(), parsed.as_ref());
+            return if err.is(refusals::GET_USER_NOT_FOUND) {
                 Ok(None)
-            }
-            (reqwest::StatusCode::NOT_FOUND, parsed) => Err(ZError::Unavailable(format!(
-                "a 404 that isn't Zitadel's not found: {}",
-                error_text(parsed.as_ref())
-            ))),
-            (status, parsed) => Err(ZError::Rejected {
-                status: status.as_u16(),
-                message: error_text(parsed.as_ref()),
-            }),
+            } else {
+                Err(err)
+            };
+        }
+        match parsed
+            .as_ref()
+            .and_then(|a| a.get("user"))
+            .and_then(parse_user)
+        {
+            // An answer for another user, or one whose org can't be read, is a fault too:
+            // callers act on the user's org and state (#57 audit B1, S1).
+            Some(user) if user.id == user_id && !user.org_id.is_empty() => Ok(Some(user)),
+            Some(_) => Err(ZError::Unavailable(
+                "the user answer is for another user or has no organization".into(),
+            )),
+            None => Err(ZError::Unavailable("the user answer can't be read".into())),
         }
     }
 
@@ -636,17 +752,24 @@ impl Zitadel {
         Ok(!self.list_users(org_id, None, 0, 1).await?.users.is_empty())
     }
 
-    /// 404 is fine: the user is already gone.
-    async fn call_or_gone(&self, method: Method, path: &str) -> Result<(), ZError> {
-        match self.call(method, path, None).await {
-            Ok(_) | Err(ZError::Rejected { status: 404, .. }) => Ok(()),
+    /// A delete: done on success, or on one of `gone`, the not-found answers captured for this
+    /// endpoint (so a repeat is idempotent). Any other answer is an error, another object's
+    /// not-found (a wrong `Host`'s, an org's) included.
+    async fn call_or_gone(&self, path: &str, gone: &[Refusal]) -> Result<(), ZError> {
+        match self.call(Method::DELETE, path, None).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.is_any(gone) => Ok(()),
             Err(e) => Err(e),
         }
     }
 
+    /// Deletes the user; one already gone ([`refusals::DELETE_USER_NOT_FOUND`]) is fine.
     pub async fn delete_user(&self, user_id: &str) -> Result<(), ZError> {
-        self.call_or_gone(Method::DELETE, &format!("/v2/users/{user_id}"))
-            .await
+        self.call_or_gone(
+            &format!("/v2/users/{user_id}"),
+            &[refusals::DELETE_USER_NOT_FOUND],
+        )
+        .await
     }
 
     pub async fn deactivate_user(&self, user_id: &str) -> Result<(), ZError> {
@@ -657,6 +780,32 @@ impl Zitadel {
         )
         .await?;
         Ok(())
+    }
+
+    /// Deactivates the user, settled: one already inactive, or gone, is done (see
+    /// [`Self::call_settled`]). Deactivating a locked user succeeds; it becomes inactive. A user
+    /// in the Initial state can't be deactivated ([`refusals::DEACTIVATE_INITIAL`]): an error.
+    pub async fn deactivate_user_settled(&self, user_id: &str) -> Result<(), ZError> {
+        self.call_settled(
+            user_id,
+            "deactivate",
+            refusals::DEACTIVATE_USER_NOT_FOUND,
+            |state| state == UserState::Inactive,
+        )
+        .await
+    }
+
+    /// Reactivates the user, settled: one already active, or gone, is done (see
+    /// [`Self::call_settled`]). So is a user in the Initial state (never signed in): Zitadel
+    /// refuses to reactivate it as "not inactive", and it was never deactivated.
+    pub async fn reactivate_user_settled(&self, user_id: &str) -> Result<(), ZError> {
+        self.call_settled(
+            user_id,
+            "reactivate",
+            refusals::REACTIVATE_USER_NOT_FOUND,
+            |state| matches!(state, UserState::Active | UserState::Initial),
+        )
+        .await
     }
 
     pub async fn reactivate_user(&self, user_id: &str) -> Result<(), ZError> {
@@ -670,24 +819,50 @@ impl Zitadel {
     }
 
     /// Locks the user (`POST /v2/users/{id}/lock`): no sign-in until unlocked (a suspended
-    /// member, D5). Already locked (Zitadel's precondition refusal, 400 or 412) or already gone
-    /// (404) is fine, so a retry completes; any other refusal is an error.
+    /// member, D5). Settled (see [`Self::call_settled`]): one already locked, or gone, is done,
+    /// so a retry completes. Zitadel refuses to lock an inactive user with the same answer as a
+    /// locked one; that user isn't locked, so it's an error.
     pub async fn lock_user(&self, user_id: &str) -> Result<(), ZError> {
-        self.call_settled(&format!("/v2/users/{user_id}/lock")).await
+        self.call_settled(user_id, "lock", refusals::LOCK_USER_NOT_FOUND, |state| {
+            state == UserState::Locked
+        })
+        .await
     }
 
-    /// Unlocks the user (`POST /v2/users/{id}/unlock`); not locked or gone is fine, as for
-    /// [`Self::lock_user`].
+    /// Unlocks the user (`POST /v2/users/{id}/unlock`), settled as [`Self::lock_user`]: one
+    /// that is active, inactive or initial, or gone, is done. A state `get_user` can't read is
+    /// an error.
     pub async fn unlock_user(&self, user_id: &str) -> Result<(), ZError> {
-        self.call_settled(&format!("/v2/users/{user_id}/unlock")).await
+        self.call_settled(user_id, "unlock", refusals::UNLOCK_USER_NOT_FOUND, |state| {
+            matches!(state, UserState::Active | UserState::Inactive | UserState::Initial)
+        })
+        .await
     }
 
-    /// A state change `POST` whose precondition refusal (400, 412: already in that state) or
-    /// 404 (the user is gone) means there is nothing left to do.
-    async fn call_settled(&self, path: &str) -> Result<(), ZError> {
-        match self.call(Method::POST, path, Some(json!({}))).await {
-            Ok(_) | Err(ZError::Rejected { status: 400 | 404 | 412, .. }) => Ok(()),
-            Err(e) => Err(e),
+    /// A state change (`POST /v2/users/{id}/{verb}`), settled: done on success; on `gone` (this
+    /// endpoint's own not-found: nothing left to change); or on Zitadel's precondition refusal
+    /// (gRPC FAILED_PRECONDITION) when [`Self::get_user`] then shows the user in the target
+    /// state (or gone). Zitadel's refusals don't say which state the user is in (a locked and
+    /// an inactive user get the same one), so the state is read. Anything else is an error:
+    /// the refusal itself when the state doesn't match.
+    async fn call_settled(
+        &self,
+        user_id: &str,
+        verb: &str,
+        gone: Refusal,
+        target: impl Fn(UserState) -> bool,
+    ) -> Result<(), ZError> {
+        let path = format!("/v2/users/{user_id}/{verb}");
+        let refusal = match self.call(Method::POST, &path, Some(json!({}))).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.is(gone) => return Ok(()),
+            Err(e) if e.zitadel_code() == Some(refusals::FAILED_PRECONDITION) => e,
+            Err(e) => return Err(e),
+        };
+        match self.get_user(user_id).await? {
+            None => Ok(()),
+            Some(user) if target(user.state) => Ok(()),
+            Some(_) => Err(refusal),
         }
     }
 
@@ -764,9 +939,10 @@ impl Zitadel {
         self.send_password_reset(user_id, url_template).await
     }
 
-    /// Ends a session without its token (admin token).
+    /// Ends a session without its token (admin token). Zitadel answers 200 for a session that
+    /// was ended before or never existed, so there is no not-found to accept.
     pub async fn delete_session_admin(&self, session_id: &str) -> Result<(), ZError> {
-        self.call_or_gone(Method::DELETE, &format!("/v2/sessions/{session_id}"))
+        self.call_or_gone(&format!("/v2/sessions/{session_id}"), &[])
             .await
     }
 
@@ -782,8 +958,10 @@ impl Zitadel {
         }
     }
 
+    /// Deletes the organization. Zitadel answers 200 for one deleted before or never created,
+    /// so there is no not-found to accept.
     pub async fn delete_org(&self, org_id: &str) -> Result<(), ZError> {
-        self.call_or_gone(Method::DELETE, &format!("/v2/organizations/{org_id}"))
+        self.call_or_gone(&format!("/v2/organizations/{org_id}"), &[])
             .await
     }
 }

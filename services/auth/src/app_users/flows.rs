@@ -5,9 +5,12 @@ use super::internal::{
     AppBranchInfo, CreateSession, InternalError, RefreshRequest, RevokeUserSessions, SyncRequest,
 };
 use super::{AppUsers, CODE_TEMPLATE};
-use crate::app::{AppState, SIGN_UP_EXTRA};
-use crate::guard::{email_tag, pad};
-use crate::zitadel::{EmailMatch, NewUser, UserState, ZError, ZUser};
+use crate::app::{
+    AppState, CREATE_PASSWORD_POLICY, SET_PASSWORD_POLICY, SIGN_UP_EXTRA, usable_password,
+};
+use crate::guard::{Slot, email_tag, pad};
+use crate::zitadel::{EmailMatch, NewUser, Session, UserState, ZError, ZUser};
+use chelabase_zitadel::refusals;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -16,7 +19,7 @@ use chelabase_auth::app_token::{APP_ISSUER, AppClaims, app_audience};
 use chelabase_query::app_users::{NewUserRow, UserRowError};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::api_extract::ApiJson;
-use chelabase_zitadel::rules::{normalize_email, strong_password};
+use chelabase_zitadel::rules::normalize_email;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -453,7 +456,7 @@ async fn app_password_reset_confirm(
         (status = 204, description = "Changed"),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
         (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
-        (status = 409, description = "The email is taken (`email_taken`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
+        (status = 409, description = "The email is taken (`email_taken`), it is the user's email already (`conflict`), or app users are off (`app_users_disabled`)", body = ErrorEnvelope),
         (status = 413, description = "The body is too large: `too_large`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "Invalid input: `invalid_request`", body = ErrorEnvelope),
@@ -539,6 +542,7 @@ mod text {
     pub const INACTIVE: &str = "This account is deactivated or locked";
     pub const NO_USER: &str = "This needs a signed-in user (the Chelabase-User header)";
     pub const BAD_EMAIL: &str = "email is not a valid address";
+    pub const EMAIL_NOT_CHANGED: &str = "This is already the account's email";
 }
 
 type Flow<T = Response> = Result<T, ApiError>;
@@ -714,7 +718,7 @@ fn session_response(
 }
 
 enum SignInError {
-    /// Wrong password (or a user Zitadel refuses a session for).
+    /// Zitadel refused the password check: a wrong password, or a user it refuses a session for.
     Credentials,
     Answer(ApiError),
 }
@@ -734,25 +738,47 @@ async fn open_session(
     password: &str,
     fresh: bool,
 ) -> Result<(SessionResponse, Uuid), SignInError> {
-    let app = app(s);
+    let session = check_password(s, user_id, password, fresh).await?;
+    Ok(open_checked(s, info, user_id, session).await?)
+}
+
+/// The password check alone: a new Zitadel session. `Credentials` is any refusal of Zitadel's
+/// own; `Answer` is only Zitadel being unavailable (503).
+async fn check_password(
+    s: &AppState,
+    user_id: Uuid,
+    password: &str,
+    fresh: bool,
+) -> Result<Session, SignInError> {
     let zid = user_id.to_string();
     let mut attempt = 0;
-    let session = loop {
+    loop {
         match s.zitadel.create_session(&zid, password).await {
-            Ok(session) => break session,
-            Err(ZError::Rejected { status: 404, .. }) if fresh && attempt < 10 => {
+            Ok(session) => return Ok(session),
+            Err(e) if fresh && e.is(refusals::SESSION_USER_NOT_FOUND) && attempt < 10 => {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(ZError::Rejected { .. }) => return Err(SignInError::Credentials),
             Err(e) => return Err(zitadel_down(&e).into()),
         }
-    };
+    }
+}
+
+/// With the password checked (`session`): the user's state, then the app session.
+async fn open_checked(
+    s: &AppState,
+    info: &AppBranchInfo,
+    user_id: Uuid,
+    session: Session,
+) -> Result<(SessionResponse, Uuid), ApiError> {
+    let app = app(s);
+    let zid = user_id.to_string();
     let end = |why: ApiError| async {
         if let Err(e) = s.zitadel.delete_session(&session).await {
             warn!(error = %e, "ending the Zitadel session failed");
         }
-        SignInError::Answer(why)
+        why
     };
     // Only now, with the password checked, may the answer say anything about the account.
     let current = match s.zitadel.get_user(&zid).await {
@@ -881,7 +907,7 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
     if !valid_email(&email) {
         return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
     }
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let data = match b.data {
@@ -960,17 +986,20 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
         .await;
     match created {
         Ok(_) => {}
-        Err(ZError::Rejected { status: 409, .. }) => {
+        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => {
             pending_insert.rollback().await;
             return taken(s, &info, &email, None).await;
         }
-        Err(ZError::Rejected {
-            status: 400,
-            message,
-        }) => {
+        // Zitadel's create-path refusals of the caller's input, by their captured ids, and its
+        // field validation (no id). A missing organization stays here too, as it always has.
+        Err(e)
+            if e.is_any(&CREATE_PASSWORD_POLICY)
+                || e.is_invalid_request()
+                || e.is(refusals::CREATE_USER_ORG_NOT_FOUND) =>
+        {
             pending_insert.rollback().await;
-            info!(%message, "zitadel refused the new app user");
-            return Err(if policy_refusal(&message) {
+            info!(error = %e, "zitadel refused the new app user");
+            return Err(if e.is_any(&CREATE_PASSWORD_POLICY) {
                 weak_password()
             } else {
                 fail(
@@ -1014,32 +1043,66 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
 
 async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     let email = normalize_email(&b.email);
-    // Per email only failures count, so nobody can use up a known account's attempts.
-    let email_key = format!(
+    rate_limit(s, caller, &[("sign-in", "ip", &caller.ip, 10, MINUTE)])?;
+    // A disabled branch (409) or the orchestrator down (503) is answered before the email's
+    // attempt is reserved, so it costs nothing.
+    let info = branch_info(app(s), caller).await?;
+    // Per email, only failed password checks count, so nobody can use up a known account's
+    // attempts; a server-vouched caller (no address limit) is held to it too. The attempt is
+    // reserved up front, so concurrent requests can't all pass a check before any failure
+    // lands, and a client that hangs up during the check still spends it. Only these outcomes
+    // give it back:
+    //
+    // | Outcome                                                        | Answer  | Email slot |
+    // |----------------------------------------------------------------|---------|------------|
+    // | the email's 5 a minute are used                                | 429     | none held  |
+    // | the user lookup fails                                          | 503     | refunded   |
+    // | no user (or several) has this email, or not a Chelabase id     | 401     | counts     |
+    // | `SignInError::Credentials`: the password check is refused      | 401     | counts     |
+    // | `SignInError::Answer`: the password check is unavailable       | 503     | refunded   |
+    // | the password is right (refunded before anything else awaits)   | any     | refunded   |
+    // | the request is dropped undecided (the client hung up)          | none    | counts     |
+    //
+    // `Credentials` is any refusal of Zitadel's own: a wrong password
+    // (`refusals::PASSWORD_INVALID`), no such user (`SESSION_USER_NOT_FOUND`), a locked or
+    // inactive user (`SESSION_USER_LOCKED`, `SESSION_USER_NOT_ACTIVE`), or its request validation
+    // (`ZError::is_invalid_request`, e.g. a password over 200 characters: the caller's input).
+    // `Answer` from [`check_password`] is only `ZError::Unavailable`: no answer, a 5xx, or a 4xx
+    // that isn't Zitadel's own error. Whatever [`open_checked`] answers afterwards (403 inactive
+    // or unverified, 401 another org's user, 503) comes after the refund. An unknown email and
+    // a wrong password both count and answer the same 401, padded alike.
+    let key = format!(
         "app:{}:sign-in:email:{}",
         caller.project_id,
         email_tag(&email)
     );
-    rate_limit(s, caller, &[("sign-in", "ip", &caller.ip, 10, MINUTE)])?;
-    if s.limiter.over(&email_key, 5, MINUTE) {
+    let Some(slot) = Slot::reserve(&s.limiter, key, 5, MINUTE) else {
         return Err(fail(429, ErrorCode::RateLimited, text::TOO_MANY));
-    }
-    let wrong = || {
-        s.limiter.hit(&email_key, MINUTE);
-        refused()
     };
-    let info = branch_info(app(s), caller).await?;
-    let Some((user_id, _)) = find_user(s, &info, &email).await? else {
-        return Err(wrong());
+    let user_id = match find_user(s, &info, &email).await {
+        Ok(Some((user_id, _))) => user_id,
+        Ok(None) => return Err(refused()),
+        Err(r) => {
+            slot.refund();
+            return Err(r);
+        }
     };
-    match open_session(s, &info, user_id, &b.password, false).await {
-        Ok((session, _)) => Ok(Json(session).into_response()),
+    let session = match check_password(s, user_id, &b.password, false).await {
+        Ok(session) => {
+            slot.refund();
+            session
+        }
         Err(SignInError::Credentials) => {
             info!(email = %email_tag(&email), "app sign-in refused");
-            Err(wrong())
+            return Err(refused());
         }
-        Err(SignInError::Answer(r)) => Err(r),
-    }
+        Err(SignInError::Answer(r)) => {
+            slot.refund();
+            return Err(r);
+        }
+    };
+    let (session, _) = open_checked(s, &info, user_id, session).await?;
+    Ok(Json(session).into_response())
 }
 
 /// Checks the token's user, then rotates the refresh token.
@@ -1313,7 +1376,7 @@ async fn password_reset_confirm(
         ],
     )?;
     // Before Zitadel sees the email, so this answer can't tell accounts apart.
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let info = branch_info(app, caller).await?;
@@ -1326,9 +1389,7 @@ async fn password_reset_confirm(
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { message, .. }) if policy_refusal(&message) => {
-            return Err(weak_password());
-        }
+        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
         // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
         Err(ZError::Rejected { .. }) => return Err(bad_code()),
         Err(e) => return Err(zitadel_down(&e)),
@@ -1386,12 +1447,15 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { status: 404, .. }) => return Err(no_user()),
-        Err(ZError::Rejected { status: 409, .. }) => {
-            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
+        // Matched by captured id only. Zitadel has no captured set-email 409 (a taken address
+        // is found by the lookup above), so any 409 here is a refusal nobody captured: 503.
+        Err(e) if e.is(refusals::SET_EMAIL_USER_NOT_FOUND) => return Err(no_user()),
+        Err(e) if e.is(refusals::EMAIL_NOT_CHANGED) => {
+            return Err(fail(409, ErrorCode::Conflict, text::EMAIL_NOT_CHANGED));
         }
-        Err(ZError::Rejected { message, .. }) => {
-            info!(%message, "zitadel refused the new email");
+        // Zitadel's validation of the field (no id): the caller's input.
+        Err(e) if e.is_invalid_request() => {
+            info!(error = %e, "zitadel refused the new email");
             return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
         }
         Err(e) => return Err(zitadel_down(&e)),
@@ -1423,7 +1487,7 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
             ("change-password", "user", &sub, 5, MINUTE),
         ],
     )?;
-    if !strong_password(&b.password) {
+    if !usable_password(&b.password) {
         return Err(weak_password());
     }
     let info = branch_info(app, caller).await?;
@@ -1445,9 +1509,7 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         .await
     {
         Ok(()) => {}
-        Err(ZError::Rejected { message, .. }) if policy_refusal(&message) => {
-            return Err(weak_password());
-        }
+        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
         // A wrong current password, or a user Zitadel no longer has.
         Err(ZError::Rejected { .. }) => return Err(refused()),
         Err(e) => return Err(zitadel_down(&e)),
@@ -1475,27 +1537,4 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         warn!(error = %e, user = %claims.sub, "revoking the other app sessions failed");
     }
     Ok(Json(session).into_response())
-}
-
-/// Zitadel's password-policy refusals (`Errors.User.PasswordComplexityPolicy.*`).
-fn policy_refusal(message: &str) -> bool {
-    message.contains("PasswordComplexityPolicy")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::policy_refusal;
-
-    #[test]
-    fn password_policy_rejections_are_told_apart() {
-        assert!(policy_refusal(
-            "Errors.User.PasswordComplexityPolicy.MinLength"
-        ));
-        assert!(policy_refusal(
-            "Errors.User.PasswordComplexityPolicy.HasUpper"
-        ));
-        assert!(!policy_refusal("Errors.User.Password.Invalid"));
-        assert!(!policy_refusal("Errors.User.Code.Invalid"));
-        assert!(!policy_refusal("Errors.User.NotFound"));
-    }
 }
