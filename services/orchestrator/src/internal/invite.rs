@@ -13,7 +13,7 @@ use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::response::{IntoResponse, Response};
 use chelabase_neon::ComputeLocator;
-use chrono::{SecondsFormat, Utc};
+use chrono::SecondsFormat;
 use chelabase_types::api_error::ApiError;
 use serde::Deserialize;
 use serde_json::json;
@@ -101,7 +101,8 @@ pub(super) struct Open {
 }
 
 /// `{open, expires_at}`: whether this Zitadel user's latest member invite that isn't revoked or
-/// accepted (its member still invited) is open, i.e. not expired, and its stored expiry (RFC 3339,
+/// accepted (its member still invited) is open, i.e. not expired by the database clock (as
+/// `describe` decides), and its stored expiry (RFC 3339,
 /// `null` with no such invite). Nothing else about the invite or the member is returned. A body
 /// that isn't `{user: string}` is the same as a user with no invite.
 pub(super) async fn open<M, L>(
@@ -112,7 +113,7 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let expires_at = match body {
+    let found = match body {
         Ok(Json(q)) => match state.metadata.invite_expiry_for_user(&q.user).await {
             Ok(found) => found,
             Err(e) => {
@@ -123,8 +124,8 @@ where
         Err(_) => None,
     };
     Json(json!({
-        "open": expires_at.is_some_and(|at| at > Utc::now()),
-        "expires_at": expires_at.map(|at| at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+        "open": found.is_some_and(|(_, open)| open),
+        "expires_at": found.map(|(at, _)| at.to_rfc3339_opts(SecondsFormat::Micros, true)),
     }))
     .into_response()
 }

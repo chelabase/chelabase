@@ -3037,10 +3037,10 @@ async fn lock_for_suspension(z: &Zitadel, user: &str) -> Result<(), ZError> {
             Some(u) if u.state == UserState::Inactive => {
                 z.reactivate_user_settled(user).await?;
                 let locked = z.lock_user(user).await;
-                if let Err(lock_err) = &locked {
-                    if let Err(deactivate_err) = z.deactivate_user_settled(user).await {
-                        warn!("suspend member: lock after reactivate failed: {lock_err}; deactivating it again failed too: {deactivate_err}");
-                    }
+                if let Err(lock_err) = &locked
+                    && let Err(deactivate_err) = z.deactivate_user_settled(user).await
+                {
+                    warn!("suspend member: lock after reactivate failed: {lock_err}; deactivating it again failed too: {deactivate_err}");
                 }
                 locked
             }

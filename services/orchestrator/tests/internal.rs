@@ -61,6 +61,9 @@ type KeyEntry = ([u8; 32], DataKeyLookup);
 /// Members hub T8: personal-login rows by (tenant, Zitadel user id).
 type LoginRows = HashMap<(TenantId, String), Vec<LoginEndpoint>>;
 
+/// An invite's stored expiry and whether the database clock calls it open.
+type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
+
 #[derive(Clone, Default)]
 struct FakeNeon {
     endpoints: Arc<Mutex<Vec<NeonEndpoint>>>,
@@ -90,8 +93,8 @@ struct FakeNeon {
     /// Zitadel user id -> the user's open invite (a closed one is simply absent).
     invites: Arc<Mutex<HashMap<String, InviteDescription>>>,
     /// Zitadel user id -> the stored expiry of the user's invite that isn't revoked or
-    /// accepted (expired or not).
-    invite_expiries: Arc<Mutex<HashMap<String, chrono::DateTime<chrono::Utc>>>>,
+    /// accepted (expired or not), and whether the database clock calls it open.
+    invite_expiries: Arc<Mutex<HashMap<String, InviteExpiry>>>,
     /// RT1 T6: Zitadel org id -> the tenant bound to it.
     tenants: Arc<Mutex<HashMap<String, TenantId>>>,
     /// Members hub T8: each (tenant, Zitadel user id)'s personal-login rows, which
@@ -722,7 +725,10 @@ impl NeonMetadataPort for FakeNeon {
         Ok(self.invites.lock().unwrap().get(zitadel_user_id).cloned())
     }
 
-    async fn invite_expiry_for_user(&self, zitadel_user_id: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetadataError> {
+    async fn invite_expiry_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> Result<Option<InviteExpiry>, MetadataError> {
         self.check()?;
         Ok(self.invite_expiries.lock().unwrap().get(zitadel_user_id).copied())
     }
@@ -5564,8 +5570,11 @@ async fn open_invite_answers_open_and_expiry_only() {
     let now = chrono::Utc::now();
     let later = now + chrono::Duration::days(3);
     let earlier = now - chrono::Duration::minutes(1);
-    neon.invite_expiries.lock().unwrap().insert("u1".into(), later);
-    neon.invite_expiries.lock().unwrap().insert("u2".into(), earlier);
+    neon.invite_expiries.lock().unwrap().insert("u1".into(), (later, true));
+    neon.invite_expiries.lock().unwrap().insert("u2".into(), (earlier, false));
+    // The database clock decides: an expiry the orchestrator's clock calls future, the
+    // database's already past, is not open.
+    neon.invite_expiries.lock().unwrap().insert("u4".into(), (later, false));
     let app = describe_app(neon).await;
     let ask = |body: Value| {
         let app = &app;
@@ -5574,6 +5583,7 @@ async fn open_invite_answers_open_and_expiry_only() {
     let rfc = |t: chrono::DateTime<chrono::Utc>| t.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     assert_eq!(ask(json!({ "user": "u1" })).await, (200, json!({ "open": true, "expires_at": rfc(later) })));
     assert_eq!(ask(json!({ "user": "u2" })).await, (200, json!({ "open": false, "expires_at": rfc(earlier) })));
+    assert_eq!(ask(json!({ "user": "u4" })).await, (200, json!({ "open": false, "expires_at": rfc(later) })));
     let none = (200, json!({ "open": false, "expires_at": null }));
     assert_eq!(ask(json!({ "user": "u3" })).await, none);
     assert_eq!(ask(json!({ "user": 1 })).await, none);

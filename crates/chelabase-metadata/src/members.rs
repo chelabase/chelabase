@@ -2098,14 +2098,15 @@ impl MetadataClient {
     }
 
     /// The stored expiry of this Zitadel user's latest invite that isn't revoked or accepted,
-    /// while its member is still invited: [`Self::open_invite_for_user`]'s invite, without its
-    /// expiry filter, so an expired one answers its past expiry. Read-only.
+    /// while its member is still invited, and whether it is open (`expires_at > now()`, the
+    /// database clock, as [`Self::open_invite_for_user`] decides): that method's invite, without
+    /// its expiry filter, so an expired one answers its past expiry. Read-only.
     pub async fn invite_expiry_for_user(
         &self,
         zitadel_user_id: &str,
-    ) -> Result<Option<DateTime<Utc>>, MetadataError> {
-        Ok(sqlx::query_scalar(
-            "SELECT i.expires_at
+    ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
+        Ok(sqlx::query_as(
+            "SELECT i.expires_at, i.expires_at > now()
              FROM invites i
              JOIN members m ON m.id = i.member_id
              WHERE i.zitadel_user_id = $1 AND i.revoked_at IS NULL AND i.accepted_at IS NULL

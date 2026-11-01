@@ -228,11 +228,12 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
 
     /// [`MetadataClient::invite_expiry_for_user`]: the stored expiry of this Zitadel user's
-    /// unclosed member invite, expired or not (`None` when it has none).
+    /// unclosed member invite, expired or not, and whether the database clock calls it open
+    /// (`None` when it has none).
     fn invite_expiry_for_user(
         &self,
         zitadel_user_id: &str,
-    ) -> impl Future<Output = Result<Option<DateTime<Utc>>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<Option<(DateTime<Utc>, bool)>, MetadataError>> + Send;
 
     /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
     fn tenant_by_org(
@@ -423,7 +424,10 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError> {
         MetadataClient::open_invite_for_user(self, zitadel_user_id).await
     }
-    async fn invite_expiry_for_user(&self, zitadel_user_id: &str) -> Result<Option<DateTime<Utc>>, MetadataError> {
+    async fn invite_expiry_for_user(
+        &self,
+        zitadel_user_id: &str,
+    ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
         MetadataClient::invite_expiry_for_user(self, zitadel_user_id).await
     }
     async fn signup_facts(&self, zitadel_org_id: &str) -> Result<Option<SignUpFacts>, MetadataError> {
