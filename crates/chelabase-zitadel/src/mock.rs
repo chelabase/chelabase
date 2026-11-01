@@ -148,6 +148,18 @@ pub fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.User.PasswordComplexityPolicy.MinLength" if call == "POST /v2/users/new" => {
             r::CREATE_USER_PASSWORD_TOO_SHORT
         }
+        "Errors.User.PasswordComplexityPolicy.HasUpper" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_UPPER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasLower" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_LOWER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasNumber" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_NUMBER
+        }
+        "Errors.User.PasswordComplexityPolicy.HasSymbol" if call == "POST /v2/users/new" => {
+            r::CREATE_USER_PASSWORD_NO_SYMBOL
+        }
         "Errors.User.PasswordComplexityPolicy.MinLength" => r::PASSWORD_TOO_SHORT,
         "Errors.User.PasswordComplexityPolicy.HasUpper" => r::PASSWORD_NO_UPPER,
         "Errors.User.PasswordComplexityPolicy.HasLower" => r::PASSWORD_NO_LOWER,
