@@ -1,6 +1,8 @@
-import { screen, waitFor } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { getGetSqlSchemaQueryKey, getGetTableQueryKey, getListObjectsQueryKey } from "@chelabase/management-client";
 import { B, BRANCHES, D, PG_DATABASES, PROJECTS, ROLES, meAs, type Level } from "@/test/table-editor-fixtures";
 import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
@@ -23,12 +25,33 @@ function setup(level: Level, params: EditorParams = PLACE, extra: Record<string,
   });
   const navigate = vi.fn();
   const openTables = vi.fn();
-  const result = renderWithQuery(<SqlPage params={params} navigate={navigate} openTables={openTables} createClient={() => Promise.reject(new Error("no worker"))} />, { fetch: f });
-  return { ...result, f, navigate, openTables, user: userEvent.setup() };
+  const createClient = vi.fn(() => Promise.reject(new Error("no worker")));
+  const ui = (p: EditorParams) => <SqlPage params={p} navigate={navigate} openTables={openTables} createClient={createClient} />;
+  const result = renderWithQuery(ui(params), { fetch: f });
+  return { ...result, f, navigate, openTables, createClient, user: userEvent.setup(), goTo: (p: EditorParams) => result.rerender(ui(p)) };
 }
 const schemaCalls = (f: ReturnType<typeof fakeFetch>) => f.calls.filter((r) => r.url.includes("/sql/schema"));
+const ndjson = (...events: unknown[]) => new Response(events.map((e) => JSON.stringify(e)).join("\n") + "\n", { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
+const ranTag = (tag: string) => () => ndjson({ t: "complete", statement: 0, tag, rows: 0, truncated: false }, { t: "done", outcome: "ok", duration_ms: 3 });
+const runsTo = (f: ReturnType<typeof fakeFetch>, branch: string) => f.calls.filter((r) => r.method === "POST" && new URL(r.url).pathname === `${D}/branches/${branch}/sql`);
+async function setDoc(text: string) {
+  const v = await waitFor(() => {
+    const found = document.querySelector(".cm-editor");
+    expect(found).not.toBeNull();
+    return EditorView.findFromDOM(found as HTMLElement)!;
+  });
+  act(() => v.dispatch({ changes: { from: 0, to: v.state.doc.length, insert: text } }));
+}
+const enabledRun = () => waitFor(() => {
+  const run = screen.getByRole("button", { name: "Run" });
+  expect(run).toBeEnabled();
+  return run;
+});
 
-afterEach(() => localStorage.clear());
+afterEach(() => {
+  localStorage.clear();
+  sessionStorage.clear();
+});
 
 describe("SqlPage", () => {
   it("a_viewer_gets_a_no_access_message_and_no_editor", async () => {
@@ -75,4 +98,80 @@ describe("SqlPage", () => {
     await user.click(await screen.findByRole("button", { name: "Quick view" }));
     expect(openTables).toHaveBeenCalledWith(PLACE);
   });
+
+  // #84 AC2: the editor stays mounted across a branch switch (the run, results, undo and the pgls worker survive);
+  // the next run goes to the new branch.
+  it("switching_branch_keeps_the_editor_mounted_and_the_next_run_goes_to_the_new_branch", async () => {
+    let answerB2!: () => void;
+    const b2Databases = new Promise<void>((r) => (answerB2 = r));
+    const B2 = `${D}/branches/b2`;
+    const { f, navigate, createClient, user, goTo } = setup("admin", PLACE, {
+      [`GET ${B2}/databases`]: async () => {
+        await b2Databases;
+        return jsonResponse(PG_DATABASES);
+      },
+      [`GET ${B2}/roles`]: () => jsonResponse(ROLES),
+      [`GET ${B2}/sql/schema`]: () => jsonResponse({ schemas: [] }),
+      [`POST ${B2}/sql`]: ranTag("SELECT 1"),
+      [`POST ${B}/sql`]: ranTag("SELECT 1"),
+    });
+    await enabledRun();
+    await setDoc("select 1");
+    expect(createClient).toHaveBeenCalledTimes(1);
+
+    // The context bar names the branch and clears the levels below it.
+    goTo({ projectId: "p1", databaseId: "d1", branchId: "b2" });
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    expect(screen.queryByText("Loading…")).toBeNull();
+    answerB2();
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith({ projectId: "p1", databaseId: "d1", branchId: "b2", pgDatabase: "app", schema: undefined, table: undefined }, { replace: true }));
+    expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument();
+    goTo({ ...PLACE, branchId: "b2" });
+
+    await user.click(await enabledRun());
+    await waitFor(() => expect(runsTo(f, "b2")).toHaveLength(1));
+    expect(runsTo(f, "b1")).toHaveLength(0);
+    expect(await runsTo(f, "b2")[0].clone().json()).toMatchObject({ sql: "select 1" });
+    expect(createClient).toHaveBeenCalledTimes(1);
+  });
+
+  // A DDL run in the full SQL tab leaves no table editor view stale (realtime sends no DDL).
+  it("a_ddl_run_invalidates_the_table_editor_and_completion_queries_of_the_branch", async () => {
+    const { queryClient, user } = setup("admin", PLACE, { [`POST ${B}/sql`]: ranTag("ALTER TABLE") });
+    const keys = [
+      getGetTableQueryKey("d1", "b1", "public", "invoices"),
+      getGetTableQueryKey("d1", "b1", "billing", "ledger"),
+      getListObjectsQueryKey("d1", "b1"),
+      getGetSqlSchemaQueryKey("d1", "b1", { role: "reporter" }),
+    ];
+    for (const k of keys) queryClient.setQueryData(k, {});
+    await setDoc("alter table invoices add column notes text");
+    await user.click(await enabledRun());
+    await waitFor(() => for_(keys, (k) => expect(queryClient.getQueryState(k)?.isInvalidated).toBe(true)));
+  });
+
+  it("a_dml_run_invalidates_no_structure", async () => {
+    const { queryClient, f, user } = setup("admin", PLACE, { [`POST ${B}/sql`]: ranTag("INSERT 0 1") });
+    const key = getGetTableQueryKey("d1", "b1", "public", "invoices");
+    queryClient.setQueryData(key, {});
+    await setDoc("insert into invoices default values");
+    await user.click(await enabledRun());
+    await waitFor(() => expect(runsTo(f, "b1")).toHaveLength(1));
+    expect(await screen.findByText(/INSERT 0 1/)).toBeInTheDocument();
+    expect(queryClient.getQueryState(key)?.isInvalidated).toBe(false);
+  });
+
+  // #84 AC3: Act as chosen on the table editor (session storage) is the run's role here.
+  it("the_act_as_role_from_session_storage_is_the_runs_role", async () => {
+    sessionStorage.setItem("chelabase.studio.tables.actAs", JSON.stringify({ "d1/b1": "reporter" }));
+    const { f, user } = setup("admin", PLACE, { [`POST ${B}/sql`]: ranTag("SELECT 1") });
+    await setDoc("select 1");
+    await user.click(await enabledRun());
+    await waitFor(() => expect(runsTo(f, "b1")).toHaveLength(1));
+    expect(await runsTo(f, "b1")[0].clone().json()).toMatchObject({ role: "reporter" });
+  });
 });
+
+function for_<T>(items: T[], check: (t: T) => void) {
+  for (const t of items) check(t);
+}

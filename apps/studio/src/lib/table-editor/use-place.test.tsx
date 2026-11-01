@@ -8,10 +8,10 @@ import { B, FULL, editorRoutes, meAs } from "@/test/table-editor-fixtures";
 import { TableEditorStoreContext, createTableEditorStore, useTableEditor } from "./store";
 import { usePlace } from "./use-place";
 
-function setup(routes: ReturnType<typeof editorRoutes>) {
+function setup(routes: ReturnType<typeof editorRoutes>, storage: Storage | null = null) {
   configureManagementClient({ baseUrl: "http://studio.test", getToken: () => "t", onUnauthorized: () => false, fetchImpl: fakeFetch(routes) });
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const store = createTableEditorStore(null);
+  const store = createTableEditorStore(storage);
   const wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={qc}>
       <TableEditorStoreContext.Provider value={store}>{children}</TableEditorStoreContext.Provider>
@@ -50,5 +50,21 @@ describe("usePlace", () => {
     expect(result.current.actAs).toBeNull();
     expect(result.current.allowed.owner).toBe(false);
     expect(result.current.actAsReason).toBe("You can't act as any Postgres role here.");
+  });
+
+  // A stored Act as role is checked again: one the caller may no longer act as, or the owner for a non-Admin, falls
+  // back to the first allowed role.
+  it.each([
+    ["a_role_no_longer_granted", "not_granted"],
+    ["the_owner_without_owner_access", null],
+  ])("a_stored_act_as_is_revalidated: %s", async (_name, stored) => {
+    sessionStorage.setItem("chelabase.studio.tables.actAs", JSON.stringify({ "d1/b1": stored }));
+    const wrapper = setup(editorRoutes({ me: meAs("developer", ["billing_admin", "reporter"]) }), sessionStorage);
+    const { result } = renderHook(() => usePlace(FULL), { wrapper });
+    await waitFor(() => expect(result.current.actAsReady).toBe(true));
+    expect(result.current.allowed.owner).toBe(false);
+    expect(result.current.allowed.roles[0]).toBe("billing_admin");
+    expect(result.current.actAs).toBe("billing_admin");
+    expect(result.current.actAsReason).toBeNull();
   });
 });

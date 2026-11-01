@@ -1,4 +1,5 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { ContextBar } from "@/components/table-editor/context-bar";
 import { errorText } from "@/lib/errors";
@@ -7,6 +8,8 @@ import { LEVELS, readLast, resolveParams, SQL_LAST_KEY, writeLast, type EditorPa
 import { TableEditorStoreContext, createTableEditorStore } from "@/lib/table-editor/store";
 import { useFillViewport } from "@/lib/use-fill-viewport";
 import { usePlace } from "@/lib/table-editor/use-place";
+import { invalidateSchemaQueries } from "@/lib/table-editor/query-keys";
+import type { SqlEditorProps } from "./sql-editor";
 
 // The editor, CodeMirror and the pgls worker load only when the SQL page opens.
 const SqlEditor = lazy(() => import("./sql-editor").then((m) => ({ default: m.SqlEditor })));
@@ -81,7 +84,44 @@ function Page({ params, navigate, openTables, createClient }: SqlPageProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, currentKey]);
 
+  const queryClient = useQueryClient();
+  // The editor's place once it is known. While the next place resolves (another branch or Postgres database is
+  // picked), the last one stays mounted with nothing to run, so a run in flight, the results, undo and the pgls worker
+  // survive the switch. Another database starts over (its buffer and history are its own).
+  const shown = useRef<{ place: EditorParams; props: Omit<SqlEditorProps, "createClient"> } | null>(null);
+  if (ready && current.databaseId && current.branchId && current.pgDatabase && pg && branch && caps.atLeast("developer")) {
+    const { databaseId, branchId } = current;
+    const pgParam = pg.main ? null : pg.name;
+    shown.current = {
+      place: current,
+      props: {
+        databaseId,
+        branchId,
+        pgDatabase: pgParam,
+        pgDatabases: (pgList ?? []).map((d) => d.name),
+        role: actAs,
+        allowed,
+        rolesReady: actAsReady,
+        branchProtected: branch.protected,
+        onHints: ({ database, role }) => {
+          if (role) place.setActAs(role);
+          if (database && database !== pg.name) navigate({ ...current, pgDatabase: database });
+        },
+        onSchemaChange: () => invalidateSchemaQueries(queryClient, databaseId, branchId, pgParam ? { database: pgParam } : undefined),
+        onQuickView: openTables && (() => openTables(quickViewTarget(current))),
+      },
+    };
+  } else if (ready || (shown.current && (shown.current.place.projectId !== params.projectId || shown.current.place.databaseId !== params.databaseId))) {
+    shown.current = null;
+  }
+  const held = !ready && resolution.kind !== "not_found" ? shown.current : null;
+
   const error = projectList.error ?? me.error ?? branches.error ?? pgDatabases.error;
+  const editor = (props: Omit<SqlEditorProps, "createClient">) => (
+    <Suspense fallback={<p className="p-6 text-sm text-chalk-dim">Loading the editor…</p>}>
+      <SqlEditor key={props.databaseId} {...props} createClient={createClient} />
+    </Suspense>
+  );
   let main;
   if (resolution.kind === "not_found") {
     main = <p className="p-6 text-sm">{{ project: "Project", database: "Database", branch: "Branch", pgDatabase: "Postgres database", schema: "Schema", table: "Table" }[resolution.level]} not found</p>;
@@ -91,6 +131,8 @@ function Page({ params, navigate, openTables, createClient }: SqlPageProps) {
         {errorText(error)}
       </p>
     );
+  } else if (held) {
+    main = editor({ ...held.props, rolesReady: false });
   } else if (!ready) {
     main = (
       <p role="status" className="p-6 text-sm text-chalk-dim">
@@ -107,26 +149,8 @@ function Page({ params, navigate, openTables, createClient }: SqlPageProps) {
     main = <p className="p-6 text-sm text-chalk-dim">No ready branch</p>;
   } else if (!current.pgDatabase || !pg || !branch) {
     main = <p className="p-6 text-sm text-chalk-dim">This branch has no main Postgres database: pick one above</p>;
-  } else {
-    main = (
-      <Suspense fallback={<p className="p-6 text-sm text-chalk-dim">Loading the editor…</p>}>
-        <SqlEditor
-          key={current.databaseId}
-          databaseId={current.databaseId}
-          branchId={current.branchId}
-          pgDatabase={pg.main ? null : pg.name}
-          pgDatabases={(pgList ?? []).map((d) => d.name)}
-          role={actAs}
-          allowed={allowed}
-          rolesReady={actAsReady}
-          branchProtected={branch.protected}
-          onPgDatabase={(name) => navigate({ ...current, pgDatabase: name })}
-          onRole={place.setActAs}
-          onQuickView={openTables && (() => openTables(quickViewTarget(current)))}
-          createClient={createClient}
-        />
-      </Suspense>
-    );
+  } else if (shown.current) {
+    main = editor(shown.current.props);
   }
 
   return (

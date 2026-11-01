@@ -24,7 +24,7 @@ import { NewTableView } from "./new-table";
 import { StructureView } from "./structure-view";
 import { TableList } from "./table-list";
 import { TypesView } from "./types-view";
-import { SqlDrawer } from "./sql-drawer";
+import { SqlDrawer, type SqlDrawerProps } from "./sql-drawer";
 import type { TableTarget } from "./target";
 
 export interface TableEditorProps {
@@ -168,30 +168,44 @@ function Editor({ params, navigate, sql = false, openSqlEditor, createSqlClient 
   const pageSize = detail.isPending ? null : pageSizeFor(detail.data?.max_rows);
   const exactRows = useTableEditor((s) => (target ? (s.exactRows[target.key] ?? null) : null));
 
-  // The SQL drawer: Developer and up, once the place is known. Leaving for the SQL tab asks about a row draft first.
+  // The SQL drawer: Developer and up, once the place is known, and never below 40rem (no room; SQL opens the full
+  // editor there, and a `?sql=1` link shows the table alone). Leaving for the SQL tab asks about a row draft first.
   const canSql = caps.atLeast("developer");
+  const drawerOpen = sql && canSql && !narrow();
   const openFull = () => openSqlEditor && guardDiscard(() => openSqlEditor(current));
-  const toggleSql = () => (!sql && narrow() ? openFull() : navigate(current, { sql: !sql, replace: true }));
-  const drawer =
-    sql && canSql && ready && branch && pg && current.databaseId && current.branchId ? (
-      <SqlDrawer
-        databaseId={current.databaseId}
-        branchId={current.branchId}
-        branchName={branch.name}
-        branchProtected={branch.protected}
-        pg={pg}
-        pgDatabases={(pgList ?? []).map((d) => d.name)}
-        role={actAs}
-        allowed={allowed}
-        rolesReady={actAsReady}
-        onPgDatabase={(name) => go({ ...current, pgDatabase: name, schema: undefined, table: undefined })}
-        onRole={(role) => guardDiscard(() => place.setActAs(role))}
-        table={target && !draftTarget ? { schema: target.schema, table: target.table } : null}
-        onFullEditor={openFull}
-        onClose={() => navigate(current, { sql: false, replace: true })}
-        createClient={createSqlClient}
-      />
-    ) : null;
+  // Opening or closing the drawer stays at the URL's place: it never moves elsewhere past the row draft question.
+  const toggleSql = () => (!sql && narrow() ? openFull() : navigate(params, { sql: !sql, replace: true }));
+  // The drawer's place once it is known. While the next place resolves (another branch or Postgres database), the last
+  // one stays mounted with nothing to run, so a run in flight, its output and undo survive the switch.
+  const drawerShown = useRef<{ place: EditorParams; props: SqlDrawerProps } | null>(null);
+  if (drawerOpen && ready && branch && pg && current.databaseId && current.branchId) {
+    drawerShown.current = {
+      place: current,
+      props: {
+        databaseId: current.databaseId,
+        branchId: current.branchId,
+        branchName: branch.name,
+        branchProtected: branch.protected,
+        pg,
+        pgDatabases: (pgList ?? []).map((d) => d.name),
+        role: actAs,
+        allowed,
+        rolesReady: actAsReady,
+        onHints: ({ database, role }) =>
+          guardDiscard(() => {
+            if (role) place.setActAs(role);
+            if (database && database !== pg.name) navigate({ ...current, pgDatabase: database, schema: undefined, table: undefined });
+          }),
+        onFullEditor: openFull,
+        onClose: () => navigate(params, { sql: false, replace: true }),
+        createClient: createSqlClient,
+      },
+    };
+  } else if (!drawerOpen || ready || resolution.kind === "not_found" || drawerShown.current?.place.projectId !== params.projectId || drawerShown.current?.place.databaseId !== params.databaseId) {
+    drawerShown.current = null;
+  }
+  const shownDrawer = drawerShown.current;
+  const drawer = shownDrawer ? <SqlDrawer {...shownDrawer.props} rolesReady={ready && shownDrawer.props.rolesReady} /> : null;
 
   let main;
   if (resolution.kind === "not_found") {

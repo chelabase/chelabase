@@ -2,7 +2,8 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { EditorView } from "@codemirror/view";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fakeFetch, jsonResponse, type FakeFetch } from "@/test/fake-fetch";
+import { getGetSqlSchemaQueryKey, getGetTableQueryKey } from "@chelabase/management-client";
+import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
 import { B, D, FULL, T, editorRoutes, meAs, stubLayout, type Level } from "@/test/table-editor-fixtures";
 import type { EditorParams } from "@/lib/table-editor/context";
@@ -18,7 +19,7 @@ import { TableEditor } from "./table-editor";
 const ndjson = (...events: unknown[]) => new Response(events.map((e) => JSON.stringify(e)).join("\n") + "\n", { status: 200, headers: { "Content-Type": "application/x-ndjson" } });
 const ranTag = (tag: string) => () => ndjson({ t: "complete", statement: 0, tag, rows: 0, truncated: false }, { t: "done", outcome: "ok", duration_ms: 3 });
 
-function mount(o: { level?: Level; sql?: boolean; run?: () => Response; params?: EditorParams } = {}) {
+function mount(o: { level?: Level; sql?: boolean; run?: () => Response; params?: EditorParams; roles?: unknown[]; routes?: Record<string, FakeHandler> } = {}) {
   const navigate = vi.fn();
   const openSqlEditor = vi.fn();
   const f: FakeFetch = fakeFetch(
@@ -28,14 +29,26 @@ function mount(o: { level?: Level; sql?: boolean; run?: () => Response; params?:
         [`GET ${B}/sql/schema`]: () => jsonResponse({ schemas: [] }),
         [`GET ${D}/sql-queries`]: () => jsonResponse([]),
         [`POST ${B}/sql`]: o.run ?? ranTag("SELECT 0"),
+        ...(o.roles ? { [`GET ${B}/roles`]: () => jsonResponse(o.roles) } : {}),
+        ...o.routes,
       },
     }),
   );
-  const ui = (sql: boolean) => (
-    <TableEditor params={o.params ?? FULL} navigate={navigate} sql={sql} openSqlEditor={openSqlEditor} createSqlClient={() => Promise.reject(new Error("no worker"))} />
+  const createSqlClient = vi.fn(() => Promise.reject(new Error("no worker")));
+  const ui = (sql: boolean, params: EditorParams = o.params ?? FULL) => (
+    <TableEditor params={params} navigate={navigate} sql={sql} openSqlEditor={openSqlEditor} createSqlClient={createSqlClient} />
   );
   const result = renderWithQuery(ui(o.sql ?? false), { fetch: f });
-  return { ...result, f, navigate, openSqlEditor, user: userEvent.setup(), setSql: (sql: boolean) => result.rerender(ui(sql)) };
+  return {
+    ...result,
+    f,
+    navigate,
+    openSqlEditor,
+    createSqlClient,
+    user: userEvent.setup(),
+    setSql: (sql: boolean) => result.rerender(ui(sql)),
+    goTo: (params: EditorParams) => result.rerender(ui(o.sql ?? false, params)),
+  };
 }
 
 async function setDoc(text: string) {
@@ -159,5 +172,110 @@ describe("the SQL drawer", () => {
     expect(screen.getByRole("button", { name: "New table" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "SQL" })).toBeNull();
     expect(screen.queryByRole("region", { name: "SQL" })).toBeNull();
+  });
+
+  // A DDL run refreshes every table's structure on the branch (not only the open one) and the completion schema of
+  // every Act as role; a DML-only run refreshes none of them.
+  const others = () => [getGetTableQueryKey("d1", "b1", "public", "customers"), getGetSqlSchemaQueryKey("d1", "b1", { role: "reporter" })];
+  it("a_ddl_run_refreshes_every_table_of_the_branch_and_every_roles_schema", async () => {
+    const { queryClient, user } = mount({ sql: true, run: ranTag("DROP TABLE") });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    for (const k of others()) queryClient.setQueryData(k, {});
+    await setDoc("drop table customers");
+    await user.click(await within(drawer).findByRole("button", { name: "Run" }));
+    expect(await within(drawer).findByText(/DROP TABLE/)).toBeInTheDocument();
+    await waitFor(() => expect(others().map((k) => queryClient.getQueryState(k)?.isInvalidated)).toEqual([true, true]));
+  });
+
+  it("a_dml_only_run_refreshes_no_other_table_or_schema", async () => {
+    const { queryClient, user } = mount({ sql: true, run: ranTag("INSERT 0 1") });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    for (const k of others()) queryClient.setQueryData(k, {});
+    await setDoc("insert into customers default values");
+    await user.click(await within(drawer).findByRole("button", { name: "Run" }));
+    expect(await within(drawer).findByText(/INSERT 0 1/)).toBeInTheDocument();
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(others().map((k) => queryClient.getQueryState(k)?.isInvalidated)).toEqual([false, false]);
+  });
+
+  it("with_no_role_to_act_as_the_drawer_says_no_role_not_owner", async () => {
+    mount({ level: "developer", sql: true, roles: [] });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    expect(await within(drawer).findByText("on main · app · no role")).toBeInTheDocument();
+    expect(within(drawer).queryByText(/as owner/)).toBeNull();
+    expect(within(drawer).getByRole("button", { name: "Run" })).toBeDisabled();
+  });
+
+  it("running_as_owner_warns_in_the_output_column", async () => {
+    mount({ sql: true });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    await within(drawer).findByRole("button", { name: "Run" });
+    const output = within(drawer).getByRole("group", { name: "Output" });
+    expect(within(output).getByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
+  });
+
+  it("acting_as_a_role_shows_no_owner_warning", async () => {
+    sessionStorage.setItem("chelabase.studio.tables.actAs", JSON.stringify({ "d1/b1": "reporter" }));
+    mount({ sql: true });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    expect(await within(drawer).findByText("on main · app · as reporter")).toBeInTheDocument();
+    expect(within(drawer).queryByText(/Running as owner/)).toBeNull();
+  });
+
+  it("below_40rem_an_open_drawer_from_the_url_stays_closed", async () => {
+    narrow(true);
+    mount({ sql: true });
+    await screen.findByRole("heading", { name: "public.invoices" });
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(screen.queryByRole("region", { name: "SQL" })).toBeNull();
+  });
+
+  it("the_toggle_keeps_the_url_place_while_it_resolves", async () => {
+    const partial: EditorParams = { projectId: "p1", databaseId: "d1" };
+    const { navigate, user } = mount({ params: partial });
+    await user.click(await screen.findByRole("button", { name: "SQL" }));
+    expect(navigate).toHaveBeenLastCalledWith(partial, { sql: true, replace: true });
+  });
+
+  it("a_saved_query_naming_a_database_and_a_role_moves_both_after_one_discard", async () => {
+    const saved = { id: "q1", name: "Report", sql: "select 1", pg_database: "reporting", role: "reporter", created_at: "2026-10-01T00:00:00Z", updated_at: "2026-10-01T00:00:00Z", version: 1 };
+    const { navigate, user } = mount({
+      sql: true,
+      routes: {
+        [`GET ${D}/sql-queries`]: () => jsonResponse([{ id: "q1", name: "Report", pg_database: "reporting", role: "reporter", created_at: saved.created_at, updated_at: saved.updated_at, version: 1 }]),
+        [`GET ${D}/sql-queries/q1`]: () => jsonResponse(saved),
+      },
+    });
+    await user.click(await screen.findByRole("button", { name: "Open row 2" }));
+    const panel = await screen.findByRole("complementary", { name: "Row" });
+    await user.type(within(panel).getByLabelText("amount_cents"), "1");
+    const drawer = screen.getByRole("region", { name: "SQL" });
+    const picker = await within(drawer).findByLabelText("Saved query");
+    await waitFor(() => expect(picker).toBeEnabled());
+    await user.selectOptions(picker, "q1");
+    await user.click(within(await screen.findByRole("dialog", { name: "Discard changes to row 2?" })).getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith({ ...FULL, pgDatabase: "reporting", schema: undefined, table: undefined }));
+    expect(await within(drawer).findByText("on main · app · as reporter")).toBeInTheDocument();
+  });
+
+  // #84 AC2 in the drawer: picking another branch keeps the drawer's editor mounted while the new place resolves.
+  it("switching_branch_keeps_the_drawer_mounted", async () => {
+    const B2 = `${D}/branches/b2`;
+    const { createSqlClient, goTo } = mount({
+      sql: true,
+      routes: {
+        [`GET ${B2}/databases`]: () => new Promise<Response>(() => {}),
+        [`GET ${B2}/roles`]: () => jsonResponse([]),
+      },
+    });
+    const drawer = await screen.findByRole("region", { name: "SQL" });
+    await within(drawer).findByRole("button", { name: "Run" });
+    expect(createSqlClient).toHaveBeenCalledTimes(1);
+    goTo({ projectId: "p1", databaseId: "d1", branchId: "b2" });
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(screen.getByRole("region", { name: "SQL" })).toBe(drawer);
+    // Nothing runs until the new place is known.
+    expect(within(drawer).getByRole("button", { name: "Run" })).toBeDisabled();
+    expect(createSqlClient).toHaveBeenCalledTimes(1);
   });
 });

@@ -39,8 +39,7 @@ const baseProps = (): SqlEditorProps => ({
   role: null,
   allowed: { owner: true, roles: ["reporter"] },
   rolesReady: true,
-  onPgDatabase: vi.fn(),
-  onRole: vi.fn(),
+  onHints: vi.fn(),
 });
 function setup(opts: Opts = {}) {
   const f: FakeFetch = fakeFetch({
@@ -383,15 +382,16 @@ describe("SqlEditor", () => {
     const { user, props } = setup({ props: { role: "reporter" } });
     await openHistory(user);
     expect(await screen.findByText(/The saved role "ghost" isn't available here; running as reporter\./)).toBeInTheDocument();
-    expect(props.onRole).not.toHaveBeenCalled();
+    expect(props.onHints).not.toHaveBeenCalled();
   });
 
   it("a_saved_role_and_database_that_are_available_move_the_context", async () => {
     savedHistory({ role: "reporter", database: "analytics" });
     const { user, props } = setup();
     await openHistory(user);
-    await vi.waitFor(() => expect(props.onRole).toHaveBeenCalledWith("reporter"));
-    expect(props.onPgDatabase).toHaveBeenCalledWith("analytics");
+    // Both in one call: the caller moves the database and the role together (one row draft question, not two).
+    await vi.waitFor(() => expect(props.onHints).toHaveBeenCalledWith({ database: "analytics", role: "reporter" }));
+    expect(props.onHints).toHaveBeenCalledTimes(1);
   });
 
   it("a_saved_database_that_is_not_here_keeps_the_selected_one_with_a_note", async () => {
@@ -399,6 +399,6 @@ describe("SqlEditor", () => {
     const { user, props } = setup();
     await openHistory(user);
     expect(await screen.findByText(/The saved database "gone" isn't on this branch/)).toBeInTheDocument();
-    expect(props.onPgDatabase).not.toHaveBeenCalled();
+    expect(props.onHints).not.toHaveBeenCalled();
   });
 });
