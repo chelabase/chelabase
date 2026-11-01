@@ -108,12 +108,19 @@ fn err(status: StatusCode, key: &str) -> Reply {
 const MOCK_KEY: &str = "mockRefusalKey";
 
 /// The refusal Zitadel v4.19.1 answers for a request (`"METHOD path"`) refused with this old
-/// error key, as `tests/zitadel_live.rs` captured it. `None` for one not captured.
-fn captured(call: &str, key: &str) -> Option<Refusal> {
+/// error key, as `tests/zitadel_live.rs` captured it. `None` for one not captured: the mock
+/// never answers its own refusal with an id nobody captured (see `zitadel_refusal`).
+pub fn captured(call: &str, key: &str) -> Option<Refusal> {
     use refusals as r;
     let verb = |v: &str| call.starts_with("POST /v2/users/") && call.ends_with(&format!("/{v}"));
     Some(match key {
+        "Errors.User.NotFound" if call.ends_with("/authentication_methods") => {
+            r::AUTH_METHODS_USER_NOT_FOUND
+        }
         "Errors.User.NotFound" if call.starts_with("GET /v2/users/") => r::GET_USER_NOT_FOUND,
+        "Errors.User.NotFound" if call.starts_with("PATCH /v2/users/") => r::UPDATE_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("email") => r::SET_EMAIL_USER_NOT_FOUND,
+        "Errors.User.NotFound" if verb("invite_code") => r::CREATE_INVITE_USER_NOT_FOUND,
         "Errors.User.NotFound" if call.starts_with("DELETE /v2/users/") => r::DELETE_USER_NOT_FOUND,
         "Errors.User.NotFound" if verb("lock") => r::LOCK_USER_NOT_FOUND,
         "Errors.User.NotFound" if verb("unlock") => r::UNLOCK_USER_NOT_FOUND,
@@ -124,6 +131,7 @@ fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.User.AlreadyLocked" | "Errors.User.NotActive" => r::LOCK_NOT_ACTIVE,
         "Errors.User.NotLocked" => r::UNLOCK_NOT_LOCKED,
         "Errors.User.AlreadyInactive" => r::DEACTIVATE_ALREADY_INACTIVE,
+        "Errors.User.CannotDeactivateInitial" => r::DEACTIVATE_INITIAL,
         "Errors.User.NotInactive" => r::REACTIVATE_NOT_INACTIVE,
         // Zitadel answers a wrong, an expired and a missing invite code alike.
         k if k.starts_with("Errors.User.Code.") && call.ends_with("/invite_code/verify") => {
@@ -149,9 +157,14 @@ fn captured(call: &str, key: &str) -> Option<Refusal> {
         "Errors.Org.AlreadyExists" => r::ORG_ALREADY_EXISTS,
         "Errors.Org.NotFound" if call == "POST /v2/users/new" => r::CREATE_USER_ORG_NOT_FOUND,
         "Errors.User.AlreadyInitialised" => r::INVITE_USER_INITIALIZED,
-        "Errors.AuthRequest.NotFound" => r::AUTH_REQUEST_NOT_FOUND,
+        "Errors.AuthRequest.NotFound" if call.starts_with("GET ") => r::AUTH_REQUEST_NOT_FOUND,
+        "Errors.AuthRequest.NotFound" if call.starts_with("POST ") => {
+            r::FINISH_AUTH_REQUEST_NOT_FOUND
+        }
         "Errors.User.Locked" if call == "POST /v2/sessions" => r::SESSION_USER_NOT_ACTIVE,
         "Errors.Token.Invalid" => r::TOKEN_INVALID,
+        // Zitadel's authorization check answers the same on every endpoint.
+        "Errors.PermissionDenied" => r::NO_PERMISSION,
         _ => return None,
     })
 }
@@ -159,14 +172,25 @@ fn captured(call: &str, key: &str) -> Option<Refusal> {
 /// Zitadel v4.19.1's error body for a refusal: the gRPC `code`, a `message` ending in the
 /// detail id, and one `details[]` entry carrying the id (a `CredentialsCheckError` for a wrong
 /// password, else an `ErrorDetail`). Until m2 the messages are the old error key, not
-/// Zitadel's localized text, so callers that still match keys keep working. A refusal that
-/// wasn't captured gets a gRPC code for its status and a `MOCK-` id.
+/// Zitadel's localized text, so callers that still match keys keep working.
+///
+/// A forced fault (`MockZitadel::fail`) whose key no capture names is the test's own stand-in
+/// for a refusal no caller matches: it gets a gRPC code for its status and a `TEST-` id. A
+/// refusal of the mock's own with no capture is a mock bug: the test process aborts, naming the
+/// call and the key (a panic here would only drop the connection, which reads as Zitadel down).
 fn zitadel_refusal(call: &str, status: StatusCode, key: &str, forced: bool) -> Response {
     use axum::response::IntoResponse;
     let (status, code, id) = match captured(call, key) {
         // A forced fault keeps the status the test chose.
         Some(r) if forced => (status, r.code, r.id.to_string()),
         Some(r) => (StatusCode::from_u16(r.status).unwrap(), r.code, r.id.to_string()),
+        None if !forced => {
+            eprintln!(
+                "mock Zitadel: no captured refusal for `{call}` refused with `{key}`; capture it \
+                 in tests/zitadel_live.rs and add it to refusals.rs and mock::captured"
+            );
+            std::process::abort();
+        }
         None => {
             let code = match status.as_u16() {
                 401 => refusals::UNAUTHENTICATED,
@@ -177,7 +201,7 @@ fn zitadel_refusal(call: &str, status: StatusCode, key: &str, forced: bool) -> R
                 400 | 412 => refusals::FAILED_PRECONDITION,
                 _ => 2,
             };
-            (status, code, format!("MOCK-{key}"))
+            (status, code, format!("TEST-{key}"))
         }
     };
     let detail = if id == refusals::PASSWORD_INVALID.id {
@@ -609,6 +633,19 @@ fn state_name(u: &User, inner: &Inner) -> &'static str {
     }
 }
 
+/// Zitadel v4.19.1's request validation of a password over 200 runes, as captured: a 400 with
+/// gRPC code 3 and no `details` (see `refusals::PASSWORD_VALIDATION_MAX_RUNES`). The mock
+/// doesn't copy the 500 that 73 bytes up to that limit get (`refusals::PASSWORD_MAX_BYTES`).
+fn too_long(password: &str, field: &str) -> Option<Reply> {
+    (password.chars().count() > refusals::PASSWORD_VALIDATION_MAX_RUNES).then(|| {
+        let message = format!(
+            "invalid {field}: embedded message failed validation | caused by: invalid \
+             Password.Password: value length must be between 1 and 200 runes, inclusive"
+        );
+        (StatusCode::BAD_REQUEST, Json(json!({"code": refusals::INVALID_ARGUMENT, "message": message})))
+    })
+}
+
 fn num(v: Option<&Value>) -> Option<usize> {
     v.and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
         .map(|n| n as usize)
@@ -714,14 +751,15 @@ async fn delete_user(State(s): S, headers: HeaderMap, Path(id): Path<String>) ->
     if let Some(e) = guard(&headers, &inner) {
         return e;
     }
+    // Zitadel v4.19.1 answers a missing user's not-found even to a token without the
+    // permission to delete.
+    if !inner.users.iter().any(|u| u.id == id) {
+        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
+    }
     if let Some(e) = admin_only(&headers) {
         return e;
     }
-    let before = inner.users.len();
     inner.users.retain(|u| u.id != id);
-    if inner.users.len() == before {
-        return err(StatusCode::NOT_FOUND, "Errors.User.NotFound");
-    }
     inner.sessions.retain(|_, (uid, _)| *uid != id);
     ok(json!({}))
 }
@@ -732,8 +770,13 @@ async fn set_active(s: S, headers: HeaderMap, id: String, inactive: bool) -> Rep
         return e;
     }
     // Zitadel v4.19.1: a precondition refusal (400) when the user is already in that state.
-    // Deactivating a locked user succeeds, and it is then inactive, not locked.
+    // Deactivating a locked user succeeds, and it is then inactive, not locked. A user in the
+    // Initial state can't be deactivated, and isn't inactive.
+    let initial = inner.initial_users.contains(&id);
     match inner.users.iter_mut().find(|u| u.id == id) {
+        Some(_) if inactive && initial => {
+            err(StatusCode::BAD_REQUEST, "Errors.User.CannotDeactivateInitial")
+        }
         Some(u) if inactive && u.inactive => {
             err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyInactive")
         }
@@ -759,18 +802,23 @@ async fn reactivate(s: S, headers: HeaderMap, Path(id): Path<String>) -> Reply {
 
 /// `POST /v2/users/{id}/lock` and `/unlock`: as `set_active`, a precondition refusal (400) when
 /// the user is already in that state, 404 for an unknown user. As in Zitadel v4.19.1, only an
-/// active user can be locked: an inactive one gets the same refusal as a locked one.
+/// active (or initial) user can be locked: an inactive one gets the same refusal as a locked
+/// one. Unlocking a user locked from the Initial state makes it active.
 async fn set_locked(s: S, headers: HeaderMap, id: String, locked: bool) -> Reply {
     let mut inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
         return e;
     }
+    let initial = inner.initial_users.contains(&id);
     match inner.users.iter_mut().find(|u| u.id == id) {
         Some(u) if locked && u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.AlreadyLocked"),
         Some(u) if locked && u.inactive => err(StatusCode::BAD_REQUEST, "Errors.User.NotActive"),
         Some(u) if !locked && !u.locked => err(StatusCode::BAD_REQUEST, "Errors.User.NotLocked"),
         Some(u) => {
             u.locked = locked;
+            if initial && locked {
+                inner.initial_users.retain(|i| *i != id);
+            }
             ok(json!({}))
         }
         None => err(StatusCode::NOT_FOUND, "Errors.User.NotFound"),
@@ -920,6 +968,9 @@ async fn create_user(State(s): S, headers: HeaderMap, Json(b): Json<Value>) -> R
         .and_then(Value::as_str)
         .unwrap_or(&email)
         .to_string();
+    if let Some(e) = password.as_deref().and_then(|p| too_long(p, "CreateUserRequest_Human.Password")) {
+        return e;
+    }
     if !inner.orgs.contains(&org_id) {
         return err(StatusCode::NOT_FOUND, "Errors.Org.NotFound");
     }
@@ -1198,6 +1249,10 @@ async fn set_password(
 ) -> Reply {
     let mut inner = s.lock().unwrap();
     if let Some(e) = guard(&headers, &inner) {
+        return e;
+    }
+    let new = b.pointer("/newPassword/password").and_then(Value::as_str).unwrap_or("");
+    if let Some(e) = too_long(new, "SetPasswordRequest.NewPassword") {
         return e;
     }
     let current = b.get("currentPassword").and_then(Value::as_str);

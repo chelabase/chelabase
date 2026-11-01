@@ -520,10 +520,8 @@ async fn an_invite_code_is_mailed_with_the_template_and_verifies() {
     assert!(mock
         .calls()
         .contains(&format!("POST /v2/users/{id}/invite_code")));
-    assert!(matches!(
-        admin.create_invite_code("missing", template).await,
-        Err(ZError::Rejected { status: 404, .. })
-    ));
+    // Zitadel answers a missing user here with a 400 (captured).
+    assert!(admin.create_invite_code("missing", template).await.is_err_and(|e| e.is(refusals::CREATE_INVITE_USER_NOT_FOUND)));
 }
 
 /// Zitadel v4.19.1 `POST /v2/users/{userId}/invite_code` with `{"returnCode": {}}`: the code
@@ -548,10 +546,8 @@ async fn a_returned_invite_code_sends_no_mail_and_verifies() {
         Err(ZError::Rejected { status: 400, .. })
     ));
     admin.verify_invite_code(&id, &second).await.unwrap();
-    assert!(matches!(
-        admin.return_invite_code("missing").await,
-        Err(ZError::Rejected { status: 404, .. })
-    ));
+    // Zitadel answers a missing user here with a 400 (captured).
+    assert!(admin.return_invite_code("missing").await.is_err_and(|e| e.is(refusals::CREATE_INVITE_USER_NOT_FOUND)));
 }
 
 /// Zitadel v4.19.1 `GET /v2/users/{userId}/authentication_methods` (no domain query: every
@@ -641,7 +637,7 @@ async fn get_user_reads_whether_a_password_is_set() {
     let u = z.get_user(&without).await.unwrap().unwrap();
     assert!(!u.has_password);
     mock.set_initial(&without);
-    assert_eq!(z.get_user(&without).await.unwrap().unwrap().state, UserState::Other);
+    assert_eq!(z.get_user(&without).await.unwrap().unwrap().state, UserState::Initial);
     match z.find_user_in_org("o1", "pat@example.com").await.unwrap() {
         EmailMatch::One(u) => assert!(u.has_password),
         other => panic!("{other:?}"),
@@ -1007,7 +1003,9 @@ async fn a_4xx_that_isnt_zitadels_is_unavailable() {
     let id = mock.add_user("una@example.com", "Secret-pass1", true);
     let validation = r#"{"code":3, "message":"invalid ListAuthenticationMethodTypesRequest.DomainQuery: embedded message failed validation"}"#;
     for status in [400, 401, 403, 404, 409, 412, 429] {
-        for body in NOT_ZITADELS.iter().copied().chain([validation]) {
+        // Zitadel's own validation refusal is a 400 (see `zitadels_validation_refusal_...`).
+        let validation = (status != 400).then_some(validation);
+        for body in NOT_ZITADELS.iter().copied().chain(validation) {
             mock.answer_raw("POST /v2/users/new", status, body, 1);
             let got = z.create_user(&app_user("x1", "x@example.com")).await;
             assert!(matches!(got, Err(ZError::Unavailable(_))), "{status} {body:?}: {got:?}");
@@ -1142,8 +1140,140 @@ async fn the_mocks_refusals_carry_the_captured_code_and_id() {
     mock.fail("DELETE /v2/users/", 404, "Errors.User.NotFound", 1);
     z.delete_user(&id).await.unwrap();
     assert!(mock.user_by_id(&id).is_some(), "the forced answer changed nothing");
-    // A key with no capture still carries a code and an id.
+    // A forced fault with a key no capture names is the test's own refusal, marked `TEST-`.
     mock.fail("GET /v2/users/", 403, "Errors.Denied", 1);
     let err = z.get_user(&id).await.unwrap_err();
-    assert!(err.zitadel_code().is_some() && err.detail_id().is_some(), "{err:?}");
+    assert_eq!(err.detail_id(), Some("TEST-Errors.Denied"), "{err:?}");
+}
+
+// #60 audit B2: the mock's own refusals carry captured ids only; the lookup it answers them
+// from has none for a pair nobody captured (the mock then aborts the test, naming both).
+#[tokio::test]
+async fn the_mock_never_invents_an_id() {
+    use serde_json::json;
+    let (mock, _) = setup().await;
+    let id = mock.add_user_in("o1", "nid@example.com", "Secret-pass1", true);
+    let session = Zitadel::new(&mock.base, TOKEN).create_session(&id, "Secret-pass1").await.unwrap();
+    let cases: Vec<(&str, &str, String, serde_json::Value, Refusal)> = vec![
+        (TOKEN, "POST", "/v2/users/missing/email".into(), json!({"email": "a@example.com"}), refusals::SET_EMAIL_USER_NOT_FOUND),
+        (TOKEN, "PATCH", "/v2/users/missing".into(), json!({"human": {"email": {"email": "a@example.com"}}}), refusals::UPDATE_USER_NOT_FOUND),
+        (TOKEN, "POST", "/v2/users/missing/invite_code".into(), json!({"returnCode": {}}), refusals::CREATE_INVITE_USER_NOT_FOUND),
+        (TOKEN, "GET", "/v2/users/missing/authentication_methods".into(), json!({}), refusals::AUTH_METHODS_USER_NOT_FOUND),
+        (TOKEN, "DELETE", "/v2/users/missing".into(), json!({}), refusals::DELETE_USER_NOT_FOUND),
+        (TOKEN, "DELETE", format!("/v2/users/{id}"), json!({}), refusals::NO_PERMISSION),
+        (TOKEN, "POST", "/v2/organizations".into(), json!({"organizationId": "o9", "name": "o9"}), refusals::NO_PERMISSION),
+        (TOKEN, "DELETE", "/v2/organizations/o1".into(), json!({}), refusals::NO_PERMISSION),
+        (TOKEN, "POST", "/v2/oidc/auth_requests/V2_none".into(),
+            json!({"session": {"sessionId": session.id, "sessionToken": session.token}}), refusals::FINISH_AUTH_REQUEST_NOT_FOUND),
+    ];
+    for (token, method, path, body, want) in cases {
+        let (status, err) = mock_answer(&mock, token, method, &path, body).await;
+        let what = format!("{method} {path}");
+        assert!(!err.detail_id().unwrap_or("").starts_with("MOCK-"), "{what}: {err:?}");
+        assert_eq!(status, want.status, "{what}: {err:?}");
+        assert!(err.is(want), "{what}: want {want:?}, got {err:?}");
+    }
+    // The login client's strict-mode refusals are the captured permission refusal too.
+    mock.set_strict_login(true);
+    let (_, err) = mock_answer(&mock, TOKEN, "PATCH", &format!("/v2/users/{id}"), json!({})).await;
+    assert!(err.is(refusals::NO_PERMISSION), "{err:?}");
+    let (_, err) = mock_answer(&mock, TOKEN, "POST", &format!("/v2/users/{id}/password"),
+        json!({"newPassword": {"password": "Long-enough1"}})).await;
+    assert!(err.is(refusals::NO_PERMISSION), "{err:?}");
+    assert_eq!(captured("GET /v2/users/1", "Errors.Denied"), None);
+    assert_eq!(captured("POST /v2/users/1/email", "Errors.User.NotFound"), Some(refusals::SET_EMAIL_USER_NOT_FOUND));
+}
+
+/// Zitadel's validation refusal for a password over 200 characters (captured live in
+/// `zitadel_live.rs`): a 400 with gRPC code 3, a message and no `details`.
+const PASSWORD_TOO_LONG_400: &str = r#"{"code":3, "message":"invalid SetPasswordRequest.NewPassword: embedded message failed validation | caused by: invalid Password.Password: value length must be between 1 and 200 runes, inclusive"}"#;
+
+// #60 audit B1: Zitadel's own validation refusal (400, code 3, no detail) is `Rejected` with no
+// id, so callers keep answering it as a refused value; it never counts as gone or settled.
+#[tokio::test]
+async fn zitadels_validation_refusal_is_rejected_without_an_id() {
+    let with_empty_details = r#"{"code":3, "message":"invalid X: value length must be between 1 and 200 runes, inclusive", "details":[]}"#;
+    for body in [PASSWORD_TOO_LONG_400, with_empty_details] {
+        let got = classify(400, body);
+        assert!(
+            matches!(&got, ZError::Rejected { status: 400, code: Some(3), id: None, message } if message.contains("200 runes")),
+            "{body}: {got:?}"
+        );
+        assert!(got.is_invalid_request(), "{got:?}");
+        for status in [401, 403, 404, 409, 412, 429] {
+            let got = classify(status, body);
+            assert!(matches!(got, ZError::Unavailable(_)), "{status} {body}: {got:?}");
+            assert!(!got.is_invalid_request());
+        }
+    }
+    for body in [
+        r#"{"code":"3", "message":"invalid X"}"#,
+        r#"{"code":3}"#,
+        r#"{"code":3, "message":7}"#,
+        r#"{"code":5, "message":"invalid X"}"#,
+        r#"{"code":9, "message":"invalid X", "details":[]}"#,
+        r#"{"code":3, "message":"invalid X", "details":[{"@type":"type.googleapis.com/google.rpc.BadRequest"}]}"#,
+        r#"{"code":3, "message":"invalid X", "details":{}}"#,
+    ] {
+        let got = classify(400, body);
+        assert!(matches!(got, ZError::Unavailable(_)), "{body}: {got:?}");
+    }
+    // Zitadel's own errors with a detail are unchanged.
+    assert!(!classify(400, &zitadel_body(refusals::PASSWORD_TOO_SHORT)).is_invalid_request());
+    // The auditor's live case, against the mock's copy of it.
+    let (mock, _) = setup().await;
+    let z = Zitadel::new(&mock.base, ADMIN_TOKEN);
+    let long = format!("Aa1!{}", "x".repeat(226));
+    let created = z.create_user(&NewUser { password: Some(&long), ..app_user("l1", "long@example.com") }).await;
+    assert!(created.as_ref().is_err_and(ZError::is_invalid_request), "{created:?}");
+    let id = mock.add_user("pwd@example.com", "Secret-pass1", true);
+    let set = z.set_password_admin(&id, &long).await;
+    assert!(set.as_ref().is_err_and(ZError::is_invalid_request), "{set:?}");
+    let stored = format!("Aa1!{}", "x".repeat(refusals::PASSWORD_MAX_BYTES - 4));
+    z.set_password_admin(&id, &stored).await.unwrap();
+    // Never gone, never settled.
+    for (pattern, status) in [("DELETE /v2/users/", 400), ("/lock", 400), ("/unlock", 400), ("/reactivate", 400)] {
+        mock.answer_raw(pattern, status, PASSWORD_TOO_LONG_400, 1);
+        let got = match pattern {
+            "DELETE /v2/users/" => z.delete_user(&id).await,
+            "/lock" => z.lock_user(&id).await,
+            "/unlock" => z.unlock_user(&id).await,
+            _ => z.reactivate_user_settled(&id).await,
+        };
+        assert!(got.as_ref().is_err_and(ZError::is_invalid_request), "{pattern}: {got:?}");
+    }
+    assert!(mock.user_by_id(&id).is_some());
+}
+
+// #60 audit N1: unlocking settles only on a state `get_user` can read as not locked.
+#[tokio::test]
+async fn unlock_with_an_unreadable_state_is_an_error() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user_in("p1", "unr@example.com", "Secret-pass1", true);
+    let user = format!(r#"{{"user": {{"userId": "{id}", "state": "USER_STATE_UNSPECIFIED", "details": {{"resourceOwner": "p1"}}}}}}"#);
+    mock.answer_raw(&format!("GET /v2/users/{id}"), 200, &user, 1);
+    let got = z.unlock_user(&id).await;
+    assert!(got.as_ref().is_err_and(|e| e.is(refusals::UNLOCK_NOT_LOCKED)), "{got:?}");
+    z.unlock_user(&id).await.unwrap();
+}
+
+// #60 N1: a user in the Initial state (never signed in), as the live test records it: reactivate
+// and unlock are refused as "not inactive" and "not locked", and both settle; deactivate is
+// refused and never settles; lock works, and unlocking then makes the user active.
+#[tokio::test]
+async fn an_initial_user_settles_reactivate_and_unlock() {
+    let (mock, z) = setup().await;
+    let id = mock.add_user_in("p1", "ini@example.com", "", false);
+    mock.set_initial(&id);
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Initial);
+    assert!(z.reactivate_user(&id).await.is_err_and(|e| e.is(refusals::REACTIVATE_NOT_INACTIVE)));
+    z.reactivate_user_settled(&id).await.unwrap();
+    z.unlock_user(&id).await.unwrap();
+    let got = z.deactivate_user_settled(&id).await;
+    assert!(got.as_ref().is_err_and(|e| e.is(refusals::DEACTIVATE_INITIAL)), "{got:?}");
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Initial);
+    z.lock_user(&id).await.unwrap();
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Locked);
+    z.unlock_user(&id).await.unwrap();
+    assert_eq!(z.get_user(&id).await.unwrap().unwrap().state, UserState::Active);
 }
