@@ -365,6 +365,13 @@ pub trait MembersPort: Send + Sync + 'static {
         teams: &[TeamSeen],
     ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
 
+    /// Whether the member's Zitadel user has another non-removed member row, in any tenant: a
+    /// removal, a decline or a revoke then leaves the user active.
+    fn has_other_membership(
+        &self,
+        member: Uuid,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
     /// Declines a pending member: removed. Returns its Zitadel user, to deactivate.
     fn decline_member(
         &self,
@@ -650,6 +657,10 @@ impl MembersPort for MetadataClient {
         teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
         MetadataClient::approve_member(self, actor, member, grants, teams).await
+    }
+
+    async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
+        MetadataClient::has_other_membership(self, member).await
     }
 
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, AccessWriteError> {
@@ -2427,8 +2438,12 @@ where
 
 /// After a revoke (I4: metadata first): a never-activated Zitadel user (no password) is
 /// deleted; one that once had a password (a removed member invited again, R29) is deactivated
-/// instead. One already gone, or already inactive, is fine, so this can be retried.
-async fn clean_up_revoked_user(z: &Zitadel, user: &str) -> Result<(), ZError> {
+/// instead. One already gone, or already inactive, is fine, so this can be retried. A user with
+/// another non-removed membership in any tenant (`shared`) is left as it is.
+async fn clean_up_revoked_user(z: &Zitadel, user: &str, shared: bool) -> Result<(), ZError> {
+    if shared {
+        return Ok(());
+    }
     match z.get_user(user).await? {
         None => Ok(()),
         Some(u) if u.has_password => z.deactivate_user_settled(user).await,
@@ -2805,7 +2820,7 @@ where
     operation_id = "removeMember",
     tag = "members",
     summary = "Remove a member",
-    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user is deactivated with its sessions ended (one that never finished sign-up can't be deactivated, so it is locked instead); a still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Removed"),
@@ -2851,9 +2866,16 @@ where
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let z = tri!(admin_zitadel(&state));
-    // Already inactive (a retry), already gone, or Initial and locked, is done; any other
-    // refusal is 503.
-    if let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
+    // The user is deactivated only when this was its last membership in any tenant. Already
+    // inactive (a retry), already gone, or Initial and locked, is done; any other refusal is 503.
+    let shared = tri!(
+        state
+            .metadata
+            .has_other_membership(id)
+            .await
+            .map_err(|err| internal("remove member: other memberships", err))
+    );
+    if !shared && let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
         return zitadel_failed("remove member: deactivate user", &err).into_response();
     }
     if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
@@ -2944,7 +2966,7 @@ where
     operation_id = "declineMember",
     tag = "members",
     summary = "Decline a sign-up",
-    description = "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user is deactivated and its sessions ended (one that never finished sign-up can't be deactivated, so it is locked instead); a still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+    description = "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Declined"),
@@ -2990,7 +3012,15 @@ where
         access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
     }
     let z = tri!(admin_zitadel(&state));
-    if let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
+    // As a removal: deactivated only when this was the user's last membership.
+    let shared = tri!(
+        state
+            .metadata
+            .has_other_membership(id)
+            .await
+            .map_err(|err| internal("decline member: other memberships", err))
+    );
+    if !shared && let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
         return zitadel_failed("decline member: deactivate user", &err).into_response();
     }
     if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
@@ -3052,7 +3082,9 @@ async fn lock_for_suspension(z: &Zitadel, user: &str) -> Result<(), ZError> {
 
 /// Deactivates a removed (or declined) member's Zitadel user, settled. One in the Initial state
 /// can't be deactivated (`DEACTIVATE_INITIAL`, "can only be deleted"); it is locked instead, so
-/// it can't finish sign-up, and that is done.
+/// it can't finish sign-up, and that is done. The caller runs it only for the user's last
+/// non-removed membership in any tenant (one Zitadel user can be a member of several); otherwise
+/// it only ends the user's sessions.
 async fn deactivate_for_removal(z: &Zitadel, user: &str) -> Result<(), ZError> {
     match z.deactivate_user_settled(user).await {
         Err(err) if err.is(refusals::DEACTIVATE_INITIAL) => z.lock_user(user).await,
@@ -3176,6 +3208,17 @@ where
     let z = tri!(admin_zitadel(&state));
     if let Err(err) = z.unlock_user(&m.zitadel_user_id).await {
         return zitadel_step_failed("reinstate member: unlock user", &err, "reinstate").into_response();
+    }
+    // A suspend whose lock failed after its reactivate left the user inactive again (see
+    // `lock_for_suspension`): reinstating instead of retrying it reactivates the user, so the
+    // member can sign in.
+    let reactivated = match z.get_user(&m.zitadel_user_id).await {
+        Ok(Some(u)) if u.state == UserState::Inactive => z.reactivate_user_settled(&m.zitadel_user_id).await,
+        Ok(_) => Ok(()),
+        Err(err) => Err(err),
+    };
+    if let Err(err) = reactivated {
+        return zitadel_step_failed("reinstate member: reactivate user", &err, "reinstate").into_response();
     }
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
     Json(tri!(member_view(&state, &principal, m).await)).into_response()
@@ -3502,7 +3545,7 @@ fn resend_delivery(body: &[u8]) -> Result<Delivery, ApiError> {
     operation_id = "revokeInvite",
     tag = "members",
     summary = "Revoke an invite",
-    description = "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again). Revoking an invite whose member is still removed retries the Zitadel step.",
+    description = "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.",
     params(("invite_id" = Uuid, Path, description = "Invite id")),
     responses(
         (status = 204, description = "Revoked"),
@@ -3566,7 +3609,14 @@ where
         access_changed(&state, principal.tenant_id, None);
         user
     };
-    if let Err(err) = clean_up_revoked_user(z, &user).await {
+    let shared = tri!(
+        state
+            .metadata
+            .has_other_membership(m.id)
+            .await
+            .map_err(|err| internal("revoke invite: other memberships", err))
+    );
+    if let Err(err) = clean_up_revoked_user(z, &user, shared).await {
         return zitadel_failed("revoke invite: Zitadel user", &err).into_response();
     }
     StatusCode::NO_CONTENT.into_response()

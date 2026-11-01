@@ -1007,6 +1007,9 @@ impl members::MembersPort for Doc {
     ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
         match *self {}
     }
+    async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
+        match *self {}
+    }
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, DocWriteError> {
         match *self {}
     }
