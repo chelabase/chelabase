@@ -12,6 +12,25 @@ const renderPage = () => render(<LandingPage docsUrl={DOCS} />);
 const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"];
 
 describe("LandingPage", () => {
+  it("each_studio_section_shows_its_screenshots_with_alt_text", () => {
+    renderPage();
+    for (const [id, srcs] of [
+      ["manage", ["manage-table-editor", "manage-rls-warning"]],
+      ["collaborate", ["collaborate-team-access"]],
+      ["iterate", ["iterate-branches"]],
+    ] as const) {
+      const section = document.getElementById(id)!;
+      const imgs = within(section).getAllByRole("img");
+      for (const src of srcs) {
+        const img = imgs.find((i) => i.getAttribute("src") === `/screens/${src}.webp`);
+        expect(img, `${id}: ${src}`).toBeDefined();
+        expect(img!.getAttribute("alt")!.trim().length).toBeGreaterThan(20);
+        expect(img!.getAttribute("loading")).toBe("lazy");
+        expect(img!.closest("figure")!.querySelector("figcaption")!.textContent!.trim()).not.toBe("");
+      }
+    }
+  });
+
   it("leads_with_the_chelabase_name", () => {
     renderPage();
     expect(screen.getByRole("heading", { level: 1, name: "Chelabase" })).toBeInTheDocument();
@@ -20,7 +39,7 @@ describe("LandingPage", () => {
   it("ctas_link_to_the_quickstart_and_github", () => {
     renderPage();
     const starts = screen.getAllByRole("link", { name: "Get started" });
-    const githubs = screen.getAllByRole("link", { name: "Visit GitHub" });
+    const githubs = screen.getAllByRole("link", { name: "GitHub" });
     expect(starts.length).toBeGreaterThanOrEqual(3);
     expect(githubs.length).toBeGreaterThanOrEqual(3);
     for (const a of starts) expect(a.getAttribute("href")).toBe(`${DOCS}/docs/using/quickstart`);
@@ -113,6 +132,12 @@ describe("LandingPage", () => {
       expect(steps).toHaveTextContent(cmd);
     }
     expect(steps).not.toHaveTextContent("just dev");
+  });
+
+  it("the_install_terminal_mentions_the_example_overlay", () => {
+    renderPage();
+    const steps = screen.getByRole("figure", { name: /your terminal/i });
+    expect(steps).toHaveTextContent("docker-compose.example.yml");
   });
 
   it("the_client_snippet_uses_the_server_client", () => {

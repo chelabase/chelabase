@@ -54,6 +54,15 @@ function plate({ primary = false, small = false }: { primary?: boolean; small?: 
   return `${base} ${size} ${tone}`;
 }
 
+/** GitHub's mark (Octicons `mark-github`), drawn in the text colour. */
+function GitHubMark() {
+  return (
+    <svg viewBox="0 0 16 16" className="size-[1.1em] shrink-0" fill="currentColor" aria-hidden="true">
+      <path d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z" />
+    </svg>
+  );
+}
+
 function Actions({ docsUrl, className = "mt-6.5" }: { docsUrl?: string; className?: string }) {
   // Below 560px each plate takes a full row.
   const full = "max-[560px]:grow max-[560px]:basis-full";
@@ -63,7 +72,8 @@ function Actions({ docsUrl, className = "mt-6.5" }: { docsUrl?: string; classNam
         Get started
       </a>
       <a className={`${plate()} ${full}`} href={GITHUB_URL}>
-        Visit GitHub
+        <GitHubMark />
+        GitHub
       </a>
     </div>
   );
@@ -147,6 +157,26 @@ function CodeInset({ label, note, children, className = "" }: { label: ReactNode
   );
 }
 
+/** A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport, and a link to the full-size file. */
+function StudioShot({ src, width, height, alt, caption }: { src: string; width: number; height: number; alt: string; caption: string }) {
+  return (
+    <figure className="m-0 min-w-0">
+      <a href={src} className={`block rounded-xl ${FOCUS}`}>
+        <img
+          src={src}
+          width={width}
+          height={height}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          className="block w-full h-auto rounded-xl border border-line-strong bg-ink"
+        />
+      </a>
+      <figcaption className="mt-2.5 text-[0.9rem] leading-snug text-chalk-dim">{caption}</figcaption>
+    </figure>
+  );
+}
+
 const K = ({ children }: { children: ReactNode }) => <span className="text-coral">{children}</span>;
 const F = ({ children }: { children: ReactNode }) => <span className="text-seafoam">{children}</span>;
 const S = ({ children }: { children: ReactNode }) => <span className="text-sand">{children}</span>;
@@ -166,7 +196,8 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
               Get started
             </a>
             <a className={`${plate({ small: true })} max-[560px]:hidden`} href={GITHUB_URL}>
-              Visit GitHub
+              <GitHubMark />
+              GitHub
             </a>
           </div>
         </div>
@@ -404,16 +435,32 @@ function Manage() {
             will run, before it runs.
           </p>
           <Notes notes={MANAGE_NOTES} />
+          <div className="mt-10 grid gap-6">
+            <StudioShot
+              src="/screens/manage-table-editor.webp"
+              width={1152}
+              height={800}
+              alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
+              caption="A staged change shows its SQL and a dry run before anything runs."
+            />
+            <StudioShot
+              src="/screens/manage-rls-warning.webp"
+              width={806}
+              height={126}
+              alt="Studio's RLS warning on the Data API panel: anyone with your public key can read the rows of public.employees, with the ALTER TABLE statement that enables row-level security."
+              caption="Studio flags public.employees, reachable by the data API without row-level security."
+            />
+          </div>
         </div>
         <CodeInset label="Table editor · review changes" note="illustration" className="sticky top-22 max-[900px]:static">
-          <C>-- 2 changes to public.orders, applied in one transaction</C>
+          <C>-- 2 changes to sales.orders, applied in one transaction</C>
           {"\n"}
-          <K>alter table</K> public.orders{"\n"}
+          <K>alter table</K> sales.orders{"\n"}
           {"  "}
           <K>add column</K> shipped_at <T>timestamptz</T>;{"\n"}
-          <K>create index</K> orders_status_idx{"\n"}
+          <K>create index</K> orders_customer_idx{"\n"}
           {"  "}
-          <K>on</K> public.orders (status);{"\n\n"}
+          <K>on</K> sales.orders (customer_id);{"\n\n"}
           <C>-- dry run: ok</C>
         </CodeInset>
       </div>
@@ -455,19 +502,28 @@ function Collaborate() {
             privileges decide the rest, so a schema can belong to one team.
           </p>
           <Notes notes={COLLABORATE_NOTES} />
+          <div className="mt-10 grid gap-6">
+            <StudioShot
+              src="/screens/collaborate-team-access.webp"
+              width={832}
+              height={542}
+              alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
+              caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
+            />
+          </div>
         </div>
         <CodeInset
-          label="SQL editor · a schema per team"
+          label="SQL editor · Acme, a schema per team"
           note="from the docs"
           className="sticky top-22 order-first max-[900px]:static max-[900px]:order-none"
         >
-          <K>create role</K> billing <K>nologin</K>;{"\n"}
-          <K>create schema</K> billing <K>authorization</K> billing;{"\n\n"}
-          <C>-- Members › Teams › billing:</C>
+          <K>create role</K> finance <K>nologin</K>;{"\n"}
+          <K>alter schema</K> finance <K>owner to</K> finance;{"\n\n"}
+          <C>-- Members › Teams › Finance:</C>
           {"\n"}
-          <C>-- Developer on the project, acting as billing.</C>
+          <C>-- Developer on the project, acting as finance.</C>
           {"\n"}
-          <C>-- Its members change this schema; nobody else can.</C>
+          <C>-- Its members change finance.invoices; sales can't.</C>
         </CodeInset>
       </div>
     </Band>
@@ -520,7 +576,16 @@ function Iterate() {
             </div>
           </dl>
         </div>
-        <TideGauge />
+        <div className="grid gap-6 min-w-0">
+          <TideGauge />
+          <StudioShot
+            src="/screens/iterate-branches.webp"
+            width={1152}
+            height={934}
+            alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
+            caption="Protected main, and feature-discounts branched from it, ready to merge."
+          />
+        </div>
       </div>
     </Band>
   );
@@ -561,7 +626,11 @@ function YourApp() {
           </p>
           <Notes notes={APP_NOTES} />
         </div>
-        <CodeInset label="Your server, with @chelabase/client" note={<code>orders.ts</code>}>
+        <CodeInset
+          label="Your server, with @chelabase/client"
+          note={<code>orders.ts</code>}
+          className="sticky top-22 max-[900px]:static"
+        >
           <K>import</K> {"{ "}
           <F>createServerClient</F>
           {" }"} <K>from</K> <S>"@chelabase/client/server"</S>;{"\n"}
@@ -571,12 +640,11 @@ function YourApp() {
           {"\n\n"}
           <K>const</K> db = <F>createServerClient</F>&lt;<T>Database</T>&gt;({"{ "}url, key, types, cookies{" }"});{"\n"}
           <K>const</K> user = <K>await</K> db.auth.<F>getUser</F>();{"\n\n"}
-          <K>const</K> paid = <K>await</K> db{"\n"}
+          <K>const</K> mine = <K>await</K> db{"\n"}
           {"  "}.<F>from</F>(<S>"orders"</S>){"\n"}
           {"  "}.<F>select</F>(<S>"id"</S>, <S>"total"</S>){"\n"}
-          {"  "}.<F>where</F>({"{ "}status: <S>"paid"</S>
-          {" }"});{"\n"}
-          <C>// paid: {"{ id: bigint; total: string }"}[]</C>
+          {"  "}.<F>where</F>({"{ "}customer_id: user.id{" }"});{"\n"}
+          <C>// sales.orders, only the signed-in customer's rows</C>
         </CodeInset>
       </div>
     </Band>
@@ -618,6 +686,8 @@ function InstallTerminal({ className = "" }: { className?: string }) {
       <F>docker</F> compose up -d --wait{"\n"}
       <F>docker</F> compose logs init-secrets <C># your setup code</C>
       {"\n\n"}
+      <C># want a populated demo? add -f docker-compose.example.yml</C>
+      {"\n"}
       <C># then open http://studio.chelabase.localhost:8000</C>
     </CodeInset>
   );

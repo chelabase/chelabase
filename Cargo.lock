@@ -309,6 +309,7 @@ dependencies = [
  "hex",
  "http",
  "moka",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
@@ -2298,6 +2299,7 @@ dependencies = [
  "anyhow",
  "chelabase-init",
  "clap",
+ "serde_json",
  "tempfile",
 ]
 

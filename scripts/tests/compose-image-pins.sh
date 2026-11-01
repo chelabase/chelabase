@@ -14,6 +14,10 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 compose="$root/infra/compose/docker-compose.yml"
 envex="$root/infra/compose/.env.example"
+overlays=()
+for f in "$root/infra/compose/docker-compose.example.yml"; do
+  if [[ -f "$f" ]]; then overlays+=("$f"); fi
+done
 digests="${1:-}"
 images=(gateway orchestrator worker rest auth realtime init studio)
 re='^ghcr\.io/chelabase/([a-z]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
@@ -45,6 +49,17 @@ while IFS= read -r line; do
        fi ;;
   esac
 done <"$envex"
+
+# Overlays (the example seed) reuse base images: each of their image lines is the base file's pin.
+for overlay in "${overlays[@]}"; do
+  while IFS= read -r line; do
+    if [[ "$line" =~ image:\ \$\{CHELABASE_IMAGE_REPO:-([^}]*)\}/([a-z]+):\$\{CHELABASE_IMAGE_TAG:-([^}]*)\}$ ]]; then
+      ref="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}:${BASH_REMATCH[3]}"
+      [[ "$ref" == "${seen_compose[${BASH_REMATCH[2]}]:-}" ]] ||
+        err "${overlay##*/}: ${BASH_REMATCH[2]} is $ref, not the base pin ${seen_compose[${BASH_REMATCH[2]}]:-none}"
+    fi
+  done <"$overlay"
+done
 
 for i in "${images[@]}"; do
   [[ -n "${seen_compose[$i]:-}" ]] || err "docker-compose.yml: no image line for $i"

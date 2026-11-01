@@ -1,0 +1,61 @@
+# The Acme example: a fresh local stack, claimed and seeded with demo people. LOCAL DEMO ONLY.
+#
+# Start it from infra/compose:
+#
+#   cp .env.example .env
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait
+#   docker compose -f docker-compose.yml -f docker-compose.example.yml logs example-seed
+#
+# To run the seed from this checkout's code instead of the published image, build it first:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build init-secrets studio
+#   docker tag chelabase/server:local chelabase/init:local
+#   CHELABASE_IMAGE_REPO=chelabase CHELABASE_IMAGE_TAG=local docker compose \
+#     -f docker-compose.yml -f docker-compose.build.yml -f docker-compose.example.yml up -d --wait
+#
+# `example-seed` (`chelabase-init example`) claims the instance as ada@acme.example with the
+# setup code, through the ordinary sign-up, then invites the other demo people with link
+# delivery and accepts each invite. Every account gets the same hard-coded password, which the
+# log prints with the account list. It acts only through the public endpoints (via the gateway,
+# addressed by the public hosts), so the orchestrator's rules apply as they do to a person.
+#
+# It refuses any stack that isn't local (hosts other than localhost / *.localhost, a gateway or
+# proxy published beyond loopback, required email verification), and an instance someone else
+# already claimed: start again with `down -v`. A seed that stopped part way is finished by the
+# next `up`. Its last write marks the demo complete (a comment on main's database); from then on
+# `up` skips the seed with 0 writes, so what you change in the demo stays changed. It mounts one
+# secret, the setup code, and no Zitadel credential.
+
+services:
+  example-seed:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/init:${CHELABASE_IMAGE_TAG:-ce80456d4dcb@sha256:4ffd65d1f7bc5b19075f151781852b790656717e19dc25b5d03086d2b9106dcd}
+    restart: "no"
+    command: ["chelabase-init", "example"]
+    environment:
+      CHELABASE_PUBLIC_SCHEME: ${CHELABASE_PUBLIC_SCHEME:-http}
+      CHELABASE_STUDIO_HOST: ${CHELABASE_STUDIO_HOST:-studio.chelabase.localhost:8000}
+      CHELABASE_API_HOST: ${CHELABASE_API_HOST:-api.chelabase.localhost:8000}
+      CHELABASE_AUTH_HOST: ${CHELABASE_AUTH_HOST:-auth.chelabase.localhost:8000}
+      # For the local-only gate: where the host publishes the gateway and the proxy.
+      CHELABASE_HTTP_ADDR: ${CHELABASE_HTTP_ADDR:-127.0.0.1}
+      CHELABASE_PROXY_ADDR: ${CHELABASE_PROXY_ADDR:-127.0.0.1}
+      CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
+      # The gateway listens on the public port inside the network too.
+      CHELABASE_EXAMPLE_GATEWAY_URL: http://gateway:${CHELABASE_PUBLIC_PORT:-8000}
+      CHELABASE_SETUP_CODE_FILE: /run/chelabase/secrets/setup/setup.code
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/setup/setup.code, read_only: true, volume: {subpath: setup/setup.code}}
+    depends_on:
+      gateway:
+        condition: service_healthy
+      auth:
+        condition: service_healthy
+      orchestrator:
+        condition: service_healthy
+
+  # `up --wait` doesn't look at a one-shot's exit code unless something depends on it: Studio
+  # waits for the seed, so a failed seed fails `up`.
+  studio:
+    depends_on:
+      example-seed:
+        condition: service_completed_successfully

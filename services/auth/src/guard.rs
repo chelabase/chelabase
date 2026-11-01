@@ -35,15 +35,31 @@ impl UsedTickets {
 }
 
 /// Fixed-window counters in memory (one auth process).
+///
+/// Invariant: within any one window of a key, the count is exactly the reservations granted and
+/// not refunded, so it never exceeds `limit`, whatever the interleaving of `allow`, `refund` and
+/// window rollover. A refused reservation counts nothing. A granted one stays counted until it
+/// is refunded: one that is never decided (its request dropped mid-call) counts. (`over` and `hit` are the peek-and-count pair; `hit`
+/// counts without a limit.)
 #[derive(Default)]
 pub struct RateLimiter {
     windows: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 impl RateLimiter {
-    /// Counts this attempt; false once `key` has used `limit` attempts in the current window.
+    /// Counts this attempt; false (and nothing counted) once `key` has used `limit` attempts in
+    /// the current window.
     pub fn allow(&self, key: &str, limit: u32, window: Duration) -> bool {
-        let now = Instant::now();
+        self.allow_slot(key, limit, window).is_some()
+    }
+
+    /// Like [`allow`](Self::allow), and on success returns the start of the window the attempt
+    /// was counted in, which [`refund`](Self::refund) needs to give it back.
+    pub fn allow_slot(&self, key: &str, limit: u32, window: Duration) -> Option<Instant> {
+        self.allow_at(key, limit, window, Instant::now())
+    }
+
+    fn allow_at(&self, key: &str, limit: u32, window: Duration, now: Instant) -> Option<Instant> {
         let mut windows = self.windows.lock().expect("limiter lock");
         if windows.len() > 100_000 {
             windows.retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(3600));
@@ -52,8 +68,13 @@ impl RateLimiter {
         if now.duration_since(entry.0) >= window {
             *entry = (now, 0);
         }
+        if entry.1 >= limit {
+            // Turned away: a refused reservation holds nothing, so it must not count (a refund
+            // would never come for it).
+            return None;
+        }
         entry.1 += 1;
-        entry.1 <= limit
+        Some(entry.0)
     }
 
     /// Whether `key` has already used `limit` attempts in its current window; counts nothing.
@@ -67,6 +88,18 @@ impl RateLimiter {
     /// Counts one attempt against `key` without checking a limit (e.g. after a failure).
     pub fn hit(&self, key: &str, window: Duration) {
         self.allow(key, u32::MAX, window);
+    }
+
+    /// Gives back one attempt that [`allow_slot`](Self::allow_slot) counted in the window that
+    /// began at `started`. It applies only to that window: when `key` is in a later window (or
+    /// has none) nothing happens, and the count never goes below zero.
+    pub fn refund(&self, key: &str, started: Instant) {
+        let mut windows = self.windows.lock().expect("limiter lock");
+        if let Some((start, n)) = windows.get_mut(key)
+            && *start == started
+        {
+            *n = n.saturating_sub(1);
+        }
     }
 }
 
@@ -253,6 +286,128 @@ mod tests {
         limiter.hit("k", minute);
         assert!(limiter.over("k", 2, minute));
         assert!(!limiter.over("other", 2, minute));
+    }
+
+    #[test]
+    fn a_refund_gives_back_one_attempt_within_the_window() {
+        let limiter = RateLimiter::default();
+        let minute = Duration::from_secs(60);
+        let slot = limiter.allow_slot("k", 2, minute).unwrap();
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+        // The refused third counted nothing; one refund leaves one held, so one more fits.
+        limiter.refund("k", slot);
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+        limiter.refund("k", slot);
+        limiter.refund("k", slot);
+        limiter.refund("k", slot);
+        // Never below zero: a full budget afterwards, not more.
+        assert!(limiter.allow("k", 2, minute));
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+        // A missing key does nothing.
+        limiter.refund("missing", slot);
+        assert!(limiter.allow("missing", 1, minute));
+        assert!(!limiter.allow("missing", 1, minute));
+    }
+
+    #[test]
+    fn a_refund_after_expiry_leaves_the_next_window_a_full_budget_and_no_more() {
+        let limiter = RateLimiter::default();
+        let short = Duration::from_millis(1);
+        let slot = limiter.allow_slot("k", 2, short).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        limiter.refund("k", slot);
+        let minute = Duration::from_secs(60);
+        assert!(limiter.allow("k", 2, minute));
+        assert!(limiter.allow("k", 2, minute));
+        assert!(!limiter.allow("k", 2, minute));
+    }
+
+    #[test]
+    fn a_refund_for_an_old_window_does_not_free_the_new_one() {
+        let limiter = RateLimiter::default();
+        let w = Duration::from_millis(50);
+        // A slot reserved in the first window (still in flight)...
+        let old = limiter.allow_slot("k", 1, w).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        // ...the window rolls over and a failure spends the new window's only attempt...
+        assert!(limiter.allow("k", 1, w));
+        // ...then the first request succeeds and hands its slot back.
+        limiter.refund("k", old);
+        // The new window's failure must still count.
+        assert!(!limiter.allow("k", 1, w), "refund of a stale slot freed the new window's failure");
+    }
+
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    enum Op {
+        Reserve,
+        /// Refund the n-th (modulo) slot still held.
+        Refund(usize),
+        /// Drop the n-th (modulo) slot still held without deciding it: it stays counted.
+        Abandon(usize),
+        /// Move the clock forward by this many milliseconds.
+        Advance(u64),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        prop::collection::vec(
+            prop_oneof![
+                4 => Just(Op::Reserve),
+                3 => any::<usize>().prop_map(Op::Refund),
+                1 => any::<usize>().prop_map(Op::Abandon),
+                2 => (0u64..250).prop_map(Op::Advance),
+            ],
+            0..200,
+        )
+    }
+
+    proptest! {
+        // The invariant on `RateLimiter`: the count for the current window is exactly the
+        // reservations granted in it and not refunded (a refused one counts nothing), and so
+        // never exceeds the limit.
+        #[test]
+        fn the_count_is_exactly_the_unrefunded_reservations_in_the_window(
+            ops in ops(),
+            limit in 1u32..6,
+        ) {
+            let limiter = RateLimiter::default();
+            let window = Duration::from_millis(100);
+            let mut now = Instant::now();
+            let mut held: Vec<Instant> = Vec::new();
+            let mut unrefunded: HashMap<Instant, u32> = HashMap::new();
+            for op in ops {
+                match op {
+                    Op::Reserve => {
+                        if let Some(started) = limiter.allow_at("k", limit, window, now) {
+                            held.push(started);
+                            *unrefunded.entry(started).or_default() += 1;
+                        }
+                    }
+                    Op::Refund(n) if !held.is_empty() => {
+                        let started = held.remove(n % held.len());
+                        limiter.refund("k", started);
+                        *unrefunded.get_mut(&started).unwrap() -= 1;
+                    }
+                    Op::Abandon(n) if !held.is_empty() => {
+                        held.remove(n % held.len());
+                    }
+                    Op::Refund(_) | Op::Abandon(_) => {}
+                    Op::Advance(ms) => now += Duration::from_millis(ms),
+                }
+                for (started, n) in &unrefunded {
+                    prop_assert!(*n <= limit, "window {started:?} holds {n} > {limit}");
+                }
+                let current = limiter.windows.lock().unwrap().get("k").copied();
+                if let Some((start, count)) = current {
+                    let expected = unrefunded.get(&start).copied().unwrap_or(0);
+                    prop_assert_eq!(count, expected, "window {:?}", start);
+                }
+            }
+        }
     }
 
     #[tokio::test]

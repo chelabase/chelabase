@@ -59,7 +59,18 @@ needs 'target/debug|fn chelabase_cli' CHELABASE_CLI "finds the chelabase CLI"
 # The shared helpers in services/worker/tests/common/mod.rs read CHELABASE_COMPOSE_PROJECT
 # (`compose_project`, and the container names built from it), so a file that gets its container
 # names from them honours the rule without naming the variable itself.
-needs '"docker"' 'CHELABASE_COMPOSE_PROJECT|compose_project\(|pageserver_container\(|storage_broker_container\(' "runs docker on a stack's containers"
+# A file that only renders Compose files (`docker compose … config`) touches no stack, so it is
+# exempt while it runs no container command; one that also execs, starts or reads a container is
+# still caught.
+renders_only() {
+  grep -q '"config"' "$1" &&
+    ! grep -qE '"(exec|up|run|start|stop|restart|ps|logs|kill|rm|cp|inspect)"' "$1"
+}
+while IFS= read -r f; do
+  renders_only "$f" && continue
+  grep -qE 'CHELABASE_COMPOSE_PROJECT|compose_project\(|pageserver_container\(|storage_broker_container\(' "$f" ||
+    { echo "stack-urls: $f runs docker on a stack's containers without CHELABASE_COMPOSE_PROJECT|compose_project\\(|pageserver_container\\(|storage_broker_container\\(" >&2; bad=1; }
+done < <(grep -lE '"docker"' "${tests[@]}" || true)
 needs 'fn internal_addr|INTERNAL_PORT' CHELABASE_INTERNAL_URL "dials the internal listener"
 grep -q 'docker' services/worker/tests/roles_live.rs && grep -q -- '--force-recreate' services/worker/tests/roles_live.rs ||
   { echo "stack-urls: roles_live restarts the orchestrator by recreating its container (compose --force-recreate)" >&2; bad=1; }
