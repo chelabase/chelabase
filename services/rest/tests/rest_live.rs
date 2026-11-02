@@ -1490,10 +1490,11 @@ async fn untrusted_chelabase_is_quarantined_and_runs_nothing_as_superuser() {
             .to_owned()
         };
         // As if the database had never been bootstrapped, and the owner made
-        // chelabase_admin first, with a login.
+        // chelabase_admin first, with a login. `chelabase_admin` also owns the storage
+        // schema (object storage m3), which goes first.
         l.sql_on(
             l.main_id(),
-            "DROP SCHEMA chelabase CASCADE; DROP OWNED BY chelabase_admin; DROP ROLE chelabase_admin;",
+            "DROP SCHEMA IF EXISTS storage CASCADE; DROP SCHEMA chelabase CASCADE; DROP OWNED BY chelabase_admin; DROP ROLE chelabase_admin;",
         )
         .await;
         l.owner(
