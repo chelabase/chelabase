@@ -42,6 +42,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+# The storage sweep (object-storage m8): user blobs.
+chelabase-storage = { workspace = true }
+bytes = { workspace = true }
 
 [dev-dependencies]
 worker = { path = ".", features = ["test-support"] }

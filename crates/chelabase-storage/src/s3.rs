@@ -317,7 +317,7 @@ impl ObjectStore for S3Store {
                 out.push(OpenUpload {
                     key: key.to_string(),
                     upload_id: u.upload_id().unwrap_or_default().to_string(),
-                    initiated: store_time(u.initiated(), key)?,
+                    initiated: u.initiated().and_then(|t| SystemTime::try_from(*t).ok()),
                 });
             }
             if !page.is_truncated().unwrap_or(false) {

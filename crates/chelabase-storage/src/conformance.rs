@@ -41,7 +41,8 @@ async fn dated_listing_and_open_uploads(store: &dyn ObjectStore, prefix: &str) {
     let mine: Vec<_> = uploads.iter().filter(|u| u.upload_id == id).collect();
     assert_eq!(mine.len(), 1, "{uploads:?}");
     assert_eq!(mine[0].key, open);
-    assert!(near(mine[0].initiated), "{uploads:?}");
+    // A store may not say when an upload began; one that does is near our clock.
+    assert!(mine[0].initiated.is_none_or(near), "{uploads:?}");
     // Outside the prefix: not listed.
     assert!(store.list_uploads(&format!("{prefix}/elsewhere/")).await.unwrap().is_empty());
     store.multipart_abort(&open, &id).await.unwrap();

@@ -32,6 +32,8 @@ struct State {
     modified: HashMap<String, SystemTime>,
     /// When each open upload began.
     initiated: HashMap<String, SystemTime>,
+    /// List uploads without their times, as SeaweedFS does.
+    hide_upload_times: bool,
 }
 
 impl State {
@@ -55,6 +57,11 @@ impl MemoryStore {
     /// Sets the store's clock (the times it lists) from now on.
     pub fn set_now(&self, now: SystemTime) {
         self.state.lock().unwrap().now = Some(now);
+    }
+
+    /// From now on, open uploads list without when they began (as SeaweedFS lists them).
+    pub fn hide_upload_times(&self) {
+        self.state.lock().unwrap().hide_upload_times = true;
     }
 
     /// The store's clock.
@@ -180,7 +187,7 @@ impl ObjectStore for MemoryStore {
             .map(|(id, (k, _))| OpenUpload {
                 key: k.clone(),
                 upload_id: id.clone(),
-                initiated: st.initiated[id],
+                initiated: (!st.hide_upload_times).then(|| st.initiated[id]),
             })
             .collect();
         out.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
@@ -309,7 +316,7 @@ mod tests {
         assert_eq!(times, [("p/a", t0), ("p/c", t0 + Duration::from_secs(60))]);
         let uploads = s.list_uploads("p/").await.unwrap();
         assert_eq!(uploads.len(), 1);
-        assert_eq!((uploads[0].upload_id.as_str(), uploads[0].initiated), (id.as_str(), t0));
+        assert_eq!((uploads[0].upload_id.as_str(), uploads[0].initiated), (id.as_str(), Some(t0)));
         assert_eq!(s.now(), t0 + Duration::from_secs(60));
     }
 

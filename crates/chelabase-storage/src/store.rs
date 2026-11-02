@@ -102,7 +102,8 @@ pub struct DatedObject {
 pub struct OpenUpload {
     pub key: String,
     pub upload_id: String,
-    pub initiated: std::time::SystemTime,
+    /// `None` when the store doesn't say (SeaweedFS lists none).
+    pub initiated: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Debug, Default)]

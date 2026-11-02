@@ -178,6 +178,9 @@ pub(crate) fn rt_worker() -> Rt {
         storage_token_refresh_every: w.storage_token_refresh_every,
         storage_token_failures: w.storage_token_failures,
         realtime_password: w.realtime_password,
+        blob_store: w.blob_store,
+        storage_sweep: w.storage_sweep,
+        sweep_requests: w.sweep_requests,
     };
     Rt {
         w,

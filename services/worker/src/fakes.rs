@@ -4148,6 +4148,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         storage_token_refresh_every: Duration::from_secs(3600),
         storage_token_failures: Mutex::default(),
         realtime_password: None,
+        blob_store: None,
+        storage_sweep: Default::default(),
+        sweep_requests: Default::default(),
     };
     (worker, journal)
 }
