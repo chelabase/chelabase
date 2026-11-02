@@ -908,8 +908,11 @@ services:
   # takes its database URL only from a file: the entrypoint writes it from the password file
   # (base64url, checked) into a private tmpfs. Outgoing mail: .env's CHELABASE_SMTP_* (the
   # password from the host file CHELABASE_SMTP_PASSWORD_PATH, as for the bootstrap).
-  # The image isn't published yet: until the release scripts pin it, build it
-  # (`docker buildx bake -f infra/images/docker-bake.hcl identity`) and set
+  # The image isn't published or pinned yet: that happens from `main` once the auth-replacement
+  # epic merges, when the release scripts learn to publish and pin it like the others.
+  # Until then the default tag `unpublished` doesn't exist: build it from the clone with
+  # docker-compose.build.yml (`up -d --build` builds chelabase/identity:local), or build it
+  # with `docker buildx bake -f infra/images/docker-bake.hcl identity` and set
   # CHELABASE_IDENTITY_IMAGE_TAG to its tag.
   identity:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IDENTITY_IMAGE_TAG:-unpublished}
