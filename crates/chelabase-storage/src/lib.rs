@@ -17,3 +17,8 @@ pub use store::{
     ByteRange, ByteStream, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions,
     STREAM_PART_SIZE, StorageError, collect,
 };
+
+/// The longest a signed object URL lives, in seconds (7 days). A signed download keeps
+/// serving its version's blob, even overwritten, until then: a sweeper must not delete an
+/// unreferenced blob younger than this.
+pub const MAX_URL_TTL_SECS: u64 = 7 * 24 * 3600;

@@ -42,7 +42,7 @@ use crate::token::{self, Claims, Purpose, TokenError};
 
 /// A URL's default lifetime, and the longest one.
 pub const DEFAULT_TTL: i64 = 3600;
-pub const MAX_TTL: i64 = 7 * 24 * 3600;
+pub const MAX_TTL: i64 = chelabase_storage::MAX_URL_TTL_SECS as i64;
 
 /// The database's OID and whether a row of the name still exists in the bucket (storage's own
 /// read: the token's minter could read it, so no policy is asked again).
