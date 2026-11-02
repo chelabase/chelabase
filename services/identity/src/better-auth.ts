@@ -4,6 +4,7 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { admin, bearer } from "better-auth/plugins";
 import { PostgresDialect } from "kysely";
 import type pg from "pg";
+import { CodeStore, codesSchemaPlugin } from "./email/codes.ts";
 
 /**
  * Better Auth wants a base URL for callbacks and redirects. Its HTTP handler is never
@@ -11,9 +12,12 @@ import type pg from "pg";
  */
 const BASE_URL = "http://identity.invalid";
 
-/** The fixed plugin list: core email/password (in the options), admin and bearer. */
+/**
+ * The fixed plugin list: core email/password (in the options), admin, bearer, and the email
+ * codes table (schema only; see email/codes.ts for why not `email-otp`).
+ */
 function plugins() {
-  return [admin(), bearer()];
+  return [admin(), bearer(), codesSchemaPlugin()];
 }
 
 /**
@@ -49,8 +53,9 @@ export function authOptions(pool: pg.Pool, secret: string, schema: string | unde
   } satisfies BetterAuthOptions;
 }
 
+/** The pool's Better Auth instance, plus its email-code store on the same pg pool. */
 export function createAuth(pool: pg.Pool, secret: string, schema: string) {
-  return betterAuth(authOptions(pool, secret, schema));
+  return Object.assign(betterAuth(authOptions(pool, secret, schema)), { codes: new CodeStore(pool, schema, secret) });
 }
 
 export type Auth = ReturnType<typeof createAuth>;

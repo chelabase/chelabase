@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import type { AddressInfo } from "node:net";
 import { CallerAuth } from "./caller-auth.ts";
 import type { Config } from "./config.ts";
+import { createMailer } from "./email/mailer.ts";
 import { readBody, toHttpError, type Json } from "./http.ts";
 import { PoolRegistry } from "./registry.ts";
 import { ALLOW, match, resolveId, resolvePool } from "./routes.ts";
@@ -23,6 +24,7 @@ function send(res: ServerResponse, status: number, body?: Json): void {
 export async function startServer(config: Config): Promise<RunningServer> {
   const callers = new CallerAuth(config.callerTokens);
   const registry = new PoolRegistry(config.databaseUrl, config.secret, config.poolCacheSize);
+  const mailer = createMailer(config.smtp);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const [path = "/", search = ""] = (req.url ?? "/").split("?", 2);
@@ -36,10 +38,14 @@ export async function startServer(config: Config): Promise<RunningServer> {
       return send(res, 403, { error: "forbidden", message: `${caller} may not call ${m.route.id}` });
     }
     try {
+      if (m.global) {
+        const reply = await m.route.handle({ caller, mailer });
+        return send(res, reply.status, reply.body);
+      }
       const pool = resolvePool(m.poolSegment);
       const id = resolveId(m.route, m.idSegment);
       const body = await readBody(req);
-      const reply = await m.route.handle({ registry, pool, id, query: new URLSearchParams(search), body });
+      const reply = await m.route.handle({ caller, mailer, registry, pool, id, query: new URLSearchParams(search), body });
       send(res, reply.status, reply.body);
     } catch (err) {
       const e = toHttpError(err);

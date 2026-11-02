@@ -903,6 +903,240 @@
           }
         }
       }
+    },
+    "/internal/v1/pools/{pool}/codes": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "createCode",
+        "summary": "Issue a six-digit email code for a user, replacing that user's earlier code of the same kind",
+        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). TTL: `verify` and `reset` 15 minutes, `invite` 7 days. A code allows 5 wrong guesses; the next guess, right or wrong, is refused.",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "user_id",
+                  "kind",
+                  "delivery"
+                ],
+                "properties": {
+                  "user_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "kind": {
+                    "$ref": "#/components/schemas/CodeKind"
+                  },
+                  "delivery": {
+                    "type": "string",
+                    "enum": [
+                      "email",
+                      "return"
+                    ]
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the email; single line. Default `Chelabase`."
+                  },
+                  "link": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri",
+                    "description": "Absolute http(s) URL where the code is entered, shown in the email. Never carries the code."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "delivery",
+                    "expires_at"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "$ref": "#/components/schemas/CodeKind"
+                    },
+                    "delivery": {
+                      "type": "string",
+                      "enum": [
+                        "email",
+                        "return"
+                      ]
+                    },
+                    "expires_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "code": {
+                      "type": "string",
+                      "pattern": "^[0-9]{6}$",
+                      "description": "Only with `delivery: return`."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/codes/verify": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "verifyCode",
+        "summary": "Check and consume a code",
+        "description": "Counts one attempt and consumes the code in one step. Any wrong, expired, used, replaced or locked-out code, or an unknown user, is 400 `invalid_code`. `verify` marks the email verified. `reset` and `invite` require `new_password`: they set it (400 `weak_password` before the code is spent if its length is out of range), mark the email verified and revoke all of the user's sessions. Kinds never stand in for each other.",
+        "x-callers": [
+          "auth"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "user_id",
+                  "kind",
+                  "code"
+                ],
+                "properties": {
+                  "user_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "kind": {
+                    "$ref": "#/components/schemas/CodeKind"
+                  },
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[0-9]{6}$"
+                  },
+                  "new_password": {
+                    "type": "string",
+                    "maxLength": 1024,
+                    "description": "Required for `reset` and `invite`; refused for `verify`."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Consumed; the updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/email/status": {
+      "get": {
+        "operationId": "emailStatus",
+        "summary": "Whether SMTP is configured and answers (connect, EHLO, TLS and auth as configured)",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "responses": {
+          "200": {
+            "description": "Status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "configured",
+                    "reachable"
+                  ],
+                  "properties": {
+                    "configured": {
+                      "type": "boolean"
+                    },
+                    "reachable": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -971,6 +1205,9 @@
               "invalid_email",
               "weak_password",
               "bad_request",
+              "invalid_code",
+              "email_not_configured",
+              "email_send_failed",
               "internal"
             ]
           },
@@ -1040,6 +1277,14 @@
             "format": "date-time"
           }
         }
+      },
+      "CodeKind": {
+        "type": "string",
+        "enum": [
+          "verify",
+          "reset",
+          "invite"
+        ]
       }
     }
   }

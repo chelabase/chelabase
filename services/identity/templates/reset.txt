@@ -1,0 +1,10 @@
+Subject: Your {{project}} password reset code
+
+Your {{project}} password reset code is:
+
+    {{code}}
+
+Enter it with your new password. It expires in {{expires}} and works once.
+Enter it at: {{link}}
+
+If you didn't ask to reset your password, you can ignore this email. Your password stays the same.
