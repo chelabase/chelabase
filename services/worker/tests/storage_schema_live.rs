@@ -315,7 +315,7 @@ async fn run(fx: &Fx) {
 
     // AC 2: a second run changes nothing.
     let before = fx.value(SHAPE_SQL).await;
-    fx.admin(&storage_schema_sql(OWNER, &fx.verifier().await)).await;
+    fx.admin(&storage_schema_sql(OWNER, &fx.verifier().await, None)).await;
     fx.worker
         .bootstrap_data_api(
             &fx.metadata.get_branch(fx.main).await.unwrap().unwrap(),

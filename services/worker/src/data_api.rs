@@ -669,9 +669,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             warn!(branch_id = %branch, %ep, database = %database_name, "a chelabase schema Chelabase didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
         }
         let (storage_password, salt) = self.storage_login(branch).await?;
+        let parent = self
+            .metadata
+            .get_branch(branch)
+            .await
+            .context("reading the branch")?
+            .and_then(|b| b.parent_branch_id);
+        let parent_verifier = match parent {
+            Some(parent) => self.storage_verifier(parent).await?,
+            None => None,
+        };
         let storage = crate::storage_schema::storage_schema_sql(
             OWNER_ROLE,
             &storage_verifier(&storage_password, &salt),
+            parent_verifier.as_deref(),
         );
         match self.computes.admin_sql(ep, database_name, &storage).await {
             Ok(_) => Ok(()),
@@ -773,6 +784,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .set_storage_password(branch, &sealed, &salt)
             .await
             .context("storing the storage login's password")?;
+        info!(branch_id = %branch, "made the branch's chelabase_storage login");
         self.stored_storage_login(branch)
             .await?
             .context("the storage login's password wasn't stored (is the branch being deleted?)")
