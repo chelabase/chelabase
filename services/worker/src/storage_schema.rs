@@ -16,16 +16,29 @@
 //!   visible or writable until the owner adds policies through `storage.create_policy` /
 //!   `storage.drop_policy` (`SECURITY DEFINER`, owned by `chelabase_admin`, executable by the
 //!   owner only).
-//! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS, NOLOGIN for now) is the storage
-//!   service's role: the only one granted the [`MANAGED_COLUMNS`] of `storage.objects`, and
-//!   the only one the managed-columns trigger lets write them or insert a row.
+//! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS, NOLOGIN until m5 makes it the storage
+//!   service's login) is locked down on every run exactly as the data API locks down
+//!   `chelabase_admin`: attributes, password, connection limit, settings (then
+//!   `search_path = pg_catalog, pg_temp`), members, admins and its own memberships revoked,
+//!   objects it owns here reassigned to the owner, its sessions (and its former members')
+//!   ended before and again after the commit. A role found changed has its tickets voided.
 //! - `anon` and `authenticated` get `USAGE` on the schema (never `CREATE`) and table
-//!   privileges that row level security still gates; `authenticated` may write only the
-//!   unmanaged columns. `authenticator` gets `USAGE` only (it parses statements before it
-//!   switches role).
+//!   privileges that row level security still gates. `authenticated` writes every column of
+//!   `storage.objects` a caller declares, the [`MANAGED_COLUMNS`] included, so RLS policies
+//!   see them. `authenticator` gets `USAGE` only (it parses statements before it switches
+//!   role).
+//! - Upload tickets vouch for the managed columns. Only [`STORAGE_ROLE`] writes
+//!   `storage.upload_tickets` (`guard_tickets` checks `current_user`, so `pg_write_all_data`
+//!   mints nothing: [`TICKET_FORGED`]); a ticket lives at most [`TICKET_MAX_LIFETIME`] and
+//!   records the Neon timeline it was minted on. `protect_objects` (after RLS, so a policy's
+//!   42501 comes first) lets an insert, or an update changing a managed column, through only
+//!   by consuming the ticket matching its bucket, name, version, size and etag, unexpired and
+//!   of this timeline; otherwise [`TICKET_MISSING`]. No role is exempt.
+//! - A branch copies unconsumed tickets but never its parent's timeline (`neon.timeline_id`
+//!   is a postmaster setting, fixed per compute), so they can't be used there.
 //! - Owner-level roles (the database owner is a Neon privileged role: `BYPASSRLS`, a member of
 //!   `pg_read_all_data` and `pg_write_all_data`) read and write past both RLS and the column
-//!   grants, as on any table; the trigger still refuses their writes to the managed columns.
+//!   grants, as on any table; the triggers still hold them to tickets.
 //!
 //! The script is one transaction under [`BOOTSTRAP_LOCK_KEY`], safe to run again: every
 //! object is created only when missing (or replaced), and the grants on both tables are reset
@@ -41,12 +54,24 @@ pub const STORAGE_SCHEMA: &str = "storage";
 /// The storage service's role.
 pub const STORAGE_ROLE: &str = "chelabase_storage";
 
-/// The columns of `storage.objects` only [`STORAGE_ROLE`] writes.
+/// The columns of `storage.objects` a caller may write only with a matching upload ticket.
 pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag"];
 
 /// The schema's comment: which version of [`storage_schema_sql`] installed it. Bump the
 /// number whenever the script changes what it installs, so reconcile reinstalls.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 1";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 2";
+
+/// The SQLSTATE `protect_objects` raises when an object's managed columns match no unexpired
+/// ticket of this timeline (none, a different value, already used, expired, or another
+/// branch's). Not `CB001`/`CB002`: those are the data API's (stale schema version, response
+/// too large) and rest's pipeline acts on them.
+pub const TICKET_MISSING: &str = "CB003";
+
+/// The SQLSTATE `guard_tickets` raises when anyone but [`STORAGE_ROLE`] writes a ticket.
+pub const TICKET_FORGED: &str = "CB004";
+
+/// The longest a ticket may live: an upload's final insert follows its body within seconds.
+pub const TICKET_MAX_LIFETIME: &str = "15 minutes";
 
 /// The script's first line (the fakes' needle).
 pub const STORAGE_SCHEMA_MARK: &str = "-- chelabase:storage-schema";
@@ -63,7 +88,7 @@ pub const STORAGE_CHECK_SQL: &str = " AND EXISTS (SELECT FROM pg_catalog.pg_name
        JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner \
        WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' \
          AND (r.rolname OPERATOR(pg_catalog.<>) 'chelabase_admin' \
-           OR (pg_catalog.obj_description(n.oid, 'pg_namespace') OPERATOR(pg_catalog.=) 'chelabase storage schema 1' \
+           OR (pg_catalog.obj_description(n.oid, 'pg_namespace') OPERATOR(pg_catalog.=) 'chelabase storage schema 2' \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
                WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND c.relkind OPERATOR(pg_catalog.=) 'r' \
                  AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets', 'objects']::pg_catalog.name[]) \
@@ -92,11 +117,56 @@ DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
     RAISE EXCEPTION 'chelabase_data_api_missing: the data API bootstrap has not run in this database';
   END IF;
-  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage') THEN
-    CREATE ROLE chelabase_storage NOLOGIN NOINHERIT BYPASSRLS;
+END $$;
+DO $$ DECLARE
+  role pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage');
+  members pg_catalog.oid[];
+  joined boolean;
+  tampered boolean;
+  m record;
+BEGIN
+  IF role IS NULL THEN
+    CREATE ROLE chelabase_storage NOLOGIN NOINHERIT BYPASSRLS PASSWORD NULL CONNECTION LIMIT 0;
+    role := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage');
+  END IF;
+  members := ARRAY(SELECT member FROM pg_catalog.pg_auth_members WHERE roleid OPERATOR(pg_catalog.=) role);
+  joined := EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role OR a.member OPERATOR(pg_catalog.=) role);
+  tampered := EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) role
+    AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
+      OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) 0))
+    OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) role
+      AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp']::pg_catalog.text[]));
+  ALTER ROLE chelabase_storage NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
+  FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
+    WHERE s.setrole OPERATOR(pg_catalog.=) role
+  LOOP
+    EXECUTE pg_catalog.format('ALTER ROLE chelabase_storage IN DATABASE %I RESET ALL', m.datname);
+  END LOOP;
+  ALTER ROLE chelabase_storage RESET ALL;
+  ALTER ROLE chelabase_storage SET search_path = pg_catalog, pg_temp;
+  FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.roleid OPERATOR(pg_catalog.=) role
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE chelabase_storage FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);
+  END LOOP;
+  FOR m IN SELECT r.rolname AS granted, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.roleid JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
+    WHERE a.member OPERATOR(pg_catalog.=) role
+  LOOP
+    EXECUTE pg_catalog.format('REVOKE %I FROM chelabase_storage GRANTED BY %I CASCADE', m.granted, m.grantor);
+  END LOOP;
+  REASSIGN OWNED BY chelabase_storage TO {owner};
+  PERFORM pg_catalog.set_config('chelabase.storage_former_members', pg_catalog.array_to_string(members, ','), false);
+  PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
+    WHERE (a.usesysid OPERATOR(pg_catalog.=) role OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
+      AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+  IF (joined OR tampered) AND pg_catalog.to_regclass('storage.upload_tickets') IS NOT NULL THEN
+    DELETE FROM storage.upload_tickets;
+    RAISE WARNING 'chelabase: chelabase_storage had been changed; it was locked down and its upload tickets voided';
   END IF;
 END $$;
-ALTER ROLE chelabase_storage NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT BYPASSRLS;
 CREATE SCHEMA IF NOT EXISTS storage AUTHORIZATION chelabase_admin;
 REVOKE ALL ON SCHEMA storage FROM PUBLIC;
 GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_storage, {owner};
@@ -122,35 +192,74 @@ CREATE TABLE IF NOT EXISTS storage.objects (
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (bucket_id, name)
 );
+CREATE TABLE IF NOT EXISTS storage.upload_tickets (
+  version_id uuid PRIMARY KEY,
+  bucket_id uuid NOT NULL,
+  name text NOT NULL,
+  size bigint NOT NULL,
+  etag text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  timeline_id text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE storage.upload_tickets OWNER TO chelabase_admin;
 ALTER TABLE storage.buckets OWNER TO chelabase_admin;
 ALTER TABLE storage.objects OWNER TO chelabase_admin;
 ALTER TABLE storage.buckets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE storage.buckets FORCE ROW LEVEL SECURITY;
 ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE storage.objects FORCE ROW LEVEL SECURITY;
-REVOKE ALL ON storage.buckets, storage.objects FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
+REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
 GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;
 GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types), UPDATE (name, public, file_size_limit, allowed_mime_types), DELETE ON storage.buckets TO authenticated;
-GRANT INSERT (id, name, owner, metadata, content_type), UPDATE (name, owner, metadata, content_type), DELETE ON storage.objects TO authenticated;
+GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;
-CREATE OR REPLACE FUNCTION storage.protect_objects() RETURNS trigger
+GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;
+CREATE OR REPLACE FUNCTION storage.guard_tickets() RETURNS trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
 $f$
 BEGIN
-  IF current_user = 'chelabase_storage' THEN
+  IF current_user <> 'chelabase_storage' THEN
+    RAISE EXCEPTION USING ERRCODE = '{TICKET_FORGED}', MESSAGE = 'storage.upload_tickets is written by Chelabase storage only';
+  END IF;
+  -- The timeline it was minted on: a branch copies the row, never the timeline.
+  NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);
+  IF NEW.timeline_id IS NULL OR NEW.timeline_id = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'storage.upload_tickets: this server has no Neon timeline';
+  END IF;
+  IF NEW.expires_at <= now() OR NEW.expires_at > now() + interval '{TICKET_MAX_LIFETIME}' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_tickets: a ticket expires within {TICKET_MAX_LIFETIME}';
+  END IF;
+  RETURN NEW;
+END
+$f$;
+ALTER FUNCTION storage.guard_tickets() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.guard_tickets() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER guard_tickets BEFORE INSERT OR UPDATE ON storage.upload_tickets
+  FOR EACH ROW EXECUTE FUNCTION storage.guard_tickets();
+ALTER TABLE storage.upload_tickets ENABLE ALWAYS TRIGGER guard_tickets;
+CREATE OR REPLACE FUNCTION storage.protect_objects() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
+$f$
+DECLARE
+  consumed uuid;
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.bucket_id IS NOT DISTINCT FROM OLD.bucket_id AND NEW.version_id IS NOT DISTINCT FROM OLD.version_id
+      AND NEW.size IS NOT DISTINCT FROM OLD.size AND NEW.etag IS NOT DISTINCT FROM OLD.etag THEN
     RETURN NULL;
   END IF;
-  IF TG_OP = 'INSERT' THEN
-    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'rows of storage.objects are created by Chelabase storage';
-  END IF;
-  IF NEW.bucket_id IS DISTINCT FROM OLD.bucket_id OR NEW.version_id IS DISTINCT FROM OLD.version_id
-      OR NEW.size IS DISTINCT FROM OLD.size OR NEW.etag IS DISTINCT FROM OLD.etag THEN
-    RAISE EXCEPTION USING ERRCODE = '42501', MESSAGE = 'columns bucket_id, version_id, size and etag of storage.objects are managed by Chelabase storage';
+  DELETE FROM storage.upload_tickets t
+    WHERE t.version_id = NEW.version_id AND t.bucket_id = NEW.bucket_id AND t.name = NEW.name
+      AND t.size = NEW.size AND t.etag = NEW.etag AND t.expires_at > now()
+      AND t.timeline_id = pg_catalog.current_setting('neon.timeline_id', true)
+    RETURNING t.version_id INTO consumed;
+  IF consumed IS NULL THEN
+    RAISE EXCEPTION USING ERRCODE = '{TICKET_MISSING}', MESSAGE = 'storage.objects: bucket_id, name, version_id, size and etag match no unused upload ticket';
   END IF;
   RETURN NULL;
 END
 $f$;
-ALTER FUNCTION storage.protect_objects() OWNER TO CURRENT_USER;
+ALTER FUNCTION storage.protect_objects() OWNER TO chelabase_admin;
 REVOKE ALL ON FUNCTION storage.protect_objects() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER protect_objects AFTER INSERT OR UPDATE ON storage.objects
   FOR EACH ROW EXECUTE FUNCTION storage.protect_objects();
@@ -241,6 +350,13 @@ GRANT EXECUTE ON FUNCTION storage.create_policy(name, name, text, name[], text, 
 GRANT EXECUTE ON FUNCTION storage.drop_policy(name, name) TO {owner};
 COMMENT ON SCHEMA storage IS '{STORAGE_SCHEMA_STAMP}';
 COMMIT;
+DO $$ BEGIN
+  PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
+    JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
+    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage' OR a.usesysid OPERATOR(pg_catalog.=) ANY
+        (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.storage_former_members', true), ',')::pg_catalog.oid[]))
+      AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
+END $$;
 "#
     )
 }
@@ -281,9 +397,16 @@ mod tests {
             "{STORAGE_SCHEMA_MARK}\nBEGIN;\nSET search_path = pg_catalog, pg_temp;\nSET LOCAL lock_timeout = '{LOCK_TIMEOUT_SECS}s';\nSELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});\n"
         );
         assert!(sql.starts_with(&head), "{sql}");
-        assert!(sql.trim_end().ends_with("COMMIT;"), "{sql}");
         assert_eq!(sql.matches("BEGIN;").count(), 1, "{sql}");
         assert_eq!(sql.matches("COMMIT;").count(), 1, "{sql}");
+        // After the commit, only the second round of terminations (no changes).
+        let after = sql.split_once("COMMIT;\n").unwrap().1;
+        assert!(
+            after.starts_with("DO $$ BEGIN\n  PERFORM pg_catalog.pg_terminate_backend(a.pid)"),
+            "{after}"
+        );
+        assert!(after.trim_end().ends_with("END $$;"), "{after}");
+        assert_eq!(after.matches(';').count(), 2, "{after}");
     }
 
     /// AC 2: every object is made only when missing, so a second run changes nothing but
@@ -309,9 +432,10 @@ mod tests {
             );
         }
         assert!(creates >= 10, "{sql}");
-        assert!(sql.contains(
-            "IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage') THEN\n    CREATE ROLE chelabase_storage "
-        ), "{sql}");
+        assert!(
+            sql.contains("IF role IS NULL THEN\n    CREATE ROLE chelabase_storage "),
+            "{sql}"
+        );
         assert!(sql.contains(
             "IF pg_catalog.to_regtype('storage.object_ref') IS NULL THEN\n    CREATE TYPE storage.object_ref "
         ), "{sql}");
@@ -390,37 +514,89 @@ mod tests {
         );
     }
 
-    /// The storage service's role: BYPASSRLS and nothing owner-level, re-asserted each run.
+    /// The storage service's role, locked down each run exactly as the data API locks down
+    /// `chelabase_admin`: whatever an owner made of a pre-created role (LOGIN, a password, a
+    /// connection limit, settings, members, admins, memberships in other roles, objects it
+    /// owns, open sessions) is gone before the schema is touched.
     #[test]
-    fn storage_schema_role_bypasses_rls_and_nothing_else() {
+    fn storage_schema_role_is_locked_down_like_the_admin() {
         let sql = sql();
+        let lockdown = between(&sql, "DO $$ DECLARE\n  role pg_catalog.oid", "END $$;");
+        let schema_at = sql.find("CREATE SCHEMA IF NOT EXISTS storage").unwrap();
+        assert!(sql.find(lockdown).unwrap() < schema_at, "{sql}");
+        for part in [
+            "IF role IS NULL THEN\n    CREATE ROLE chelabase_storage NOLOGIN NOINHERIT BYPASSRLS PASSWORD NULL CONNECTION LIMIT 0;",
+            "ALTER ROLE chelabase_storage NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;",
+            "EXECUTE pg_catalog.format('ALTER ROLE chelabase_storage IN DATABASE %I RESET ALL', m.datname);",
+            "ALTER ROLE chelabase_storage RESET ALL;",
+            "ALTER ROLE chelabase_storage SET search_path = pg_catalog, pg_temp;",
+            // Its members and admins (an ADMIN grant is a membership row too)...
+            "WHERE a.roleid OPERATOR(pg_catalog.=) role",
+            "EXECUTE pg_catalog.format('REVOKE chelabase_storage FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);",
+            // ...and its own memberships in other roles.
+            "WHERE a.member OPERATOR(pg_catalog.=) role",
+            "EXECUTE pg_catalog.format('REVOKE %I FROM chelabase_storage GRANTED BY %I CASCADE', m.granted, m.grantor);",
+            // Objects a pre-created role owns here go to the owner, so nothing runs as it.
+            "REASSIGN OWNED BY chelabase_storage TO \"postgres\"",
+            "PERFORM pg_catalog.set_config('chelabase.storage_former_members', pg_catalog.array_to_string(members, ','), false);",
+            "PERFORM pg_catalog.pg_terminate_backend(a.pid)",
+            // Tickets minted while it was tampered with are void.
+            "IF (joined OR tampered) AND pg_catalog.to_regclass('storage.upload_tickets') IS NOT NULL THEN\n    DELETE FROM storage.upload_tickets;",
+        ] {
+            assert!(lockdown.contains(part), "{part}: {lockdown}");
+        }
+        // Tampered: any attribute or setting beyond the ones it is given here.
+        let tampered = between(lockdown, "tampered :=", ";\n");
+        for attribute in [
+            "rolcanlogin",
+            "rolsuper",
+            "rolcreaterole",
+            "rolcreatedb",
+            "rolreplication",
+            "NOT a.rolbypassrls",
+            "rolpassword IS NOT NULL",
+            "rolconnlimit OPERATOR(pg_catalog.<>) 0",
+            "pg_db_role_setting",
+            "ARRAY['search_path=pg_catalog, pg_temp']",
+        ] {
+            assert!(tampered.contains(attribute), "{attribute}: {tampered}");
+        }
+        let joined = between(lockdown, "joined :=", ";\n");
         assert!(
-            sql.contains("CREATE ROLE chelabase_storage NOLOGIN NOINHERIT BYPASSRLS;"),
-            "{sql}"
+            joined.contains(
+                "a.roleid OPERATOR(pg_catalog.=) role OR a.member OPERATOR(pg_catalog.=) role"
+            ),
+            "{joined}"
         );
-        assert!(sql.contains("ALTER ROLE chelabase_storage NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOINHERIT BYPASSRLS;"), "{sql}");
+        // The sessions are ended again once the revokes are committed.
+        let after = sql.split_once("COMMIT;\n").unwrap().1;
+        assert!(
+            after.contains("pg_catalog.current_setting('chelabase.storage_former_members', true)")
+                && after.contains("r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage'"),
+            "{after}"
+        );
         assert_eq!(STORAGE_ROLE, "chelabase_storage");
     }
 
-    /// AC 3 and 5: the grants are reset each run and then given exactly: `USAGE` (never
-    /// `CREATE`) on the schema, `SELECT` for `anon`, the unmanaged columns only for
-    /// `authenticated`, everything for the storage role. Nobody gets `TRUNCATE`, `TRIGGER`,
-    /// `REFERENCES` or a grant option.
+    /// The grants are reset each run and then given exactly: `USAGE` (never `CREATE`) on the
+    /// schema; `SELECT` for `anon`; `authenticated` writes every object column a caller
+    /// declares, the managed ones included (so RLS policies see them; the ticket trigger
+    /// vouches for them); tickets only for the storage role. Nobody gets `TRUNCATE`,
+    /// `TRIGGER`, `REFERENCES`, a grant option or anything on the tickets but the storage role.
     #[test]
-    fn storage_schema_grants_keep_managed_columns_for_the_storage_role() {
+    fn storage_schema_grants_let_callers_declare_managed_columns() {
         let sql = sql();
         assert!(
             sql.contains("REVOKE ALL ON SCHEMA storage FROM PUBLIC;"),
             "{sql}"
         );
         assert!(sql.contains("GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_storage, \"postgres\";"), "{sql}");
-        let reset = "REVOKE ALL ON storage.buckets, storage.objects FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, \"postgres\";";
+        let reset = "REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, \"postgres\";";
         let reset_at = sql.find(reset).unwrap_or_else(|| panic!("{reset}: {sql}"));
         let grants: Vec<&str> = sql
             .lines()
             .filter(|l| l.starts_with("GRANT ") && l.contains(" ON storage."))
             .collect();
-        assert!(!grants.is_empty());
         for grant in &grants {
             assert!(
                 sql.find(grant).unwrap() > reset_at,
@@ -434,58 +610,60 @@ mod tests {
                     && !grant.contains(" ALL "),
                 "{grant}"
             );
-            let to = grant.rsplit_once(" TO ").unwrap().1;
-            if to != "chelabase_storage;" {
-                let words: Vec<&str> = grant
-                    .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-                    .collect();
-                for column in MANAGED_COLUMNS {
-                    assert!(
-                        !words.contains(&column),
-                        "{column} granted beyond the storage role: {grant}"
-                    );
-                }
-                // A table-wide INSERT or UPDATE would cover the managed columns.
-                let privileges = grant
-                    .strip_prefix("GRANT ")
-                    .unwrap()
-                    .split(" ON ")
-                    .next()
-                    .unwrap();
-                for privilege in privileges.split(", ") {
-                    assert!(
-                        !(privilege == "INSERT" || privilege == "UPDATE"),
-                        "table-wide {privilege}: {grant}"
-                    );
-                }
-                assert!(!to.contains("authenticator"), "{grant}");
+            if grant.contains("upload_tickets") {
+                assert_eq!(
+                    *grant,
+                    "GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;"
+                );
+            }
+            if !grant.ends_with(" TO chelabase_storage;") {
+                assert!(!grant.contains("authenticator"), "{grant}");
             }
         }
-        assert!(
-            grants.contains(
-                &"GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;"
-            ),
-            "{grants:?}"
+        assert_eq!(
+            grants,
+            [
+                "GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;",
+                "GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types), UPDATE (name, public, file_size_limit, allowed_mime_types), DELETE ON storage.buckets TO authenticated;",
+                "GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;",
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;",
+                "GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;",
+            ]
         );
-        assert!(grants.contains(&"GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;"), "{grants:?}");
-        assert!(
-            grants.iter().any(
-                |g| g.contains("UPDATE (name, owner, metadata, content_type)")
-                    && g.contains("storage.objects TO authenticated")
-            ),
-            "{grants:?}"
-        );
+        for column in MANAGED_COLUMNS {
+            assert!(grants[2].contains(column), "{column}");
+        }
     }
 
-    /// AC 3: the trigger refuses every write to a managed column, and every insert, unless
-    /// the statement runs as the storage role; `ENABLE ALWAYS`, so replica mode doesn't skip
-    /// it.
+    /// The tickets table: the admin's, no RLS (nobody but the storage role has a grant), and
+    /// a trigger that refuses with [`TICKET_FORGED`] any write not made as the storage role
+    /// (so `pg_write_all_data` mints nothing), stamps the timeline, and caps the lifetime.
     #[test]
-    fn storage_schema_trigger_guards_the_managed_columns() {
+    fn storage_schema_tickets_are_written_by_the_storage_role_only() {
         let sql = sql();
+        let table = between(
+            &sql,
+            "CREATE TABLE IF NOT EXISTS storage.upload_tickets (",
+            ");",
+        );
+        for column in [
+            "version_id uuid PRIMARY KEY",
+            "bucket_id uuid NOT NULL",
+            "name text NOT NULL",
+            "size bigint NOT NULL",
+            "etag text NOT NULL",
+            "expires_at timestamptz NOT NULL",
+            "timeline_id text NOT NULL",
+        ] {
+            assert!(table.contains(column), "{column}: {table}");
+        }
+        assert!(
+            sql.contains("ALTER TABLE storage.upload_tickets OWNER TO chelabase_admin;"),
+            "{sql}"
+        );
         let body = between(
             &sql,
-            "CREATE OR REPLACE FUNCTION storage.protect_objects()",
+            "CREATE OR REPLACE FUNCTION storage.guard_tickets()",
             "$f$;",
         );
         assert!(
@@ -494,28 +672,99 @@ mod tests {
             ),
             "{body}"
         );
+        assert!(body.contains(&format!("IF current_user <> 'chelabase_storage' THEN\n    RAISE EXCEPTION USING ERRCODE = '{TICKET_FORGED}'")), "{body}");
         assert!(
             body.contains(
-                "IF current_user = 'chelabase_storage' THEN\n    RETURN NULL;\n  END IF;"
+                "NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);"
             ),
             "{body}"
         );
-        assert!(body.contains("IF TG_OP = 'INSERT' THEN"), "{body}");
-        for column in MANAGED_COLUMNS {
-            assert!(
-                body.contains(&format!("NEW.{column} IS DISTINCT FROM OLD.{column}")),
-                "{column}: {body}"
-            );
+        assert!(
+            body.contains("IF NEW.timeline_id IS NULL OR NEW.timeline_id = '' THEN"),
+            "{body}"
+        );
+        assert!(body.contains(&format!("NEW.expires_at <= now() OR NEW.expires_at > now() + interval '{TICKET_MAX_LIFETIME}'")), "{body}");
+        assert!(sql.contains("CREATE OR REPLACE TRIGGER guard_tickets BEFORE INSERT OR UPDATE ON storage.upload_tickets\n  FOR EACH ROW EXECUTE FUNCTION storage.guard_tickets();"), "{sql}");
+        assert!(
+            sql.contains("ALTER TABLE storage.upload_tickets ENABLE ALWAYS TRIGGER guard_tickets;"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("ALTER FUNCTION storage.guard_tickets() OWNER TO CURRENT_USER;"),
+            "{sql}"
+        );
+    }
+
+    /// AC 3: `protect_objects` (after RLS, so a policy's 42501 comes first) accepts the
+    /// managed columns of an insert, or of an update that changes one, only by consuming the
+    /// matching unexpired ticket minted on this timeline; no role is exempt. `ENABLE ALWAYS`.
+    #[test]
+    fn storage_schema_objects_trigger_consumes_one_ticket() {
+        let sql = sql();
+        let body = between(
+            &sql,
+            "CREATE OR REPLACE FUNCTION storage.protect_objects()",
+            "$f$;",
+        );
+        assert!(
+            body.contains(
+                "LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp"
+            ),
+            "{body}"
+        );
+        assert!(!body.contains("current_user"), "no role is exempt: {body}");
+        assert!(body.contains("IF TG_OP = 'UPDATE' AND NEW.bucket_id IS NOT DISTINCT FROM OLD.bucket_id AND NEW.version_id IS NOT DISTINCT FROM OLD.version_id\n      AND NEW.size IS NOT DISTINCT FROM OLD.size AND NEW.etag IS NOT DISTINCT FROM OLD.etag THEN\n    RETURN NULL;"), "{body}");
+        let consume = between(body, "DELETE FROM storage.upload_tickets t", ";");
+        for part in [
+            "t.version_id = NEW.version_id",
+            "t.bucket_id = NEW.bucket_id",
+            "t.name = NEW.name",
+            "t.size = NEW.size",
+            "t.etag = NEW.etag",
+            "t.expires_at > now()",
+            "t.timeline_id = pg_catalog.current_setting('neon.timeline_id', true)",
+            "RETURNING t.version_id INTO consumed",
+        ] {
+            assert!(consume.contains(part), "{part}: {consume}");
         }
-        assert!(body.contains("ERRCODE = '42501'"), "{body}");
+        assert!(
+            body.contains(&format!(
+                "IF consumed IS NULL THEN\n    RAISE EXCEPTION USING ERRCODE = '{TICKET_MISSING}'"
+            )),
+            "{body}"
+        );
         assert!(sql.contains("CREATE OR REPLACE TRIGGER protect_objects AFTER INSERT OR UPDATE ON storage.objects\n  FOR EACH ROW EXECUTE FUNCTION storage.protect_objects();"), "{sql}");
         assert!(
             sql.contains("ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER protect_objects;"),
             "{sql}"
         );
         assert!(
-            sql.contains("ALTER FUNCTION storage.protect_objects() OWNER TO CURRENT_USER;"),
+            sql.contains("ALTER FUNCTION storage.protect_objects() OWNER TO chelabase_admin;"),
             "{sql}"
+        );
+    }
+
+    /// The triggers' codes are their own: never RLS's 42501, never the data API's `CB001`
+    /// (stale schema version: rest retries) or `CB002` (response too large).
+    #[test]
+    fn storage_schema_ticket_codes_are_dedicated() {
+        assert_eq!((TICKET_MISSING, TICKET_FORGED), ("CB003", "CB004"));
+        let data_api = crate::data_api::data_api_sql("postgres", "pw", "public");
+        for code in [TICKET_MISSING, TICKET_FORGED] {
+            assert_ne!(code, "42501");
+            assert!(
+                !data_api.contains(&format!("'{code}'")),
+                "{code} is the data API's"
+            );
+            assert_eq!(
+                sql().matches(&format!("ERRCODE = '{code}'")).count(),
+                1,
+                "{code}"
+            );
+        }
+        assert!(
+            !sql().contains("ERRCODE = '42501'"),
+            "the triggers never raise RLS's code"
         );
     }
 
