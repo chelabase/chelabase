@@ -176,7 +176,7 @@ pub fn final_failure(f: Failure) -> Failure {
 
 impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     /// `bucket`'s id and limit in the located database; 404 when there's none.
-    async fn bucket(
+    pub(crate) async fn bucket(
         &self,
         data: &DataIdentity,
         at: &Located,
@@ -424,11 +424,25 @@ fn header(headers: &HeaderMap, name: impl axum::http::header::AsHeaderName) -> O
 async fn upload_object<S: ConnSource, M: ConnSource>(
     state: Arc<AppState<S, M>>,
     headers: HeaderMap,
-    (bucket, name): (String, String),
+    path: (String, String),
     q: ObjectParams,
     request: Body,
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
+    upload_as(&state, &data, &rid, &headers, path, q, request).await
+}
+
+/// An upload as `data` (a data key's request, or an upload token's minting key).
+pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
+    state: &AppState<S, M>,
+    data: &DataIdentity,
+    rid: &str,
+    headers: &HeaderMap,
+    (bucket, name): (String, String),
+    q: ObjectParams,
+    request: Body,
+) -> Result<Response, Failure> {
+    let (data, rid, headers) = (data.clone(), rid.to_owned(), headers.clone());
     check_object_name(&name)?;
     let upsert = q.upsert.unwrap_or(false) || header(&headers, "x-upsert") == Some("true");
     let at = state
@@ -538,19 +552,19 @@ pub async fn put<S: ConnSource, M: ConnSource>(
 }
 
 /// What a read needs of the row the caller sees.
-struct Found {
+pub(crate) struct Found {
     /// The database's OID, read with the row.
-    datoid: u32,
-    version: Uuid,
-    size: i64,
-    etag: String,
-    content_type: String,
-    owner: Option<Uuid>,
+    pub datoid: u32,
+    pub version: Uuid,
+    pub size: i64,
+    pub etag: String,
+    pub content_type: String,
+    pub owner: Option<Uuid>,
 }
 
 impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     /// The object `name` of `bucket` as the caller sees it; 404 when missing or hidden.
-    async fn find(
+    pub(crate) async fn find(
         &self,
         data: &DataIdentity,
         at: &Located,
@@ -601,16 +615,26 @@ fn object_headers(found: &Found, name: &str, download: Option<&str>) -> HeaderMa
     };
     set(&mut h, header::ETAG, names::quoted_etag(&found.etag));
     set(&mut h, header::CONTENT_TYPE, found.content_type.clone());
+    // Inline only for a safe type without `?download`; anything else is an attachment.
+    let disposition = match download {
+        None if names::inline_safe(&found.content_type) => None,
+        other => Some(other.unwrap_or("")),
+    };
     set(
         &mut h,
         header::CONTENT_DISPOSITION,
-        names::content_disposition(name, download),
+        names::content_disposition(name, disposition),
     );
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
-    // Never sniffed into another type (m6 adds the sandbox and attachment rules).
+    // Never sniffed into another type, and never a document that runs script on the API's
+    // origin, even opened directly.
     h.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
     );
     h
 }
@@ -645,11 +669,34 @@ pub async fn download<S: ConnSource, M: ConnSource>(
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
     let (_, found) = state.find(&data, &at, &bucket, &name, &rid).await?;
-    let mut out = object_headers(&found, &name, q.download.as_deref());
-    if header(&headers, header::IF_NONE_MATCH).is_some_and(|v| names::none_match(v, &found.etag)) {
+    serve(
+        &state,
+        &headers,
+        at.database_id,
+        &found,
+        &name,
+        q.download.as_deref(),
+        &rid,
+    )
+    .await
+}
+
+/// Answers a GET of `found` (its blob under `database_id`'s prefix): 304 for a matching
+/// `If-None-Match`, 206 for a `Range`, else 200, with [`object_headers`].
+pub(crate) async fn serve<S, M>(
+    state: &AppState<S, M>,
+    headers: &HeaderMap,
+    database_id: Uuid,
+    found: &Found,
+    name: &str,
+    download: Option<&str>,
+    rid: &str,
+) -> Result<Response, Failure> {
+    let mut out = object_headers(found, name, download);
+    if header(headers, header::IF_NONE_MATCH).is_some_and(|v| names::none_match(v, &found.etag)) {
         return Ok((StatusCode::NOT_MODIFIED, out).into_response());
     }
-    let range = match header(&headers, header::RANGE) {
+    let range = match header(headers, header::RANGE) {
         Some(r) => Some(ByteRange::parse(r).map_err(|_| Failure::range_not_satisfiable())?),
         None => None,
     };
@@ -663,14 +710,14 @@ pub async fn download<S: ConnSource, M: ConnSource>(
         None => None,
     };
     let key = names::version_key(
-        &names::object_prefix(at.database_id, found.datoid),
+        &names::object_prefix(database_id, found.datoid),
         found.version,
     );
     let object = state
         .store
         .get(&key, range)
         .await
-        .map_err(|e| Failure::from_store(&e, &rid))?;
+        .map_err(|e| Failure::from_store(&e, rid))?;
     let status = match span {
         Some(span) => {
             let v = format!(
@@ -1208,6 +1255,30 @@ mod tests {
                 .unwrap()
                 .contains("(key, key) > ($5::text::text, $6)")
         );
+    }
+
+    /// m6: no stored object runs script on the API origin: every answer is sandboxed and
+    /// never sniffed, and anything but a safe inline type is an attachment.
+    #[test]
+    fn unsafe_types_are_sandboxed_attachments() {
+        let mut found = Found {
+            datoid: 1,
+            version: Uuid::nil(),
+            size: 1,
+            etag: "e".into(),
+            content_type: "text/html".into(),
+            owner: None,
+        };
+        let h = object_headers(&found, "a.html", None);
+        assert_eq!(h[header::CONTENT_SECURITY_POLICY], "sandbox");
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
+        found.content_type = "image/png".into();
+        let h = object_headers(&found, "a.png", None);
+        assert_eq!(h[header::CONTENT_DISPOSITION], "inline");
+        assert_eq!(h[header::CONTENT_SECURITY_POLICY], "sandbox");
+        let h = object_headers(&found, "a.png", Some(""));
+        assert!(h[header::CONTENT_DISPOSITION].to_str().unwrap().starts_with("attachment;"));
     }
 
     /// Every download and HEAD answer says `nosniff`.

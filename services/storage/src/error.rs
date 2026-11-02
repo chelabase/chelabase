@@ -117,6 +117,26 @@ impl Failure {
         )
     }
 
+    /// 401: a signed URL's token that isn't one of ours, was changed, or is missing.
+    pub fn invalid_token() -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "invalid_token", "the URL's token isn't valid")
+    }
+
+    /// 401: a signed URL past its expiry.
+    pub fn token_expired() -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "token_expired", "the URL has expired")
+    }
+
+    /// 403: a genuine token that doesn't open this: another object, purpose or branch, a key
+    /// revoked since, or an upload token already used.
+    pub fn token_refused() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "token_not_valid",
+            "the URL doesn't open this object, its key was revoked, or it was used already",
+        )
+    }
+
     /// 502: the object store failed (the caller logs why).
     pub fn store_failed() -> Self {
         Self::new(

@@ -8451,3 +8451,45 @@ async fn an_exemption_name_may_hold_any_character_but_nul() {
     assert!(added.unwrap());
     assert_eq!(listed.unwrap(), ["a\u{1}b"]);
 }
+
+/// Object storage m6: an upload token is recorded only for a live key and spent once, before
+/// its expiry, while its key is live; two concurrent spends (two replicas) get it once.
+#[tokio::test]
+#[ignore]
+async fn storage_upload_tokens_spend_once() {
+    let client = client().await;
+    let (id, _) = ready_database(&client).await;
+    let branch = main_of(id);
+    let (key, _) = new_key(branch, DataKeyKind::Secret, "authenticated", "uploads");
+    client.insert_data_key(&key).await.unwrap();
+    let live = client.live_data_key(key.id).await.unwrap();
+    let unknown = client.live_data_key(uuid::Uuid::new_v4()).await.unwrap();
+    let later = chrono::Utc::now() + chrono::Duration::minutes(5);
+    let claims = serde_json::json!({ "sub": "u1" });
+    let (token, expired, revoked) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+    let recorded = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
+    let again = client.insert_upload_token(token, key.id, &claims, later).await.unwrap();
+    let dead_key = client.insert_upload_token(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), &claims, later).await;
+    client
+        .insert_upload_token(expired, key.id, &claims, chrono::Utc::now() - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(client.consume_upload_token(token), client.consume_upload_token(token));
+    let spends: Vec<_> = [a.unwrap(), b.unwrap()].into_iter().flatten().collect();
+    let after = client.consume_upload_token(token).await.unwrap();
+    let past = client.consume_upload_token(expired).await.unwrap();
+    client.insert_upload_token(revoked, key.id, &claims, later).await.unwrap();
+    client.revoke_data_key(branch, key.id).await.unwrap();
+    let of_revoked = client.consume_upload_token(revoked).await.unwrap();
+    let live_after = client.live_data_key(key.id).await.unwrap();
+    cleanup(&client, id).await;
+    assert_eq!(live.map(|k| k.branch_id), Some(branch));
+    assert!(unknown.is_none());
+    assert!(recorded && !again);
+    assert!(matches!(dead_key, Ok(false)), "{dead_key:?}");
+    assert_eq!(spends.len(), 1, "{spends:?}");
+    assert_eq!(spends[0].0.key_id, key.id);
+    assert_eq!(spends[0].1, claims);
+    assert!(after.is_none() && past.is_none() && of_revoked.is_none());
+    assert!(live_after.is_none());
+}

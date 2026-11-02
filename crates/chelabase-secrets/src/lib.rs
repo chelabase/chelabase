@@ -104,6 +104,8 @@ pub enum Purpose {
     MemberRole,
     /// The `chelabase_storage` login's password on a branch (the storage service's own).
     Storage,
+    /// The key storage signs its object URLs with ([`derive_key`]; never a sealed value).
+    StorageUrl,
 }
 
 impl Purpose {
@@ -115,8 +117,20 @@ impl Purpose {
             Purpose::Role => "role",
             Purpose::MemberRole => "member_role",
             Purpose::Storage => "storage",
+            Purpose::StorageUrl => "storage_url",
         }
     }
+}
+
+/// A 32-byte key for one `purpose` and generation (`kid`), derived from `key`:
+/// HMAC-SHA256 over a fixed label, so no two purposes or generations share a key and the
+/// derived key reveals nothing of `key`.
+pub fn derive_key(key: &SecretKey, purpose: Purpose, kid: u32) -> [u8; 32] {
+    use hmac::{Hmac, KeyInit, Mac};
+    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.0.as_slice())
+        .expect("HMAC accepts any key size");
+    mac.update(format!("chelabase:derive:{}:{kid}", purpose.as_str()).as_bytes());
+    mac.finalize().into_bytes().into()
 }
 
 /// Encrypt `plaintext`, authenticated with `aad` (it only opens with the same `aad`).
@@ -294,6 +308,23 @@ mod tests {
             SecretKey::from_base64("short"),
             Err(SecretsError::Config(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod derive_tests {
+    use super::*;
+
+    #[test]
+    fn derived_keys_are_stable_and_bound_to_key_purpose_and_generation() {
+        let key = SecretKey::from_base64(&STANDARD.encode([7u8; 32])).unwrap();
+        let a = derive_key(&key, Purpose::StorageUrl, 1);
+        assert_eq!(a, derive_key(&key, Purpose::StorageUrl, 1));
+        assert_ne!(a, derive_key(&key, Purpose::StorageUrl, 2));
+        assert_ne!(a, derive_key(&key, Purpose::Storage, 1));
+        assert_ne!(a, derive_key(&SecretKey::generate(), Purpose::StorageUrl, 1));
+        assert_ne!(&a[..], &[7u8; 32][..]);
+        assert_eq!(Purpose::StorageUrl.as_str(), "storage_url");
     }
 }
 

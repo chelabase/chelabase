@@ -132,7 +132,17 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         data: &DataIdentity,
         requested: Option<&str>,
     ) -> Result<ServedDatabase, Failure> {
-        let branch = data.branch_id;
+        self.served_on(data.branch_id, requested, data.databases.as_deref())
+            .await
+    }
+
+    /// [`Engine::served_database`] on `branch`, for a key's list `allowed` (`None`: any).
+    pub async fn served_on(
+        &self,
+        branch: Uuid,
+        requested: Option<&str>,
+        allowed: Option<&[String]>,
+    ) -> Result<ServedDatabase, Failure> {
         let mut info = self
             .pools
             .info(branch)
@@ -148,7 +158,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         {
             info = fresh;
         }
-        pick_database(&info, requested, data.databases.as_deref()).cloned()
+        pick_database(&info, requested, allowed).cloned()
     }
 
     /// Where a request's objects live: the served database it asks for (schema checked) and
@@ -159,12 +169,28 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         requested: Option<&str>,
         request_id: &str,
     ) -> Result<Located, Failure> {
-        let served = self.served_database(data, requested).await?;
-        self.check_schema(data.branch_id, &served.name, request_id)
-            .await?;
+        self.locate_on(
+            data.branch_id,
+            requested,
+            data.databases.as_deref(),
+            request_id,
+        )
+        .await
+    }
+
+    /// [`Engine::locate`] on `branch` without a caller (signed and public URLs).
+    pub async fn locate_on(
+        &self,
+        branch: Uuid,
+        requested: Option<&str>,
+        allowed: Option<&[String]>,
+        request_id: &str,
+    ) -> Result<Located, Failure> {
+        let served = self.served_on(branch, requested, allowed).await?;
+        self.check_schema(branch, &served.name, request_id).await?;
         let info = self
             .pools
-            .info(data.branch_id)
+            .info(branch)
             .await
             .map_err(|e| Failure::from_conn(&e))?;
         let database_id = info.database_id.ok_or_else(Failure::storage_unavailable)?;

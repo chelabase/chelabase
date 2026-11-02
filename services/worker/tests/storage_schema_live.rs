@@ -2411,6 +2411,7 @@ async fn in_process_storage(store: Arc<FailingStore>, branch: BranchId) -> (Stri
         engine: storage::engine::Engine::new(pools, chelabase_pgsession::InternalSource::storage_login(&url, &token)),
         verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
         store,
+        urls: storage::control::Urls::new(Arc::new(storage::control::Orchestrator::new(&url, &token))),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -2558,4 +2559,154 @@ async fn versions(fx: &Fx) {
             "{old}"
         );
     }
+}
+
+// --- m6: signed and public URLs through the gateway, with no key -------------------------
+
+/// A GET of `url` (a path on the API host) with no key: `(status, headers, body)`.
+async fn keyless(method: &str, url: &str, body: Option<Vec<u8>>) -> (u16, reqwest::header::HeaderMap, bytes::Bytes) {
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{url}", gateway()))
+        .timeout(Duration::from_secs(60));
+    if let Some(body) = body {
+        req = req.body(body);
+    }
+    let res = req.send().await.expect("the gateway answers");
+    let (status, headers) = (res.status().as_u16(), res.headers().clone());
+    (status, headers, res.bytes().await.unwrap_or_default())
+}
+
+/// `POST /storage/v1/object/{route}/{path}` with `{"expires_in"}`: the signed URL.
+async fn mint(route: &str, path: &str, key: &str, expires_in: i64) -> (u16, String) {
+    let body = serde_json::to_vec(&json!({ "expires_in": expires_in })).unwrap();
+    let (status, _, b) = object("POST", &format!("/storage/v1/object/{route}/{path}"), key, Some(body.into()), &[JSON]).await;
+    (status, json_of(&b)["signed_url"].as_str().unwrap_or_default().to_string())
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_urls(&task).await }).await;
+    fx.purge_blobs(&object_store().await).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_urls(fx: &Fx) {
+    let secret = fx.secret_key("st-urls", None).await;
+    fx.bucket("files").await;
+    fx.bucket("pub").await;
+    fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; UPDATE storage.buckets SET public = true WHERE name = 'pub'; COMMIT;").await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
+    for (name, command, using, check) in [
+        ("o_select", "SELECT", "'name NOT LIKE ''hidden/%'''", "NULL"),
+        ("o_insert", "INSERT", "NULL", "'true'"),
+        ("o_update", "UPDATE", "'true'", "'true'"),
+        ("o_delete", "DELETE", "'true'", "NULL"),
+    ] {
+        fx.owner(&format!(
+            "SELECT storage.create_policy('{name}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+    let put = |path: &'static str, body: &'static [u8], ct: &'static str, upsert: bool| {
+        let secret = secret.clone();
+        async move {
+            let mut headers = vec![("content-type", ct)];
+            if upsert {
+                headers.push(("x-upsert", "true"));
+            }
+            let (status, _, b) =
+                object("POST", &format!("/storage/v1/object/{path}"), &secret, Some(body.to_vec().into()), &headers).await;
+            assert_eq!(status, 200, "{path}: {}", json_of(&b));
+        }
+    };
+    put("files/docs/a b.txt", b"v1", "text/plain", false).await;
+    put("files/page.html", b"<script>alert(1)</script>", "text/html", false).await;
+    put("files/hidden/x.txt", b"h", "text/plain", false).await;
+    put("pub/logo.png", b"png", "image/png", false).await;
+
+    // AC 1: downloads without a key, inline (a safe type), sandboxed, not cached as public.
+    let (status, url) = mint("sign", "files/docs/a b.txt", &secret, 60).await;
+    assert_eq!(status, 200, "{url}");
+    assert!(url.starts_with("/storage/v1/object/sign/files/docs/a%20b.txt?token="), "{url}");
+    let (status, h, b) = keyless("GET", &url, None).await;
+    assert_eq!((status, &b[..]), (200, &b"v1"[..]));
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    assert_eq!(h["content-security-policy"], "sandbox");
+    assert_eq!(h["content-disposition"], "inline");
+    assert_eq!(h["cache-control"], "private, no-cache");
+
+    // AC 3: no signed URL for an object the caller can't read; AC 10: a TTL over 7 days.
+    assert_eq!(mint("sign", "files/hidden/x.txt", &secret, 60).await.0, 404);
+    assert_eq!(mint("sign", "files/docs/a b.txt", &secret, 604_801).await.0, 400);
+    assert_eq!(mint("upload/sign", "files/u.txt", &secret, 604_801).await.0, 400);
+
+    // AC 2: a changed token, or one for another object.
+    let tampered = format!("{}{}", &url[..url.len() - 1], if url.ends_with('A') { 'B' } else { 'A' });
+    assert_eq!(keyless("GET", &tampered, None).await.0, 401);
+    let token = url.split_once("?token=").unwrap().1;
+    let elsewhere = format!("/storage/v1/object/sign/files/page.html?token={token}");
+    assert_eq!(keyless("GET", &elsewhere, None).await.0, 403);
+    assert_eq!(keyless("GET", "/storage/v1/object/sign/files/page.html", None).await.0, 401);
+
+    // AC 9: HTML is a sandboxed, unsniffed attachment.
+    let (_, html) = mint("sign", "files/page.html", &secret, 60).await;
+    let (status, h, _) = keyless("GET", &html, None).await;
+    assert_eq!(status, 200);
+    assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment;"), "{h:?}");
+    assert_eq!(h["content-security-policy"], "sandbox");
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    // m5's authenticated download says the same.
+    let (_, h, _) = object("GET", "/storage/v1/object/files/page.html", &secret, None, &[]).await;
+    assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment;"), "{h:?}");
+    assert_eq!(h["content-security-policy"], "sandbox");
+
+    // AC 4: overwritten, the old URL still serves the old version; deleted, it is 404.
+    put("files/docs/a b.txt", b"v2", "text/plain", true).await;
+    assert_eq!(&keyless("GET", &url, None).await.2[..], b"v1");
+    let (status, _, _) = object("DELETE", "/storage/v1/object/files/docs/a%20b.txt", &secret, None, &[]).await;
+    assert_eq!(status, 204);
+    assert_eq!(keyless("GET", &url, None).await.0, 404);
+
+    // AC 5: a private bucket's public path is 404; a public one serves with Cache-Control.
+    let public = |path: &str| format!("/storage/v1/object/public/{}/{path}", fx.main);
+    assert_eq!(keyless("GET", &public("files/page.html"), None).await.0, 404);
+    assert_eq!(keyless("GET", &public("pub/missing.png"), None).await.0, 404);
+    let (status, h, b) = keyless("GET", &public("pub/logo.png"), None).await;
+    assert_eq!((status, &b[..]), (200, &b"png"[..]));
+    assert_eq!(h["cache-control"], "public, max-age=3600");
+    assert_eq!(h["content-security-policy"], "sandbox");
+
+    // AC 8, 11: an upload URL takes one upload without a key; the second use fails.
+    let (status, up) = mint("upload/sign", "files/up.txt", &secret, 60).await;
+    assert_eq!(status, 200, "{up}");
+    let (status, _, b) = keyless("PUT", &up, Some(b"once".to_vec())).await;
+    assert_eq!(status, 200, "{}", json_of(&b));
+    let (status, _, b) = keyless("PUT", &up, Some(b"twice".to_vec())).await;
+    assert_eq!((status, json_of(&b)["error"]["code"].clone()), (403, json!("token_not_valid")));
+    let (_, _, b) = object("GET", "/storage/v1/object/files/up.txt", &secret, None, &[]).await;
+    assert_eq!(&b[..], b"once");
+
+    // AC 7: a revoked key's URLs fail (download and upload alike).
+    let doomed = fx.secret_key("st-urls-doomed", None).await;
+    let (_, durl) = mint("sign", "files/page.html", &doomed, 60).await;
+    let (_, dup) = mint("upload/sign", "files/d.txt", &doomed, 60).await;
+    let (status, keys) = api("GET", &fx.keys_path(), None).await;
+    assert_eq!(status, 200);
+    let id = keys.as_array().unwrap().iter().find(|k| k["name"] == "st-urls-doomed").expect("the key")["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (status, body) = api("DELETE", &format!("{}/{id}", fx.keys_path()), None).await;
+    assert!(status == 200 || status == 204, "revoke: {status} {body}");
+    assert_eq!(keyless("GET", &durl, None).await.0, 403);
+    assert_eq!(keyless("PUT", &dup, Some(b"x".to_vec())).await.0, 403);
 }

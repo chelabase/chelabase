@@ -1298,6 +1298,27 @@ pub mod storage {
         data("storage.list_objects", Method::Post, "/storage/v1/object/list/{bucket}");
     pub const COPY_OBJECT: Endpoint = data("storage.copy_object", Method::Post, "/storage/v1/object/copy");
     pub const MOVE_OBJECT: Endpoint = data("storage.move_object", Method::Post, "/storage/v1/object/move");
+
+    /// m6: no key at the gateway; the URL's token (or a public bucket) is the credential,
+    /// checked by storage.
+    const fn open(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            policy: Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public },
+            ..data(name, method, path)
+        }
+    }
+
+    const SIGNED: &str = "/storage/v1/object/sign/{bucket}/{*name}";
+    const UPLOAD_SIGNED: &str = "/storage/v1/object/upload/sign/{bucket}/{*name}";
+    /// Mints a signed download URL (the caller must be able to read the object).
+    pub const SIGN_OBJECT: Endpoint = data("storage.sign_object", Method::Post, SIGNED);
+    pub const SIGNED_DOWNLOAD: Endpoint = open("storage.signed_download", Method::Get, SIGNED);
+    /// Mints a one-time upload URL.
+    pub const SIGN_UPLOAD: Endpoint = data("storage.sign_upload", Method::Post, UPLOAD_SIGNED);
+    pub const SIGNED_UPLOAD: Endpoint = open("storage.signed_upload", Method::Put, UPLOAD_SIGNED);
+    /// A public bucket's object, on its branch.
+    pub const PUBLIC_DOWNLOAD: Endpoint =
+        open("storage.public_download", Method::Get, "/storage/v1/object/public/{branch}/{bucket}/{*name}");
 }
 
 /// Every public endpoint the gateway exposes.
@@ -1470,6 +1491,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::LIST_OBJECTS,
     storage::COPY_OBJECT,
     storage::MOVE_OBJECT,
+    storage::SIGN_OBJECT,
+    storage::SIGNED_DOWNLOAD,
+    storage::SIGN_UPLOAD,
+    storage::SIGNED_UPLOAD,
+    storage::PUBLIC_DOWNLOAD,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1580,6 +1606,42 @@ mod tests {
         // A tail matches only as the last segment of a template.
         assert_eq!(path_specificity("/a/{*rest}", "/a"), None);
         assert_eq!(path_specificity("/a/{*rest}", "/a/b/c"), Some(vec![true, false]));
+    }
+
+    /// m6: minting a signed URL takes a data key; serving one (the token is the credential) and
+    /// a public bucket's objects take none. The literal `sign`, `upload` and `public` segments
+    /// win over a bucket of that name (reserved, so never one).
+    #[test]
+    fn storage_url_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        let open = Policy { auth: Auth::Public, cors: Cors::Any, access: Access::Public };
+        for (method, path, name, policy) in [
+            ("POST", "/storage/v1/object/sign/avatars/u1/a.png", "storage.sign_object", key),
+            ("GET", "/storage/v1/object/sign/avatars/u1/a.png", "storage.signed_download", open),
+            ("POST", "/storage/v1/object/upload/sign/avatars/a.png", "storage.sign_upload", key),
+            ("PUT", "/storage/v1/object/upload/sign/avatars/a.png", "storage.signed_upload", open),
+            (
+                "GET",
+                "/storage/v1/object/public/6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10/avatars/a.png",
+                "storage.public_download",
+                open,
+            ),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy), (name, policy), "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
+        }
+        // Nothing else is public on these paths: no HEAD, DELETE or a POST that uploads.
+        for (method, path) in [
+            ("DELETE", "/storage/v1/object/sign/avatars/a.png"),
+            ("POST", "/storage/v1/object/public/b/avatars/a.png"),
+        ] {
+            if let Match::Found(ep) = match_endpoint(Scope::Api, method, path) {
+                assert_ne!(ep.policy.auth, Auth::Public, "{method} {path}");
+            }
+        }
     }
 
     /// m5: the storage service's bucket routes take any data key and stream (long timeouts,
@@ -2297,6 +2359,11 @@ mod tests {
             ("storage.list_objects", Access::DataKey),
             ("storage.copy_object", Access::DataKey),
             ("storage.move_object", Access::DataKey),
+            ("storage.sign_object", Access::DataKey),
+            ("storage.signed_download", Access::Public),
+            ("storage.sign_upload", Access::DataKey),
+            ("storage.signed_upload", Access::Public),
+            ("storage.public_download", Access::Public),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.

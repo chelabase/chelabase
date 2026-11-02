@@ -92,6 +92,55 @@ pub fn content_disposition(name: &str, download: Option<&str>) -> String {
     format!("attachment; filename=\"{ascii}\"; filename*=UTF-8''{encoded}")
 }
 
+/// Whether a stored content type may be served `inline`: images (never SVG, which runs script),
+/// video, audio, PDF and plain text. Anything else (HTML, XML, unknown) is an attachment.
+pub fn inline_safe(content_type: &str) -> bool {
+    let essence = content_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let Some((kind, sub)) = essence.split_once('/') else {
+        return false;
+    };
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-+.".contains(&b))
+    };
+    if !token(sub) {
+        return false;
+    }
+    match kind {
+        "image" => !sub.contains("svg") && !sub.contains("xml"),
+        "video" | "audio" => !sub.contains("xml"),
+        "application" => sub == "pdf",
+        "text" => sub == "plain",
+        _ => false,
+    }
+}
+
+/// A name or bucket as URL path segments: each `/`-separated segment percent-encoded (all but
+/// unreserved characters), so the URL's path decodes back to exactly `name`.
+pub fn encode_path(name: &str) -> String {
+    name.split('/')
+        .map(|segment| {
+            segment
+                .bytes()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                        (b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// `"etag"`, whatever quoting the store gave it.
 pub fn quoted_etag(etag: &str) -> String {
     format!("\"{}\"", etag.trim_matches('"'))
@@ -214,6 +263,47 @@ mod tests {
     use chelabase_storage::MemoryStore;
 
     /// AC: `../x`, `/x`, 1025 bytes (and control characters, empty segments) are refused.
+    /// m6: only the safe inline types are served inline; parameters and case don't matter.
+    #[test]
+    fn only_safe_types_are_inline() {
+        for t in [
+            "image/png",
+            "IMAGE/JPEG",
+            "image/webp; q=1",
+            "video/mp4",
+            "audio/mpeg",
+            "application/pdf",
+            "text/plain",
+            "text/plain; charset=utf-8",
+        ] {
+            assert!(inline_safe(t), "{t}");
+        }
+        for t in [
+            "text/html",
+            "image/svg+xml",
+            "IMAGE/SVG+XML; charset=utf-8",
+            "image/svg",
+            "application/xhtml+xml",
+            "text/xml",
+            "application/javascript",
+            "text/plain-html",
+            "application/octet-stream",
+            "",
+            "image",
+            "image/",
+        ] {
+            assert!(!inline_safe(t), "{t}");
+        }
+    }
+
+    /// A signed URL's path decodes back to the name.
+    #[test]
+    fn names_encode_per_segment() {
+        assert_eq!(encode_path("u1/a b.png"), "u1/a%20b.png");
+        assert_eq!(encode_path("a?b#c%d/é"), "a%3Fb%23c%25d/%C3%A9");
+        assert_eq!(encode_path("plain-name_1.~x"), "plain-name_1.~x");
+    }
+
     #[test]
     fn object_names_are_checked() {
         for ok in [

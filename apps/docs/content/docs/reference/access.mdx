@@ -86,6 +86,11 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/storage/v1/object/copy` | any data key | Data API key |
 | POST | `/storage/v1/object/list/\{bucket\}` | any data key | Data API key |
 | POST | `/storage/v1/object/move` | any data key | Data API key |
+| GET | `/storage/v1/object/public/\{branch\}/\{bucket\}/\{*name\}` | none | Public |
+| GET | `/storage/v1/object/sign/\{bucket\}/\{*name\}` | none | Public |
+| POST | `/storage/v1/object/sign/\{bucket\}/\{*name\}` | any data key | Data API key |
+| POST | `/storage/v1/object/upload/sign/\{bucket\}/\{*name\}` | any data key | Data API key |
+| PUT | `/storage/v1/object/upload/sign/\{bucket\}/\{*name\}` | none | Public |
 | DELETE | `/storage/v1/object/\{bucket\}` | any data key | Data API key |
 | DELETE | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
 | GET | `/storage/v1/object/\{bucket\}/\{*name\}` | any data key | Data API key |
