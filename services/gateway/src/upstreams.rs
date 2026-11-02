@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 const DEFAULT_REST: &str = "127.0.0.1:8085";
 const DEFAULT_REALTIME: &str = "127.0.0.1:8087";
+const DEFAULT_STORAGE: &str = "127.0.0.1:8089";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Upstreams {
@@ -13,6 +14,7 @@ pub struct Upstreams {
     auth: String,
     rest: String,
     realtime: String,
+    storage: String,
     /// The pass-through sites that have an upstream.
     sites: HashMap<Site, String>,
 }
@@ -24,6 +26,7 @@ impl Upstreams {
             auth: authority_from_url(auth_url)?,
             rest: DEFAULT_REST.to_string(),
             realtime: DEFAULT_REALTIME.to_string(),
+            storage: DEFAULT_STORAGE.to_string(),
             sites: HashMap::new(),
         })
     }
@@ -40,6 +43,12 @@ impl Upstreams {
         Ok(self)
     }
 
+    /// Where `storage` (object storage) lives.
+    pub fn with_storage(mut self, storage_url: &str) -> Result<Self, String> {
+        self.storage = authority_from_url(storage_url)?;
+        Ok(self)
+    }
+
     /// Where `site` lives.
     pub fn with_site(mut self, site: Site, url: &str) -> Result<Self, String> {
         self.sites.insert(site, authority_from_url(url)?);
@@ -52,6 +61,7 @@ impl Upstreams {
             Service::Auth => &self.auth,
             Service::Rest => &self.rest,
             Service::Realtime => &self.realtime,
+            Service::Storage => &self.storage,
         }
     }
 
@@ -130,6 +140,17 @@ mod tests {
         let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
         for bad in ["https://studio:3000", "http://studio", "http://studio:3000/app"] {
             assert!(upstreams.clone().with_site(Site::Studio, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn storage_has_its_own_upstream_checked_like_the_others() {
+        let upstreams = Upstreams::new("http://127.0.0.1:8081", "http://127.0.0.1:8084").unwrap();
+        assert_eq!(upstreams.addr(Service::Storage), "127.0.0.1:8089");
+        let set = upstreams.clone().with_storage("http://storage:8089/").unwrap();
+        assert_eq!(set.addr(Service::Storage), "storage:8089");
+        for bad in ["https://storage:8089", "http://storage", "http://storage:8089/x"] {
+            assert!(upstreams.clone().with_storage(bad).is_err(), "{bad}");
         }
     }
 

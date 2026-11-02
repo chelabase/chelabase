@@ -1,0 +1,44 @@
+[package]
+name = "chelabase-storage-service"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase object storage behind the gateway: buckets and objects, authorized by row level security"
+
+[lib]
+name = "storage"
+path = "src/lib.rs"
+
+[[bin]]
+name = "storage"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chelabase-auth = { workspace = true }
+# The caller's role session and the managed pool, within the branch's storage budget.
+chelabase-pgsession = { workspace = true }
+# `QueryFailure` (the error body and its SQLSTATE mapping) and the compute TLS.
+chelabase-query = { workspace = true }
+# The S3 store the objects go to (built at startup so a bad configuration refuses to start).
+chelabase-storage = { workspace = true }
+chelabase-types = { workspace = true }
+dotenvy = { workspace = true }
+moka = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+utoipa = { workspace = true }
+utoipa-axum = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-pgsession = { workspace = true, features = ["test-support"] }
+# The OpenAPI document's registry test.
+chelabase-routes = { workspace = true }
+reqwest = { workspace = true }

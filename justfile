@@ -90,7 +90,7 @@ sweep-dbs-test:
 
 # Regenerate the committed OpenAPI documents (openapi/*.json) from the Rust handlers, then both orval clients
 api-gen:
-    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest document_is_current
+    CHELABASE_BLESS=1 cargo test -p orchestrator -p auth -p rest -p chelabase-storage-service document_is_current
     pnpm --filter @chelabase/management-client generate
     pnpm --filter @chelabase/studio generate:login
 

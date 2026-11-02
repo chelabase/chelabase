@@ -1,0 +1,187 @@
+//! The storage service's error body: the data API's envelope,
+//! `{"error":{"code","message","detail"?,"hint"?,"sqlstate"?}}`, built on
+//! [`QueryFailure`] (whose SQLSTATE mapping a statement's failure goes through).
+
+use axum::Json;
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use chelabase_pgsession::{AcquireError, ConnError};
+use chelabase_query::QueryFailure;
+use serde_json::{Map, Value, json};
+
+/// Seconds a 503 asks the client to wait.
+pub const RETRY_AFTER_SECS: u32 = 2;
+
+/// A failed request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure(pub QueryFailure);
+
+impl Failure {
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Failure(QueryFailure::new(status, code, message))
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, "unauthorized", message)
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+    }
+
+    /// 503: the database's `storage` schema isn't Chelabase's current one (a user's own, a
+    /// missing or unknown stamp), or storage's own login can't reach it.
+    pub fn storage_unavailable() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_unavailable",
+            "object storage isn't available in this database right now",
+        )
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    }
+
+    /// 403: the database isn't served or isn't on the key's list (one text for both).
+    pub fn database_not_allowed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "database_not_allowed",
+            "the database doesn't exist or this key may not use it",
+        )
+    }
+
+    /// 403: a secret key's role is owner-level (as the data API refuses it).
+    pub fn role_not_allowed(role: &str) -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "role_not_allowed",
+            format!("the role `{role}` of this key is owner-level or has system privileges"),
+        )
+    }
+
+    /// 404: no bucket of that name that the caller may see (missing or hidden alike).
+    pub fn bucket_not_found(name: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "bucket_not_found",
+            format!("no bucket `{name}`"),
+        )
+    }
+
+    /// 409: the bucket still holds `objects` objects.
+    pub fn bucket_not_empty(name: &str, objects: i64) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "bucket_not_empty",
+            format!("bucket `{name}` holds {objects} object(s); delete them first"),
+        )
+    }
+
+    /// No connection to the branch's database.
+    pub fn from_acquire(e: &AcquireError, request_id: &str) -> Self {
+        match e {
+            AcquireError::NotServed => Self::database_not_allowed(),
+            AcquireError::Conn(e) => Self::from_conn(e),
+            AcquireError::Db(e) => {
+                tracing::warn!(request_id, "connecting to the branch: {e}");
+                Self::unavailable(chelabase_query::error::UNREACHABLE)
+            }
+            AcquireError::Busy | AcquireError::TimedOut => {
+                Self::unavailable("too many connections in use; try again")
+            }
+        }
+    }
+
+    pub fn from_conn(e: &ConnError) -> Self {
+        match e {
+            ConnError::UnknownBranch => Self::unauthorized("the key's branch is gone"),
+            ConnError::NotReady(status) => Self::unavailable(format!("the branch is {status}")),
+            ConnError::Unreachable(_) => {
+                Self::unavailable("storage can't look up the branch right now; try again")
+            }
+        }
+    }
+}
+
+impl From<QueryFailure> for Failure {
+    fn from(f: QueryFailure) -> Self {
+        Failure(f)
+    }
+}
+
+impl IntoResponse for Failure {
+    fn into_response(self) -> Response {
+        let f = self.0;
+        let mut body = Map::new();
+        body.insert("code".into(), json!(f.code));
+        body.insert("message".into(), json!(f.message));
+        for (key, value) in [
+            ("detail", f.detail),
+            ("hint", f.hint),
+            ("sqlstate", f.sqlstate),
+        ] {
+            if let Some(value) = value {
+                body.insert(key.into(), Value::String(value));
+            }
+        }
+        let mut response = (f.status, Json(json!({ "error": body }))).into_response();
+        if f.status == StatusCode::SERVICE_UNAVAILABLE {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECS));
+        }
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body(f: Failure) -> (StatusCode, Option<HeaderValue>, Value) {
+        let response = f.into_response();
+        let status = response.status();
+        let retry = response.headers().get(header::RETRY_AFTER).cloned();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        (status, retry, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// AC 6: every route answers a 503 `storage_unavailable` (with `Retry-After`) for a schema
+    /// that isn't Chelabase's; the envelope is the data API's.
+    #[tokio::test]
+    async fn storage_unavailable_is_a_503_in_the_data_api_envelope() {
+        let (status, retry, json) = body(Failure::storage_unavailable()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry, Some(HeaderValue::from(RETRY_AFTER_SECS)));
+        assert_eq!(json["error"]["code"], "storage_unavailable");
+        assert!(json["error"].get("sqlstate").is_none());
+    }
+
+    /// RLS refusing a write is Postgres's 42501: a 403 carrying the SQLSTATE.
+    #[tokio::test]
+    async fn a_policy_refusal_is_a_403() {
+        let mut f = QueryFailure::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "new row violates row-level security policy",
+        );
+        f.sqlstate = Some("42501".into());
+        let (status, retry, json) = body(f.into()).await;
+        assert_eq!((status, retry), (StatusCode::FORBIDDEN, None));
+        assert_eq!(json["error"]["sqlstate"], "42501");
+        let (status, _, json) = body(Failure::bucket_not_empty("avatars", 3)).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("holds 3 object(s)")
+        );
+        let (status, _, _) = body(Failure::from_acquire(&AcquireError::NotServed, "r")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}

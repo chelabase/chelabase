@@ -1,0 +1,502 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chelabase Storage API",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "version": "1"
+  },
+  "paths": {
+    "/storage/v1/bucket": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List the buckets the caller may see",
+        "operationId": "listBuckets",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The buckets the caller's policies show, by name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {}
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "`unauthorized`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Create a bucket",
+        "description": "Runs as the key's role: an insert policy on `storage.buckets` decides.",
+        "operationId": "createBucket",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Bucket"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`, `invalid_value`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied` (no policy allows it), `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: a bucket of that name exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/bucket/{name}": {
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete an empty bucket",
+        "description": "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused with their count.",
+        "operationId": "deleteBucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The bucket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "`database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`bucket_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`bucket_not_empty`: it holds objects",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "patch": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Change a bucket",
+        "description": "Runs as the key's role: the update policy on `storage.buckets` decides.",
+        "operationId": "updateBucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The bucket",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "Served, and on the key's database list when it has one.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "400": {
+            "description": "`invalid_request`, `invalid_value`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied`, `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`bucket_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the new name is taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Bucket": {
+        "type": "object",
+        "description": "A bucket as created.",
+        "required": [
+          "id",
+          "name",
+          "public"
+        ],
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "name": {
+            "type": "string"
+          },
+          "public": {
+            "type": "boolean"
+          }
+        }
+      },
+      "CreateBucket": {
+        "type": "object",
+        "description": "A new bucket.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Bytes; above 0."
+          },
+          "name": {
+            "type": "string"
+          },
+          "public": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default false."
+          }
+        },
+        "additionalProperties": false
+      },
+      "StorageErrorBody": {
+        "type": "object",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "Stable: `unauthorized`, `invalid_request`, `invalid_value`, `permission_denied`,\n`database_not_allowed`, `role_not_allowed`, `bucket_not_found`, `bucket_not_empty`,\n`conflict`, `storage_unavailable`, `unavailable`, `internal`."
+          },
+          "message": {
+            "type": "string",
+            "description": "What went wrong, for a person; not stable."
+          },
+          "sqlstate": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The SQLSTATE of a mapped database error."
+          }
+        }
+      },
+      "StorageErrorEnvelope": {
+        "type": "object",
+        "description": "Every storage error: `{\"error\": {...}}`, the data API's envelope.",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/StorageErrorBody"
+          }
+        }
+      },
+      "UpdateBucket": {
+        "type": "object",
+        "description": "A bucket's changes; a field left out stays as it is.",
+        "properties": {
+          "allowed_mime_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "file_size_limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A new name."
+          },
+          "public": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "data API key",
+        "description": "A data API key (`chk_pub_…` or `chk_sec_…`) as `Authorization: Bearer <key>`"
+      }
+    }
+  }
+}

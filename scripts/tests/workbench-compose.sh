@@ -147,7 +147,7 @@ tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sour
 [[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
 on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
-[[ "$on_compute" == "auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker" ]] ||
+[[ "$on_compute" == "auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 storage worker" ]] ||
   fail "exactly the compute dependencies and the clients that dial computes are on the compute network; got: $on_compute"
 for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 safekeeper2 safekeeper3 worker; do
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
@@ -394,8 +394,16 @@ sw_want+=" s3/access-key<-s3/access-key s3/secret-key<-s3/secret-key"
 sw_want+=" storage-s3/access-key<-storage-s3/access-key storage-s3/secret-key<-storage-s3/secret-key"
 [[ "$(seaweed_binds)" == "$sw_want" ]] || fail "seaweedfs mounts the neon and storage key pairs and the gRPC TLS files; got: $(seaweed_binds)"
 others="$(q '[.services | to_entries[] | select(.key != "seaweedfs")
-  | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/(storage-s3|grpc-tls|s3-admin)/")))) | .key] | join(" ")')"
-[[ -z "$others" ]] || fail "only seaweedfs mounts the storage S3 keys or the gRPC TLS files; got: $others"
+  | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/(grpc-tls|s3-admin)/")))) | .key] | join(" ")')"
+[[ -z "$others" ]] || fail "only seaweedfs mounts the gRPC TLS files; got: $others"
+# m5: the `storage` identity's keys: seaweedfs and the storage service, read-only, nobody else.
+others="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/storage-s3/"))))
+  | .key] | sort | join(" ")')"
+[[ "$others" == "seaweedfs storage" ]] || fail "only seaweedfs and storage mount the storage S3 keys; got: $others"
+storage_binds="$(q '[.services.storage.volumes[] | select(.type == "bind" and (.source | test("/storage-s3/")))
+  | "\(.target)\(if (.read_only // false) then "" else ":rw" end)"] | sort | join(" ")')"
+[[ "$storage_binds" == "/run/chelabase/secrets/storage-s3/access-key /run/chelabase/secrets/storage-s3/secret-key" ]] ||
+  fail "storage mounts its two key files read-only; got: $storage_binds"
 [[ "$(q '.services["create-bucket"] | [.volumes // [], .environment // {}] | tojson')" == '[[],{}]' ]] ||
   fail "create-bucket holds no key, volume or credential"
 ! grep -qE 's3-admin|chelabase-(storage|admin)-dev' <<<"$config" || fail "no admin key file and no dev S3 key of the storage identity is in the rendered config (inspect)"

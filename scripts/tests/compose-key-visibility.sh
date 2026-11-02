@@ -113,6 +113,12 @@ expected='{
     "K/compute-ca/ca.crt": "ro",
     "K/tokens/rest-internal.token": "ro"
   },
+  "storage": {
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "K/gateway/internal-verify.pem": "ro",
+    "K/compute-ca/ca.crt": "ro",
+    "K/tokens/storage-internal.token": "ro"
+  },
   "realtime": {
     "C/scripts/tests/workbench-compose.sh": "ro",
     "K/gateway/internal-verify.pem": "ro",
@@ -146,7 +152,7 @@ expected='{
     "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/storage-internal.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   }
 }'
 
@@ -196,7 +202,9 @@ expected_state_binds='[
   "seaweedfs:S/grpc-tls/server.crt->/run/chelabase/secrets/grpc-tls/server.crt",
   "seaweedfs:S/grpc-tls/server.key->/run/chelabase/secrets/grpc-tls/server.key",
   "seaweedfs:S/grpc-tls/client.crt->/run/chelabase/secrets/grpc-tls/client.crt",
-  "seaweedfs:S/grpc-tls/client.key->/run/chelabase/secrets/grpc-tls/client.key"
+  "seaweedfs:S/grpc-tls/client.key->/run/chelabase/secrets/grpc-tls/client.key",
+  "storage:S/storage-s3/access-key->/run/chelabase/secrets/storage-s3/access-key",
+  "storage:S/storage-s3/secret-key->/run/chelabase/secrets/storage-s3/secret-key"
 ]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink
@@ -318,7 +326,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs gateway landing orchestrator realtime rest runner studio worker" ]] ||
+  [[ "$mounting" == "auth docs gateway landing orchestrator realtime rest runner storage studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

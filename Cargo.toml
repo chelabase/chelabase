@@ -7,6 +7,7 @@ members = [
     "services/auth",
     "services/rest",
     "services/realtime",
+    "services/storage",
     "services/init",
     "tools/cli",
     "tools/bench-data-api",

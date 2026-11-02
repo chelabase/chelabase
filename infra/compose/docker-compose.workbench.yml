@@ -642,6 +642,44 @@ services:
       metadata-db:
         condition: service_healthy
 
+  # Object storage (m5), 8089 behind the gateway. Only in this overlay until its first release
+  # image is published (the base file pins every image it runs). It dials computes on the compute
+  # network as `authenticator` (caller sessions) and as `chelabase_storage` (its own login), and
+  # SeaweedFS's S3 API as the `storage` identity (bucket chelabase-storage only).
+  storage:
+    <<: *workbench
+    command: ["${CHELABASE_CHECKOUT}/target/debug/storage"]
+    env_file:
+      - *stack-env
+    environment:
+      - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
+      - CHELABASE_STORAGE_BACKEND=seaweedfs
+      - CHELABASE_STORAGE_S3_ENDPOINT=http://seaweedfs:8333
+      - CHELABASE_STORAGE_S3_BUCKET=chelabase-storage
+      - CHELABASE_STORAGE_S3_ACCESS_KEY_FILE=/run/chelabase/secrets/storage-s3/access-key
+      - CHELABASE_STORAGE_S3_SECRET_KEY_FILE=/run/chelabase/secrets/storage-s3/secret-key
+    networks:
+      default: {}
+      compute: {}
+    volumes:
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+    secrets:
+      - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
+      - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
+      - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
+      - {source: s3-storage-access-key, target: /run/chelabase/secrets/storage-s3/access-key}
+      - {source: s3-storage-secret-key, target: /run/chelabase/secrets/storage-s3/secret-key}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:8089/health"]
+    depends_on:
+      metadata-db:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_started
+
   # Its static address on `control` is outside the computes' range and in the chelabase_realtime
   # login rule. It reads demo.env for the OIDC audiences, as the gateway does.
   realtime:
@@ -758,6 +796,7 @@ services:
       - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
       - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
+      - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
     group_add: ["${CHELABASE_DOCKER_GID}"]
@@ -806,6 +845,7 @@ services:
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+      - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
       - {source: storage-pem, target: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub.pem"}
       - {source: storage-pageserver-api, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/pageserver-api.jwt"}
       - {source: storage-safekeeper-data, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/safekeeper-data.jwt"}

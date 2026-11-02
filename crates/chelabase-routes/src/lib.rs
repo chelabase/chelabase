@@ -44,6 +44,8 @@ pub enum Service {
     Auth,
     Rest,
     Realtime,
+    /// Object storage (buckets and objects).
+    Storage,
 }
 
 impl Service {
@@ -54,8 +56,20 @@ impl Service {
             Service::Auth => "auth",
             Service::Rest => "rest",
             Service::Realtime => "realtime",
+            Service::Storage => "storage",
         }
     }
+}
+
+/// How a route's bodies move through the gateway. Neither kind has a body cap at the gateway
+/// (the service enforces its own limits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    /// The gateway's configured upstream read timeout and the default client idle timeout.
+    Standard,
+    /// A body that may take long to send or answer (object uploads and downloads): long
+    /// upstream read and client idle timeouts.
+    Stream,
 }
 
 /// Which family of hostnames an endpoint is served on.
@@ -113,6 +127,16 @@ pub struct Endpoint {
     /// The route takes a websocket upgrade (a GET). Every other API route answers an
     /// `Upgrade` request with 400 at the gateway.
     pub websocket: bool,
+}
+
+impl Endpoint {
+    /// Every storage route streams ([`Transfer::Stream`]); every other route is standard.
+    pub const fn transfer(&self) -> Transfer {
+        match self.service {
+            Service::Storage => Transfer::Stream,
+            _ => Transfer::Standard,
+        }
+    }
 }
 
 pub mod orchestrator {
@@ -1227,6 +1251,36 @@ pub mod realtime {
     };
 }
 
+/// Object storage, served by `storage`: any data key; what the caller may do is decided by row
+/// level security on `storage.buckets` and `storage.objects`.
+pub mod storage {
+    use super::{Access, Auth, Cors, Endpoint, Method, Policy, Scope, Service};
+
+    const fn data(name: &'static str, method: Method, path: &'static str) -> Endpoint {
+        Endpoint {
+            name,
+            method,
+            path,
+            scope: Scope::Api,
+            service: Service::Storage,
+            policy: Policy {
+                auth: Auth::DataKey,
+                cors: Cors::Any,
+                access: Access::DataKey,
+            },
+            websocket: false,
+        }
+    }
+
+    pub const LIST_BUCKETS: Endpoint = data("storage.list_buckets", Method::Get, "/storage/v1/bucket");
+    pub const CREATE_BUCKET: Endpoint = data("storage.create_bucket", Method::Post, "/storage/v1/bucket");
+    pub const UPDATE_BUCKET: Endpoint =
+        data("storage.update_bucket", Method::Patch, "/storage/v1/bucket/{name}");
+    /// Only an empty bucket.
+    pub const DELETE_BUCKET: Endpoint =
+        data("storage.delete_bucket", Method::Delete, "/storage/v1/bucket/{name}");
+}
+
 /// Every public endpoint the gateway exposes.
 pub const ENDPOINTS: &[Endpoint] = &[
     orchestrator::HEALTH,
@@ -1384,6 +1438,10 @@ pub const ENDPOINTS: &[Endpoint] = &[
     auth::APP_JWKS,
     realtime::TICKET,
     realtime::SOCKET,
+    storage::LIST_BUCKETS,
+    storage::CREATE_BUCKET,
+    storage::UPDATE_BUCKET,
+    storage::DELETE_BUCKET,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1453,6 +1511,34 @@ fn path_specificity(template: &str, path: &str) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m5: the storage service's bucket routes take any data key and stream (long timeouts,
+    /// no body cap); every other route is a standard one.
+    #[test]
+    fn storage_routes_are_data_key_transfer_routes() {
+        for (method, path, name) in [
+            ("GET", "/storage/v1/bucket", "storage.list_buckets"),
+            ("POST", "/storage/v1/bucket", "storage.create_bucket"),
+            ("PATCH", "/storage/v1/bucket/avatars", "storage.update_bucket"),
+            ("DELETE", "/storage/v1/bucket/avatars", "storage.delete_bucket"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!(ep.name, name);
+            assert_eq!(ep.service, Service::Storage);
+            assert_eq!(ep.service.name(), "storage");
+            assert_eq!(
+                ep.policy,
+                Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey }
+            );
+            assert_eq!(ep.transfer(), Transfer::Stream, "{name}");
+            assert!(!ep.websocket);
+        }
+        for ep in ENDPOINTS.iter().filter(|e| e.service != Service::Storage) {
+            assert_eq!(ep.transfer(), Transfer::Standard, "{}", ep.name);
+        }
+    }
 
     #[test]
     fn api_docs_paths_are_unrouted() {
@@ -2128,6 +2214,10 @@ mod tests {
             ("orchestrator.list_project_team_grants", Access::Project(Admin)),
             // Data API.
             ("rest.query", Access::DataKey),
+            ("storage.list_buckets", Access::DataKey),
+            ("storage.create_bucket", Access::DataKey),
+            ("storage.update_bucket", Access::DataKey),
+            ("storage.delete_bucket", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.

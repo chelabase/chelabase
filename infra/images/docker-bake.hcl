@@ -69,6 +69,13 @@ target "realtime" {
   target   = "realtime"
   tags     = ["${REPO}/realtime:${TAG}"]
 }
+# Object storage (m5): not in the default group yet. The base compose file runs it once its
+# first image is published and pinned.
+target "storage" {
+  inherits = ["_app"]
+  target   = "storage"
+  tags     = ["${REPO}/storage:${TAG}"]
+}
 target "init" {
   inherits = ["_app"]
   target   = "init"
