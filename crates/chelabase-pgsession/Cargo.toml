@@ -6,9 +6,12 @@ license.workspace = true
 description = "Chelabase's connections to a branch's compute: where it is, pools within the branch's connection budget, and the per-request role session the data API and storage share"
 
 [dependencies]
+# The owner-level checks take the key's identity.
+chelabase-auth = { workspace = true }
 chelabase-http = { workspace = true }
 # `Lease`, `QueryClient`, the compute TLS (`ServerTls`) and the session's transaction.
 chelabase-query = { workspace = true }
+chelabase-types = { workspace = true }
 deadpool-postgres = { workspace = true }
 moka = { workspace = true }
 serde = { workspace = true }

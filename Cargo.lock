@@ -1281,8 +1281,10 @@ dependencies = [
 name = "chelabase-pgsession"
 version = "0.1.0"
 dependencies = [
+ "chelabase-auth",
  "chelabase-http",
  "chelabase-query",
+ "chelabase-types",
  "deadpool-postgres",
  "moka",
  "reqwest",
