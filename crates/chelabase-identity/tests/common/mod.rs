@@ -316,11 +316,11 @@ pub async fn code_strictness(id: &Identity, pool: &Pool) {
         .await
         .unwrap();
     // A new code replaces the old one.
-    let a = issue(id, pool, &uid, CodeKind::Invite).await;
-    let b = issue(id, pool, &uid, CodeKind::Invite).await;
+    let a = issue(id, pool, &uid, CodeKind::Reset).await;
+    let b = issue(id, pool, &uid, CodeKind::Reset).await;
     if a != b {
         assert_eq!(
-            id.verify_code(pool, &uid, CodeKind::Invite, &a, Some("n3w password!"))
+            id.verify_code(pool, &uid, CodeKind::Reset, &a, Some("n3w password!"))
                 .await
                 .unwrap_err(),
             IdentityError::CodeInvalid
@@ -385,5 +385,108 @@ pub async fn reset_revokes_sessions(id: &Identity, pool: &Pool) {
         .await
         .unwrap();
     assert!(id.session_by_token(pool, &s.session_token).await.is_err());
+    id.sign_in(pool, &mail, "n3w password!").await.unwrap();
+}
+
+async fn code_for(id: &Identity, pool: &Pool, uid: &str, kind: CodeKind) -> String {
+    id.create_code(pool, &CodeRequest::new(uid, kind, Delivery::Return))
+        .await
+        .unwrap()
+        .code
+        .unwrap()
+}
+
+/// A code is bound to the email it was sent to: changing the email kills every outstanding
+/// code for the user, whatever its kind.
+pub async fn email_change_kills_codes(id: &Identity, pool: &Pool) {
+    let uid = user(id, pool, &email("bind")).await;
+    let reset = code_for(id, pool, &uid, CodeKind::Reset).await;
+    let verify = code_for(id, pool, &uid, CodeKind::Verify).await;
+    let moved = email("moved");
+    id.set_email(pool, &uid, &moved, true).await.unwrap();
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Reset, &reset, Some("n3w password!"))
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeInvalid);
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Verify, &verify, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeInvalid);
+    // The old password is untouched, and a code sent to the new address works.
+    id.sign_in(pool, &moved, PW).await.unwrap();
+    let fresh = code_for(id, pool, &uid, CodeKind::Reset).await;
+    id.verify_code(pool, &uid, CodeKind::Reset, &fresh, Some("n3w password!"))
+        .await
+        .unwrap();
+}
+
+/// An invite for an established account (password and verified email) is refused when
+/// issued (409) and when verified (`invalid_code`, no attempt spent).
+pub async fn invite_refused_for_established_account(id: &Identity, pool: &Pool) {
+    let mail = email("estab");
+    // Issued while the account was still an invitee.
+    let uid = id
+        .create_user(
+            pool,
+            &NewUser {
+                email: &mail,
+                password: Some(PW),
+                email_verified: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let invite = code_for(id, pool, &uid, CodeKind::Invite).await;
+    id.mark_email_verified(pool, &uid).await.unwrap();
+    // Now established: issuing is refused.
+    let e = id
+        .create_code(
+            pool,
+            &CodeRequest::new(&uid, CodeKind::Invite, Delivery::Return),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IdentityError::InviteRefused(_)), "{e:?}");
+    assert!(!e.is_retryable());
+    // Verifying the right code is refused, as often as asked: it costs no attempt.
+    for _ in 0..7 {
+        let e = id
+            .verify_code(pool, &uid, CodeKind::Invite, &invite, Some("n3w password!"))
+            .await
+            .unwrap_err();
+        assert_eq!(e, IdentityError::CodeInvalid);
+    }
+    // Unverified again, the same code still works (so no attempt was spent).
+    id.set_email(pool, &uid, &mail, false).await.unwrap();
+    id.verify_code(pool, &uid, CodeKind::Invite, &invite, Some("n3w password!"))
+        .await
+        .unwrap();
+    id.sign_in(pool, &mail, "n3w password!").await.unwrap();
+}
+
+/// A pre-registered account (no password, unverified email) can still be invited.
+pub async fn invite_works_for_preregistered_account(id: &Identity, pool: &Pool) {
+    let mail = email("prereg");
+    let uid = id
+        .create_user(
+            pool,
+            &NewUser {
+                email: &mail,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+    let invite = code_for(id, pool, &uid, CodeKind::Invite).await;
+    let u = id
+        .verify_code(pool, &uid, CodeKind::Invite, &invite, Some("n3w password!"))
+        .await
+        .unwrap();
+    assert!(u.email_verified);
     id.sign_in(pool, &mail, "n3w password!").await.unwrap();
 }

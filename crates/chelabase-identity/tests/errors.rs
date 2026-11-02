@@ -21,6 +21,7 @@ fn classify_status() {
         ),
         (404, body("not_found"), E::NotFound(Missing::Route)),
         (409, body("conflict"), E::Conflict(m())),
+        (409, body("invite_refused"), E::InviteRefused(m())),
         (409, body("email_not_configured"), E::EmailNotConfigured),
         (403, body("banned"), E::Banned),
         (403, body("forbidden"), E::Forbidden(m())),
