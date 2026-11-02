@@ -152,7 +152,13 @@ function Sections({ databaseId, branchId, pgDatabase, apiUrl }: { databaseId: st
         <DataApiSecretKeys api={api} />
       </Card>
       <Card title="Row-level security" className="min-[64rem]:col-span-2">
-        <p className="text-chalk-dim">Tables the Data API reaches without row-level security are listed here.</p>
+        <p className="text-chalk-dim">
+          {api.pickedDb && api.pickedDb.data_api !== "on"
+            ? `The Data API doesn't serve ${api.pickedDb.name}.`
+            : api.schemaLoading
+              ? "Checking…"
+              : "Tables the Data API reaches without row-level security are listed here."}
+        </p>
         <DataApiRls api={api} />
       </Card>
       {canDownload && (

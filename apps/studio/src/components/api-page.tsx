@@ -8,14 +8,12 @@ const ApiReference = lazy(() => import("@/components/api-reference"));
 export function ApiPage({ doc, onDocChange }: { doc: ApiDocId; onDocChange: (doc: ApiDocId) => void }) {
   return (
     <div className="pt-4">
-      <div className="px-4 sm:px-8">
-        <Tabs label="APIs" items={API_DOCS} value={doc} onValueChange={onDocChange}>
-          {null}
-        </Tabs>
-      </div>
-      <Suspense fallback={<p className="p-8 text-muted-foreground">Loading the API reference…</p>}>
-        <ApiReference doc={doc} />
-      </Suspense>
+      {/* Scalar runs full width in the panel: only the tab strip takes the page gutters. */}
+      <Tabs label="APIs" items={API_DOCS} value={doc} onValueChange={onDocChange} listClassName="px-4 sm:px-8">
+        <Suspense fallback={<p className="p-8 text-muted-foreground">Loading the API reference…</p>}>
+          <ApiReference doc={doc} />
+        </Suspense>
+      </Tabs>
     </div>
   );
 }

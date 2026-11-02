@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 const loads = vi.hoisted(() => ({ count: 0 }));
@@ -27,5 +27,11 @@ describe("ApiPage", () => {
     expect(onDocChange).toHaveBeenCalledWith("data");
     rerender(<ApiPage doc="data" onDocChange={onDocChange} />);
     expect(screen.getByTestId("reference").dataset.doc).toBe("data");
+  });
+
+  it("renders the reference as the current tab's panel", async () => {
+    render(<ApiPage doc="auth" onDocChange={() => {}} />);
+    const panel = screen.getByRole("tabpanel");
+    expect((await within(panel).findByTestId("reference")).dataset.doc).toBe("auth");
   });
 });

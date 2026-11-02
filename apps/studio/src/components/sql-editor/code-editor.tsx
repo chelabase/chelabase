@@ -54,7 +54,7 @@ const errorField = StateField.define<{ pos: number | null; deco: DecorationSet }
 
 // `dark: true`: Studio's ground is dark, so CodeMirror's base theme must use its dark caret,
 // active-line and selection colours (the light ones give a black caret and pale washes under chalk text).
-const SELECTION = "rgb(242 199 163 / 0.25)";
+const SELECTION = "color-mix(in srgb, var(--sand) 25%, transparent)";
 
 const theme = EditorView.theme(
   {
@@ -69,10 +69,10 @@ const theme = EditorView.theme(
     // ::selection (ink, 1.9:1 on the sand tint): keep selected text chalk, with no native background of its own.
     ".cm-content ::selection, .cm-content::selection": { color: "var(--foreground)", backgroundColor: "transparent" },
     // The dark base theme's active line and selection matches are cyan washes: use warm chalk instead.
-    "&.cm-editor .cm-line.cm-activeLine": { backgroundColor: "rgb(235 230 224 / 0.05)" },
-    "&.cm-editor .cm-selectionMatch": { backgroundColor: "rgb(235 230 224 / 0.12)" },
+    "&.cm-editor .cm-line.cm-activeLine": { backgroundColor: "color-mix(in srgb, var(--chalk) 5%, transparent)" },
+    "&.cm-editor .cm-selectionMatch": { backgroundColor: "color-mix(in srgb, var(--chalk) 12%, transparent)" },
     "&.cm-editor .cm-cursor": { borderLeftColor: "var(--chalk)" },
-    "&.cm-editor .cm-matchingBracket": { backgroundColor: "rgb(242 199 163 / 0.2)", color: "inherit" },
+    "&.cm-editor .cm-matchingBracket": { backgroundColor: "color-mix(in srgb, var(--sand) 20%, transparent)", color: "inherit" },
   },
   { dark: true },
 );

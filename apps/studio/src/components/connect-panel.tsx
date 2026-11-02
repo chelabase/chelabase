@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { useGetMe, useListBranchDatabases, useListBranches, type DatabaseSummary } from "@chelabase/management-client";
+import { useGetMe, useListBranchDatabases, useListBranches, type BranchDatabaseView, type DatabaseSummary } from "@chelabase/management-client";
 import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { DatabasePicker } from "./data-api-databases";
@@ -115,6 +115,19 @@ export function ConnectPanel({ projectId, database, apiUrl }: ConnectPanelProps)
   );
 }
 
+/** Why the Data API doesn't serve a Postgres database yet, in its real state. */
+function servedText(d: BranchDatabaseView): string {
+  if (d.origin === "system") return "The Data API can't serve the system database.";
+  switch (d.data_api) {
+    case "enabling":
+      return `The Data API is enabling for ${d.name}.`;
+    case "error":
+      return `The Data API failed to enable for ${d.name}.`;
+    default:
+      return `The Data API is off for ${d.name}.`;
+  }
+}
+
 /** What to connect the Data API with: the endpoint and public key, and the page that manages them. */
 function ConnectDataApi({
   projectId,
@@ -130,21 +143,24 @@ function ConnectDataApi({
   pgDatabase: string | undefined;
 }) {
   const api = useDataApi(databaseId, branchId, pgDatabase);
-  const off = api.pickedDb && api.pickedDb.data_api !== "on";
+  const picked = api.pickedDb;
+  // The Data API page doesn't offer the system database: link to the branch, which opens on main.
+  const system = picked?.origin === "system";
   return (
     <section aria-label="Data API" className="space-y-3 text-sm">
       <h3 className="font-semibold">Data API</h3>
       <DataApiEndpoint api={api} apiUrl={apiUrl} readOnly />
-      {api.error && (
+      {/* The keys' and a rotate's errors show in the endpoint above. */}
+      {api.dbError && (
         <p role="alert" className="text-destructive">
-          {api.error}
+          {api.dbError}
         </p>
       )}
       <p className="text-muted-foreground">
-        {off && <>The Data API is off for {api.pickedDb!.name}. </>}
+        {picked && picked.data_api !== "on" && <>{servedText(picked)} </>}
         <Link
           to={DATA_API_ROUTE}
-          params={{ projectId, databaseId, branchId, pgDatabase: api.pickedDb?.name }}
+          params={{ projectId, databaseId, branchId, pgDatabase: system ? undefined : picked?.name }}
           className="underline underline-offset-4 hover:text-foreground"
         >
           Manage Data API
