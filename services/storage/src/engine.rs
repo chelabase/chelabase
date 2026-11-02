@@ -37,13 +37,16 @@ pub const MIN_SCHEMA_VERSION: u32 = 4;
 /// How long a database's schema check is trusted.
 pub const SCHEMA_CHECK_TTL: Duration = Duration::from_secs(30);
 
-/// The owner and the stamp of the database's `storage` schema (no row: there is none), and
-/// the database's OID (the blob keys' prefix).
+/// The owner and the stamp of the database's `storage` schema (no row: there is none).
 const STORAGE_SCHEMA: NamedStatement = named_statement!(
     "storage schema",
-    "SELECT r.rolname::pg_catalog.text, pg_catalog.obj_description(n.oid, 'pg_namespace'), (SELECT d.oid::pg_catalog.int8 FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner WHERE n.nspname OPERATOR(pg_catalog.=) 'storage'",
+    "SELECT r.rolname::pg_catalog.text, pg_catalog.obj_description(n.oid, 'pg_namespace') FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner WHERE n.nspname OPERATOR(pg_catalog.=) 'storage'",
     &[]
 );
+
+/// The OID of the database a caller statement runs in, read in that statement's own
+/// transaction: it, never a cache, decides a blob's key.
+pub const DATOID_SQL: &str = "SELECT oid::pg_catalog.int8 FROM pg_catalog.pg_database WHERE datname OPERATOR(pg_catalog.=) pg_catalog.current_database()";
 
 /// A database OID as Postgres sends it (int8 here), when it is one.
 pub fn datoid_of(oid: Option<i64>) -> Option<u32> {
@@ -88,21 +91,21 @@ pub fn pick_database<'a>(
     }
 }
 
-/// A request's database and its blob keys' prefix ([`Engine::locate`]).
+/// A request's database ([`Engine::locate`]). Its blob keys' prefix is
+/// `{database_id}/{datoid}/` ([`crate::names::object_prefix`]), the OID read in the request's
+/// own caller transaction.
 #[derive(Debug, Clone)]
 pub struct Located {
     pub database: String,
-    /// `{database_id}/{pg_database}/`: a version's blob is `{prefix}{version_id}`.
-    pub prefix: String,
+    pub database_id: Uuid,
 }
 
 pub struct Engine<S, M> {
     pools: Pools<S>,
     managed: ServicePool<M>,
     owner_level: OwnerLevelCache,
-    /// `(branch, database)` → the schema check's answer.
-    /// `(branch, database)` → the database's OID when its schema may be served, else `None`.
-    schema_ok: moka::future::Cache<(Uuid, String), Option<u32>>,
+    /// `(branch, database)` → whether its schema may be served.
+    schema_ok: moka::future::Cache<(Uuid, String), bool>,
 }
 
 impl<S: ConnSource, M: ConnSource> Engine<S, M> {
@@ -149,7 +152,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
     }
 
     /// Where a request's objects live: the served database it asks for (schema checked) and
-    /// the blob keys' prefix, `{database_id}/{pg_database}/`.
+    /// the Chelabase database's id.
     pub async fn locate(
         &self,
         data: &DataIdentity,
@@ -157,8 +160,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         request_id: &str,
     ) -> Result<Located, Failure> {
         let served = self.served_database(data, requested).await?;
-        let datoid = self
-            .check_schema(data.branch_id, &served.name, request_id)
+        self.check_schema(data.branch_id, &served.name, request_id)
             .await?;
         let info = self
             .pools
@@ -167,8 +169,8 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             .map_err(|e| Failure::from_conn(&e))?;
         let database_id = info.database_id.ok_or_else(Failure::storage_unavailable)?;
         Ok(Located {
-            prefix: crate::names::object_prefix(database_id, datoid),
             database: served.name,
+            database_id,
         })
     }
 
@@ -179,7 +181,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         branch: Uuid,
         database: &str,
         request_id: &str,
-    ) -> Result<u32, Failure> {
+    ) -> Result<(), Failure> {
         let key = (branch, database.to_owned());
         let ok = match self.schema_ok.get(&key).await {
             Some(ok) => ok,
@@ -189,14 +191,13 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                     .await?;
                 let ok = rows
                     .first()
-                    .filter(|row| schema_acceptable(row.get(0), row.get(1)))
-                    .and_then(|row| datoid_of(row.get(2)));
+                    .is_some_and(|row| schema_acceptable(row.get(0), row.get(1)));
                 self.schema_ok.insert(key, ok).await;
                 ok
             }
         };
-        if let Some(datoid) = ok {
-            Ok(datoid)
+        if ok {
+            Ok(())
         } else {
             tracing::warn!(request_id, branch_id = %branch, database, "the storage schema isn't Chelabase's current one");
             Err(Failure::storage_unavailable())
@@ -267,13 +268,6 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                 }
                 ServiceError::Query(f) => managed_failure(f, request_id),
             })
-    }
-
-    /// Forgets what's held for `branch`.
-    pub async fn invalidate(&self, branch: Uuid) {
-        self.pools.invalidate(branch).await;
-        self.managed.invalidate(branch).await;
-        owner_level::invalidate_branch(&self.owner_level, branch);
     }
 }
 
@@ -363,9 +357,9 @@ mod tests {
         }
     }
 
-    /// SF10: the schema check also reads the database's OID, the blob keys' prefix.
+    /// A database OID as the caller transaction reads it (int8).
     #[test]
-    fn the_schema_check_reads_the_database_oid() {
+    fn a_database_oid_parses() {
         assert_eq!(datoid_of(Some(16384)), Some(16384));
         assert_eq!(datoid_of(Some(-1)), None);
         assert_eq!(datoid_of(None), None);

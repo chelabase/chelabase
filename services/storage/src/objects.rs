@@ -10,14 +10,20 @@
 //! 1. pre-check as the caller: the existing row's version (if any) and, in a savepoint rolled
 //!    back, the INSERT (or upsert) with the declared values: 42501 is 403, `CB003` (the policy
 //!    passed, only the ticket is missing) continues;
-//! 2. the body streams to a staging key through a byte counter (the bucket's limit: 413);
-//! 3. storage writes a ticket for the real size and etag, the caller's role and `sub`;
-//! 4. one statement as the caller writes the row; the trigger consumes the ticket. An upsert
-//!    updates only the version the pre-check saw, so a lost race is 409 and the winner's row is
-//!    unchanged;
-//! 5. the staged blob moves to `{database_id}/{pg_database}/{version_id}`.
+//!    The same transaction reads the database's OID: the blob's key is
+//!    `{database_id}/{datoid}/{version_id}` with that OID, never a cached one;
+//! 2. the body streams straight to that key (random, unreferenced until the row exists)
+//!    through a byte counter (the bucket's limit: 413);
+//! 3. storage clears the version's dead tickets (expired, or another timeline's) and writes
+//!    one for the real size and etag, the caller's role and `sub`;
+//! 4. one statement as the caller writes the row, after re-reading the OID in its own
+//!    transaction (a database dropped and made again meanwhile: 503); the trigger consumes the
+//!    ticket. An upsert updates only the version the pre-check saw, so a lost race is 409 and
+//!    the winner's row is unchanged.
 //!
-//! Any refusal or failure deletes the staged blob ([`crate::names::settle`]).
+//! A refused or failed write deletes the blob and withdraws the ticket
+//! ([`crate::names::keep_if_written`]); a write whose outcome is unknown (no answer from
+//! Postgres) keeps the blob for m8's sweeper, which deletes only unreferenced blobs.
 
 use std::sync::Arc;
 
@@ -39,7 +45,7 @@ use uuid::Uuid;
 
 use crate::app::{AppState, identity};
 use crate::buckets::body;
-use crate::engine::Located;
+use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
 use crate::names::{self, Staged, check_object_name};
 use crate::openapi::StorageErrorEnvelope;
@@ -67,12 +73,27 @@ const TICKET: NamedStatement = named_statement!(
     ]
 );
 
+/// Clears a version's dead tickets before one is minted for it: expired ones, and those a
+/// branch copied from its parent (another timeline's, never consumable here). Otherwise a
+/// leftover (an abandoned move, a failed withdrawal) blocks the version's tickets forever.
+const PURGE_TICKETS: NamedStatement = named_statement!(
+    "purge tickets",
+    "DELETE FROM storage.upload_tickets WHERE version_id OPERATOR(pg_catalog.=) $1 AND (expires_at OPERATOR(pg_catalog.<=) pg_catalog.clock_timestamp() OR timeline_id IS DISTINCT FROM pg_catalog.current_setting('neon.timeline_id', true))",
+    &[Type::UUID]
+);
+
 /// Withdraws a ticket the row it was minted for didn't take (a refused or failed write).
 const UNTICKET: NamedStatement = named_statement!(
     "unticket",
     "DELETE FROM storage.upload_tickets WHERE version_id OPERATOR(pg_catalog.=) $1 AND bucket_id OPERATOR(pg_catalog.=) $2 AND name OPERATOR(pg_catalog.=) $3",
     &[Type::UUID, Type::UUID, Type::TEXT]
 );
+
+/// Whether a failed write may have committed: Postgres gave no answer (the connection lost,
+/// the COMMIT unconfirmed), so it has no SQLSTATE and is a 503 `unavailable` or a 500.
+pub fn outcome_unknown(f: &Failure) -> bool {
+    f.0.sqlstate.is_none() && matches!(f.0.code, "unavailable" | "internal")
+}
 
 /// The trigger's code for a row its ticket doesn't vouch for.
 const TICKET_MISSING: &str = "CB003";
@@ -125,6 +146,8 @@ struct Row {
     content_type: String,
     etag: Option<String>,
     version: Uuid,
+    /// The database's OID, read in the pre-check's transaction (0 until then).
+    datoid: u32,
 }
 
 const INSERT: &str = "INSERT INTO storage.objects (bucket_id, name, owner, size, content_type, etag, version_id) VALUES ($1, $2, $3, $4, $5, $6, $7)";
@@ -205,9 +228,13 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         row: &Row,
         upsert: bool,
         rid: &str,
-    ) -> Result<Option<Uuid>, Failure> {
+    ) -> Result<(Option<Uuid>, u32), Failure> {
         let (seen, _) = self
             .caller(data, at, rid, async |c, _| {
+                let oid: i64 = c.query_one(DATOID_SQL, &[]).await.map_err(pg(rid))?.get(0);
+                let Some(datoid) = datoid_of(Some(oid)) else {
+                    return Ok(Err(Failure::storage_unavailable()));
+                };
                 let seen = c
                     .query_opt(
                         "SELECT version_id FROM storage.objects WHERE bucket_id = $1 AND name = $2",
@@ -241,13 +268,15 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                     .await
                     .map_err(pg(rid))?;
                 Ok(match tried {
-                    Err(f) if f.sqlstate.as_deref() == Some(TICKET_MISSING) => Ok(seen.flatten()),
+                    Err(f) if f.sqlstate.as_deref() == Some(TICKET_MISSING) => {
+                        Ok((seen.flatten(), datoid))
+                    }
                     Err(f) if f.sqlstate.as_deref() == Some("23505") => {
                         Err(Failure::object_conflict())
                     }
                     Err(f) => Err(Failure(f).refusal()),
                     // A ticket happened to match: the policy passed all the same.
-                    Ok(_) => Ok(seen.flatten()),
+                    Ok(_) => Ok((seen.flatten(), datoid)),
                 })
             })
             .await?;
@@ -274,7 +303,9 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         out
     }
 
-    /// Withdraws `row`'s ticket after its write failed (best effort: it expires anyway).
+    /// Withdraws `row`'s ticket after its write failed. Best effort: a ticket left behind (this
+    /// failing, the request dropped) is cleared by the next mint for its version
+    /// ([`PURGE_TICKETS`]) once it has expired.
     async fn unticket(&self, data: &DataIdentity, at: &Located, row: &Row, rid: &str) {
         let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
             [&row.version, &row.bucket, &row.name];
@@ -296,6 +327,15 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         row: &Row,
         rid: &str,
     ) -> Result<(), Failure> {
+        self.engine
+            .managed(
+                data.branch_id,
+                &at.database,
+                &PURGE_TICKETS,
+                &[&row.version],
+                rid,
+            )
+            .await?;
         let size = row.size.unwrap_or_default();
         self.engine
             .managed(
@@ -330,6 +370,12 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     ) -> Result<(), Failure> {
         let (written, _) = self
             .caller(data, at, rid, async |c, _| {
+                // The database dropped and made again since the pre-check: the blob's key names
+                // the old one, so nothing is written.
+                let oid: i64 = c.query_one(DATOID_SQL, &[]).await.map_err(pg(rid))?.get(0);
+                if datoid_of(Some(oid)) != Some(row.datoid) {
+                    return Ok(Err(Failure::storage_unavailable()));
+                }
                 let base: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
                     &row.bucket,
                     &row.name,
@@ -339,16 +385,18 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                     &row.etag,
                     &row.version,
                 ];
-                if upsert && expected.is_some() {
+                let written = if upsert && expected.is_some() {
                     let mut params = base.to_vec();
                     params.push(&expected);
-                    c.execute(UPSERT, &params).await.map_err(pg(rid))
+                    c.execute(UPSERT, &params).await.map_err(pg(rid))?
                 } else {
-                    c.execute(INSERT, &base).await.map_err(pg(rid))
-                }
+                    c.execute(INSERT, &base).await.map_err(pg(rid))?
+                };
+                Ok(Ok(written))
             })
             .await
             .map_err(final_failure)?;
+        let written = written?;
         if written == 0 {
             // The upsert's row changed since the pre-check: someone else won.
             return Err(Failure::object_conflict());
@@ -404,10 +452,12 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
             .to_owned(),
         etag: None,
         version: Uuid::new_v4(),
+        datoid: 0,
     };
-    let expected = state.precheck(&data, &at, &row, upsert, &rid).await?;
+    let (expected, datoid) = state.precheck(&data, &at, &row, upsert, &rid).await?;
+    row.datoid = datoid;
     // Straight to the version's own key: random, and unreferenced until the row exists.
-    let key = names::version_key(&at.prefix, row.version);
+    let key = names::version_key(&names::object_prefix(at.database_id, datoid), row.version);
     let (stream, counter) =
         names::counted(request.into_data_stream(), limit.map(|l| l.max(0) as u64));
     let meta = names::stage(
@@ -425,7 +475,7 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
     row.size = Some(meta.size as i64);
     row.etag = Some(meta.etag.trim_matches('"').to_owned());
     // After the body: the ticket (its real size and etag), then the caller's row. A refused or
-    // failed write deletes the blob and withdraws the ticket.
+    // failed write deletes the blob (unless its outcome is unknown) and withdraws the ticket.
     names::keep_if_written(state.store.as_ref(), &key, async || {
         state.write(&data, &at, &row, expected, upsert, &rid).await
     })
@@ -443,7 +493,7 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
     tag = "storage",
     summary = "Upload an object",
     description = "Streams the body (any length, chunked included). Row level security on `storage.objects` decides, before any byte is stored and again when the row is written.",
-    params(("bucket" = String, Path), ("name" = String, Path, description = "The object's name: no leading `/`, no empty or `..` segment, at most 1024 bytes"), ObjectParams),
+    params(("bucket" = String, Path), ("name" = String, Path, description = "The object's name: at most 1024 bytes of UTF-8, no control characters, no leading `/`, no empty segment and none made only of dots (`.`, `..`, full-width or other NFKC dot forms)"), ObjectParams),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     security(("bearer" = [])),
     responses(
@@ -489,6 +539,8 @@ pub async fn put<S: ConnSource, M: ConnSource>(
 
 /// What a read needs of the row the caller sees.
 struct Found {
+    /// The database's OID, read with the row.
+    datoid: u32,
     version: Uuid,
     size: i64,
     etag: String,
@@ -507,22 +559,29 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         rid: &str,
     ) -> Result<(Uuid, Found), Failure> {
         let (bucket_id, _) = self.bucket(data, at, bucket, rid).await?;
-        let (row, _) = self
+        // The OID in the same transaction as the row: it decides the blob's key. A row without
+        // a version or a size (never one the service writes) isn't served.
+        let (found, _) = self
             .caller(data, at, rid, async |c, _| {
-                c.query_opt(
-                    "SELECT version_id, size, etag, content_type, owner FROM storage.objects WHERE bucket_id = $1 AND name = $2 AND version_id IS NOT NULL",
-                    &[&bucket_id, &name],
-                )
-                .await
-                .map_err(pg(rid))
+                let row = c
+                    .query_opt(
+                        "SELECT version_id, size, etag, content_type, owner FROM storage.objects WHERE bucket_id = $1 AND name = $2 AND version_id IS NOT NULL AND size IS NOT NULL",
+                        &[&bucket_id, &name],
+                    )
+                    .await
+                    .map_err(pg(rid))?;
+                let oid = c.query_one(DATOID_SQL, &[]).await.map_err(pg(rid))?;
+                Ok(row.map(|row| (row, oid.get::<_, i64>(0))))
             })
             .await?;
-        let row = row.ok_or_else(Failure::object_not_found)?;
+        let (row, oid) = found.ok_or_else(Failure::object_not_found)?;
+        let datoid = datoid_of(Some(oid)).ok_or_else(Failure::storage_unavailable)?;
         Ok((
             bucket_id,
             Found {
+                datoid,
                 version: row.get(0),
-                size: row.get::<_, Option<i64>>(1).unwrap_or_default(),
+                size: row.get::<_, i64>(1),
                 etag: row.get::<_, Option<String>>(2).unwrap_or_default(),
                 content_type: row
                     .get::<_, Option<String>>(3)
@@ -603,7 +662,10 @@ pub async fn download<S: ConnSource, M: ConnSource>(
         ),
         None => None,
     };
-    let key = names::version_key(&at.prefix, found.version);
+    let key = names::version_key(
+        &names::object_prefix(at.database_id, found.datoid),
+        found.version,
+    );
     let object = state
         .store
         .get(&key, range)
@@ -799,15 +861,21 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
         content_type: src.content_type.clone(),
         etag: Some(src.etag.clone()),
         version: Uuid::new_v4(),
+        datoid: 0,
     };
-    let expected = state.precheck(&data, &at, &row, false, &rid).await?;
+    let (expected, datoid) = state.precheck(&data, &at, &row, false, &rid).await?;
+    let row = Row { datoid, ..row };
     // Only after the caller may read the source and write the destination: the blob is copied
     // to the new version's key, deleted again if the row isn't written. One `CopyObject`: on
     // AWS S3 that copies at most 5 GB, above which it needs `UploadPartCopy` (m7).
-    let key = names::version_key(&at.prefix, row.version);
+    let key = names::version_key(&names::object_prefix(at.database_id, datoid), row.version);
+    let source = names::version_key(
+        &names::object_prefix(at.database_id, src.datoid),
+        src.version,
+    );
     let meta = state
         .store
-        .copy(&names::version_key(&at.prefix, src.version), &key)
+        .copy(&source, &key)
         .await
         .map_err(|e| Failure::from_store(&e, &rid))?;
     let row = Row {
@@ -815,10 +883,10 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
         size: Some(meta.size as i64),
         ..row
     };
-    if let Err(f) = state.write(&data, &at, &row, expected, false, &rid).await {
-        let _ = state.store.delete(&key).await;
-        return Err(f);
-    }
+    names::keep_if_written(state.store.as_ref(), &key, async || {
+        state.write(&data, &at, &row, expected, false, &rid).await
+    })
+    .await?;
     Ok(
         Json(json!({ "bucket": to_bucket, "name": row.name, "version_id": row.version }))
             .into_response(),
@@ -867,6 +935,7 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
         content_type: src.content_type.clone(),
         etag: Some(src.etag.clone()),
         version: src.version,
+        datoid: src.datoid,
     });
     if let Some(row) = &ticketed {
         let (passed, _) = state
@@ -1083,6 +1152,26 @@ mod tests {
         );
     }
 
+    /// SF2: a final write that failed without an answer from Postgres (the connection lost, the
+    /// COMMIT unconfirmed) may have committed: its blob stays for m8's sweeper. Any answer
+    /// (a refusal, a conflict, our own refusals) means nothing was written.
+    #[test]
+    fn only_an_unanswered_write_keeps_its_blob() {
+        let lost = Failure(QueryFailure::unreachable("r", "connection closed"));
+        assert!(outcome_unknown(&lost));
+        let internal = Failure(QueryFailure::internal("r", "a value that didn't decode"));
+        assert!(outcome_unknown(&internal));
+        for answered in [
+            Failure(db_failure("42501", "rls", "r")),
+            Failure(db_failure("23505", "dup", "r")),
+            Failure::object_conflict(),
+            Failure::not_allowed(),
+            Failure::storage_unavailable(),
+        ] {
+            assert!(!outcome_unknown(&answered), "{answered:?}");
+        }
+    }
+
     /// AC: a lost race (the ticket no longer matches, or the name was taken) is 409; a policy
     /// that changed since the pre-check is still RLS's 403.
     #[test]
@@ -1125,6 +1214,7 @@ mod tests {
     #[test]
     fn downloads_are_never_sniffed() {
         let found = Found {
+            datoid: 1,
             version: Uuid::nil(),
             size: 1,
             etag: "e".into(),

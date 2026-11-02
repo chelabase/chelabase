@@ -70,7 +70,7 @@ impl Failure {
         )
     }
 
-    /// 409: the bucket still holds `objects` objects.
+    /// 409: the bucket still holds objects (no count: it would include hidden ones).
     pub fn bucket_not_empty(name: &str) -> Self {
         Self::new(
             StatusCode::CONFLICT,
@@ -82,7 +82,7 @@ impl Failure {
     /// 400: an object name that isn't allowed (checked before any statement).
     pub fn invalid_name() -> Self {
         Self::invalid_request(
-            "an object name is 1 to 1024 bytes of UTF-8 with no control characters, no leading `/`, and no empty or `..` segment",
+            "an object name is 1 to 1024 bytes of UTF-8 with no control characters, no leading `/`, no empty segment and no segment made only of dots",
         )
     }
 
