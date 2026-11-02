@@ -4,6 +4,7 @@
 // Auth qualifies every query with the pool's schema (`database.schemaName`), and an
 // unqualified table reference fails rather than reaching some pool's tables. One shared
 // pool also keeps the connection count fixed however many pools are cached.
+import { getSchema } from "better-auth/db";
 import { getMigrations } from "better-auth/db/migration";
 import pg from "pg";
 import { authOptions, createAuth, type Auth } from "./better-auth.ts";
@@ -50,12 +51,17 @@ export class PoolRegistry {
   private readonly databaseUrl: string;
   private readonly secret: string;
   private readonly capacity: number;
+  /** Every table a pool's migration creates, from the same options the migration uses. */
+  private readonly tables: string[];
 
   constructor(databaseUrl: string, secret: string, capacity: number) {
     this.databaseUrl = databaseUrl;
     this.secret = secret;
     this.capacity = capacity;
     this.db = sharedPgPool(databaseUrl);
+    this.tables = Object.entries(getSchema(authOptions(this.db, secret, undefined)))
+      .filter(([, table]) => !table.disableMigrations)
+      .map(([name]) => name);
   }
 
   /** Runs `fn` with the pool's instance. */
@@ -114,12 +120,14 @@ export class PoolRegistry {
   private async load(ref: PoolRef): Promise<Auth> {
     const cached = this.cache.get(ref.schema);
     if (cached) return cached;
-    // A pool exists once its migrations ran: `session` is the last core table created.
-    const found = await this.db.query(
-      "SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = 'session'",
-      [ref.schema],
+    // A pool exists once its migration ran to the end: every table it creates is there. One
+    // that stopped partway (or predates a table) is not found until createPool runs again;
+    // loading never migrates.
+    const found = await this.db.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = ANY($2::text[])",
+      [ref.schema, this.tables],
     );
-    if (found.rowCount !== 1) throw new PoolNotFound(ref.name);
+    if (found.rows[0]?.n !== this.tables.length) throw new PoolNotFound(ref.name);
     const auth = createAuth(this.db, this.secret, ref.schema);
     this.cache.set(ref.schema, auth);
     while (this.cache.size > this.capacity) {

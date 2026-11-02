@@ -151,7 +151,9 @@ describeDb("codes", () => {
     expect(message.to).toEqual(["deliver@x.io"]);
     expect(message.data).toContain("Acme");
     expect(message.data).toContain("https://acme.test/verify");
-    const code = /\b([0-9]{6})\b/.exec(message.data)![1]!;
+    // The code as the text part shows it, after "code is:" (not any six digits in the raw DATA).
+    const textPart = message.data.split(/Content-Type: text\/plain/i)[1]!;
+    const code = /code is:\s+([0-9]{6})\b/.exec(textPart)![1]!;
     expect(JSON.stringify(emailed.body)).not.toContain(code);
     expect(logged.join("\n")).not.toContain(code);
     // The emailed code replaced the returned one.
@@ -244,6 +246,102 @@ describeDb("codes", () => {
 
     vi.setSystemTime(t0 + 7 * DAY + 1000);
     expect((await verify(b.id, "invite", inviteB.code, { new_password: "password-ttl-2" })).status).toBe(400);
+  });
+
+  // B1: a code proves control of the address it was mailed to, so changing the email kills it.
+  it("email_change_kills_codes", async () => {
+    const changeEmail = async (id: string, extra: Record<string, unknown> = {}) => {
+      const r = await call(h, "PUT", `${base()}/users/${id}/email`, { body: { email: `moved-${++n}-${Date.now()}@y.io`, ...extra } });
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      return r.body.user as { id: string; email: string; email_verified: boolean };
+    };
+
+    // verify: the old mailbox's code must not mark the new address verified.
+    const v = await createUser();
+    const verifyCode = await issue(v.id, "verify");
+    expect((await changeEmail(v.id)).email_verified).toBe(false);
+    const rv = await verify(v.id, "verify", verifyCode.code);
+    expect(rv.status, JSON.stringify(rv.body)).toBe(400);
+    expect(rv.body.error).toBe("invalid_code");
+    const fresh = await issue(v.id, "verify");
+    const okV = await verify(v.id, "verify", fresh.code);
+    expect(okV.status).toBe(200);
+    expect(okV.body.user.email_verified).toBe(true);
+
+    // reset: the old mailbox's code must not set the password.
+    const r = await createUser("password-move-0");
+    const resetCode = await issue(r.id, "reset");
+    const moved = await changeEmail(r.id, { email_verified: true });
+    const rr = await verify(r.id, "reset", resetCode.code, { new_password: "password-move-9" });
+    expect(rr.status, JSON.stringify(rr.body)).toBe(400);
+    expect(rr.body.error).toBe("invalid_code");
+    expect((await signIn(moved.email, "password-move-9")).status).toBe(401);
+    expect((await signIn(moved.email, "password-move-0")).status).toBe(201);
+
+    // invite: a code sent to a mistyped address dies when the address is corrected.
+    const i = await createUser();
+    const inviteCode = await issue(i.id, "invite");
+    await changeEmail(i.id);
+    const ri = await verify(i.id, "invite", inviteCode.code, { new_password: "password-move-8" });
+    expect(ri.status, JSON.stringify(ri.body)).toBe(400);
+    expect(ri.body.error).toBe("invalid_code");
+    const again = await issue(i.id, "invite");
+    expect((await verify(i.id, "invite", again.code, { new_password: "password-move-8" })).status).toBe(200);
+  });
+
+  // S1: an invite never overwrites an established account (a password and a verified email).
+  it("invite_refused_for_user_with_password", async () => {
+    const user = await createUser("password-est-0");
+    expect((await call(h, "POST", `${base()}/users/${user.id}/verify-email`)).status).toBe(200);
+    for (const as of ["auth", "orchestrator"] as const) {
+      const r = await call(h, "POST", `${base()}/codes`, { as, body: { user_id: user.id, kind: "invite", delivery: "return" } });
+      expect(r.status, JSON.stringify(r.body)).toBe(409);
+      expect(r.body.error).toBe("invite_refused");
+      expect(r.body.code).toBeUndefined();
+    }
+    // Other kinds are unaffected.
+    expect((await call(h, "POST", `${base()}/codes`, { body: { user_id: user.id, kind: "reset", delivery: "return" } })).status).toBe(201);
+    expect((await signIn(user.email, "password-est-0")).status).toBe(201);
+  });
+
+  it("invite_refused_at_verify_once_established", async () => {
+    // Invited while pending (no password), then the account was set up some other way.
+    const user = await createUser();
+    const { code } = await issue(user.id, "invite");
+    expect((await call(h, "PUT", `${base()}/users/${user.id}/password`, { body: { password: "password-est-1" } })).status).toBe(200);
+    expect((await call(h, "POST", `${base()}/users/${user.id}/verify-email`)).status).toBe(200);
+    const wrongReply = await verify(user.id, "invite", wrong(code), { new_password: "password-est-2" });
+    // More refusals than MAX_ATTEMPTS: none of them may cost an attempt, and each looks like a wrong code.
+    for (let k = 0; k < 6; k++) {
+      const r = await verify(user.id, "invite", code, { new_password: "password-est-2" });
+      expect(r.status, JSON.stringify(r.body)).toBe(400);
+      expect(r.body).toEqual(wrongReply.body);
+    }
+    expect((await signIn(user.email, "password-est-2")).status).toBe(401);
+    expect((await signIn(user.email, "password-est-1")).status).toBe(201);
+    // Back to unverified (same address, so the code's binding holds): the code was never spent.
+    const unverify = await call(h, "PUT", `${base()}/users/${user.id}/email`, { body: { email: user.email } });
+    expect(unverify.status).toBe(200);
+    expect(unverify.body.user.email_verified).toBe(false);
+    expect((await verify(user.id, "invite", code, { new_password: "password-est-2" })).status).toBe(200);
+  });
+
+  it("invite_accepted_for_preregistered_user", async () => {
+    // A password but an unverified email: a pre-registered account the invite completes.
+    const user = await createUser("password-pre-0");
+    const s = await signIn(user.email, "password-pre-0");
+    expect(s.status).toBe(201);
+    const { code } = await issue(user.id, "invite", pool);
+    const orch = await call(h, "POST", `${base()}/codes`, { as: "orchestrator", body: { user_id: user.id, kind: "invite", delivery: "return" } });
+    expect(orch.status).toBe(201);
+    // The orchestrator's code replaced the first.
+    expect((await verify(user.id, "invite", code, { new_password: "password-pre-1" })).status).toBe(400);
+    const r = await verify(user.id, "invite", orch.body.code, { new_password: "password-pre-1" });
+    expect(r.status).toBe(200);
+    expect(r.body.user.email_verified).toBe(true);
+    expect((await lookup(s.body.session_token)).status).toBe(404);
+    expect((await signIn(user.email, "password-pre-0")).status).toBe(401);
+    expect((await signIn(user.email, "password-pre-1")).status).toBe(201);
   });
 
   it("caller_allow_list", async () => {

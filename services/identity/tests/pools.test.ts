@@ -124,6 +124,31 @@ describeDb("pools", () => {
     await createPool(h, a.pool);
     expect((await signIn(a.pool, "d@x.io", "password-for-pool-a")).status).toBe(201);
   });
+
+  // A pool is ready only when every table its migration creates exists. One whose migration
+  // stopped partway (here: no email_code) is not found until createPool runs again.
+  it("pool_missing_email_code_not_ready", async () => {
+    const a = newAppPool();
+    await createPool(h, a.pool);
+    await h.db.query(`DROP TABLE "${a.schema}".email_code`);
+    // A fresh server, so nothing is cached.
+    const cold = await startHarness();
+    try {
+      const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "e@x.io" } });
+      expect(r.status, JSON.stringify(r.body)).toBe(404);
+      expect(r.body.error).toBe("pool_not_found");
+      // Creating it again completes the migration.
+      await createPool(cold, a.pool);
+      const up = await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "f@x.io" } });
+      expect(up.status, JSON.stringify(up.body)).toBe(201);
+      const code = await call(cold, "POST", `/internal/v1/pools/${a.pool}/codes`, {
+        body: { user_id: up.body.user.id, kind: "verify", delivery: "return" },
+      });
+      expect(code.status, JSON.stringify(code.body)).toBe(201);
+    } finally {
+      await cold.close();
+    }
+  });
 });
 
 // AC 6: a bad pool name is refused with 400 before any SQL runs. The server here points at a

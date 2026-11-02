@@ -913,7 +913,7 @@
       "post": {
         "operationId": "createCode",
         "summary": "Issue a six-digit email code for a user, replacing that user's earlier code of the same kind",
-        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). TTL: `verify` and `reset` 15 minutes, `invite` 7 days. A code allows 5 wrong guesses; the next guess, right or wrong, is refused.",
+        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). An `invite` code is refused with 409 `invite_refused` for an established account (a password and a verified email); a pre-registered account (no password, or an unverified email) may be invited. A code is bound to the user's email when issued: changing the email kills every outstanding code. TTL: `verify` and `reset` 15 minutes, `invite` 7 days. A code allows 5 wrong guesses; the next guess, right or wrong, is refused.",
         "x-callers": [
           "auth",
           "orchestrator"
@@ -1027,7 +1027,7 @@
       "post": {
         "operationId": "verifyCode",
         "summary": "Check and consume a code",
-        "description": "Counts one attempt and consumes the code in one step. Any wrong, expired, used, replaced or locked-out code, or an unknown user, is 400 `invalid_code`. `verify` marks the email verified. `reset` and `invite` require `new_password`: they set it (400 `weak_password` before the code is spent if its length is out of range), mark the email verified and revoke all of the user's sessions. Kinds never stand in for each other.",
+        "description": "Counts one attempt and consumes the code in one step. Any wrong, expired, used, replaced or locked-out code, a code sent to an address the user no longer has, an unknown user, or an `invite` code for an account that has since been established (a password and a verified email), is 400 `invalid_code`; the last two cost no attempt. `verify` marks the email verified. `reset` and `invite` require `new_password`: they set it (400 `weak_password` before the code is spent if its length is out of range), mark the email verified and revoke all of the user's sessions. Kinds never stand in for each other.",
         "x-callers": [
           "auth"
         ],
@@ -1207,6 +1207,7 @@
               "bad_request",
               "invalid_code",
               "email_not_configured",
+              "invite_refused",
               "email_send_failed",
               "internal"
             ]

@@ -73,6 +73,23 @@ function optLink(body: Record<string, unknown>): string | undefined {
   return v;
 }
 
+/** Every refused guess, whatever the reason, is this one reply. */
+function invalidCode(): HttpError {
+  return new HttpError(400, "invalid_code", "the code is wrong, expired, used up or was replaced");
+}
+
+/**
+ * Whether an invite may set this user's password: only while the account is not established,
+ * that is, it has no credential password or its email is unverified (a pre-registered
+ * account, whose password accepting replaces). An invite never overwrites an established
+ * account; resetting one is the reset code's job.
+ */
+async function inviteAllowed(ctx: Context, user: BaUser): Promise<boolean> {
+  if (!user.emailVerified) return true;
+  const account = (await ctx.internalAdapter.findCredentialAccount(user.id)) as { password?: string | null } | null;
+  return !account?.password;
+}
+
 /**
  * Sets the password after a reset or invite code: Better Auth's `setUserPassword` (the
  * `users.set_password` route) plus `revokeUserSessions`, and the email marked verified (the
@@ -106,8 +123,12 @@ export function codeRoutes(): Route[] {
           throw new HttpError(409, "email_not_configured", "no SMTP server is configured; use delivery \"return\"");
         }
         return registry.use(pool, async (auth) => {
-          const user = await requireUser(await context(auth), id);
-          const { code, expiresAt } = await auth.codes.issue(user.id, kind);
+          const ctx = await context(auth);
+          const user = await requireUser(ctx, id);
+          if (kind === "invite" && !(await inviteAllowed(ctx, user))) {
+            throw new HttpError(409, "invite_refused", "the user already has a password and a verified email; use a reset code");
+          }
+          const { code, expiresAt } = await auth.codes.issue(user.id, user.email, kind);
           const out = { kind, delivery, expires_at: expiresAt.toISOString() };
           if (delivery === "return") return { status: 201, body: { ...out, code } };
           const email = render(kind, { project, code, expires: CODE_TTL_TEXT[kind], ...(link === undefined ? {} : { link }) });
@@ -138,12 +159,17 @@ export function codeRoutes(): Route[] {
           const ctx = await context(auth);
           // Before the code is spent, so a weak password costs no attempt.
           if (typeof password === "string") checkPasswordLength(ctx, password);
-          if (!(await auth.codes.consume(id, kind, code))) {
-            throw new HttpError(400, "invalid_code", "the code is wrong, expired, used up or was replaced");
-          }
+          // The user first: the code is bound to their current email. An unknown user, or an
+          // invite for an established account, is refused like a wrong code, before the guess
+          // is counted, so neither costs an attempt nor tells the cases apart.
+          const holder = (await ctx.internalAdapter.findUserById(id)) as BaUser | null;
+          if (!holder || (kind === "invite" && !(await inviteAllowed(ctx, holder)))) throw invalidCode();
+          if (!(await auth.codes.consume(id, holder.email, kind, code))) throw invalidCode();
           // The row cascades with its user, so the user existed when the code was consumed; a
-          // concurrent delete since then is a plain 404.
+          // concurrent delete since then is a plain 404. An email changed since the read above
+          // means the code proved the old address only.
           let user = await requireUser(ctx, id);
+          if (user.email.toLowerCase() !== holder.email.toLowerCase()) throw invalidCode();
           if (kind === "verify") {
             if (!user.emailVerified) user = (await ctx.internalAdapter.updateUser(id, { emailVerified: true })) as BaUser;
           } else {

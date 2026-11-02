@@ -10,8 +10,10 @@
 //
 // Invariants:
 // - a code is stored only as an HMAC-SHA256 under the service secret, over the pool schema,
-//   user id, kind and code, so a row is worthless in another pool, for another user or kind,
-//   and a database dump can't be brute-forced without the secret;
+//   user id, lowercased email, kind and code, so a row is worthless in another pool, for
+//   another user or kind, and a database dump can't be brute-forced without the secret;
+// - a code proves control of the address it was sent to: it is checked against the user's
+//   current email, so changing the email kills every outstanding code for that user;
 // - a guess is counted and the code consumed in one UPDATE: a row whose attempts reached
 //   MAX_ATTEMPTS, or that is expired or consumed, never matches again;
 // - a new code for the same (user, kind) replaces the row, so the old code dies with its
@@ -75,14 +77,17 @@ export class CodeStore {
     this.table = `"${schema}"."${TABLE}"`;
   }
 
-  private hash(userId: string, kind: CodeKind, code: string): string {
+  private hash(userId: string, email: string, kind: CodeKind, code: string): string {
     return createHmac("sha256", this.secret)
-      .update(`chelabase-identity email-code v1\0${this.schema}\0${userId}\0${kind}\0${code}`)
+      .update(`chelabase-identity email-code v2\0${this.schema}\0${userId}\0${email.toLowerCase()}\0${kind}\0${code}`)
       .digest("base64url");
   }
 
-  /** A fresh code for (user, kind), replacing any earlier one. The caller checked the user. */
-  async issue(userId: string, kind: CodeKind, now = new Date()): Promise<{ code: string; expiresAt: Date }> {
+  /**
+   * A fresh code for (user, kind), replacing any earlier one, bound to `email`: the address
+   * it is sent to, the user's current one. The caller checked the user.
+   */
+  async issue(userId: string, email: string, kind: CodeKind, now = new Date()): Promise<{ code: string; expiresAt: Date }> {
     const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
     const expiresAt = new Date(now.getTime() + CODE_TTL_MS[kind]);
     await this.db.query(
@@ -91,7 +96,7 @@ export class CodeStore {
        ON CONFLICT ("userId", kind) DO UPDATE SET
          "codeHash" = EXCLUDED."codeHash", attempts = 0, "expiresAt" = EXCLUDED."expiresAt",
          "consumedAt" = NULL, "createdAt" = EXCLUDED."createdAt"`,
-      [randomUUID(), userId, kind, this.hash(userId, kind, code), expiresAt, now],
+      [randomUUID(), userId, kind, this.hash(userId, email, kind, code), expiresAt, now],
     );
     return { code, expiresAt };
   }
@@ -99,16 +104,17 @@ export class CodeStore {
   /**
    * One guess. Counts the attempt and, when the code matches, consumes it, in one statement:
    * concurrent guesses serialize on the row, and each re-checks the conditions after the
-   * previous one committed.
+   * previous one committed. `email` is the user's current address: a code sent to another
+   * one never matches (it still counts the attempt).
    */
-  async consume(userId: string, kind: CodeKind, code: string, now = new Date()): Promise<boolean> {
+  async consume(userId: string, email: string, kind: CodeKind, code: string, now = new Date()): Promise<boolean> {
     const r = await this.db.query<{ ok: boolean }>(
       `UPDATE ${this.table} SET
          attempts = attempts + 1,
          "consumedAt" = CASE WHEN "codeHash" = $3 THEN $4::timestamptz END
        WHERE "userId" = $1 AND kind = $2 AND "consumedAt" IS NULL AND attempts < $5 AND "expiresAt" > $4::timestamptz
        RETURNING "consumedAt" IS NOT NULL AS ok`,
-      [userId, kind, this.hash(userId, kind, code), now, MAX_ATTEMPTS],
+      [userId, kind, this.hash(userId, email, kind, code), now, MAX_ATTEMPTS],
     );
     return r.rows[0]?.ok === true;
   }
