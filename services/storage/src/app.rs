@@ -14,9 +14,10 @@ use chelabase_storage::ObjectStore;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+use crate::control::Urls;
 use crate::engine::Engine;
 use crate::error::Failure;
-use crate::{buckets, objects};
+use crate::{buckets, objects, public, signed};
 
 /// The identity token's audience.
 pub const AUDIENCE: &str = "storage";
@@ -31,6 +32,8 @@ pub struct AppState<S, M> {
     pub verifier: InternalVerifier,
     /// Where objects go (m5's object routes).
     pub store: Arc<dyn ObjectStore>,
+    /// Signed URLs' key, key liveness and upload tokens (m6).
+    pub urls: Urls,
 }
 
 /// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
@@ -49,6 +52,9 @@ pub fn api_router<S: ConnSource, M: ConnSource>() -> OpenApiRouter<Arc<AppState<
         .routes(routes!(objects::list))
         .routes(routes!(objects::copy))
         .routes(routes!(objects::r#move))
+        .routes(routes!(signed::sign, signed::signed_download))
+        .routes(routes!(signed::sign_upload, signed::signed_upload))
+        .routes(routes!(public::public_download))
 }
 
 pub fn router<S: ConnSource, M: ConnSource>(state: Arc<AppState<S, M>>) -> Router {
@@ -133,6 +139,7 @@ mod tests {
             engine: Engine::new(Pools::new(RefusedSource, 1), RefusedSource),
             verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             store: Arc::new(chelabase_storage::MemoryStore::default()),
+            urls: Urls::new(Arc::new(crate::control::Orchestrator::new("http://127.0.0.1:9", "t"))),
         };
         let headers = |token: &str| {
             let mut h = HeaderMap::new();
@@ -182,12 +189,58 @@ mod tests {
         pools: S,
         managed: M,
     ) -> (String, String) {
+        let (base, token, _) = serve_with(pools, managed, Arc::new(FakeControl::default())).await;
+        (base, token)
+    }
+
+    /// The control plane stand-in: a fixed URL key, the live keys, the upload tokens.
+    #[derive(Default)]
+    struct FakeControl {
+        live: std::sync::Mutex<Vec<crate::control::LiveKey>>,
+        /// token id -> (key id, claims, spent)
+        uploads: std::sync::Mutex<std::collections::HashMap<Uuid, (Uuid, serde_json::Value, bool)>>,
+    }
+
+    const URL_KEY: crate::token::UrlKey = crate::token::UrlKey { kid: 1, key: [3; 32] };
+
+    impl crate::control::Control for FakeControl {
+        fn url_key(&self) -> crate::control::BoxFuture<'_, Result<crate::token::UrlKey, crate::control::Unreachable>> {
+            Box::pin(async { Ok(URL_KEY) })
+        }
+        fn live_key(&self, key_id: Uuid) -> crate::control::BoxFuture<'_, Result<Option<crate::control::LiveKey>, crate::control::Unreachable>> {
+            let hit = self.live.lock().unwrap().iter().find(|k| k.key_id == key_id).cloned();
+            Box::pin(async move { Ok(hit) })
+        }
+        fn record_upload<'a>(&'a self, token_id: Uuid, key_id: Uuid, claims: &'a serde_json::Value, _: u64) -> crate::control::BoxFuture<'a, Result<bool, crate::control::Unreachable>> {
+            let ok = self.uploads.lock().unwrap().insert(token_id, (key_id, claims.clone(), false)).is_none();
+            Box::pin(async move { Ok(ok) })
+        }
+        fn consume_upload(&self, token_id: Uuid) -> crate::control::BoxFuture<'_, Result<Option<(crate::control::LiveKey, serde_json::Value)>, crate::control::Unreachable>> {
+            let mut uploads = self.uploads.lock().unwrap();
+            let out = match uploads.get_mut(&token_id) {
+                Some((key, claims, spent)) if !*spent => {
+                    *spent = true;
+                    self.live.lock().unwrap().iter().find(|k| k.key_id == *key).cloned().map(|k| (k, claims.clone()))
+                }
+                _ => None,
+            };
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    /// [`serve`] with `control`; also the key's identity.
+    async fn serve_with<S: chelabase_pgsession::ConnSource, M: chelabase_pgsession::ConnSource>(
+        pools: S,
+        managed: M,
+        control: Arc<FakeControl>,
+    ) -> (String, String, DataIdentity) {
         let (private, public) = generate_keypair_pem();
         let signer = InternalSigner::from_pem(private.as_bytes()).unwrap();
         let state = Arc::new(AppState {
             engine: Engine::new(Pools::new(pools, 4), managed),
             verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             store: Arc::new(chelabase_storage::MemoryStore::default()),
+            urls: Urls::new(control),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -195,10 +248,8 @@ mod tests {
         let mut key = data();
         key.kind = DataKeyKind::Secret;
         key.role = "authenticated".into();
-        (
-            base,
-            signer.sign(AUDIENCE, &identity_of(Some(key))).unwrap(),
-        )
+        let token = signer.sign(AUDIENCE, &identity_of(Some(key.clone()))).unwrap();
+        (base, token, key)
     }
 
     // A plain client against a local test server (clippy.toml allows it in tests only).
@@ -333,5 +384,149 @@ mod tests {
                 .0,
             400
         );
+    }
+
+    fn live_of(data: &DataIdentity) -> crate::control::LiveKey {
+        crate::control::LiveKey {
+            key_id: data.key_id,
+            branch_id: data.branch_id,
+            kind: data.kind,
+            role: data.role.clone(),
+            databases: None,
+            role_oid: None,
+        }
+    }
+
+    fn download_claims(data: &DataIdentity, exp: u64) -> crate::token::Claims {
+        crate::token::Claims {
+            purpose: crate::token::Purpose::Download,
+            database_id: Uuid::new_v4(),
+            branch_id: data.branch_id,
+            database: "app".into(),
+            datoid: Some(16384),
+            key_id: data.key_id,
+            bucket: "b".into(),
+            name: "a.txt".into(),
+            version_id: Some(Uuid::new_v4()),
+            size: Some(1),
+            etag: Some("e".into()),
+            content_type: Some("text/html".into()),
+            token_id: Uuid::new_v4(),
+            exp,
+        }
+    }
+
+    /// AC 2, 6, 7: a signed GET with a missing, changed, expired or other object's token, or
+    /// one whose key was revoked or moved to another branch, is refused before storage asks
+    /// the branch anything (an unreachable orchestrator here would make that a 503) or reads
+    /// the store. A good token gets as far as the branch.
+    #[tokio::test]
+    async fn a_bad_signed_url_is_refused_before_any_read() {
+        let control = Arc::new(FakeControl::default());
+        let (base, _, data) = serve_with(Unreachable, Unreachable, control.clone()).await;
+        control.live.lock().unwrap().push(live_of(&data));
+        let now = crate::signed::now();
+        let good = crate::token::sign(&URL_KEY, &download_claims(&data, now + 60));
+        let expired = crate::token::sign(&URL_KEY, &download_claims(&data, now - 1));
+        let other_key = crate::token::sign(&crate::token::UrlKey { kid: 1, key: [4; 32] }, &download_claims(&data, now + 60));
+        let mut moved = download_claims(&data, now + 60);
+        moved.branch_id = Uuid::new_v4();
+        let other_branch = crate::token::sign(&URL_KEY, &moved);
+        let mut gone = download_claims(&data, now + 60);
+        gone.key_id = Uuid::new_v4();
+        let revoked = crate::token::sign(&URL_KEY, &gone);
+        let tampered = format!("{}x", &good[..good.len() - 1]);
+        let get = |path: String| {
+            let base = base.clone();
+            async move {
+                let (status, _, json) = call(&base, "", "GET", &path, Vec::new()).await;
+                (status, json["error"]["code"].as_str().unwrap_or_default().to_owned())
+            }
+        };
+        let at = |t: &str| format!("/storage/v1/object/sign/b/a.txt?token={t}");
+        for (path, want) in [
+            ("/storage/v1/object/sign/b/a.txt".to_owned(), (401, "invalid_token")),
+            (at(&tampered), (401, "invalid_token")),
+            (at(&other_key), (401, "invalid_token")),
+            (at(&expired), (401, "token_expired")),
+            (format!("/storage/v1/object/sign/b/other.txt?token={good}"), (403, "token_not_valid")),
+            (format!("/storage/v1/object/sign/c/a.txt?token={good}"), (403, "token_not_valid")),
+            (at(&other_branch), (403, "token_not_valid")),
+            (at(&revoked), (403, "token_not_valid")),
+        ] {
+            assert_eq!(get(path.clone()).await, (want.0, want.1.to_owned()), "{path}");
+        }
+        // The good one passes every check and reaches the branch (unreachable here).
+        assert_eq!(get(at(&good)).await.0, 503);
+    }
+
+    /// AC 8, 11: an upload token is spent once; the second use is refused before the body.
+    /// An upload token never opens a download, nor a download token an upload.
+    #[tokio::test]
+    async fn an_upload_token_is_used_once() {
+        let control = Arc::new(FakeControl::default());
+        let (base, key, data) = serve_with(Unreachable, Unreachable, control.clone()).await;
+        control.live.lock().unwrap().push(live_of(&data));
+        let now = crate::signed::now();
+        let token_id = Uuid::new_v4();
+        control.uploads.lock().unwrap().insert(token_id, (data.key_id, serde_json::json!({}), false));
+        let claims = crate::token::Claims {
+            purpose: crate::token::Purpose::Upload,
+            datoid: None,
+            version_id: None,
+            size: None,
+            etag: None,
+            content_type: None,
+            token_id,
+            ..download_claims(&data, now + 60)
+        };
+        let token = crate::token::sign(&URL_KEY, &claims);
+        let path = format!("/storage/v1/object/upload/sign/b/a.txt?token={token}");
+        // The first use is spent and goes on to upload (the branch is unreachable here).
+        let (first, _, _) = call(&base, "", "PUT", &path, b"x".to_vec()).await;
+        assert_eq!(first, 503);
+        let (second, _, json) = call(&base, "", "PUT", &path, b"x".to_vec()).await;
+        assert_eq!((second, json["error"]["code"].as_str()), (403, Some("token_not_valid")), "{json}");
+        // Not a download token.
+        let (status, _, _) = call(&base, "", "GET", &format!("/storage/v1/object/sign/b/a.txt?token={token}"), Vec::new()).await;
+        assert_eq!(status, 403);
+        let download = crate::token::sign(&URL_KEY, &download_claims(&data, now + 60));
+        let (status, _, _) = call(&base, "", "PUT", &format!("/storage/v1/object/upload/sign/b/a.txt?token={download}"), b"x".to_vec()).await;
+        assert_eq!(status, 403);
+        // AC 10: minting with a TTL over 7 days is 400 before anything is read.
+        for route in ["sign", "upload/sign"] {
+            let body = serde_json::to_vec(&serde_json::json!({ "expires_in": 604_801 })).unwrap();
+            let (status, _, json) = call(&base, &key, "POST", &format!("/storage/v1/object/{route}/b/a.txt"), body).await;
+            assert_eq!(status, 400, "{route}: {json}");
+        }
+    }
+
+    /// The orchestrator says the branch doesn't exist.
+    struct NoBranch;
+
+    impl chelabase_pgsession::ConnSource for NoBranch {
+        async fn fetch(
+            &self,
+            _branch: Uuid,
+        ) -> Result<chelabase_pgsession::ConnInfo, chelabase_pgsession::ConnError> {
+            Err(chelabase_pgsession::ConnError::UnknownBranch)
+        }
+    }
+
+    /// AC 5: a public path on an unknown branch, or one that isn't a branch id, is the
+    /// object's 404 (never the data API's 401); a branch storage can't reach is 503.
+    #[tokio::test]
+    async fn a_public_path_off_any_branch_is_404() {
+        let (base, _) = serve(NoBranch, NoBranch).await;
+        for path in [
+            format!("/storage/v1/object/public/{}/b/a.txt", Uuid::new_v4()),
+            "/storage/v1/object/public/not-a-branch/b/a.txt".to_owned(),
+        ] {
+            let (status, _, json) = call(&base, "", "GET", &path, Vec::new()).await;
+            assert_eq!((status, json["error"]["code"].as_str()), (404, Some("object_not_found")), "{path}");
+        }
+        let (base, _) = serve(Unreachable, Unreachable).await;
+        let path = format!("/storage/v1/object/public/{}/b/a.txt", Uuid::new_v4());
+        assert_eq!(call(&base, "", "GET", &path, Vec::new()).await.0, 503);
     }
 }

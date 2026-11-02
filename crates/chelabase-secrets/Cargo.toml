@@ -8,6 +8,9 @@ description = "Encryption at rest for Chelabase control-plane secrets"
 [dependencies]
 aes-gcm = { workspace = true }
 base64 = { workspace = true }
+# `derive_key`: purpose-bound keys derived from the secrets key.
+hmac = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 

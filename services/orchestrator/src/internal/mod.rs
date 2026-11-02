@@ -12,6 +12,7 @@ mod proxy;
 pub mod realtime;
 mod signup;
 mod spec;
+mod storage;
 
 pub use signup::{SETUP_NONCE_TTL, SetupCode, load_setup_code};
 
@@ -109,6 +110,27 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         key_id: Uuid,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+
+    /// Object storage (m6): the key with this id while it is live.
+    fn live_data_key(
+        &self,
+        key_id: Uuid,
+    ) -> impl Future<Output = Result<Option<DataKeyLookup>, MetadataError>> + Send;
+
+    /// Records a minted one-time upload token; false when the id is taken or the key is dead.
+    fn insert_upload_token(
+        &self,
+        token_id: Uuid,
+        key_id: Uuid,
+        claims: &serde_json::Value,
+        expires_at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+
+    /// Spends an upload token once, before its expiry, while its key is live.
+    fn consume_upload_token(
+        &self,
+        token_id: Uuid,
+    ) -> impl Future<Output = Result<Option<(DataKeyLookup, serde_json::Value)>, MetadataError>> + Send;
 
     /// What the REST service needs to connect to a branch, whatever its status.
     fn branch_connection(
@@ -331,6 +353,24 @@ impl NeonMetadataPort for MetadataClient {
         sha256: &[u8; 32],
     ) -> Result<Option<DataKeyLookup>, MetadataError> {
         MetadataClient::lookup_data_key(self, sha256).await
+    }
+    async fn live_data_key(&self, key_id: Uuid) -> Result<Option<DataKeyLookup>, MetadataError> {
+        MetadataClient::live_data_key(self, key_id).await
+    }
+    async fn insert_upload_token(
+        &self,
+        token_id: Uuid,
+        key_id: Uuid,
+        claims: &serde_json::Value,
+        expires_at: DateTime<Utc>,
+    ) -> Result<bool, MetadataError> {
+        MetadataClient::insert_upload_token(self, token_id, key_id, claims, expires_at).await
+    }
+    async fn consume_upload_token(
+        &self,
+        token_id: Uuid,
+    ) -> Result<Option<(DataKeyLookup, serde_json::Value)>, MetadataError> {
+        MetadataClient::consume_upload_token(self, token_id).await
     }
     async fn touch_data_key(&self, key_id: Uuid) -> Result<(), MetadataError> {
         MetadataClient::touch_data_key(self, key_id).await
@@ -617,8 +657,8 @@ where
             get(data::branch_connection::<M, L>),
         )
         .route_layer(middleware::from_fn_with_state(rest_tokens, require_any_bearer));
-    // The `chelabase_storage` login's password: storage's bearer only.
-    let storage = Router::new()
+    // The `chelabase_storage` login's password and object URLs' state: storage's bearer only.
+    let storage = storage::routes::<M, L>()
         .route(
             "/internal/storage/branches/{id}/connection",
             get(data::storage_connection::<M, L>),

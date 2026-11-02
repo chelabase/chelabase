@@ -59,6 +59,8 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
+/// Upload tokens by id: (key id, claims, spent).
+type UploadTokens = HashMap<uuid::Uuid, (uuid::Uuid, Value, bool)>;
 /// Members hub T8: personal-login rows by (tenant, Zitadel user id).
 type LoginRows = HashMap<(TenantId, String), Vec<LoginEndpoint>>;
 
@@ -110,6 +112,9 @@ struct FakeNeon {
     clears: Arc<Mutex<Vec<(TenantId, String)>>>,
     fail_clear: Arc<Mutex<bool>>,
     fail_tenant_lookup: Arc<Mutex<bool>>,
+    /// Object storage m6: upload tokens by id (key id, claims, spent); the SQL's own rules are
+    /// tested live (`live_db::storage_upload_tokens_*`).
+    upload_tokens: Arc<Mutex<UploadTokens>>,
 }
 
 /// The fake's fresh-install claim rows: a model of `claim_setup`'s rules (the real ones are
@@ -494,6 +499,44 @@ impl NeonMetadataPort for FakeNeon {
             .iter()
             .find(|(h, _)| h == sha256)
             .map(|(_, l)| l.clone()))
+    }
+
+    async fn live_data_key(&self, key_id: uuid::Uuid) -> Result<Option<DataKeyLookup>, MetadataError> {
+        self.check()?;
+        Ok(self.data_keys.lock().unwrap().iter().find(|(_, l)| l.key_id == key_id).map(|(_, l)| l.clone()))
+    }
+
+    async fn insert_upload_token(
+        &self,
+        token_id: uuid::Uuid,
+        key_id: uuid::Uuid,
+        claims: &Value,
+        _expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, MetadataError> {
+        if self.live_data_key(key_id).await?.is_none() {
+            return Ok(false);
+        }
+        let mut tokens = self.upload_tokens.lock().unwrap();
+        if tokens.contains_key(&token_id) {
+            return Ok(false);
+        }
+        tokens.insert(token_id, (key_id, claims.clone(), false));
+        Ok(true)
+    }
+
+    async fn consume_upload_token(
+        &self,
+        token_id: uuid::Uuid,
+    ) -> Result<Option<(DataKeyLookup, Value)>, MetadataError> {
+        let entry = self.upload_tokens.lock().unwrap().get(&token_id).cloned();
+        let Some((key_id, claims, false)) = entry else {
+            return Ok(None);
+        };
+        let Some(key) = self.live_data_key(key_id).await? else {
+            return Ok(None);
+        };
+        self.upload_tokens.lock().unwrap().insert(token_id, (key_id, claims.clone(), true));
+        Ok(Some((key, claims)))
     }
 
     async fn touch_data_key(&self, key_id: uuid::Uuid) -> Result<(), MetadataError> {
@@ -2250,6 +2293,63 @@ async fn storage_connection_requires_the_storage_bearer() {
         assert_eq!(app.get(&path, token).await.0, 401, "{token:?}");
     }
     assert_eq!(app.get(&path, Some(STORAGE_TOKEN)).await.0, 404);
+}
+
+/// Object storage m6: the URL routes take storage's bearer only. The URL key is the secrets
+/// key's `storage_url` derivation (generation 1); a key's liveness is the gateway's lookup by
+/// id; an upload token is recorded for a live key only and spent once.
+#[tokio::test]
+async fn storage_url_routes_serve_the_url_key_liveness_and_one_time_tokens() {
+    use base64::Engine;
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon.clone(), FakeLocator::default(), "http://127.0.0.1:9").await;
+    let key_id = uuid::Uuid::new_v4();
+    let lookup = DataKeyLookup {
+        key_id,
+        branch_id: BranchId::new(),
+        project_id: ProjectId::new(),
+        kind: DataKeyKind::Secret,
+        role: "authenticated".into(),
+        databases: None,
+        role_oid: Some(16384),
+    };
+    neon.data_keys.lock().unwrap().push(([9; 32], lookup.clone()));
+    let token = uuid::Uuid::new_v4();
+    let consume = format!("/internal/storage/upload-tokens/{token}/consume");
+    let new_token = |key: uuid::Uuid| {
+        json!({ "token_id": token, "key_id": key, "claims": { "sub": "u1" }, "expires_at": "2030-01-01T00:00:00Z" })
+    };
+    for bearer in [None, Some("wrong"), Some(REST_TOKEN), Some(REALTIME_TOKEN), Some(DATA_KEYS_TOKEN)] {
+        assert_eq!(app.get("/internal/storage/url-key", bearer).await.0, 401, "{bearer:?}");
+        assert_eq!(app.get(&format!("/internal/storage/keys/{key_id}"), bearer).await.0, 401);
+        assert_eq!(app.post_json("/internal/storage/upload-tokens", bearer, new_token(key_id)).await.0, 401);
+        assert_eq!(app.post_json(&consume, bearer, json!({})).await.0, 401);
+    }
+    let (code, body) = app.get("/internal/storage/url-key", Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    let derived = chelabase_secrets::derive_key(&app.key, Purpose::StorageUrl, 1);
+    assert_eq!(body, json!({ "kid": 1, "key": base64::engine::general_purpose::STANDARD.encode(derived) }));
+
+    let (code, body) = app.get(&format!("/internal/storage/keys/{key_id}"), Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["branch_id"], json!(lookup.branch_id));
+    assert_eq!(body["role"], "authenticated");
+    let unknown = format!("/internal/storage/keys/{}", uuid::Uuid::new_v4());
+    assert_eq!(app.get(&unknown, Some(STORAGE_TOKEN)).await.0, 404);
+
+    // A dead key's token isn't recorded; a live key's is, once; it is spent once.
+    let dead = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(uuid::Uuid::new_v4()));
+    assert_eq!(dead.await.0, 409);
+    assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
+    let made = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
+    assert_eq!(made.0, 204, "{}", made.1);
+    let again = app.post_json("/internal/storage/upload-tokens", Some(STORAGE_TOKEN), new_token(key_id)).await;
+    assert_eq!(again.0, 409);
+    let (code, body) = app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["key"]["key_id"], json!(key_id));
+    assert_eq!(body["claims"], json!({ "sub": "u1" }));
+    assert_eq!(app.post_json(&consume, Some(STORAGE_TOKEN), json!({})).await.0, 404);
 }
 
 /// The storage route answers as `chelabase_storage` with its own password (sealed for the

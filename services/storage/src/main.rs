@@ -39,6 +39,10 @@ async fn main() -> anyhow::Result<()> {
         engine: Engine::new(pools, managed),
         verifier: InternalVerifier::from_env()?,
         store: Arc::new(chelabase_storage::S3Store::new(&config.store).await),
+        urls: storage::control::Urls::new(Arc::new(storage::control::Orchestrator::new(
+            &config.internal_url,
+            &config.internal_token,
+        ))),
     });
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     info!(
