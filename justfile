@@ -268,6 +268,11 @@ app-users-e2e:
 compute-network-e2e:
     cargo run -q -p chelabase -- workbench run scripts/compute-network-e2e.sh
 
+# Live check of SeaweedFS's bucket boundary (object-storage m2): neon and storage identities each
+# reach only their own bucket (list, write, copy), no unauthenticated port is reachable, no key in inspect
+storage-iam-e2e:
+    cargo run -q -p chelabase -- workbench run scripts/storage-iam-e2e.sh
+
 # Live data API story: keys, queries through the gateway, RLS, generated types, revoke
 data-e2e:
     cargo run -q -p chelabase -- workbench run scripts/data-e2e.sh

@@ -402,6 +402,7 @@ pub fn ensure_stack_secrets(
         &main.join(".chelabase"),
         &chelabase_init::InitSecrets::workbench(state),
     )?;
+    ensure_object_store_dev_files(state).context("writing the object store's dev keys")?;
     if report.setup_code.is_some() {
         eprintln!(
             "[workbench] the stack's setup code is in {}",
@@ -409,6 +410,44 @@ pub fn ensure_stack_secrets(
         );
     }
     Ok(report.auth_files)
+}
+
+/// The fixed dev S3 keys of SeaweedFS's `storage` identity (bucket `chelabase-storage`) and its
+/// `admin` identity (create-bucket only), as files in the stack's state dir beside Neon's `s3/`
+/// pair. The workbench's compose overlay mounts them as secrets, so they are not in
+/// `docker inspect` (`scripts/tests/workbench-compose.sh` pins the mounts).
+const OBJECT_STORE_DEV_KEYS: [(&str, &str); 4] = [
+    ("storage-s3/access-key", "chelabase-storage-dev"),
+    ("storage-s3/secret-key", "chelabase-storage-dev-secret"),
+    ("s3-admin/access-key", "chelabase-admin-dev"),
+    ("s3-admin/secret-key", "chelabase-admin-dev-secret"),
+];
+
+/// Writes [`OBJECT_STORE_DEV_KEYS`] under `state` (dirs 0700, files 0600) when missing; a file
+/// that exists is never touched, so a stack made before these files gains them and nothing else.
+fn ensure_object_store_dev_files(state: &Path) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    for (rel, value) in OBJECT_STORE_DEV_KEYS {
+        let path = state.join(rel);
+        if path.exists() {
+            continue;
+        }
+        let dir = path.parent().expect("a file below the state dir");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(value.as_bytes()))
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// Sets each PAT file to 0600; a missing file is an error.
@@ -2365,6 +2404,30 @@ mod key_phase_tests {
             }
         }
         out
+    }
+
+    // m2 of epic object-storage: the `storage` and `admin` S3 dev keys appear on `up` for a stack
+    // made without them, with the fixed dev values at 0600, and an existing file is never changed.
+    #[test]
+    fn the_object_store_dev_keys_are_added_and_never_overwritten() {
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        super::ensure_object_store_dev_files(&state).unwrap();
+        let read = |p: &str| std::fs::read_to_string(state.join(p)).unwrap();
+        assert_eq!(read("storage-s3/access-key"), "chelabase-storage-dev");
+        assert_eq!(read("storage-s3/secret-key"), "chelabase-storage-dev-secret");
+        assert_eq!(read("s3-admin/access-key"), "chelabase-admin-dev");
+        assert_eq!(read("s3-admin/secret-key"), "chelabase-admin-dev-secret");
+        for p in ["storage-s3/access-key", "s3-admin/secret-key"] {
+            let mode = std::fs::metadata(state.join(p)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{p}");
+        }
+        let dir_mode = std::fs::metadata(state.join("s3-admin")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        std::fs::write(state.join("storage-s3/access-key"), "kept").unwrap();
+        super::ensure_object_store_dev_files(&state).unwrap();
+        assert_eq!(read("storage-s3/access-key"), "kept", "an existing key is left alone");
+        assert_eq!(read("s3-admin/access-key"), "chelabase-admin-dev");
     }
 
     // AC 7: a stack whose keys the old key phase made (under umask 002, like the real shared keys

@@ -377,4 +377,29 @@ mt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sourc
 [[ "$mt_mounts" == "runner:true" ]] || fail "metrics.token: read-only for the runner, nobody else; got: $mt_mounts"
 # S7: Valkey TLS is off in the stack (platform mode turns it on).
 [[ "$(env_of realtime CHELABASE_VALKEY_TLS)" == off ]] || fail "realtime: CHELABASE_VALKEY_TLS=off in the stack"
+# --- Object storage (epic object-storage m2): one SeaweedFS, two buckets, three identities -----
+# The identities, bucket-scoped actions and loopback binds are the base file's command (checked
+# in compose-secret-boundary.sh); the workbench runs it as is, with the three key pairs as
+# Compose secrets from the stack's state dir (so no new key is in `docker inspect`), and
+# create-bucket gets only the admin pair.
+bind_set() { # bind_set <service>: "target<-source" of its s3 key binds, sorted
+  q "[.services[\"$1\"].volumes[]? | select(.type == \"bind\" and (.target | test(\"/secrets/(s3|storage-s3|s3-admin)/\")))
+    | \"\(.target)<-\(.source | sub(\"^.*/(?<d>(s3|storage-s3|s3-admin)/[a-z-]+)$\"; \"\\(.d)\"))\" ] | sort | join(\" \")"
+}
+sw_want="/run/chelabase/secrets/s3-admin/access-key<-s3-admin/access-key /run/chelabase/secrets/s3-admin/secret-key<-s3-admin/secret-key"
+sw_want+=" /run/chelabase/secrets/s3/access-key<-s3/access-key /run/chelabase/secrets/s3/secret-key<-s3/secret-key"
+sw_want+=" /run/chelabase/secrets/storage-s3/access-key<-storage-s3/access-key /run/chelabase/secrets/storage-s3/secret-key<-storage-s3/secret-key"
+[[ "$(bind_set seaweedfs)" == "$sw_want" ]] || fail "seaweedfs mounts the neon, storage and admin key pairs; got: $(bind_set seaweedfs)"
+cb_want="/run/chelabase/secrets/s3-admin/access-key<-s3-admin/access-key /run/chelabase/secrets/s3-admin/secret-key<-s3-admin/secret-key"
+[[ "$(bind_set create-bucket)" == "$cb_want" ]] || fail "create-bucket mounts the admin key pair only; got: $(bind_set create-bucket)"
+others="$(q '[.services | to_entries[] | select(.key != "seaweedfs" and .key != "create-bucket")
+  | select(any(.value.volumes[]?; .type == "bind" and (.source | test("/(storage-s3|s3-admin)/")))) | .key] | join(" ")')"
+[[ -z "$others" ]] || fail "only seaweedfs and create-bucket mount storage or admin S3 keys; got: $others"
+! grep -qE 'chelabase-(storage|admin)-dev' <<<"$config" || fail "no dev S3 key of the storage or admin identity is in the rendered config (inspect)"
+for s in pageserver safekeeper1 safekeeper2 safekeeper3; do
+  want_env "$s" AWS_ACCESS_KEY_ID chelabase-dev
+done
+[[ "$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "neon_seaweedfs_data")) | .key] | join(" ")')" == seaweedfs ]] ||
+  fail "only seaweedfs mounts its data volume (S3 is reached by URL only)"
+
 echo "workbench-compose: ok"
