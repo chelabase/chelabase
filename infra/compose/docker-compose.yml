@@ -1002,6 +1002,7 @@ services:
       CHELABASE_DATA_KEYS_TOKEN_FILE: /run/chelabase/secrets/tokens/data-keys.token
       CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-auth.token
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
+      CHELABASE_STORAGE_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/storage-internal.token
       CHELABASE_PROXY_API_TOKEN_FILE: /run/chelabase/secrets/tokens/proxy-api.token
       CHELABASE_STORCON_HOOK_TOKEN_FILE: /run/chelabase/secrets/tokens/storcon-hook.token
     # The default network for the apps, `control` for its TLS connections to computes (a static
@@ -1024,6 +1025,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/data-keys.token, read_only: true, volume: {subpath: tokens/data-keys.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-auth.token, read_only: true, volume: {subpath: tokens/app-auth.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storage-internal.token, read_only: true, volume: {subpath: tokens/storage-internal.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storcon-hook.token, read_only: true, volume: {subpath: tokens/storcon-hook.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, read_only: true, volume: {subpath: orchestrator-tls}}

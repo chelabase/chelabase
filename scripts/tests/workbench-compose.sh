@@ -189,6 +189,7 @@ for t in REST_INTERNAL:rest-internal DATA_KEYS:data-keys APP_AUTH_INTERNAL:app-a
     want_env "$s" "CHELABASE_${t%%:*}_TOKEN_FILE" "$K/tokens/${t#*:}.token"
   done
 done
+want_env orchestrator CHELABASE_STORAGE_INTERNAL_TOKEN_FILE "$K/tokens/storage-internal.token"
 want_env gateway CHELABASE_DATA_KEYS_TOKEN_FILE "$K/tokens/data-keys.token"
 want_env gateway CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE "$K/tokens/app-sessions.token"
 want_env auth CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE "$K/tokens/app-auth.token"
@@ -197,10 +198,11 @@ want_env rest CHELABASE_REST_INTERNAL_TOKEN_FILE "$K/tokens/rest-internal.token"
 plain="$(q '[.services | to_entries[] | .key as $s | (.value.environment // {}) | to_entries[]
   | select(.key | IN("CHELABASE_NATS_PASSWORD", "CHELABASE_REST_INTERNAL_TOKEN", "CHELABASE_DATA_KEYS_TOKEN",
       "CHELABASE_APP_AUTH_INTERNAL_TOKEN", "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN", "CHELABASE_PROXY_API_TOKEN",
-      "CHELABASE_STORCON_HOOK_TOKEN", "CHELABASE_REALTIME_INTERNAL_TOKEN", "NEON_PROXY_TO_CONTROLPLANE_TOKEN"))
+      "CHELABASE_STORCON_HOOK_TOKEN", "CHELABASE_REALTIME_INTERNAL_TOKEN", "CHELABASE_STORAGE_INTERNAL_TOKEN",
+      "NEON_PROXY_TO_CONTROLPLANE_TOKEN"))
   | "\($s): \(.key)"] | join(", ")')"
 [[ -z "$plain" ]] || fail "a credential is set in plain in a service's environment: $plain"
-! grep -Eq 'chelabase-dev-(rest-internal|data-keys|app-auth|app-sessions|proxy-api|storcon-hook|realtime)' <<<"$config" ||
+! grep -Eq 'chelabase-dev-(rest-internal|data-keys|app-auth|app-sessions|proxy-api|storcon-hook|realtime|storage-internal)' <<<"$config" ||
   fail "a public development bearer (chelabase-dev-*) is in the rendered config"
 for k in CHELABASE_NATS_USER CHELABASE_NATS_PASSWORD CHELABASE_VALKEY_USER CHELABASE_VALKEY_PASSWORD_FILE \
   CHELABASE_REST_INTERNAL_TOKEN CHELABASE_DATA_KEYS_TOKEN CHELABASE_APP_AUTH_INTERNAL_TOKEN; do

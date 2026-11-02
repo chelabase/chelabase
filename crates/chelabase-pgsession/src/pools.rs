@@ -68,7 +68,12 @@ pub struct Settings {
     pub max_rows: i64,
     pub statement_timeout_ms: i64,
     pub max_connections: u32,
+    /// The storage service's own per-branch budget ([`storage_budget`]).
+    pub storage_max_connections: u32,
 }
+
+/// `storage_max_connections` when the answer has none (an orchestrator from before it).
+pub const DEFAULT_STORAGE_MAX_CONNECTIONS: u32 = 2;
 
 /// A service that opens connections to a branch's compute, each within its own per-branch
 /// [`Budget`]: rest the branch's data API `max_connections` ([`data_api_budget`]), storage
@@ -98,6 +103,12 @@ pub type Budget = Arc<dyn Fn(&ConnInfo) -> u32 + Send + Sync>;
 /// Rest's budget: the branch's data API `max_connections` (at least 1).
 pub fn data_api_budget(info: &ConnInfo) -> u32 {
     info.settings.max_connections.max(1)
+}
+
+/// Storage's budget: the branch's `storage_max_connections` (at least 1), for
+/// [`Pools::for_service`] and so [`crate::ServicePool::beside`].
+pub fn storage_budget(info: &ConnInfo) -> u32 {
+    info.settings.storage_max_connections.max(1)
 }
 
 /// A database the branch's data API serves.
@@ -174,8 +185,14 @@ struct WireSettings {
     max_rows: i64,
     statement_timeout_ms: i64,
     max_connections: u32,
+    #[serde(default = "default_storage_max_connections")]
+    storage_max_connections: u32,
     #[serde(default)]
     default_schema: Option<String>,
+}
+
+fn default_storage_max_connections() -> u32 {
+    DEFAULT_STORAGE_MAX_CONNECTIONS
 }
 
 impl From<WireConnInfo> for ConnInfo {
@@ -200,6 +217,7 @@ impl From<WireConnInfo> for ConnInfo {
                 max_rows: w.settings.max_rows,
                 statement_timeout_ms: w.settings.statement_timeout_ms,
                 max_connections: w.settings.max_connections,
+                storage_max_connections: w.settings.storage_max_connections,
             },
             databases,
         }
@@ -239,16 +257,30 @@ pub trait ConnSource: Send + Sync + 'static {
     fn fetch(&self, branch: Uuid) -> impl Future<Output = Result<ConnInfo, ConnError>> + Send;
 }
 
-/// The orchestrator's internal listener.
+/// The orchestrator's internal listener: the data route (`authenticator`), or storage's own
+/// login's route ([`Self::storage_login`]).
 pub struct InternalSource {
     http: chelabase_http::Client,
     base: String,
     token: String,
+    /// `data` or `storage`: `/internal/{route}/branches/{id}/connection`.
+    route: &'static str,
 }
 
 impl InternalSource {
     pub fn new(base_url: &str, token: &str) -> Self {
+        Self::at(base_url, token, "data")
+    }
+
+    /// The `chelabase_storage` login's connection info (the storage service's managed pool),
+    /// asked with storage's bearer.
+    pub fn storage_login(base_url: &str, token: &str) -> Self {
+        Self::at(base_url, token, "storage")
+    }
+
+    fn at(base_url: &str, token: &str, route: &'static str) -> Self {
         InternalSource {
+            route,
             // Never a redirect (#26): the internal bearer goes to the orchestrator only.
             http: chelabase_http::client_builder()
                 .timeout(Duration::from_secs(5))
@@ -262,7 +294,10 @@ impl InternalSource {
 
 impl ConnSource for InternalSource {
     async fn fetch(&self, branch: Uuid) -> Result<ConnInfo, ConnError> {
-        let url = format!("{}/internal/data/branches/{branch}/connection", self.base);
+        let url = format!(
+            "{}/internal/{}/branches/{branch}/connection",
+            self.base, self.route
+        );
         let response = self
             .http
             .get(url)
@@ -1032,6 +1067,7 @@ pub mod test_support {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
                 max_connections: 2,
+                storage_max_connections: 2,
             },
             databases: vec![
                 ServedDatabase {
@@ -1269,6 +1305,81 @@ mod tests {
         assert!(info.served("ghost").is_none());
     }
 
+    /// Storage's budget comes from the branch's own `storage_max_connections` (at least 1);
+    /// an answer from before the setting existed means the default, 2.
+    #[test]
+    fn storage_budget_is_the_branchs_storage_setting() {
+        let info = |settings: serde_json::Value| -> ConnInfo {
+            serde_json::from_value(serde_json::json!({
+                "host": "10.0.0.1", "port": 5432, "database": "main",
+                "user": "authenticator", "password": "pw", "status": "ready",
+                "settings": settings,
+            }))
+            .unwrap()
+        };
+        let set = info(serde_json::json!({
+            "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 4,
+            "storage_max_connections": 7,
+        }));
+        assert_eq!(
+            (set.settings.storage_max_connections, storage_budget(&set)),
+            (7, 7)
+        );
+        let old = info(serde_json::json!({
+            "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 4,
+        }));
+        assert_eq!(storage_budget(&old), DEFAULT_STORAGE_MAX_CONNECTIONS);
+        assert_eq!(DEFAULT_STORAGE_MAX_CONNECTIONS, 2);
+        let mut zero = old.clone();
+        zero.settings.storage_max_connections = 0;
+        assert_eq!(storage_budget(&zero), 1);
+    }
+
+    /// The storage login's source asks the storage route, with its bearer, never the data
+    /// route (whose answer is `authenticator`'s).
+    #[tokio::test]
+    async fn the_storage_login_source_asks_the_storage_route() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let branch = Uuid::new_v4();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 4096];
+            let n = socket.read(&mut request).await.unwrap();
+            let body = serde_json::json!({
+                "host": "10.0.0.1", "port": 5432, "database": "main",
+                "user": "chelabase_storage", "password": "spw", "status": "ready",
+                "settings": { "max_rows": 1, "statement_timeout_ms": 1, "max_connections": 1 },
+            })
+            .to_string();
+            let answer = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(answer.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request[..n]).into_owned()
+        });
+        let info = InternalSource::storage_login(&base, "st-token")
+            .fetch(branch)
+            .await
+            .unwrap();
+        let request = server.await.unwrap();
+        assert!(
+            request.starts_with(&format!(
+                "GET /internal/storage/branches/{branch}/connection "
+            )),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer st-token"),
+            "{request}"
+        );
+        assert_eq!(info.user, "chelabase_storage");
+    }
+
     /// The shape before served databases existed: main alone, with the settings'
     /// `default_schema` (or `public` without one).
     #[test]
@@ -1420,6 +1531,7 @@ mod tests {
                 max_rows: 10,
                 statement_timeout_ms: 1000,
                 max_connections: 2,
+                storage_max_connections: 2,
             },
             databases: [&a, &b]
                 .iter()

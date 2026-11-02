@@ -16,15 +16,18 @@
 //!   visible or writable until the owner adds policies through `storage.create_policy` /
 //!   `storage.drop_policy` (`SECURITY DEFINER`, owned by `chelabase_admin`, executable by the
 //!   owner only).
-//! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS, NOLOGIN until m5 makes it the storage
-//!   service's login) is locked down on every run exactly as the data API locks down
-//!   `chelabase_admin`: attributes, password, connection limit, settings (then
+//! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS) is the storage service's own login
+//!   (m5), locked down on every run like the data API's `chelabase_admin`: attributes (LOGIN,
+//!   [`STORAGE_CONNECTION_LIMIT`], no expiry), exactly the branch's password verifier
+//!   (`crate::data_api`'s storage login: never in connection details), settings (then
 //!   `search_path = pg_catalog, pg_temp` and `event_triggers = off`, so no event trigger,
 //!   a login one included, fires for its sessions; it has no `SET` on the parameter to turn
 //!   them back on), members, admins and its own memberships revoked, objects it owns here
-//!   reassigned to the owner, its sessions (and its former members') ended before and again
-//!   after the commit. Changed attributes or settings, or a member, void its tickets; the
-//!   health check notices any drift or membership, so reconcile reruns the lockdown.
+//!   reassigned to the owner. Its former members' sessions are ended before and again after
+//!   the commit, and its own too when it had drifted or had a membership either way (else
+//!   they are the storage service's). Changed attributes, password or settings, or a member,
+//!   void its tickets; the health check notices any drift or membership, so reconcile reruns
+//!   the lockdown.
 //! - `anon` and `authenticated` get `USAGE` on the schema (never `CREATE`) and table
 //!   privileges that row level security still gates. `authenticated` writes every column of
 //!   `storage.objects` a caller declares, the [`MANAGED_COLUMNS`] included, so RLS policies
@@ -99,6 +102,11 @@ pub const TICKET_MISSING: &str = "CB003";
 /// The SQLSTATE `guard_tickets` raises when anyone but [`STORAGE_ROLE`] writes a ticket.
 pub const TICKET_FORGED: &str = "CB004";
 
+/// `chelabase_storage`'s connection limit. Each storage service process holds at most a
+/// branch's `storage_max_connections` (1 to 20) to it; during a rolling deploy two replicas
+/// can each reach 20, so the limit is twice the setting's top.
+pub const STORAGE_CONNECTION_LIMIT: u32 = 40;
+
 /// The longest a ticket may live: an upload's final insert follows its body within seconds.
 pub const TICKET_MAX_LIFETIME: &str = "15 minutes";
 
@@ -110,18 +118,20 @@ pub const STORAGE_SCHEMA_MARK: &str = "-- chelabase:storage-schema";
 pub const FOREIGN_SCHEMA_MARK: &str = "chelabase_storage_foreign";
 
 /// The install script, for `admin_sql` (the superuser) in one database; `owner_role` is the
-/// database owner (the policy helpers' only grantee).
+/// database owner (the policy helpers' only grantee), `verifier` the SCRAM verifier of the
+/// branch's `chelabase_storage` password.
 ///
 /// Plain operators inside the function bodies and table definitions resolve against the
 /// pinned `search_path` (`pg_catalog` first) when they're created or run; the `DO` blocks
 /// qualify theirs, like the data API script.
-pub fn storage_schema_sql(owner_role: &str) -> String {
+pub fn storage_schema_sql(owner_role: &str, verifier: &str) -> String {
     let owner = quote_ident(owner_role);
+    let verifier_lit = crate::data_api::quote_literal(verifier);
     let foreign_objects = foreign_objects_sql();
     let acl_entries = acl_entries_sql().replace("{owner}", &owner_role.replace('\'', "''"));
     let owner_lit = crate::data_api::quote_literal(owner_role);
     let newer = newer_than_mine_sql();
-    let drift = role_drift_sql("role");
+    let drift = role_drift_sql("role", verifier);
     let (defaults, constraints) = (
         expected_list(&EXPECTED_DEFAULTS),
         expected_list(&EXPECTED_CONSTRAINTS),
@@ -138,6 +148,7 @@ DO $$ DECLARE
   members pg_catalog.oid[];
   has_members boolean;
   tampered boolean;
+  ended boolean;
   m record;
 BEGIN
   IF role IS NULL THEN
@@ -150,7 +161,8 @@ BEGIN
     SELECT oid FROM reach);
   has_members := EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role);
   tampered := {drift};
-  ALTER ROLE chelabase_storage NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
+  ended := has_members OR tampered OR EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role);
+  ALTER ROLE chelabase_storage LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT CONNECTION LIMIT {STORAGE_CONNECTION_LIMIT} VALID UNTIL 'infinity' PASSWORD {verifier_lit};
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
     WHERE s.setrole OPERATOR(pg_catalog.=) role
   LOOP
@@ -173,9 +185,10 @@ BEGIN
   END LOOP;
   REASSIGN OWNED BY chelabase_storage TO {owner};
   PERFORM pg_catalog.set_config('chelabase.storage_former_members', pg_catalog.array_to_string(members, ','), false);
+  PERFORM pg_catalog.set_config('chelabase.storage_end_sessions', ended::pg_catalog.text, false);
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (a.usesysid OPERATOR(pg_catalog.=) role OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
+    WHERE ((a.usesysid OPERATOR(pg_catalog.=) role AND ended) OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
       AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
   IF (has_members OR tampered) AND EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
       JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
@@ -188,7 +201,7 @@ COMMIT;
 DO $$ BEGIN
   PERFORM pg_catalog.pg_terminate_backend(a.pid) FROM pg_catalog.pg_stat_activity a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
-    WHERE (r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage' OR a.usesysid OPERATOR(pg_catalog.=) ANY
+    WHERE ((r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage' AND pg_catalog.current_setting('chelabase.storage_end_sessions', true) OPERATOR(pg_catalog.=) 'true') OR a.usesysid OPERATOR(pg_catalog.=) ANY
         (pg_catalog.string_to_array(pg_catalog.current_setting('chelabase.storage_former_members', true), ',')::pg_catalog.oid[]))
       AND NOT r.rolsuper AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
 END $$;
@@ -447,8 +460,12 @@ COMMIT;
 /// with row level security enabled and forced, nothing in it the install didn't make, no ACL
 /// entry beyond the install's, its triggers on, the policy helpers with event triggers off),
 /// or it belongs to someone else (left alone, so reconcile doesn't rerun the bootstrap for it
-/// on every pass).
-pub fn storage_check_sql(owner_role: &str) -> String {
+/// on every pass); and `chelabase_storage` as the lockdown leaves it, with exactly `verifier`
+/// as its password. `None` (the branch has no storage login yet) is never healthy.
+pub fn storage_check_sql(owner_role: &str, verifier: Option<&str>) -> String {
+    let Some(verifier) = verifier else {
+        return " AND false".to_owned();
+    };
     format!(
         " AND EXISTS (SELECT FROM pg_catalog.pg_namespace n \
        JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner \
@@ -494,7 +511,7 @@ pub fn storage_check_sql(owner_role: &str) -> String {
         defaults = expected_list(&EXPECTED_DEFAULTS),
         constraints = expected_list(&EXPECTED_CONSTRAINTS),
         storage_role = STORAGE_ROLE_OID,
-        drift = role_drift_sql(STORAGE_ROLE_OID),
+        drift = role_drift_sql(STORAGE_ROLE_OID, verifier),
     )
 }
 
@@ -666,13 +683,16 @@ pub fn expected_list(items: &[&str]) -> String {
 }
 
 /// Whether the role `role` (an oid expression) has drifted from what the lockdown leaves:
-/// any attribute, password, connection limit, or settings other than exactly `search_path`
-/// and `event_triggers = off`.
-pub fn role_drift_sql(role: &str) -> String {
+/// any attribute (it logs in, never expires), a password other than exactly `verifier`, a
+/// connection limit other than [`STORAGE_CONNECTION_LIMIT`], or settings other than exactly
+/// `search_path` and `event_triggers = off`.
+pub fn role_drift_sql(role: &str, verifier: &str) -> String {
+    let verifier = crate::data_api::quote_literal(verifier);
     format!(
         "(EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) {role}
-    AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
-      OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) 0))
+    AND (NOT a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
+      OR a.rolpassword IS DISTINCT FROM {verifier} OR a.rolconnlimit OPERATOR(pg_catalog.<>) {STORAGE_CONNECTION_LIMIT}
+      OR a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz))
     OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {role}
       AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']::pg_catalog.text[])))"
     )
@@ -716,8 +736,11 @@ mod tests {
     use chelabase_metadata::DataApiState;
     use chelabase_types::BranchId;
 
+    /// A branch's `chelabase_storage` verifier, as the bootstrap computes it.
+    const VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$c3RvcmVk:c2VydmVy";
+
     fn sql() -> String {
-        storage_schema_sql("postgres")
+        storage_schema_sql("postgres", VERIFIER)
     }
 
     /// The text between `start` and the next `end`, both included.
@@ -891,7 +914,8 @@ mod tests {
         assert!(lockdown.contains("members := ARRAY(WITH RECURSIVE reach(oid) AS (\n      SELECT a.member FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role\n      UNION SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid)\n    SELECT oid FROM reach);"), "{lockdown}");
         for part in [
             "IF role IS NULL THEN\n    CREATE ROLE chelabase_storage NOLOGIN NOINHERIT BYPASSRLS PASSWORD NULL CONNECTION LIMIT 0;",
-            "ALTER ROLE chelabase_storage NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;",
+            // m5: the storage service's login, with exactly the branch's verifier.
+            &format!("ALTER ROLE chelabase_storage LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT CONNECTION LIMIT {STORAGE_CONNECTION_LIMIT} VALID UNTIL 'infinity' PASSWORD '{VERIFIER}';"),
             "EXECUTE pg_catalog.format('ALTER ROLE chelabase_storage IN DATABASE %I RESET ALL', m.datname);",
             "ALTER ROLE chelabase_storage RESET ALL;",
             "ALTER ROLE chelabase_storage SET search_path = pg_catalog, pg_temp;",
@@ -915,14 +939,16 @@ mod tests {
         // Tampered: any attribute or setting beyond the ones it is given here.
         let tampered = between(lockdown, "tampered :=", ";\n");
         for attribute in [
-            "rolcanlogin",
+            "NOT a.rolcanlogin",
             "rolsuper",
             "rolcreaterole",
             "rolcreatedb",
             "rolreplication",
             "NOT a.rolbypassrls",
-            "rolpassword IS NOT NULL",
-            "rolconnlimit OPERATOR(pg_catalog.<>) 0",
+            // Any other password, a changed one included, is drift.
+            &format!("a.rolpassword IS DISTINCT FROM '{VERIFIER}'"),
+            &format!("rolconnlimit OPERATOR(pg_catalog.<>) {STORAGE_CONNECTION_LIMIT}"),
+            "a.rolvaliduntil IS DISTINCT FROM 'infinity'::pg_catalog.timestamptz",
             "pg_db_role_setting",
             "ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']",
         ] {
@@ -942,6 +968,17 @@ mod tests {
                 && after.contains("r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage'"),
             "{after}"
         );
+        // m5: its own sessions (the storage service's) are ended only when it had drifted or
+        // had members either way; its former members' always.
+        assert!(lockdown.contains("ended := has_members OR tampered OR EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role);"), "{lockdown}");
+        assert!(lockdown.contains("WHERE ((a.usesysid OPERATOR(pg_catalog.=) role AND ended) OR a.usesysid OPERATOR(pg_catalog.=) ANY (members))"), "{lockdown}");
+        assert!(lockdown.contains("PERFORM pg_catalog.set_config('chelabase.storage_end_sessions', ended::pg_catalog.text, false);"), "{lockdown}");
+        assert!(
+            after.contains("(r.rolname OPERATOR(pg_catalog.=) 'chelabase_storage' AND pg_catalog.current_setting('chelabase.storage_end_sessions', true) OPERATOR(pg_catalog.=) 'true')"),
+            "{after}"
+        );
+        // Two replicas of the storage service, each at the top of the setting's range.
+        assert_eq!(STORAGE_CONNECTION_LIMIT, 40);
         assert_eq!(STORAGE_ROLE, "chelabase_storage");
     }
 
@@ -1485,7 +1522,7 @@ mod tests {
             "before any change: {install}"
         );
         assert!(install.contains(&format!("RAISE EXCEPTION '{NEWER_SCHEMA_MARK}: the storage schema is version %, newer than this worker''s {STORAGE_SCHEMA_VERSION}; it was left alone'")), "{install}");
-        let check = storage_check_sql("postgres");
+        let check = storage_check_sql("postgres", Some(VERIFIER));
         assert!(
             check.contains(&format!("OR COALESCE({newer}, false)")),
             "{check}"
@@ -1529,7 +1566,7 @@ mod tests {
         assert!(lock < check && check < first_change, "{sql}");
         // ...but after the role's lockdown has committed (S2).
         assert!(
-            sql.find("ALTER ROLE chelabase_storage NOLOGIN").unwrap()
+            sql.find("ALTER ROLE chelabase_storage LOGIN").unwrap()
                 < sql.find("COMMIT;").unwrap(),
             "{sql}"
         );
@@ -1553,9 +1590,12 @@ mod tests {
     /// AC 2: reconcile's check fails until the current version is installed.
     #[test]
     fn storage_schema_is_part_of_the_health_check() {
-        let check = schema_check_sql("public");
-        let storage = storage_check_sql("postgres");
+        let check = schema_check_sql("public", Some(VERIFIER));
+        let storage = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.ends_with(&storage), "{check}");
+        // A branch with no stored storage login yet is never healthy: its bootstrap makes one.
+        assert!(storage_check_sql("postgres", None).ends_with(" AND false"));
+        assert!(!storage_check_sql("postgres", None).contains("SCRAM"));
         let stamp = format!("'{STORAGE_SCHEMA_STAMP}'");
         for part in [
             stamp.as_str(),
@@ -1574,7 +1614,11 @@ mod tests {
             "a.roleid OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage') OR a.member OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')",
             &role_drift_sql(
                 "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')",
+                VERIFIER,
             ),
+            // m5: a changed password fails the check (and so reruns the lockdown, which sets
+            // the verifier back).
+            &format!("a.rolpassword IS DISTINCT FROM '{VERIFIER}'"),
             // Re-audit S3: the triggers' functions as installed, and only the install's
             // defaults and constraints.
             &format!("$b${PROTECT_OBJECTS_BODY}$b$"),
@@ -1619,7 +1663,8 @@ mod tests {
             .filter(|(_, _, s)| s.starts_with(STORAGE_SCHEMA_MARK))
             .map(|(_, _, s)| s.clone())
             .collect();
-        assert_eq!(scripts, [storage_schema_sql("postgres")]);
+        let verifier = w.storage_verifier(main.id).await.unwrap().expect("a stored login");
+        assert_eq!(scripts, [storage_schema_sql("postgres", &verifier)]);
 
         w.metadata.state().db_rows.insert(
             main.id,
@@ -1687,4 +1732,70 @@ mod tests {
     fn storage_schema_is_excluded_from_merge() {
         assert!(chelabase_schema::exclusions::EXCLUDED_SCHEMAS.contains(&STORAGE_SCHEMA));
     }
+
+    /// m5: the bootstrap gives `chelabase_storage` a password of its own per branch: made once
+    /// (sealed `Purpose::Storage` for the branch, with a random 16-byte SCRAM salt stored
+    /// beside it), set as the verifier of that salt, and kept on every later run; the health
+    /// check holds the role to exactly that verifier.
+    #[tokio::test]
+    async fn storage_login_is_made_once_and_set_as_its_verifier() {
+        use chelabase_secrets::{Purpose, open_credential};
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let stored = w.metadata.state().storage_logins.get(&main.id).cloned();
+        let (sealed, salt) = stored.expect("the bootstrap stored a storage login");
+        assert_eq!(salt.len(), 16);
+        let password = open_credential(&w.key, &main.id.to_string(), Purpose::Storage, &sealed)
+            .expect("sealed for the branch as storage's");
+        assert_eq!(password.len(), 32);
+        let verifier = chelabase_neon::scram::verifier_with_salt(&password, &salt, 4096);
+        assert_eq!(w.storage_verifier(main.id).await.unwrap().as_deref(), Some(verifier.as_str()));
+        let script = |w: &crate::fakes::FakeWorker| -> Vec<String> {
+            w.computes
+                .sql
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, s)| s.starts_with(STORAGE_SCHEMA_MARK))
+                .map(|(_, _, s)| s.clone())
+                .collect()
+        };
+        assert!(script(&w)[0].contains(&format!("PASSWORD '{verifier}';")), "{:?}", script(&w));
+        // A second run keeps the login: the same sealed password and salt, the same verifier.
+        w.computes.sql.lock().unwrap().clear();
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        assert_eq!(w.metadata.state().storage_logins.get(&main.id), Some(&(sealed, salt)));
+        assert!(script(&w)[0].contains(&format!("PASSWORD '{verifier}';")));
+        // The health check asks for exactly that verifier.
+        w.computes.sql.lock().unwrap().clear();
+        let _ = w.data_api_healthy(main.id, main.endpoint_id.as_deref().unwrap()).await;
+        let checks: Vec<String> = w.computes.sql.lock().unwrap().iter().map(|(_, _, s)| s.clone()).collect();
+        assert!(
+            checks.iter().any(|s| s.contains(&format!("a.rolpassword IS DISTINCT FROM '{verifier}'"))),
+            "{checks:?}"
+        );
+    }
+
+    /// A racing bootstrap that stored a storage login first wins: both use its password.
+    #[tokio::test]
+    async fn storage_login_yields_to_a_racer() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let first = w.metadata.state().storage_logins.get(&main.id).cloned().unwrap();
+        w.metadata.state().storage_logins.remove(&main.id);
+        let racer = (chelabase_secrets::seal_credential(&w.key, &main.id.to_string(), chelabase_secrets::Purpose::Storage, "r".repeat(32).as_str()), vec![9u8; 16]);
+        let raced = racer.clone();
+        w.metadata.state().before_set_storage_password = Some(Box::new(move |s: &mut crate::fakes::FakeState| {
+            s.storage_logins.insert(main.id, raced.clone());
+        }));
+        let main = w.metadata.main(id);
+        w.bootstrap_data_api(&main, "app").await.unwrap();
+        assert_ne!(first, racer);
+        assert_eq!(w.metadata.state().storage_logins.get(&main.id), Some(&racer));
+        let verifier = chelabase_neon::scram::verifier_with_salt(&"r".repeat(32), &[9u8; 16], 4096);
+        assert_eq!(w.storage_verifier(main.id).await.unwrap(), Some(verifier));
+    }
+
 }

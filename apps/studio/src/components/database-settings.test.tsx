@@ -12,7 +12,11 @@ const DEFAULTS = {
   max_rows: 1000,
   statement_timeout_ms: 8000,
   max_connections: 5,
+  storage_max_connections: 2,
 };
+// What a save sends: the form doesn't edit storage's connection budget (Studio m12), so it
+// leaves it out and the API keeps it.
+const { storage_max_connections: _storage, ...SENT } = DEFAULTS;
 
 const PATCH = "PATCH /v1/databases/db";
 
@@ -53,7 +57,7 @@ describe("DatabaseSettings", () => {
     await userEvent.type(cap, "3");
     await userEvent.click(save());
     await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, history_window: 43200, max_branches: 3 }));
-    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, history_window: 43200, max_branches: 3 }]);
+    expect(await patches(fetch)).toEqual([{ ...SENT, history_window: 43200, max_branches: 3 }]);
     expect(await screen.findByRole("status")).toHaveTextContent("Saved.");
   });
 
@@ -115,7 +119,7 @@ describe("DatabaseSettings", () => {
     await userEvent.type(rows, "50");
     await userEvent.click(save());
     await vi.waitFor(() => expect(onSaved).toHaveBeenCalledWith({ ...DEFAULTS, max_rows: 50 }));
-    expect(await patches(fetch)).toEqual([{ ...DEFAULTS, max_rows: 50 }]);
+    expect(await patches(fetch)).toEqual([{ ...SENT, max_rows: 50 }]);
   });
 
   it("refuses data API settings outside their bounds", async () => {

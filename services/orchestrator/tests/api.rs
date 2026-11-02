@@ -1672,6 +1672,7 @@ async fn patch_updates_the_settings_and_returns_them() {
         json!({
             "history_window": 86400, "max_branches": 10,
             "max_rows": 1000, "statement_timeout_ms": 8000, "max_connections": 5,
+            "storage_max_connections": 2,
         })
     );
     let db = t.metadata.database(t.db);
@@ -1681,6 +1682,7 @@ async fn patch_updates_the_settings_and_returns_them() {
     let get: Value = t.send(Method::GET, &database_path(&t), None).await.json().await.unwrap();
     assert_eq!(get["history_window"], 86400);
     assert_eq!(get["max_branches"], 10);
+    assert_eq!(get["storage_max_connections"], 2);
 }
 
 #[tokio::test]
@@ -2385,6 +2387,7 @@ async fn settings_patch_bounds() {
         ("max_rows", [1, 100000], [0, 100001]),
         ("statement_timeout_ms", [100, 120000], [99, 120001]),
         ("max_connections", [1, 50], [0, 51]),
+        ("storage_max_connections", [1, 20], [0, 21]),
     ] {
         for value in ok {
             let resp = t.send(Method::PATCH, &path, Some(json!({ field: value }))).await;
@@ -2403,6 +2406,7 @@ async fn settings_patch_bounds() {
     // Refused values change nothing, and the stored values come back on the next PATCH.
     let db = t.metadata.database(t.db);
     assert_eq!((db.max_rows, db.statement_timeout_ms, db.max_connections), (100000, 120000, 50));
+    assert_eq!(db.storage_max_connections, 20);
     let body: Value = t.send(Method::PATCH, &path, Some(json!({}))).await.json().await.unwrap();
     assert_eq!(body["max_rows"], 100000);
 }

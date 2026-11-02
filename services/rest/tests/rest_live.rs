@@ -2283,7 +2283,7 @@ async fn a_non_public_default_schema_runs_pipelined() {
         );
         l.enable(l.main_id(), "analytics").await;
         let ep = l.branch(l.main_id()).await.endpoint_id.expect("endpoint");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(l.main_id(), &ep, "analytics", "stats").await.unwrap());
 
         let read = select_t(Some("analytics"));
         let write = json!({"v":1,"database":"analytics","op":"insert","into":"t",
@@ -2307,13 +2307,13 @@ async fn a_non_public_default_schema_runs_pipelined() {
             "REVOKE USAGE ON SCHEMA stats FROM authenticator;",
         )
         .await;
-        assert!(!l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+        assert!(!l.worker.data_api_healthy_in(l.main_id(), &ep, "analytics", "stats").await.unwrap());
         let main = l.branch(l.main_id()).await;
         l.worker
             .bootstrap_data_api(&main, &l.database_name)
             .await
             .expect("bootstrap");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(l.main_id(), &ep, "analytics", "stats").await.unwrap());
     })
     .await;
 }
@@ -2498,7 +2498,7 @@ async fn disable_answers_unknown_database_at_once() {
 
         // The machinery stays: re-enabling is the bootstrap again, and serves at once.
         let ep = l.branch(main).await.endpoint_id.expect("endpoint");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "public").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(main, &ep, "analytics", "public").await.unwrap());
         l.enable(main, "analytics").await;
         assert_eq!(l.anon(query.clone()).await.ok(), &json!([{"v":"analytics"}]));
 
@@ -2582,7 +2582,7 @@ async fn child_branch_serves_the_parent_second_database() {
         assert_eq!(row.data_api, DataApiState::On);
         assert_eq!(row.default_schema, "stats");
         let ep = dev.endpoint_id.clone().expect("endpoint");
-        assert!(l.worker.data_api_healthy_in(&ep, "analytics", "stats").await.unwrap());
+        assert!(l.worker.data_api_healthy_in(dev.id, &ep, "analytics", "stats").await.unwrap());
 
         let on_dev = |body: Value| l.query_on(dev_id, DataKeyKind::Secret, "authenticated", body);
         assert_eq!(

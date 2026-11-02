@@ -36,7 +36,7 @@ for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verif
   valkey/proxy.password valkey/control.password valkey/realtime.password valkey/runner.password valkey/health.password \
   realtime/pg.password realtime/ticket.key realtime/internal.token \
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token \
-  tokens/proxy-api.token tokens/storcon-hook.token \
+  tokens/storage-internal.token tokens/proxy-api.token tokens/storcon-hook.token \
   neon/compute-jwt.pub.pem neon/storage-tokens/pageserver-api.jwt neon/storage-tokens/safekeeper-data.jwt \
   neon/storage-tokens/generations-api.jwt neon/storage-tokens/storcon-admin.jwt \
   stacks/other/secret; do
@@ -72,13 +72,13 @@ readable=(secrets/secrets.key gateway/internal-verify.pem neon/compute-jwt.pem n
   orchestrator-tls/current/client.crt orchestrator-tls/current/client.key orchestrator-tls/current/ca.crt
   nats/orchestrator.password valkey/control.password realtime/internal.token
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token
-  tokens/proxy-api.token tokens/storcon-hook.token stacks/x/zitadel/admin.pat)
+  tokens/storage-internal.token tokens/proxy-api.token tokens/storcon-hook.token stacks/x/zitadel/admin.pat)
 expected="$(printf '%s\n' "$keys/secrets/secrets.key" "$keys/gateway/internal-verify.pem" \
   "$keys/neon/compute-jwt.pem" "$keys/neon/compute-jwt.pub" "$keys/orchestrator-tls/current" \
   "$keys/orchestrator-tls/v1/client.crt" "$keys/orchestrator-tls/v1/client.key" "$keys/orchestrator-tls/v1/ca.crt" \
   "$keys/nats/orchestrator.password" "$keys/valkey/control.password" "$keys/realtime/internal.token" \
   "$keys/tokens/rest-internal.token" "$keys/tokens/data-keys.token" "$keys/tokens/app-auth.token" \
-  "$keys/tokens/app-sessions.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
+  "$keys/tokens/app-sessions.token" "$keys/tokens/storage-internal.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
   "$state/zitadel/admin.pat" | sort)"
 
 script='set -e

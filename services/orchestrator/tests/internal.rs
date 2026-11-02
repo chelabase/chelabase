@@ -46,6 +46,7 @@ const STORCON_TOKEN: &str = "storcon-token";
 const COMPUTE_TOKEN: &str = "compute-token";
 const DATA_KEYS_TOKEN: &str = "data-keys-token";
 const REST_TOKEN: &str = "rest-token";
+const STORAGE_TOKEN: &str = "storage-token";
 const CONTROL_PLANE_URI: &str = "http://orchestrator:8083";
 const APP_AUTH_TOKEN: &str = "app-auth-token";
 const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
@@ -1408,6 +1409,7 @@ async fn spawn_with_app(
         data_keys_token: DATA_KEYS_TOKEN.into(),
         rest_token: REST_TOKEN.into(),
         realtime_token: REALTIME_TOKEN.into(),
+        storage_token: STORAGE_TOKEN.into(),
         rt_events: Arc::new(app.rt_events),
         secrets: key.clone(),
         roles,
@@ -2209,10 +2211,13 @@ fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option
         endpoint_id: endpoint.map(str::to_string),
         database_name: Some("web1".into()),
         authenticator_password_enc: password,
+        storage_password_enc: None,
+        storage_password_salt: None,
         settings: DataApiSettings {
             max_rows: 500,
             statement_timeout_ms: 4000,
             max_connections: 7,
+            storage_max_connections: 3,
         },
         databases: vec![ServedDatabase { name: "web1".into(), default_schema: "app".into() }],
     }
@@ -2227,8 +2232,78 @@ async fn connection_requires_the_rest_bearer() {
     assert_eq!(app.get(&path, Some("wrong")).await.0, 401);
     assert_eq!(app.get(&path, Some(DATA_KEYS_TOKEN)).await.0, 401);
     assert_eq!(app.get(&path, Some(PROXY_TOKEN)).await.0, 401);
-    // With the right token an unknown branch is a plain 404.
+    // With the right token an unknown branch is a plain 404; storage reads it too (its role
+    // sessions connect as `authenticator`).
     assert_eq!(app.get(&path, Some(REST_TOKEN)).await.0, 404);
+    assert_eq!(app.get(&path, Some(STORAGE_TOKEN)).await.0, 404);
+}
+
+/// The storage login's route takes storage's bearer only: never rest's, realtime's or the
+/// gateway's, so no other service learns the `chelabase_storage` password.
+#[tokio::test]
+async fn storage_connection_requires_the_storage_bearer() {
+    let neon = FakeNeon::default();
+    let app = spawn_internal(neon, FakeLocator::default(), "http://127.0.0.1:9").await;
+    let path = format!("/internal/storage/branches/{}/connection", BranchId::new().as_uuid());
+    for token in [None, Some("wrong"), Some(REST_TOKEN), Some(REALTIME_TOKEN), Some(DATA_KEYS_TOKEN), Some(PROXY_TOKEN)] {
+        assert_eq!(app.get(&path, token).await.0, 401, "{token:?}");
+    }
+    assert_eq!(app.get(&path, Some(STORAGE_TOKEN)).await.0, 404);
+}
+
+/// The storage route answers as `chelabase_storage` with its own password (sealed for the
+/// branch, `Purpose::Storage`) and the same address, databases and settings; 409 until the
+/// worker stored a password, and the data route never carries it.
+#[tokio::test]
+async fn storage_connection_opens_the_storage_password() {
+    let neon = FakeNeon::default();
+    let locator = FakeLocator::default();
+    let app = spawn_internal(neon.clone(), locator.clone(), "http://127.0.0.1:9").await;
+    locator.pg.lock().unwrap().insert("ep-1".into(), "127.0.0.1:55432".parse().unwrap());
+    let mut row = connection_row(BranchStatus::Ready, Some("ep-1"), None);
+    let branch = row.branch_id.to_string();
+    row.authenticator_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "auth-pw"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let path = format!("/internal/storage/branches/{}/connection", row.branch_id.as_uuid());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!((code, &body), (409, &json!({ "status": "ready" })));
+
+    row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Storage, "storage-pw"));
+    row.storage_password_salt = Some(vec![1; 16]);
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
+            "port": 55432,
+            "database": "web1",
+            "server_name": "ep-1.compute.chelabase.internal",
+            "user": "chelabase_storage",
+            "password": "storage-pw",
+            "status": "ready",
+            "settings": {
+                "max_rows": 500,
+                "statement_timeout_ms": 4000,
+                "max_connections": 7,
+                "storage_max_connections": 3,
+            },
+            "databases": [{ "name": "web1", "default_schema": "app" }],
+        })
+    );
+    let (code, data) = app
+        .get(&format!("/internal/data/branches/{}/connection", row.branch_id.as_uuid()), Some(STORAGE_TOKEN))
+        .await;
+    assert_eq!((code, &data["user"], &data["password"]), (200, &json!("authenticator"), &json!("auth-pw")));
+    assert!(!data.to_string().contains("storage-pw"), "{data}");
+
+    // A storage password sealed as another purpose (the authenticator's) doesn't open.
+    row.storage_password_enc = Some(seal_credential(&app.key, &branch, Purpose::Authenticator, "swapped"));
+    neon.connections.lock().unwrap().insert(row.branch_id, row.clone());
+    let (code, body) = app.get(&path, Some(STORAGE_TOKEN)).await;
+    assert_eq!(code, 500);
+    assert!(!body.to_string().contains("swapped"));
 }
 
 #[tokio::test]
@@ -2326,6 +2401,7 @@ async fn connection_opens_the_authenticator_password() {
                 "max_rows": 500,
                 "statement_timeout_ms": 4000,
                 "max_connections": 7,
+                "storage_max_connections": 3,
             },
             "databases": [{ "name": "web1", "default_schema": "app" }],
             // C4 (SP11): no control-network address found, so null; the rest is unchanged.

@@ -2261,6 +2261,8 @@ struct Database {
     max_rows: i32,
     statement_timeout_ms: i32,
     max_connections: i32,
+    /// Connections the storage service may hold to each branch.
+    storage_max_connections: i32,
 }
 
 /// The proxy's host and Postgres port, once the database is ready: until then its endpoint
@@ -2328,6 +2330,7 @@ impl Database {
             max_rows: r.max_rows,
             statement_timeout_ms: r.statement_timeout_ms,
             max_connections: r.max_connections,
+            storage_max_connections: r.storage_max_connections,
         }
     }
 }

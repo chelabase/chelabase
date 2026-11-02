@@ -18,4 +18,5 @@ export interface DatabaseSettings {
   max_connections: number;
   max_rows: number;
   statement_timeout_ms: number;
+  storage_max_connections: number;
 }

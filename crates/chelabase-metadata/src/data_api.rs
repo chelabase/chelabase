@@ -182,6 +182,8 @@ pub struct DataApiSettings {
     pub max_rows: i32,
     pub statement_timeout_ms: i32,
     pub max_connections: i32,
+    /// The storage service's own per-branch budget.
+    pub storage_max_connections: i32,
 }
 
 /// A database the data API serves, with the schema requests use when they name none.
@@ -200,6 +202,10 @@ pub struct BranchConnectionRow {
     /// The Postgres database inside the compute (the database's, shared by its branches).
     pub database_name: Option<String>,
     pub authenticator_password_enc: Option<String>,
+    /// The `chelabase_storage` login's sealed password (`Purpose::Storage`) and its SCRAM
+    /// salt: both or neither.
+    pub storage_password_enc: Option<String>,
+    pub storage_password_salt: Option<Vec<u8>>,
     pub settings: DataApiSettings,
     /// The branch's databases in state `on`, main first.
     pub databases: Vec<ServedDatabase>,
@@ -613,14 +619,38 @@ impl MetadataClient {
         Ok(())
     }
 
-    /// Everything the REST service needs to connect to `branch`, whatever its status.
+    /// Records the sealed `chelabase_storage` password of a live branch that has none, with the
+    /// SCRAM salt its verifier uses; like [`Self::set_authenticator_password`], the first one
+    /// stored stays.
+    pub async fn set_storage_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE branches SET storage_password_enc = $2, storage_password_salt = $3, updated_at = now()
+             WHERE id = $1 AND status NOT IN ('deleting', 'deleted')
+               AND storage_password_enc IS NULL",
+        )
+        .bind(branch.as_uuid())
+        .bind(sealed)
+        .bind(salt)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Everything the REST and storage services need to connect to `branch`, whatever its status.
     pub async fn branch_connection(
         &self,
         branch: BranchId,
     ) -> Result<Option<BranchConnectionRow>, MetadataError> {
         let row = sqlx::query(
             "SELECT b.id, b.status, b.endpoint_id, b.authenticator_password_enc,
-                    d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections
+                    b.storage_password_enc, b.storage_password_salt,
+                    d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
+                    d.storage_max_connections
              FROM branches b
              JOIN databases d ON d.id = b.database_id
              WHERE b.id = $1",
@@ -638,10 +668,13 @@ impl MetadataClient {
             endpoint_id: r.get("endpoint_id"),
             database_name: r.get("database_name"),
             authenticator_password_enc: r.get("authenticator_password_enc"),
+            storage_password_enc: r.get("storage_password_enc"),
+            storage_password_salt: r.get("storage_password_salt"),
             settings: DataApiSettings {
                 max_rows: r.get("max_rows"),
                 statement_timeout_ms: r.get("statement_timeout_ms"),
                 max_connections: r.get("max_connections"),
+                storage_max_connections: r.get("storage_max_connections"),
             },
             databases,
         }))

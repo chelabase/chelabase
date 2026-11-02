@@ -199,6 +199,10 @@ pub struct FakeState {
     pub before_insert_data_key: Option<StateHook>,
     /// Runs once, just before the next `set_authenticator_password`: a concurrent run's write.
     pub before_set_authenticator_password: Option<StateHook>,
+    /// Each branch's stored `chelabase_storage` login: the sealed password and its salt.
+    pub storage_logins: HashMap<BranchId, (String, Vec<u8>)>,
+    /// Runs once, just before the next `set_storage_password`: a concurrent run's write.
+    pub before_set_storage_password: Option<StateHook>,
     /// The next N `apply_resync` calls answer `VersionMoved` (and bump the version, as a
     /// concurrent write would).
     pub resync_version_moves: u32,
@@ -539,6 +543,7 @@ impl FakeMetadata {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
                 max_connections: 5,
+                storage_max_connections: 2,
             },
         );
         state.branches.insert(
@@ -2661,6 +2666,25 @@ impl WorkerMetadata for FakeMetadata {
         Ok(())
     }
 
+    async fn set_storage_password(
+        &self,
+        branch: BranchId,
+        sealed: &str,
+        salt: &[u8],
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_storage_password")?;
+        if let Some(hook) = state.before_set_storage_password.take() {
+            hook(&mut state);
+        }
+        let live = state.branches.get(&branch).is_some_and(|b| branch_live(b.status));
+        if live && !state.storage_logins.contains_key(&branch) {
+            state
+                .storage_logins
+                .insert(branch, (sealed.to_string(), salt.to_vec()));
+        }
+        Ok(())
+    }
+
     async fn branches_missing_data_api(&self) -> Result<Vec<BranchId>, MetadataError> {
         let state = self.read("branches_missing_data_api")?;
         Ok(sorted(state.branches.values().filter(|b| {
@@ -2686,10 +2710,13 @@ impl WorkerMetadata for FakeMetadata {
                 endpoint_id: b.endpoint_id.clone(),
                 database_name: db.database_name.clone(),
                 authenticator_password_enc: b.authenticator_password_enc.clone(),
+                storage_password_enc: state.storage_logins.get(&branch).map(|l| l.0.clone()),
+                storage_password_salt: state.storage_logins.get(&branch).map(|l| l.1.clone()),
                 settings: DataApiSettings {
                     max_rows: db.max_rows,
                     statement_timeout_ms: db.statement_timeout_ms,
                     max_connections: db.max_connections,
+                    storage_max_connections: db.storage_max_connections,
                 },
                 databases: vec![chelabase_metadata::ServedDatabase {
                     name: db.database_name.clone().unwrap_or_else(|| "db".into()),

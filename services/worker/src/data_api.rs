@@ -49,9 +49,10 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version
 /// the sequential path. A default schema that doesn't exist passes: the bootstrap skips it
 /// too. The literal is the quoted identifier (`to_regnamespace` parses identifier syntax).
 /// The search path is pinned first (`cloud_admin` is a superuser; `to_regclass` is unqualified).
-pub fn schema_check_sql(schema: &str) -> String {
+/// `storage_verifier`: the branch's `chelabase_storage` verifier ([`crate::storage_schema::storage_check_sql`]).
+pub fn schema_check_sql(schema: &str, storage_verifier: Option<&str>) -> String {
     let schema_literal = quote_literal(&quote_ident(schema));
-    let storage = crate::storage_schema::storage_check_sql(crate::OWNER_ROLE);
+    let storage = crate::storage_schema::storage_check_sql(crate::OWNER_ROLE, storage_verifier);
     format!(
         "SET search_path = pg_catalog, pg_temp; {SCHEMA_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
@@ -156,6 +157,15 @@ enum Lookup {
     /// The branch has no such database.
     Unknown,
     Found(DataApiTarget),
+}
+
+/// SCRAM's iteration count for the storage login's verifier (Postgres's default).
+const STORAGE_SCRAM_ITERATIONS: u32 = 4096;
+
+/// The `chelabase_storage` verifier of `password` with its stored `salt`: computed here, so
+/// the health check can require exactly it.
+fn storage_verifier(password: &str, salt: &[u8]) -> String {
+    chelabase_neon::scram::verifier_with_salt(password, salt, STORAGE_SCRAM_ITERATIONS)
 }
 
 /// `s` as an SQL string literal (`quote_literal`): single quotes doubled.
@@ -658,7 +668,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if let Some(aside) = quarantined(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, "a chelabase schema Chelabase didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
         }
-        let storage = crate::storage_schema::storage_schema_sql(OWNER_ROLE);
+        let (storage_password, salt) = self.storage_login(branch).await?;
+        let storage = crate::storage_schema::storage_schema_sql(
+            OWNER_ROLE,
+            &storage_verifier(&storage_password, &salt),
+        );
         match self.computes.admin_sql(ep, database_name, &storage).await {
             Ok(_) => Ok(()),
             Err(e) if let Some(why) = crate::storage_schema::newer_schema(&format!("{e:#}")) => {
@@ -742,6 +756,52 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     .context("opening the authenticator password")
             })
             .transpose()
+    }
+
+    /// The branch's `chelabase_storage` login (the storage service's own): its password and
+    /// the SCRAM salt of its verifier. A new one (sealed `Purpose::Storage`, AAD = branch id,
+    /// with a random 16-byte salt) is stored when the branch has none; like
+    /// [`Self::authenticator_password`] it is read back, so a racing run's wins.
+    async fn storage_login(&self, branch: BranchId) -> anyhow::Result<(String, Vec<u8>)> {
+        if let Some(login) = self.stored_storage_login(branch).await? {
+            return Ok(login);
+        }
+        let password = credentials::generate_password();
+        let salt: [u8; 16] = rand::random();
+        let sealed = seal_credential(&self.key, &branch.to_string(), Purpose::Storage, &password);
+        self.metadata
+            .set_storage_password(branch, &sealed, &salt)
+            .await
+            .context("storing the storage login's password")?;
+        self.stored_storage_login(branch)
+            .await?
+            .context("the storage login's password wasn't stored (is the branch being deleted?)")
+    }
+
+    async fn stored_storage_login(
+        &self,
+        branch: BranchId,
+    ) -> anyhow::Result<Option<(String, Vec<u8>)>> {
+        let row = self
+            .metadata
+            .branch_connection(branch)
+            .await
+            .context("reading the storage login's password")?;
+        row.and_then(|r| r.storage_password_enc.zip(r.storage_password_salt))
+            .map(|(sealed, salt)| {
+                open_credential(&self.key, &branch.to_string(), Purpose::Storage, &sealed)
+                    .context("opening the storage login's password")
+                    .map(|password| (password, salt))
+            })
+            .transpose()
+    }
+
+    /// The verifier the branch's `chelabase_storage` must carry (`None`: no login stored yet).
+    pub async fn storage_verifier(&self, branch: BranchId) -> anyhow::Result<Option<String>> {
+        Ok(self
+            .stored_storage_login(branch)
+            .await?
+            .map(|(password, salt)| storage_verifier(&password, &salt)))
     }
 
     /// The branch's public key (role `anon`, name `public`, sealed with AAD = key id), unless
@@ -860,20 +920,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .into_iter()
             .find(|d| d.name == database_name)
             .map_or_else(|| "public".to_owned(), |d| d.default_schema);
-        self.data_api_healthy_in(ep, &database_name, &schema).await
+        self.data_api_healthy_in(branch, ep, &database_name, &schema).await
     }
 
     /// [`Self::data_api_healthy`] for any database of `ep`, whose default schema is `schema`
     /// ([`schema_check_sql`]).
     pub async fn data_api_healthy_in(
         &self,
+        branch: BranchId,
         ep: &str,
         database: &str,
         schema: &str,
     ) -> anyhow::Result<bool> {
+        let verifier = self.storage_verifier(branch).await?;
         let out = self
             .computes
-            .admin_sql(ep, database, &schema_check_sql(schema))
+            .admin_sql(ep, database, &schema_check_sql(schema, verifier.as_deref()))
             .await?;
         match out.trim() {
             "t" => Ok(true),
@@ -1778,7 +1840,7 @@ COMMIT;
     /// it too, so it can't repair it).
     #[test]
     fn the_health_check_asks_for_authenticator_usage_on_the_default_schema() {
-        let sql = schema_check_sql("my\"schema");
+        let sql = schema_check_sql("my\"schema", Some("v"));
         // Fix round 1 (I3): the superuser session searches only pg_catalog.
         let sql = sql
             .strip_prefix("SET search_path = pg_catalog, pg_temp; ")
@@ -1792,7 +1854,7 @@ COMMIT;
         ] {
             assert!(rest.contains(part), "{part}: {rest}");
         }
-        assert!(schema_check_sql("public").contains("to_regnamespace('\"public\"')"));
+        assert!(schema_check_sql("public", Some("v")).contains("to_regnamespace('\"public\"')"));
     }
 
     #[tokio::test]

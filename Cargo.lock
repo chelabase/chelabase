@@ -6353,6 +6353,7 @@ dependencies = [
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
+ "chelabase-pgsession",
  "chelabase-schema",
  "chelabase-secrets",
  "chelabase-types",

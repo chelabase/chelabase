@@ -99,6 +99,7 @@ orchestrator	tokens/rest-internal.token	ro
 orchestrator	tokens/data-keys.token	ro
 orchestrator	tokens/app-auth.token	ro
 orchestrator	tokens/app-sessions.token	ro
+orchestrator	tokens/storage-internal.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
 orchestrator	orchestrator-tls	ro

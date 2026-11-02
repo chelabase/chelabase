@@ -17525,7 +17525,8 @@
           "max_branches",
           "max_rows",
           "statement_timeout_ms",
-          "max_connections"
+          "max_connections",
+          "storage_max_connections"
         ],
         "properties": {
           "branch_count": {
@@ -17594,6 +17595,11 @@
           "status": {
             "$ref": "#/components/schemas/DatabaseStatus"
           },
+          "storage_max_connections": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Connections the storage service may hold to each branch."
+          },
           "tenant_id": {
             "$ref": "#/components/schemas/TenantId"
           }
@@ -17621,7 +17627,8 @@
           "max_branches",
           "max_rows",
           "statement_timeout_ms",
-          "max_connections"
+          "max_connections",
+          "storage_max_connections"
         ],
         "properties": {
           "history_window": {
@@ -17643,6 +17650,10 @@
             "format": "int32"
           },
           "statement_timeout_ms": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "storage_max_connections": {
             "type": "integer",
             "format": "int32"
           }
@@ -22951,6 +22962,14 @@
               "null"
             ],
             "format": "int64"
+          },
+          "storage_max_connections": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Connections the storage service may hold to each branch, apart from `max_connections`."
           }
         },
         "additionalProperties": false

@@ -276,6 +276,7 @@ pub struct SettingsPatch {
     pub max_rows: Option<i32>,
     pub statement_timeout_ms: Option<i32>,
     pub max_connections: Option<i32>,
+    pub storage_max_connections: Option<i32>,
 }
 
 /// A branch that isn't deleted, as seen by the reconcile loop.
@@ -1417,6 +1418,7 @@ impl MetadataClient {
                  max_rows = COALESCE($4, max_rows),
                  statement_timeout_ms = COALESCE($5, statement_timeout_ms),
                  max_connections = COALESCE($6, max_connections),
+                 storage_max_connections = COALESCE($7, storage_max_connections),
                  updated_at = now()
              WHERE id = $1 AND status NOT IN ('deleting', 'deleted')",
         )
@@ -1426,6 +1428,7 @@ impl MetadataClient {
         .bind(patch.max_rows)
         .bind(patch.statement_timeout_ms)
         .bind(patch.max_connections)
+        .bind(patch.storage_max_connections)
         .execute(&self.pool)
         .await?
         .rows_affected();

@@ -99,6 +99,42 @@ impl Fx {
         cleanup(&self.worker, &self.metadata, self.id).await;
     }
 
+    /// The verifier the branch's `chelabase_storage` must carry (the bootstrap stored its login).
+    async fn verifier(&self) -> String {
+        self.worker
+            .storage_verifier(self.main)
+            .await
+            .expect("read the storage login")
+            .expect("a stored storage login")
+    }
+
+    /// The branch's `chelabase_storage` password, as the orchestrator hands it to storage.
+    async fn storage_password(&self) -> String {
+        let row = self
+            .metadata
+            .branch_connection(self.main)
+            .await
+            .unwrap()
+            .expect("the branch's row");
+        open_credential(
+            &self.worker.key,
+            &self.main.to_string(),
+            Purpose::Storage,
+            row.storage_password_enc.as_deref().expect("a storage password"),
+        )
+        .expect("open the storage password")
+    }
+
+    /// `chelabase_storage`'s attributes, its password checked against the verifier
+    /// ([`LOCKED_DOWN`] when the lockdown left it).
+    async fn locked_down(&self) -> String {
+        let verifier = self.verifier().await;
+        self.value(&format!(
+            "SELECT rolcanlogin || ' ' || (rolpassword = '{verifier}') || ' ' || rolconnlimit || ' ' || rolbypassrls || ' ' || rolinherit || ' ' || rolvaliduntil FROM pg_authid WHERE rolname = 'chelabase_storage'"
+        ))
+        .await
+    }
+
     /// SQL as cloud_admin on `ep`, in the main database.
     async fn admin_on(&self, ep: &str, sql: &str) -> Result<String, String> {
         self.worker
@@ -273,13 +309,13 @@ async fn run(fx: &Fx) {
         "buckets chelabase_admin true true,objects chelabase_admin true true,upload_tickets chelabase_admin false false"
     );
     assert_eq!(fx.value("SELECT count(*) FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid WHERE c.relnamespace = 'storage'::regnamespace").await, "0");
-    assert_eq!(fx.value("SELECT rolbypassrls AND NOT rolsuper AND NOT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'").await, "t");
+    assert_eq!(fx.value("SELECT rolbypassrls AND NOT rolsuper AND rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'").await, "t");
     assert_eq!(fx.value("SELECT storage.foldername('a/b/c.png')::text || ' ' || storage.filename('a/b/c.png') || ' ' || storage.extension('a/b/c.tar.gz') || ' ' || storage.foldername('c')::text").await, "{a,b} c.png gz {}");
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
 
     // AC 2: a second run changes nothing.
     let before = fx.value(SHAPE_SQL).await;
-    fx.admin(&storage_schema_sql(OWNER)).await;
+    fx.admin(&storage_schema_sql(OWNER, &fx.verifier().await)).await;
     fx.worker
         .bootstrap_data_api(
             &fx.metadata.get_branch(fx.main).await.unwrap().unwrap(),
@@ -512,10 +548,7 @@ GRANT chelabase_storage TO st_member WITH ADMIN OPTION; GRANT {OWNER} TO chelaba
         )
         .await
         .expect("bootstrap after the tamper");
-    assert_eq!(
-        fx.value("SELECT rolcanlogin || ' ' || (rolpassword IS NULL) || ' ' || rolconnlimit || ' ' || rolbypassrls || ' ' || rolinherit FROM pg_authid WHERE rolname = 'chelabase_storage'").await,
-        "false true 0 true false"
-    );
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
     assert_eq!(fx.value("SELECT coalesce(string_agg(array_to_string(setconfig, ','), ';'), '') FROM pg_db_role_setting WHERE setrole = 'chelabase_storage'::regrole").await, "search_path=pg_catalog, pg_temp,event_triggers=off");
     assert_eq!(fx.value("SELECT count(*) FROM pg_auth_members WHERE roleid = 'chelabase_storage'::regrole OR member = 'chelabase_storage'::regrole").await, "0");
     assert_eq!(
@@ -532,8 +565,11 @@ GRANT chelabase_storage TO st_member WITH ADMIN OPTION; GRANT {OWNER} TO chelaba
     let err = fx
         .direct("chelabase_storage", TAMPER_PASSWORD, "SELECT 1")
         .await
-        .expect_err("no login");
+        .expect_err("no login with the tamperer's password");
     assert!(!err.is_empty());
+    fx.direct("chelabase_storage", &fx.storage_password().await, "SELECT 1")
+        .await
+        .expect("the branch's own password logs in again");
     // Neither the owner nor authenticator can become it.
     let err = fx.owner_err("SET ROLE chelabase_storage").await;
     assert!(err.contains("permission denied"), "{err}");
@@ -571,6 +607,10 @@ GRANT chelabase_storage TO st_member WITH ADMIN OPTION; GRANT {OWNER} TO chelaba
         "0"
     );
 }
+
+/// `chelabase_storage` as the lockdown leaves it ([`Fx::locked_down`]): it logs in, with the
+/// branch's verifier, a connection limit of 40, BYPASSRLS, NOINHERIT, no expiry.
+const LOCKED_DOWN: &str = "true true 40 true false infinity";
 
 /// The password the tamper scenario gives `chelabase_storage`.
 const TAMPER_PASSWORD: &str = "tamper-Passw0rd-3c9e";
@@ -790,12 +830,12 @@ async fn hardening(fx: &Fx) {
     )
     .await;
     assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public")).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
         "f",
         "the check notices the plant"
     );
     bootstrap(fx).await;
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
     assert_eq!(fx.value("SELECT to_regprocedure('storage.audit_backdoor()') IS NULL AND to_regclass('storage.audit_v') IS NULL").await, "t");
     assert_eq!(
         fx.value(
@@ -892,7 +932,7 @@ async fn hardening(fx: &Fx) {
     ))
     .await;
     bootstrap(fx).await;
-    assert_eq!(fx.value("SELECT rolcanlogin || ' ' || (rolpassword IS NULL) || ' ' || rolconnlimit FROM pg_authid WHERE rolname = 'chelabase_storage'").await, "false true 0");
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
     assert_eq!(
         fx.value("SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'storage'")
             .await,
@@ -985,7 +1025,7 @@ async fn reaudit(fx: &Fx) {
     fx.owner("CREATE ROLE audit_grp NOLOGIN; GRANT audit_grp TO chelabase_storage;")
         .await
         .expect("the owner grants a role to it");
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "f");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "f");
     bootstrap(fx).await;
     assert_eq!(
         fx.value(
@@ -994,7 +1034,7 @@ async fn reaudit(fx: &Fx) {
         .await,
         "0"
     );
-    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "t");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await), "t");
     assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '00000000-0000-0000-0000-0000000000f2'").await, "1", "a membership voids no ticket");
     fx.owner("DROP ROLE audit_grp").await.unwrap();
 
@@ -1014,13 +1054,13 @@ async fn reaudit(fx: &Fx) {
         ))
         .await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public")).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
             "f",
             "{plant}"
         );
         bootstrap(fx).await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public")).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
             "t",
             "{plant}"
         );
@@ -1104,14 +1144,109 @@ async fn reaudit(fx: &Fx) {
         "the login trigger ran for chelabase_storage"
     );
     bootstrap(fx).await;
-    assert_eq!(
-        fx.value("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'")
-            .await,
-        "f"
-    );
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
     fx.owner("DROP EVENT TRIGGER audit_login").await.unwrap();
     fx.admin("DROP OWNED BY audit_guarded; DROP ROLE audit_guarded")
         .await;
+}
+
+// --- m5: chelabase_storage is the storage service's login -----------------------------------
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_login_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_login(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+/// The managed pool's login check ([`chelabase_pgsession::SERVICE_LOGIN_SQL`]) as
+/// `chelabase_storage` asks it on every connection.
+fn service_login_check() -> String {
+    chelabase_pgsession::SERVICE_LOGIN_SQL.replace("$1", "'chelabase_storage'")
+}
+
+async fn storage_login(fx: &Fx) {
+    let password = fx.storage_password().await;
+    let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+    // Provisioned: it logs in straight to the compute with the stored password, as the bare
+    // login the managed pool requires, with its pinned settings.
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
+    assert_eq!(check().await, "t");
+    let login = fx
+        .direct("chelabase_storage", &password, &format!("{}; SELECT current_setting('search_path') || '|' || current_setting('event_triggers')", service_login_check()))
+        .await
+        .expect("chelabase_storage logs in with its password");
+    assert_eq!(login, "t\npg_catalog, pg_temp|off");
+    assert_eq!(fx.value("SELECT count(*) FROM pg_auth_members WHERE roleid = 'chelabase_storage'::regrole OR member = 'chelabase_storage'::regrole").await, "0");
+    fx.direct("chelabase_storage", "not-the-password", "SELECT 1")
+        .await
+        .expect_err("a wrong password");
+    // Never in the data API's connection details: those are authenticator's.
+    let row = fx.metadata.branch_connection(fx.main).await.unwrap().unwrap();
+    assert_ne!(row.storage_password_enc, row.authenticator_password_enc);
+
+    // Neither the owner nor authenticator can become it.
+    let err = fx.owner_err("SET ROLE chelabase_storage").await;
+    assert!(err.contains("permission denied"), "{err}");
+    let authenticator = open_credential(
+        &fx.worker.key,
+        &fx.main.to_string(),
+        Purpose::Authenticator,
+        row.authenticator_password_enc.as_deref().unwrap(),
+    )
+    .unwrap();
+    let err = fx
+        .direct("authenticator", &authenticator, "SET ROLE chelabase_storage")
+        .await
+        .expect_err("authenticator");
+    assert!(err.contains("permission denied"), "{err}");
+
+    // A rerun without drift leaves the storage service's own sessions open.
+    let mut service = session(fx, "chelabase_storage", &password).await;
+    send(&mut service, "SELECT 'before';").await;
+    assert_eq!(read_line(&mut service).await, "before");
+    bootstrap(fx).await;
+    send(&mut service, "SELECT 'kept';").await;
+    assert_eq!(read_line(&mut service).await, "kept");
+
+    // A changed password fails the check; the bootstrap sets the verifier back and ends the
+    // sessions opened meanwhile.
+    fx.admin("ALTER ROLE chelabase_storage PASSWORD 'x-Changed-pw-9f3'").await;
+    assert_eq!(check().await, "f");
+    let mut tamperer = session(fx, "chelabase_storage", "x-Changed-pw-9f3").await;
+    send(&mut tamperer, "SELECT 'in';").await;
+    assert_eq!(read_line(&mut tamperer).await, "in");
+    bootstrap(fx).await;
+    assert_eq!(check().await, "t");
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
+    send(&mut tamperer, "SELECT 'still in';").await;
+    assert!(!finish(tamperer).await.contains("still in"), "the session opened while it drifted was ended");
+    drop(service);
+    fx.direct("chelabase_storage", "x-Changed-pw-9f3", "SELECT 1")
+        .await
+        .expect_err("the changed password no longer opens");
+    fx.direct("chelabase_storage", &password, "SELECT 1")
+        .await
+        .expect("the branch's password logs in again");
+
+    // A membership either way makes the managed pool's login check fail (so it refuses to
+    // open) and the health check fail; the bootstrap revokes it.
+    fx.admin("CREATE ROLE st_svc_grp NOLOGIN; GRANT st_svc_grp TO chelabase_storage;").await;
+    let refused = fx
+        .direct("chelabase_storage", &password, &service_login_check())
+        .await
+        .expect("logs in");
+    assert_eq!(refused, "f", "the managed pool would open with a membership");
+    assert_eq!(check().await, "f");
+    bootstrap(fx).await;
+    assert_eq!(fx.direct("chelabase_storage", &password, &service_login_check()).await.unwrap(), "t");
+    assert_eq!(check().await, "t");
+    fx.admin("DROP ROLE st_svc_grp").await;
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------
@@ -1143,7 +1278,7 @@ async fn versions(fx: &Fx) {
     .await;
     let before = fx.value(SHAPE_SQL).await;
     assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public")).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
         "f",
         "the role's drift still shows"
     );
@@ -1154,13 +1289,9 @@ async fn versions(fx: &Fx) {
         "a newer storage schema was changed"
     );
     assert_eq!(fx.value(stamp).await, "chelabase storage schema 99");
+    assert_eq!(fx.locked_down().await, LOCKED_DOWN);
     assert_eq!(
-        fx.value("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'")
-            .await,
-        "f"
-    );
-    assert_eq!(
-        last_line(&fx.admin(&schema_check_sql("public")).await),
+        last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
         "t",
         "a newer schema is healthy here"
     );
@@ -1170,7 +1301,7 @@ async fn versions(fx: &Fx) {
         fx.admin(&format!("COMMENT ON SCHEMA storage IS '{old}'"))
             .await;
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public")).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
             "f",
             "{old}"
         );
@@ -1187,7 +1318,7 @@ async fn versions(fx: &Fx) {
             "{old}: healed"
         );
         assert_eq!(
-            last_line(&fx.admin(&schema_check_sql("public")).await),
+            last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await),
             "t",
             "{old}"
         );

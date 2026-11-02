@@ -207,6 +207,7 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/data-keys.token", M, Gen::Text32, P),
     e("tokens/app-auth.token", M, Gen::Text32, P),
     e("tokens/app-sessions.token", M, Gen::Text32, P),
+    e("tokens/storage-internal.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
     e(

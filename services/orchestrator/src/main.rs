@@ -114,6 +114,7 @@ async fn main() -> anyhow::Result<()> {
         data_keys_token: internal_config.data_keys_token.clone(),
         rest_token: internal_config.rest_token.clone(),
         realtime_token: internal_config.realtime_token.clone(),
+        storage_token: internal_config.storage_token.clone(),
         rt_events: Arc::new(nats.clone()),
         secrets: secrets.clone(),
         roles,
