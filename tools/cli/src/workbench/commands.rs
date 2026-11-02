@@ -427,46 +427,68 @@ const OBJECT_STORE_DEV_KEYS: [(&str, &str); 2] = [
 const GRPC_TLS_FILES: [&str; 6] = ["ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"];
 
 /// The compose overlay mounts these as secrets (`scripts/tests/workbench-compose.sh` pins the
-/// mounts), so they are not in `docker inspect`. Writes the missing ones under `state`; a file
-/// that exists is never touched, so a stack made before these files gains them and nothing else.
+/// mounts), so they are not in `docker inspect`. Writes what is missing under `state`; a file that
+/// is fine is never touched, so a stack made before these files gains them and nothing else.
+/// The gRPC set is repaired as a whole: an empty file counts as missing; a CA that isn't a valid
+/// pair is made again (and then both leaves); a leaf is made again, certificate and key together,
+/// when either is missing or the pair isn't signed by the CA on disk. Every write is a temp file
+/// renamed into place, so an interrupted `up` leaves no half-written file.
 fn ensure_object_store_dev_files(state: &Path) -> anyhow::Result<()> {
-    for (rel, value) in OBJECT_STORE_DEV_KEYS {
-        write_new_private_file(&state.join(rel), value.as_bytes())?;
-    }
-    let dir = state.join("grpc-tls");
-    // The CA signs both certificates, so a missing CA file means all six are made again.
-    if !dir.join("ca.crt").exists() || !dir.join("ca.key").exists() {
-        for f in GRPC_TLS_FILES {
-            let _ = std::fs::remove_file(dir.join(f));
-        }
-    }
-    if GRPC_TLS_FILES.iter().all(|f| dir.join(f).exists()) {
-        return Ok(());
-    }
+    use chelabase_neon::compute_tls::{key_matches_cert, signed_by};
     use rcgen::{
         BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
         KeyPair, KeyUsagePurpose, SanType, date_time_ymd,
     };
-    let params = |cn: &str| -> anyhow::Result<CertificateParams> {
+    // An earlier build of this milestone had an admin identity; its dev keys are not used.
+    match std::fs::remove_dir_all(state.join("s3-admin")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).context("removing the stale s3-admin dir");
+        }
+        _ => {}
+    }
+    for (rel, value) in OBJECT_STORE_DEV_KEYS {
+        write_private_file_if_missing(&state.join(rel), value.as_bytes())?;
+    }
+    let dir = state.join("grpc-tls");
+    let read = |f: &str| std::fs::read_to_string(dir.join(f)).ok().filter(|t| !t.is_empty());
+    let params = |cn: &str| {
         let mut p = CertificateParams::default();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, cn);
         p.distinguished_name = dn;
         p.not_before = date_time_ymd(2025, 1, 1);
         p.not_after = date_time_ymd(2125, 1, 1);
-        Ok(p)
+        p
     };
-    let ca_key = KeyPair::generate().context("generating the gRPC CA key")?;
-    let mut ca_params = params("chelabase-seaweedfs-grpc-ca")?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).context("signing the gRPC CA")?;
-    let issuer = Issuer::new(ca_params, &ca_key);
-    write_new_private_file(&dir.join("ca.crt"), ca_cert.pem().as_bytes())?;
-    write_new_private_file(&dir.join("ca.key"), ca_key.serialize_pem().as_bytes())?;
+    // The CA on disk, if it is a valid pair; else a new one (both files written).
+    let existing = match (read("ca.crt"), read("ca.key")) {
+        (Some(crt), Some(key)) if key_matches_cert(&crt, &key) => KeyPair::from_pem(&key)
+            .ok()
+            .and_then(|k| Issuer::from_ca_cert_pem(&crt, k).ok())
+            .map(|issuer| (crt, issuer)),
+        _ => None,
+    };
+    let (ca_pem, issuer) = match existing {
+        Some(found) => found,
+        None => {
+            let key = KeyPair::generate().context("generating the gRPC CA key")?;
+            let mut p = params("chelabase-seaweedfs-grpc-ca");
+            p.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+            p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let cert = p.self_signed(&key).context("signing the gRPC CA")?;
+            // Key first: a crash between the two leaves a CA that doesn't pass the check above.
+            write_private_file(&dir.join("ca.key"), key.serialize_pem().as_bytes())?;
+            write_private_file(&dir.join("ca.crt"), cert.pem().as_bytes())?;
+            (cert.pem(), Issuer::new(p, key))
+        }
+    };
     for (name, eku) in [("server", ExtendedKeyUsagePurpose::ServerAuth), ("client", ExtendedKeyUsagePurpose::ClientAuth)] {
+        let (crt, key) = (read(&format!("{name}.crt")), read(&format!("{name}.key")));
+        if matches!((&crt, &key), (Some(c), Some(k)) if signed_by(c, &ca_pem) && key_matches_cert(c, k)) {
+            continue;
+        }
         let key = KeyPair::generate().with_context(|| format!("generating the gRPC {name} key"))?;
-        let mut p = params(&format!("seaweedfs-{name}"))?;
+        let mut p = params(&format!("seaweedfs-{name}"));
         p.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         p.extended_key_usages = vec![eku];
         p.subject_alt_names = vec![
@@ -475,32 +497,40 @@ fn ensure_object_store_dev_files(state: &Path) -> anyhow::Result<()> {
             SanType::IpAddress([127, 0, 0, 1].into()),
         ];
         let cert = p.signed_by(&key, &issuer).with_context(|| format!("signing the gRPC {name} certificate"))?;
-        write_new_private_file(&dir.join(format!("{name}.crt")), cert.pem().as_bytes())?;
-        write_new_private_file(&dir.join(format!("{name}.key")), key.serialize_pem().as_bytes())?;
+        write_private_file(&dir.join(format!("{name}.key")), key.serialize_pem().as_bytes())?;
+        write_private_file(&dir.join(format!("{name}.crt")), cert.pem().as_bytes())?;
     }
     Ok(())
 }
 
-/// Creates `path` (dirs 0700, file 0600) with `bytes` unless it exists.
-fn write_new_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-    if path.exists() {
+/// [`write_private_file`] unless `path` exists and isn't empty.
+fn write_private_file_if_missing(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 0) {
         return Ok(());
     }
+    write_private_file(path, bytes)
+}
+
+/// Writes `bytes` to `path` (dirs 0700, file 0600) through a temp file renamed into place.
+fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     let dir = path.parent().expect("a file below the state dir");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(dir)
         .with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(".{}.tmp", path.file_name().expect("a file name").to_string_lossy()));
+    let _ = std::fs::remove_file(&tmp);
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
-        .and_then(|mut f| f.write_all(bytes))
-        .with_context(|| format!("writing {}", path.display()))
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(bytes).and_then(|()| f.sync_all()))
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming {} into place", path.display()))
 }
 
 /// Sets each PAT file to 0600; a missing file is an error.
@@ -2496,6 +2526,67 @@ mod key_phase_tests {
             .map(|f| read(&format!("grpc-tls/{f}")))
             .collect();
         assert_eq!(before, after, "a second run changes no certificate");
+    }
+
+    /// After `damage` runs on a complete grpc-tls dir, a second `ensure` leaves a set in which
+    /// both leaves are signed by `ca.crt` and each key is its certificate's (white-room audit of
+    /// m2, B1); `kept` files must come through byte for byte.
+    fn repairs(damage: impl Fn(&Path), kept: &[&str]) {
+        use chelabase_neon::compute_tls::{key_matches_cert, signed_by};
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        super::ensure_object_store_dev_files(&state).unwrap();
+        let dir = state.join("grpc-tls");
+        let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
+        let before: Vec<String> = kept.iter().map(|f| read(f)).collect();
+        damage(&dir);
+        super::ensure_object_store_dev_files(&state).unwrap();
+        for f in ["server", "client"] {
+            let (crt, key) = (read(&format!("{f}.crt")), read(&format!("{f}.key")));
+            assert!(signed_by(&crt, &read("ca.crt")), "{f}.crt is not signed by ca.crt");
+            assert!(key_matches_cert(&crt, &key), "{f}.key does not match {f}.crt");
+        }
+        let after: Vec<String> = kept.iter().map(|f| read(f)).collect();
+        assert_eq!(before, after, "files that were fine are not remade");
+        for f in super::GRPC_TLS_FILES {
+            let mode = std::fs::metadata(dir.join(f)).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers.len(), 6, "no temp file is left: {leftovers:?}");
+    }
+
+    #[test]
+    fn audit_missing_server_key() {
+        repairs(|d| std::fs::remove_file(d.join("server.key")).unwrap(), &["ca.crt", "ca.key", "client.crt", "client.key"]);
+    }
+
+    #[test]
+    fn audit_missing_client_crt() {
+        repairs(|d| std::fs::remove_file(d.join("client.crt")).unwrap(), &["ca.crt", "ca.key", "server.crt", "server.key"]);
+    }
+
+    #[test]
+    fn audit_missing_ca_key() {
+        repairs(|d| std::fs::remove_file(d.join("ca.key")).unwrap(), &[]);
+    }
+
+    #[test]
+    fn an_empty_or_truncated_file_counts_as_missing() {
+        repairs(|d| std::fs::write(d.join("client.key"), "").unwrap(), &["ca.crt", "ca.key", "server.crt", "server.key"]);
+        repairs(|d| std::fs::write(d.join("ca.crt"), "garbage").unwrap(), &[]);
+        repairs(|d| std::fs::write(d.join("server.crt"), "").unwrap(), &["ca.crt", "ca.key", "client.crt", "client.key"]);
+    }
+
+    // N3: the dev admin keys of an earlier build of this milestone are removed on `up`.
+    #[test]
+    fn a_stale_admin_key_dir_is_removed() {
+        let t = tempfile::tempdir().unwrap();
+        let state = t.path().join("state");
+        std::fs::create_dir_all(state.join("s3-admin")).unwrap();
+        std::fs::write(state.join("s3-admin/access-key"), "chelabase-admin-dev").unwrap();
+        super::ensure_object_store_dev_files(&state).unwrap();
+        assert!(!state.join("s3-admin").exists());
     }
 
     // AC 7: a stack whose keys the old key phase made (under umask 002, like the real shared keys
