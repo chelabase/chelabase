@@ -187,7 +187,16 @@ expected_state_binds='[
   "worker:S/zitadel/admin.pat->S/zitadel/admin.pat",
   "auth:S/zitadel/admin.pat->S/zitadel/admin.pat",
   "auth:S/zitadel/login-client.pat->S/zitadel/login-client.pat",
-  "runner:S->S:rw"
+  "runner:S->S:rw",
+  "seaweedfs:S/s3/access-key->/run/chelabase/secrets/s3/access-key",
+  "seaweedfs:S/s3/secret-key->/run/chelabase/secrets/s3/secret-key",
+  "seaweedfs:S/storage-s3/access-key->/run/chelabase/secrets/storage-s3/access-key",
+  "seaweedfs:S/storage-s3/secret-key->/run/chelabase/secrets/storage-s3/secret-key",
+  "seaweedfs:S/grpc-tls/ca.crt->/run/chelabase/secrets/grpc-tls/ca.crt",
+  "seaweedfs:S/grpc-tls/server.crt->/run/chelabase/secrets/grpc-tls/server.crt",
+  "seaweedfs:S/grpc-tls/server.key->/run/chelabase/secrets/grpc-tls/server.key",
+  "seaweedfs:S/grpc-tls/client.crt->/run/chelabase/secrets/grpc-tls/client.crt",
+  "seaweedfs:S/grpc-tls/client.key->/run/chelabase/secrets/grpc-tls/client.key"
 ]'
 
 # $1 label, $2 checkout, $3 keys dir, $4 state dir, $5 link (1: <checkout>/.chelabase is a symlink

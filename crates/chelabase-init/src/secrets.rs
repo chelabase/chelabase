@@ -1212,8 +1212,9 @@ mod tests {
     }
 
     /// The workbench: the files the overlay's top-level `secrets:` block reads from
-    /// `${CHELABASE_KEYS_DIR}`; the others are Zitadel's PATs in the stack dir, which Zitadel
-    /// writes.
+    /// `${CHELABASE_KEYS_DIR}`; the others are in the stack dir: Zitadel's PATs, which Zitadel
+    /// writes, and the object store's dev keys and gRPC TLS set, which `chelabase workbench up`
+    /// writes (`ensure_object_store_dev_files`).
     fn workbench_secret_files() -> Vec<String> {
         let text = compose_file("docker-compose.workbench.yml");
         let block = text
@@ -1239,10 +1240,19 @@ mod tests {
         assert_eq!(
             others,
             [
+                "${CHELABASE_STACK_DIR}/s3/access-key",
+                "${CHELABASE_STACK_DIR}/s3/secret-key",
+                "${CHELABASE_STACK_DIR}/storage-s3/access-key",
+                "${CHELABASE_STACK_DIR}/storage-s3/secret-key",
+                "${CHELABASE_STACK_DIR}/grpc-tls/ca.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/server.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/server.key",
+                "${CHELABASE_STACK_DIR}/grpc-tls/client.crt",
+                "${CHELABASE_STACK_DIR}/grpc-tls/client.key",
                 "${CHELABASE_STACK_DIR}/zitadel/admin.pat",
                 "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"
             ],
-            "a workbench secret outside the keys dir that chelabase-init doesn't make"
+            "a workbench secret outside the keys dir that neither chelabase-init nor the workbench makes"
         );
         assert!(keys.len() > 30, "{keys:?}");
         keys
@@ -1250,9 +1260,11 @@ mod tests {
 
     /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
     /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
-    /// makes after it (Zitadel's PATs, the bootstrap's outputs, Zitadel's rendered config).
+    /// makes after it (Zitadel's PATs, the bootstrap's outputs, Zitadel's rendered config, and the
+    /// object store's `storage` keys and gRPC TLS set).
     fn selfhost_secret_paths() -> Vec<String> {
         const SCRIPT_DIRS: [&str; 3] = ["zitadel-pats", "bootstrap", "zitadel-config"];
+        const SCRIPT_FILES: [&str; 2] = ["storage-s3", "grpc-tls"];
         let text = compose_file("docker-compose.yml");
         let mut paths = Vec::new();
         let mut others = Vec::new();
@@ -1262,7 +1274,7 @@ mod tests {
             };
             let sub = rest.split(['}', ',', ' ']).next().unwrap().to_string();
             let top = sub.split('/').next().unwrap();
-            let list = if SCRIPT_DIRS.contains(&top) {
+            let list = if SCRIPT_DIRS.contains(&top) || SCRIPT_FILES.contains(&top) {
                 &mut others
             } else {
                 &mut paths
@@ -1277,6 +1289,13 @@ mod tests {
             [
                 "bootstrap",
                 "bootstrap/ids",
+                "grpc-tls/ca.crt",
+                "grpc-tls/client.crt",
+                "grpc-tls/client.key",
+                "grpc-tls/server.crt",
+                "grpc-tls/server.key",
+                "storage-s3/access-key",
+                "storage-s3/secret-key",
                 "zitadel-config/database.yaml",
                 "zitadel-pats",
                 "zitadel-pats/admin.pat",
@@ -1289,6 +1308,9 @@ mod tests {
             script.contains(&format!("for d in {}; do", SCRIPT_DIRS.join(" "))),
             "init-secrets makes {SCRIPT_DIRS:?}"
         );
+        for made in ["new_key storage-s3/access-key 20", "new_key storage-s3/secret-key 40", "T=\"$$S/grpc-tls\""] {
+            assert!(script.contains(made), "init-secrets runs {made}");
+        }
         assert!(paths.len() > 30, "{paths:?}");
         paths
     }
