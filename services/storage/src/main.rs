@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
             &config.internal_url,
             &config.internal_token,
         ))),
+        inflight: storage::limits::InFlight::new(config.max_inflight_bytes),
     });
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     info!(

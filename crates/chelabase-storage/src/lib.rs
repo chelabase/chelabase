@@ -15,5 +15,5 @@ pub use memory::MemoryStore;
 pub use s3::S3Store;
 pub use store::{
     ByteRange, ByteStream, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions,
-    STREAM_PART_SIZE, StorageError, collect,
+    COPY_OBJECT_MAX, COPY_PART_SIZE, STREAM_PART_SIZE, StorageError, collect, copy_in_parts,
 };

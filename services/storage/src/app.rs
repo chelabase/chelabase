@@ -17,7 +17,7 @@ use utoipa_axum::routes;
 use crate::control::Urls;
 use crate::engine::Engine;
 use crate::error::Failure;
-use crate::{buckets, objects, public, signed};
+use crate::{buckets, multipart, objects, public, signed};
 
 /// The identity token's audience.
 pub const AUDIENCE: &str = "storage";
@@ -34,6 +34,8 @@ pub struct AppState<S, M> {
     pub store: Arc<dyn ObjectStore>,
     /// Signed URLs' key, key liveness and upload tokens (m6).
     pub urls: Urls,
+    /// The cap on upload buffers in this process (m7).
+    pub inflight: crate::limits::InFlight,
 }
 
 /// The public routes with their OpenAPI annotations ([`crate::openapi::openapi`]).
@@ -55,6 +57,10 @@ pub fn api_router<S: ConnSource, M: ConnSource>() -> OpenApiRouter<Arc<AppState<
         .routes(routes!(signed::sign, signed::signed_download))
         .routes(routes!(signed::sign_upload, signed::signed_upload))
         .routes(routes!(public::public_download))
+        .routes(routes!(multipart::create))
+        .routes(routes!(multipart::upload_part))
+        .routes(routes!(multipart::list_parts, multipart::abort))
+        .routes(routes!(multipart::complete))
 }
 
 pub fn router<S: ConnSource, M: ConnSource>(state: Arc<AppState<S, M>>) -> Router {
@@ -140,6 +146,7 @@ mod tests {
             verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             store: Arc::new(chelabase_storage::MemoryStore::default()),
             urls: Urls::new(Arc::new(crate::control::Orchestrator::new("http://127.0.0.1:9", "t"))),
+            inflight: crate::limits::InFlight::new(1 << 30),
         };
         let headers = |token: &str| {
             let mut h = HeaderMap::new();
@@ -241,6 +248,7 @@ mod tests {
             verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
             store: Arc::new(chelabase_storage::MemoryStore::default()),
             urls: Urls::new(control),
+            inflight: crate::limits::InFlight::new(1 << 30),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());

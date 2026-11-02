@@ -42,6 +42,11 @@
 //!   update changing a managed column, through only by consuming (`consume_ticket`) the
 //!   ticket matching its bucket, name, version, size, etag, owner and role, unexpired and of
 //!   this timeline; otherwise [`TICKET_MISSING`]. No role is exempt, the owner included.
+//! - Resumable upload sessions (`storage.upload_sessions`, m7) are the storage service's
+//!   alone, like the tickets: `guard_sessions` lets only [`STORAGE_ROLE`] write them, stamps
+//!   the timeline, caps them at 24 hours and lets an update change only the parts (and bring
+//!   the expiry closer). A session vouches for nothing: completing one mints a ticket and
+//!   writes the row as the caller, so row level security decides again.
 //! - A branch copies unconsumed tickets but never its parent's timeline (`neon.timeline_id`
 //!   is a postmaster setting, fixed per compute), so they can't be used there.
 //! - Owner-level roles (the database owner is a Neon privileged role: `BYPASSRLS`, a member of
@@ -81,10 +86,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 5;
+pub const STORAGE_SCHEMA_VERSION: u32 = 6;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 5";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 6";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -206,6 +211,9 @@ BEGIN
       JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
       WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
     DELETE FROM storage.upload_tickets;
+    IF pg_catalog.to_regclass('storage.upload_sessions') IS NOT NULL THEN
+      DELETE FROM storage.upload_sessions;
+    END IF;
     RAISE WARNING 'chelabase: chelabase_storage had been changed; it was locked down and its upload tickets voided';
   END IF;
 END $$;
@@ -272,6 +280,23 @@ CREATE TABLE IF NOT EXISTS storage.upload_tickets (
   owner uuid,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS storage.upload_sessions (
+  id uuid PRIMARY KEY,
+  bucket_id uuid NOT NULL,
+  name text NOT NULL,
+  version_id uuid NOT NULL,
+  upload_id text NOT NULL,
+  content_type text NOT NULL,
+  upsert boolean NOT NULL,
+  datoid bigint NOT NULL,
+  caller_role name NOT NULL,
+  owner uuid,
+  parts jsonb NOT NULL,
+  timeline_id text NOT NULL,
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+ALTER TABLE storage.upload_sessions OWNER TO chelabase_admin;
 ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
 DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
 ALTER TABLE storage.upload_tickets OWNER TO chelabase_admin;
@@ -315,6 +340,7 @@ ALTER TABLE storage.objects ALTER COLUMN metadata SET DEFAULT '{{}}';
 ALTER TABLE storage.objects ALTER COLUMN created_at SET DEFAULT now();
 ALTER TABLE storage.objects ALTER COLUMN updated_at SET DEFAULT now();
 ALTER TABLE storage.upload_tickets ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE storage.upload_sessions ALTER COLUMN created_at SET DEFAULT now();
 DO $$ DECLARE e record; BEGIN
   FOR e IN SELECT g.rolname AS grantor, pg_catalog.format('REVOKE ALL %s FROM %s CASCADE', x.target,
         CASE WHEN x.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' ELSE pg_catalog.quote_ident(r.rolname) END) AS statement
@@ -332,14 +358,18 @@ GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_s
 ALTER TABLE storage.buckets ENABLE TRIGGER ALL;
 ALTER TABLE storage.objects ENABLE TRIGGER ALL;
 ALTER TABLE storage.upload_tickets ENABLE TRIGGER ALL;
+ALTER TABLE storage.upload_sessions ENABLE TRIGGER ALL;
 ALTER TABLE storage.upload_tickets NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE storage.upload_tickets DISABLE ROW LEVEL SECURITY;
-REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
+ALTER TABLE storage.upload_sessions NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE storage.upload_sessions DISABLE ROW LEVEL SECURITY;
+REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
 GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;
 GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types), UPDATE (name, public, file_size_limit, allowed_mime_types), DELETE ON storage.buckets TO authenticated;
 GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;
 GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;
+GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;
 CREATE OR REPLACE FUNCTION storage.guard_tickets() RETURNS trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
 $f${GUARD_TICKETS_BODY}$f$;
@@ -348,6 +378,20 @@ REVOKE ALL ON FUNCTION storage.guard_tickets() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER guard_tickets BEFORE INSERT OR UPDATE ON storage.upload_tickets
   FOR EACH ROW EXECUTE FUNCTION storage.guard_tickets();
 ALTER TABLE storage.upload_tickets ENABLE ALWAYS TRIGGER guard_tickets;
+CREATE OR REPLACE FUNCTION storage.guard_sessions() RETURNS trigger
+  LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
+$f${GUARD_SESSIONS_BODY}$f$;
+ALTER FUNCTION storage.guard_sessions() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.guard_sessions() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER guard_sessions BEFORE INSERT OR UPDATE ON storage.upload_sessions
+  FOR EACH ROW EXECUTE FUNCTION storage.guard_sessions();
+ALTER TABLE storage.upload_sessions ENABLE ALWAYS TRIGGER guard_sessions;
+CREATE OR REPLACE FUNCTION storage.record_part(p_session uuid, p_part integer, p_size bigint, p_etag text) RETURNS boolean
+  LANGUAGE sql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
+$f${RECORD_PART_BODY}$f$;
+ALTER FUNCTION storage.record_part(uuid, integer, bigint, text) OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.record_part(uuid, integer, bigint, text) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION storage.record_part(uuid, integer, bigint, text) TO chelabase_storage;
 CREATE OR REPLACE FUNCTION storage.consume_ticket(p_version uuid, p_bucket uuid, p_name text, p_size bigint, p_etag text, p_owner uuid, p_caller name)
   RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
 $f${CONSUME_TICKET_BODY}$f$;
@@ -510,10 +554,12 @@ pub fn storage_check_sql(owner_role: &str, verifier: Option<&str>) -> String {
                AND ((p.proname OPERATOR(pg_catalog.=) 'protect_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${PROTECT_OBJECTS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'guard_tickets' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_TICKETS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'touch_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${TOUCH_OBJECTS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'guard_sessions' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_SESSIONS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'record_part' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${RECORD_PART_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'consume_ticket' AND p.prosecdef AND p.proowner OPERATOR(pg_catalog.=) r.oid \
-                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 4 \
+                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 6 \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
-               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 3 \
+               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 4 \
              AND (SELECT pg_catalog.array_agg(v ORDER BY v) FROM (SELECT {default_entry} AS v FROM pg_catalog.pg_attrdef x \
                JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid \
                JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.adrelid AND a.attnum OPERATOR(pg_catalog.=) x.adnum \
@@ -546,13 +592,13 @@ pub fn foreign_objects_sql() -> String {
         "SELECT pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure) FROM pg_catalog.pg_proc p \
   WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND p.oid::pg_catalog.regprocedure::pg_catalog.text OPERATOR(pg_catalog.<>) ALL (ARRAY[\
 'storage.foldername(text)', 'storage.filename(text)', 'storage.extension(text)', 'storage.object_ref(uuid,text)', \
-'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', 'storage.touch_objects()', \
+'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', 'storage.touch_objects()', 'storage.guard_sessions()', 'storage.record_part(uuid,integer,bigint,text)', \
 'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)']) \
 UNION ALL SELECT pg_catalog.format('DROP %s IF EXISTS %s CASCADE', CASE c.relkind WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' \
     WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, c.oid::pg_catalog.regclass) \
   FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} \
-    AND NOT ((c.relkind OPERATOR(pg_catalog.=) 'r' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets', 'objects', 'upload_tickets']::pg_catalog.name[])) \
-      OR (c.relkind OPERATOR(pg_catalog.=) 'i' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets_pkey', 'buckets_name_key', 'objects_pkey', 'objects_bucket_id_name_key', 'upload_tickets_pkey']::pg_catalog.name[])) \
+    AND NOT ((c.relkind OPERATOR(pg_catalog.=) 'r' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets', 'objects', 'upload_tickets', 'upload_sessions']::pg_catalog.name[])) \
+      OR (c.relkind OPERATOR(pg_catalog.=) 'i' AND c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['buckets_pkey', 'buckets_name_key', 'objects_pkey', 'objects_bucket_id_name_key', 'upload_tickets_pkey', 'upload_sessions_pkey']::pg_catalog.name[])) \
       OR (c.relkind OPERATOR(pg_catalog.=) 'c' AND c.relname OPERATOR(pg_catalog.=) 'object_ref')) \
 UNION ALL SELECT pg_catalog.format('DROP TYPE IF EXISTS %s CASCADE', t.oid::pg_catalog.regtype) FROM pg_catalog.pg_type t \
   WHERE t.typnamespace OPERATOR(pg_catalog.=) {ns} AND t.typrelid OPERATOR(pg_catalog.=) 0::pg_catalog.oid AND t.typtype OPERATOR(pg_catalog.<>) 'm' \
@@ -567,11 +613,13 @@ UNION ALL SELECT pg_catalog.format('DROP TRIGGER IF EXISTS %I ON %s CASCADE', t.
   JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND NOT t.tgisinternal \
     AND NOT ((t.tgname OPERATOR(pg_catalog.=) 'protect_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
       OR (t.tgname OPERATOR(pg_catalog.=) 'touch_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
-      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_tickets' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets')) \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_tickets' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets') \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_sessions' AND c.relname OPERATOR(pg_catalog.=) 'upload_sessions')) \
 UNION ALL SELECT pg_catalog.format('DROP RULE IF EXISTS %I ON %s CASCADE', w.rulename, w.ev_class::pg_catalog.regclass) FROM pg_catalog.pg_rewrite w \
   JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND c.relkind OPERATOR(pg_catalog.=) 'r' \
 UNION ALL SELECT pg_catalog.format('DROP POLICY IF EXISTS %I ON storage.upload_tickets', y.polname) FROM pg_catalog.pg_policy y \
-  WHERE y.polrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_tickets')"
+  WHERE y.polrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_tickets') \
+    OR y.polrelid OPERATOR(pg_catalog.=) pg_catalog.to_regclass('storage.upload_sessions')"
     )
 }
 
@@ -580,7 +628,7 @@ UNION ALL SELECT pg_catalog.format('DROP POLICY IF EXISTS %I ON storage.upload_t
 /// it, `allowed` the grantees the install grants there.
 fn acl_entries_sql() -> String {
     let ns = "pg_catalog.to_regnamespace('storage')";
-    let tables = "CASE WHEN c.relname OPERATOR(pg_catalog.=) 'upload_tickets' THEN ARRAY['chelabase_storage'] ELSE ARRAY['anon', 'authenticated', 'chelabase_storage'] END";
+    let tables = "CASE WHEN c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['upload_tickets', 'upload_sessions']::pg_catalog.name[]) THEN ARRAY['chelabase_storage'] ELSE ARRAY['anon', 'authenticated', 'chelabase_storage'] END";
     format!(
         "SELECT 'ON SCHEMA storage' AS target, a.grantor, a.grantee, a.is_grantable, ARRAY['anon', 'authenticated', 'authenticator', 'chelabase_storage', '{{owner}}'] AS allowed \
     FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a WHERE n.oid OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) n.nspowner \
@@ -591,7 +639,8 @@ fn acl_entries_sql() -> String {
     WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
   UNION ALL SELECT 'ON ROUTINE ' OPERATOR(pg_catalog.||) p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, \
       CASE WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) THEN ARRAY['{{owner}}'] \
-        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
+        WHEN p.proname OPERATOR(pg_catalog.=) 'record_part' THEN ARRAY['chelabase_storage'] \
+        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
     FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) p.proowner \
   UNION ALL SELECT 'ON TYPE ' OPERATOR(pg_catalog.||) t.oid::pg_catalog.regtype::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, ARRAY['public'] \
     FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a WHERE t.typnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) t.typowner"
@@ -643,6 +692,41 @@ BEGIN
 END
 ";
 
+/// `guard_sessions`'s body (m7).
+/// Only [`STORAGE_ROLE`] writes a session; an insert is stamped with this timeline (a branch
+/// copies the row, never the timeline) and lives at most 24 hours; an update changes only the
+/// parts, and the expiry only to come sooner.
+pub const GUARD_SESSIONS_BODY: &str = "
+BEGIN
+  IF current_user <> 'chelabase_storage' THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB004', MESSAGE = 'storage.upload_sessions is written by Chelabase storage only';
+  END IF;
+  IF TG_OP = 'UPDATE' THEN
+    IF (NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.timeline_id, NEW.created_at)
+      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.timeline_id, OLD.created_at)
+      OR NEW.expires_at > OLD.expires_at THEN
+      RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_sessions: only the parts change, and the expiry only comes sooner';
+    END IF;
+    RETURN NEW;
+  END IF;
+  NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);
+  IF NEW.timeline_id IS NULL OR NEW.timeline_id = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'storage.upload_sessions: this server has no Neon timeline';
+  END IF;
+  IF NEW.expires_at <= clock_timestamp() OR NEW.expires_at > clock_timestamp() + interval '24 hours' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_sessions: a session expires within 24 hours';
+  END IF;
+  RETURN NEW;
+END
+";
+
+/// `record_part`'s body (m7): merges one part into a live session's `parts`.
+pub const RECORD_PART_BODY: &str = "
+UPDATE storage.upload_sessions SET parts = parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))
+  WHERE id = p_session AND expires_at > clock_timestamp()
+  RETURNING true
+";
+
 /// `touch_objects`'s body: every update of an object (an upsert's overwrite included) stamps
 /// `updated_at`, which callers can't write themselves.
 pub const TOUCH_OBJECTS_BODY: &str = "
@@ -675,7 +759,7 @@ END
 const STORAGE_ROLE_OID: &str = "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')";
 
 /// The install's column defaults, as `table.column=pg_get_expr`.
-pub const EXPECTED_DEFAULTS: [&str; 8] = [
+pub const EXPECTED_DEFAULTS: [&str; 9] = [
     "buckets.created_at=now()",
     "buckets.id=gen_random_uuid()",
     "buckets.public=false",
@@ -683,17 +767,19 @@ pub const EXPECTED_DEFAULTS: [&str; 8] = [
     "objects.id=gen_random_uuid()",
     "objects.metadata='{}'::jsonb",
     "objects.updated_at=now()",
+    "upload_sessions.created_at=now()",
     "upload_tickets.created_at=now()",
 ];
 
 /// The install's constraints, as `table.constraint`.
-pub const EXPECTED_CONSTRAINTS: [&str; 7] = [
+pub const EXPECTED_CONSTRAINTS: [&str; 8] = [
     "buckets.buckets_file_size_limit_check",
     "buckets.buckets_name_key",
     "buckets.buckets_pkey",
     "objects.objects_bucket_id_fkey",
     "objects.objects_bucket_id_name_key",
     "objects.objects_pkey",
+    "upload_sessions.upload_sessions_pkey",
     "upload_tickets.upload_tickets_pkey",
 ];
 
@@ -1026,7 +1112,7 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("GRANT USAGE ON SCHEMA storage TO anon, authenticated, authenticator, chelabase_storage, \"postgres\";"), "{sql}");
-        let reset = "REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, \"postgres\";";
+        let reset = "REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, \"postgres\";";
         let reset_at = sql.find(reset).unwrap_or_else(|| panic!("{reset}: {sql}"));
         let grants: Vec<&str> = sql
             .lines()
@@ -1063,6 +1149,7 @@ mod tests {
                 "GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;",
                 "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;",
                 "GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;",
+                "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;",
             ]
         );
         for column in MANAGED_COLUMNS {
@@ -1202,7 +1289,8 @@ mod tests {
     fn storage_schema_ticket_codes_are_dedicated() {
         assert_eq!((TICKET_MISSING, TICKET_FORGED), ("CB003", "CB004"));
         let data_api = crate::data_api::data_api_sql("postgres", "pw", "public");
-        for code in [TICKET_MISSING, TICKET_FORGED] {
+        // A forged write is refused with the same code on the tickets and the sessions (m7).
+        for (code, uses) in [(TICKET_MISSING, 1), (TICKET_FORGED, 2)] {
             assert_ne!(code, "42501");
             assert!(
                 !data_api.contains(&format!("'{code}'")),
@@ -1210,7 +1298,7 @@ mod tests {
             );
             assert_eq!(
                 sql().matches(&format!("ERRCODE = '{code}'")).count(),
-                1,
+                uses,
                 "{code}"
             );
         }
@@ -1220,6 +1308,7 @@ mod tests {
             PROTECT_OBJECTS_BODY,
             GUARD_TICKETS_BODY,
             CONSUME_TICKET_BODY,
+            GUARD_SESSIONS_BODY,
         ] {
             assert!(!body.contains("42501"), "{body}");
         }
@@ -1664,7 +1753,7 @@ mod tests {
             sql().contains(&format!("$f${PROTECT_OBJECTS_BODY}$f$"))
                 && sql().contains(&format!("$f${CONSUME_TICKET_BODY}$f$"))
         );
-        assert_eq!(EXPECTED_DEFAULTS.len(), 8);
+        assert_eq!(EXPECTED_DEFAULTS.len(), 9);
         assert!(EXPECTED_CONSTRAINTS.contains(&"objects.objects_bucket_id_fkey"));
     }
 
@@ -1875,10 +1964,9 @@ mod tests {
 
     /// m5 phase B: every update of an object (an upsert's overwrite included) advances its
     /// `updated_at`, through a BEFORE UPDATE trigger installed, owned, checked and healed like
-    /// the others; the schema is version 5.
+    /// the others.
     #[test]
     fn storage_schema_objects_updated_at_advances() {
-        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (5, "chelabase storage schema 5"));
         let sql = sql();
         for part in [
             "CREATE OR REPLACE FUNCTION storage.touch_objects() RETURNS trigger\n  LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS",
@@ -1893,12 +1981,114 @@ mod tests {
         assert!(TOUCH_OBJECTS_BODY.contains("NEW.updated_at := pg_catalog.clock_timestamp();"));
         let check = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'touch_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${TOUCH_OBJECTS_BODY}$b$)")), "{check}");
-        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 4"), "four checked functions: {check}");
-        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 3"), "three triggers: {check}");
         let foreign = foreign_objects_sql();
         assert!(foreign.contains("'storage.touch_objects()'"), "{foreign}");
         assert!(foreign.contains("(t.tgname OPERATOR(pg_catalog.=) 'touch_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects')"), "{foreign}");
-        assert!(acl_entries_sql().contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects']"));
+        assert!(acl_entries_sql().contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects'"));
+    }
+
+    /// m7: resumable upload sessions, version 6. `chelabase_admin`'s table, written by the
+    /// storage role only (`guard_sessions`, as the tickets' guard: `pg_write_all_data` writes
+    /// nothing), stamped with the timeline it was opened on, at most 24 hours long; an update
+    /// changes only its parts and may only bring its expiry closer. Checked, healed and voided
+    /// with the tickets when the role was tampered with.
+    #[test]
+    fn storage_schema_upload_sessions_are_storages_alone() {
+        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (6, "chelabase storage schema 6"));
+        let sql = sql();
+        let table = between(&sql, "CREATE TABLE IF NOT EXISTS storage.upload_sessions (", ");");
+        for column in [
+            "id uuid PRIMARY KEY",
+            "bucket_id uuid NOT NULL",
+            "name text NOT NULL",
+            "version_id uuid NOT NULL",
+            "upload_id text NOT NULL",
+            "content_type text NOT NULL",
+            "upsert boolean NOT NULL",
+            "datoid bigint NOT NULL",
+            "caller_role name NOT NULL",
+            "owner uuid",
+            "parts jsonb NOT NULL",
+            "timeline_id text NOT NULL",
+            "expires_at timestamptz NOT NULL",
+            "created_at timestamptz NOT NULL DEFAULT now()",
+        ] {
+            assert!(table.contains(column), "{column}: {table}");
+        }
+        for part in [
+            "ALTER TABLE storage.upload_sessions OWNER TO chelabase_admin;",
+            "ALTER TABLE storage.upload_sessions DISABLE ROW LEVEL SECURITY;",
+            "ALTER TABLE storage.upload_sessions ENABLE TRIGGER ALL;",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;",
+            "CREATE OR REPLACE TRIGGER guard_sessions BEFORE INSERT OR UPDATE ON storage.upload_sessions\n  FOR EACH ROW EXECUTE FUNCTION storage.guard_sessions();",
+            "ALTER TABLE storage.upload_sessions ENABLE ALWAYS TRIGGER guard_sessions;",
+            "ALTER FUNCTION storage.guard_sessions() OWNER TO CURRENT_USER;",
+            "REVOKE ALL ON FUNCTION storage.guard_sessions() FROM PUBLIC;",
+            &format!("$f${GUARD_SESSIONS_BODY}$f$"),
+        ] {
+            assert!(sql.contains(part), "{part}");
+        }
+        assert!(sql.contains("REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC"), "{sql}");
+        for part in [
+            &format!("IF current_user <> 'chelabase_storage' THEN\n    RAISE EXCEPTION USING ERRCODE = '{TICKET_FORGED}'"),
+            "NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);",
+            "NEW.expires_at > clock_timestamp() + interval '24 hours'",
+            "NEW.expires_at > OLD.expires_at",
+            "(NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.timeline_id, NEW.created_at)\n      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.timeline_id, OLD.created_at)",
+        ] {
+            assert!(GUARD_SESSIONS_BODY.contains(part), "{part}: {GUARD_SESSIONS_BODY}");
+        }
+        // Voided with the tickets when the role was tampered with (the table may not exist yet).
+        let lockdown = between(&sql, "DO $$ DECLARE\n  role pg_catalog.oid", "END $$;");
+        assert!(lockdown.contains("IF pg_catalog.to_regclass('storage.upload_sessions') IS NOT NULL THEN\n      DELETE FROM storage.upload_sessions;"), "{lockdown}");
+        // Checked and healed like the tickets.
+        let check = storage_check_sql("postgres", Some(VERIFIER));
+        assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'guard_sessions' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_SESSIONS_BODY}$b$)")), "{check}");
+        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 4"), "four triggers: {check}");
+        let foreign = foreign_objects_sql();
+        for part in [
+            "'storage.guard_sessions()'",
+            "'upload_sessions'",
+            "'upload_sessions_pkey'",
+            "(t.tgname OPERATOR(pg_catalog.=) 'guard_sessions' AND c.relname OPERATOR(pg_catalog.=) 'upload_sessions')",
+            "pg_catalog.to_regclass('storage.upload_sessions')",
+        ] {
+            assert!(foreign.contains(part), "{part}: {foreign}");
+        }
+        let acl = acl_entries_sql();
+        assert!(acl.contains("c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['upload_tickets', 'upload_sessions']::pg_catalog.name[]) THEN ARRAY['chelabase_storage']"), "{acl}");
+        assert!(acl.contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions']"), "{acl}");
+        assert!(EXPECTED_DEFAULTS.contains(&"upload_sessions.created_at=now()"));
+        assert!(EXPECTED_CONSTRAINTS.contains(&"upload_sessions.upload_sessions_pkey"));
+    }
+
+    /// m7: a part is recorded through `storage.record_part` (the storage service's statements
+    /// never say `SET`): `SECURITY INVOKER`, so the session's guard sees the storage role, and
+    /// executable by it alone; checked and healed like the others.
+    #[test]
+    fn storage_schema_parts_are_recorded_by_the_storage_role() {
+        let sql = sql();
+        for part in [
+            "CREATE OR REPLACE FUNCTION storage.record_part(p_session uuid, p_part integer, p_size bigint, p_etag text) RETURNS boolean\n  LANGUAGE sql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS",
+            &format!("$f${RECORD_PART_BODY}$f$"),
+            "ALTER FUNCTION storage.record_part(uuid, integer, bigint, text) OWNER TO CURRENT_USER;",
+            "REVOKE ALL ON FUNCTION storage.record_part(uuid, integer, bigint, text) FROM PUBLIC;",
+            "GRANT EXECUTE ON FUNCTION storage.record_part(uuid, integer, bigint, text) TO chelabase_storage;",
+        ] {
+            assert!(sql.contains(part), "{part}");
+        }
+        for part in [
+            "UPDATE storage.upload_sessions SET parts = parts || jsonb_build_object(p_part::text, jsonb_build_object('size', p_size, 'etag', p_etag))",
+            "WHERE id = p_session AND expires_at > clock_timestamp()",
+            "RETURNING true",
+        ] {
+            assert!(RECORD_PART_BODY.contains(part), "{part}: {RECORD_PART_BODY}");
+        }
+        let check = storage_check_sql("postgres", Some(VERIFIER));
+        assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'record_part' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${RECORD_PART_BODY}$b$)")), "{check}");
+        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 6"), "six checked functions: {check}");
+        assert!(foreign_objects_sql().contains("'storage.record_part(uuid,integer,bigint,text)'"));
+        assert!(acl_entries_sql().contains("WHEN p.proname OPERATOR(pg_catalog.=) 'record_part' THEN ARRAY['chelabase_storage']"));
     }
 
 }

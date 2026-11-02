@@ -21,6 +21,10 @@ pub struct Config {
     pub max_connections: usize,
     /// `CHELABASE_COMPUTE_CA_FILE` (required): every compute is verified against it (U15).
     pub compute_ca: PathBuf,
+    /// `CHELABASE_STORAGE_MAX_INFLIGHT_BYTES` (default 1 GiB): upload buffers held at once in
+    /// this process (a part is held whole; a single upload holds one stream part). Past it,
+    /// 503 `busy`.
+    pub max_inflight_bytes: usize,
     /// The object store (`CHELABASE_STORAGE_BACKEND`, `CHELABASE_STORAGE_S3_*`).
     pub store: StorageConfig,
 }
@@ -66,6 +70,7 @@ impl Config {
                     )
                 })?
                 .into(),
+            max_inflight_bytes: env_or("CHELABASE_STORAGE_MAX_INFLIGHT_BYTES", "1073741824").parse()?,
             store: StorageConfig::from_lookup(&get)?,
         })
     }
@@ -102,6 +107,7 @@ mod tests {
         assert_eq!(c.addr, "127.0.0.1:8089".parse().unwrap());
         assert_eq!(c.internal_token, "a-generated-storage-token");
         assert_eq!(c.max_connections, 200);
+        assert_eq!(c.max_inflight_bytes, 1 << 30);
         assert_eq!(c.store.bucket, "chelabase-storage");
     }
 

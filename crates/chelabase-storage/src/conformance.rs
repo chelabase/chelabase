@@ -4,7 +4,9 @@
 
 use bytes::Bytes;
 
-use crate::{ByteRange, CompletedPart, ObjectStore, PutOptions, StorageError, collect};
+use crate::{
+    ByteRange, CompletedPart, ObjectStore, PutOptions, StorageError, collect, copy_in_parts,
+};
 
 pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     ranged_read(store, prefix).await;
@@ -13,6 +15,7 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     multipart_out_of_order(store, prefix).await;
     multipart_abort(store, prefix).await;
     unknown_length_stream(store, prefix).await;
+    copy_by_parts(store, prefix).await;
 }
 
 async fn ranged_read(store: &dyn ObjectStore, prefix: &str) {
@@ -227,4 +230,43 @@ async fn unknown_length_stream(store: &dyn ObjectStore, prefix: &str) {
     let want: Vec<u8> = (0..12u8).flat_map(|i| vec![i; 1024 * 1024]).collect();
     assert!(got == want, "streamed object differs");
     store.delete(&key).await.unwrap();
+}
+
+/// m7: a copy made of `UploadPartCopy` parts (what a copy over 5 GB takes on S3), here 11 MiB
+/// in parts of 5 MiB: the copy is the source byte for byte, and no upload stays open. A
+/// missing source fails and leaves nothing.
+async fn copy_by_parts(store: &dyn ObjectStore, prefix: &str) {
+    let (src, dst) = (format!("{prefix}/copy-src"), format!("{prefix}/copy-dst"));
+    let body: Vec<u8> = (0..11 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+    store
+        .put(&src, Bytes::from(body.clone()), PutOptions::default())
+        .await
+        .unwrap();
+    let meta = copy_in_parts(store, &src, &dst, body.len() as u64, 5 * 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(meta.size, body.len() as u64);
+    let got = collect(store.get(&dst, None).await.unwrap().body)
+        .await
+        .unwrap();
+    assert!(got == body, "the part-by-part copy differs");
+    // A single part of exactly the source's size works too.
+    let one = format!("{prefix}/copy-one");
+    copy_in_parts(store, &src, &one, body.len() as u64, body.len() as u64)
+        .await
+        .unwrap();
+    assert_eq!(store.head(&one).await.unwrap().size, body.len() as u64);
+    let missing = format!("{prefix}/copy-missing");
+    assert!(
+        copy_in_parts(store, &missing, &format!("{prefix}/copy-none"), 6 << 20, 5 << 20)
+            .await
+            .is_err()
+    );
+    assert!(matches!(
+        store.head(&format!("{prefix}/copy-none")).await,
+        Err(StorageError::NotFound)
+    ));
+    for k in [src, dst, one] {
+        store.delete(&k).await.unwrap();
+    }
 }
