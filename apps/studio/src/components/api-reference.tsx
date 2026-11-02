@@ -6,6 +6,8 @@ import scalarCss from "@scalar/api-reference-react/style.css?inline";
 import designScalarCss from "@chelabase/design/scalar.css?inline";
 import { useEffect, useMemo, type CSSProperties } from "react";
 import managementDocument from "../../../../openapi/management.json";
+import dataDocument from "../../../../openapi/data.json";
+import { appUserAuthDocument, type ApiDocId } from "@/lib/api-docs";
 import { useAccessToken } from "@/lib/access-token";
 import { useStudioEnv } from "@/lib/env-context";
 
@@ -15,9 +17,10 @@ import { useStudioEnv } from "@/lib/env-context";
  * back to https://proxy.scalar.com on the web layout, so it is set to "" (no
  * proxy); the external URLs, agent, MCP and developer tools are switched off.
  */
-export function apiReferenceConfiguration(apiUrl: string, token: string | undefined): AnyApiReferenceConfiguration {
+export function apiReferenceConfiguration(doc: ApiDocId, apiUrl: string, token: string | undefined): AnyApiReferenceConfiguration {
+  const content = doc === "management" ? managementDocument : doc === "data" ? dataDocument : appUserAuthDocument();
   return {
-    content: { ...managementDocument, servers: [{ url: apiUrl }] },
+    content: { ...content, servers: [{ url: apiUrl }] },
     telemetry: false,
     withDefaultFonts: false,
     proxyUrl: "",
@@ -28,19 +31,23 @@ export function apiReferenceConfiguration(apiUrl: string, token: string | undefi
     defaultHttpClient: { targetKey: "js", clientKey: "axios" },
     forceDarkModeState: "dark",
     hideDarkModeToggle: true,
-    authentication: {
-      preferredSecurityScheme: "bearer",
-      securitySchemes: { bearer: { token: token ?? "" } },
-    },
+    // Only the Management API takes Studio's session token. The Data API takes a data API key and
+    // the Auth API an app user's: Studio's token is never prefilled there.
+    ...(doc === "management" && {
+      authentication: {
+        preferredSecurityScheme: "bearer",
+        securitySchemes: { bearer: { token: token ?? "" } },
+      },
+    }),
   };
 }
 
-export default function ApiReference() {
+export default function ApiReference({ doc }: { doc: ApiDocId }) {
   const { apiUrl } = useStudioEnv();
   const token = useAccessToken();
   // A new configuration only when the token changes: Scalar re-applies it, so a
   // refreshed token reaches "Try it out" without remounting.
-  const configuration = useMemo(() => apiReferenceConfiguration(apiUrl, token), [apiUrl, token]);
+  const configuration = useMemo(() => apiReferenceConfiguration(doc, apiUrl, token), [doc, apiUrl, token]);
   // Scalar toggles a color-mode class on document.body and never removes it.
   useEffect(
     () => () => {
@@ -58,7 +65,8 @@ export default function ApiReference() {
         className="design-scalar"
         style={{ "--scalar-custom-header-height": "52px" } as CSSProperties}
       >
-        <ApiReferenceReact configuration={configuration} />
+        {/* A fresh Scalar per document: it keeps the previous document's sidebar state otherwise. */}
+        <ApiReferenceReact key={doc} configuration={configuration} />
       </div>
     </>
   );

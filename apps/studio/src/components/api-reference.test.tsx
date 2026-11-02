@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AccessTokenContext } from "@/lib/access-token";
 import { EnvContext } from "@/lib/env-context";
 import type { StudioEnv } from "@/lib/env";
+import type { ApiDocId } from "@/lib/api-docs";
 
 const configurations: any[] = [];
 vi.mock("@scalar/api-reference-react", () => ({
@@ -22,10 +23,10 @@ const env: StudioEnv = {
   apiUrl: "http://gw.test",
 };
 
-const wrap = (token: string | undefined) => (
+const wrap = (token: string | undefined, doc: ApiDocId = "management") => (
   <EnvContext.Provider value={env}>
     <AccessTokenContext.Provider value={token}>
-      <ApiReference />
+      <ApiReference doc={doc} />
     </AccessTokenContext.Provider>
   </EnvContext.Provider>
 );
@@ -62,13 +63,13 @@ describe("ApiReference", () => {
   });
 
   it("forces Scalar's dark mode and hides its toggle", () => {
-    const config = apiReferenceConfiguration("http://gw", "t") as any;
+    const config = apiReferenceConfiguration("management", "http://gw", "t") as any;
     expect(config.forceDarkModeState).toBe("dark");
     expect(config.hideDarkModeToggle).toBe(true);
   });
 
   it("defaults the code samples to JavaScript / Axios", () => {
-    const config = apiReferenceConfiguration("http://gw", "t") as any;
+    const config = apiReferenceConfiguration("management", "http://gw", "t") as any;
     expect(config.defaultHttpClient).toEqual({ targetKey: "js", clientKey: "axios" });
   });
 
@@ -94,5 +95,20 @@ describe("ApiReference", () => {
     const { rerender } = render(wrap("t"));
     rerender(wrap("t"));
     expect(new Set(configurations).size).toBe(1);
+  });
+
+  it("shows the Data API document without Studio's own token", () => {
+    render(wrap("studio-token", "data"));
+    expect(Object.keys(last().content.paths)).toContain("/data/v1/query");
+    expect(last().content.servers).toEqual([{ url: "http://gw.test" }]);
+    // The Data API takes a data API key; Studio's session token must never be prefilled.
+    expect(JSON.stringify(last())).not.toContain("studio-token");
+  });
+
+  it("shows only the app-user endpoints for the Auth API, without Studio's token", () => {
+    render(wrap("studio-token", "auth"));
+    const paths = Object.keys(last().content.paths);
+    expect(paths.every((p) => p.startsWith("/auth/v1/app/"))).toBe(true);
+    expect(JSON.stringify(last())).not.toContain("studio-token");
   });
 });
