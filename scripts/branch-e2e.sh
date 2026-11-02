@@ -198,6 +198,18 @@ pass "restore left main at A; backup $backup_name has no compute; its branch has
 # every commit of this young tenant, so Neon answers "past" whatever window it has applied yet:
 # one attempt, no race with the settings job.
 ok PATCH "/v1/databases/$db_id" 200 '{"history_window": 3600}'
+# Object storage m5: storage's own connection budget round-trips (1 to 20), apart from the data
+# API's; a value out of range is 422 and changes nothing.
+ok GET "/v1/databases/$db_id" 200
+[[ "$(jq -r '.storage_max_connections' "$tmp/body")" == 2 ]] || die "storage_max_connections isn't 2 by default: $(cat "$tmp/body")"
+ok PATCH "/v1/databases/$db_id" 200 '{"storage_max_connections": 7}'
+[[ "$(jq -r '.storage_max_connections' "$tmp/body")" == 7 ]] || die "PATCH answered $(cat "$tmp/body")"
+for bad in 0 21; do
+  ok PATCH "/v1/databases/$db_id" 422 "{\"storage_max_connections\": $bad}"
+done
+ok GET "/v1/databases/$db_id" 200
+[[ "$(jq -r '.storage_max_connections + 0 | tostring' "$tmp/body")" == 7 ]] || die "storage_max_connections isn't 7: $(cat "$tmp/body")"
+pass "storage_max_connections round-trips; 0 and 21 are 422"
 old="$(date -u -d '2 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
 ok POST "/v1/databases/$db_id/branches" 202 \
   "$(jq -nc --arg p "$main_id" --arg t "$old" '{name: "too-old", parent_branch_id: $p, at: {timestamp: $t}}')"

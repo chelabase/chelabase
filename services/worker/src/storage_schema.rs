@@ -119,12 +119,13 @@ pub const FOREIGN_SCHEMA_MARK: &str = "chelabase_storage_foreign";
 
 /// The install script, for `admin_sql` (the superuser) in one database; `owner_role` is the
 /// database owner (the policy helpers' only grantee), `verifier` the SCRAM verifier of the
-/// branch's `chelabase_storage` password.
+/// branch's `chelabase_storage` password, `parent_verifier` its parent branch's (a fresh child
+/// still carries it: its first provisioning, not drift).
 ///
 /// Plain operators inside the function bodies and table definitions resolve against the
 /// pinned `search_path` (`pg_catalog` first) when they're created or run; the `DO` blocks
 /// qualify theirs, like the data API script.
-pub fn storage_schema_sql(owner_role: &str, verifier: &str) -> String {
+pub fn storage_schema_sql(owner_role: &str, verifier: &str, parent_verifier: Option<&str>) -> String {
     let owner = quote_ident(owner_role);
     let verifier_lit = crate::data_api::quote_literal(verifier);
     let foreign_objects = foreign_objects_sql();
@@ -132,6 +133,15 @@ pub fn storage_schema_sql(owner_role: &str, verifier: &str) -> String {
     let owner_lit = crate::data_api::quote_literal(owner_role);
     let newer = newer_than_mine_sql();
     let drift = role_drift_sql("role", verifier);
+    let inherited = parent_verifier.map_or_else(
+        || "false".to_owned(),
+        |parent| {
+            format!(
+                "NOT has_members AND NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role) AND NOT {}",
+                role_drift_sql("role", parent)
+            )
+        },
+    );
     let (defaults, constraints) = (
         expected_list(&EXPECTED_DEFAULTS),
         expected_list(&EXPECTED_CONSTRAINTS),
@@ -148,6 +158,7 @@ DO $$ DECLARE
   members pg_catalog.oid[];
   has_members boolean;
   tampered boolean;
+  inherited boolean;
   ended boolean;
   m record;
 BEGIN
@@ -160,7 +171,8 @@ BEGIN
       UNION SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid)
     SELECT oid FROM reach);
   has_members := EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role);
-  tampered := {drift};
+  inherited := {inherited};
+  tampered := {drift} AND NOT inherited;
   ended := has_members OR tampered OR EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role);
   ALTER ROLE chelabase_storage LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT CONNECTION LIMIT {STORAGE_CONNECTION_LIMIT} VALID UNTIL 'infinity' PASSWORD {verifier_lit};
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
@@ -740,7 +752,7 @@ mod tests {
     const VERIFIER: &str = "SCRAM-SHA-256$4096:c2FsdHNhbHRzYWx0c2FsdA==$c3RvcmVk:c2VydmVy";
 
     fn sql() -> String {
-        storage_schema_sql("postgres", VERIFIER)
+        storage_schema_sql("postgres", VERIFIER, None)
     }
 
     /// The text between `start` and the next `end`, both included.
@@ -1664,7 +1676,7 @@ mod tests {
             .map(|(_, _, s)| s.clone())
             .collect();
         let verifier = w.storage_verifier(main.id).await.unwrap().expect("a stored login");
-        assert_eq!(scripts, [storage_schema_sql("postgres", &verifier)]);
+        assert_eq!(scripts, [storage_schema_sql("postgres", &verifier, None)]);
 
         w.metadata.state().db_rows.insert(
             main.id,
@@ -1796,6 +1808,49 @@ mod tests {
         assert_eq!(w.metadata.state().storage_logins.get(&main.id), Some(&racer));
         let verifier = chelabase_neon::scram::verifier_with_salt(&"r".repeat(32), &[9u8; 16], 4096);
         assert_eq!(w.storage_verifier(main.id).await.unwrap(), Some(verifier));
+    }
+
+
+    /// A fresh child's `chelabase_storage` still carries its parent's verifier: its first
+    /// provisioning, never drift (no warning, its tickets kept), but only when the role is
+    /// otherwise exactly as the lockdown leaves it and nothing is a member either way.
+    #[test]
+    fn storage_schema_a_childs_inherited_login_is_no_drift() {
+        const PARENT: &str = "SCRAM-SHA-256$4096:cGFyZW50cGFyZW50cGFyZQ==$cA==:cA==";
+        let sql = storage_schema_sql("postgres", VERIFIER, Some(PARENT));
+        let lockdown = between(&sql, "DO $$ DECLARE\n  role pg_catalog.oid", "END $$;");
+        let inherited = format!(
+            "inherited := NOT has_members AND NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.member OPERATOR(pg_catalog.=) role) AND NOT {};",
+            role_drift_sql("role", PARENT)
+        );
+        assert!(lockdown.contains(&inherited), "{lockdown}");
+        let tampered = between(lockdown, "tampered :=", ";\n");
+        assert!(tampered.trim_end().ends_with("AND NOT inherited;"), "{tampered:?}");
+        assert!(lockdown.find("inherited :=").unwrap() < lockdown.find("tampered :=").unwrap());
+        // Without a parent (main) nothing is inherited.
+        let main = storage_schema_sql("postgres", VERIFIER, None);
+        assert!(main.contains("inherited := false;"), "{main}");
+    }
+
+    /// A child's bootstrap passes its parent's stored verifier; the child gets its own login.
+    #[tokio::test]
+    async fn storage_login_of_a_child_names_its_parents_verifier() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        let parent = w.storage_verifier(main.id).await.unwrap().unwrap();
+        let mut child = main.clone();
+        child.id = BranchId::new();
+        child.parent_branch_id = Some(main.id);
+        child.authenticator_password_enc = None;
+        w.metadata.state().branches.insert(child.id, child.clone());
+        w.computes.sql.lock().unwrap().clear();
+        w.bootstrap_data_api(&child, "app").await.unwrap();
+        let own = w.storage_verifier(child.id).await.unwrap().expect("the child's own login");
+        assert_ne!(own, parent);
+        let scripts: Vec<String> = w.computes.sql.lock().unwrap().iter()
+            .filter(|(_, _, s)| s.starts_with(STORAGE_SCHEMA_MARK)).map(|(_, _, s)| s.clone()).collect();
+        assert_eq!(scripts, [storage_schema_sql("postgres", &own, Some(&parent))]);
     }
 
 }

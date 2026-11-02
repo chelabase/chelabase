@@ -423,7 +423,8 @@ const OBJECT_STORE_DEV_KEYS: [(&str, &str); 2] = [
 /// SeaweedFS's gRPC mutual TLS files under `<state>/grpc-tls/`: a CA (`ca.crt`, and `ca.key`,
 /// which no service mounts) and a server and a client certificate with their keys, all valid for
 /// a century (a dev stack has no renewal). The base file's init-secrets makes the same files
-/// with openssl. Mode 0600; the dir 0700.
+/// with openssl. Mode 0600; the dir 0700. Only the tests list them.
+#[cfg(test)]
 const GRPC_TLS_FILES: [&str; 6] = ["ca.crt", "ca.key", "server.crt", "server.key", "client.crt", "client.key"];
 
 /// The compose overlay mounts these as secrets (`scripts/tests/workbench-compose.sh` pins the
