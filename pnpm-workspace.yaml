@@ -1,6 +1,7 @@
 packages:
   - "apps/*"
   - "packages/*"
+  - "services/identity"
 
 allowBuilds:
   "@scarf/scarf": true

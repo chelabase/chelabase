@@ -1,0 +1,25 @@
+{
+  "name": "@chelabase/identity",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Internal identity service: Better Auth behind a narrow JSON API, one Postgres schema per pool",
+  "type": "module",
+  "scripts": {
+    "start": "node src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "bench:pools": "node --expose-gc bench/pools.ts"
+  },
+  "dependencies": {
+    "better-auth": "1.7.15",
+    "kysely": "0.29.8",
+    "pg": "8.23.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.6",
+    "@types/pg": "8.23.1",
+    "typescript": "7.0.2",
+    "vitest": "5.0.2"
+  }
+}

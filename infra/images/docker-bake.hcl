@@ -90,3 +90,15 @@ target "studio" {
   annotations = index_annotations(RELEASE, SOURCE, REVISION)
   tags       = ["${REPO}/studio:${TAG}"]
 }
+# The internal identity service (Node, Better Auth); its own Dockerfile, no cargo build.
+# Not in the default group yet: compose and the publish scripts pick it up with m5.
+target "identity" {
+  context    = "."
+  dockerfile = "infra/images/identity.Dockerfile"
+  labels = {
+    "org.opencontainers.image.revision" = "${REVISION}"
+    "org.opencontainers.image.source"   = "${SOURCE}"
+  }
+  annotations = index_annotations(RELEASE, SOURCE, REVISION)
+  tags        = ["${REPO}/identity:${TAG}"]
+}
