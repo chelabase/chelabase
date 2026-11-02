@@ -1,5 +1,15 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { call, createPool, describeDb, newAppPool, schemaExists, startHarness, type Harness } from "./harness.ts";
+import { sharedPgPool } from "../src/registry.ts";
+import {
+  call,
+  createPool,
+  describeDb,
+  newAppPool,
+  schemaExists,
+  startHarness,
+  TEST_DB_URL,
+  type Harness,
+} from "./harness.ts";
 
 describeDb("pools", () => {
   let h: Harness;
@@ -87,6 +97,24 @@ describeDb("pools", () => {
     expect((await signIn(b.pool, "c@x.io", "password-for-pool-b")).status).toBe(201);
     // Dropping again is a no-op, not an error.
     expect((await call(h, "DELETE", `/internal/v1/pools/${a.pool}`, { as: "worker" })).status).toBe(204);
+  });
+
+  // Every pool's instance shares one pg pool whose search_path is only pg_catalog, so an
+  // unqualified table reference can never land in some pool's schema.
+  it("shared_pool_refuses_unqualified_tables", async () => {
+    const a = newAppPool();
+    await createPool(h, a.pool);
+    const shared = sharedPgPool(TEST_DB_URL!, 1);
+    try {
+      expect((await shared.query("SHOW search_path")).rows[0].search_path).toBe("pg_catalog");
+      for (const table of ['"user"', "session", "account", "verification"]) {
+        await expect(shared.query(`SELECT 1 FROM ${table}`), table).rejects.toMatchObject({ code: "42P01" });
+      }
+      // The same tables qualified with the pool's schema are there.
+      expect((await shared.query(`SELECT count(*)::int AS n FROM ${a.schema}.session`)).rows[0].n).toBe(0);
+    } finally {
+      await shared.end();
+    }
   });
 
   it("creating a pool twice is idempotent", async () => {

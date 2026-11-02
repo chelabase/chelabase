@@ -7,11 +7,11 @@ export const CALLERS = ["auth", "orchestrator", "worker"] as const;
 export type Caller = (typeof CALLERS)[number];
 
 /**
- * Cached Better Auth instances. `bench/pools.ts` measured 262–308 KiB RSS per cached pool
- * (200 pools, Node 24), so 128 pools cost under 40 MiB. Memory would allow far more; the
- * bound stays low because each cached pool can hold Postgres connections.
+ * Cached Better Auth instances. `bench/pools.ts` measured 307 KiB RSS per cached pool (200
+ * pools, Node 24, default max_connections=100): 256 pools cost about 77 MiB. All instances
+ * share one pg pool, so the cache size does not change the connection count.
  */
-export const DEFAULT_POOL_CACHE_SIZE = 128;
+export const DEFAULT_POOL_CACHE_SIZE = 256;
 
 export interface Config {
   /** Postgres URL for the `chelabase_identity` role. */

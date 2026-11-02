@@ -4,7 +4,7 @@ import { CallerAuth } from "./caller-auth.ts";
 import type { Config } from "./config.ts";
 import { readBody, toHttpError, type Json } from "./http.ts";
 import { PoolRegistry } from "./registry.ts";
-import { ALLOW, match, resolvePool } from "./routes.ts";
+import { ALLOW, match, resolveId, resolvePool } from "./routes.ts";
 
 export interface RunningServer {
   url: string;
@@ -25,7 +25,7 @@ export async function startServer(config: Config): Promise<RunningServer> {
   const registry = new PoolRegistry(config.databaseUrl, config.secret, config.poolCacheSize);
 
   async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const path = (req.url ?? "/").split("?")[0]!;
+    const [path = "/", search = ""] = (req.url ?? "/").split("?", 2);
     if (req.method === "GET" && path === "/health") return send(res, 200, { status: "ok" });
     // Caller auth runs first, so an unauthenticated caller learns nothing about routes or pools.
     const caller = callers.identify(req.headers);
@@ -37,8 +37,9 @@ export async function startServer(config: Config): Promise<RunningServer> {
     }
     try {
       const pool = resolvePool(m.poolSegment);
+      const id = resolveId(m.route, m.idSegment);
       const body = await readBody(req);
-      const reply = await m.route.handle({ registry, pool, body });
+      const reply = await m.route.handle({ registry, pool, id, query: new URLSearchParams(search), body });
       send(res, reply.status, reply.body);
     } catch (err) {
       const e = toHttpError(err);

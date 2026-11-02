@@ -51,9 +51,18 @@ const BETTER_AUTH_CODES: Record<string, [number, string]> = {
   USER_NOT_FOUND: [404, "user_not_found"],
 };
 
+function pgCode(err: unknown): unknown {
+  for (let e: unknown = err, depth = 0; e && typeof e === "object" && depth < 3; e = (e as { cause?: unknown }).cause, depth++) {
+    if ("code" in e && typeof e.code === "string" && /^[0-9A-Z]{5}$/.test(e.code)) return e.code;
+  }
+  return undefined;
+}
+
 export function toHttpError(err: unknown): HttpError {
   if (err instanceof HttpError) return err;
   if (err instanceof PoolNotFound) return new HttpError(404, "pool_not_found", err.message);
+  // undefined_table: the pool's schema was dropped while this request was using it.
+  if (pgCode(err) === "42P01") return new HttpError(404, "pool_not_found", "pool does not exist");
   if (err instanceof APIError) {
     const code = typeof err.body?.code === "string" ? err.body.code : "";
     const mapped = BETTER_AUTH_CODES[code];

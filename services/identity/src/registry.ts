@@ -1,6 +1,9 @@
-// Better Auth instances, one per pool, created lazily and kept in an LRU cache. Each instance
-// owns its own pg pool, whose connections pin `search_path` to that pool's schema, so no
-// connection ever serves two pools. Queries are schema-qualified on top of that.
+// Better Auth instances, one per pool, created lazily and kept in an LRU cache.
+//
+// Every instance shares one pg pool whose connections pin `search_path=pg_catalog`. Better
+// Auth qualifies every query with the pool's schema (`database.schemaName`), and an
+// unqualified table reference fails rather than reaching some pool's tables. One shared
+// pool also keeps the connection count fixed however many pools are cached.
 import { getMigrations } from "better-auth/db/migration";
 import pg from "pg";
 import { authOptions, createAuth, type Auth } from "./better-auth.ts";
@@ -12,23 +15,38 @@ export class PoolNotFound extends Error {
   }
 }
 
-interface Entry {
-  auth: Auth;
-  db: pg.Pool;
-  refs: number;
-  evicted: boolean;
-}
-
-/** Connections per cached pool. Idle ones close, so a cold pool holds none. */
-const MAX_CONNECTIONS_PER_POOL = 4;
+/** Connections in the shared pool, for every pool together. */
+const SHARED_POOL_MAX = 10;
 const IDLE_TIMEOUT_MS = 10_000;
 
+function pgPool(databaseUrl: string, searchPath: string, max: number): pg.Pool {
+  // The search path goes into the startup packet, never into SQL text, and is only ever
+  // pg_catalog or a validated pool schema.
+  if (searchPath !== "pg_catalog" && !SCHEMA_PATTERN.test(searchPath)) {
+    throw new Error("refusing an unvalidated schema name");
+  }
+  const db = new pg.Pool({
+    connectionString: databaseUrl,
+    max,
+    idleTimeoutMillis: IDLE_TIMEOUT_MS,
+    options: `-c search_path=${searchPath}`,
+  });
+  // An idle client's network error must not crash the process; the next query reconnects.
+  db.on("error", (err) => console.error(`identity: pg pool error (${searchPath}): ${err.message}`));
+  return db;
+}
+
+/** The pool every Better Auth instance shares: `search_path` is pg_catalog only. */
+export function sharedPgPool(databaseUrl: string, max = SHARED_POOL_MAX): pg.Pool {
+  return pgPool(databaseUrl, "pg_catalog", max);
+}
+
 export class PoolRegistry {
-  private readonly cache = new Map<string, Entry>();
-  private readonly pending = new Map<string, Promise<Entry>>();
-  /** Per-schema lifecycle lock: create and drop for one pool never overlap, nor a cold load. */
+  private readonly cache = new Map<string, Auth>();
+  private readonly pending = new Map<string, Promise<Auth>>();
+  /** Per-schema lifecycle lock: create, drop and a cold load for one pool never overlap. */
   private readonly locks = new Map<string, Promise<unknown>>();
-  private readonly admin: pg.Pool;
+  private readonly db: pg.Pool;
   private readonly databaseUrl: string;
   private readonly secret: string;
   private readonly capacity: number;
@@ -37,32 +55,27 @@ export class PoolRegistry {
     this.databaseUrl = databaseUrl;
     this.secret = secret;
     this.capacity = capacity;
-    this.admin = this.pgPool("pg_catalog", 2);
+    this.db = sharedPgPool(databaseUrl);
   }
 
-  /** Runs `fn` with the pool's instance; the instance stays open until `fn` settles. */
+  /** Runs `fn` with the pool's instance. */
   async use<T>(ref: PoolRef, fn: (auth: Auth) => Promise<T>): Promise<T> {
-    const entry = await this.acquire(ref);
-    try {
-      return await fn(entry.auth);
-    } finally {
-      entry.refs -= 1;
-      if (entry.evicted && entry.refs === 0) void entry.db.end();
-    }
+    return fn(await this.acquire(ref));
   }
 
   /** Creates the schema through m5's function and runs Better Auth's migrations. Idempotent. */
   async createPool(ref: PoolRef): Promise<void> {
     await this.locked(ref.schema, async () => {
-      await this.admin.query("SELECT identity_admin.create_pool_schema($1)", [ref.schema]);
-      // Migrate in search_path mode: Better Auth targets current_schema() and emits no
-      // CREATE SCHEMA, which this role may not run (it has no CREATE on the database).
-      const db = this.pgPool(ref.schema, 1);
+      await this.db.query("SELECT identity_admin.create_pool_schema($1)", [ref.schema]);
+      // Migrate in search_path mode on a connection pinned to the schema: Better Auth targets
+      // current_schema() and emits no CREATE SCHEMA, which this role may not run (it has no
+      // CREATE on the database). The schema exists by now.
+      const pinned = pgPool(this.databaseUrl, ref.schema, 1);
       try {
-        const { runMigrations } = await getMigrations(authOptions(db, this.secret, undefined));
+        const { runMigrations } = await getMigrations(authOptions(pinned, this.secret, undefined));
         await runMigrations();
       } finally {
-        await db.end();
+        await pinned.end();
       }
     });
   }
@@ -70,74 +83,49 @@ export class PoolRegistry {
   /** Evicts the pool's instance and drops its schema through m5's function. Idempotent. */
   async dropPool(ref: PoolRef): Promise<void> {
     await this.locked(ref.schema, async () => {
-      this.evict(ref.schema);
-      await this.admin.query("SELECT identity_admin.drop_pool_schema($1)", [ref.schema]);
+      this.cache.delete(ref.schema);
+      await this.db.query("SELECT identity_admin.drop_pool_schema($1)", [ref.schema]);
     });
   }
 
   async close(): Promise<void> {
-    for (const schema of [...this.cache.keys()]) this.evict(schema);
-    await this.admin.end();
+    this.cache.clear();
+    await this.db.end();
   }
 
-  private async acquire(ref: PoolRef): Promise<Entry> {
-    for (;;) {
-      const hit = this.cache.get(ref.schema);
-      if (hit) {
-        // Refresh LRU order.
-        this.cache.delete(ref.schema);
-        this.cache.set(ref.schema, hit);
-        hit.refs += 1;
-        return hit;
-      }
-      let load = this.pending.get(ref.schema);
-      if (!load) {
-        load = this.locked(ref.schema, () => this.load(ref));
-        this.pending.set(ref.schema, load);
-        void load.then(
-          () => this.pending.delete(ref.schema),
-          () => this.pending.delete(ref.schema),
-        );
-      }
-      const loaded = await load;
-      if (!loaded.evicted) {
-        loaded.refs += 1;
-        return loaded;
-      }
-      // A drop or the LRU evicted it before we got it: load again (a drop then says not found).
+  private async acquire(ref: PoolRef): Promise<Auth> {
+    const hit = this.cache.get(ref.schema);
+    if (hit) {
+      // Refresh LRU order.
+      this.cache.delete(ref.schema);
+      this.cache.set(ref.schema, hit);
+      return hit;
     }
+    let load = this.pending.get(ref.schema);
+    if (!load) {
+      load = this.locked(ref.schema, () => this.load(ref));
+      this.pending.set(ref.schema, load);
+      const done = () => this.pending.delete(ref.schema);
+      void load.then(done, done);
+    }
+    return load;
   }
 
-  private async load(ref: PoolRef): Promise<Entry> {
+  private async load(ref: PoolRef): Promise<Auth> {
     const cached = this.cache.get(ref.schema);
     if (cached) return cached;
-    const db = this.pgPool(ref.schema, MAX_CONNECTIONS_PER_POOL);
-    try {
-      // A pool exists once its migrations ran: `session` is the last core table created.
-      const found = await db.query(
-        "SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = 'session'",
-        [ref.schema],
-      );
-      if (found.rowCount !== 1) throw new PoolNotFound(ref.name);
-    } catch (err) {
-      await db.end();
-      throw err;
-    }
-    const entry: Entry = { auth: createAuth(db, this.secret, ref.schema), db, refs: 0, evicted: false };
-    this.cache.set(ref.schema, entry);
+    // A pool exists once its migrations ran: `session` is the last core table created.
+    const found = await this.db.query(
+      "SELECT 1 FROM pg_catalog.pg_tables WHERE schemaname = $1 AND tablename = 'session'",
+      [ref.schema],
+    );
+    if (found.rowCount !== 1) throw new PoolNotFound(ref.name);
+    const auth = createAuth(this.db, this.secret, ref.schema);
+    this.cache.set(ref.schema, auth);
     while (this.cache.size > this.capacity) {
-      const oldest = this.cache.keys().next().value!;
-      this.evict(oldest);
+      this.cache.delete(this.cache.keys().next().value!);
     }
-    return entry;
-  }
-
-  private evict(schema: string): void {
-    const entry = this.cache.get(schema);
-    if (!entry) return;
-    this.cache.delete(schema);
-    entry.evicted = true;
-    if (entry.refs === 0) void entry.db.end();
+    return auth;
   }
 
   private locked<T>(schema: string, fn: () => Promise<T>): Promise<T> {
@@ -149,22 +137,5 @@ export class PoolRegistry {
       if (this.locks.get(schema) === tail) this.locks.delete(schema);
     });
     return next;
-  }
-
-  private pgPool(searchPath: string, max: number): pg.Pool {
-    // The schema name goes into the startup packet, never into SQL text; it is still only
-    // ever a validated name.
-    if (searchPath !== "pg_catalog" && !SCHEMA_PATTERN.test(searchPath)) {
-      throw new Error("refusing an unvalidated schema name");
-    }
-    const db = new pg.Pool({
-      connectionString: this.databaseUrl,
-      max,
-      idleTimeoutMillis: IDLE_TIMEOUT_MS,
-      options: `-c search_path=${searchPath}`,
-    });
-    // An idle client's network error must not crash the process; the next query reconnects.
-    db.on("error", (err) => console.error(`identity: pg pool error (${searchPath}): ${err.message}`));
-    return db;
   }
 }
