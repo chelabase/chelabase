@@ -27,7 +27,7 @@ use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use worker::config::RealWorker;
 use worker::data_api::schema_check_sql;
-use worker::storage_schema::storage_schema_sql;
+use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
 use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup};
@@ -1112,4 +1112,84 @@ async fn reaudit(fx: &Fx) {
     fx.owner("DROP EVENT TRIGGER audit_login").await.unwrap();
     fx.admin("DROP OWNED BY audit_guarded; DROP ROLE audit_guarded")
         .await;
+}
+
+// --- Mixed versions: a newer schema is never downgraded --------------------------------------
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_schema_versions_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { versions(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn versions(fx: &Fx) {
+    let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
+    // Newer (as a later worker would leave it, with something this worker would heal):
+    // nothing in `storage` changes, the check is healthy, the role is still locked down.
+    fx.admin(
+        "COMMENT ON SCHEMA storage IS 'chelabase storage schema 99';
+         BEGIN; SET LOCAL ROLE chelabase_admin; CREATE FUNCTION storage.from_v99() RETURNS int LANGUAGE sql AS $$ SELECT 99 $$; COMMIT;",
+    )
+    .await;
+    fx.admin(&format!(
+        "ALTER ROLE chelabase_storage LOGIN PASSWORD '{TAMPER_PASSWORD}'"
+    ))
+    .await;
+    let before = fx.value(SHAPE_SQL).await;
+    assert_eq!(
+        last_line(&fx.admin(&schema_check_sql("public")).await),
+        "f",
+        "the role's drift still shows"
+    );
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value(SHAPE_SQL).await,
+        before,
+        "a newer storage schema was changed"
+    );
+    assert_eq!(fx.value(stamp).await, "chelabase storage schema 99");
+    assert_eq!(
+        fx.value("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'")
+            .await,
+        "f"
+    );
+    assert_eq!(
+        last_line(&fx.admin(&schema_check_sql("public")).await),
+        "t",
+        "a newer schema is healthy here"
+    );
+
+    // Older and unparseable stamps are installed over.
+    for old in ["chelabase storage schema 3", "chelabase storage schema x"] {
+        fx.admin(&format!("COMMENT ON SCHEMA storage IS '{old}'"))
+            .await;
+        assert_eq!(
+            last_line(&fx.admin(&schema_check_sql("public")).await),
+            "f",
+            "{old}"
+        );
+        bootstrap(fx).await;
+        assert_eq!(
+            fx.value(stamp).await,
+            storage_schema::STORAGE_SCHEMA_STAMP,
+            "{old}"
+        );
+        assert_eq!(
+            fx.value("SELECT to_regprocedure('storage.from_v99()') IS NULL")
+                .await,
+            "t",
+            "{old}: healed"
+        );
+        assert_eq!(
+            last_line(&fx.admin(&schema_check_sql("public")).await),
+            "t",
+            "{old}"
+        );
+    }
 }

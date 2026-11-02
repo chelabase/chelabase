@@ -74,9 +74,21 @@ pub const STORAGE_ROLE: &str = "chelabase_storage";
 /// The columns of `storage.objects` a caller may write only with a matching upload ticket.
 pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag"];
 
-/// The schema's comment: which version of [`storage_schema_sql`] installed it. Bump the
-/// number whenever the script changes what it installs, so reconcile reinstalls.
+/// Which version of [`storage_schema_sql`] this worker installs. Bump it (and
+/// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
+/// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
+/// alone (mixed versions during a deploy never downgrade it).
+pub const STORAGE_SCHEMA_VERSION: u32 = 4;
+
+/// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
 pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 4";
+
+/// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
+pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
+
+/// The error the install raises, before changing anything, when the schema is a newer
+/// worker's.
+pub const NEWER_SCHEMA_MARK: &str = "chelabase_storage_newer";
 
 /// The SQLSTATE `protect_objects` raises when an object's managed columns match no unexpired
 /// ticket of this timeline (none, a different value, already used, expired, or another
@@ -108,6 +120,7 @@ pub fn storage_schema_sql(owner_role: &str) -> String {
     let foreign_objects = foreign_objects_sql();
     let acl_entries = acl_entries_sql().replace("{owner}", &owner_role.replace('\'', "''"));
     let owner_lit = crate::data_api::quote_literal(owner_role);
+    let newer = newer_than_mine_sql();
     let drift = role_drift_sql("role");
     let (defaults, constraints) = (
         expected_list(&EXPECTED_DEFAULTS),
@@ -187,6 +200,12 @@ DO $$ BEGIN
   IF EXISTS (SELECT FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
       WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' AND r.rolname OPERATOR(pg_catalog.<>) 'chelabase_admin') THEN
     RAISE EXCEPTION '{FOREIGN_SCHEMA_MARK}: the storage schema is not Chelabase''s; it was left alone';
+  END IF;
+  IF EXISTS (SELECT FROM pg_catalog.pg_namespace n WHERE n.nspname OPERATOR(pg_catalog.=) 'storage'
+      AND {newer}) THEN
+    RAISE EXCEPTION '{NEWER_SCHEMA_MARK}: the storage schema is version %, newer than this worker''s {STORAGE_SCHEMA_VERSION}; it was left alone',
+      (SELECT pg_catalog.substring(pg_catalog.obj_description(n.oid, 'pg_namespace'), '{STAMP_PATTERN}') FROM pg_catalog.pg_namespace n
+        WHERE n.nspname OPERATOR(pg_catalog.=) 'storage');
   END IF;
   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
     RAISE EXCEPTION 'chelabase_data_api_missing: the data API bootstrap has not run in this database';
@@ -435,6 +454,7 @@ pub fn storage_check_sql(owner_role: &str) -> String {
        JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner \
        WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' \
          AND (r.rolname OPERATOR(pg_catalog.<>) 'chelabase_admin' \
+           OR COALESCE({newer}, false) \
            OR (pg_catalog.obj_description(n.oid, 'pg_namespace') OPERATOR(pg_catalog.=) '{STORAGE_SCHEMA_STAMP}' \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_class c \
                WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND c.relkind OPERATOR(pg_catalog.=) 'r' \
@@ -468,6 +488,7 @@ pub fn storage_check_sql(owner_role: &str) -> String {
      AND EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {storage_role} AND s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid)",
         objects = foreign_objects_sql(),
         acl = foreign_acl_sql(owner_role),
+        newer = newer_than_mine_sql(),
         default_entry = DEFAULT_ENTRY,
         constraint_entry = CONSTRAINT_ENTRY,
         defaults = expected_list(&EXPECTED_DEFAULTS),
@@ -655,6 +676,31 @@ pub fn role_drift_sql(role: &str) -> String {
     OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {role}
       AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']::pg_catalog.text[])))"
     )
+}
+
+/// Whether the stamp of schema `n` names a version above [`STORAGE_SCHEMA_VERSION`] (NULL
+/// when it doesn't parse: an unparseable stamp is installed over).
+fn newer_than_mine_sql() -> String {
+    format!(
+        "pg_catalog.substring(pg_catalog.obj_description(n.oid, 'pg_namespace'), '{STAMP_PATTERN}')::pg_catalog.int4 OPERATOR(pg_catalog.>) {STORAGE_SCHEMA_VERSION}"
+    )
+}
+
+/// Whether the install stopped because the schema is a newer worker's: the warning to log
+/// (the error's text after [`NEWER_SCHEMA_MARK`], naming both versions).
+pub fn newer_schema(error: &str) -> Option<&str> {
+    let marker = format!("ERROR:  {NEWER_SCHEMA_MARK}: ");
+    let start = error.find(&marker)? + marker.len();
+    Some(error[start..].lines().next().unwrap_or("").trim_end())
+}
+
+/// The version a stamp names, as [`STAMP_PATTERN`] reads it in SQL: `None` for anything but
+/// exactly `chelabase storage schema <1 to 9 digits>`.
+pub fn stamp_version(stamp: &str) -> Option<u32> {
+    let digits = stamp.strip_prefix("chelabase storage schema ")?;
+    (!digits.is_empty() && digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
 }
 
 /// Whether the script stopped because `storage` belongs to someone else (from its error).
@@ -1393,6 +1439,84 @@ mod tests {
             sql.contains("CREATE TYPE storage.object_ref AS (bucket_id uuid, name text);"),
             "{sql}"
         );
+    }
+
+    /// The stamp is the version number; a stamp parses only in exactly that form.
+    #[test]
+    fn storage_schema_stamp_versions_parse() {
+        assert_eq!(
+            STORAGE_SCHEMA_STAMP,
+            format!("chelabase storage schema {STORAGE_SCHEMA_VERSION}")
+        );
+        assert_eq!(
+            stamp_version(STORAGE_SCHEMA_STAMP),
+            Some(STORAGE_SCHEMA_VERSION)
+        );
+        assert_eq!(stamp_version("chelabase storage schema 3"), Some(3));
+        assert_eq!(stamp_version("chelabase storage schema 99"), Some(99));
+        for garbage in [
+            "",
+            "chelabase storage schema",
+            "chelabase storage schema x",
+            "chelabase storage schema 4 ",
+            "chelabase storage schema -1",
+            "chelabase storage schema 1234567890",
+            "other 4",
+        ] {
+            assert_eq!(stamp_version(garbage), None, "{garbage:?}");
+        }
+    }
+
+    /// Mixed versions: a stamp newer than this worker's leaves the install alone (the role's
+    /// lockdown, which commits first, still runs) and is healthy for this worker's check; an
+    /// older, equal or unparseable stamp is installed over as before.
+    #[test]
+    fn storage_schema_leaves_a_newer_schema_alone() {
+        let sql = sql();
+        let newer = format!(
+            "pg_catalog.substring(pg_catalog.obj_description(n.oid, 'pg_namespace'), '{STAMP_PATTERN}')::pg_catalog.int4 OPERATOR(pg_catalog.>) {STORAGE_SCHEMA_VERSION}"
+        );
+        let install = sql.split_once("COMMIT;\n").unwrap().1;
+        let check_at = install
+            .find(&newer)
+            .unwrap_or_else(|| panic!("{newer}: {install}"));
+        assert!(
+            check_at < install.find("CREATE SCHEMA").unwrap(),
+            "before any change: {install}"
+        );
+        assert!(install.contains(&format!("RAISE EXCEPTION '{NEWER_SCHEMA_MARK}: the storage schema is version %, newer than this worker''s {STORAGE_SCHEMA_VERSION}; it was left alone'")), "{install}");
+        let check = storage_check_sql("postgres");
+        assert!(
+            check.contains(&format!("OR COALESCE({newer}, false)")),
+            "{check}"
+        );
+        // The role's checks still apply to a newer schema.
+        assert!(
+            check.rfind("pg_auth_members").unwrap() > check.find(&newer).unwrap(),
+            "{check}"
+        );
+        let error = format!(
+            "psql in compute ep-1 exited with 3: ERROR:  {NEWER_SCHEMA_MARK}: the storage schema is version 99, newer than this worker's 4; it was left alone"
+        );
+        assert_eq!(
+            newer_schema(&error),
+            Some("the storage schema is version 99, newer than this worker's 4; it was left alone")
+        );
+        assert_eq!(
+            newer_schema("psql in compute ep-1 exited with 3: ERROR:  permission denied"),
+            None
+        );
+        assert!(!foreign_schema(&error));
+    }
+
+    /// A newer schema doesn't fail the bootstrap.
+    #[tokio::test]
+    async fn storage_schema_newer_schema_does_not_fail_the_bootstrap() {
+        let (w, _journal) = worker();
+        let id = ready_database(&w).await;
+        let main = w.metadata.main(id);
+        w.computes.fail_in_with("app", STORAGE_SCHEMA_MARK, &format!("psql in compute ep exited with 3: ERROR:  {NEWER_SCHEMA_MARK}: the storage schema is version 99, newer than this worker's 4; it was left alone"));
+        w.bootstrap_data_api(&main, "app").await.unwrap();
     }
 
     /// A `storage` schema someone else owns stops the script before its first change.
