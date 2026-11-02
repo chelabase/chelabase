@@ -16,7 +16,7 @@
 //! `BEGIN; RESET_SQL` (with a `ROLLBACK` first when the connection may be inside a
 //! transaction: [`chelabase_query::engine::begin_sql`]) and ends with
 //! `RESET_SQL` after its `COMMIT`; a request that doesn't finish closes its connection
-//! ([`chelabase_query::Lease`]).
+//! ([`chelabase_query::Lease`], held by the role session: [`crate::session`]).
 
 use std::fmt;
 use std::future::Future;
@@ -287,12 +287,13 @@ pub enum AcquireError {
 #[error(transparent)]
 pub struct DbAcquireError(pub PoolError);
 
-/// A connection, holding its branch and global slots until it's dropped. Lease the client
-/// (`chelabase_query::Lease::new(conn.client)`) for a request.
+/// A connection, holding its branch and global slots until it's dropped. Its client is
+/// reached only through a role session ([`Conn::with_role_session`]): nothing runs on it
+/// without a role.
 pub struct Conn {
-    pub client: Object,
+    pub(crate) client: Object,
     pub info: Arc<ConnInfo>,
-    _permits: Permits,
+    pub(crate) permits: Permits,
 }
 
 /// A branch slot and a global slot, held together for the life of a connection.
@@ -846,7 +847,7 @@ impl<S: ConnSource> Pools<S> {
                     return Ok(Conn {
                         client,
                         info,
-                        _permits: permits,
+                        permits,
                     });
                 }
                 Err(e) if !retried && is_connect_error(&e, pool_at_size(&pool)) => {

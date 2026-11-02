@@ -12,9 +12,9 @@
 use std::sync::Arc;
 
 use chelabase_auth::internal::DataIdentity;
-use chelabase_query::engine::{self, QueryCache, RunAs, RunSettings, with_transaction};
+use chelabase_query::engine::{self, QueryCache, with_transaction};
 use chelabase_query::schema::{RoleView, Schema, Visibility};
-use chelabase_query::{Lease, QueryClient};
+use chelabase_query::QueryClient;
 use chelabase_schema::catalog;
 use chelabase_schema::cell::{
     CELL_STATEMENT_TIMEOUT_MS, KEY_TYPE_SQL, cell_query, decode_cell, primary_key,
@@ -31,7 +31,7 @@ use uuid::Uuid;
 
 use crate::conn::owner_level::{self, OwnerLevelCache, RoleRefused, owner_level_cache};
 use crate::conn::{
-    AcquireError, ConnError, ConnInfo, ConnSource, Pools, RESET_SQL, ServedDatabase,
+    AcquireError, ConnError, ConnInfo, ConnSource, Pools, RESET_SQL, RoleSession, ServedDatabase,
 };
 use crate::error::ApiError;
 
@@ -199,16 +199,6 @@ pub struct Engine<S> {
     max_response_bytes: usize,
     cache: QueryCache,
     owner_level: OwnerLevelCache,
-}
-
-/// The request limits from the branch's connection info, for `database`.
-fn run_settings(info: &ConnInfo, database: &ServedDatabase) -> RunSettings {
-    RunSettings {
-        max_rows: info.settings.max_rows,
-        statement_timeout_ms: info.settings.statement_timeout_ms,
-        default_schema: database.default_schema.clone(),
-        reset_sql: RESET_SQL,
-    }
 }
 
 /// Why the full-cell route failed: in the database or the request's shape (the management
@@ -507,24 +497,23 @@ impl<S: ConnSource> Engine<S> {
             .database(branch, request.database.as_deref(), None)
             .await?;
         let conn = self.acquire(branch, &served.name, request_id).await?;
-        // Declared after `conn`, dropped before its permits are released.
-        let mut lease = Lease::new(conn.client);
-        let out = self
-            .cell_on(&lease, &conn.info, &served, branch, request, request_id)
-            .await;
-        lease.done();
-        out
+        let claims = Value::Object(Default::default());
+        conn.with_role_session(&request.role, &claims, None, async |session| {
+            self.cell_on(session, &served, branch, request, request_id)
+                .await
+        })
+        .await
     }
 
     async fn cell_on(
         &self,
-        lease: &Lease,
-        info: &ConnInfo,
+        session: &RoleSession,
         served: &ServedDatabase,
         branch: Uuid,
         request: &ConsoleCellRequest,
         request_id: &str,
     ) -> Result<CellValue, CellError> {
+        let lease = session.lease();
         self.guard(lease, branch, Guard::Console(&request.role), request_id)
             .await?;
         // The table's model is its own transaction (`BEGIN … COMMIT`), so it is read before the
@@ -559,18 +548,13 @@ impl<S: ConnSource> Engine<S> {
         };
         // Shape errors (no key, wrong key columns, unknown column) before any session.
         cell_query(&model, &request.key, &request.column)?;
-        let claims = Value::Object(Default::default());
-        let mut settings = run_settings(info, served);
+        let mut settings = session.settings(served);
         settings.statement_timeout_ms =
             i64::try_from(CELL_STATEMENT_TIMEOUT_MS).unwrap_or(i64::MAX);
         let answer = engine::console_session(
             lease,
             &served.name,
-            RunAs::Role {
-                role: &request.role,
-                claims: &claims,
-                oid: None,
-            },
+            session.run_as(),
             &settings,
             request_id,
             // An in-database failure is the answer, not the session's: the read-only
@@ -603,38 +587,31 @@ impl<S: ConnSource> Engine<S> {
     ) -> Result<String, Failure> {
         let branch = data.branch_id;
         let conn = self.acquire(branch, &database.name, request_id).await?;
-        // Declared after `conn`, dropped before its permits are released.
-        let mut lease = Lease::new(conn.client);
         let guard = if console {
             Guard::Console(&data.role)
         } else {
             Guard::Key(data)
         };
-        let out = async {
-            self.guard(&lease, branch, guard, request_id)
+        conn.with_role_session(&data.role, &data.claims, guard.role_oid(), async |session| {
+            let lease = session.lease();
+            self.guard(lease, branch, guard, request_id)
                 .await?;
             // `run` sends `[ROLLBACK;] BEGIN; RESET_SQL`, `COMMIT` and `RESET_SQL` itself.
             Ok::<_, Failure>(
                 chelabase_query::run(
-                    &lease,
+                    lease,
                     &self.cache,
                     (branch, &database.name),
-                    RunAs::Role {
-                        role: &data.role,
-                        claims: &data.claims,
-                        oid: guard.role_oid(),
-                    },
-                    &run_settings(&conn.info, database),
+                    session.run_as(),
+                    &session.settings(database),
                     self.max_response_bytes,
                     op,
                     request_id,
                 )
                 .await?,
             )
-        }
-        .await;
-        lease.done();
-        out
+        })
+        .await
     }
 
     /// `GET /data/v1/schema?database=`: what the key's role can reach in the database,
@@ -727,38 +704,33 @@ impl<S: ConnSource> Engine<S> {
     ) -> Result<Schemas, Failure> {
         let conn = self.acquire(branch, &database.name, request_id).await?;
         let info = conn.info.clone();
-        // Declared after `conn`, dropped before its permits are released.
-        let mut lease = Lease::new(conn.client);
         let claims = Value::Object(Default::default());
-        let out = async {
-            self.guard(&lease, branch, guard, request_id)
-                .await?;
-            Ok::<_, Failure>(
-                with_transaction(&lease, RESET_SQL, request_id, async |client| {
-                    let (schema, _, _) = chelabase_query::load_schema(
-                        client,
-                        &self.cache,
-                        (branch, &database.name),
-                        RunAs::Role {
-                            role,
-                            claims: &claims,
-                            oid: guard.role_oid(),
-                        },
-                        info.settings.statement_timeout_ms,
-                        request_id,
-                    )
+        let out = conn
+            .with_role_session(role, &claims, guard.role_oid(), async |session| {
+                let lease = session.lease();
+                self.guard(lease, branch, guard, request_id)
                     .await?;
-                    let mut views = Vec::new();
-                    for r in roles {
-                        views.push(engine::view(client, &schema, r, request_id).await?);
-                    }
-                    Ok((schema, views))
-                })
-                .await?,
-            )
-        }
-        .await;
-        lease.done();
+                Ok::<_, Failure>(
+                    with_transaction(lease, RESET_SQL, request_id, async |client| {
+                        let (schema, _, _) = chelabase_query::load_schema(
+                            client,
+                            &self.cache,
+                            (branch, &database.name),
+                            session.run_as(),
+                            info.settings.statement_timeout_ms,
+                            request_id,
+                        )
+                        .await?;
+                        let mut views = Vec::new();
+                        for r in roles {
+                            views.push(engine::view(client, &schema, r, request_id).await?);
+                        }
+                        Ok((schema, views))
+                    })
+                    .await?,
+                )
+            })
+            .await;
         let (schema, views) = out?;
         Ok((schema, views, database.default_schema.clone(), info))
     }
