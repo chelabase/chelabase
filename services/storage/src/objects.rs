@@ -34,6 +34,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chelabase_auth::internal::DataIdentity;
+use futures_util::StreamExt;
 use chelabase_pgsession::service::Type;
 use chelabase_pgsession::{ConnSource, NamedStatement, named_statement};
 use chelabase_query::QueryFailure;
@@ -47,13 +48,14 @@ use crate::app::{AppState, identity};
 use crate::buckets::body;
 use crate::engine::{DATOID_SQL, Located, datoid_of};
 use crate::error::Failure;
+use crate::limits::{Limits, SNIFF_BYTES, peek};
 use crate::names::{self, Staged, check_object_name};
 use crate::openapi::StorageErrorEnvelope;
 
-/// A bucket's id and file size limit, by name (storage's own read: `bucket_id` is managed).
+/// A bucket's id and limits, by name (storage's own read: `bucket_id` is managed).
 const BUCKET: NamedStatement = named_statement!(
     "bucket",
-    "SELECT id, file_size_limit FROM storage.buckets WHERE name OPERATOR(pg_catalog.=) $1",
+    "SELECT id, file_size_limit, allowed_mime_types FROM storage.buckets WHERE name OPERATOR(pg_catalog.=) $1",
     &[Type::TEXT]
 );
 
@@ -128,7 +130,7 @@ pub fn db_failure(code: &str, message: &str, request_id: &str) -> QueryFailure {
 }
 
 /// [`crate::buckets::pg`], keeping `CB003` ([`db_failure`]).
-fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
+pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
     move |e| match e.as_db_error() {
         Some(db) if db.code().code() == TICKET_MISSING => {
             db_failure(TICKET_MISSING, db.message(), request_id)
@@ -138,23 +140,23 @@ fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
 }
 
 /// The row an upload or copy writes.
-struct Row {
-    bucket: Uuid,
-    name: String,
-    owner: Option<Uuid>,
-    size: Option<i64>,
-    content_type: String,
-    etag: Option<String>,
-    version: Uuid,
+pub(crate) struct Row {
+    pub bucket: Uuid,
+    pub name: String,
+    pub owner: Option<Uuid>,
+    pub size: Option<i64>,
+    pub content_type: String,
+    pub etag: Option<String>,
+    pub version: Uuid,
     /// The database's OID, read in the pre-check's transaction (0 until then).
-    datoid: u32,
+    pub datoid: u32,
 }
 
 const INSERT: &str = "INSERT INTO storage.objects (bucket_id, name, owner, size, content_type, etag, version_id) VALUES ($1, $2, $3, $4, $5, $6, $7)";
 const UPSERT: &str = "INSERT INTO storage.objects (bucket_id, name, owner, size, content_type, etag, version_id) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (bucket_id, name) DO UPDATE SET owner = EXCLUDED.owner, size = EXCLUDED.size, content_type = EXCLUDED.content_type, etag = EXCLUDED.etag, version_id = EXCLUDED.version_id WHERE storage.objects.version_id IS NOT DISTINCT FROM $8";
 
 /// The caller's `sub` claim as a uuid (an app user), else no owner.
-fn owner_of(data: &DataIdentity) -> Option<Uuid> {
+pub(crate) fn owner_of(data: &DataIdentity) -> Option<Uuid> {
     data.claims
         .get("sub")
         .and_then(Value::as_str)
@@ -183,6 +185,18 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         bucket: &str,
         rid: &str,
     ) -> Result<(Uuid, Option<i64>), Failure> {
+        let limits = self.limits(data, at, bucket, rid).await?;
+        Ok((limits.id, limits.file_size_limit))
+    }
+
+    /// `bucket`'s id and limits, as [`Self::bucket`] finds it.
+    pub(crate) async fn limits(
+        &self,
+        data: &DataIdentity,
+        at: &Located,
+        bucket: &str,
+        rid: &str,
+    ) -> Result<Limits, Failure> {
         // As the caller first: a bucket it can't see answers as a refusal, whether it exists.
         let (seen, _) = self
             .caller(data, at, rid, async |c, _| {
@@ -199,13 +213,46 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
             .managed(data.branch_id, &at.database, &BUCKET, &[&bucket], rid)
             .await?;
         rows.first()
-            .map(|r| (r.get(0), r.get(1)))
+            .map(|r| Limits {
+                id: r.get(0),
+                file_size_limit: r.get(1),
+                allowed_mime_types: r.get(2),
+            })
             .ok_or_else(Failure::not_allowed)
+    }
+
+    /// The destination's limits for the stored object at `key` (copy, move): 413 over its
+    /// size, 415 when its type or its first bytes aren't on the list. Nothing is written yet.
+    async fn check_existing(
+        &self,
+        limits: &Limits,
+        key: &str,
+        src: &Found,
+        rid: &str,
+    ) -> Result<(), Failure> {
+        limits.check_size(src.size.max(0) as u64)?;
+        limits.check_declared(&src.content_type)?;
+        if limits.sniffs() {
+            let head = ByteRange::From {
+                start: 0,
+                end: Some(SNIFF_BYTES as u64 - 1),
+            };
+            let got = self
+                .store
+                .get(key, names::range_for(src.size.max(0) as u64, Some(head)))
+                .await
+                .map_err(|e| Failure::from_store(&e, rid))?;
+            let head = chelabase_storage::collect(got.body)
+                .await
+                .map_err(|e| Failure::from_store(&e, rid))?;
+            limits.check_sniffed(&head[..head.len().min(SNIFF_BYTES)])?;
+        }
+        Ok(())
     }
 
     /// [`crate::engine::Engine::as_caller`] in the located database, a refusal as
     /// [`Failure::not_allowed`].
-    async fn caller<T>(
+    pub(crate) async fn caller<T>(
         &self,
         data: &DataIdentity,
         at: &Located,
@@ -221,7 +268,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     /// Pre-check (step 1): the version of the row the caller sees at the name (`None`: none),
     /// after the write with `row`'s declared values passed the policies in a rolled-back
     /// savepoint. An existing row without `upsert` is 409.
-    async fn precheck(
+    pub(crate) async fn precheck(
         &self,
         data: &DataIdentity,
         at: &Located,
@@ -286,7 +333,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     /// Steps 3 and 4 (copy: its blob is already at the version key): the ticket, then the
     /// caller's own write of `row`. `expected`: the version
     /// the pre-check saw at the name (an upsert replaces only it).
-    async fn write(
+    pub(crate) async fn write(
         &self,
         data: &DataIdentity,
         at: &Located,
@@ -449,7 +496,8 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         .engine
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
-    let (bucket_id, limit) = state.bucket(&data, &at, &bucket, &rid).await?;
+    let limits = state.limits(&data, &at, &bucket, &rid).await?;
+    let (bucket_id, limit) = (limits.id, limits.file_size_limit);
     let declared = header(&headers, header::CONTENT_LENGTH).and_then(|v| v.parse::<i64>().ok());
     if let (Some(limit), Some(declared)) = (limit, declared)
         && declared > limit
@@ -468,12 +516,25 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         version: Uuid::new_v4(),
         datoid: 0,
     };
+    limits.check_declared(&row.content_type)?;
     let (expected, datoid) = state.precheck(&data, &at, &row, upsert, &rid).await?;
     row.datoid = datoid;
+    // The body's buffer (at most one stream part) comes out of the process's cap: 503 `busy`.
+    let stream_part = chelabase_storage::STREAM_PART_SIZE as u64;
+    let _buffer = state
+        .inflight
+        .reserve(declared.map_or(stream_part, |d| (d.max(0) as u64).min(stream_part)))?;
+    let mut body = request.into_data_stream().boxed();
+    if limits.sniffs() {
+        let (head, again) = peek(body)
+            .await
+            .map_err(|e| Failure::invalid_request(format!("the request body: {e}")))?;
+        limits.check_sniffed(&head)?;
+        body = again;
+    }
     // Straight to the version's own key: random, and unreferenced until the row exists.
     let key = names::version_key(&names::object_prefix(at.database_id, datoid), row.version);
-    let (stream, counter) =
-        names::counted(request.into_data_stream(), limit.map(|l| l.max(0) as u64));
+    let (stream, counter) = names::counted(body, limit.map(|l| l.max(0) as u64));
     let meta = names::stage(
         state.store.as_ref(),
         &key,
@@ -516,8 +577,9 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         (status = 403, description = "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`: over the bucket's file size limit", body = StorageErrorEnvelope),
+        (status = 415, description = "`mime_not_allowed`: the declared type, or the type the first bytes are recognised as, isn't on the bucket's `allowed_mime_types`", body = StorageErrorEnvelope),
         (status = 502, description = "`storage_error`: the object store failed", body = StorageErrorEnvelope),
-        (status = 503, description = "`storage_unavailable`, `unavailable`", body = StorageErrorEnvelope),
+        (status = 503, description = "`storage_unavailable`, `unavailable`, `busy` (too many uploads in flight)", body = StorageErrorEnvelope),
     ),
 )]
 pub async fn upload<S: ConnSource, M: ConnSource>(
@@ -881,7 +943,7 @@ pub struct Relocate {
     params(ObjectParams),
     request_body = Relocate,
     security(("bearer" = [])),
-    responses((status = 200, description = "`version_id` of the copy", body = Value), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope)),
+    responses((status = 200, description = "`version_id` of the copy", body = Value), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing is written", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
 )]
 pub async fn copy<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -899,7 +961,14 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
         .await?;
     let (_, src) = state.find(&data, &at, &r.bucket, &r.from, &rid).await?;
     let to_bucket = r.to_bucket.as_deref().unwrap_or(&r.bucket);
-    let (bucket_id, _) = state.bucket(&data, &at, to_bucket, &rid).await?;
+    let dest = state.limits(&data, &at, to_bucket, &rid).await?;
+    let source = names::version_key(
+        &names::object_prefix(at.database_id, src.datoid),
+        src.version,
+    );
+    // The destination's limits before anything is written (413, 415).
+    state.check_existing(&dest, &source, &src, &rid).await?;
+    let bucket_id = dest.id;
     let row = Row {
         bucket: bucket_id,
         name: r.to.clone(),
@@ -913,13 +982,10 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
     let (expected, datoid) = state.precheck(&data, &at, &row, false, &rid).await?;
     let row = Row { datoid, ..row };
     // Only after the caller may read the source and write the destination: the blob is copied
-    // to the new version's key, deleted again if the row isn't written. One `CopyObject`: on
-    // AWS S3 that copies at most 5 GB, above which it needs `UploadPartCopy` (m7).
+    // to the new version's key, deleted again if the row isn't written. `CopyObject`: on
+    // AWS S3 that copies at most 5 GB; the S3 store copies a larger one in `UploadPartCopy`
+    // parts (m7).
     let key = names::version_key(&names::object_prefix(at.database_id, datoid), row.version);
-    let source = names::version_key(
-        &names::object_prefix(at.database_id, src.datoid),
-        src.version,
-    );
     let meta = state
         .store
         .copy(&source, &key)
@@ -950,7 +1016,7 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
     params(ObjectParams),
     request_body = Relocate,
     security(("bearer" = [])),
-    responses((status = 204, description = "Moved"), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Moved"), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing changes", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
 )]
 pub async fn r#move<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -967,9 +1033,18 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
     let (from_id, src) = state.find(&data, &at, &r.bucket, &r.from, &rid).await?;
-    let (to_id, _) = match r.to_bucket.as_deref() {
-        Some(b) if b != r.bucket => state.bucket(&data, &at, b, &rid).await?,
-        _ => (from_id, None),
+    let to_id = match r.to_bucket.as_deref() {
+        Some(b) if b != r.bucket => {
+            // Into another bucket: its limits hold before anything changes (413, 415).
+            let dest = state.limits(&data, &at, b, &rid).await?;
+            let key = names::version_key(
+                &names::object_prefix(at.database_id, src.datoid),
+                src.version,
+            );
+            state.check_existing(&dest, &key, &src, &rid).await?;
+            dest.id
+        }
+        _ => from_id,
     };
     const MOVE: &str = "UPDATE storage.objects SET bucket_id = $3, name = $4 WHERE bucket_id = $1 AND name = $2 AND version_id = $5";
     // A cross-bucket move changes a managed column, so it needs a ticket: minted only once the

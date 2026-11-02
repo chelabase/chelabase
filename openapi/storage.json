@@ -415,6 +415,26 @@
                 }
               }
             }
+          },
+          "413": {
+            "description": "`too_large`: over the destination bucket's limit; nothing is written",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: a type the destination bucket doesn't allow",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [
@@ -559,6 +579,26 @@
           },
           "409": {
             "description": "The destination exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the destination bucket's limit; nothing changes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: a type the destination bucket doesn't allow",
             "content": {
               "application/json": {
                 "schema": {
@@ -1467,6 +1507,16 @@
               }
             }
           },
+          "415": {
+            "description": "`mime_not_allowed`: the declared type, or the type the first bytes are recognised as, isn't on the bucket's `allowed_mime_types`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "502": {
             "description": "`storage_error`: the object store failed",
             "content": {
@@ -1478,7 +1528,7 @@
             }
           },
           "503": {
-            "description": "`storage_unavailable`, `unavailable`",
+            "description": "`storage_unavailable`, `unavailable`, `busy` (too many uploads in flight)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1623,6 +1673,459 @@
           },
           "404": {
             "description": "Missing or hidden"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "The parts received",
+        "operationId": "listParts",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`bucket`, `name`, `expires_at`, `parts` (`part_number`, `size`, `etag`)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Abort a resumable upload",
+        "operationId": "abortUpload",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Aborted: its parts are gone"
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}/complete": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Complete a resumable upload",
+        "description": "Parts 1 to n with none missing make the object, atomically: the total is held to the bucket's current `file_size_limit`, and the caller's policies on `storage.objects` decide again before and as the row is written. A refusal (403, 413, 415) aborts the upload.",
+        "operationId": "completeUpload",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored: `bucket`, `name`, `version_id`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`: the policies no longer allow it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/session/{session}/{part}": {
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload one part",
+        "description": "Part numbers are 1 to 10000; a part is 5 MiB to 100 MiB, but the last may be smaller. Sending a part again replaces it. Its bytes are counted as they arrive and held to the bucket's `file_size_limit` less the other parts'. Part 1's first bytes must be a type the bucket allows.",
+        "operationId": "uploadPart",
+        "parameters": [
+          {
+            "name": "session",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "part",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`part_number`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "`upload_not_found`: missing, finished, or another caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "410": {
+            "description": "`upload_expired`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over 100 MiB or the bucket's limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`busy`: too many uploads in flight; `storage_unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/upload/{bucket}/{*name}": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Start a resumable upload",
+        "description": "Checks the declared `Content-Type` against the bucket's `allowed_mime_types` and the caller's INSERT (or, with `upsert`, its UPDATE) policies on `storage.objects`, then opens a session for 24 hours. Upload parts of 5 MiB to 100 MiB (the last may be smaller), then complete it. The body is empty.",
+        "operationId": "createUpload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The object's name, as for an upload",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "`id` (the session), `bucket`, `name`, `expires_at` (Unix seconds), `min_part_size`, `max_part_size`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "403": {
+            "description": "`not_allowed`: no policy allows the write, or the caller can't see the bucket",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name is taken (no upsert)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
           }
         },
         "security": [

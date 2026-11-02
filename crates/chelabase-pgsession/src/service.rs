@@ -123,6 +123,11 @@ impl NamedStatement {
     pub fn name(&self) -> &'static str {
         self.name
     }
+
+    /// The statement's text (callers' tests check what it matches on).
+    pub fn sql(&self) -> &'static str {
+        self.sql
+    }
 }
 
 const fn lower(b: u8) -> u8 {

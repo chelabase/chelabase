@@ -40,9 +40,9 @@ fn check_name(name: &str) -> Result<(), Failure> {
 }
 
 /// Literal segments the storage routes use where a bucket name goes (`/object/list/…`,
-/// `/object/copy`, …, and the ones later milestones add): never a bucket's name.
-pub const RESERVED_BUCKET_NAMES: [&str; 7] = [
-    "list", "copy", "move", "sign", "public", "upload", "resolve",
+/// `/object/copy`, `/upload/session/…`, …, and the ones later milestones add): never a bucket's name.
+pub const RESERVED_BUCKET_NAMES: [&str; 8] = [
+    "list", "copy", "move", "sign", "public", "upload", "resolve", "session",
 ];
 
 /// A bucket's new name (create, rename): valid and not reserved.
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn route_segments_are_reserved_bucket_names() {
         for name in [
-            "list", "copy", "move", "sign", "public", "upload", "resolve",
+            "list", "copy", "move", "sign", "public", "upload", "resolve", "session",
         ] {
             let err = check_new_name(name).unwrap_err();
             assert_eq!(
@@ -331,7 +331,7 @@ mod tests {
             .iter()
             .filter(|e| e.service == chelabase_routes::Service::Storage)
         {
-            for base in ["/storage/v1/object/", "/storage/v1/bucket/"] {
+            for base in ["/storage/v1/object/", "/storage/v1/bucket/", "/storage/v1/upload/"] {
                 if let Some(rest) = ep.path.strip_prefix(base) {
                     let first = rest.split('/').next().unwrap();
                     if !first.starts_with('{') {

@@ -18,6 +18,8 @@ anyhow = { workspace = true }
 # Signed URLs: their tokens (HMAC-SHA256) and the orchestrator's URL routes.
 base64 = { workspace = true }
 hmac = { workspace = true }
+# Sniffing an upload's type for a bucket's `allowed_mime_types`.
+infer = { workspace = true }
 sha2 = { workspace = true }
 chelabase-http = { workspace = true }
 chrono = { workspace = true }
@@ -45,6 +47,7 @@ utoipa-axum = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+proptest = { workspace = true }
 chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-pgsession = { workspace = true, features = ["test-support"] }
 # The OpenAPI document's registry test.

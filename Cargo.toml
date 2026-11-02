@@ -77,6 +77,9 @@ bollard = "0.21.1"
 futures-util = "0.3.34"
 rand = "0.10.3"
 proptest = "1.11.0"
+# Upload type sniffing (file signatures, WHATWG HTML/XML); no `std`: it only adds the
+# old-Office `cfb` parser, which nothing here needs.
+infer = { version = "0.22.0", default-features = false }
 # One crypto backend for the whole workspace: jsonwebtoken panics at runtime if both
 # `aws_lc_rs` and `rust_crypto` end up enabled in one binary.
 jsonwebtoken = { version = "11.1.0", features = ["aws_lc_rs"] }

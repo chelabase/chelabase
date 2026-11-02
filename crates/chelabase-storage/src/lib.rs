@@ -14,8 +14,9 @@ pub use config::{Backend, ConfigError, CredentialSource, StorageConfig};
 pub use memory::MemoryStore;
 pub use s3::S3Store;
 pub use store::{
-    ByteRange, ByteStream, CompletedPart, DatedObject, GetObject, ObjectMeta, ObjectStore, OpenUpload, PutOptions,
-    STREAM_PART_SIZE, StorageError, collect,
+    ByteRange, ByteStream, COPY_OBJECT_MAX, COPY_PART_SIZE, CompletedPart, DatedObject,
+    GetObject, ObjectMeta, ObjectStore, OpenUpload, PutOptions, STREAM_PART_SIZE, StorageError,
+    collect, copy_in_parts,
 };
 
 /// The longest a signed download URL may live (object-storage m6). It pins an object's
