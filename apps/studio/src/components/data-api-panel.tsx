@@ -44,6 +44,8 @@ export function useDataApi(databaseId: string, branchId: string, pgDatabase: str
   const [rotateError, setRotateError] = useState<string | null>(null);
   const keys = keyList.data ?? null;
   const schema = pickedDb?.data_api === "on" ? (schemaQuery.data ?? null) : null;
+  // Still finding out what the RLS check says: the databases, or a served one's schema, are loading.
+  const schemaLoading = (databases === null && !dbList.error) || (pickedDb?.data_api === "on" && schemaQuery.isPending);
   // Each section shows the failure it depends on: the keys' (endpoint, secret keys), the databases' (exposure), a rotate's (endpoint).
   const keysError = keyList.error ? errorText(keyList.error) : null;
   const dbError = dbList.error ? errorText(dbList.error) : null;
@@ -72,7 +74,7 @@ export function useDataApi(databaseId: string, branchId: string, pgDatabase: str
     }
   }
 
-  return { databaseId, branchId, keys, databases, pickedDb, schema, keysError, dbError, rotateError, schemaError, publicKey, rotating, setRotating, busy, rotatePublic };
+  return { databaseId, branchId, keys, databases, pickedDb, schema, schemaLoading, keysError, dbError, rotateError, schemaError, publicKey, rotating, setRotating, busy, rotatePublic };
 }
 
 export type DataApi = ReturnType<typeof useDataApi>;
