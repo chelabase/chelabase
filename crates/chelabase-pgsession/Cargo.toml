@@ -11,6 +11,8 @@ chelabase-auth = { workspace = true }
 chelabase-http = { workspace = true }
 # `Lease`, `QueryClient`, the compute TLS (`ServerTls`) and the session's transaction.
 chelabase-query = { workspace = true }
+# The console cell read's catalog query (`RoleSession::table_json`).
+chelabase-schema = { workspace = true }
 chelabase-types = { workspace = true }
 deadpool-postgres = { workspace = true }
 moka = { workspace = true }

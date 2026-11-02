@@ -12,9 +12,8 @@
 use std::sync::Arc;
 
 use chelabase_auth::internal::DataIdentity;
-use chelabase_query::engine::{self, QueryCache, with_transaction};
+use chelabase_query::engine::{self, QueryCache};
 use chelabase_query::schema::{RoleView, Schema, Visibility};
-use chelabase_query::QueryClient;
 use chelabase_schema::catalog;
 use chelabase_schema::cell::{
     CELL_STATEMENT_TIMEOUT_MS, KEY_TYPE_SQL, cell_query, decode_cell, primary_key,
@@ -26,12 +25,11 @@ use chelabase_types::table_api::{CellValue, ConsoleCellRequest, cell_failure};
 use serde_json::Value;
 use tokio_postgres::error::ErrorPosition;
 use tokio_postgres::types::{ToSql, Type};
-use tokio_postgres::SimpleQueryMessage;
 use uuid::Uuid;
 
 use crate::conn::owner_level::{self, OwnerLevelCache, RoleRefused, owner_level_cache};
 use crate::conn::{
-    AcquireError, ConnError, ConnInfo, ConnSource, Pools, RESET_SQL, RoleSession, ServedDatabase,
+    AcquireError, ConnError, ConnInfo, ConnSource, Pools, RoleSession, ServedDatabase,
 };
 use crate::error::ApiError;
 
@@ -39,13 +37,14 @@ use crate::error::ApiError;
 use chelabase_query::engine::SchemaKey;
 pub use chelabase_query::engine::{DEFAULT_MAX_RESPONSE_BYTES, SCHEMA_CACHE};
 
-/// [`owner_level::fetch_owner_level`], its failure as the API's.
-async fn fetch_owner_level<C: QueryClient + ?Sized>(
-    client: &C,
+/// The session's owner-level check ([`RoleSession::owner_level`]), its failure as the API's.
+async fn fetch_owner_level(
+    session: &RoleSession,
     role: &str,
     request_id: &str,
 ) -> Result<Option<bool>, ApiError> {
-    owner_level::fetch_owner_level(client, role, request_id)
+    session
+        .owner_level(role, request_id)
         .await
         .map_err(|e| ApiError::from_pg(&e, request_id))
 }
@@ -404,12 +403,12 @@ impl<S: ConnSource> Engine<S> {
     /// The owner-level check (cached), before the request's transaction.
     async fn check_owner_level(
         &self,
-        client: &(impl QueryClient + ?Sized),
+        session: &RoleSession,
         data: &DataIdentity,
         request_id: &str,
     ) -> Result<(), ApiError> {
         ensure_not_owner_level(&self.owner_level, data, || {
-            fetch_owner_level(client, &data.role, request_id)
+            fetch_owner_level(session, &data.role, request_id)
         })
         .await
     }
@@ -417,17 +416,17 @@ impl<S: ConnSource> Engine<S> {
     /// The check a request on `branch` passes before its transaction.
     async fn guard(
         &self,
-        client: &(impl QueryClient + ?Sized),
+        session: &RoleSession,
         branch: Uuid,
         guard: Guard<'_>,
         request_id: &str,
     ) -> Result<(), ApiError> {
         match guard {
             Guard::None => Ok(()),
-            Guard::Key(data) => self.check_owner_level(client, data, request_id).await,
+            Guard::Key(data) => self.check_owner_level(session, data, request_id).await,
             Guard::Console(role) => {
                 ensure_console_role(&self.owner_level, branch, role, || {
-                    fetch_owner_level(client, role, request_id)
+                    fetch_owner_level(session, role, request_id)
                 })
                 .await
             }
@@ -513,29 +512,15 @@ impl<S: ConnSource> Engine<S> {
         request: &ConsoleCellRequest,
         request_id: &str,
     ) -> Result<CellValue, CellError> {
-        let lease = session.lease();
-        self.guard(lease, branch, Guard::Console(&request.role), request_id)
+        self.guard(session, branch, Guard::Console(&request.role), request_id)
             .await?;
         // The table's model is its own transaction (`BEGIN … COMMIT`), so it is read before the
         // session's, under the cell read's statement timeout; the catalog is readable by every
         // role.
-        let client = lease.client();
-        client
-            .simple_query(&format!(
-                "SET statement_timeout = {CELL_STATEMENT_TIMEOUT_MS}"
-            ))
+        let json = session
+            .table_json(&request.schema, &request.table, CELL_STATEMENT_TIMEOUT_MS)
             .await
             .map_err(|e| Read::pg(&e, request_id))?;
-        let json = client
-            .simple_query(&catalog::table_sql(&request.schema, &request.table))
-            .await
-            .map_err(|e| Read::pg(&e, request_id))?
-            .iter()
-            .find_map(|m| match m {
-                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
-                _ => None,
-            })
-            .unwrap_or_default();
         let mut model = match catalog::parse_table(&json) {
             Ok(Some(model)) => model,
             Ok(None) => {
@@ -551,10 +536,9 @@ impl<S: ConnSource> Engine<S> {
         let mut settings = session.settings(served);
         settings.statement_timeout_ms =
             i64::try_from(CELL_STATEMENT_TIMEOUT_MS).unwrap_or(i64::MAX);
-        let answer = engine::console_session(
-            lease,
+        let answer = session
+            .transaction(
             &served.name,
-            session.run_as(),
             &settings,
             request_id,
             // An in-database failure is the answer, not the session's: the read-only
@@ -565,16 +549,16 @@ impl<S: ConnSource> Engine<S> {
                 Err(Read::Cell(e)) => Ok(Err(e)),
                 Err(Read::Query(f)) => Err(f),
             },
-        )
-        .await
-        .map_err(Failure::from)?;
+            )
+            .await
+            .map_err(Failure::from)?;
         Ok(answer?)
     }
 
     /// Runs `op` in `database` as `data`'s role, in one transaction. `console`: the role
     /// must also exist.
     ///
-    /// The connection is leased ([`Lease`]): it goes back to the pool only when the owner
+    /// The connection is leased ([`chelabase_query::Lease`]): it goes back to the pool only when the owner
     /// check and the request both ran to the end (an answer, an error included) and the
     /// session was reset; a cancelled request's connection is closed.
     async fn run(
@@ -593,16 +577,14 @@ impl<S: ConnSource> Engine<S> {
             Guard::Key(data)
         };
         conn.with_role_session(&data.role, &data.claims, guard.role_oid(), async |session| {
-            let lease = session.lease();
-            self.guard(lease, branch, guard, request_id)
+            self.guard(session, branch, guard, request_id)
                 .await?;
             // `run` sends `[ROLLBACK;] BEGIN; RESET_SQL`, `COMMIT` and `RESET_SQL` itself.
             Ok::<_, Failure>(
-                chelabase_query::run(
-                    lease,
+                session
+                    .run(
                     &self.cache,
                     (branch, &database.name),
-                    session.run_as(),
                     &session.settings(database),
                     self.max_response_bytes,
                     op,
@@ -707,27 +689,24 @@ impl<S: ConnSource> Engine<S> {
         let claims = Value::Object(Default::default());
         let out = conn
             .with_role_session(role, &claims, guard.role_oid(), async |session| {
-                let lease = session.lease();
-                self.guard(lease, branch, guard, request_id)
+                self.guard(session, branch, guard, request_id)
                     .await?;
                 Ok::<_, Failure>(
-                    with_transaction(lease, RESET_SQL, request_id, async |client| {
-                        let (schema, _, _) = chelabase_query::load_schema(
-                            client,
+                    session
+                        .schema(
                             &self.cache,
                             (branch, &database.name),
-                            session.run_as(),
                             info.settings.statement_timeout_ms,
                             request_id,
+                            async |client, schema| {
+                                let mut views = Vec::new();
+                                for r in roles {
+                                    views.push(engine::view(client, schema, r, request_id).await?);
+                                }
+                                Ok(views)
+                            },
                         )
-                        .await?;
-                        let mut views = Vec::new();
-                        for r in roles {
-                            views.push(engine::view(client, &schema, r, request_id).await?);
-                        }
-                        Ok((schema, views))
-                    })
-                    .await?,
+                        .await?,
                 )
             })
             .await;

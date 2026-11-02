@@ -348,22 +348,24 @@ struct DbPool {
 impl DbPool {
     #[cfg(test)]
     fn new(info: Arc<ConnInfo>, config: tokio_postgres::Config, max_size: usize) -> Self {
-        Self::with_connector(info, config, max_size, None)
+        Self::with_connector(info, config, max_size, None, None)
     }
 
     /// A pool whose connections use `connector` (TLS verified against the platform CA), or
-    /// none (plain: the fakes).
+    /// none (plain: the fakes). `service_login`: each connection must pass
+    /// [`SERVICE_LOGIN_SQL`] as that role before it's pooled (the managed pool).
     fn with_connector(
         info: Arc<ConnInfo>,
         config: tokio_postgres::Config,
         max_size: usize,
         connector: Option<MakeRustlsConnect>,
+        service_login: Option<String>,
     ) -> Self {
         DbPool {
             info,
             #[cfg(test)]
             config: config.clone(),
-            pool: build_pool_with(config, max_size, connector),
+            pool: build_pool_with(config, max_size, connector, service_login),
             last_used: std::sync::Mutex::new(tokio::time::Instant::now()),
             opening: AtomicUsize::new(0),
         }
@@ -449,7 +451,40 @@ fn connect_config(
 /// A plain pool ([`build_pool_with`] without a connector).
 #[cfg(test)]
 fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Pool {
-    build_pool_with(config, max_size, None)
+    build_pool_with(config, max_size, None, None)
+}
+
+/// Whether the connection is a bare service login, `$1`: logged in as it, no superuser, no
+/// `CREATEROLE`, no members and a member of nothing (directly or not), so it can't take on
+/// any other role.
+pub const SERVICE_LOGIN_SQL: &str = "SELECT session_user::pg_catalog.text OPERATOR(pg_catalog.=) $1 \
+     AND current_user::pg_catalog.text OPERATOR(pg_catalog.=) $1 \
+     AND NOT r.rolsuper AND NOT r.rolcreaterole \
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m \
+         WHERE m.member OPERATOR(pg_catalog.=) r.oid OR m.roleid OPERATOR(pg_catalog.=) r.oid) \
+     AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles o WHERE o.oid OPERATOR(pg_catalog.<>) r.oid \
+         AND pg_catalog.pg_has_role(r.oid, o.oid, 'MEMBER')) \
+     FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) session_user";
+
+/// The `post_create` hook that refuses a connection unless it's the bare service login
+/// `user` ([`SERVICE_LOGIN_SQL`]).
+fn service_login_hook(user: String) -> deadpool_postgres::Hook {
+    deadpool_postgres::Hook::async_fn(move |client, _| {
+        let user = user.clone();
+        Box::pin(async move {
+            let row = client
+                .query_one(SERVICE_LOGIN_SQL, &[&user])
+                .await
+                .map_err(deadpool_postgres::HookError::Backend)?;
+            if row.get::<_, Option<bool>>(0) == Some(true) {
+                Ok(())
+            } else {
+                Err(deadpool_postgres::HookError::message(format!(
+                    "the managed pool's login isn't the bare service role {user}"
+                )))
+            }
+        })
+    })
 }
 
 /// A pool of up to `max_size` connections opened with `config`: TLS through `connector`
@@ -461,6 +496,7 @@ fn build_pool_with(
     config: tokio_postgres::Config,
     max_size: usize,
     connector: Option<MakeRustlsConnect>,
+    service_login: Option<String>,
 ) -> Pool {
     let manager_config = ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
@@ -469,10 +505,14 @@ fn build_pool_with(
         Some(connector) => Manager::from_config(config, connector, manager_config),
         None => Manager::from_config(config, tokio_postgres::NoTls, manager_config),
     };
-    Pool::builder(manager)
+    let mut builder = Pool::builder(manager)
         .max_size(max_size)
         .runtime(Runtime::Tokio1)
-        .wait_timeout(Some(ACQUIRE_TIMEOUT))
+        .wait_timeout(Some(ACQUIRE_TIMEOUT));
+    if let Some(user) = service_login {
+        builder = builder.post_create(service_login_hook(user));
+    }
+    builder
         .build()
         .expect("a pool with a runtime")
 }
@@ -647,6 +687,10 @@ pub struct Pools<S> {
     service: Service,
     /// How many connections to each branch they may hold open.
     budget: Budget,
+    /// The managed pool's ([`Self::sharing_budget`]): each connection is checked as the bare
+    /// service login and starts with `search_path = pg_catalog, pg_temp`; the shared slots
+    /// are sized by the role pools' info only.
+    managed: bool,
 }
 
 /// Failing to open a connection, before any statement: worth a fresh look at where the
@@ -697,6 +741,7 @@ impl<S: ConnSource> Pools<S> {
             server_tls: None,
             service: Service::Rest,
             budget: data_api_budget,
+            managed: false,
         }
     }
 
@@ -728,6 +773,7 @@ impl<S: ConnSource> Pools<S> {
             server_tls: self.server_tls.clone(),
             service: self.service,
             budget: self.budget,
+            managed: true,
             ..Pools::new(source, 0)
         }
     }
@@ -777,7 +823,7 @@ impl<S: ConnSource> Pools<S> {
     }
 
     /// The pool of `database` for `info`, rebuilt when the branch's address, credentials or
-    /// size changed.
+    /// `max_connections` changed, resized when only the service's budget did.
     async fn pool(
         &self,
         branch: Uuid,
@@ -789,15 +835,23 @@ impl<S: ConnSource> Pools<S> {
             && p.info.same_server(info)
             && !p.pool.is_closed()
         {
+            let size = (self.budget)(info).max(1) as usize;
+            if p.pool.status().max_size != size {
+                p.pool.resize(size);
+            }
             return Ok(p);
         }
-        let (config, connector) =
+        let (mut config, connector) =
             connect_config(info, database, self.server_tls.as_ref(), self.service)?;
+        if self.managed {
+            config.options("-c search_path=pg_catalog,pg_temp");
+        }
         let p = Arc::new(DbPool::with_connector(
             info.clone(),
             config,
             (self.budget)(info).max(1) as usize,
             connector,
+            self.managed.then(|| info.user.clone()),
         ));
         self.pools.insert(key, p.clone()).await;
         Ok(p)
@@ -811,7 +865,10 @@ impl<S: ConnSource> Pools<S> {
             .slots
             .get_with(branch, async { Arc::new(BranchSlots::new(size)) })
             .await;
-        slots.resize(size);
+        // The managed pool shares its role pools' slots; one info source sizes them.
+        if !self.managed {
+            slots.resize(size);
+        }
         slots
     }
 
@@ -1491,6 +1548,41 @@ mod tests {
         let open = fake.open.load(Ordering::SeqCst);
         assert!(open <= 7, "{open} connections open for budgets of 5 and 2");
         drop(held);
+    }
+
+    /// A service's budget that changes while `max_connections` doesn't still resizes its
+    /// pools: grown from 1 to 3, three connections open.
+    #[tokio::test]
+    async fn a_grown_budget_resizes_the_pool() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static BUDGET: AtomicU32 = AtomicU32::new(1);
+        fn budget(_: &ConnInfo) -> u32 {
+            BUDGET.load(Ordering::SeqCst)
+        }
+        struct At(u16);
+        impl ConnSource for At {
+            async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
+                let mut info = super::test_support::two_databases();
+                info.port = self.0;
+                Ok(info)
+            }
+        }
+        let fake = super::test_support::fake_pg(super::test_support::Answer::Ready).await;
+        let pools = Pools::new(At(fake.port), 100).for_service(Service::Storage, budget);
+        let branch = Uuid::new_v4();
+        let first = pools.acquire(branch, "main").await.unwrap();
+        BUDGET.store(3, Ordering::SeqCst);
+        let mut held = vec![first];
+        for n in 2..=3 {
+            let next = tokio::time::timeout(Duration::from_secs(3), pools.acquire(branch, "main"))
+                .await
+                .map(|r| r.map_err(|e| e.to_string()));
+            match next {
+                Ok(Ok(conn)) => held.push(conn),
+                other => panic!("budget 3, connection {n} refused: {:?}", other.map(|r| r.map(|_| ()))),
+            }
+        }
+        assert_eq!(held.len(), 3);
     }
 
     /// A new `max_connections` resizes the branch's one semaphore: permits held across the

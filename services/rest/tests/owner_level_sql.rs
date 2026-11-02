@@ -36,7 +36,7 @@ fn rest_imports_it_from_chelabase_query_roles() {
         "the owner-level check doesn't take OWNER_LEVEL_SQL from chelabase_query::roles"
     );
     assert!(
-        EXEC.contains("owner_level::fetch_owner_level"),
+        EXEC.contains(".owner_level(role, request_id)"),
         "exec.rs doesn't ask through chelabase_pgsession's owner-level check"
     );
 }
