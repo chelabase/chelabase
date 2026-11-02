@@ -4105,6 +4105,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         enabling_seen: Mutex::default(),
         recreate_backoff: Mutex::default(),
         zitadel: None,
+        identity: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),
         identity_sweep_every: Duration::from_secs(600),

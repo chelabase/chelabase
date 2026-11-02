@@ -25,6 +25,7 @@ chelabase-nats = { workspace = true }
 chelabase-schema = { workspace = true }
 chelabase-types = { workspace = true }
 chelabase-zitadel = { workspace = true }
+chelabase-identity = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
@@ -53,4 +54,5 @@ base64 = { workspace = true }
 proptest = { workspace = true }
 chelabase-neon = { workspace = true, features = ["fake"] }
 chelabase-zitadel = { workspace = true, features = ["mock"] }
+chelabase-identity = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }

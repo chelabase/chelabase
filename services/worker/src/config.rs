@@ -70,6 +70,11 @@ pub struct WorkerConfig {
     /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
     /// session deletes). Read by [`build`].
     pub zitadel_admin_pat_file: Option<PathBuf>,
+    /// `CHELABASE_IDENTITY_URL`: the identity service (app-user pools and users). Read with
+    /// [`Self::identity_token_file`] by [`identity_client`].
+    pub identity_url: Option<String>,
+    /// `CHELABASE_IDENTITY_TOKEN_FILE`: the worker's bearer for the identity service.
+    pub identity_token_file: Option<PathBuf>,
     /// `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300, 30 to 86,400).
     pub app_users_reconcile_every: Duration,
     /// `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (default 300, 30 to 86,400): how often every branch's
@@ -169,6 +174,9 @@ impl WorkerConfig {
             zitadel_issuer,
             zitadel_at,
             zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+                .map(PathBuf::from),
+            identity_url: non_blank(&get, "CHELABASE_IDENTITY_URL"),
+            identity_token_file: non_blank(&get, "CHELABASE_IDENTITY_TOKEN_FILE")
                 .map(PathBuf::from),
             app_users_reconcile_every: reconcile_every(
                 "CHELABASE_APP_USERS_RECONCILE_SECS",
@@ -363,6 +371,25 @@ pub fn check_control_plane_uri(uri: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The identity service's client, when both settings are given and the token file reads;
+/// otherwise `None` (logged), and app users and project delete jobs fail and are retried until
+/// it's configured.
+pub fn identity_client(config: &WorkerConfig) -> Option<chelabase_identity::Identity> {
+    let (Some(url), Some(file)) = (&config.identity_url, &config.identity_token_file) else {
+        tracing::warn!(
+            "CHELABASE_IDENTITY_URL or CHELABASE_IDENTITY_TOKEN_FILE is unset: app users and project delete jobs wait until both are set"
+        );
+        return None;
+    };
+    match chelabase_identity::Identity::from_token_file(url, file) {
+        Ok(identity) => Some(identity),
+        Err(e) => {
+            tracing::warn!("{e}; app users and project delete jobs wait until it's readable");
+            None
+        }
+    }
+}
+
 /// Zitadel with the admin PAT, when both settings are given and the file reads; otherwise
 /// `None` (logged), and app users jobs fail and are retried until it's configured.
 pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client::Zitadel> {
@@ -529,6 +556,7 @@ pub fn build_with(
         enabling_seen: Default::default(),
         recreate_backoff: Default::default(),
         zitadel: zitadel_client(config),
+        identity: identity_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,
         identity_sweep_every: config.identity_sweep_every,
@@ -715,8 +743,12 @@ mod tests {
             .iter()
             .flat_map(|(var, _)| [var.to_string(), format!("{var}_FILE")])
             .collect();
+        // The identity service's token is a file the stack mounts and has no default at all
+        // (unset, the client is absent and its jobs wait; checked below).
+        let no_default = ["CHELABASE_IDENTITY_TOKEN_FILE"];
         let bearers: Vec<&String> = asked
             .iter()
+            .filter(|n| !no_default.contains(&n.as_str()))
             .filter(|n| {
                 real.contains(n)
                     || ["_TOKEN", "_TOKEN_FILE", "_SECRET", "_SECRET_FILE", "_BEARER", "_BEARER_FILE"]
@@ -746,6 +778,8 @@ mod tests {
             zitadel_issuer: _,
             zitadel_at: _,
             zitadel_admin_pat_file,
+            identity_url: _,
+            identity_token_file,
             app_users_reconcile_every: _,
             member_roles_sweep_every: _,
             identity_sweep_every: _,
@@ -760,8 +794,13 @@ mod tests {
             realtime_pg_password_file,
         } = c;
         assert_eq!(
-            (valkey_password_file, zitadel_admin_pat_file, realtime_pg_password_file),
-            (None, None, None),
+            (
+                valkey_password_file,
+                zitadel_admin_pat_file,
+                identity_token_file,
+                realtime_pg_password_file
+            ),
+            (None, None, None, None),
             "unset, a credential file is absent, never a default"
         );
     }
@@ -1075,6 +1114,30 @@ mod tests {
     }
 
     /// Both settings and a readable file give a client; anything less gives none.
+    #[test]
+    fn identity_client_needs_url_and_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
+        assert!(identity_client(&c).is_none());
+        let token = dir.path().join("worker-identity.token");
+        let c2 = WorkerConfig::from_lookup(lookup(&[
+            IMAGE,
+            ("CHELABASE_IDENTITY_URL", "http://identity:8080"),
+            ("CHELABASE_IDENTITY_TOKEN_FILE", token.to_str().unwrap()),
+        ]))
+        .unwrap();
+        assert_eq!(c2.identity_url.as_deref(), Some("http://identity:8080"));
+        assert_eq!(c2.identity_token_file.as_deref(), Some(token.as_path()));
+        // Missing, then empty: no client.
+        assert!(identity_client(&c2).is_none());
+        std::fs::write(&token, " \n").unwrap();
+        assert!(identity_client(&c2).is_none());
+        std::fs::write(&token, "secret\n").unwrap();
+        assert!(identity_client(&c2).is_some());
+        c.identity_token_file = Some(token);
+        assert!(identity_client(&c).is_none(), "the URL is needed too");
+    }
+
     #[test]
     fn zitadel_client_needs_issuer_and_pat_file() {
         let dir = tempfile::tempdir().unwrap();

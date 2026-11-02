@@ -5841,6 +5841,7 @@ dependencies = [
  "bollard",
  "chelabase-auth",
  "chelabase-http",
+ "chelabase-identity",
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
