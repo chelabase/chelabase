@@ -3,9 +3,10 @@
 //! Connection info comes from the orchestrator's internal listener and is cached 60 s (or
 //! until [`Pools::invalidate`]). Each served database of a branch gets its own
 //! deadpool-postgres pool (dropped after 5 minutes unused); every pool of a branch waits on
-//! one set of branch slots (`max_connections`), and one global semaphore caps connections
-//! across every branch. Open connections, idle ones included, stay within `max_connections`
-//! per branch too: before a pool may open one, idle connections of the branch's other pools
+//! one set of branch slots (the service's share of `max_connections`: [`Settings::share`],
+//! so the services together stay within it), and one global semaphore caps connections
+//! across every branch. Open connections, idle ones included, stay within that share per
+//! branch too: before a pool may open one, idle connections of the branch's other pools
 //! are closed, least recently used pool first and oldest connection first
 //! ([`idle_to_close`], [`oldest_first`]). A reaper closes connections idle past
 //! [`CONNECTION_IDLE`]. A connection that fails to open (the compute moved after a reset or
@@ -70,6 +71,43 @@ pub struct Settings {
     pub max_connections: u32,
 }
 
+/// A service that opens connections to a branch's compute. Each has its own share of the
+/// branch's `max_connections` ([`Settings::share`]), so together they never open more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Service {
+    /// The data API (rest).
+    Rest,
+    /// Object storage: its role sessions and its managed pool together.
+    Storage,
+}
+
+impl Service {
+    /// Every service that shares a branch's connections.
+    pub const ALL: [Service; 2] = [Service::Rest, Service::Storage];
+
+    /// The `application_name` its connections open with.
+    pub fn application_name(self) -> &'static str {
+        match self {
+            Service::Rest => "chelabase-rest",
+            Service::Storage => "chelabase-storage",
+        }
+    }
+}
+
+impl Settings {
+    /// How many of the branch's `max_connections` (at least 1) `service` may hold open:
+    /// storage a fifth, rounded up, from 2 on (none below: a one-connection branch is the
+    /// data API's), rest the rest. The shares add up to `max_connections`.
+    pub fn share(&self, service: Service) -> u32 {
+        let max = self.max_connections.max(1);
+        let storage = if max >= 2 { max.div_ceil(5) } else { 0 };
+        match service {
+            Service::Rest => max - storage,
+            Service::Storage => storage,
+        }
+    }
+}
+
 /// A database the branch's data API serves.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServedDatabase {
@@ -98,6 +136,11 @@ pub struct ConnInfo {
 }
 
 impl ConnInfo {
+    /// `service`'s share of the branch's connections ([`Settings::share`]).
+    pub fn share(&self, service: Service) -> u32 {
+        self.settings.share(service)
+    }
+
     /// The served database named `name`.
     pub fn served(&self, name: &str) -> Option<&ServedDatabase> {
         self.databases.iter().find(|d| d.name == name)
@@ -372,21 +415,21 @@ impl Drop for Opening<'_> {
 }
 
 /// How a pool for `database` of `info` connects, plain (`host` dialled as given).
-fn pg_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
-    let mut config = base_config(info, database);
+fn pg_config(info: &ConnInfo, database: &str, service: Service) -> tokio_postgres::Config {
+    let mut config = base_config(info, database, service);
     config.host(&info.host);
     config
 }
 
 /// Everything but where: the caller sets the host (plain) or the TLS target.
-fn base_config(info: &ConnInfo, database: &str) -> tokio_postgres::Config {
+fn base_config(info: &ConnInfo, database: &str, service: Service) -> tokio_postgres::Config {
     let mut config = tokio_postgres::Config::new();
     config
         .port(info.port)
         .user(&info.user)
         .password(&info.password)
         .dbname(database)
-        .application_name("chelabase-rest")
+        .application_name(service.application_name())
         .connect_timeout(CONNECT_TIMEOUT);
     config
 }
@@ -398,10 +441,11 @@ fn connect_config(
     info: &ConnInfo,
     database: &str,
     server_tls: Option<&ServerTls>,
+    service: Service,
 ) -> Result<(tokio_postgres::Config, Option<MakeRustlsConnect>), ConnError> {
     match (&info.server_name, server_tls) {
         (Some(name), Some(tls)) => {
-            let mut config = base_config(info, database);
+            let mut config = base_config(info, database, service);
             tls.configure(&mut config, &info.host, name)
                 .map_err(|e| ConnError::Unreachable(format!("compute TLS: {e}")))?;
             Ok((config, Some(tls.connector())))
@@ -412,7 +456,7 @@ fn connect_config(
         (None, Some(_)) => Err(ConnError::Unreachable(
             "no certificate name to verify the compute's TLS against".into(),
         )),
-        (None, None) => Ok((pg_config(info, database), None)),
+        (None, None) => Ok((pg_config(info, database, service), None)),
     }
 }
 
@@ -613,6 +657,8 @@ pub struct Pools<S> {
     permits: Arc<Semaphore>,
     /// The platform CA computes are verified against (U15); `None` only for the fakes.
     server_tls: Option<ServerTls>,
+    /// Whose share of each branch's connections the pools stay within.
+    service: Service,
 }
 
 /// Failing to open a connection, before any statement: worth a fresh look at where the
@@ -661,7 +707,15 @@ impl<S: ConnSource> Pools<S> {
                 .build(),
             permits: Arc::new(Semaphore::new(max_connections)),
             server_tls: None,
+            service: Service::Rest,
         }
+    }
+
+    /// The pools as `service`'s (rest's by default): each branch's connections stay within
+    /// its share, and they open with its `application_name`.
+    pub fn for_service(mut self, service: Service) -> Self {
+        self.service = service;
+        self
     }
 
     /// Like [`Self::new`], verifying every compute against `server_tls` (U15): the service's
@@ -732,20 +786,22 @@ impl<S: ConnSource> Pools<S> {
         {
             return Ok(p);
         }
-        let (config, connector) = connect_config(info, database, self.server_tls.as_ref())?;
+        let (config, connector) =
+            connect_config(info, database, self.server_tls.as_ref(), self.service)?;
         let p = Arc::new(DbPool::with_connector(
             info.clone(),
             config,
-            info.settings.max_connections.max(1) as usize,
+            info.share(self.service).max(1) as usize,
             connector,
         ));
         self.pools.insert(key, p.clone()).await;
         Ok(p)
     }
 
-    /// The branch's slots and pools, resized in place when `max_connections` changed.
+    /// The branch's slots and pools, resized in place when `max_connections` changed: the
+    /// service's share of them.
     async fn branch(&self, branch: Uuid, info: &ConnInfo) -> Arc<BranchSlots> {
-        let size = info.settings.max_connections.max(1) as usize;
+        let size = info.share(self.service) as usize;
         let slots = self
             .slots
             .get_with(branch, async { Arc::new(BranchSlots::new(size)) })
@@ -815,6 +871,11 @@ impl<S: ConnSource> Pools<S> {
             if info.served(database).is_none() {
                 return Err(AcquireError::NotServed);
             }
+            // A branch too small to give the service a connection.
+            let cap = info.share(self.service);
+            if cap == 0 {
+                return Err(AcquireError::Busy);
+            }
             let slots = self.branch(branch, &info).await;
             let pool = self.pool(branch, database, &info).await?;
             slots.register(&pool);
@@ -824,12 +885,7 @@ impl<S: ConnSource> Pools<S> {
             // branch before room is made (another request's `make_room` sees it) until the
             // attempt ends, however it ends.
             let opening = (pool.pool.status().available == 0).then(|| Opening::new(&pool.opening));
-            self.make_room(
-                &slots,
-                &pool,
-                info.settings.max_connections.max(1),
-                opening.is_some(),
-            );
+            self.make_room(&slots, &pool, cap, opening.is_some());
             // A compute that moved may not answer at all (a dropped SYN), so the first
             // attempt gets less time before the info is fetched again; running out of it
             // counts as a wait for the pool.
@@ -892,7 +948,8 @@ impl<S: ConnSource> Pools<S> {
 pub mod test_support {
     use super::*;
 
-    /// A branch serving `main` (`public`) and `analytics` (`reporting`), 2 connections.
+    /// A branch serving `main` (`public`) and `analytics` (`reporting`), 3 connections
+    /// (rest's share: 2).
     pub fn two_databases() -> ConnInfo {
         ConnInfo {
             host: "127.0.0.1".into(),
@@ -904,7 +961,7 @@ pub mod test_support {
             settings: Settings {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
-                max_connections: 2,
+                max_connections: 3,
             },
             databases: vec![
                 ServedDatabase {
@@ -1201,11 +1258,11 @@ mod tests {
         // Another branch has its own.
         let other = pools.slots(Uuid::new_v4(), &info).await;
         assert!(!Arc::ptr_eq(&slots, &other));
-        // A new `max_connections` resizes the branch's slots.
+        // A new `max_connections` resizes the branch's slots (to rest's share: 4 of 5).
         let mut bigger = (*info).clone();
         bigger.settings.max_connections = 5;
         let resized = pools.slots(branch, &Arc::new(bigger)).await;
-        assert_eq!(resized.available_permits(), 5);
+        assert_eq!(resized.available_permits(), 4);
     }
 
     fn load(size: u32, idle: usize, age_secs: u64) -> PoolLoad {
@@ -1261,9 +1318,9 @@ mod tests {
         }
     }
 
-    /// [`idle_to_close`] end to end: two databases of one branch with `max_connections` 2.
-    /// Two connections left idle in one, then one taken in the other: the branch never has
-    /// more than 2 open.
+    /// [`idle_to_close`] end to end: two databases of one branch with `max_connections` 3
+    /// (rest's share: 2). Two connections left idle in one, then one taken in the other:
+    /// rest never has more than 2 open.
     #[tokio::test]
     #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
     async fn open_connections_stay_within_the_branch_cap_live() {
@@ -1292,7 +1349,7 @@ mod tests {
             settings: Settings {
                 max_rows: 10,
                 statement_timeout_ms: 1000,
-                max_connections: 2,
+                max_connections: 3,
             },
             databases: [&a, &b]
                 .iter()
@@ -1367,6 +1424,73 @@ mod tests {
         }
     }
 
+    /// Every service's share together never passes the branch's `max_connections`, for
+    /// every value a branch may have; rest always keeps one, and storage has one from 2 on.
+    #[test]
+    fn the_services_shares_fit_the_branch_cap() {
+        for max in 0..=60u32 {
+            let settings = Settings {
+                max_rows: 1,
+                statement_timeout_ms: 1,
+                max_connections: max,
+            };
+            let total: u32 = Service::ALL.iter().map(|s| settings.share(*s)).sum();
+            assert!(total <= max.max(1), "{total} shares of {max}");
+            assert!(settings.share(Service::Rest) >= 1, "rest at {max}");
+            if max >= 2 {
+                assert!(settings.share(Service::Storage) >= 1, "storage at {max}");
+            }
+        }
+    }
+
+    /// Two services' pools against one branch (here in one process; in production rest and
+    /// storage, each with its own [`Pools`]): however many connections each asks for at
+    /// once, the branch's open connections stay within `max_connections`, each service
+    /// within its share.
+    #[tokio::test]
+    async fn two_services_stay_within_the_branch_cap() {
+        use std::sync::atomic::Ordering;
+        let fake = super::test_support::fake_pg(super::test_support::Answer::Ready).await;
+        struct Five(u16);
+        impl ConnSource for Five {
+            async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
+                let mut info = super::test_support::two_databases();
+                info.port = self.0;
+                info.settings.max_connections = 5;
+                Ok(info)
+            }
+        }
+        let rest = Arc::new(Pools::new(Five(fake.port), 100));
+        let storage = Arc::new(Pools::new(Five(fake.port), 100).for_service(Service::Storage));
+        let branch = Uuid::new_v4();
+        let mut tries = Vec::new();
+        for (i, pools) in std::iter::repeat_n(&rest, 8)
+            .chain(std::iter::repeat_n(&storage, 8))
+            .enumerate()
+        {
+            let pools = pools.clone();
+            let database = if i % 2 == 0 { "main" } else { "analytics" };
+            tries.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_millis(300), pools.acquire(branch, database))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+            }));
+        }
+        let mut held = Vec::new();
+        for t in tries {
+            held.push(t.await.unwrap());
+        }
+        let (got_rest, got_storage) = (
+            held[..8].iter().flatten().count(),
+            held[8..].iter().flatten().count(),
+        );
+        let open = fake.open.load(Ordering::SeqCst);
+        assert!(open <= 5, "{open} connections open for a branch capped at 5");
+        assert_eq!((got_rest, got_storage), (4, 1), "each service's share");
+        drop(held);
+    }
+
     /// A new `max_connections` resizes the branch's one semaphore: permits held across the
     /// change still count, so the branch never holds more than the new size.
     #[tokio::test]
@@ -1390,9 +1514,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(shrunk.available_permits(), 1);
-        // Growing while one is held.
+        // Growing while one is held (rest's share of 4: 3).
         let one = shrunk.clone().try_acquire_owned().unwrap();
-        let grown = pools.slots(branch, &with(3)).await;
+        let grown = pools.slots(branch, &with(4)).await;
         assert!(Arc::ptr_eq(&slots, &grown));
         assert_eq!(grown.available_permits(), 2);
         drop(one);
@@ -1512,7 +1636,7 @@ mod tests {
     async fn pending_opens_count_against_the_branch_cap() {
         tokio::time::advance(Duration::from_secs(100)).await;
         let info = Arc::new(super::test_support::two_databases());
-        let analytics = DbPool::new(info.clone(), pg_config(&info, "analytics"), 2);
+        let analytics = DbPool::new(info.clone(), pg_config(&info, "analytics", Service::Rest), 2);
         assert_eq!(analytics.load().size, 0);
         let opening = Opening::new(&analytics.opening);
         assert_eq!(analytics.load().size, 1, "an open in flight counts");
@@ -1567,7 +1691,7 @@ mod tests {
         let pools = Arc::new(moka::future::Cache::builder().build());
         let pool = Arc::new(DbPool::new(
             Arc::new(info.clone()),
-            pg_config(&info, "main"),
+            pg_config(&info, "main", Service::Rest),
             2,
         ));
         pools.insert((Uuid::nil(), "main".to_owned()), pool.clone()).await;
