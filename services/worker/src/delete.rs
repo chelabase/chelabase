@@ -16,6 +16,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// each branch and the database `deleted`. `Err` (the job is retried, and the rows stay
     /// `deleting`) when any of that fails.
     pub async fn handle_delete(&self, id: DatabaseId) -> Result<(), String> {
+        let result = self.delete_database(id).await;
+        // object-storage m8: once the database is gone, its blobs' prefix goes too.
+        if result.is_ok() {
+            self.sweep_requests.request(id);
+        }
+        result
+    }
+
+    async fn delete_database(&self, id: DatabaseId) -> Result<(), String> {
         let branches = self
             .metadata
             .list_branches(id)

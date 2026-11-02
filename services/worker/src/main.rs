@@ -13,7 +13,7 @@ use chelabase_nats::{
     SUBJECT_ROLE_DELETE_PREVIEW, SUBJECT_ROLE_RESET, SUBJECT_ROLE_UPDATE, connect, ensure_control_stream, publish_merge,
     run_app_users_consumer, run_app_users_sync_consumer, run_branch_consumer,
     run_delete_consumer, run_merge_consumer, run_project_delete_consumer,
-    run_provision_consumer, run_settings_consumer,
+    run_provision_consumer, run_settings_consumer, run_storage_sweep_consumer,
 };
 use chelabase_secrets::{SecretKey, key_check_value, verify_key_check};
 use futures_util::StreamExt;
@@ -68,7 +68,18 @@ async fn main() -> anyhow::Result<()> {
     // Provisions wait for the orchestrator's tenant-attached events (carried gaps T4), read
     // with the worker's own NATS rights (filtered consumers only; no stream lookups).
     let attach = worker::ports::AttachSource::Nats(js.clone());
-    let worker = Arc::new(build(&config, metadata, key, publisher, attach)?);
+    let mut built = build(&config, metadata, key, publisher, attach)?;
+    built.storage_sweep = worker::storage_sweep::SweepSettings::from_lookup(|name| std::env::var(name).ok())
+        .map_err(|e| anyhow::anyhow!(e))?;
+    // object-storage m8: the sweep needs the user-blob store; without one it doesn't run.
+    if std::env::var(chelabase_storage::config::ENV_BACKEND).is_ok_and(|v| !v.trim().is_empty()) {
+        let store_config = chelabase_storage::StorageConfig::from_env()?;
+        built.blob_store = Some(Arc::new(chelabase_storage::S3Store::new(&store_config).await));
+    } else {
+        warn!("CHELABASE_STORAGE_BACKEND is unset: the storage sweep doesn't run");
+    }
+    let worker = Arc::new(built);
+    worker.sweep_requests.connect(js.clone());
     worker.resync_requests.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.
@@ -140,6 +151,22 @@ async fn main() -> anyhow::Result<()> {
             warn!("project delete consumer exited: {err}");
         }
     });
+
+    if worker.blob_store.is_some() {
+        tokio::spawn(storage_sweep_loop(worker.clone()));
+        let sweep_worker = worker.clone();
+        let sweep_js = js.clone();
+        tokio::spawn(async move {
+            let result = run_storage_sweep_consumer(sweep_js, move |job| {
+                let worker = sweep_worker.clone();
+                async move { worker.handle_storage_sweep(job.payload.database_id).await }
+            })
+            .await;
+            if let Err(err) = result {
+                warn!("storage sweep consumer exited: {err}");
+            }
+        });
+    }
 
     let app_users_worker = worker.clone();
     let app_users_js = js.clone();
@@ -761,6 +788,20 @@ async fn identity_sweep_loop(worker: Arc<RealWorker>) {
         let (checked, revoked) = worker.sweep_identities_once().await;
         if revoked > 0 {
             info!(checked, revoked, "identity sweep: offboarded members' logins revoked");
+        }
+    }
+}
+
+/// object-storage m8: every `CHELABASE_STORAGE_SWEEP_SECS`, a sweep of every ready database is
+/// queued (one job per database; the consumer runs them one at a time).
+async fn storage_sweep_loop(worker: Arc<RealWorker>) {
+    let every = worker.storage_sweep.every;
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticks.tick().await;
+        if let Err(err) = worker.queue_storage_sweeps().await {
+            warn!("queueing storage sweeps: {err}");
         }
     }
 }

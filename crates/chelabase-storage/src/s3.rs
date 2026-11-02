@@ -22,8 +22,8 @@ use bytes::Bytes;
 use futures_util::stream;
 
 use crate::{
-    ByteRange, CompletedPart, CredentialSource, GetObject, ObjectMeta, ObjectStore, PutOptions,
-    StorageConfig, StorageError,
+    ByteRange, CompletedPart, CredentialSource, DatedObject, GetObject, ObjectMeta, ObjectStore,
+    OpenUpload, PutOptions, StorageConfig, StorageError,
     config::{ENV_ACCESS_KEY_FILE, ENV_SECRET_KEY_FILE, read_key_file},
 };
 
@@ -281,6 +281,65 @@ impl ObjectStore for S3Store {
         Ok(out)
     }
 
+    async fn list_dated(&self, prefix: &str) -> Result<Vec<DatedObject>, StorageError> {
+        let mut out = Vec::new();
+        let mut pages = self
+            .client
+            .list_objects_v2()
+            .bucket(&self.bucket)
+            .prefix(prefix)
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            for o in page.map_err(map_err)?.contents() {
+                let key = o.key().unwrap_or_default();
+                out.push(DatedObject {
+                    key: key.to_string(),
+                    size: o.size().unwrap_or(0).max(0) as u64,
+                    modified: store_time(o.last_modified(), key)?,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    async fn list_uploads(&self, prefix: &str) -> Result<Vec<OpenUpload>, StorageError> {
+        let mut out = Vec::new();
+        let (mut key_marker, mut id_marker) = (None::<String>, None::<String>);
+        loop {
+            let page = self
+                .client
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .prefix(prefix)
+                .set_key_marker(key_marker.take())
+                .set_upload_id_marker(id_marker.take())
+                .send()
+                .await
+                .map_err(map_err)?;
+            for u in page.uploads() {
+                let key = u.key().unwrap_or_default();
+                out.push(OpenUpload {
+                    key: key.to_string(),
+                    upload_id: u.upload_id().unwrap_or_default().to_string(),
+                    initiated: u.initiated().and_then(|t| SystemTime::try_from(*t).ok()),
+                });
+            }
+            if !page.is_truncated().unwrap_or(false) {
+                break;
+            }
+            key_marker = page.next_key_marker().map(str::to_owned);
+            id_marker = page.next_upload_id_marker().map(str::to_owned);
+            // A truncated page without a marker would loop forever: refuse instead.
+            if key_marker.is_none() && id_marker.is_none() {
+                return Err(StorageError::Other(
+                    "a truncated upload listing came without a marker".into(),
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     async fn multipart_create(
         &self,
         key: &str,
@@ -394,6 +453,16 @@ impl ObjectStore for S3Store {
             .map_err(map_err)?;
         Ok(())
     }
+}
+
+/// A listed time as the store reported it; a missing or unrepresentable one is an error, never
+/// a guess.
+fn store_time(
+    t: Option<&aws_sdk_s3::primitives::DateTime>,
+    key: &str,
+) -> Result<SystemTime, StorageError> {
+    t.and_then(|t| SystemTime::try_from(*t).ok())
+        .ok_or_else(|| StorageError::Other(format!("the store gave no time for {key:?}")))
 }
 
 /// Percent-encode `bucket/key` for `x-amz-copy-source`, keeping the slashes.
