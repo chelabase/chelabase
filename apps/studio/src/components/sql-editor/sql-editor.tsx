@@ -1,15 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  ApiError,
-  cancelSqlRun,
-  useGetMe,
-  useGetSqlSchema,
-  useListBranchDatabases,
-  useListBranches,
-  useListRoles,
-  type SavedQuery,
-} from "@chelabase/management-client";
-import { DATA_API_ROLES, actAsRoles, dataApiActAs, useProjectCaps } from "@/lib/capabilities";
+import { ApiError, cancelSqlRun, getSavedQuery, useGetMe, useGetSqlSchema, useListSavedQueries, type SavedQuery } from "@chelabase/management-client";
+import { Button } from "@/components/ui/button";
 import { errorText } from "@/lib/errors";
 import type { PglsClient } from "@/lib/pgls/client";
 import { sqlExtensions } from "@/lib/pgls/codemirror";
@@ -22,10 +13,41 @@ import { SqlResults } from "./sql-results";
 import { SqlToolbar } from "./sql-toolbar";
 import { addHistory, clearHistory, loadBuffer, loadHistory, loadTimeout, saveBuffer, saveTimeout, type HistoryEntry } from "./run-history";
 
+/** Where the editor runs, as the page's context bar has it: the editor takes the place and Act as, and picks none of its own. */
 export interface SqlEditorProps {
   databaseId: string;
+  branchId: string;
+  /** The Postgres database to run in; null is the branch's main one. */
+  pgDatabase: string | null;
+  /** The Postgres databases of the branch (a saved query may name one). */
+  pgDatabases: string[];
+  /** The role acted as; null is the owner. */
+  role: string | null;
+  /** What the caller may act as here. */
+  allowed: { owner: boolean; roles: string[] };
+  /** The roles have loaded (until then nothing runs and no schema is read). */
+  rolesReady: boolean;
+  branchProtected?: boolean;
+  /**
+   * A saved query or history entry names a Postgres database on this branch, a role the caller may act as, or both:
+   * the caller moves the context there, both at once (one question about a row draft, not two).
+   */
+  onHints: (hints: { database?: string; role?: string }) => void;
+  /** A run that changed the schema finished: the caller refreshes what it shows of it, the editor's schema read included. Without it the editor reads its schema again itself. */
+  onSchemaChange?: () => void;
+  /** The SQL tab's Quick view: to the table editor with the drawer open. */
+  onQuickView?: () => void;
+  /** The table editor's drawer: a compact layout (a saved-query picker, output beside the editor). */
+  drawer?: SqlDrawerSlot;
   /** Starts the pgls worker (tests inject a fake). The default imports the client lazily, so the wasm stays out of the main bundle. */
   createClient?: () => Promise<PglsClient>;
+}
+
+export interface SqlDrawerSlot {
+  /** "on <branch> · <db> · as <role>". */
+  place: string;
+  onFullEditor: () => void;
+  onClose: () => void;
 }
 
 type RunInFlight = {
@@ -43,42 +65,31 @@ const defaultCreateClient = () => import("@/lib/pgls/client").then((m) => m.crea
 /** The stand-in user id for storage keys when the caller's identity can't be read. */
 const FALLBACK_SUB = "anonymous";
 
-export function SqlEditor({ databaseId, createClient }: SqlEditorProps) {
+export function SqlEditor({ createClient, ...place }: SqlEditorProps) {
   const me = useGetMe();
-  if (me.isPending) return <p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>;
-  return <SqlWorkspace databaseId={databaseId} sub={me.data?.user.sub ?? FALLBACK_SUB} createClient={createClient ?? defaultCreateClient} />;
+  if (me.isPending) return <p className="p-6 text-sm text-chalk-dim">Loading the editor…</p>;
+  return <SqlWorkspace {...place} sub={me.data?.user.sub ?? FALLBACK_SUB} createClient={createClient ?? defaultCreateClient} />;
 }
 
-
-function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; sub: string; createClient: () => Promise<PglsClient> }) {
-  const branches = useListBranches(databaseId);
-  const eligible = (branches.data ?? []).filter((b) => b.kind === "normal" && b.status === "ready");
-  const [pickedBranch, setPickedBranch] = useState<string | null>(null);
-  const branch = eligible.find((b) => b.id === pickedBranch) ?? eligible.find((b) => b.parent_branch_id === null) ?? eligible[0] ?? null;
-  const branchId = branch?.id ?? null;
-
-  const dbs = useListBranchDatabases(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
-  const dbList = (dbs.data ?? []).filter((d) => d.origin !== "system").sort((a, b) => Number(b.main) - Number(a.main));
-  const [pickedDb, setPickedDb] = useState<string | null>(null);
-  const db = dbList.find((d) => d.name === pickedDb) ?? dbList[0] ?? null;
-  const dbParam = db && !db.main ? db.name : null;
-
-  const rolesQuery = useListRoles(databaseId, branchId ?? "", { query: { enabled: branchId !== null } });
-  // Only the roles the caller may act as: Admin has the owner and every role; below Admin the
-  // granted roles and their chains (the API decides; this only hides what it would refuse). The
-  // data API's anon and authenticated only when a grant names them (R18), whatever the level.
-  const caps = useProjectCaps();
-  const allowed = actAsRoles(caps, rolesQuery.data ?? []);
-  const roleOptionsFor = (d: typeof db) => {
-    const api: string[] = DATA_API_ROLES.filter((n) => dataApiActAs(caps).includes(n) || allowed.roles.includes(n));
-    const own = allowed.roles.filter((n) => !api.includes(n));
-    return d?.data_api === "on" ? [...api, ...own] : own;
-  };
-  const roleOptions = roleOptionsFor(db);
-  const [pickedRole, setPickedRole] = useState("");
-  // "" is the owner; without it the first allowed role is the default.
-  const role = roleOptions.includes(pickedRole) ? pickedRole : allowed.owner ? "" : (roleOptions[0] ?? "");
-  const noRole = !allowed.owner && role === "";
+function SqlWorkspace({
+  databaseId,
+  branchId,
+  pgDatabase: dbParam,
+  pgDatabases,
+  role: roleParam,
+  allowed,
+  rolesReady,
+  branchProtected,
+  onHints,
+  onSchemaChange,
+  onQuickView,
+  drawer,
+  sub,
+  createClient,
+}: Omit<SqlEditorProps, "createClient"> & { sub: string; createClient: () => Promise<PglsClient> }) {
+  // "" is the owner in the schema key and the notes below; the run body and history use null.
+  const role = roleParam ?? "";
+  const noRole = !allowed.owner && roleParam === null;
 
   const [timeoutMs, setTimeoutMs] = useState(loadTimeout);
 
@@ -108,8 +119,8 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
   // The schema read follows the chosen role's USAGE (T9): `?role=` unless it's the owner.
   const schemaKey = `${branchId}|${dbParam}|${role}`;
   const schemaParams = { ...(dbParam ? { database: dbParam } : {}), ...(role !== "" ? { role } : {}) };
-  const schemaQuery = useGetSqlSchema(databaseId, branchId ?? "", schemaParams, {
-    query: { enabled: branchId !== null && db !== null && rolesQuery.isSuccess && !noRole, staleTime: Infinity, retry: false },
+  const schemaQuery = useGetSqlSchema(databaseId, branchId, schemaParams, {
+    query: { enabled: rolesReady && !noRole, staleTime: Infinity, retry: false },
   });
   const schemaData = schemaQuery.data;
   const [pglsSchema, setPglsSchema] = useState<{ key: string; ok: boolean } | null>(null);
@@ -141,13 +152,12 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
     }, 300);
     return () => clearTimeout(t);
   }, [doc, sub, databaseId]);
-  useEffect(
-    () => () => {
-      if (unsaved.current !== null) saveBuffer(sub, databaseId, unsaved.current);
-      unsaved.current = null;
-    },
-    [sub, databaseId],
-  );
+  // Also called before leaving for the other view: its editor reads the buffer while it mounts, before this one's cleanup runs.
+  const flush = useCallback(() => {
+    if (unsaved.current !== null) saveBuffer(sub, databaseId, unsaved.current);
+    unsaved.current = null;
+  }, [sub, databaseId]);
+  useEffect(() => flush, [flush]);
   const [active, setActive] = useState<ActiveQuery | null>(null);
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory(sub, databaseId));
   const [loadNote, setLoadNote] = useState<string | null>(null);
@@ -174,14 +184,13 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
   );
 
   async function execute(text: RunText, confirm: boolean) {
-    if (branchId === null) return;
     controller.current?.abort();
     const abort = new AbortController();
     controller.current = abort;
     const token = ++tokens.current;
     const id = crypto.randomUUID();
     const forBranch = branchId;
-    const cur: RunInFlight = { id, token, text, startedAt: Date.now(), branchId: forBranch, database: dbParam, role: role === "" ? null : role, finished: false };
+    const cur: RunInFlight = { id, token, text, startedAt: Date.now(), branchId: forBranch, database: dbParam, role: roleParam, finished: false };
     current.current = cur;
     lastText.current = text;
     setFailure(null);
@@ -207,7 +216,10 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
       cur.finished = true;
       if (acc.done) {
         record(cur, acc.done.outcome, acc.done.duration_ms);
-        if (changesSchema(acc.statements.flatMap((s) => (s.tag ? [s.tag] : [])))) void schemaQuery.refetch();
+        if (changesSchema(acc.statements.flatMap((s) => (s.tag ? [s.tag] : [])))) {
+          if (onSchemaChange) onSchemaChange();
+          else void schemaQuery.refetch();
+        }
       } else {
         setRun({ ...acc, running: false });
         setFailure("The connection closed before the run finished.");
@@ -251,18 +263,16 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
 
   function applyHints(hints: { database?: string | null; role?: string | null }) {
     const notes: string[] = [];
-    let target = db;
+    const move: { database?: string; role?: string } = {};
     if (hints.database) {
-      const found = dbList.find((d) => d.name === hints.database);
-      if (found) {
-        setPickedDb(found.name);
-        target = found;
-      } else notes.push(`The saved database "${hints.database}" isn't on this branch; the selected one is kept.`);
+      if (pgDatabases.includes(hints.database)) move.database = hints.database;
+      else notes.push(`The saved database "${hints.database}" isn't on this branch; the selected one is kept.`);
     }
     if (hints.role) {
-      if (roleOptionsFor(target).includes(hints.role)) setPickedRole(hints.role);
+      if (allowed.roles.includes(hints.role)) move.role = hints.role;
       else notes.push(`The saved role "${hints.role}" isn't available here; running as ${role === "" ? "the owner" : role}.`);
     }
+    if (move.database || move.role) onHints(move);
     setLoadNote(notes.length > 0 ? notes.join(" ") : null);
   }
 
@@ -271,76 +281,100 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
     setDoc(sql);
   };
 
-  const gone = !branches.isPending && branch === null;
-  const fatal = branches.error ?? dbs.error ?? rolesQuery.error;
   const basicNote = !pglsReady;
+  const loadQuery = (q: SavedQuery) => {
+    loadSql(q.sql);
+    applyHints({ database: q.pg_database ?? null, role: q.role ?? null });
+  };
+  const confirmDialog = (
+    <SqlConfirmDialog
+      statements={held}
+      onCancel={() => setHeld(null)}
+      onConfirm={() => {
+        const text = lastText.current;
+        setHeld(null);
+        if (text) void execute(text, true);
+      }}
+    />
+  );
+  const ownerNotice = (ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && (
+    <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
+  );
+  const ownerWarning = !noRole && role === "" ? "Running as owner: row-level security is bypassed." : null;
+  const noRoleNote = noRole && rolesReady && <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>;
+  const output = (
+    <>
+      {failure && (
+        <p role="alert" className="text-sm text-destructive">
+          {failure}
+        </p>
+      )}
+      {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
+    </>
+  );
+  const codeEditor = <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />;
+
+  if (drawer) {
+    // The drawer: one header row (saved queries, the place, Full editor, Run, close), the editor beside its output.
+    return (
+      <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line px-3 py-1.5 text-sm">
+          <span className="font-medium">SQL</span>
+          <SavedQueryPicker databaseId={databaseId} onLoad={loadQuery} />
+          <span className="min-w-0 truncate text-xs text-chalk-dim">{drawer.place}</span>
+          <div className="ml-auto flex items-center gap-2">
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => {
+                flush();
+                drawer.onFullEditor();
+              }}
+            >
+              Full editor
+            </Button>
+            {run?.running ? (
+              <Button size="sm" variant="destructive" onClick={() => void cancel()}>
+                Cancel
+              </Button>
+            ) : (
+              <Button size="sm" disabled={!rolesReady || noRole} onClick={start} title="Ctrl/Cmd+Enter runs the selection, or everything">
+                Run <kbd aria-hidden="true" className="font-sans text-[11px] opacity-70">Ctrl ↵</kbd>
+              </Button>
+            )}
+            <Button size="icon-sm" variant="ghost" aria-label="Close SQL" onClick={drawer.onClose}>
+              <span aria-hidden="true">×</span>
+            </Button>
+          </div>
+        </div>
+        <div className="flex min-h-0 flex-1">
+          {/* CodeMirror takes the drawer body's height (the page theme caps it at 24rem); the same mounted editor, no remount. */}
+          <div className="min-h-0 min-w-0 flex-1 overflow-hidden [&>[data-testid=sql-editor]]:h-full [&_.cm-editor]:h-full [&_.cm-editor]:max-h-none">{codeEditor}</div>
+          <div aria-label="Output" role="group" className="w-[42%] min-w-0 space-y-2 overflow-auto border-l border-line p-2">
+            {noRoleNote}
+            {ownerWarning && <p className="border border-destructive/40 p-1.5 text-xs">{ownerWarning}</p>}
+            {branchProtected && <p className="text-xs text-chalk-dim">Protected branch: every change asks for confirmation.</p>}
+            {ownerNotice}
+            {loadNote && <p className="text-xs text-chalk-dim">{loadNote}</p>}
+            {output}
+            {!run && !failure && <p className="text-xs text-chalk-dim">Each statement&apos;s output shows here.</p>}
+          </div>
+        </div>
+        {confirmDialog}
+      </div>
+    );
+  }
 
   return (
-    <div className="space-y-3 py-3">
-      <SqlToolbar
-        branches={eligible.map((b) => ({ id: b.id, name: b.name }))}
-        branchId={branchId}
-        onBranch={(id) => {
-          setPickedBranch(id);
-          setPickedDb(null);
-          setPickedRole("");
-        }}
-        databases={dbList.map((d) => d.name)}
-        database={db?.name ?? null}
-        onDatabase={setPickedDb}
-        roles={roleOptions}
-        ownerAllowed={allowed.owner}
-        role={role}
-        onRole={setPickedRole}
-        timeoutMs={timeoutMs}
-        onTimeout={(ms) => {
-          setTimeoutMs(ms);
-          saveTimeout(ms);
-        }}
-        running={run?.running === true}
-        canRun={branchId !== null && db !== null && !noRole}
-        onRun={start}
-        onCancel={() => void cancel()}
-        onRefreshSchema={() => void schemaQuery.refetch()}
-      />
-
-      {noRole ? (
-        rolesQuery.isSuccess && (
-          <p className="border p-2 text-sm">You can't act as any Postgres role here. Ask a project Admin to grant you one.</p>
-        )
-      ) : role === "" ? (
-        <p className="border border-destructive/40 p-2 text-sm">Running as owner: row-level security is bypassed.</p>
-      ) : !allowed.owner ? (
-        <p className="border p-2 text-sm">
-          Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.
-        </p>
-      ) : (
-        <p className="border p-2 text-sm">
-          Running as <code>{role}</code> (SET ROLE). This previews that role&apos;s view; it isn&apos;t a security boundary, since a script can RESET ROLE.
-        </p>
-      )}
-      {branch?.protected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
-      {fatal && (
-        <p role="alert" className="text-sm text-destructive">
-          {errorText(fatal)}
-        </p>
-      )}
-      {gone && !fatal && <p className="text-sm text-muted-foreground">This database has no ready branch yet.</p>}
-      {(ownerUnknown || (schemaQuery.error instanceof ApiError && schemaQuery.error.code === "owner_password_unknown")) && branchId && (
-        <OwnerPasswordNotice databaseId={databaseId} branchId={branchId} onRetry={() => (ownerUnknown ? start() : void schemaQuery.refetch())} />
-      )}
-
-      <div className="grid gap-4 md:grid-cols-[16rem_1fr]">
+    <div className="flex min-h-0 flex-1 max-[40rem]:flex-col">
+      <aside className="w-64 shrink-0 overflow-y-auto border-r border-line p-3 max-[40rem]:w-auto max-[40rem]:border-r-0 max-[40rem]:border-b">
         <SavedQueriesPanel
           databaseId={databaseId}
           sql={doc}
-          hints={{ pg_database: dbParam, role: role === "" ? null : role }}
+          hints={{ pg_database: dbParam, role: roleParam }}
           active={active}
           onActiveChange={setActive}
-          onLoad={(q: SavedQuery) => {
-            loadSql(q.sql);
-            applyHints({ database: q.pg_database ?? null, role: q.role ?? null });
-          }}
+          onLoad={loadQuery}
           history={history}
           onOpenHistory={(h) => {
             loadSql(h.sql);
@@ -351,30 +385,90 @@ function SqlWorkspace({ databaseId, sub, createClient }: { databaseId: string; s
             setHistory([]);
           }}
         />
-        <div className="min-w-0 space-y-3">
-          <div className="flex items-center justify-between text-xs text-muted-foreground">
-            <span>{loadNote}</span>
-            {basicNote && <span>Basic completion</span>}
-          </div>
-          <CodeEditor ref={editor} initialDoc={initialDoc.current} extensions={extensions} onChange={setDoc} onRun={start} />
-          {failure && (
-            <p role="alert" className="text-sm text-destructive">
-              {failure}
-            </p>
-          )}
-          {run && <SqlResults state={run} onGoToError={errorAt !== null ? () => editor.current?.goTo(errorAt) : null} />}
-        </div>
+      </aside>
+      <div className="min-w-0 flex-1 space-y-3 overflow-y-auto p-3">
+      <SqlToolbar
+        timeoutMs={timeoutMs}
+        onTimeout={(ms) => {
+          setTimeoutMs(ms);
+          saveTimeout(ms);
+        }}
+        running={run?.running === true}
+        canRun={rolesReady && !noRole}
+        onRun={start}
+        onCancel={() => void cancel()}
+        onRefreshSchema={() => void schemaQuery.refetch()}
+        onQuickView={
+          onQuickView &&
+          (() => {
+            flush();
+            onQuickView();
+          })
+        }
+      />
+
+      {noRole ? (
+        noRoleNote
+      ) : ownerWarning ? (
+        <p className="border border-destructive/40 p-2 text-sm">{ownerWarning}</p>
+      ) : !allowed.owner ? (
+        <p className="border p-2 text-sm">
+          Running as <code>{role}</code>: Postgres applies this role&apos;s privileges and row-level security.
+        </p>
+      ) : (
+        <p className="border p-2 text-sm">
+          Running as <code>{role}</code> (SET ROLE). This previews that role&apos;s view; it isn&apos;t a security boundary, since a script can RESET ROLE.
+        </p>
+      )}
+      {branchProtected && <p className="border p-2 text-sm">Protected branch: every change asks for confirmation.</p>}
+      {ownerNotice}
+
+      <div className="flex items-center justify-between text-xs text-muted-foreground">
+        <span>{loadNote}</span>
+        {basicNote && <span>Basic completion</span>}
+      </div>
+      {codeEditor}
+      {output}
       </div>
 
-      <SqlConfirmDialog
-        statements={held}
-        onCancel={() => setHeld(null)}
-        onConfirm={() => {
-          const text = lastText.current;
-          setHeld(null);
-          if (text) void execute(text, true);
-        }}
-      />
+      {confirmDialog}
     </div>
+  );
+}
+
+/** The drawer's saved queries: a picker that loads the chosen one (saving stays in the full editor). */
+function SavedQueryPicker({ databaseId, onLoad }: { databaseId: string; onLoad: (q: SavedQuery) => void }) {
+  const list = useListSavedQueries(databaseId);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <>
+      <select
+        aria-label="Saved query"
+        value=""
+        disabled={!list.data?.length}
+        onChange={async (e) => {
+          const id = e.target.value;
+          setError(null);
+          try {
+            onLoad(await getSavedQuery(databaseId, id));
+          } catch (err) {
+            setError(errorText(err));
+          }
+        }}
+        className="h-7 max-w-48 border border-input bg-background px-2 text-sm"
+      >
+        <option value="">{list.data?.length ? "Saved queries…" : "No saved queries"}</option>
+        {(list.data ?? []).map((q) => (
+          <option key={q.id} value={q.id}>
+            {q.name}
+          </option>
+        ))}
+      </select>
+      {error && (
+        <span role="alert" className="text-xs text-destructive">
+          {error}
+        </span>
+      )}
+    </>
   );
 }

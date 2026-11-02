@@ -19,6 +19,7 @@ import { fakeFetch, jsonResponse, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithRouter } from "@/test/render-router";
 import { BranchActions } from "./branch-actions";
 import { BranchRoles } from "./branch-roles";
+import { ConnectPanel } from "./connect-panel";
 import { Dashboard } from "./dashboard";
 import { DataApiDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
@@ -28,6 +29,7 @@ import { MembersPage, type MembersTab } from "./members/members-page";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectPage } from "./project-page";
 import { ProjectSettings } from "./project-settings";
+import { SqlPage } from "./sql-editor/sql-page";
 import { MergePage } from "./merges/merge-page";
 import { branchOf, detailOf, devBranch, mergeOf } from "@/test/merge-fixtures";
 
@@ -222,8 +224,31 @@ const accessReady = async () => {
 
 const CONTROLS: Control[] = [
   { name: "Create database", operationId: "createDatabase", ui: projectPage, ready: projectReady, query: button("Create database") },
-  { name: "SQL editor", operationId: "runSql", ui: projectPage, ready: projectReady, query: button("SQL") },
-  { name: "Connection details", operationId: "getDatabaseConnection", ui: projectPage, ready: projectReady, query: button("Connection details") },
+  {
+    name: "SQL editor", operationId: "runSql",
+    routes: {
+      "GET /v1/projects": ok([info]),
+      "GET /v1/databases/d1/branches/m/sql/schema": ok({ schemas: [] }),
+      "GET /v1/databases/d1/sql-queries": ok([]),
+    },
+    ui: () => <SqlPage params={{ projectId: "p1", databaseId: "d1", branchId: "m", pgDatabase: "web1" }} navigate={() => {}} createClient={() => Promise.reject(new Error("no worker"))} />,
+    // Either the editor or the no-access message has rendered.
+    ready: () => Promise.any([screen.findByRole("button", { name: "Run" }), screen.findByText(/needs the Developer role/)]),
+    query: button("Run"),
+  },
+  { name: "Connection details on a branch", operationId: "getBranchConnection", ui: branchActions(mainOpen), ready: branchReady, query: button("Connection details") },
+  // The owner connection lives in the Connect panel (a branch's, for the header's branch and database).
+  {
+    name: "Owner connection in Connect", operationId: "getBranchConnection",
+    ui: () => <ConnectPanel projectId="p1" database={database as never} apiUrl="http://gw" />,
+    routes: {
+      "GET /v1/databases/d1/branches/m/connection": ok({
+        host: "h", port: 4432, database: "web1", user: "o", password: "pw", uri: "postgresql://o@h:4432/web1",
+        http_url: "https://h/sql", password_state: "generated", ca_file: null,
+      }),
+    },
+    ready: () => screen.findByLabelText("Branch"), query: button("Show password"),
+  },
   { name: "Reset database password", operationId: "resetDatabasePassword", ui: projectPage, ready: projectReady, query: button("Reset password") },
   { name: "Delete database", operationId: "deleteDatabase", ui: projectPage, ready: projectReady, query: button("Delete") },
   {
@@ -248,17 +273,17 @@ const CONTROLS: Control[] = [
   },
   {
     name: "Enable data API", operationId: "enableDataApi",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "off")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "off")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Enable data API"),
   },
   {
     name: "Disable data API", operationId: "disableDataApi",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "on")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "on")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Disable data API"),
   },
   {
     name: "Save default schema", operationId: "updatePgDatabase",
-    ui: () => <DataApiDatabases databaseId="d1" branchId="m" databases={[dbView("web1", true, "on"), dbView("extra", false, "on")]} picked="extra" onPick={() => {}} />,
+    ui: () => <DataApiDatabases databaseId="d1" branchId="m" database={dbView("extra", false, "on")} />,
     ready: () => screen.findAllByText(/extra/), query: button("Save default schema"),
   },
   {

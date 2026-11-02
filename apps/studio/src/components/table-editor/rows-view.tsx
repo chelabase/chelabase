@@ -45,6 +45,7 @@ import {
 import { smallColumns } from "@/lib/table-editor/oversized";
 import { viewKey, type Selection } from "@/lib/table-editor/selection";
 import { useTableEditor } from "@/lib/table-editor/store";
+import { COUNT_QUERY, ROWS_QUERY, rowWriteKeys } from "@/lib/table-editor/query-keys";
 import type { CellValue } from "./cell-editor";
 import type { CellMenuGroups } from "./cell-menu";
 import { ConflictDialog, type ConflictDialogProps } from "./conflict-dialog";
@@ -60,22 +61,7 @@ import type { TableTarget } from "./target";
 import { useTableStructure } from "./use-structure";
 import { useColumnHeaders, type ColumnChips } from "./column-headers";
 
-/**
- * The first key of every rows query. Apply (T5) and every row write (inline edits, the row
- * panel's save, insert and delete, insert with defaults) invalidate both
- * `[ROWS_QUERY, databaseId, branchId]` and `[COUNT_QUERY, databaseId, branchId]`.
- */
-export const ROWS_QUERY = "table-editor-rows";
-/** The first key of the selection bar's filtered count (kept apart from `ROWS_QUERY`; see there). */
-export const COUNT_QUERY = "table-editor-count";
-
-/** The invalidations after a row write or an Apply: the rows and the filtered count of the branch. */
-export function rowWriteKeys(databaseId: string, branchId: string): readonly (readonly unknown[])[] {
-  return [
-    [ROWS_QUERY, databaseId, branchId],
-    [COUNT_QUERY, databaseId, branchId],
-  ];
-}
+export { COUNT_QUERY, ROWS_QUERY, rowWriteKeys };
 /** The row panel's single-row reads sit under `ROWS_QUERY` with this marker, so every refresh covers them. */
 export const PANEL_ROW = "panel-row";
 /** The row panel's read of the row with this key. */

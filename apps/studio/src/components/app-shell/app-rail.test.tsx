@@ -22,7 +22,7 @@ beforeAll(() => {
  * Renders the rail at `path` inside a memory router that knows the routes it links to.
  * The behaviour lives in state, like the shell's, so `setBehaviour` re-renders the same rail.
  */
-async function renderRail(initial: RailBehaviour, path = "/app", badges?: { members?: number }) {
+async function renderRail(initial: RailBehaviour, path = "/app", badges?: { members?: number }, hidden?: readonly ("sql")[]) {
   const onBehaviourChange = vi.fn();
   let setter: (next: RailBehaviour) => void = () => {};
   function Layout() {
@@ -33,6 +33,7 @@ async function renderRail(initial: RailBehaviour, path = "/app", badges?: { memb
         <AppRail
           behaviour={behaviour}
           badges={badges}
+          hidden={hidden}
           onBehaviourChange={(next) => {
             onBehaviourChange(next);
             setBehaviourState(next);
@@ -53,8 +54,9 @@ async function renderRail(initial: RailBehaviour, path = "/app", badges?: { memb
     component: () => <p>project</p>,
   });
   const members = createRoute({ getParentRoute: () => root, path: "/app/members", component: () => <p>members</p> });
+  const dataApi = createRoute({ getParentRoute: () => root, path: "/app/data-api", component: () => <p>data api</p> });
   const router = createRouter({
-    routeTree: root.addChildren([dashboard, api, project, members]),
+    routeTree: root.addChildren([dashboard, api, project, members, dataApi]),
     history: createMemoryHistory({ initialEntries: [path] }),
   });
   render(<RouterProvider router={router} />);
@@ -233,6 +235,7 @@ describe("AppRail", () => {
     const current: Record<string, string> = {
       "/app": "Projects",
       "/app/api": "API reference",
+      "/app/data-api": "Data API",
       "/app/projects/p1": "Projects",
       "/app/members": "Members",
     };
@@ -314,5 +317,22 @@ describe("AppRail", () => {
 
     await renderRail("expanded", "/app", { members: 0 });
     expect(screen.getByRole("link", { name: "Members" })).toBeInTheDocument();
+  });
+
+  it("sql_item_links_between_table_editor_and_api_reference_and_can_be_hidden", async () => {
+    await renderRail("expanded");
+    expect(screen.getByRole("link", { name: "SQL editor" })).toHaveAttribute("href", "/app/sql");
+    cleanup();
+    await renderRail("expanded", "/app", undefined, ["sql"]);
+    expect(screen.queryByRole("link", { name: "SQL editor" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Table editor" })).toBeInTheDocument();
+  });
+
+  it("data_api_item_links_between_sql_editor_and_api_reference", async () => {
+    const { nav } = await renderRail("expanded");
+    const names = [...nav.querySelectorAll("a")].map((a) => a.textContent);
+    expect(names.indexOf("Data API")).toBe(names.indexOf("SQL editor") + 1);
+    expect(names.indexOf("API reference")).toBe(names.indexOf("Data API") + 1);
+    expect(screen.getByRole("link", { name: "Data API" })).toHaveAttribute("href", "/app/data-api");
   });
 });

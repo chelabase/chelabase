@@ -12,6 +12,10 @@ export interface EditorParams {
 
 export const LEVELS: readonly (keyof EditorParams)[] = ["projectId", "databaseId", "branchId", "pgDatabase", "schema", "table"];
 export const LAST_KEY = "chelabase.studio.tables.last";
+/** The SQL editor's own last place (its levels stop at the Postgres database). */
+export const SQL_LAST_KEY = "chelabase.studio.sql.last";
+/** The Data API page's own last place (its levels stop at the Postgres database too). */
+export const DATA_API_LAST_KEY = "chelabase.studio.data-api.last";
 
 /** The URL of a place: each present level up to the first missing one. */
 export function editorPath(p: EditorParams): string {
@@ -40,6 +44,12 @@ export function editorRouteParams(p: EditorParams): Record<keyof EditorParams, s
   };
 }
 
+/** The SQL editor's and the Data API page's route params: the place down to the Postgres database, `undefined` for a missing level. */
+export function sqlRouteParams(p: EditorParams): Pick<Record<keyof EditorParams, string | undefined>, "projectId" | "databaseId" | "branchId" | "pgDatabase"> {
+  const { projectId, databaseId, branchId, pgDatabase } = editorRouteParams(p);
+  return { projectId, databaseId, branchId, pgDatabase };
+}
+
 function pick(p: EditorParams): EditorParams {
   const out: EditorParams = {};
   for (const level of LEVELS) {
@@ -50,10 +60,10 @@ function pick(p: EditorParams): EditorParams {
 }
 
 /** The last place the editor was ready at; null when nothing usable is stored. */
-export function readLast(storage: Storage | null): EditorParams | null {
+export function readLast(storage: Storage | null, key: string = LAST_KEY): EditorParams | null {
   if (!storage) return null;
   try {
-    const raw = storage.getItem(LAST_KEY);
+    const raw = storage.getItem(key);
     if (!raw) return null;
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
@@ -63,10 +73,10 @@ export function readLast(storage: Storage | null): EditorParams | null {
   }
 }
 
-export function writeLast(storage: Storage | null, p: EditorParams): void {
+export function writeLast(storage: Storage | null, p: EditorParams, key: string = LAST_KEY): void {
   if (!storage) return;
   try {
-    storage.setItem(LAST_KEY, JSON.stringify(pick(p)));
+    storage.setItem(key, JSON.stringify(pick(p)));
   } catch {
     // Remembering the place is a convenience.
   }

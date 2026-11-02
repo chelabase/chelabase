@@ -14,6 +14,8 @@ export interface TableListProps {
   noDatabase?: boolean;
   /** The open table's exact row count when its estimate is missing (a short page told it), else null. */
   exactRows?: number | null;
+  /** The SQL drawer's toggle (Developer and up); absent, there is no SQL button. */
+  sql?: { open: boolean; onToggle: () => void };
 }
 
 /** "3.1k", "131k", "1.2M": a row estimate in a few characters. */
@@ -52,8 +54,8 @@ const ghost =
 
 const NO_DATABASE = "This branch has no Postgres database";
 
-/** The left list: the schema, a filter, the schema's tables and views, and the entries to Types and a new table. */
-export function TableList({ params, navigate, objects, noDatabase = false, exactRows = null }: TableListProps) {
+/** The left list: New table and SQL, the schema, a filter, the schema's tables and views, and the entry to Types. */
+export function TableList({ params, navigate, objects, noDatabase = false, exactRows = null, sql }: TableListProps) {
   const [filter, setFilter] = useState("");
   const schemas = objects ? schemasOf(objects) : [];
   const schema = params.schema ?? null;
@@ -71,6 +73,16 @@ export function TableList({ params, navigate, objects, noDatabase = false, exact
 
   return (
     <nav aria-label="Tables" className="flex w-[248px] shrink-0 flex-col gap-3 border-r border-line bg-deep py-3 max-[40rem]:w-full max-[40rem]:border-r-0 max-[40rem]:border-b">
+      <div className="flex gap-2 px-3">
+        <button type="button" aria-pressed={view === "new_table"} disabled={noDatabase} title={noDatabase ? NO_DATABASE : undefined} onClick={() => setView("new_table")} className={cn(ghost, "min-w-0 flex-1", view === "new_table" && "bg-channel")}>
+          <span aria-hidden="true" className="mr-1.5">+</span>New table
+        </button>
+        {sql && (
+          <button type="button" aria-pressed={sql.open} onClick={sql.onToggle} title="SQL under the table" className={cn(ghost, "w-auto shrink-0 font-mono", sql.open && "bg-channel")}>
+            SQL
+          </button>
+        )}
+      </div>
       <div className="space-y-2 px-3">
         <Picker
           label="Schema"
@@ -130,9 +142,6 @@ export function TableList({ params, navigate, objects, noDatabase = false, exact
       <div className="space-y-2 px-3">
         <button type="button" aria-pressed={view === "types"} disabled={noDatabase} title={noDatabase ? NO_DATABASE : undefined} onClick={() => setView("types")} className={cn(ghost, view === "types" && "bg-channel")}>
           Types
-        </button>
-        <button type="button" aria-pressed={view === "new_table"} disabled={noDatabase} title={noDatabase ? NO_DATABASE : undefined} onClick={() => setView("new_table")} className={cn(ghost, view === "new_table" && "bg-channel")}>
-          New table
         </button>
       </div>
     </nav>

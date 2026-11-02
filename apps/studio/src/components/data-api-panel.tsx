@@ -6,7 +6,6 @@ import {
   useGetDataApiSchema,
   useListBranchDatabases,
   useListKeys,
-  type Branch,
   type BranchDatabaseView,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
@@ -19,27 +18,20 @@ import { DataApiKeys } from "./data-api-keys";
 import { DataApiTypes } from "./data-api-types";
 import { RlsWarning } from "./rls-warning";
 
-export interface DataApiPanelProps {
-  databaseId: string;
-  branch: Branch;
-  /** The gateway's base URL (`VITE_API_URL`); the endpoint is `${apiUrl}/data/v1/query`. */
-  apiUrl: string;
-}
-
-/** One branch's data API: endpoint, public key, secret keys and the RLS warning. */
-export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) {
-  // Rotating the public key is Developer's (rotateKey).
-  const canRotate = useProjectCaps().atLeast("developer");
+/**
+ * One branch's data API: the keys, the branch's Postgres databases (with the one picked) and the
+ * served database's schema, and rotating the public key. The sections below share one of these,
+ * so the Connect panel and the Data API page send the same requests.
+ */
+export function useDataApi(databaseId: string, branchId: string, pgDatabase: string | undefined) {
   const queryClient = useQueryClient();
-  const branchId = branch.id;
   const keyList = useListKeys(databaseId, branchId);
   // While a database is enabling, keep the list fresh until it turns on or fails.
   const dbList = useListBranchDatabases(databaseId, branchId, {
     query: { refetchInterval: pollWhile<BranchDatabaseView[]>((ds) => ds.some((d) => d.data_api === "enabling")) },
   });
   const databases = dbList.data ?? null;
-  const [pickedName, setPickedName] = useState<string | null>(null);
-  const pickedDb = databases?.find((d) => d.name === pickedName) ?? databases?.find((d) => d.main) ?? databases?.[0];
+  const pickedDb = databases?.find((d) => d.name === pgDatabase) ?? databases?.find((d) => d.main) ?? databases?.[0];
   // The schema (and the RLS warning) are read from a served database only.
   const schemaQuery = useGetDataApiSchema(
     databaseId,
@@ -47,24 +39,24 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
     { database: pickedDb?.name },
     { query: { enabled: pickedDb?.data_api === "on" } },
   );
-  const [rotating, setRotating] = useState(false);
+  const [rotating, setRotatingState] = useState(false);
   const [busy, setBusy] = useState(false);
   const [rotateError, setRotateError] = useState<string | null>(null);
   const keys = keyList.data ?? null;
   const schema = pickedDb?.data_api === "on" ? (schemaQuery.data ?? null) : null;
-  const error = keyList.error ? errorText(keyList.error) : dbList.error ? errorText(dbList.error) : rotateError;
+  // Still finding out what the RLS check says: the databases, or a served one's schema, are loading.
+  const schemaLoading = (databases === null && !dbList.error) || (pickedDb?.data_api === "on" && schemaQuery.isPending);
+  // Each section shows the failure it depends on: the keys' (endpoint, secret keys), the databases' (exposure), a rotate's (endpoint).
+  const keysError = keyList.error ? errorText(keyList.error) : null;
+  const dbError = dbList.error ? errorText(dbList.error) : null;
   const schemaError = pickedDb?.data_api === "on" && schemaQuery.error ? `Couldn't check RLS: ${errorText(schemaQuery.error)}` : null;
-  const endpoint = `${apiUrl.replace(/\/+$/, "")}/data/v1/query`;
-
   const publicKey = keys?.find((k) => k.kind === "public");
-  const reasonId = useId();
-  const rotateReason = busy
-    ? "Working on a key change."
-    : keys === null
-      ? "Waiting for the keys to load."
-      : !publicKey
-        ? "This branch has no public key."
-        : null;
+
+  // Opening or closing the confirm box clears an earlier rotate's error.
+  function setRotating(open: boolean) {
+    setRotatingState(open);
+    setRotateError(null);
+  }
 
   async function rotatePublic() {
     if (!publicKey) return;
@@ -73,7 +65,7 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
     try {
       // The plain function, so the new key never sits in the mutation cache.
       await rotateKey(databaseId, branchId, publicKey.id);
-      setRotating(false);
+      setRotatingState(false);
       await queryClient.invalidateQueries({ queryKey: getListKeysQueryKey(databaseId, branchId) });
     } catch (err) {
       setRotateError(errorText(err));
@@ -82,33 +74,63 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
     }
   }
 
+  return { databaseId, branchId, keys, databases, pickedDb, schema, schemaLoading, keysError, dbError, rotateError, schemaError, publicKey, rotating, setRotating, busy, rotatePublic };
+}
+
+export type DataApi = ReturnType<typeof useDataApi>;
+
+/** The endpoint and the public key, each with Copy, and Rotate public key (Developer's, rotateKey) unless `readOnly`. */
+export function DataApiEndpoint({ api, apiUrl, readOnly = false }: { api: DataApi; apiUrl: string; readOnly?: boolean }) {
+  const canRotate = useProjectCaps().atLeast("developer") && !readOnly;
+  const { keys, keysError, rotateError, publicKey, busy, rotating, setRotating, rotatePublic } = api;
+  const endpoint = `${apiUrl.replace(/\/+$/, "")}/data/v1/query`;
+  const reasonId = useId();
+  const rotateReason = busy
+    ? "Working on a key change."
+    : keysError
+      ? "Couldn't load the keys."
+      : keys === null
+        ? "Waiting for the keys to load."
+        : !publicKey
+          ? "This branch has no public key."
+          : null;
+
   return (
-    <section aria-label={`Data API for ${branch.name}`} className="space-y-3 border p-3 text-sm">
-      <h3 className="font-medium">Data API</h3>
-      <dl className="grid grid-cols-[auto_1fr_auto] items-center gap-x-4 gap-y-1">
+    <>
+      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-2">
         <dt className="text-muted-foreground">Endpoint</dt>
-        <dd className="font-mono break-all">{endpoint}</dd>
-        <dd>
-          <CopyButton value={endpoint} label="Copy endpoint" />
+        <dd className="min-w-0 space-y-1">
+          <div className="font-mono break-all">{endpoint}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            <CopyButton value={endpoint} label="Copy endpoint" />
+          </div>
         </dd>
         <dt className="text-muted-foreground">Public key</dt>
-        <dd className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</dd>
-        <dd className="flex items-center gap-2">
-          {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
-          {canRotate && (
-          <Button
-            size="xs"
-            variant="outline"
-            disabled={rotateReason !== null}
-            aria-describedby={rotateReason ? reasonId : undefined}
-            onClick={() => setRotating(true)}
-          >
-            Rotate public key
-          </Button>
-          )}
+        <dd className="min-w-0 space-y-1">
+          <div className="font-mono break-all">{publicKey ? (publicKey.key ?? `${publicKey.prefix}…`) : "—"}</div>
+          <div className="flex flex-wrap items-center gap-2">
+            {publicKey?.key && <CopyButton value={publicKey.key} label="Copy public key" />}
+            {canRotate && (
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={rotateReason !== null}
+                aria-describedby={rotateReason ? reasonId : undefined}
+                onClick={() => setRotating(true)}
+              >
+                Rotate public key
+              </Button>
+            )}
+          </div>
         </dd>
       </dl>
-      {rotateReason && (
+      {keysError && (
+        <p role="alert" className="text-destructive">
+          {keysError}
+        </p>
+      )}
+      {/* Why Rotate is disabled: only where there is a Rotate button. */}
+      {canRotate && rotateReason && (
         <p id={reasonId} className="text-xs text-muted-foreground">
           {rotateReason}
         </p>
@@ -124,17 +146,28 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
               Cancel
             </Button>
           </div>
+          {rotateError && (
+            <p role="alert" className="text-destructive">
+              {rotateError}
+            </p>
+          )}
         </div>
       )}
-      {databases !== null && databases.length > 0 && pickedDb && (
-        <DataApiDatabases
-          databaseId={databaseId}
-          branchId={branchId}
-          databases={databases}
-          picked={pickedDb.name}
-          onPick={setPickedName}
-        />
+    </>
+  );
+}
+
+/** Whether the data API serves the picked Postgres database, and which databases the public key reaches. */
+export function DataApiExposure({ api }: { api: DataApi }) {
+  const { databaseId, branchId, pickedDb, publicKey, databases, dbError } = api;
+  return (
+    <>
+      {dbError && (
+        <p role="alert" className="text-destructive">
+          {dbError}
+        </p>
       )}
+      {pickedDb && <DataApiDatabases databaseId={databaseId} branchId={branchId} database={pickedDb} />}
       {publicKey && databases && (
         <section aria-label="Public key databases" className="space-y-1">
           <h4 className="text-muted-foreground">Public key databases</h4>
@@ -148,25 +181,44 @@ export function DataApiPanel({ databaseId, branch, apiUrl }: DataApiPanelProps) 
           />
         </section>
       )}
+    </>
+  );
+}
+
+/** The RLS warning for the served database's exposed tables (nothing while it has none). */
+export function DataApiRls({ api }: { api: DataApi }) {
+  return (
+    <>
+      {api.schemaError && (
+        <p role="alert" className="text-destructive">
+          {api.schemaError}
+        </p>
+      )}
+      {api.schema && <RlsWarning schema={api.schema} />}
+    </>
+  );
+}
+
+/** The secret keys (list, create, revoke), with the keys' load error. */
+export function DataApiSecretKeys({ api }: { api: DataApi }) {
+  const { databaseId, branchId, keys, databases, keysError: error } = api;
+  return (
+    <>
       {error && (
         <p role="alert" className="text-destructive">
           {error}
         </p>
       )}
       {keys === null && !error && <p className="text-muted-foreground">Loading keys…</p>}
-      {keys !== null && (
-        <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />
-      )}
-      {/* Downloading types is creating a key's access (Developer, by role). */}
-      {canRotate && databases !== null && (
-        <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} />
-      )}
-      {schemaError && (
-        <p role="alert" className="text-destructive">
-          {schemaError}
-        </p>
-      )}
-      {schema && <RlsWarning schema={schema} />}
-    </section>
+      {keys !== null && <DataApiKeys databaseId={databaseId} branchId={branchId} keys={keys} databases={databases ?? []} />}
+    </>
   );
+}
+
+/** Downloading types is creating a key's access (Developer, by role). */
+export function DataApiTypesFor({ api }: { api: DataApi }) {
+  const canDownload = useProjectCaps().atLeast("developer");
+  const { databaseId, branchId, databases, pickedDb } = api;
+  if (!canDownload || databases === null) return null;
+  return <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} defaultDatabase={pickedDb?.name} />;
 }

@@ -96,7 +96,6 @@ export function DataApiKeys({ databaseId, branchId, keys, databases }: DataApiKe
   const field = "h-8 border border-input bg-background px-2 text-sm";
   return (
     <div className="space-y-2">
-      <h3 className="text-sm font-medium">Secret keys</h3>
       {secrets.length === 0 ? (
         <p className="text-sm text-muted-foreground">No secret keys yet.</p>
       ) : (

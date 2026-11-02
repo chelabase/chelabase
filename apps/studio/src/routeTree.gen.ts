@@ -24,7 +24,9 @@ import { Route as AppMembersRouteImport } from './routes/app.members'
 import { Route as AppMembersMemberIdRouteImport } from './routes/app.members_.$memberId'
 import { Route as AppProjectsProjectIdRouteImport } from './routes/app.projects.$projectId'
 import { Route as AppMembersTeamsTeamIdRouteImport } from './routes/app.members_.teams.$teamId'
+import { Route as AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport } from './routes/app.data-api.{-$projectId}.{-$databaseId}.{-$branchId}.{-$pgDatabase}'
 import { Route as AppMembersRolesDatabaseIdBranchIdRoleRouteImport } from './routes/app.members_.roles.$databaseId.$branchId.$role'
+import { Route as AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport } from './routes/app.sql.{-$projectId}.{-$databaseId}.{-$branchId}.{-$pgDatabase}'
 import { Route as AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport } from './routes/app.projects.$projectId_.databases.$databaseId.merges.$mergeId'
 import { Route as AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125RouteImport } from './routes/app.tables.{-$projectId}.{-$databaseId}.{-$branchId}.{-$pgDatabase}.{-$schema}.{-$table}'
 
@@ -103,12 +105,28 @@ const AppMembersTeamsTeamIdRoute = AppMembersTeamsTeamIdRouteImport.update({
   path: '/members/teams/$teamId',
   getParentRoute: () => AppRoute,
 } as any)
+const AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route =
+  AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport.update(
+    {
+      id: '/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}',
+      path: '/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}',
+      getParentRoute: () => AppRoute,
+    } as any,
+  )
 const AppMembersRolesDatabaseIdBranchIdRoleRoute =
   AppMembersRolesDatabaseIdBranchIdRoleRouteImport.update({
     id: '/members_/roles/$databaseId/$branchId/$role',
     path: '/members/roles/$databaseId/$branchId/$role',
     getParentRoute: () => AppRoute,
   } as any)
+const AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route =
+  AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport.update(
+    {
+      id: '/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}',
+      path: '/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}',
+      getParentRoute: () => AppRoute,
+    } as any,
+  )
 const AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute =
   AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRouteImport.update({
     id: '/projects/$projectId_/databases/$databaseId/merges/$mergeId',
@@ -140,7 +158,9 @@ export interface FileRoutesByFullPath {
   '/app/members/$memberId': typeof AppMembersMemberIdRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/members/teams/$teamId': typeof AppMembersTeamsTeamIdRoute
+  '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/members/roles/$databaseId/$branchId/$role': typeof AppMembersRolesDatabaseIdBranchIdRoleRoute
+  '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
   '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}': typeof AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route
 }
@@ -159,7 +179,9 @@ export interface FileRoutesByTo {
   '/app/members/$memberId': typeof AppMembersMemberIdRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/members/teams/$teamId': typeof AppMembersTeamsTeamIdRoute
+  '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/members/roles/$databaseId/$branchId/$role': typeof AppMembersRolesDatabaseIdBranchIdRoleRoute
+  '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/projects/$projectId/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
   '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}': typeof AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route
 }
@@ -180,7 +202,9 @@ export interface FileRoutesById {
   '/app/members_/$memberId': typeof AppMembersMemberIdRoute
   '/app/projects/$projectId': typeof AppProjectsProjectIdRoute
   '/app/members_/teams/$teamId': typeof AppMembersTeamsTeamIdRoute
+  '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/members_/roles/$databaseId/$branchId/$role': typeof AppMembersRolesDatabaseIdBranchIdRoleRoute
+  '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': typeof AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId': typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
   '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}': typeof AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route
 }
@@ -202,7 +226,9 @@ export interface FileRouteTypes {
     | '/app/members/$memberId'
     | '/app/projects/$projectId'
     | '/app/members/teams/$teamId'
+    | '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/members/roles/$databaseId/$branchId/$role'
+    | '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
     | '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}'
   fileRoutesByTo: FileRoutesByTo
@@ -221,7 +247,9 @@ export interface FileRouteTypes {
     | '/app/members/$memberId'
     | '/app/projects/$projectId'
     | '/app/members/teams/$teamId'
+    | '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/members/roles/$databaseId/$branchId/$role'
+    | '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/projects/$projectId/databases/$databaseId/merges/$mergeId'
     | '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}'
   id:
@@ -241,7 +269,9 @@ export interface FileRouteTypes {
     | '/app/members_/$memberId'
     | '/app/projects/$projectId'
     | '/app/members_/teams/$teamId'
+    | '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/members_/roles/$databaseId/$branchId/$role'
+    | '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
     | '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId'
     | '/app/tables/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}/{-$schema}/{-$table}'
   fileRoutesById: FileRoutesById
@@ -365,11 +395,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppMembersTeamsTeamIdRouteImport
       parentRoute: typeof AppRoute
     }
+    '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': {
+      id: '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      path: '/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      fullPath: '/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      preLoaderRoute: typeof AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport
+      parentRoute: typeof AppRoute
+    }
     '/app/members_/roles/$databaseId/$branchId/$role': {
       id: '/app/members_/roles/$databaseId/$branchId/$role'
       path: '/members/roles/$databaseId/$branchId/$role'
       fullPath: '/app/members/roles/$databaseId/$branchId/$role'
       preLoaderRoute: typeof AppMembersRolesDatabaseIdBranchIdRoleRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}': {
+      id: '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      path: '/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      fullPath: '/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}'
+      preLoaderRoute: typeof AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125RouteImport
       parentRoute: typeof AppRoute
     }
     '/app/projects/$projectId_/databases/$databaseId/merges/$mergeId': {
@@ -396,7 +440,9 @@ interface AppRouteChildren {
   AppMembersMemberIdRoute: typeof AppMembersMemberIdRoute
   AppProjectsProjectIdRoute: typeof AppProjectsProjectIdRoute
   AppMembersTeamsTeamIdRoute: typeof AppMembersTeamsTeamIdRoute
+  AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route: typeof AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   AppMembersRolesDatabaseIdBranchIdRoleRoute: typeof AppMembersRolesDatabaseIdBranchIdRoleRoute
+  AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route: typeof AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route
   AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute: typeof AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute
   AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route: typeof AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route
 }
@@ -408,8 +454,12 @@ const AppRouteChildren: AppRouteChildren = {
   AppMembersMemberIdRoute: AppMembersMemberIdRoute,
   AppProjectsProjectIdRoute: AppProjectsProjectIdRoute,
   AppMembersTeamsTeamIdRoute: AppMembersTeamsTeamIdRoute,
+  AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route:
+    AppDataApiChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route,
   AppMembersRolesDatabaseIdBranchIdRoleRoute:
     AppMembersRolesDatabaseIdBranchIdRoleRoute,
+  AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route:
+    AppSqlChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Route,
   AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute:
     AppProjectsProjectIdDatabasesDatabaseIdMergesMergeIdRoute,
   AppTablesChar123ProjectIdChar125Char123DatabaseIdChar125Char123BranchIdChar125Char123PgDatabaseChar125Char123SchemaChar125Char123TableChar125Route:

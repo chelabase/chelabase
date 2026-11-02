@@ -1,11 +1,12 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import { closeBrackets } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap, indentWithTab } from "@codemirror/commands";
-import { bracketMatching, indentOnInput } from "@codemirror/language";
+import { bracketMatching, HighlightStyle, indentOnInput, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter } from "@codemirror/lint";
 import { highlightSelectionMatches, searchKeymap } from "@codemirror/search";
 import { Compartment, EditorState, Prec, StateEffect, StateField, type Extension } from "@codemirror/state";
 import { Decoration, type DecorationSet, drawSelection, EditorView, highlightActiveLine, keymap, lineNumbers } from "@codemirror/view";
+import { tags as t } from "@lezer/highlight";
 
 /** What the next run sends: the selection when there is one, else the whole buffer. */
 export type RunText = { text: string; from: number };
@@ -53,7 +54,7 @@ const errorField = StateField.define<{ pos: number | null; deco: DecorationSet }
 
 // `dark: true`: Studio's ground is dark, so CodeMirror's base theme must use its dark caret,
 // active-line and selection colours (the light ones give a black caret and pale washes under chalk text).
-const SELECTION = "rgb(242 199 163 / 0.25)";
+const SELECTION = "color-mix(in srgb, var(--sand) 25%, transparent)";
 
 const theme = EditorView.theme(
   {
@@ -67,9 +68,27 @@ const theme = EditorView.theme(
     // drawSelection() makes the native selection transparent, but its glyph colour still comes from the global
     // ::selection (ink, 1.9:1 on the sand tint): keep selected text chalk, with no native background of its own.
     ".cm-content ::selection, .cm-content::selection": { color: "var(--foreground)", backgroundColor: "transparent" },
+    // The dark base theme's active line and selection matches are cyan washes: use warm chalk instead.
+    "&.cm-editor .cm-line.cm-activeLine": { backgroundColor: "color-mix(in srgb, var(--chalk) 5%, transparent)" },
+    "&.cm-editor .cm-selectionMatch": { backgroundColor: "color-mix(in srgb, var(--chalk) 12%, transparent)" },
+    "&.cm-editor .cm-cursor": { borderLeftColor: "var(--chalk)" },
+    "&.cm-editor .cm-matchingBracket": { backgroundColor: "color-mix(in srgb, var(--sand) 20%, transparent)", color: "inherit" },
   },
   { dark: true },
 );
+
+// Syntax colours from the design palette, so they follow the theme's tokens.
+const highlight = HighlightStyle.define([
+  { tag: [t.keyword, t.operatorKeyword, t.modifier], color: "var(--sand)" },
+  // lang-sql tags "quoted identifiers" special(string): they are names, so they stay chalk.
+  { tag: t.special(t.string), color: "var(--chalk)" },
+  { tag: t.string, color: "var(--palm)" },
+  { tag: [t.number, t.bool, t.null], color: "var(--method-patch)" },
+  { tag: [t.typeName, t.standard(t.name)], color: "var(--seafoam)" },
+  { tag: [t.function(t.variableName), t.special(t.name)], color: "var(--method-get)" },
+  { tag: [t.lineComment, t.blockComment, t.comment], color: "var(--chalk-dim)", fontStyle: "italic" },
+  { tag: [t.operator, t.punctuation, t.bracket], color: "var(--chalk-dim)" },
+]);
 
 /** CodeMirror 6 used directly (no React wrapper). `extensions` may change over the editor's life. */
 export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function CodeEditor({ initialDoc, extensions, onChange, onRun, label = "SQL editor" }, ref) {
@@ -100,6 +119,7 @@ export const CodeEditor = forwardRef<CodeEditorHandle, CodeEditorProps>(function
           keymap.of([...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
           errorField,
           theme,
+          syntaxHighlighting(highlight),
           language.current.of(extensions),
           EditorView.contentAttributes.of({ "aria-label": label }),
           EditorView.updateListener.of((u) => u.docChanged && onChangeRef.current(u.state.doc.toString())),

@@ -35,7 +35,7 @@ export function Dashboard({ onLoaded }: DashboardProps) {
   const restarting = me.error?.signInRestarted === true;
 
   return (
-    <div className="mx-auto max-w-4xl space-y-8 p-8">
+    <div className="mx-auto max-w-6xl space-y-8 p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : me.data === undefined ? (

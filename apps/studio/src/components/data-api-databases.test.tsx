@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { getListBranchDatabasesQueryKey, type BranchDatabaseView } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
-import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
+import { DataApiDatabases, DatabasePicker, KeyDatabases } from "./data-api-databases";
 
 const row = (name: string, over: Partial<BranchDatabaseView> = {}): BranchDatabaseView => ({
   name,
@@ -34,22 +34,19 @@ const noContent: FakeHandler = () => new Response(null, { status: 204 });
 
 function setup(picked: string, routes: Record<string, FakeHandler> = {}) {
   const f = fakeFetch(routes);
-  const onPick = vi.fn();
   const result = renderWithQuery(
-    <DataApiDatabases databaseId="db" branchId="br" databases={dbs} picked={picked} onPick={onPick} />,
+    <DataApiDatabases databaseId="db" branchId="br" database={dbs.find((d) => d.name === picked)!} />,
     { fetch: f },
   );
-  return { ...result, fetch: f, onPick };
+  return { ...result, fetch: f };
 }
 const find = (f: FakeFetch, r: string) => f.calls.find((c) => route(c) === r);
 
-describe("DataApiDatabases", () => {
-  it("databases_list_shows_states_and_enable", async () => {
-    const { fetch, queryClient, onPick } = setup("later", {
-      [ENABLE("later")]: () => jsonResponse(row("later", { data_api: "enabling" }), 202),
-    });
-    queryClient.setQueryData(getListBranchDatabasesQueryKey("db", "br"), dbs);
-    const picker = screen.getByLabelText("Database") as HTMLSelectElement;
+describe("DatabasePicker", () => {
+  it("lists_each_database_with_its_state", async () => {
+    const onPick = vi.fn();
+    renderWithQuery(<DatabasePicker label="Postgres DB" databases={dbs} value="later" onPick={onPick} />);
+    const picker = screen.getByLabelText("Postgres DB") as HTMLSelectElement;
     expect(Array.from(picker.options).map((o) => o.text)).toEqual([
       "web1 (main) · Served",
       "app · Served",
@@ -58,8 +55,20 @@ describe("DataApiDatabases", () => {
       "broken · Error",
       "postgres (System) · Not served",
     ]);
+    expect(picker).toHaveValue("later");
     await userEvent.selectOptions(picker, "app");
     expect(onPick).toHaveBeenCalledWith("app");
+  });
+});
+
+describe("DataApiDatabases", () => {
+  it("shows_the_picked_databases_state_and_enable", async () => {
+    const { fetch, queryClient } = setup("later", {
+      [ENABLE("later")]: () => jsonResponse(row("later", { data_api: "enabling" }), 202),
+    });
+    queryClient.setQueryData(getListBranchDatabasesQueryKey("db", "br"), dbs);
+    expect(screen.queryByRole("combobox")).toBeNull();
+    expect(screen.getByText("later")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Enable data API" }));
     await waitFor(() => expect(find(fetch, ENABLE("later"))).toBeDefined());
     await waitFor(() =>

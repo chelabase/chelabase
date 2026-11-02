@@ -71,6 +71,10 @@ export function buildCrumbs(pathname: string, params: CrumbParams, labels: Crumb
     ]);
   }
 
+  if (pathname === "/app/sql" || pathname.startsWith("/app/sql/")) return [{ key: "sql", label: "SQL editor" }];
+
+  if (pathname === "/app/data-api" || pathname.startsWith("/app/data-api/")) return [{ key: "data-api", label: "Data API" }];
+
   if (pathname === "/app/api" || pathname.startsWith("/app/api/")) return [{ key: "api", label: "API" }];
 
   if (pathname === "/app/members" || pathname.startsWith("/app/members/")) {

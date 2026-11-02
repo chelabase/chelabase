@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { act, screen } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { MeResponse as Me, ProjectInfo } from "@chelabase/management-client";
@@ -84,6 +84,16 @@ describe("ProjectPage", () => {
     expect(screen.getByText("web1")).toBeInTheDocument();
     expect(screen.getByText("127.0.0.1:49153")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create database" })).toBeInTheDocument();
+  });
+
+  it("offers a ready database's row no Connection details button", async () => {
+    setup({});
+    await screen.findByText("web1");
+    for (const name of ["Reset password", "Delete", "Branches", "Merges", "Connect"]) {
+      expect(screen.getByRole("button", { name })).toBeInTheDocument();
+    }
+    expect(screen.getByRole("link", { name: "Open" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Connection details" })).toBeNull();
   });
 
   it("fs3_databases_table_scrolls_inside_a_relative_frame", async () => {
@@ -210,31 +220,50 @@ describe("ProjectPage", () => {
     expect(screen.queryByRole("table", { name: "Merges" })).toBeNull();
   });
 
-  it("opens the Data API view of a database, switching with Branches", async () => {
+  it("database_row_buttons_are_branches_merges_connect_open", async () => {
     setup({});
-    await userEvent.click(await screen.findByRole("button", { name: "Data API" }));
-    expect(await screen.findByText("http://gw/data/v1/query")).toBeInTheDocument();
+    const row = (await screen.findByRole("cell", { name: "web1" })).closest("tr") as HTMLElement;
+    const names = within(row)
+      .getAllByRole("button")
+      .map((b) => b.textContent);
+    const link = within(row).getByRole("link", { name: /^Open/ });
+    expect(names.slice(names.indexOf("Branches"))).toEqual(["Branches", "Merges", "Connect"]);
+    expect(link).toHaveAttribute("href", "/app/tables/p1/d1");
+    // Connect precedes Open in the row.
+    expect(within(row).getByRole("button", { name: "Connect" }).compareDocumentPosition(link) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    for (const gone of ["Data API", "SQL", "Tables"]) {
+      expect(within(row).queryByRole("button", { name: gone })).toBeNull();
+      expect(within(row).queryByRole("link", { name: gone })).toBeNull();
+    }
+  });
+
+  it("connect_toggles_the_panel_and_switches_with_branches", async () => {
+    setup({});
+    const connect = await screen.findByRole("button", { name: "Connect" });
+    expect(connect).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(connect);
+    expect(connect).toHaveAttribute("aria-expanded", "true");
+    expect(await screen.findByRole("heading", { name: "Connect to web1" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Branches" }));
     expect(await screen.findByText("0 of 5 branches")).toBeInTheDocument();
-    expect(screen.queryByText("http://gw/data/v1/query")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Connect to web1" })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(await screen.findByRole("heading", { name: "Connect to web1" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Connect" }));
+    expect(screen.queryByRole("heading", { name: "Connect to web1" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Connect" })).toHaveAttribute("aria-expanded", "false");
   });
 
-  it("tables_links_to_the_table_editor", async () => {
-    setup({});
-    expect(await screen.findByRole("link", { name: "Tables" })).toHaveAttribute("href", "/app/tables/p1/d1");
-  });
-
-  it("opens the SQL editor of a database", async () => {
-    setup({
-      "GET /v1/databases/d1/branches/b-main/databases": () =>
-        jsonResponse([{ name: "app", main: true, data_api: "on", data_api_error: null, default_schema: "public", origin: "main", owner: "o" }]),
-      "GET /v1/databases/d1/branches/b-main/roles": () => jsonResponse([]),
-      "GET /v1/databases/d1/branches/b-main/sql/schema": () => jsonResponse({}),
-      "GET /v1/databases/d1/sql-queries": () => jsonResponse([]),
-    });
-    await userEvent.click(await screen.findByRole("button", { name: "SQL" }));
-    expect(await screen.findByLabelText("Run as", {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(screen.getByText("Running as owner: row-level security is bypassed.")).toBeInTheDocument();
+  it("not_ready_database_disables_connect_and_open", async () => {
+    const starting = { ...database, status: "creating", host: null, port: null };
+    const meStarting: Me = {
+      ...me,
+      tenant: { ...me.tenant!, projects: [{ ...me.tenant!.projects[0]!, databases: [starting] }] },
+    } as Me;
+    setup({ "GET /v1/me": ok(meStarting) });
+    expect(await screen.findByRole("button", { name: "Connect" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Open/ })).toBeDisabled();
+    expect(screen.queryByRole("link", { name: /^Open/ })).toBeNull();
   });
 
   it("access_tab_is_in_the_strip", async () => {

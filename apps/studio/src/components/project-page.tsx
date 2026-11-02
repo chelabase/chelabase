@@ -1,4 +1,4 @@
-import { Fragment, lazy, Suspense, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useOverflowFocusable } from "@/lib/use-overflow-focusable";
 import { Link } from "@tanstack/react-router";
 import {
@@ -20,16 +20,13 @@ import { pollWhile, TRANSITIONAL } from "@/lib/query";
 import { CreateDatabaseForm } from "./create-database-form";
 import { DatabaseActions } from "./database-actions";
 import { DatabaseBranches } from "./database-branches";
-import { DatabaseDataApi } from "./database-data-api";
+import { ConnectPanel } from "./connect-panel";
 
 import { NO_ACCESS_POLL_MS, NoAccess } from "./no-access";
 import { MergesList } from "./merges/merges-list";
 import { AccessTab } from "./project-access/access-tab";
 import { ProjectSettings } from "./project-settings";
 import { UsersTab } from "./users-tab";
-
-// The editor, CodeMirror and the pgls worker load only when a SQL view opens.
-const SqlEditor = lazy(() => import("./sql-editor/sql-editor").then((m) => ({ default: m.SqlEditor })));
 
 const pollDatabases = pollWhile<Me>((m) =>
   (m.tenant?.projects ?? []).some((p) => p.databases.some((d) => TRANSITIONAL.has(d.status))),
@@ -94,7 +91,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   // A member with no project at all sees the no-access screen here too, not a 403 (Q9).
   if (me.data && noAccess(me.data)) {
     return (
-      <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
+      <div className="mx-auto max-w-6xl space-y-8 p-4 sm:p-8">
         <NoAccess me={me.data} checking={me.isFetching} onCheck={() => void me.refetch()} />
       </div>
     );
@@ -109,7 +106,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
 
   return (
     <ProjectCapsContext.Provider value={caps}>
-    <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
+    <div className="mx-auto max-w-6xl space-y-8 p-4 sm:p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : gone ? (
@@ -189,7 +186,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   );
 }
 
-type DatabaseView = "branches" | "merges" | "data-api" | "sql";
+type DatabaseView = "branches" | "merges" | "connect";
 
 function DatabasesTable({
   projectId,
@@ -231,7 +228,6 @@ function DatabasesTable({
           // Each database is shown with what the caller may do there: the project's caps, or the
           // narrower ones of an override on that database.
           const dbCaps = projectCaps(me, projectId, db.database_id);
-          const canSql = dbCaps.atLeast("developer");
           return (
           <ProjectCapsContext.Provider key={db.database_id} value={dbCaps}>
           <Fragment>
@@ -264,10 +260,10 @@ function DatabasesTable({
                     size="sm"
                     variant="outline"
                     disabled={db.status !== "ready"}
-                    aria-expanded={open?.id === db.database_id && open.view === "data-api"}
-                    onClick={() => toggle(db.database_id, "data-api")}
+                    aria-expanded={open?.id === db.database_id && open.view === "connect"}
+                    onClick={() => toggle(db.database_id, "connect")}
                   >
-                    Data API
+                    Connect
                   </Button>
                   {db.status === "ready" ? (
                     <Link
@@ -275,23 +271,11 @@ function DatabasesTable({
                       params={{ projectId, databaseId: db.database_id }}
                       className={buttonVariants({ size: "sm", variant: "outline" })}
                     >
-                      Tables
+                      Open
                     </Link>
                   ) : (
                     <Button size="sm" variant="outline" disabled>
-                      Tables
-                    </Button>
-                  )}
-                  {/* The SQL editor needs Developer; Viewers read through Tables. */}
-                  {canSql && (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      disabled={db.status !== "ready"}
-                      aria-expanded={open?.id === db.database_id && open.view === "sql"}
-                      onClick={() => toggle(db.database_id, "sql")}
-                    >
-                      SQL
+                      Open
                     </Button>
                   )}
                 </div>
@@ -309,12 +293,8 @@ function DatabasesTable({
                     />
                   ) : open.view === "merges" ? (
                     <MergesList projectId={projectId} databaseId={db.database_id} />
-                  ) : open.view === "sql" && canSql ? (
-                    <Suspense fallback={<p className="py-3 text-sm text-muted-foreground">Loading the editor…</p>}>
-                      <SqlEditor databaseId={db.database_id} />
-                    </Suspense>
                   ) : (
-                    <DatabaseDataApi apiUrl={apiUrl} database={db} />
+                    <ConnectPanel projectId={projectId} apiUrl={apiUrl} database={db} />
                   )}
                   </div>
                 </td>

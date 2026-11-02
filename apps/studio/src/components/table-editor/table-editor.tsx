@@ -1,34 +1,21 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
 import { Tabs as TabsPrimitive } from "@base-ui/react/tabs";
-import { useQueryClient } from "@tanstack/react-query";
-import {
-  useGetDatabase,
-  useGetMe,
-  useListBranchDatabases,
-  useListBranches,
-  useListObjects,
-  useListProjects,
-  useListRoles,
-  type Branch,
-  type ObjectSummary,
-  type Project,
-} from "@chelabase/management-client";
+import { useListObjects, type ObjectSummary } from "@chelabase/management-client";
 import { useCrumbLabel } from "@/components/app-shell/crumbs";
 import { HeaderContext } from "@/components/app-shell/header-context";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { DATA_API_ROLES, actAsRoles, actingCaps, dataApiActAs, projectCaps, type ProjectCaps } from "@/lib/capabilities";
-import { isTransitional } from "@/lib/branches";
+import { useFillViewport } from "@/lib/use-fill-viewport";
+import { actingCaps } from "@/lib/capabilities";
 import { pageSizeFor } from "@/lib/console";
-import { pollWhile } from "@/lib/query";
 import { errorText } from "@/lib/errors";
-import { useRealtime } from "@/lib/realtime/context";
-import { fallbackInterval, invalidateAll, invalidateForEvent } from "@/lib/realtime/events";
 import { rowAccess, structureAccess } from "@/lib/table-editor/access";
 import { changesetKey } from "@/lib/table-editor/changeset";
-import { branchTree, editorPath, readLast, resolveParams, writeLast, type EditorParams, type Resolution } from "@/lib/table-editor/context";
+import { editorPath, readLast, resolveParams, writeLast, type EditorParams, type Resolution } from "@/lib/table-editor/context";
 import { formatBytes } from "@/lib/table-editor/dry-run";
+import type { PglsClient } from "@/lib/pgls/client";
 import { TableEditorStoreContext, createTableEditorStore, useTableEditor } from "@/lib/table-editor/store";
+import { usePlace } from "@/lib/table-editor/use-place";
 import { ContextBar } from "./context-bar";
 import { DiscardPrompt, EditorPanel, reviewLabel } from "./panel";
 import { RlsBanner } from "./rls-banner";
@@ -37,11 +24,19 @@ import { NewTableView } from "./new-table";
 import { StructureView } from "./structure-view";
 import { TableList } from "./table-list";
 import { TypesView } from "./types-view";
+import { SqlDrawer, type SqlDrawerProps } from "./sql-drawer";
 import type { TableTarget } from "./target";
 
 export interface TableEditorProps {
   params: EditorParams;
-  navigate: (p: EditorParams, opts?: { replace?: boolean }) => void;
+  /** `sql` opens or closes the SQL drawer (the URL's `?sql=1`); left out, the drawer stays as it is. */
+  navigate: (p: EditorParams, opts?: { replace?: boolean; sql?: boolean }) => void;
+  /** The SQL drawer is open (`?sql=1`). */
+  sql?: boolean;
+  /** The SQL tab at this place (the drawer's Full editor, and SQL on a narrow screen). */
+  openSqlEditor?: (p: EditorParams) => void;
+  /** Starts the drawer's pgls worker (tests inject a fake). */
+  createSqlClient?: () => Promise<PglsClient>;
   /** Rendered inside the editor's store (the route's blocker for a dirty row draft); the editor stays router-free. */
   leaveGuard?: ComponentType;
 }
@@ -54,28 +49,6 @@ const NOT_FOUND: Record<Extract<Resolution, { kind: "not_found" }>["level"], str
   schema: "Schema",
   table: "Table",
 };
-
-/**
- * The projects with their databases. `/v1/projects` lists the projects; the caller's databases
- * per project come with `/v1/me` (`tenant.projects`). Absent until both have loaded.
- */
-function withDatabases(list: ProjectInfoLike[] | undefined, me: { tenant: { projects: Project[] } | null } | undefined): Project[] | undefined {
-  if (!list || !me) return undefined;
-  const mine = new Map((me.tenant?.projects ?? []).map((p) => [p.id, p]));
-  return list.map((p) => ({ ...p, databases: mine.get(p.id)?.databases ?? p.databases ?? [] }) as Project);
-}
-type ProjectInfoLike = { id: string; name: string; slug: string; status: Project["status"]; databases?: Project["databases"] };
-
-/**
- * Act as's roles with the data API's last (the default stays the first role of the caller's own):
- * `anon` and `authenticated` only when the grant names them (or a granted role's chain reaches
- * them), even when the branch's role list doesn't show them (R18: an Admin's every role doesn't
- * hold them).
- */
-function withDataApiRoles(caps: ProjectCaps, allowed: { owner: boolean; roles: string[] }) {
-  const api: string[] = DATA_API_ROLES.filter((r) => dataApiActAs(caps).includes(r) || allowed.roles.includes(r));
-  return { owner: allowed.owner, roles: [...allowed.roles.filter((r) => !api.includes(r)), ...api] };
-}
 
 function browserStorage(kind: "local" | "session"): Storage | null {
   try {
@@ -99,94 +72,22 @@ export function TableEditor(props: TableEditorProps) {
   );
 }
 
-/**
- * The height that fills the viewport below the element's top (the shell header's height isn't
- * hard-coded here): measured on mount and on resize.
- */
-function useFillViewport() {
-  const ref = useRef<HTMLDivElement>(null);
-  const [top, setTop] = useState<number | null>(null);
-  useLayoutEffect(() => {
-    const measure = () => {
-      const el = ref.current;
-      if (el) setTop(Math.max(0, el.getBoundingClientRect().top + window.scrollY));
-    };
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, []);
-  return { ref, style: top === null ? undefined : { height: `calc(100dvh - ${top}px)` } };
-}
+/** Below the 40rem breakpoint SQL opens the full editor: there is no room for a drawer. */
+const narrow = () => typeof window.matchMedia === "function" && window.matchMedia("(width < 40rem)").matches;
 
-/**
- * The project's `project:` channel (§5.3): its events invalidate exactly the queries they concern;
- * a rejoin after a reconnect, or a `resync`, invalidates everything the editor shows. True while joined.
- */
-function useProjectChannel(projectId: string | undefined, databaseId: string | undefined, branchId: string | undefined): boolean {
-  const realtime = useRealtime();
-  const queryClient = useQueryClient();
-  const [live, setLive] = useState(false);
-  const scope = useRef({ databaseId: "", branchId: "" });
-  scope.current = { databaseId: databaseId ?? "", branchId: branchId ?? "" };
-  useEffect(() => {
-    if (!realtime || !projectId) return;
-    let joinedBefore = false;
-    const sub = realtime.joinProject(projectId, {
-      onEvent: (event) => invalidateForEvent(queryClient, event),
-      onResync: () => invalidateAll(queryClient, scope.current),
-      onLive: (next) => {
-        setLive(next);
-        if (!next) return;
-        // Events may have been missed while the socket was down.
-        if (joinedBefore) invalidateAll(queryClient, scope.current);
-        joinedBefore = true;
-      },
-      onError: () => setLive(false),
-    });
-    return () => {
-      sub.leave();
-      setLive(false);
-    };
-  }, [realtime, projectId, queryClient]);
-  return live;
-}
-
-function Editor({ params, navigate }: TableEditorProps) {
+function Editor({ params, navigate, sql = false, openSqlEditor, createSqlClient }: TableEditorProps) {
   const fill = useFillViewport();
   // The last place, read once: it only matters for the levels this visit leaves out.
   const [last] = useState(() => readLast(browserStorage("local")));
-  // P10: while the project channel is live, events drive the refetches and a slow poll is the fallback.
-  const projectLive = useProjectChannel(params.projectId, params.databaseId, params.branchId);
-  const me = useGetMe({ query: { refetchInterval: fallbackInterval(projectLive, false) } });
-  const projectList = useListProjects();
-  const projects = withDatabases(projectList.data, me.data);
-  const project = projects?.find((p) => p.id === params.projectId);
-  const databaseOk = !!params.databaseId && !!project?.databases.some((d) => d.database_id === params.databaseId);
-  const databaseId = databaseOk ? params.databaseId! : "";
-  const detail = useGetDatabase(databaseId, { query: { enabled: databaseOk } });
-  // Only a branch created here is polled until it settles; opening the Branch picker refetches the list.
-  // While live, branch events invalidate the list instead (the slow poll stays as the fallback).
-  const [createdBranchId, setCreatedBranchId] = useState<string | null>(null);
-  const settling = pollWhile<Branch[]>((bs) => bs.some((b) => b.id === createdBranchId && isTransitional(b)));
-  const branches = useListBranches(databaseId, {
-    query: {
-      enabled: databaseOk,
-      refetchInterval: (query) => fallbackInterval(projectLive, settling(query)),
-    },
-  });
-  const branch = branches.data?.find((b) => b.id === params.branchId);
-  const branchOk = databaseOk && !!branch && branchTree(branches.data ?? []).some((r) => r.branch.id === branch.id);
-  const branchId = branchOk ? params.branchId! : "";
-  const pgDatabases = useListBranchDatabases(databaseId, branchId, { query: { enabled: branchOk } });
-  // The system database (`postgres`) is the platform's: the table API refuses it, so it isn't offered (M2).
-  const pgList = pgDatabases.data?.filter((d) => d.origin !== "system");
-  const pg = pgList?.find((d) => d.name === params.pgDatabase);
+  const place = usePlace(params);
+  const { me, projectList, projects, databaseOk, detail, branches, branch, branchOk, pgDatabases, pgList, pg, roles, caps, allowed, actAs, actAsReady, rolesError } = place;
   // The branch's main database is addressed without a name (P9).
   const pgParam = pg && !pg.main ? pg.name : undefined;
+  const databaseId = databaseOk ? params.databaseId! : "";
+  const branchId = branchOk ? params.branchId! : "";
   const objects = useListObjects(databaseId, branchId, pgParam ? { database: pgParam } : undefined, {
     query: { enabled: branchOk && !!pg },
   });
-  const roles = useListRoles(databaseId, branchId, { query: { enabled: branchOk } });
 
   const resolution = resolveParams(params, last, {
     projects,
@@ -208,21 +109,10 @@ function Editor({ params, navigate }: TableEditorProps) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ready, currentPath]);
 
-  const caps = projectCaps(me.data, params.projectId ?? "", params.databaseId);
-  const actAsKey = `${params.databaseId}/${params.branchId}`;
-  const picked = useTableEditor((s) => s.actAs[actAsKey]);
-  const setActAs = useTableEditor((s) => s.setActAs);
   // Leaving the table (another table, branch, database, project, an FK link) or switching Act as remounts the row
   // panel: an unsaved draft is asked about first.
   const guardDiscard = useTableEditor((s) => s.guardDiscard);
   const go = (p: EditorParams) => guardDiscard(() => navigate(p));
-  // A roles error degrades to no roles (the owner stays for an Admin); the error shows by Act as.
-  const allowed = withDataApiRoles(caps, actAsRoles(caps, roles.isSuccess ? roles.data : []));
-  // The chosen role while the caller may still act as it, else the owner (Admin) or the first allowed role.
-  const chosenOk = picked === null ? allowed.owner : picked !== undefined && allowed.roles.includes(picked);
-  const actAs = chosenOk ? picked! : allowed.owner ? null : (allowed.roles[0] ?? null);
-  const actAsReady = branchOk && me.isSuccess && (roles.isSuccess || roles.isError);
-  const rolesError = branchOk && roles.isError ? errorText(roles.error) : null;
 
   const error = projectList.error ?? me.error ?? branches.error ?? pgDatabases.error ?? objects.error;
   // Write controls follow the level of the role acted as (D1), not the project's alone.
@@ -231,9 +121,7 @@ function Editor({ params, navigate }: TableEditorProps) {
   const structureReason = structure && !structure.allowed ? structure.reason : null;
   // Dry runs and previews are sent as the act-as role: none goes out before that role is known
   // (it would go as the owner), nor when there is no role to act as.
-  const dryRunReason =
-    structureReason ??
-    (!actAsReady ? "Loading roles…" : !allowed.owner && actAs === null ? "You can't act as any Postgres role here." : null);
+  const dryRunReason = structureReason ?? place.actAsReason;
   const rows = pg ? rowAccess(actedCaps, { owner: allowed.owner && actAs === null, roles: actAs ? [actAs] : [] }, pg) : null;
   const object = objects.data?.objects?.find((o) => o.schema === current.schema && o.name === current.table);
   useCrumbLabel("table", object ? current.table : undefined, current.table);
@@ -279,6 +167,45 @@ function Editor({ params, navigate }: TableEditorProps) {
   }, [viewScope, setView]);
   const pageSize = detail.isPending ? null : pageSizeFor(detail.data?.max_rows);
   const exactRows = useTableEditor((s) => (target ? (s.exactRows[target.key] ?? null) : null));
+
+  // The SQL drawer: Developer and up, once the place is known, and never below 40rem (no room; SQL opens the full
+  // editor there, and a `?sql=1` link shows the table alone). Leaving for the SQL tab asks about a row draft first.
+  const canSql = caps.atLeast("developer");
+  const drawerOpen = sql && canSql && !narrow();
+  const openFull = () => openSqlEditor && guardDiscard(() => openSqlEditor(current));
+  // Opening or closing the drawer stays at the URL's place: it never moves elsewhere past the row draft question.
+  const toggleSql = () => (narrow() ? openFull() : navigate(params, { sql: !sql, replace: true }));
+  // The drawer's place once it is known. While the next place resolves (another branch or Postgres database), the last
+  // one stays mounted with nothing to run, so a run in flight, its output and undo survive the switch.
+  const drawerShown = useRef<{ place: EditorParams; props: SqlDrawerProps } | null>(null);
+  if (drawerOpen && ready && branch && pg && current.databaseId && current.branchId) {
+    drawerShown.current = {
+      place: current,
+      props: {
+        databaseId: current.databaseId,
+        branchId: current.branchId,
+        branchName: branch.name,
+        branchProtected: branch.protected,
+        pg,
+        pgDatabases: (pgList ?? []).map((d) => d.name),
+        role: actAs,
+        allowed,
+        rolesReady: actAsReady,
+        onHints: ({ database, role }) =>
+          guardDiscard(() => {
+            if (role) place.setActAs(role);
+            if (database && database !== pg.name) navigate({ ...current, pgDatabase: database, schema: undefined, table: undefined });
+          }),
+        onFullEditor: openFull,
+        onClose: () => navigate(params, { sql: false, replace: true }),
+        createClient: createSqlClient,
+      },
+    };
+  } else if (!drawerOpen || ready || resolution.kind === "not_found" || drawerShown.current?.place.projectId !== params.projectId || drawerShown.current?.place.databaseId !== params.databaseId) {
+    drawerShown.current = null;
+  }
+  const shownDrawer = drawerShown.current;
+  const drawer = shownDrawer ? <SqlDrawer {...shownDrawer.props} rolesReady={ready && shownDrawer.props.rolesReady} /> : null;
 
   let main;
   if (resolution.kind === "not_found") {
@@ -357,11 +284,11 @@ function Editor({ params, navigate }: TableEditorProps) {
           branches={databaseOk ? branches.data : undefined}
           pgDatabases={branchOk ? pgList : undefined}
           actAs={actAsReady ? { owner: allowed.owner, roles: allowed.roles, selected: actAs } : undefined}
-          onActAs={(role) => guardDiscard(() => setActAs(actAsKey, role))}
+          onActAs={(role) => guardDiscard(() => place.setActAs(role))}
           rolesError={rolesError}
           historyWindow={detail.data?.history_window}
           onBranchesOpen={() => void branches.refetch()}
-          onBranchCreated={(b) => setCreatedBranchId(b.id)}
+          onBranchCreated={(b) => place.setCreatedBranchId(b.id)}
         />
       </HeaderContext>
       <TableList
@@ -370,8 +297,13 @@ function Editor({ params, navigate }: TableEditorProps) {
         objects={branchOk && pg ? objects.data?.objects : undefined}
         noDatabase={ready && !current.pgDatabase}
         exactRows={exactRows}
+        sql={canSql ? { open: drawerOpen, onToggle: toggleSql } : undefined}
       />
-      <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">{main}</div>
+      {/* The grid and the drawer share the filled height (the drawer's share is the store's `sqlHeight`). */}
+      <div className="flex min-w-0 flex-1 flex-col max-[40rem]:min-h-[24rem]">
+        <div className="flex min-h-0 flex-1 flex-col">{main}</div>
+        {drawer}
+      </div>
       <EditorPanel
         target={draftTarget ?? target}
         access={draftTarget ? null : rows}

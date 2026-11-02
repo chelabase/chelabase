@@ -39,40 +39,50 @@ const optionText = (d: BranchDatabaseView) =>
 export interface DataApiDatabasesProps {
   databaseId: string;
   branchId: string;
-  databases: BranchDatabaseView[];
-  picked: string;
-  onPick: (name: string) => void;
+  /** The picked Postgres database (the Connect panel's header picks it). */
+  database: BranchDatabaseView;
 }
 
-/** The branch's databases: a picker with each state, and the picked one's controls. */
-export function DataApiDatabases({ databaseId, branchId, databases, picked, onPick }: DataApiDatabasesProps) {
-  const current = databases.find((d) => d.name === picked) ?? databases[0];
+/** The picker for a branch's databases, each with its state. */
+export function DatabasePicker({
+  label,
+  databases,
+  value,
+  onPick,
+}: {
+  label: string;
+  databases: BranchDatabaseView[];
+  value: string;
+  onPick: (name: string) => void;
+}) {
   return (
-    <div className="space-y-2">
-      <label className="flex items-center gap-2">
-        <span>Database</span>
-        <select
-          value={current?.name ?? ""}
-          onChange={(e) => onPick(e.target.value)}
-          className="h-8 border border-input bg-background px-2 text-sm"
-        >
-          {databases.map((d) => (
-            <option key={d.name} value={d.name}>
-              {optionText(d)}
-            </option>
-          ))}
-        </select>
-      </label>
-      {current && (
-        <DatabaseControls
-          // A fresh form per database, and per saved schema.
-          key={`${current.name}/${current.default_schema}`}
-          databaseId={databaseId}
-          branchId={branchId}
-          database={current}
-        />
-      )}
-    </div>
+    <label className="flex items-center gap-2">
+      <span>{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onPick(e.target.value)}
+        className="h-8 border border-input bg-background px-2 text-sm"
+      >
+        {databases.map((d) => (
+          <option key={d.name} value={d.name}>
+            {optionText(d)}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+/** The picked database's data API: its state and, for an Admin, its controls. */
+export function DataApiDatabases({ databaseId, branchId, database }: DataApiDatabasesProps) {
+  return (
+    <DatabaseControls
+      // A fresh form per database, and per saved schema.
+      key={`${database.name}/${database.default_schema}`}
+      databaseId={databaseId}
+      branchId={branchId}
+      database={database}
+    />
   );
 }
 
