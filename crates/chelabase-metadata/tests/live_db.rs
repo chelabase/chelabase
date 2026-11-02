@@ -8485,7 +8485,8 @@ async fn members_unique_identity_user_per_tenant() {
     let second = uuid::Uuid::new_v4();
     sqlx::query(insert).bind(first).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await.unwrap();
     let dup = sqlx::query(insert).bind(second).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await;
-    sqlx::query("DELETE FROM members WHERE id = $1").bind(first).execute(pool).await.unwrap();
+    // Clean up both rows, so a duplicate that is wrongly accepted leaves nothing behind.
+    sqlx::query("DELETE FROM members WHERE id = ANY($1)").bind(vec![first, second]).execute(pool).await.unwrap();
     let err = dup.expect_err("a second row for the same user in the tenant is refused");
     let constraint = err.as_database_error().and_then(|e| e.constraint().map(str::to_string));
     assert_eq!(constraint.as_deref(), Some("members_tenant_id_identity_user_id_key"));
@@ -8506,4 +8507,37 @@ async fn search_path_pinned_and_chelabase_schema_owned() {
     .await
     .unwrap();
     assert_eq!(owner.as_deref(), Some("chelabase"));
+}
+
+/// A connection that doesn't pin `search_path` (psql, scripts) still resolves to `public`,
+/// because the migration sets it on the database.
+#[tokio::test]
+#[ignore]
+async fn search_path_is_public_on_an_unpinned_connection() {
+    let _client = client().await;
+    let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+    });
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&database_url).await.unwrap();
+    let path: String = sqlx::query_scalar("SHOW search_path").fetch_one(&pool).await.unwrap();
+    assert_eq!(path, "public");
+}
+
+/// The metadata search_path migration refuses a `chelabase` schema that holds objects. Runs
+/// in a transaction that is rolled back, so the shared database is untouched.
+#[tokio::test]
+#[ignore]
+async fn search_path_migration_refuses_a_chelabase_schema_with_objects() {
+    use sqlx::Connection;
+    let _client = client().await;
+    let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+    });
+    let mut conn = sqlx::PgConnection::connect(&database_url).await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::raw_sql("CREATE TABLE chelabase.guard_probe (id int)").execute(&mut *tx).await.unwrap();
+    let sql = include_str!("../migrations/20261103000002_metadata_search_path.sql");
+    let err = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string())).execute(&mut *tx).await.expect_err("guard refuses");
+    assert!(err.to_string().contains("must contain no objects"), "{err}");
+    drop(tx); // rolls back
 }
