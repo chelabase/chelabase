@@ -1,0 +1,5 @@
+error[E0599]: no associated function or constant named `new` found for struct `RoleSession` in the current scope
+ --> tests/ui/role_session_new.rs:3:47
+  |
+3 |     let _ = chelabase_pgsession::RoleSession::new(lease);
+  |                                               ^^^ associated function or constant not found in `RoleSession`

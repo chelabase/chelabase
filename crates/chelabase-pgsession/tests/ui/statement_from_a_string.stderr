@@ -1,0 +1,11 @@
+error: no rules expected `&`
+ --> tests/ui/statement_from_a_string.rs:3:56
+  |
+3 |     let _ = chelabase_pgsession::named_statement!("x", &sql, &[]);
+  |                                                        ^ no rules expected this token in macro call
+  |
+note: while trying to match meta-variable `$sql:literal`
+ --> src/service.rs
+  |
+  |     ($name:literal, $sql:literal, $types:expr $(,)?) => {{
+  |                     ^^^^^^^^^^^^

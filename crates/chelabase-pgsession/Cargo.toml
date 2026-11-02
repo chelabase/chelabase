@@ -36,5 +36,7 @@ test-support = []
 reqwest = { workspace = true }
 # The live tests' own admin sessions.
 sqlx = { workspace = true }
+# The compile-fail tests with their expected errors (`tests/compile_fail.rs`).
+trybuild = "1.0.122"
 # Paused-clock tests.
 tokio = { workspace = true, features = ["test-util"] }

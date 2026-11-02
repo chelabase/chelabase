@@ -1,0 +1,5 @@
+error[E0599]: no method named `lease` found for reference `&RoleSession` in the current scope
+ --> tests/ui/session_has_no_owner_path.rs:7:19
+  |
+7 |                 s.lease(),
+  |                   ^^^^^ private field, not a method

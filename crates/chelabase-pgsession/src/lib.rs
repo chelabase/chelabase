@@ -12,5 +12,5 @@ pub mod session;
 mod live_tests;
 
 pub use pools::*;
-pub use service::{NamedStatement, ServicePool};
-pub use session::{RoleSession, run_settings};
+pub use service::{NamedStatement, ServicePool, StatementText};
+pub use session::{NoRole, RoleSession, run_settings};

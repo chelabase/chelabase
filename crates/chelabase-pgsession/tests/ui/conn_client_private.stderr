@@ -1,0 +1,5 @@
+error[E0616]: field `client` of struct `chelabase_pgsession::Conn` is private
+ --> tests/ui/conn_client_private.rs:3:24
+  |
+3 |     let _client = conn.client;
+  |                        ^^^^^^ private field

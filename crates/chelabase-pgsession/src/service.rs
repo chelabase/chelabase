@@ -2,104 +2,36 @@
 //! statements the service runs as itself rather than as a caller (storage's write and delete
 //! tickets). A [`ServicePool`] runs only [`NamedStatement`]s, each a string literal in the
 //! service's code ([`named_statement!`](crate::named_statement)), never one built from a
-//! request. It has no role session and no way to hand out its connections. Every statement
-//! runs in its own transaction on a reset session (`[ROLLBACK;] BEGIN; RESET_SQL` …
-//! `COMMIT; RESET_SQL`); a failed reset or a cancelled call closes the connection.
+//! request: a statement's text is a [`StatementText`] associated const, which run-time text
+//! can't fill. The pool has no role session and no way to hand out its connections. Every
+//! statement runs in its own transaction on a reset session (`[ROLLBACK;] BEGIN; RESET_SQL`
+//! … `COMMIT; RESET_SQL`); a failed reset or a cancelled call closes the connection.
 //!
-//! The boundary is Postgres's: each connection checks, before it's pooled, that it logged in
-//! as the expected service role and that the role is no superuser, can't create roles, has
-//! no members and is a member of nothing (`pg_auth_members`, `pg_has_role`), so `SET ROLE`
-//! or `set_config('role', …)` to any other role fails in the database whatever the text. A
-//! connection that fails the check is never pooled: the pool refuses to open. Connections
-//! start with `search_path = pg_catalog, pg_temp`.
+//! The boundary is Postgres's. Each connection checks, when it opens and again on every
+//! checkout, that it is logged in as the expected service role, and that the role is no
+//! superuser, can't create roles or databases, can't replicate, has no members and is a
+//! member of nothing (`pg_auth_members`, `pg_has_role`): so `SET ROLE` or
+//! `set_config('role', …)` to any other role fails in the database whatever the text, and a
+//! grant made after a connection was pooled is caught before its next statement. A
+//! connection that fails the check is never used: the pool refuses to open. `BYPASSRLS` is
+//! allowed: storage's login has it by design, to write the rows its managed statements
+//! own; with no memberships it can't lend it to any other role. Connections start with
+//! `search_path = pg_catalog, pg_temp`.
 //!
 //! The text check ([`changes_session`]) is a secondary one: it refuses, at compile time,
-//! anything that looks like it could change the session.
+//! anything that looks like it could change the session or leave state `RESET ALL` doesn't
+//! clear (advisory locks, listeners, prepared statements, temporary tables, locks).
 //!
 //! Its connections count against the same service's per-branch budget as its role
-//! sessions ([`ServicePool::beside`]). With a budget of 1, never call it while holding a role
-//! session: it waits for the one connection and fails with `Busy` after the acquire timeout.
+//! sessions ([`ServicePool::beside`]). A managed call made while holding a role session
+//! needs a free connection of the same budget: with N role sessions held at once, each
+//! making a managed call, the budget must be above N, or the managed calls wait for the
+//! acquire timeout and fail with `Busy` (with a budget of 1, any nested call does). Size
+//! storage's budget above its peak concurrent role sessions.
 //!
-//! A statement is a literal; a request's text can't become one:
-//!
-//! ```compile_fail
-//! fn from_request(sql: String) {
-//!     let _ = chelabase_pgsession::named_statement!("x", &sql, &[]);
-//! }
-//! ```
-//!
-//! ```compile_fail
-//! let request = String::from("DELETE FROM storage.objects");
-//! let _ = chelabase_pgsession::named_statement!("from request", request.leak(), &[]);
-//! ```
-//!
-//! ```compile_fail,E0599
-//! let request = String::from("DELETE FROM storage.objects");
-//! let _ = chelabase_pgsession::service::NamedStatement::new("from request", request.leak(), &[]);
-//! ```
-//!
-//! A statement the text check refuses doesn't compile, the audit's bypasses included:
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!("escalate", "SET ROLE postgres", &[]);
-//! ```
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!("escalate", "/**/SET/**/ROLE postgres", &[]);
-//! ```
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!(
-//!     "path",
-//!     "-- managed write\nSET search_path TO evil",
-//!     &[]
-//! );
-//! ```
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!("path", "/* x */ SET search_path TO evil", &[]);
-//! ```
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!(
-//!     "escalate",
-//!     "SELECT U&\"set\\005fconfig\"('role', 'postgres', false)",
-//!     &[]
-//! );
-//! ```
-//!
-//! ```compile_fail,E0080
-//! let _ = chelabase_pgsession::named_statement!(
-//!     "escalate",
-//!     "DO $$BEGIN EXECUTE format('%s ROLE postgres', 'SE' || 'T'); END$$",
-//!     &[]
-//! );
-//! ```
-//!
-//! nor can one be built around the check:
-//!
-//! ```compile_fail,E0451
-//! let _ = chelabase_pgsession::service::NamedStatement {
-//!     name: "escalate",
-//!     sql: "SET ROLE postgres",
-//!     types: &[],
-//! };
-//! ```
-//!
-//! The pool hands out no connection, so nothing else runs on it (and no role session can be
-//! opened from it):
-//!
-//! ```compile_fail,E0599
-//! async fn f(pool: &chelabase_pgsession::ServicePool<chelabase_pgsession::InternalSource>) {
-//!     let conn = pool.acquire(uuid::Uuid::nil(), "main").await.unwrap();
-//! }
-//! ```
-//!
-//! ```compile_fail,E0616
-//! async fn f(pool: &chelabase_pgsession::ServicePool<chelabase_pgsession::InternalSource>) {
-//!     let _ = pool.pools.acquire(uuid::Uuid::nil(), "main").await;
-//! }
-//! ```
+//! `tests/compile_fail.rs` holds what doesn't compile, with each expected error: run-time
+//! text as a statement, a refused text, a statement built around the check, a connection
+//! taken from the pool.
 //!
 //! What it does run:
 //!
@@ -120,13 +52,16 @@
 
 use chelabase_query::{Lease, QueryClient, QueryFailure, with_transaction};
 use tokio_postgres::Row;
-use tokio_postgres::types::{ToSql, Type};
+use tokio_postgres::types::ToSql;
+/// The parameter types a [`StatementText`] lists (re-exported for [`named_statement!`](crate::named_statement)).
+pub use tokio_postgres::types::Type;
 use uuid::Uuid;
 
 use crate::pools::{AcquireError, ConnSource, Pools, RESET_SQL};
 
 /// A statement a [`ServicePool`] may run: a fixed text (`$1`… its parameters, of `types`)
-/// and a name for the logs, made only by [`named_statement!`](crate::named_statement).
+/// and a name for the logs, made only from a [`StatementText`] ([`NamedStatement::of`],
+/// [`named_statement!`](crate::named_statement)).
 #[derive(Debug, Clone, Copy)]
 pub struct NamedStatement {
     name: &'static str,
@@ -134,34 +69,44 @@ pub struct NamedStatement {
     types: &'static [Type],
 }
 
-/// A [`NamedStatement`] from a string literal, evaluated in a `const` item: a text the
-/// check refuses ([`changes_session`]) is a compile error, and anything but a literal doesn't
-/// match.
+/// A statement's text as associated consts: only constant expressions (literals) fill them.
+pub trait StatementText {
+    const NAME: &'static str;
+    const SQL: &'static str;
+    const TYPES: &'static [Type];
+}
+
+/// A [`NamedStatement`] from string literals: it declares a hidden type, implements
+/// [`StatementText`] for it and calls [`NamedStatement::of`]. Anything but a literal doesn't
+/// match, and a text the check refuses ([`changes_session`]) is a compile error.
 #[macro_export]
 macro_rules! named_statement {
     ($name:literal, $sql:literal, $types:expr $(,)?) => {{
-        const STATEMENT: $crate::service::NamedStatement =
-            $crate::service::NamedStatement::__literal_only_use_named_statement_macro(
-                $name, $sql, $types,
-            );
-        STATEMENT
+        struct Text;
+        impl $crate::service::StatementText for Text {
+            const NAME: &'static str = $name;
+            const SQL: &'static str = $sql;
+            const TYPES: &'static [$crate::service::Type] = $types;
+        }
+        $crate::service::NamedStatement::of::<Text>()
     }};
 }
 
 impl NamedStatement {
-    /// [`named_statement!`](crate::named_statement)'s constructor; never call it directly.
-    /// Panics when the text check refuses `sql`.
-    #[doc(hidden)]
-    pub const fn __literal_only_use_named_statement_macro(
-        name: &'static str,
-        sql: &'static str,
-        types: &'static [Type],
-    ) -> Self {
-        assert!(
-            !changes_session(sql),
-            "a named statement never changes the session"
-        );
-        NamedStatement { name, sql, types }
+    /// The statement `T` describes; a text the check refuses ([`changes_session`]) fails to
+    /// compile.
+    pub const fn of<T: StatementText>() -> Self {
+        const {
+            assert!(
+                !changes_session(T::SQL),
+                "a named statement never changes the session"
+            )
+        };
+        NamedStatement {
+            name: T::NAME,
+            sql: T::SQL,
+            types: T::TYPES,
+        }
     }
 
     /// A statement the text check never saw: this crate's live tests show the database
@@ -188,8 +133,9 @@ const fn is_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-/// Whether `word` (lower case) is at `i` of `s`, as a whole word, in any case.
-const fn word_at(s: &[u8], i: usize, word: &[u8]) -> bool {
+/// Whether `word` (lower case) is at `i` of `s`, in any case: as a whole word, or (`prefix`)
+/// at the start of one.
+const fn word_at(s: &[u8], i: usize, word: &[u8], prefix: bool) -> bool {
     if i + word.len() > s.len() || (i > 0 && is_ident(s[i - 1])) {
         return false;
     }
@@ -200,17 +146,18 @@ const fn word_at(s: &[u8], i: usize, word: &[u8]) -> bool {
         }
         k += 1;
     }
-    i + word.len() == s.len() || !is_ident(s[i + word.len()])
+    prefix || i + word.len() == s.len() || !is_ident(s[i + word.len()])
 }
 
 /// The secondary text check (the boundary is the database's: see the module docs). It
 /// refuses, case-insensitively and anywhere in the text (string literals included): a
-/// comment (`--`, `/*`), a `U&` escape, more than one statement (`;`), and the words `DO`,
-/// `SET`, `RESET`, `ROLE`, `set_config`, `session_authorization` and `authorization`. So
-/// `UPDATE … SET` is refused too: managed statements are `SELECT`s of functions, `INSERT`s
-/// and `DELETE`s.
+/// comment (`--`, `/*`), a `U&` escape, more than one statement (`;`), the words `DO`, `SET`,
+/// `RESET`, `ROLE`, `set_config`, `session_authorization`, `authorization`, `LISTEN`,
+/// `UNLISTEN`, `NOTIFY`, `pg_notify`, `PREPARE`, `DEALLOCATE`, `DISCARD`, `TEMP`,
+/// `TEMPORARY`, `LOAD` and `LOCK`, and any word starting `pg_advisory`. So `UPDATE … SET`
+/// is refused too: managed statements are `SELECT`s of functions, `INSERT`s and `DELETE`s.
 pub const fn changes_session(sql: &str) -> bool {
-    const WORDS: [&[u8]; 7] = [
+    const WORDS: [&[u8]; 18] = [
         b"do",
         b"set",
         b"reset",
@@ -218,6 +165,17 @@ pub const fn changes_session(sql: &str) -> bool {
         b"set_config",
         b"session_authorization",
         b"authorization",
+        b"listen",
+        b"unlisten",
+        b"notify",
+        b"pg_notify",
+        b"prepare",
+        b"deallocate",
+        b"discard",
+        b"temp",
+        b"temporary",
+        b"load",
+        b"lock",
     ];
     let s = sql.as_bytes();
     let mut i = 0;
@@ -228,9 +186,12 @@ pub const fn changes_session(sql: &str) -> bool {
             (b'u' | b'U', b'&') => return true,
             _ => {}
         }
+        if word_at(s, i, b"pg_advisory", true) {
+            return true;
+        }
         let mut w = 0;
         while w < WORDS.len() {
-            if word_at(s, i, WORDS[w]) {
+            if word_at(s, i, WORDS[w], false) {
                 return true;
             }
             w += 1;
@@ -356,12 +317,27 @@ mod tests {
         }
     }
 
-    /// Built at run time (a leaked string), a session-changing statement still never exists.
+    /// Session state `RESET ALL` doesn't clear (advisory locks, listeners, prepared
+    /// statements, temporary tables, loaded libraries, held locks) is refused too.
     #[test]
-    #[should_panic(expected = "changes the session")]
-    fn a_session_changing_statement_panics_at_run_time_too() {
-        let sql: &'static str = String::from("SET ROLE postgres").leak();
-        let _ = NamedStatement::__literal_only_use_named_statement_macro("escalate", sql, &[]);
+    fn session_state_outside_reset_all_is_refused() {
+        for sql in [
+            "SELECT pg_catalog.pg_advisory_lock(42)",
+            "SELECT PG_ADVISORY_XACT_LOCK(1)",
+            "LISTEN storage",
+            "SELECT pg_notify('c', 'x')",
+            "NOTIFY storage",
+            "PREPARE p AS SELECT 1",
+            "DEALLOCATE ALL",
+            "DISCARD PLANS",
+            "CREATE TEMP TABLE t (a int)",
+            "CREATE TEMPORARY TABLE t (a int)",
+            "LOAD 'auto_explain'",
+            "LOCK TABLE storage.objects",
+        ] {
+            assert!(changes_session(sql), "{sql:?}");
+        }
+        assert!(!changes_session("SELECT storage.write_ticket($1)"));
     }
 
     struct Five(u16);

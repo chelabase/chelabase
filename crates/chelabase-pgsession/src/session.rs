@@ -16,74 +16,9 @@
 //! No role, no run: a connection's client can't be read, a [`Conn`] is no
 //! [`chelabase_query::QueryClient`], and a [`RoleSession`] runs statements only through its
 //! own methods, which apply the preamble (apart from its two fixed pre-transaction reads).
-//!
-//! ```compile_fail,E0616
-//! fn no_role_no_run(conn: chelabase_pgsession::Conn) {
-//!     let _client = conn.client;
-//! }
-//! ```
-//!
-//! ```compile_fail,E0277
-//! fn no_role_no_run(conn: &chelabase_pgsession::Conn) {
-//!     fn runs_on<C: chelabase_query::QueryClient>(_: &C) {}
-//!     runs_on(conn);
-//! }
-//! ```
-//!
-//! Nor does a session hand out its connection: no client before the preamble, so no
-//! statement as the login, and no owner path.
-//!
-//! ```compile_fail,E0599
-//! async fn as_the_login(conn: chelabase_pgsession::Conn, claims: &serde_json::Value) {
-//!     use chelabase_query::QueryClient;
-//!     conn.with_role_session("no_such_role", claims, None, async |s| {
-//!         let _ = s.lease().client().batch_execute("SELECT 1").await;
-//!     })
-//!     .await;
-//! }
-//! ```
-//!
-//! ```compile_fail,E0599
-//! async fn as_the_owner(conn: chelabase_pgsession::Conn, claims: &serde_json::Value) {
-//!     conn.with_role_session("authenticated", claims, None, async |s| {
-//!         let settings = s.settings(&s.info().databases[0]);
-//!         let _ = chelabase_query::engine::console_session(
-//!             s.lease(),
-//!             "main",
-//!             chelabase_query::RunAs::Owner { user: "authenticator" },
-//!             &settings,
-//!             "rid",
-//!             async |_, _| Ok(()),
-//!         )
-//!         .await;
-//!     })
-//!     .await;
-//! }
-//! ```
-//!
-//! A [`RoleSession`] can't be built or named into being outside the crate:
-//!
-//! ```compile_fail,E0451
-//! fn forged(
-//!     lease: chelabase_query::Lease,
-//!     info: std::sync::Arc<chelabase_pgsession::ConnInfo>,
-//!     claims: serde_json::Value,
-//! ) -> chelabase_pgsession::RoleSession {
-//!     chelabase_pgsession::RoleSession {
-//!         lease,
-//!         info,
-//!         role: "postgres".into(),
-//!         claims,
-//!         oid: None,
-//!     }
-//! }
-//! ```
-//!
-//! ```compile_fail,E0599
-//! fn forged(lease: chelabase_query::Lease) {
-//!     let _ = chelabase_pgsession::RoleSession::new(lease);
-//! }
-//! ```
+//! A role session refuses `none` and the empty name (Postgres reads `none` as no role: the
+//! login itself). The one session as the login is explicit: [`Conn::with_login_session`].
+//! `tests/compile_fail.rs` holds what doesn't compile, with each expected error.
 //!
 //! The one way in names the role and its claims:
 //!
@@ -275,13 +210,46 @@ impl RoleSession {
     }
 }
 
+/// A role session asked for no role: `none` (any case) or the empty name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} names no role")]
+pub struct NoRole(pub String);
+
+/// Whether `role` names no role in a preamble: Postgres reads `none` as the login itself, and
+/// the empty name fails (any case of `none` is refused too).
+fn names_no_role(role: &str) -> bool {
+    role.is_empty() || role.eq_ignore_ascii_case("none")
+}
+
 impl Conn {
     /// Runs `f` with this connection as a session of `role` with `claims` (`oid`: the role's
     /// identity a secret key is bound to, `None` to check the name only). When `f` returns
     /// (an error it answers with included), the connection goes back to its pool unless a
     /// reset failed; when `f` is cancelled or panics, the connection is closed. Its slots are
-    /// released after.
+    /// released after. A `role` that names no role ([`NoRole`]) runs nothing.
     pub async fn with_role_session<T>(
+        self,
+        role: &str,
+        claims: &Value,
+        oid: Option<i64>,
+        f: impl AsyncFnOnce(&RoleSession) -> T,
+    ) -> Result<T, NoRole> {
+        if names_no_role(role) {
+            return Err(NoRole(role.to_owned()));
+        }
+        Ok(self.session(role, claims, oid, f).await)
+    }
+
+    /// Runs `f` with this connection as a session of its own login (rest's `authenticator`),
+    /// with no claims: each transaction's preamble sets the role `none`. Only for reads
+    /// every role may make and the login is meant to make itself (rest's internal schema
+    /// route, which describes other roles' views); everything else is a role session.
+    pub async fn with_login_session<T>(self, f: impl AsyncFnOnce(&RoleSession) -> T) -> T {
+        self.session("none", &Value::Object(Default::default()), None, f)
+            .await
+    }
+
+    async fn session<T>(
         self,
         role: &str,
         claims: &Value,
@@ -536,7 +504,8 @@ pub(crate) mod tests {
                 })
                 .await
             })
-            .await;
+            .await
+            .unwrap();
         assert!(out.is_ok(), "{out:?}");
         assert_eq!(
             *fake.queries.lock().unwrap(),
@@ -583,9 +552,38 @@ pub(crate) mod tests {
             // The next request opens a new connection.
             let conn = pools.acquire(branch, "main").await.unwrap();
             conn.with_role_session("reader", &claims, None, async |_| ())
-                .await;
+                .await
+                .unwrap();
             assert_eq!(settle(&fake.open, 1).await, 1, "{name}");
         }
+    }
+
+    /// `none` (Postgres's word for no role, the login itself) and the empty name are no
+    /// role: such a session runs nothing, and its connection goes back unused.
+    #[tokio::test]
+    async fn no_role_no_run() {
+        let fake = recorder(|_, _| false).await;
+        let pools = Pools::new(At(fake.port), 10);
+        let claims = serde_json::json!({});
+        for role in ["none", "NONE", "None", ""] {
+            let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
+            let ran = std::cell::Cell::new(false);
+            let out = conn
+                .with_role_session(role, &claims, None, async |_| ran.set(true))
+                .await;
+            assert_eq!(out.unwrap_err(), NoRole(role.to_owned()));
+            assert!(!ran.get(), "{role:?} ran");
+        }
+        assert!(fake.queries.lock().unwrap().is_empty());
+        // The login's own session is explicit, and its role is `none`.
+        let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
+        let role = conn
+            .with_login_session(async |s| match s.run_as() {
+                chelabase_query::RunAs::Role { role, .. } => role.to_owned(),
+                chelabase_query::RunAs::Owner { .. } => panic!("the owner"),
+            })
+            .await;
+        assert_eq!(role, "none");
     }
 
     /// The owner check's clean-up failing on a role session's connection discards it too.
@@ -600,7 +598,8 @@ pub(crate) mod tests {
             assert!(check.is_err());
             assert!(s.lease.is_broken());
         })
-        .await;
+        .await
+        .unwrap();
         assert_eq!(settle(&fake.open, 0).await, 0);
     }
 }

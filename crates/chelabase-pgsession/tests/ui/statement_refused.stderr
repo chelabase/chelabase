@@ -1,0 +1,108 @@
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<SET_ROLE::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/service.rs
+  |
+  | /         const {
+  | |             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |         };
+  | |_________^
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<COMMENTS::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<LINE_COMMENT::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<BLOCK_COMMENT::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<UNICODE::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<DYNAMIC::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
+
+error[E0080]: evaluation panicked: a named statement never changes the session
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `chelabase_pgsession::NamedStatement::of::<ADVISORY::Text>::{constant#0}` failed here
+  |
+ ::: src/service.rs
+  |
+  | /             assert!(
+  | |                 !changes_session(T::SQL),
+  | |                 "a named statement never changes the session"
+  | |             )
+  | |_____________- in this macro invocation
