@@ -91,7 +91,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
   // A member with no project at all sees the no-access screen here too, not a 403 (Q9).
   if (me.data && noAccess(me.data)) {
     return (
-      <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
+      <div className="mx-auto max-w-6xl space-y-8 p-4 sm:p-8">
         <NoAccess me={me.data} checking={me.isFetching} onCheck={() => void me.refetch()} />
       </div>
     );
@@ -106,7 +106,7 @@ export function ProjectPage({ projectId, apiUrl, onLoaded, tab, onTabChange, onG
 
   return (
     <ProjectCapsContext.Provider value={caps}>
-    <div className="mx-auto max-w-4xl space-y-8 p-4 sm:p-8">
+    <div className="mx-auto max-w-6xl space-y-8 p-4 sm:p-8">
       {restarting ? (
         <p className="text-muted-foreground">Your session expired. Signing you in again…</p>
       ) : gone ? (
