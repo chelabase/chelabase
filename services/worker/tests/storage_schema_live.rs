@@ -247,8 +247,8 @@ const SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDE
 /// A bucket and an object, written as the storage role (with the object's ticket).
 const SEED_SQL: &str = "BEGIN; SET LOCAL ROLE chelabase_storage;
 INSERT INTO storage.buckets (id, name) VALUES ('00000000-0000-0000-0000-0000000000b1', 'avatars');
-INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at)
-  VALUES ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000b1', 'u1/me.png', 3, 'e1', now() + interval '5 minutes');
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role, owner)
+  VALUES ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000b1', 'u1/me.png', 3, 'e1', now() + interval '5 minutes', 'chelabase_storage', '00000000-0000-0000-0000-0000000000a1');
 INSERT INTO storage.objects (bucket_id, name, owner, size, etag, version_id)
   VALUES ('00000000-0000-0000-0000-0000000000b1', 'u1/me.png', '00000000-0000-0000-0000-0000000000a1', 3, 'e1', '00000000-0000-0000-0000-0000000000c1');
 COMMIT;";
@@ -404,7 +404,7 @@ async fn run(fx: &Fx) {
         "CB003",
         "no ticket"
     );
-    let mint = "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES ('00000000-0000-0000-0000-0000000000c2', '00000000-0000-0000-0000-0000000000b1', 'u1/a.png', 5, 'e2', now() + interval '5 minutes')";
+    let mint = "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role) VALUES ('00000000-0000-0000-0000-0000000000c2', '00000000-0000-0000-0000-0000000000b1', 'u1/a.png', 5, 'e2', now() + interval '5 minutes', 'authenticated')";
     // A ticket for other values doesn't do.
     fx.as_role_commit("chelabase_storage", mint).await;
     assert_eq!(
@@ -516,7 +516,7 @@ GRANT chelabase_storage TO st_member WITH ADMIN OPTION; GRANT {OWNER} TO chelaba
         fx.value("SELECT rolcanlogin || ' ' || (rolpassword IS NULL) || ' ' || rolconnlimit || ' ' || rolbypassrls || ' ' || rolinherit FROM pg_authid WHERE rolname = 'chelabase_storage'").await,
         "false true 0 true false"
     );
-    assert_eq!(fx.value("SELECT coalesce(string_agg(array_to_string(setconfig, ','), ';'), '') FROM pg_db_role_setting WHERE setrole = 'chelabase_storage'::regrole").await, "search_path=pg_catalog, pg_temp");
+    assert_eq!(fx.value("SELECT coalesce(string_agg(array_to_string(setconfig, ','), ';'), '') FROM pg_db_role_setting WHERE setrole = 'chelabase_storage'::regrole").await, "search_path=pg_catalog, pg_temp,event_triggers=off");
     assert_eq!(fx.value("SELECT count(*) FROM pg_auth_members WHERE roleid = 'chelabase_storage'::regrole OR member = 'chelabase_storage'::regrole").await, "0");
     assert_eq!(
         fx.value("SELECT relowner::regrole FROM pg_class WHERE oid = 'public.st_owned'::regclass")
@@ -733,7 +733,7 @@ async fn hardening(fx: &Fx) {
     .await;
     let mint = |v: &str, name: &str| {
         format!(
-            "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES ('{v}', '{B1}', '{name}', 1, 'e', now() + interval '10 minutes')"
+            "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role) VALUES ('{v}', '{B1}', '{name}', 1, 'e', now() + interval '10 minutes', 'authenticated')"
         )
     };
 
@@ -901,5 +901,215 @@ async fn hardening(fx: &Fx) {
     );
     fx.owner("DROP SCHEMA storage").await.unwrap();
     fx.admin("ALTER SCHEMA audit_storage_aside RENAME TO storage")
+        .await;
+}
+
+// --- Re-audit (m3b): ticket binding, the role's event triggers, drift, guard ---------------
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_schema_reaudit_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { reaudit(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+const A1: &str = "00000000-0000-0000-0000-0000000000a1";
+
+async fn reaudit(fx: &Fx) {
+    fx.as_role_commit(
+        "chelabase_storage",
+        &format!("INSERT INTO storage.buckets (id, name) VALUES ('{B1}', 'avatars')"),
+    )
+    .await;
+    fx.owner("SELECT storage.create_policy('ins', 'objects', 'INSERT', ARRAY['authenticated']::name[], NULL, 'true')").await.unwrap();
+    let mint = |v: &str, name: &str, owner: &str| {
+        format!(
+            "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role, owner) VALUES ('{v}', '{B1}', '{name}', 1, 'e', clock_timestamp() + interval '10 minutes', 'authenticated', '{owner}')"
+        )
+    };
+    let insert = |v: &str, name: &str, owner: &str| {
+        format!(
+            "INSERT INTO storage.objects (bucket_id, name, owner, size, etag, version_id) VALUES ('{B1}', '{name}', '{owner}', 1, 'e', '{v}')"
+        )
+    };
+
+    // S1: a ticket is for the caller's role and owner it was minted for.
+    fx.as_role_commit(
+        "chelabase_storage",
+        &mint("00000000-0000-0000-0000-0000000000f1", "a/1", A1),
+    )
+    .await;
+    let err = fx
+        .owner_err(&insert("00000000-0000-0000-0000-0000000000f1", "a/1", A1))
+        .await;
+    assert!(
+        err.contains("CB003"),
+        "the owner uses another role's ticket: {err}"
+    );
+    assert_eq!(
+        fx.code(
+            "authenticated",
+            &insert(
+                "00000000-0000-0000-0000-0000000000f1",
+                "a/1",
+                "00000000-0000-0000-0000-0000000000ee"
+            )
+        )
+        .await,
+        "CB003",
+        "another owner"
+    );
+    fx.as_role_commit(
+        "authenticated",
+        &insert("00000000-0000-0000-0000-0000000000f1", "a/1", A1),
+    )
+    .await;
+    assert_eq!(
+        fx.value("SELECT count(*) FROM storage.objects WHERE name = 'a/1'")
+            .await,
+        "1"
+    );
+
+    // S2: a membership of the role, made by the owner, fails the check; the next run revokes
+    // it and leaves pending tickets alone.
+    fx.as_role_commit(
+        "chelabase_storage",
+        &mint("00000000-0000-0000-0000-0000000000f2", "a/2", A1),
+    )
+    .await;
+    fx.owner("CREATE ROLE audit_grp NOLOGIN; GRANT audit_grp TO chelabase_storage;")
+        .await
+        .expect("the owner grants a role to it");
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "f");
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value(
+            "SELECT count(*) FROM pg_auth_members WHERE member = 'chelabase_storage'::regrole"
+        )
+        .await,
+        "0"
+    );
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "t");
+    assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '00000000-0000-0000-0000-0000000000f2'").await, "1", "a membership voids no ticket");
+    fx.owner("DROP ROLE audit_grp").await.unwrap();
+
+    // S3: a dropped or rewritten trigger, a planted default or constraint, a dropped bucket
+    // key: the check notices, the next run restores.
+    for plant in [
+        "DROP TRIGGER protect_objects ON storage.objects",
+        // The function is the superuser's now: only a superuser could do this.
+        "RESET ROLE; CREATE OR REPLACE FUNCTION storage.protect_objects() RETURNS trigger LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $f$ BEGIN RETURN NULL; END $f$",
+        "ALTER TABLE storage.objects ALTER COLUMN metadata SET DEFAULT '{\"planted\":1}'",
+        "ALTER TABLE storage.objects ADD CONSTRAINT audit_ck CHECK (size IS NULL OR size >= 0) NOT VALID",
+        "ALTER TABLE storage.objects DROP CONSTRAINT objects_bucket_id_fkey",
+        "ALTER TABLE storage.upload_tickets ALTER COLUMN etag SET DEFAULT 'planted'",
+    ] {
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_admin; {plant}; COMMIT;"
+        ))
+        .await;
+        assert_eq!(
+            last_line(&fx.admin(&schema_check_sql("public")).await),
+            "f",
+            "{plant}"
+        );
+        bootstrap(fx).await;
+        assert_eq!(
+            last_line(&fx.admin(&schema_check_sql("public")).await),
+            "t",
+            "{plant}"
+        );
+    }
+    assert_eq!(fx.value("SELECT pg_get_expr(adbin, adrelid) FROM pg_attrdef WHERE adrelid = 'storage.objects'::regclass AND adnum = (SELECT attnum FROM pg_attribute WHERE attrelid = 'storage.objects'::regclass AND attname = 'metadata')").await, "'{}'::jsonb");
+    assert_eq!(fx.value("SELECT string_agg(conname, ',' ORDER BY conname) FROM pg_constraint WHERE conrelid = 'storage.objects'::regclass").await, "objects_bucket_id_fkey,objects_bucket_id_name_key,objects_pkey");
+    assert_eq!(
+        fx.code(
+            "authenticated",
+            &insert("00000000-0000-0000-0000-0000000000f9", "a/9", A1)
+        )
+        .await,
+        "CB003",
+        "the ticket gate is back"
+    );
+
+    // S4: on a protected branch, an owner wrapper called by a locked login can't change
+    // policies; the owner itself still can.
+    use worker::schema_guard::{GuardSettings, schema_guard_sql, schema_unguard_sql};
+    fx.admin("CREATE ROLE audit_guarded LOGIN PASSWORD 'Audit-pw-g1x9'")
+        .await;
+    fx.owner("CREATE FUNCTION public.audit_w() RETURNS void LANGUAGE sql SECURITY DEFINER AS $$ SELECT storage.create_policy('audit_w', 'objects', 'SELECT', ARRAY['anon']::name[], 'true') $$; GRANT EXECUTE ON FUNCTION public.audit_w() TO audit_guarded;").await.unwrap();
+    fx.admin(&schema_guard_sql(&GuardSettings {
+        guard_logins: true,
+        exempt: Default::default(),
+    }))
+    .await;
+    let err = fx
+        .direct("audit_guarded", "Audit-pw-g1x9", "SELECT public.audit_w()")
+        .await
+        .expect_err("a locked login");
+    assert!(err.contains("chelabase:branch_protected"), "{err}");
+    fx.owner("SELECT storage.create_policy('audit_o', 'objects', 'SELECT', ARRAY['anon']::name[], 'false')").await.expect("the owner, unlocked");
+    fx.admin(&schema_unguard_sql()).await;
+    assert_eq!(fx.value("SELECT string_agg(polname, ',' ORDER BY polname) FROM pg_policy WHERE polrelid = 'storage.objects'::regclass").await, "audit_o,ins");
+
+    // The role's sessions fire no event trigger: an owner's login trigger doesn't run for it.
+    fx.owner(
+        "CREATE TABLE public.audit_logins (u text); GRANT ALL ON public.audit_logins TO PUBLIC;
+         CREATE FUNCTION public.audit_login() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO public.audit_logins VALUES (session_user); END $$;
+         CREATE EVENT TRIGGER audit_login ON login EXECUTE FUNCTION public.audit_login();",
+    )
+    .await
+    .expect("the owner's login trigger");
+    fx.direct("audit_guarded", "Audit-pw-g1x9", "SELECT 1")
+        .await
+        .expect("a plain login");
+    assert_eq!(
+        fx.value("SELECT count(*) FROM public.audit_logins WHERE u = 'audit_guarded'")
+            .await,
+        "1",
+        "the trigger fires for other logins"
+    );
+    fx.admin(&format!(
+        "ALTER ROLE chelabase_storage LOGIN PASSWORD '{TAMPER_PASSWORD}' CONNECTION LIMIT 1"
+    ))
+    .await;
+    let setting = fx
+        .direct(
+            "chelabase_storage",
+            TAMPER_PASSWORD,
+            "SELECT current_setting('event_triggers')",
+        )
+        .await
+        .expect("the role logs in");
+    assert_eq!(last_line(&setting), "off");
+    // ...and it can't turn them back on (no SET on the parameter).
+    let err = fx
+        .direct(
+            "chelabase_storage",
+            TAMPER_PASSWORD,
+            "SET event_triggers = on",
+        )
+        .await
+        .expect_err("SET event_triggers");
+    assert!(err.contains("42501"), "{err}");
+    assert_eq!(
+        fx.value("SELECT count(*) FROM public.audit_logins WHERE u = 'chelabase_storage'")
+            .await,
+        "0",
+        "the login trigger ran for chelabase_storage"
+    );
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value("SELECT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'")
+            .await,
+        "f"
+    );
+    fx.owner("DROP EVENT TRIGGER audit_login").await.unwrap();
+    fx.admin("DROP OWNED BY audit_guarded; DROP ROLE audit_guarded")
         .await;
 }

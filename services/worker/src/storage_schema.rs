@@ -19,9 +19,12 @@
 //! - [`STORAGE_ROLE`] (`chelabase_storage`, BYPASSRLS, NOLOGIN until m5 makes it the storage
 //!   service's login) is locked down on every run exactly as the data API locks down
 //!   `chelabase_admin`: attributes, password, connection limit, settings (then
-//!   `search_path = pg_catalog, pg_temp`), members, admins and its own memberships revoked,
-//!   objects it owns here reassigned to the owner, its sessions (and its former members')
-//!   ended before and again after the commit. A role found changed has its tickets voided.
+//!   `search_path = pg_catalog, pg_temp` and `event_triggers = off`, so no event trigger,
+//!   a login one included, fires for its sessions; it has no `SET` on the parameter to turn
+//!   them back on), members, admins and its own memberships revoked, objects it owns here
+//!   reassigned to the owner, its sessions (and its former members') ended before and again
+//!   after the commit. Changed attributes or settings, or a member, void its tickets; the
+//!   health check notices any drift or membership, so reconcile reruns the lockdown.
 //! - `anon` and `authenticated` get `USAGE` on the schema (never `CREATE`) and table
 //!   privileges that row level security still gates. `authenticated` writes every column of
 //!   `storage.objects` a caller declares, the [`MANAGED_COLUMNS`] included, so RLS policies
@@ -30,10 +33,12 @@
 //! - Upload tickets vouch for the managed columns. Only [`STORAGE_ROLE`] writes
 //!   `storage.upload_tickets` (`guard_tickets` checks `current_user`, so `pg_write_all_data`
 //!   mints nothing: [`TICKET_FORGED`]); a ticket lives at most [`TICKET_MAX_LIFETIME`] and
-//!   records the Neon timeline it was minted on. `protect_objects` (after RLS, so a policy's
-//!   42501 comes first) lets an insert, or an update changing a managed column, through only
-//!   by consuming the ticket matching its bucket, name, version, size and etag, unexpired and
-//!   of this timeline; otherwise [`TICKET_MISSING`]. No role is exempt.
+//!   records the Neon timeline it was minted on, the role of the request it was minted for
+//!   and the object's `owner`. `protect_objects` (after RLS, so a policy's 42501 comes
+//!   first; `SECURITY INVOKER`, so `current_user` is the inserting role) lets an insert, or an
+//!   update changing a managed column, through only by consuming (`consume_ticket`) the
+//!   ticket matching its bucket, name, version, size, etag, owner and role, unexpired and of
+//!   this timeline; otherwise [`TICKET_MISSING`]. No role is exempt, the owner included.
 //! - A branch copies unconsumed tickets but never its parent's timeline (`neon.timeline_id`
 //!   is a postmaster setting, fixed per compute), so they can't be used there.
 //! - Owner-level roles (the database owner is a Neon privileged role: `BYPASSRLS`, a member of
@@ -42,7 +47,9 @@
 //!
 //! - The policy helpers run with `event_triggers = off` (the bootstrap grants
 //!   `chelabase_admin` `SET` on the parameter), so an owner's event trigger never runs as
-//!   `chelabase_admin` inside them.
+//!   `chelabase_admin` inside them. They apply the protected-branch guard themselves: while
+//!   it is installed only an unmarked owner session or a superuser may change policies
+//!   (stricter than the guard, which also lets exempt logins and Admin members through).
 //!
 //! The script is two transactions, each under [`BOOTSTRAP_LOCK_KEY`] and safe to run again:
 //! the role's lockdown (every role reaching it, at any depth, has its sessions ended, before
@@ -56,6 +63,7 @@
 //! and changes nothing; the role's lockdown has already committed.
 
 use crate::data_api::{BOOTSTRAP_LOCK_KEY, LOCK_TIMEOUT_SECS, quote_ident};
+use chelabase_types::table_api::{BRANCH_PROTECTED_HINT, SCHEMA_LOCKED_ROLE};
 
 /// The schema's name, reserved as a data API default schema and never served by `/data/v1`.
 pub const STORAGE_SCHEMA: &str = "storage";
@@ -68,7 +76,7 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 
 /// The schema's comment: which version of [`storage_schema_sql`] installed it. Bump the
 /// number whenever the script changes what it installs, so reconcile reinstalls.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 3";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 4";
 
 /// The SQLSTATE `protect_objects` raises when an object's managed columns match no unexpired
 /// ticket of this timeline (none, a different value, already used, expired, or another
@@ -99,6 +107,13 @@ pub fn storage_schema_sql(owner_role: &str) -> String {
     let owner = quote_ident(owner_role);
     let foreign_objects = foreign_objects_sql();
     let acl_entries = acl_entries_sql().replace("{owner}", &owner_role.replace('\'', "''"));
+    let owner_lit = crate::data_api::quote_literal(owner_role);
+    let drift = role_drift_sql("role");
+    let (defaults, constraints) = (
+        expected_list(&EXPECTED_DEFAULTS),
+        expected_list(&EXPECTED_CONSTRAINTS),
+    );
+    let (default_entry, constraint_entry) = (DEFAULT_ENTRY, CONSTRAINT_ENTRY);
     format!(
         r#"{STORAGE_SCHEMA_MARK}
 BEGIN;
@@ -108,7 +123,7 @@ SELECT pg_catalog.pg_advisory_xact_lock({BOOTSTRAP_LOCK_KEY});
 DO $$ DECLARE
   role pg_catalog.oid := (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage');
   members pg_catalog.oid[];
-  joined boolean;
+  has_members boolean;
   tampered boolean;
   m record;
 BEGIN
@@ -120,12 +135,8 @@ BEGIN
       SELECT a.member FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role
       UNION SELECT a.member FROM pg_catalog.pg_auth_members a JOIN reach ON a.roleid OPERATOR(pg_catalog.=) reach.oid)
     SELECT oid FROM reach);
-  joined := EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role OR a.member OPERATOR(pg_catalog.=) role);
-  tampered := EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) role
-    AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
-      OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) 0))
-    OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) role
-      AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp']::pg_catalog.text[]));
+  has_members := EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) role);
+  tampered := {drift};
   ALTER ROLE chelabase_storage NOLOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION BYPASSRLS NOINHERIT PASSWORD NULL CONNECTION LIMIT 0;
   FOR m IN SELECT d.datname FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid OPERATOR(pg_catalog.=) s.setdatabase
     WHERE s.setrole OPERATOR(pg_catalog.=) role
@@ -134,6 +145,7 @@ BEGIN
   END LOOP;
   ALTER ROLE chelabase_storage RESET ALL;
   ALTER ROLE chelabase_storage SET search_path = pg_catalog, pg_temp;
+  ALTER ROLE chelabase_storage SET event_triggers = off;
   FOR m IN SELECT r.rolname AS member, g.rolname AS grantor FROM pg_catalog.pg_auth_members a
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.member JOIN pg_catalog.pg_roles g ON g.oid OPERATOR(pg_catalog.=) a.grantor
     WHERE a.roleid OPERATOR(pg_catalog.=) role
@@ -152,7 +164,7 @@ BEGIN
     JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) a.usesysid
     WHERE (a.usesysid OPERATOR(pg_catalog.=) role OR a.usesysid OPERATOR(pg_catalog.=) ANY (members)) AND NOT r.rolsuper
       AND a.pid OPERATOR(pg_catalog.<>) pg_catalog.pg_backend_pid();
-  IF (joined OR tampered) AND EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
+  IF (has_members OR tampered) AND EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace
       JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner
       WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN
     DELETE FROM storage.upload_tickets;
@@ -212,8 +224,12 @@ CREATE TABLE IF NOT EXISTS storage.upload_tickets (
   etag text NOT NULL,
   expires_at timestamptz NOT NULL,
   timeline_id text NOT NULL,
+  caller_role name NOT NULL,
+  owner uuid,
   created_at timestamptz NOT NULL DEFAULT now()
 );
+ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
+DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
 ALTER TABLE storage.upload_tickets OWNER TO chelabase_admin;
 ALTER TABLE storage.buckets OWNER TO chelabase_admin;
 ALTER TABLE storage.objects OWNER TO chelabase_admin;
@@ -226,6 +242,35 @@ DO $$ DECLARE d pg_catalog.text; BEGIN
     EXECUTE d;
   END LOOP;
 END $$;
+DO $$ DECLARE d record; k record; BEGIN
+  FOR d IN SELECT c.oid::pg_catalog.regclass AS rel, a.attname AS att FROM pg_catalog.pg_attrdef x
+      JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid
+      JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.adrelid AND a.attnum OPERATOR(pg_catalog.=) x.adnum
+    WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace('storage')
+      AND {default_entry} OPERATOR(pg_catalog.<>) ALL ({defaults})
+  LOOP
+    EXECUTE pg_catalog.format('ALTER TABLE %s ALTER COLUMN %I DROP DEFAULT', d.rel, d.att);
+  END LOOP;
+  FOR k IN SELECT c.oid::pg_catalog.regclass AS rel, x.conname FROM pg_catalog.pg_constraint x
+      JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.conrelid
+    WHERE c.relnamespace OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace('storage')
+      AND {constraint_entry} OPERATOR(pg_catalog.<>) ALL ({constraints})
+  LOOP
+    EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I CASCADE', k.rel, k.conname);
+  END LOOP;
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_constraint WHERE conrelid OPERATOR(pg_catalog.=) 'storage.objects'::pg_catalog.regclass
+      AND conname OPERATOR(pg_catalog.=) 'objects_bucket_id_fkey') THEN
+    ALTER TABLE storage.objects ADD CONSTRAINT objects_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets (id);
+  END IF;
+END $$;
+ALTER TABLE storage.buckets ALTER COLUMN id SET DEFAULT gen_random_uuid();
+ALTER TABLE storage.buckets ALTER COLUMN public SET DEFAULT false;
+ALTER TABLE storage.buckets ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE storage.objects ALTER COLUMN id SET DEFAULT gen_random_uuid();
+ALTER TABLE storage.objects ALTER COLUMN metadata SET DEFAULT '{{}}';
+ALTER TABLE storage.objects ALTER COLUMN created_at SET DEFAULT now();
+ALTER TABLE storage.objects ALTER COLUMN updated_at SET DEFAULT now();
+ALTER TABLE storage.upload_tickets ALTER COLUMN created_at SET DEFAULT now();
 DO $$ DECLARE e record; BEGIN
   FOR e IN SELECT g.rolname AS grantor, pg_catalog.format('REVOKE ALL %s FROM %s CASCADE', x.target,
         CASE WHEN x.grantee OPERATOR(pg_catalog.=) 0::pg_catalog.oid THEN 'PUBLIC' ELSE pg_catalog.quote_ident(r.rolname) END) AS statement
@@ -253,49 +298,22 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chel
 GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;
 CREATE OR REPLACE FUNCTION storage.guard_tickets() RETURNS trigger
   LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
-$f$
-BEGIN
-  IF current_user <> 'chelabase_storage' THEN
-    RAISE EXCEPTION USING ERRCODE = '{TICKET_FORGED}', MESSAGE = 'storage.upload_tickets is written by Chelabase storage only';
-  END IF;
-  -- The timeline it was minted on: a branch copies the row, never the timeline.
-  NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);
-  IF NEW.timeline_id IS NULL OR NEW.timeline_id = '' THEN
-    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'storage.upload_tickets: this server has no Neon timeline';
-  END IF;
-  IF NEW.expires_at <= clock_timestamp() OR NEW.expires_at > clock_timestamp() + interval '{TICKET_MAX_LIFETIME}' THEN
-    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_tickets: a ticket expires within {TICKET_MAX_LIFETIME}';
-  END IF;
-  RETURN NEW;
-END
-$f$;
+$f${GUARD_TICKETS_BODY}$f$;
 ALTER FUNCTION storage.guard_tickets() OWNER TO CURRENT_USER;
 REVOKE ALL ON FUNCTION storage.guard_tickets() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER guard_tickets BEFORE INSERT OR UPDATE ON storage.upload_tickets
   FOR EACH ROW EXECUTE FUNCTION storage.guard_tickets();
 ALTER TABLE storage.upload_tickets ENABLE ALWAYS TRIGGER guard_tickets;
+CREATE OR REPLACE FUNCTION storage.consume_ticket(p_version uuid, p_bucket uuid, p_name text, p_size bigint, p_etag text, p_owner uuid, p_caller name)
+  RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
+$f${CONSUME_TICKET_BODY}$f$;
+ALTER FUNCTION storage.consume_ticket(uuid, uuid, text, bigint, text, uuid, name) OWNER TO chelabase_admin;
+REVOKE ALL ON FUNCTION storage.consume_ticket(uuid, uuid, text, bigint, text, uuid, name) FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION storage.consume_ticket(uuid, uuid, text, bigint, text, uuid, name) TO PUBLIC;
 CREATE OR REPLACE FUNCTION storage.protect_objects() RETURNS trigger
-  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
-$f$
-DECLARE
-  consumed uuid;
-BEGIN
-  IF TG_OP = 'UPDATE' AND NEW.bucket_id IS NOT DISTINCT FROM OLD.bucket_id AND NEW.version_id IS NOT DISTINCT FROM OLD.version_id
-      AND NEW.size IS NOT DISTINCT FROM OLD.size AND NEW.etag IS NOT DISTINCT FROM OLD.etag THEN
-    RETURN NULL;
-  END IF;
-  DELETE FROM storage.upload_tickets t
-    WHERE t.version_id = NEW.version_id AND t.bucket_id = NEW.bucket_id AND t.name = NEW.name
-      AND t.size = NEW.size AND t.etag = NEW.etag AND t.expires_at > clock_timestamp()
-      AND t.timeline_id = pg_catalog.current_setting('neon.timeline_id', true)
-    RETURNING t.version_id INTO consumed;
-  IF consumed IS NULL THEN
-    RAISE EXCEPTION USING ERRCODE = '{TICKET_MISSING}', MESSAGE = 'storage.objects: bucket_id, name, version_id, size and etag match no unused upload ticket';
-  END IF;
-  RETURN NULL;
-END
-$f$;
-ALTER FUNCTION storage.protect_objects() OWNER TO chelabase_admin;
+  LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
+$f${PROTECT_OBJECTS_BODY}$f$;
+ALTER FUNCTION storage.protect_objects() OWNER TO CURRENT_USER;
 REVOKE ALL ON FUNCTION storage.protect_objects() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER protect_objects AFTER INSERT OR UPDATE ON storage.objects
   FOR EACH ROW EXECUTE FUNCTION storage.protect_objects();
@@ -334,6 +352,13 @@ DECLARE
   targets text;
   statement text;
 BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_event_trigger e WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_ddl')
+      AND NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) session_user AND rolsuper)
+      AND (session_user OPERATOR(pg_catalog.<>) {owner_lit}
+        OR CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) '{SCHEMA_LOCKED_ROLE}')
+          THEN pg_catalog.pg_has_role(session_user, '{SCHEMA_LOCKED_ROLE}', 'MEMBER') ELSE false END) THEN
+    RAISE EXCEPTION 'branch is protected: schema changes need Admin' USING ERRCODE = '42501', HINT = '{BRANCH_PROTECTED_HINT}';
+  END IF;
   IF table_name IS NULL OR table_name NOT IN ('buckets', 'objects') THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.create_policy: the table must be buckets or objects';
   END IF;
@@ -371,6 +396,13 @@ CREATE OR REPLACE FUNCTION storage.drop_policy(policy_name name, table_name name
   LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp SET event_triggers = off AS
 $f$
 BEGIN
+  IF EXISTS (SELECT FROM pg_catalog.pg_event_trigger e WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_ddl')
+      AND NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) session_user AND rolsuper)
+      AND (session_user OPERATOR(pg_catalog.<>) {owner_lit}
+        OR CASE WHEN EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) '{SCHEMA_LOCKED_ROLE}')
+          THEN pg_catalog.pg_has_role(session_user, '{SCHEMA_LOCKED_ROLE}', 'MEMBER') ELSE false END) THEN
+    RAISE EXCEPTION 'branch is protected: schema changes need Admin' USING ERRCODE = '42501', HINT = '{BRANCH_PROTECTED_HINT}';
+  END IF;
   IF table_name IS NULL OR table_name NOT IN ('buckets', 'objects') THEN
     RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.drop_policy: the table must be buckets or objects';
   END IF;
@@ -416,9 +448,32 @@ pub fn storage_check_sql(owner_role: &str) -> String {
                  AND ((NOT t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.<>) 'A') OR (t.tgisinternal AND t.tgenabled OPERATOR(pg_catalog.=) 'D'))) \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) n.oid \
                AND p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) \
-               AND 'event_triggers=off' OPERATOR(pg_catalog.=) ANY (p.proconfig)) OPERATOR(pg_catalog.=) 2)))",
+               AND 'event_triggers=off' OPERATOR(pg_catalog.=) ANY (p.proconfig)) OPERATOR(pg_catalog.=) 2 \
+             AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) n.oid \
+               AND ((p.proname OPERATOR(pg_catalog.=) 'protect_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${PROTECT_OBJECTS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'guard_tickets' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_TICKETS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'consume_ticket' AND p.prosecdef AND p.proowner OPERATOR(pg_catalog.=) r.oid \
+                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 3 \
+             AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
+               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 2 \
+             AND (SELECT pg_catalog.array_agg(v ORDER BY v) FROM (SELECT {default_entry} AS v FROM pg_catalog.pg_attrdef x \
+               JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid \
+               JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.adrelid AND a.attnum OPERATOR(pg_catalog.=) x.adnum \
+               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid) d) OPERATOR(pg_catalog.=) {defaults} \
+             AND (SELECT pg_catalog.array_agg(v ORDER BY v) FROM (SELECT {constraint_entry} AS v FROM pg_catalog.pg_constraint x \
+               JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.conrelid WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid) k) \
+               OPERATOR(pg_catalog.=) {constraints}))) \
+     AND NOT EXISTS (SELECT FROM pg_catalog.pg_auth_members a WHERE a.roleid OPERATOR(pg_catalog.=) {storage_role} OR a.member OPERATOR(pg_catalog.=) {storage_role}) \
+     AND NOT {drift} \
+     AND EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {storage_role} AND s.setdatabase OPERATOR(pg_catalog.=) 0::pg_catalog.oid)",
         objects = foreign_objects_sql(),
         acl = foreign_acl_sql(owner_role),
+        default_entry = DEFAULT_ENTRY,
+        constraint_entry = CONSTRAINT_ENTRY,
+        defaults = expected_list(&EXPECTED_DEFAULTS),
+        constraints = expected_list(&EXPECTED_CONSTRAINTS),
+        storage_role = STORAGE_ROLE_OID,
+        drift = role_drift_sql(STORAGE_ROLE_OID),
     )
 }
 
@@ -432,7 +487,8 @@ pub fn foreign_objects_sql() -> String {
         "SELECT pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure) FROM pg_catalog.pg_proc p \
   WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND p.oid::pg_catalog.regprocedure::pg_catalog.text OPERATOR(pg_catalog.<>) ALL (ARRAY[\
 'storage.foldername(text)', 'storage.filename(text)', 'storage.extension(text)', 'storage.object_ref(uuid,text)', \
-'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()']) \
+'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', \
+'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)']) \
 UNION ALL SELECT pg_catalog.format('DROP %s IF EXISTS %s CASCADE', CASE c.relkind WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' \
     WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, c.oid::pg_catalog.regclass) \
   FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} \
@@ -491,6 +547,113 @@ pub fn foreign_acl_sql(owner_role: &str) -> String {
         "SELECT FROM ({entries}) x LEFT JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) x.grantee \
   WHERE x.is_grantable OR NOT (COALESCE(r.rolname::pg_catalog.text, 'public') OPERATOR(pg_catalog.=) ANY (x.allowed)) \
     OR x.grantor OPERATOR(pg_catalog.<>) ALL (ARRAY(SELECT o.oid FROM pg_catalog.pg_roles o WHERE o.rolname OPERATOR(pg_catalog.=) 'chelabase_admin' OR o.rolsuper))"
+    )
+}
+
+/// `guard_tickets`'s body (its `prosrc`, which [`storage_check_sql`] compares).
+pub const GUARD_TICKETS_BODY: &str = "
+BEGIN
+  IF current_user <> 'chelabase_storage' THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB004', MESSAGE = 'storage.upload_tickets is written by Chelabase storage only';
+  END IF;
+  -- The timeline it was minted on: a branch copies the row, never the timeline.
+  NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);
+  IF NEW.timeline_id IS NULL OR NEW.timeline_id = '' THEN
+    RAISE EXCEPTION USING ERRCODE = '55000', MESSAGE = 'storage.upload_tickets: this server has no Neon timeline';
+  END IF;
+  IF NEW.expires_at <= clock_timestamp() OR NEW.expires_at > clock_timestamp() + interval '15 minutes' THEN
+    RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_tickets: a ticket expires within 15 minutes';
+  END IF;
+  RETURN NEW;
+END
+";
+
+/// `protect_objects`'s body: it runs as the inserting role, so `current_user` is the role
+/// the ticket must have been minted for.
+pub const PROTECT_OBJECTS_BODY: &str = "
+BEGIN
+  IF TG_OP = 'UPDATE' AND NEW.bucket_id IS NOT DISTINCT FROM OLD.bucket_id AND NEW.version_id IS NOT DISTINCT FROM OLD.version_id
+      AND NEW.size IS NOT DISTINCT FROM OLD.size AND NEW.etag IS NOT DISTINCT FROM OLD.etag THEN
+    RETURN NULL;
+  END IF;
+  IF NOT storage.consume_ticket(NEW.version_id, NEW.bucket_id, NEW.name, NEW.size, NEW.etag, NEW.owner, current_user) THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB003', MESSAGE = 'storage.objects: the row matches no unused upload ticket for this role and owner';
+  END IF;
+  RETURN NULL;
+END
+";
+
+/// `consume_ticket`'s body (`SECURITY DEFINER` as `chelabase_admin`, the tickets' owner):
+/// deletes the one matching unexpired ticket of this timeline. Outside a trigger it does
+/// nothing, so a direct call can't be used to probe or drop tickets.
+pub const CONSUME_TICKET_BODY: &str = "
+DECLARE
+  consumed uuid;
+BEGIN
+  IF pg_catalog.pg_trigger_depth() = 0 THEN
+    RETURN false;
+  END IF;
+  DELETE FROM storage.upload_tickets t
+    WHERE t.version_id = p_version AND t.bucket_id = p_bucket AND t.name = p_name AND t.size = p_size AND t.etag = p_etag
+      AND t.owner IS NOT DISTINCT FROM p_owner AND t.caller_role = p_caller AND t.expires_at > clock_timestamp()
+      AND t.timeline_id = pg_catalog.current_setting('neon.timeline_id', true)
+    RETURNING t.version_id INTO consumed;
+  RETURN consumed IS NOT NULL;
+END
+";
+
+/// `chelabase_storage`'s oid, as the check reads it.
+const STORAGE_ROLE_OID: &str = "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')";
+
+/// The install's column defaults, as `table.column=pg_get_expr`.
+pub const EXPECTED_DEFAULTS: [&str; 8] = [
+    "buckets.created_at=now()",
+    "buckets.id=gen_random_uuid()",
+    "buckets.public=false",
+    "objects.created_at=now()",
+    "objects.id=gen_random_uuid()",
+    "objects.metadata='{}'::jsonb",
+    "objects.updated_at=now()",
+    "upload_tickets.created_at=now()",
+];
+
+/// The install's constraints, as `table.constraint`.
+pub const EXPECTED_CONSTRAINTS: [&str; 7] = [
+    "buckets.buckets_file_size_limit_check",
+    "buckets.buckets_name_key",
+    "buckets.buckets_pkey",
+    "objects.objects_bucket_id_fkey",
+    "objects.objects_bucket_id_name_key",
+    "objects.objects_pkey",
+    "upload_tickets.upload_tickets_pkey",
+];
+
+/// A default as [`EXPECTED_DEFAULTS`] spells it (`c`: its table, `a`: its column, `x`: the
+/// `pg_attrdef` row).
+const DEFAULT_ENTRY: &str = "c.relname::pg_catalog.text OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) a.attname::pg_catalog.text OPERATOR(pg_catalog.||) '=' OPERATOR(pg_catalog.||) pg_catalog.pg_get_expr(x.adbin, x.adrelid)";
+
+/// A constraint as [`EXPECTED_CONSTRAINTS`] spells it (`c`: its table, `x`: the row).
+const CONSTRAINT_ENTRY: &str = "c.relname::pg_catalog.text OPERATOR(pg_catalog.||) '.' OPERATOR(pg_catalog.||) x.conname::pg_catalog.text";
+
+/// `items` as a `text[]` literal.
+pub fn expected_list(items: &[&str]) -> String {
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|i| format!("'{}'", i.replace('\'', "''")))
+        .collect();
+    format!("ARRAY[{}]::pg_catalog.text[]", quoted.join(", "))
+}
+
+/// Whether the role `role` (an oid expression) has drifted from what the lockdown leaves:
+/// any attribute, password, connection limit, or settings other than exactly `search_path`
+/// and `event_triggers = off`.
+pub fn role_drift_sql(role: &str) -> String {
+    format!(
+        "(EXISTS (SELECT FROM pg_catalog.pg_authid a WHERE a.oid OPERATOR(pg_catalog.=) {role}
+    AND (a.rolcanlogin OR a.rolsuper OR a.rolcreaterole OR a.rolcreatedb OR a.rolreplication OR NOT a.rolbypassrls OR a.rolinherit
+      OR a.rolpassword IS NOT NULL OR a.rolconnlimit OPERATOR(pg_catalog.<>) 0))
+    OR EXISTS (SELECT FROM pg_catalog.pg_db_role_setting s WHERE s.setrole OPERATOR(pg_catalog.=) {role}
+      AND (s.setdatabase OPERATOR(pg_catalog.<>) 0::pg_catalog.oid OR s.setconfig OPERATOR(pg_catalog.<>) ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']::pg_catalog.text[])))"
     )
 }
 
@@ -686,6 +849,8 @@ mod tests {
             "EXECUTE pg_catalog.format('ALTER ROLE chelabase_storage IN DATABASE %I RESET ALL', m.datname);",
             "ALTER ROLE chelabase_storage RESET ALL;",
             "ALTER ROLE chelabase_storage SET search_path = pg_catalog, pg_temp;",
+            // No event trigger fires for its sessions (a login trigger included).
+            "ALTER ROLE chelabase_storage SET event_triggers = off;",
             // Its members and admins (an ADMIN grant is a membership row too)...
             "WHERE a.roleid OPERATOR(pg_catalog.=) role",
             "EXECUTE pg_catalog.format('REVOKE chelabase_storage FROM %I GRANTED BY %I CASCADE', m.member, m.grantor);",
@@ -697,7 +862,7 @@ mod tests {
             "PERFORM pg_catalog.set_config('chelabase.storage_former_members', pg_catalog.array_to_string(members, ','), false);",
             "PERFORM pg_catalog.pg_terminate_backend(a.pid)",
             // Tickets minted while it was tampered with are void.
-            "IF (joined OR tampered) AND EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace\n      JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner\n      WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN\n    DELETE FROM storage.upload_tickets;",
+            "IF (has_members OR tampered) AND EXISTS (SELECT FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid OPERATOR(pg_catalog.=) c.relnamespace\n      JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner\n      WHERE n.nspname OPERATOR(pg_catalog.=) 'storage' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets' AND r.rolname OPERATOR(pg_catalog.=) 'chelabase_admin') THEN\n    DELETE FROM storage.upload_tickets;",
         ] {
             assert!(lockdown.contains(part), "{part}: {lockdown}");
         }
@@ -713,15 +878,15 @@ mod tests {
             "rolpassword IS NOT NULL",
             "rolconnlimit OPERATOR(pg_catalog.<>) 0",
             "pg_db_role_setting",
-            "ARRAY['search_path=pg_catalog, pg_temp']",
+            "ARRAY['search_path=pg_catalog, pg_temp', 'event_triggers=off']",
         ] {
             assert!(tampered.contains(attribute), "{attribute}: {tampered}");
         }
-        let joined = between(lockdown, "joined :=", ";\n");
+        // Only a role that could become it (a member) voids tickets, not its own memberships.
+        let joined = between(lockdown, "has_members :=", ";\n");
         assert!(
-            joined.contains(
-                "a.roleid OPERATOR(pg_catalog.=) role OR a.member OPERATOR(pg_catalog.=) role"
-            ),
+            joined.contains("a.roleid OPERATOR(pg_catalog.=) role)")
+                && !joined.contains("a.member"),
             "{joined}"
         );
         // The sessions are ended again once the revokes are committed.
@@ -810,6 +975,9 @@ mod tests {
             "etag text NOT NULL",
             "expires_at timestamptz NOT NULL",
             "timeline_id text NOT NULL",
+            // Bound to the request it was minted for (re-audit S1).
+            "caller_role name NOT NULL",
+            "owner uuid",
         ] {
             assert!(table.contains(column), "{column}: {table}");
         }
@@ -862,42 +1030,56 @@ mod tests {
             "CREATE OR REPLACE FUNCTION storage.protect_objects()",
             "$f$;",
         );
+        // It runs as the inserting role, so `current_user` is the caller's own role.
         assert!(
             body.contains(
-                "LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp"
+                "LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp"
             ),
             "{body}"
         );
-        assert!(!body.contains("current_user"), "no role is exempt: {body}");
         assert!(body.contains("IF TG_OP = 'UPDATE' AND NEW.bucket_id IS NOT DISTINCT FROM OLD.bucket_id AND NEW.version_id IS NOT DISTINCT FROM OLD.version_id\n      AND NEW.size IS NOT DISTINCT FROM OLD.size AND NEW.etag IS NOT DISTINCT FROM OLD.etag THEN\n    RETURN NULL;"), "{body}");
-        let consume = between(body, "DELETE FROM storage.upload_tickets t", ";");
+        assert!(body.contains(&format!("IF NOT storage.consume_ticket(NEW.version_id, NEW.bucket_id, NEW.name, NEW.size, NEW.etag, NEW.owner, current_user) THEN\n    RAISE EXCEPTION USING ERRCODE = '{TICKET_MISSING}'")), "{body}");
+        let consume = between(
+            &sql,
+            "CREATE OR REPLACE FUNCTION storage.consume_ticket(",
+            "$f$;",
+        );
+        assert!(
+            consume.contains(
+                "LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp"
+            ),
+            "{consume}"
+        );
+        assert!(
+            consume.contains("IF pg_catalog.pg_trigger_depth() = 0 THEN\n    RETURN false;"),
+            "only from a trigger: {consume}"
+        );
+        let delete = between(consume, "DELETE FROM storage.upload_tickets t", ";");
         for part in [
-            "t.version_id = NEW.version_id",
-            "t.bucket_id = NEW.bucket_id",
-            "t.name = NEW.name",
-            "t.size = NEW.size",
-            "t.etag = NEW.etag",
+            "t.version_id = p_version",
+            "t.bucket_id = p_bucket",
+            "t.name = p_name",
+            "t.size = p_size",
+            "t.etag = p_etag",
+            "t.owner IS NOT DISTINCT FROM p_owner",
+            "t.caller_role = p_caller",
             "t.expires_at > clock_timestamp()",
             "t.timeline_id = pg_catalog.current_setting('neon.timeline_id', true)",
             "RETURNING t.version_id INTO consumed",
         ] {
-            assert!(consume.contains(part), "{part}: {consume}");
+            assert!(delete.contains(part), "{part}: {delete}");
         }
-        assert!(
-            body.contains(&format!(
-                "IF consumed IS NULL THEN\n    RAISE EXCEPTION USING ERRCODE = '{TICKET_MISSING}'"
-            )),
-            "{body}"
-        );
         assert!(sql.contains("CREATE OR REPLACE TRIGGER protect_objects AFTER INSERT OR UPDATE ON storage.objects\n  FOR EACH ROW EXECUTE FUNCTION storage.protect_objects();"), "{sql}");
         assert!(
             sql.contains("ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER protect_objects;"),
             "{sql}"
         );
         assert!(
-            sql.contains("ALTER FUNCTION storage.protect_objects() OWNER TO chelabase_admin;"),
+            sql.contains("ALTER FUNCTION storage.protect_objects() OWNER TO CURRENT_USER;"),
             "{sql}"
         );
+        assert!(sql.contains("ALTER FUNCTION storage.consume_ticket(uuid, uuid, text, bigint, text, uuid, name) OWNER TO chelabase_admin;"), "{sql}");
+        assert!(sql.contains("GRANT EXECUTE ON FUNCTION storage.consume_ticket(uuid, uuid, text, bigint, text, uuid, name) TO PUBLIC;"), "{sql}");
     }
 
     /// The triggers' codes are their own: never RLS's 42501, never the data API's `CB001`
@@ -918,9 +1100,19 @@ mod tests {
                 "{code}"
             );
         }
-        assert!(
-            !sql().contains("ERRCODE = '42501'"),
-            "the triggers never raise RLS's code"
+        // The ticket triggers never raise RLS's code (only the helpers' branch guard does,
+        // as the guard itself does).
+        for body in [
+            PROTECT_OBJECTS_BODY,
+            GUARD_TICKETS_BODY,
+            CONSUME_TICKET_BODY,
+        ] {
+            assert!(!body.contains("42501"), "{body}");
+        }
+        assert_eq!(
+            sql().matches("ERRCODE = '42501'").count(),
+            2,
+            "the two helpers' guard only"
         );
     }
 
@@ -1015,6 +1207,48 @@ mod tests {
         }
     }
 
+    /// Re-audit S4: with event triggers off, the helpers apply the protected-branch guard
+    /// themselves: while the guard is installed only an unmarked owner session (or a
+    /// superuser) may change policies, so an owner wrapper called by a locked login is refused.
+    #[test]
+    fn storage_schema_policy_helpers_apply_the_branch_guard() {
+        use chelabase_types::table_api::{BRANCH_PROTECTED_HINT, SCHEMA_LOCKED_ROLE};
+        let sql = sql();
+        for function in ["storage.create_policy(", "storage.drop_policy("] {
+            let body = between(
+                &sql,
+                &format!("CREATE OR REPLACE FUNCTION {function}"),
+                "$f$;",
+            );
+            let guard = between(
+                body,
+                "IF EXISTS (SELECT FROM pg_catalog.pg_event_trigger e WHERE e.evtname OPERATOR(pg_catalog.=) 'chelabase_schema_guard_ddl')",
+                "END IF;",
+            );
+            assert!(guard.contains("NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) session_user AND rolsuper)"), "{guard}");
+            assert!(
+                guard.contains("session_user OPERATOR(pg_catalog.<>) 'postgres'"),
+                "{guard}"
+            );
+            assert!(
+                guard.contains(&format!(
+                    "pg_catalog.pg_has_role(session_user, '{SCHEMA_LOCKED_ROLE}', 'MEMBER')"
+                )),
+                "{guard}"
+            );
+            assert!(
+                guard.contains(&format!(
+                    "ERRCODE = '42501', HINT = '{BRANCH_PROTECTED_HINT}'"
+                )),
+                "{guard}"
+            );
+            assert!(
+                body.find(guard).unwrap() < body.find("EXECUTE ").unwrap(),
+                "the guard comes before the DDL: {body}"
+            );
+        }
+    }
+
     /// B1: every run removes what it didn't make in `storage`, revokes every ACL entry before
     /// granting its own (whoever granted it, grant options included), and turns every trigger
     /// on its tables back on.
@@ -1047,6 +1281,14 @@ mod tests {
             install.contains("GRANT USAGE ON TYPE storage.object_ref TO PUBLIC;"),
             "{install}"
         );
+        // Re-audit S3: foreign defaults and constraints go, the install's come back.
+        assert!(install.contains("EXECUTE pg_catalog.format('ALTER TABLE %s ALTER COLUMN %I DROP DEFAULT', d.rel, d.att);"), "{install}");
+        assert!(install.contains("EXECUTE pg_catalog.format('ALTER TABLE %s DROP CONSTRAINT %I CASCADE', k.rel, k.conname);"), "{install}");
+        assert!(
+            install.contains("ALTER TABLE storage.objects ALTER COLUMN metadata SET DEFAULT '{}';"),
+            "{install}"
+        );
+        assert!(install.contains("    ALTER TABLE storage.objects ADD CONSTRAINT objects_bucket_id_fkey FOREIGN KEY (bucket_id) REFERENCES storage.buckets (id);"), "{install}");
         let objects = foreign_objects_sql();
         for part in [
             "DROP ROUTINE IF EXISTS",
@@ -1057,6 +1299,7 @@ mod tests {
             "DROP STATISTICS IF EXISTS",
             "DROP COLLATION IF EXISTS",
             "'storage.create_policy(name,name,text,name[],text,text,boolean)'",
+            "'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)'",
             "'objects_bucket_id_name_key'",
         ] {
             assert!(objects.contains(part), "{part}: {objects}");
@@ -1203,9 +1446,27 @@ mod tests {
             "t.tgenabled OPERATOR(pg_catalog.<>) 'A'",
             "t.tgenabled OPERATOR(pg_catalog.=) 'D'",
             "'event_triggers=off'",
+            // Re-audit S2: the role's drift or any membership, either way.
+            "a.roleid OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage') OR a.member OPERATOR(pg_catalog.=) (SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')",
+            &role_drift_sql(
+                "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')",
+            ),
+            // Re-audit S3: the triggers' functions as installed, and only the install's
+            // defaults and constraints.
+            &format!("$b${PROTECT_OBJECTS_BODY}$b$"),
+            &format!("$b${GUARD_TICKETS_BODY}$b$"),
+            &format!("$b${CONSUME_TICKET_BODY}$b$"),
+            &expected_list(&EXPECTED_DEFAULTS),
+            &expected_list(&EXPECTED_CONSTRAINTS),
         ] {
             assert!(storage.contains(part), "{part}: {storage}");
         }
+        assert!(
+            sql().contains(&format!("$f${PROTECT_OBJECTS_BODY}$f$"))
+                && sql().contains(&format!("$f${CONSUME_TICKET_BODY}$f$"))
+        );
+        assert_eq!(EXPECTED_DEFAULTS.len(), 8);
+        assert!(EXPECTED_CONSTRAINTS.contains(&"objects.objects_bucket_id_fkey"));
     }
 
     /// AC 1: provisioning installs it right after the data API script, in each served
