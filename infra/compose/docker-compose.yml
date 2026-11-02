@@ -212,6 +212,22 @@ services:
           [ -e "$$S/zitadel-pats/$$f" ] || (umask 077 && : >"$$S/zitadel-pats/$$f")
           chmod 0600 "$$S/zitadel-pats/$$f"
         done
+        # The object-store identities beside Neon's `s3/` pair (chelabase-init makes that one):
+        # `storage-s3/` for the storage service, scoped to bucket chelabase-storage, and
+        # `s3-admin/` for create-bucket alone (the only holder of global Admin). Each file is made
+        # only when missing, so an upgraded install keeps every key it has and only gains these.
+        # Same owner, group and mode as `s3/*`.
+        new_key() { # <file under $$S> <length>
+          [ -s "$$S/$$1" ] && return 0
+          install -d -m 0700 "$$S/$${1%/*}"
+          ( umask 027; tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$$2" >"$$S/$$1.tmp" )
+          chgrp 1000 "$$S/$$1.tmp"
+          mv -f "$$S/$$1.tmp" "$$S/$$1"
+        }
+        new_key storage-s3/access-key 20
+        new_key storage-s3/secret-key 40
+        new_key s3-admin/access-key 20
+        new_key s3-admin/secret-key 40
         # Zitadel takes its database passwords only from its environment or a config file: the
         # file, rendered from the two password files (no quote or backslash can be in them).
         umask 077
@@ -433,9 +449,17 @@ services:
   # Flags and health checks come from the old cheladb repo's core/docker/docker-compose.yml,
   # checked there against the pinned Neon source.
 
-  # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL.
-  # Its one S3 identity is rendered from the two key files into a private file of the container
-  # (SeaweedFS takes it only in that JSON; the key files hold no quote or backslash).
+  # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL,
+  # and for user objects (bucket `chelabase-storage`, written by the storage service).
+  # Three S3 identities are rendered from their key files into a private file of the container
+  # (SeaweedFS takes them only in that JSON; the key files hold no quote or backslash):
+  #   neon     Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
+  #   storage  the same on bucket `chelabase-storage` only
+  #   admin    global Admin, for create-bucket only; no service holds it besides that one-shot
+  # Neither service identity can reach the other's bucket. Master (9333), volume (8080) and filer
+  # (8888) have no auth and bypass S3 IAM, so every component binds to and advertises 127.0.0.1;
+  # only the S3 port (8333) listens on the network (`-s3.ip.bind`). The Iceberg and Lance catalog
+  # ports are off and the embedded IAM API is off, so identities change only through this file.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     restart: unless-stopped
@@ -444,19 +468,34 @@ services:
       - |
         set -e
         umask 077
-        ak="$$(cat /run/chelabase/secrets/s3/access-key)"
-        sk="$$(cat /run/chelabase/secrets/s3/secret-key)"
+        nak="$$(cat /run/chelabase/secrets/s3/access-key)"
+        nsk="$$(cat /run/chelabase/secrets/s3/secret-key)"
+        sak="$$(cat /run/chelabase/secrets/storage-s3/access-key)"
+        ssk="$$(cat /run/chelabase/secrets/storage-s3/secret-key)"
+        aak="$$(cat /run/chelabase/secrets/s3-admin/access-key)"
+        ask="$$(cat /run/chelabase/secrets/s3-admin/secret-key)"
         cat > /tmp/s3.json <<EOT
-        {"identities": [{"name": "neon",
-          "credentials": [{"accessKey": "$$ak", "secretKey": "$$sk"}],
-          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+        {"identities": [
+          {"name": "neon",
+           "credentials": [{"accessKey": "$$nak", "secretKey": "$$nsk"}],
+           "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},
+          {"name": "storage",
+           "credentials": [{"accessKey": "$$sak", "secretKey": "$$ssk"}],
+           "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]},
+          {"name": "admin",
+           "credentials": [{"accessKey": "$$aak", "secretKey": "$$ask"}],
+           "actions": ["Admin"]}]}
         EOT
-        unset ak sk
-        exec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
+        unset nak nsk sak ssk aak ask
+        exec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
     volumes:
       - neon_seaweedfs_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/secret-key, read_only: true, volume: {subpath: s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/access-key, read_only: true, volume: {subpath: s3-admin/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/secret-key, read_only: true, volume: {subpath: s3-admin/secret-key}}
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "8333"]
       interval: 2s
@@ -465,6 +504,8 @@ services:
       init-secrets:
         condition: service_completed_successfully
 
+  # Makes both buckets with the admin identity, the only one that may create a bucket. It does
+  # not use Neon's keys, so it is not the way to check that `neon` can reach its bucket.
   create-bucket:
     image: *neon-image
     restart: "no"
@@ -474,20 +515,34 @@ services:
       - /bin/sh
       - -c
       - |
-        export AWS_ACCESS_KEY_ID="$$(cat /run/chelabase/secrets/s3/access-key)"
-        export AWS_SECRET_ACCESS_KEY="$$(cat /run/chelabase/secrets/s3/secret-key)"
-        for i in $$(seq 60); do
-          aws --endpoint-url http://seaweedfs:8333 s3 mb s3://neon 2>/dev/null ||
-            aws --endpoint-url http://seaweedfs:8333 s3 ls s3://neon >/dev/null && exit 0
-          sleep 2
+        export AWS_ACCESS_KEY_ID="$$(cat /run/chelabase/secrets/s3-admin/access-key)"
+        export AWS_SECRET_ACCESS_KEY="$$(cat /run/chelabase/secrets/s3-admin/secret-key)"
+        for b in neon chelabase-storage; do
+          ok=
+          for i in $$(seq 60); do
+            aws --endpoint-url http://seaweedfs:8333 s3 mb s3://$$b 2>/dev/null ||
+              aws --endpoint-url http://seaweedfs:8333 s3 ls s3://$$b >/dev/null && { ok=1; break; }
+            sleep 2
+          done
+          [ -n "$$ok" ] || exit 1
         done
-        exit 1
     volumes:
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/secret-key, read_only: true, volume: {subpath: s3/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/access-key, read_only: true, volume: {subpath: s3-admin/access-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/secret-key, read_only: true, volume: {subpath: s3-admin/secret-key}}
     depends_on:
       seaweedfs:
         condition: service_healthy
+
+  # The storage service (epic object-storage m5) lands here. It reads only its own identity, from
+  # files, and reaches S3 only by URL (no shared volume, so SeaweedFS may be on another node):
+  #   environment:
+  #     CHELABASE_STORAGE_S3_ENDPOINT: http://seaweedfs:8333
+  #     CHELABASE_STORAGE_S3_BUCKET: chelabase-storage
+  #     CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/storage-s3/access-key
+  #     CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/storage-s3/secret-key
+  #   volumes:
+  #     - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
+  #     - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
 
   storage-broker:
     image: *neon-image

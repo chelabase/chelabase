@@ -190,31 +190,28 @@ services:
       - neon_storcon_pg_data:/var/lib/postgresql/data
     depends_on: !reset {}
 
+  # SeaweedFS runs the base file's command: its three identities come from key files, here
+  # Compose secrets from the stack's state dir (the CLI writes the fixed dev values of `storage`
+  # and `admin` there beside Neon's `s3/` pair), so no S3 key of the new identities is in
+  # `docker inspect`.
   seaweedfs:
-    command: !override
-      - |
-        cat > /tmp/s3.json <<EOT
-        {"identities": [{"name": "neon",
-          "credentials": [{"accessKey": "chelabase-dev", "secretKey": "chelabase-dev-secret"}],
-          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
-        EOT
-        exec weed server -s3 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
     volumes: !override
       - neon_seaweedfs_data:/data
+    secrets:
+      - {source: s3-neon-access-key, target: /run/chelabase/secrets/s3/access-key}
+      - {source: s3-neon-secret-key, target: /run/chelabase/secrets/s3/secret-key}
+      - {source: s3-storage-access-key, target: /run/chelabase/secrets/storage-s3/access-key}
+      - {source: s3-storage-secret-key, target: /run/chelabase/secrets/storage-s3/secret-key}
+      - {source: s3-admin-access-key, target: /run/chelabase/secrets/s3-admin/access-key}
+      - {source: s3-admin-secret-key, target: /run/chelabase/secrets/s3-admin/secret-key}
     depends_on: !reset {}
 
+  # The base file's entrypoint, with the admin key files as secrets instead of volume mounts.
   create-bucket:
-    environment: *neon-s3-env
-    entrypoint: !override ["/bin/sh", "-c"]
-    command: !override
-      - |
-        for i in $$(seq 60); do
-          aws --endpoint-url http://seaweedfs:8333 s3 mb s3://neon 2>/dev/null ||
-            aws --endpoint-url http://seaweedfs:8333 s3 ls s3://neon >/dev/null && exit 0
-          sleep 2
-        done
-        exit 1
     volumes: !reset []
+    secrets:
+      - {source: s3-admin-access-key, target: /run/chelabase/secrets/s3-admin/access-key}
+      - {source: s3-admin-secret-key, target: /run/chelabase/secrets/s3-admin/secret-key}
 
   safekeeper1:
     user: "0"
@@ -839,6 +836,12 @@ volumes:
 # 0600, never overwritten); a service gets its file's path as <NAME>_FILE in its own
 # `environment:`, never through stack.env.
 secrets:
+  s3-neon-access-key: {file: "${CHELABASE_STACK_DIR}/s3/access-key"}
+  s3-neon-secret-key: {file: "${CHELABASE_STACK_DIR}/s3/secret-key"}
+  s3-storage-access-key: {file: "${CHELABASE_STACK_DIR}/storage-s3/access-key"}
+  s3-storage-secret-key: {file: "${CHELABASE_STACK_DIR}/storage-s3/secret-key"}
+  s3-admin-access-key: {file: "${CHELABASE_STACK_DIR}/s3-admin/access-key"}
+  s3-admin-secret-key: {file: "${CHELABASE_STACK_DIR}/s3-admin/secret-key"}
   secrets-key: {file: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
   internal-signing: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
   internal-verify: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
