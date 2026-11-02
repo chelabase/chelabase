@@ -849,7 +849,7 @@
           {
             "name": "name",
             "in": "path",
-            "description": "The object's name: no leading `/`, no empty or `..` segment, at most 1024 bytes",
+            "description": "The object's name: at most 1024 bytes of UTF-8, no control characters, no leading `/`, no empty segment and none made only of dots (`.`, `..`, full-width or other NFKC dot forms)",
             "required": true,
             "schema": {
               "type": "string"

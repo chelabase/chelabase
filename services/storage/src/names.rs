@@ -1,5 +1,5 @@
 //! Object names, blob keys and the small pieces of the object routes that need no database:
-//! the upload's byte counter and staging, `Content-Disposition`, and the list cursor.
+//! the upload's byte counter and streaming, `Content-Disposition`, and the list cursor.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -23,7 +23,16 @@ pub fn valid_object_name(name: &str) -> bool {
         && !name.chars().any(char::is_control)
         && name
             .split('/')
-            .all(|s| !s.is_empty() && !s.chars().all(|c| c == '.' || c == '\u{ff0e}'))
+            .all(|s| !s.is_empty() && !s.chars().all(is_dot))
+}
+
+/// `.` and every code point NFKC folds to dots: `．` U+FF0E, `․` U+2024, `‥` U+2025, `…`
+/// U+2026, `﹒` U+FE52.
+fn is_dot(c: char) -> bool {
+    matches!(
+        c,
+        '.' | '\u{ff0e}' | '\u{2024}' | '\u{2025}' | '\u{2026}' | '\u{fe52}'
+    )
 }
 
 pub fn check_object_name(name: &str) -> Result<(), Failure> {
@@ -34,8 +43,8 @@ pub fn check_object_name(name: &str) -> Result<(), Failure> {
     }
 }
 
-/// A version's blob: `{database_id}/{pg_database}/{version_id}` (`prefix` from
-/// [`crate::engine::Engine::locate`]). A row carrying another database's version names a key
+/// A version's blob: `{database_id}/{datoid}/{version_id}` (`prefix` from
+/// [`object_prefix`], the OID read in the request's caller transaction). A row carrying another database's version names a key
 /// under that database's prefix, never reached from here.
 pub fn version_key(prefix: &str, version: Uuid) -> String {
     format!("{prefix}{version}")
@@ -147,11 +156,11 @@ pub enum Staged {
     Store(StorageError),
 }
 
-/// Streams `body` to `staging` (the version's own key); the blob's size and etag, or why not.
+/// Streams `body` to `key` (the version's own); the blob's size and etag, or why not.
 /// Whatever failed, nothing stays at the key.
 pub async fn stage(
     store: &dyn ObjectStore,
-    staging: &str,
+    key: &str,
     body: ByteStream,
     counter: &Counter,
     content_type: Option<String>,
@@ -160,10 +169,10 @@ pub async fn stage(
         content_type,
         if_none_match: false,
     };
-    match store.put_stream(staging, body, opts).await {
+    match store.put_stream(key, body, opts).await {
         Ok(meta) => Ok(meta),
         Err(e) => {
-            let _ = store.delete(staging).await;
+            let _ = store.delete(key).await;
             Err(if counter.over.load(Ordering::SeqCst) {
                 Staged::TooLarge
             } else {
@@ -174,16 +183,27 @@ pub async fn stage(
 }
 
 /// After the body is at `version_key` (random and unreferenced until its row exists): runs
-/// `write` (the ticket and the caller's row). A failed or refused `write` deletes the blob, so
-/// no blob outlives a refused row and no row ever points at a missing blob.
+/// `write` (the ticket and the caller's row). A refused or failed `write` deletes the blob, so
+/// no blob outlives a refused row. A write whose outcome is unknown
+/// ([`crate::objects::outcome_unknown`]: it may have committed) keeps it for m8's sweeper,
+/// which deletes only unreferenced blobs, so no row ever points at a missing blob.
 pub async fn keep_if_written<T>(
     store: &dyn ObjectStore,
     version_key: &str,
     write: impl AsyncFnOnce() -> Result<T, Failure>,
 ) -> Result<T, Failure> {
     let out = write().await;
-    if out.is_err() {
-        let _ = store.delete(version_key).await;
+    match &out {
+        Err(f) if crate::objects::outcome_unknown(f) => {
+            tracing::warn!(
+                version_key,
+                "the row's write may have committed; its blob is left for the sweeper"
+            );
+        }
+        Err(_) => {
+            let _ = store.delete(version_key).await;
+        }
+        Ok(_) => {}
     }
     out
 }
@@ -223,6 +243,11 @@ mod tests {
             "...",
             "\u{ff0e}/x",
             "a/\u{ff0e}\u{ff0e}",
+            // N3: everything NFKC folds to dots.
+            "\u{2024}/x",
+            "a/\u{2025}",
+            "\u{2026}",
+            "a/\u{fe52}/b",
         ] {
             assert!(!valid_object_name(bad), "{bad:?}");
         }

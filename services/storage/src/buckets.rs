@@ -104,8 +104,17 @@ pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFai
 }
 
 pub(crate) fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
-    json.map(|Json(t)| t)
-        .map_err(|e| Failure::invalid_request(format!("the body: {}", e.body_text())))
+    json.map(|Json(t)| t).map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            Failure::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                "the body is over 16 MiB",
+            )
+        } else {
+            Failure::invalid_request(format!("the body: {}", e.body_text()))
+        }
+    })
 }
 
 #[utoipa::path(

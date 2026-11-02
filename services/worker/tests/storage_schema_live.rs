@@ -1722,6 +1722,7 @@ async fn storage_api_objects(fx: &Fx) {
     // Racing upserts of one existing name: one wins, the other is 409, and the winner's row and
     // blob stay.
     assert_eq!(object("POST", &up("race.bin"), &secret, Some(b"0".to_vec().into()), &[]).await.0, 200);
+    let before_race = fx.blobs(&store).await;
     let slow = || Some(paced_body(512 * 1024, 7, Duration::from_millis(100), None));
     let race = up("race.bin");
     let (a, b) = tokio::join!(
@@ -1734,9 +1735,10 @@ async fn storage_api_objects(fx: &Fx) {
     let winner = if a.0 == 200 { json_of(&a.2) } else { json_of(&b.2) };
     let version = winner["version_id"].as_str().unwrap().to_string();
     assert_eq!(fx.value("SELECT version_id FROM storage.objects WHERE name = 'race.bin'").await, version);
-    let blobs = fx.blobs(&store).await;
-    assert!(blobs.contains(&version), "{blobs:?}");
-    assert!(!blobs.iter().any(|k| k.starts_with("staging/")), "{blobs:?}");
+    // Exactly one blob was added, the winner's: the loser's was deleted.
+    let mut added: Vec<String> = fx.blobs(&store).await.into_iter().filter(|k| !before_race.contains(k)).collect();
+    added.sort();
+    assert_eq!(added, std::slice::from_ref(&version), "the race left a stray blob");
 
     // A row carrying another database's version (the owner can't write one: the trigger wants
     // a ticket only storage writes, and it fires even with session_replication_role = replica;
@@ -1986,18 +1988,29 @@ async fn storage_api_policy_change_live() {
         let fx = &*fx;
         let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
         let store = object_store().await;
-        let slow = Some(paced_body(512 * 1024, 4, Duration::from_millis(500), None));
+        // Warm: the key, schema, owner-level checks and the pools are hot.
+        assert_eq!(object("POST", "/storage/v1/object/files/warm.bin", &secret, Some(b"w".to_vec().into()), &[]).await.0, 200);
+        let warm = fx.blobs(&store).await;
+        // 12 MiB at about 1.25 MiB/s; the policy goes once the client has handed over 8 MiB, far
+        // more than the socket buffers hold, so the server is mid-body: past its pre-check.
+        let total = 12 << 20;
+        let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let past = Arc::new(tokio::sync::Notify::new());
+        let body = Some(counted_body(total, Duration::from_millis(50), sent.clone(), 8 << 20, past.clone()));
         let (upload, ()) = tokio::join!(
-            object("POST", "/storage/v1/object/files/late.bin", &secret, slow, &[]),
+            object("POST", "/storage/v1/object/files/late.bin", &secret, body, &[]),
             async {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
+                past.notified().await;
                 fx.owner("SELECT storage.drop_policy('o_1', 'objects')").await.unwrap();
             },
         );
         assert_eq!((upload.0, json_of(&upload.2)["error"]["code"].clone()), (403, json!("not_allowed")), "{}", json_of(&upload.2));
-        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        // The whole body was taken: the refusal is the final write's, after the ticket (always
+        // minted right after the body), which was withdrawn.
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), total);
+        assert_eq!(fx.blobs(&store).await, warm, "the refused upload's blob stayed");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects WHERE name = 'late.bin'").await, "0");
         assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0");
-        assert!(fx.blobs(&store).await.is_empty());
     }))
     .await;
 }
@@ -2122,11 +2135,210 @@ async fn storage_api_oid_prefix_live() {
         let oid_sql = "SELECT oid FROM pg_database WHERE datname = current_database()";
         let main_oid = fx.value(oid_sql).await;
         assert_eq!(fx.blobs(&store).await, std::slice::from_ref(&version), "under {}/{main_oid}/", fx.id);
-        let (_child, child_ep) = fx.child("oid-child").await;
+        let (child, child_ep) = fx.child("oid-child").await;
         let child_oid = last_line(&fx.admin_on(&child_ep, oid_sql).await.unwrap());
         assert_eq!(child_oid, main_oid, "a branch shares the database's OID");
         let child_version = last_line(&fx.admin_on(&child_ep, "SELECT version_id FROM storage.objects WHERE name = 'o.txt'").await.unwrap());
         assert_eq!(child_version, version);
+        // The child downloads main's object (the re-audit's test); its own upload isn't main's.
+        let (status, body) = api("POST", &format!("/v1/databases/{}/branches/{child}/keys", fx.id), Some(json!({ "name": "oid-child", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let ck = body["key"].as_str().unwrap().to_string();
+        let (status, _, got) = object("GET", "/storage/v1/object/files/o.txt", &ck, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"o"[..]));
+        let (status, _, b) = object("POST", "/storage/v1/object/files/c.txt", &ck, Some(b"c".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(object("GET", "/storage/v1/object/files/c.txt", &secret, None, &[]).await.0, 404, "a child's upload is visible on main");
+        let (status, _, got) = object("GET", "/storage/v1/object/files/c.txt", &ck, None, &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"c"[..]));
+    }))
+    .await;
+}
+
+// --- m5 fix round 2 (re-audit) ---------------------------------------------------------------
+
+/// A paced body that counts what it handed to the client and notifies `past` once more than
+/// `mark` bytes are out, so a test knows the server has pulled beyond the socket buffers.
+fn counted_body(
+    total: usize,
+    pause: Duration,
+    sent: Arc<std::sync::atomic::AtomicUsize>,
+    mark: usize,
+    past: Arc<tokio::sync::Notify>,
+) -> reqwest::Body {
+    const CHUNK: usize = 64 * 1024;
+    let stream = futures_util::stream::unfold(0usize, move |n| {
+        let (sent, past) = (sent.clone(), past.clone());
+        async move {
+            if n >= total {
+                return None;
+            }
+            tokio::time::sleep(pause).await;
+            let k = CHUNK.min(total - n);
+            sent.store(n + k, std::sync::atomic::Ordering::SeqCst);
+            if n < mark && n + k >= mark {
+                past.notify_one();
+            }
+            Some((Ok::<_, std::io::Error>(bytes::Bytes::from(vec![9u8; k])), n + k))
+        }
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
+/// B1 (the re-audit's repro): a ticket left for an object's version (an abandoned move, a
+/// failed withdrawal) no longer blocks its cross-bucket moves once it has expired.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_expired_ticket_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/t.txt", &secret, Some(b"t".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let version = json_of(&b)["version_id"].as_str().unwrap().to_string();
+        fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role, owner) SELECT '{version}', id, 'elsewhere', 1, 'x', clock_timestamp() + interval '1 second', 'authenticated', NULL FROM storage.buckets WHERE name = 'other'; COMMIT;")).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let expired = fx.value(&format!("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '{version}' AND expires_at < clock_timestamp()")).await;
+        assert_eq!(expired, "1");
+        let body = json!({ "bucket": "files", "from": "t.txt", "to": "t.txt", "to_bucket": "other" }).to_string();
+        let (status, _, b) = object("POST", "/storage/v1/object/move", &secret, Some(body.into()), &[JSON]).await;
+        assert_eq!(status, 204, "an expired ticket still blocks the move: {}", json_of(&b));
+        assert_eq!(fx.value(&tickets_sql(&version)).await, "0");
+    }))
+    .await;
+}
+
+/// B1: a ticket a branch copied from its parent (another timeline's, never consumable) doesn't
+/// block the object's cross-bucket move on the branch, even unexpired.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_foreign_timeline_ticket_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/t.txt", &secret, Some(b"t".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let version = json_of(&b)["version_id"].as_str().unwrap().to_string();
+        // A move in flight on main when the branch is made: its ticket is copied, with main's
+        // timeline.
+        fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role, owner) SELECT '{version}', id, 't.txt', 1, 'x', clock_timestamp() + interval '10 minutes', 'authenticated', NULL FROM storage.buckets WHERE name = 'other'; COMMIT;")).await;
+        let (child, child_ep) = fx.child("ticket-child").await;
+        assert_eq!(last_line(&fx.admin_on(&child_ep, &tickets_sql(&version)).await.unwrap()), "1");
+        let (status, body) = api("POST", &format!("/v1/databases/{}/branches/{child}/keys", fx.id), Some(json!({ "name": "child", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let child_key = body["key"].as_str().unwrap().to_string();
+        let body = json!({ "bucket": "files", "from": "t.txt", "to": "t.txt", "to_bucket": "other" }).to_string();
+        let (status, _, b) = object("POST", "/storage/v1/object/move", &child_key, Some(body.into()), &[JSON]).await;
+        assert_eq!(status, 204, "another timeline's ticket blocks the move: {}", json_of(&b));
+        assert_eq!(last_line(&fx.admin_on(&child_ep, &tickets_sql(&version)).await.unwrap()), "0");
+    }))
+    .await;
+}
+
+/// B2 (the re-audit's repro): the database dropped (renamed away) and made again under the
+/// same name within the schema check's cache: the upload's blob goes under the new database's
+/// OID (read in the request's own transaction), and it downloads once the cache has expired.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service; about 40 s"]
+async fn storage_api_recreated_database_live() {
+    with_fx(|fx| Box::pin(async move {
+        use chelabase_storage::ObjectStore;
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        let oid_sql = "SELECT oid FROM pg_database WHERE datname = current_database()";
+        let started = Instant::now();
+        let (status, _, b) = object("POST", "/storage/v1/object/files/a.txt", &secret, Some(b"a".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let old_oid = fx.value(oid_sql).await;
+        let d = fx.database.clone();
+        let maint = if d == "postgres" { "template1" } else { "postgres" };
+        let sys = |sql: String| async move { fx.worker.computes.admin_sql(&fx.ep, maint, &sql).await.map_err(|e| format!("{e:#}")) };
+        let mut renamed = Err(String::new());
+        for _ in 0..10 {
+            renamed = sys(format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{d}' AND pid <> pg_backend_pid();\nALTER DATABASE \"{d}\" RENAME TO \"st_old\";\n")).await;
+            if renamed.is_ok() {
+                break;
+            }
+        }
+        renamed.expect("rename");
+        let mut made = Err(String::new());
+        for _ in 0..10 {
+            made = sys(format!("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'st_old' AND pid <> pg_backend_pid();\nCREATE DATABASE \"{d}\" TEMPLATE \"st_old\";\n")).await;
+            if made.is_ok() {
+                break;
+            }
+        }
+        made.expect("create");
+        let new_oid = fx.value(oid_sql).await;
+        assert_ne!(new_oid, old_oid);
+        let mut uploaded = None;
+        for _ in 0..5 {
+            let (status, _, b) = object("POST", "/storage/v1/object/files/b.txt", &secret, Some(b"b".to_vec().into()), &[]).await;
+            if status == 200 {
+                uploaded = Some(json_of(&b)["version_id"].as_str().unwrap().to_string());
+                break;
+            }
+        }
+        let vb = uploaded.expect("b.txt uploaded");
+        assert!(started.elapsed() < Duration::from_secs(29), "inconclusive: past the cache TTL");
+        let under_old = store.head(&format!("{}/{old_oid}/{vb}", fx.id)).await.is_ok();
+        let under_new = store.head(&format!("{}/{new_oid}/{vb}", fx.id)).await.is_ok();
+        tokio::time::sleep(Duration::from_secs(33).saturating_sub(started.elapsed())).await;
+        let (status, _, body) = object("GET", "/storage/v1/object/files/b.txt", &secret, None, &[]).await;
+        for oid in [&old_oid, &new_oid] {
+            for blob in store.list(&format!("{}/{oid}/", fx.id)).await.unwrap() {
+                store.delete(&blob.key).await.unwrap();
+            }
+        }
+        sys("DROP DATABASE IF EXISTS \"st_old\" WITH (FORCE)".into()).await.expect("drop st_old");
+        assert!(under_new && !under_old, "b.txt's blob went to the dropped database's prefix");
+        assert_eq!((status, &body[..]), (200, &b"b"[..]), "b.txt became unreachable");
+    }))
+    .await;
+}
+
+/// SF4: a ticket minted for a move or a copy is withdrawn when the caller's final write is
+/// refused after it (a policy that passes once, at the pre-check, then refuses).
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_refused_final_write_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        fx.owner(
+            "CREATE SEQUENCE public.st_calls;
+             CREATE FUNCTION public.st_first_call() RETURNS boolean LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog
+               AS $$ SELECT nextval('public.st_calls') % 2 = 1 $$;
+             GRANT EXECUTE ON FUNCTION public.st_first_call() TO authenticated;",
+        )
+        .await
+        .unwrap();
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/src.txt", &secret, Some(b"s".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        // From here, every INSERT and UPDATE check passes on odd calls only.
+        fx.owner("SELECT storage.drop_policy('o_1', 'objects')").await.unwrap();
+        for (name, command) in [("o_flip_insert", "INSERT"), ("o_flip_update", "UPDATE")] {
+            let using = if command == "UPDATE" { "'true'" } else { "NULL" };
+            fx.owner(&format!("SELECT storage.create_policy('{name}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, 'public.st_first_call()')"))
+                .await
+                .unwrap();
+        }
+        let version = json_of(&b)["version_id"].as_str().unwrap().to_string();
+        let blobs = fx.blobs(&store).await;
+        // Copy: the pre-check passes (call 1), the final INSERT is refused (call 2).
+        let body = json!({ "bucket": "files", "from": "src.txt", "to": "dst.txt" }).to_string();
+        let (status, _, b) = object("POST", "/storage/v1/object/copy", &secret, Some(body.into()), &[JSON]).await;
+        assert_eq!(status, 403, "{}", json_of(&b));
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0", "the copy's ticket stayed");
+        assert_eq!(fx.blobs(&store).await, blobs, "the copy's blob stayed");
+        // Move: the pre-check UPDATE passes (call 3), the final UPDATE is refused (call 4).
+        let body = json!({ "bucket": "files", "from": "src.txt", "to": "src.txt", "to_bucket": "other" }).to_string();
+        let (status, _, b) = object("POST", "/storage/v1/object/move", &secret, Some(body.into()), &[JSON]).await;
+        assert_eq!(status, 403, "{}", json_of(&b));
+        assert_eq!(fx.value(&tickets_sql(&version)).await, "0", "the move's ticket stayed");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects WHERE name = 'src.txt'").await, "1");
     }))
     .await;
 }

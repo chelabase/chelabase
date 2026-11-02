@@ -21,9 +21,10 @@ use crate::{buckets, objects};
 /// The identity token's audience.
 pub const AUDIENCE: &str = "storage";
 
-/// The largest JSON request body: delete-many's 1000 names of up to 1024 bytes, with room for
-/// their quoting (object uploads stream, unlimited here).
-pub const MAX_JSON_BODY: usize = 2 * 1024 * 1024;
+/// The largest JSON request body: delete-many's 1000 names of up to 1024 bytes even with every
+/// character `\u` escaped (12 bytes per UTF-8 byte at worst, about 12.5 MB); the names' count
+/// and bytes are checked after parsing. Over it: 413. Object uploads stream, unlimited here.
+pub const MAX_JSON_BODY: usize = 16 * 1024 * 1024;
 
 pub struct AppState<S, M> {
     pub engine: Engine<S, M>,
@@ -275,5 +276,62 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({ "names": names })).unwrap();
         let (status, _, json) = call(&base, &token, "DELETE", "/storage/v1/object/b", body).await;
         assert_eq!(status, 503, "{json}");
+    }
+
+    /// SF1 (the re-audit's test): 1000 names of 1024 bytes as Python's `json.dumps` sends
+    /// them, every character `\u` escaped (about 3 MB) are taken.
+    #[tokio::test]
+    async fn delete_many_takes_escaped_names() {
+        let (base, token) = serve(Unreachable, Unreachable).await;
+        let one = "\\ud83d\\ude00".repeat(256);
+        let body = format!(
+            "{{\"names\": [{}]}}",
+            (0..1000)
+                .map(|_| format!("\"{one}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["names"][0].as_str().unwrap().len(), 1024);
+        let (status, _, json) = call(
+            &base,
+            &token,
+            "DELETE",
+            "/storage/v1/object/b",
+            body.into_bytes(),
+        )
+        .await;
+        assert_eq!(
+            status, 503,
+            "the advertised 1000 x 1024-byte names were refused: {json}"
+        );
+    }
+
+    /// SF1: a JSON body over the cap is 413 `too_large`, not 400; 1001 names is 400.
+    #[tokio::test]
+    async fn an_oversized_json_body_is_413() {
+        let (base, token) = serve(Unreachable, Unreachable).await;
+        let body = format!("{{\"names\": [\"{}\"]}}", "n".repeat(MAX_JSON_BODY));
+        let (status, _, json) = call(
+            &base,
+            &token,
+            "DELETE",
+            "/storage/v1/object/b",
+            body.into_bytes(),
+        )
+        .await;
+        assert_eq!(
+            (status, json["error"]["code"].clone()),
+            (413, serde_json::json!("too_large")),
+            "{json}"
+        );
+        let names: Vec<String> = (0..1001).map(|i| i.to_string()).collect();
+        let body = serde_json::to_vec(&serde_json::json!({ "names": names })).unwrap();
+        assert_eq!(
+            call(&base, &token, "DELETE", "/storage/v1/object/b", body)
+                .await
+                .0,
+            400
+        );
     }
 }
