@@ -109,6 +109,40 @@ impl Failure {
         )
     }
 
+    /// 415: the declared or sniffed type isn't on the bucket's `allowed_mime_types`.
+    pub fn mime_not_allowed() -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "mime_not_allowed",
+            "the object's type isn't one the bucket allows",
+        )
+    }
+
+    /// 503: the service's upload memory is in use (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`).
+    pub fn busy() -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "too many uploads in flight; try again",
+        )
+    }
+
+    /// 404: no resumable upload of that id for this caller (missing, finished, aborted, or
+    /// another caller's: one answer).
+    pub fn upload_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "upload_not_found", "no such upload")
+    }
+
+    /// 410: the resumable upload is past its 24 hours; its parts are gone.
+    pub fn upload_expired() -> Self {
+        Self::new(StatusCode::GONE, "upload_expired", "the upload has expired; start again")
+    }
+
+    /// 400: the parts don't make an object (a gap, a part under 5 MiB that isn't the last).
+    pub fn invalid_parts(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_parts", message)
+    }
+
     pub fn range_not_satisfiable() -> Self {
         Self::new(
             StatusCode::RANGE_NOT_SATISFIABLE,

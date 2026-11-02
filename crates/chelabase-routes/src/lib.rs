@@ -1319,6 +1319,18 @@ pub mod storage {
     /// A public bucket's object, on its branch.
     pub const PUBLIC_DOWNLOAD: Endpoint =
         open("storage.public_download", Method::Get, "/storage/v1/object/public/{branch}/{bucket}/{*name}");
+
+    /// m7: resumable uploads. A session is opened for a bucket and name, then addressed by its
+    /// id alone (the caller's own: storage answers another's as missing).
+    pub const CREATE_UPLOAD: Endpoint =
+        data("storage.create_upload", Method::Post, "/storage/v1/upload/{bucket}/{*name}");
+    const SESSION: &str = "/storage/v1/upload/session/{session}";
+    pub const UPLOAD_PART: Endpoint =
+        data("storage.upload_part", Method::Put, "/storage/v1/upload/session/{session}/{part}");
+    pub const LIST_PARTS: Endpoint = data("storage.list_parts", Method::Get, SESSION);
+    pub const COMPLETE_UPLOAD: Endpoint =
+        data("storage.complete_upload", Method::Post, "/storage/v1/upload/session/{session}/complete");
+    pub const ABORT_UPLOAD: Endpoint = data("storage.abort_upload", Method::Delete, SESSION);
 }
 
 /// Every public endpoint the gateway exposes.
@@ -1496,6 +1508,11 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::SIGN_UPLOAD,
     storage::SIGNED_UPLOAD,
     storage::PUBLIC_DOWNLOAD,
+    storage::CREATE_UPLOAD,
+    storage::UPLOAD_PART,
+    storage::LIST_PARTS,
+    storage::COMPLETE_UPLOAD,
+    storage::ABORT_UPLOAD,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1641,6 +1658,27 @@ mod tests {
             if let Match::Found(ep) = match_endpoint(Scope::Api, method, path) {
                 assert_ne!(ep.policy.auth, Auth::Public, "{method} {path}");
             }
+        }
+    }
+
+    /// m7: resumable uploads take a data key and stream; the literal `session` wins over a
+    /// bucket of that name (reserved, so never one), and a part's PUT is its own route.
+    #[test]
+    fn storage_resumable_upload_routes() {
+        let key = Policy { auth: Auth::DataKey, cors: Cors::Any, access: Access::DataKey };
+        let id = "6f1c0b6e-9d2a-4a57-8a77-1f3c2a9b4e10";
+        for (method, path, name) in [
+            ("POST", "/storage/v1/upload/avatars/u1/big.bin".to_owned(), "storage.create_upload"),
+            ("PUT", format!("/storage/v1/upload/session/{id}/3"), "storage.upload_part"),
+            ("GET", format!("/storage/v1/upload/session/{id}"), "storage.list_parts"),
+            ("POST", format!("/storage/v1/upload/session/{id}/complete"), "storage.complete_upload"),
+            ("DELETE", format!("/storage/v1/upload/session/{id}"), "storage.abort_upload"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, &path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!((ep.name, ep.policy), (name, key), "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
         }
     }
 
@@ -2364,6 +2402,11 @@ mod tests {
             ("storage.sign_upload", Access::DataKey),
             ("storage.signed_upload", Access::Public),
             ("storage.public_download", Access::Public),
+            ("storage.create_upload", Access::DataKey),
+            ("storage.upload_part", Access::DataKey),
+            ("storage.list_parts", Access::DataKey),
+            ("storage.complete_upload", Access::DataKey),
+            ("storage.abort_upload", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.

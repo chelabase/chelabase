@@ -268,6 +268,25 @@ impl ObjectStore for MemoryStore {
         Ok(m)
     }
 
+    async fn multipart_part_copy(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        src: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<String, StorageError> {
+        let body = {
+            let st = self.state.lock().unwrap();
+            let body = st.objects.get(src).ok_or(StorageError::NotFound)?;
+            if range.start > range.end || range.end > body.len() as u64 {
+                return Err(StorageError::Other("the copy range is outside the source".into()));
+            }
+            body.slice(range.start as usize..range.end as usize)
+        };
+        self.multipart_part(key, upload_id, part_number, body).await
+    }
+
     async fn multipart_abort(&self, key: &str, upload_id: &str) -> Result<(), StorageError> {
         let mut st = self.state.lock().unwrap();
         match st.uploads.get(upload_id) {

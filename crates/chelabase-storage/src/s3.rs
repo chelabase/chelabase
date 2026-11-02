@@ -245,7 +245,12 @@ impl ObjectStore for S3Store {
         }
     }
 
+    /// One `CopyObject` up to [`crate::COPY_OBJECT_MAX`]; above it, `UploadPartCopy` parts.
     async fn copy(&self, src: &str, dst: &str) -> Result<ObjectMeta, StorageError> {
+        let size = self.head(src).await?.size;
+        if size > crate::COPY_OBJECT_MAX {
+            return crate::copy_in_parts(self, src, dst, size, crate::COPY_PART_SIZE).await;
+        }
         let source = format!("{}/{}", self.bucket, src);
         self.client
             .copy_object()
@@ -405,6 +410,36 @@ impl ObjectStore for S3Store {
             .await
             .map_err(map_err)?;
         self.head(key).await
+    }
+
+    async fn multipart_part_copy(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        src: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<String, StorageError> {
+        if range.start >= range.end {
+            return Err(StorageError::Other("an empty copy range".into()));
+        }
+        let out = self
+            .client
+            .upload_part_copy()
+            .bucket(&self.bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number as i32)
+            .copy_source(urlencoding_path(&format!("{}/{}", self.bucket, src)))
+            .copy_source_range(format!("bytes={}-{}", range.start, range.end - 1))
+            .send()
+            .await
+            .map_err(map_err)?;
+        Ok(out
+            .copy_part_result()
+            .and_then(|r| r.e_tag())
+            .unwrap_or_default()
+            .to_string())
     }
 
     async fn multipart_abort(&self, key: &str, upload_id: &str) -> Result<(), StorageError> {

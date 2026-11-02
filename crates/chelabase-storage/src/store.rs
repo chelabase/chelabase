@@ -237,6 +237,55 @@ pub trait ObjectStore: Send + Sync {
     ) -> Result<ObjectMeta, StorageError>;
     /// Drop the upload and its parts; nothing remains.
     async fn multipart_abort(&self, key: &str, upload_id: &str) -> Result<(), StorageError>;
+    /// Copy bytes `range` (half-open) of the object `src` into part `part_number` of an upload
+    /// (S3's `UploadPartCopy`); returns the part's etag.
+    async fn multipart_part_copy(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        src: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<String, StorageError>;
+}
+
+/// The largest object one `CopyObject` copies on Amazon S3 (5 GB); above it [`copy_in_parts`].
+pub const COPY_OBJECT_MAX: u64 = 5_000_000_000;
+
+/// The part size [`copy_in_parts`] uses above [`COPY_OBJECT_MAX`]: 10000 parts of it cover
+/// S3's 5 TiB object limit.
+pub const COPY_PART_SIZE: u64 = 1 << 30;
+
+/// Copies `src` (`size` bytes) to `dst` with a multipart upload of `UploadPartCopy` parts of
+/// `part_size` bytes (the last smaller), aborted if any part fails.
+pub async fn copy_in_parts(
+    store: &(impl ObjectStore + ?Sized),
+    src: &str,
+    dst: &str,
+    size: u64,
+    part_size: u64,
+) -> Result<ObjectMeta, StorageError> {
+    let part_size = part_size.max(1);
+    let id = store.multipart_create(dst, None).await?;
+    let result = async {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < size || parts.is_empty() {
+            let end = (start + part_size).min(size);
+            let part_number = parts.len() as u32 + 1;
+            let etag = store
+                .multipart_part_copy(dst, &id, part_number, src, start..end)
+                .await?;
+            parts.push(CompletedPart { part_number, etag });
+            start = end;
+        }
+        store.multipart_complete(dst, &id, parts).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = store.multipart_abort(dst, &id).await;
+    }
+    result
 }
 
 /// Part size for [`ObjectStore::put_stream`]: above S3's 5 MiB minimum.
