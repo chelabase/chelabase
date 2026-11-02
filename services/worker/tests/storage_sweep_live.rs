@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chelabase_metadata::{
-    BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient, NewBranch,
+    BranchKind, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient,
+    NewBranch,
 };
 use chelabase_nats::BranchJob;
 use chelabase_neon::ComputeBackend;
@@ -98,6 +99,15 @@ impl Fx {
         cleanup(&self.worker, &self.metadata, self.id).await;
     }
 
+    /// SQL as cloud_admin in `database` on main.
+    async fn admin_in(&self, database: &str, sql: &str) -> String {
+        self.worker
+            .computes
+            .admin_sql(&self.ep, database, sql)
+            .await
+            .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
+    }
+
     async fn admin(&self, sql: &str) -> String {
         self.worker
             .computes
@@ -153,6 +163,11 @@ impl Fx {
 
     /// A child of main, made by the worker's create job.
     async fn child(&self, name: &str) -> BranchId {
+        self.child_of(self.main, name).await
+    }
+
+    /// A child of `parent`, made by the worker's create job.
+    async fn child_of(&self, parent: BranchId, name: &str) -> BranchId {
         let child = BranchId::new();
         let outcome = self
             .metadata
@@ -160,7 +175,7 @@ impl Fx {
                 id: child,
                 database_id: self.id,
                 name,
-                parent_branch_id: self.main,
+                parent_branch_id: parent,
                 branched_at_time: None,
                 branched_at_lsn: None,
             })
@@ -328,28 +343,7 @@ async fn storage_sweep_live() {
 
 async fn run(fx: &Fx) {
     let store = object_store().await;
-    for name in ["files", "other"] {
-        fx.admin(&format!(
-            "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{name}'); COMMIT;"
-        ))
-        .await;
-    }
-    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)").await;
-    for (i, (command, using, check)) in [
-        ("SELECT", "'true'", "NULL"),
-        ("INSERT", "NULL", "'true'"),
-        ("UPDATE", "'true'", "'true'"),
-        ("DELETE", "'true'", "NULL"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        fx.owner(&format!(
-            "SELECT storage.create_policy('o_{i}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
-        ))
-        .await;
-    }
-    let key = fx.secret_key(fx.main, "sw-main").await;
+    let key = fixture(fx).await;
     let mut versions = std::collections::HashMap::new();
     for name in ["kept-on-child", "moved", "gone", "stays"] {
         let (status, b) = object(
@@ -492,6 +486,189 @@ async fn run(fx: &Fx) {
         .unwrap();
     assert_eq!((again.waiting, again.deleted), (1, 0), "{again:?}");
     assert_eq!(blobs(&store, &prefix).await, left);
+}
+
+/// Buckets `files` and `other`, policies letting `authenticated` do anything, and a key on
+/// main.
+async fn fixture(fx: &Fx) -> String {
+    for name in ["files", "other"] {
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{name}'); COMMIT;"
+        ))
+        .await;
+    }
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)").await;
+    for (i, (command, using, check)) in [
+        ("SELECT", "'true'", "NULL"),
+        ("INSERT", "NULL", "'true'"),
+        ("UPDATE", "'true'", "'true'"),
+        ("DELETE", "'true'", "NULL"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        fx.owner(&format!(
+            "SELECT storage.create_policy('o_{i}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+        ))
+        .await;
+    }
+    fx.secret_key(fx.main, "sw-main").await
+}
+
+/// Uploads `files/{name}` with `key`; its version.
+async fn upload(key: &str, name: &str) -> String {
+    let (status, b) = object(
+        "POST",
+        &format!("/storage/v1/object/files/{name}"),
+        key,
+        Some(name.as_bytes().to_vec()),
+        false,
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    body["version_id"].as_str().unwrap().to_string()
+}
+
+/// Runs `f` on a fresh database; its blobs and marks are purged and the database deleted,
+/// pass or fail.
+async fn with_fx(f: fn(Arc<Fx>) -> futures_util::future::BoxFuture<'static, ()>) {
+    let fx = Arc::new(Fx::provision().await);
+    let outcome = tokio::spawn(f(fx.clone())).await;
+    fx.purge(&object_store().await).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+/// Audit B1: a database made a template, or closed to connections, still holds live rows.
+/// The sweep reads the template and refuses the closed one; either way the object survives
+/// and downloads once the database is opened again.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn audit_m8_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let version = upload(&key, "victim").await;
+            let prefix = fx.prefix().await;
+            let source = NoWindow(&fx.worker);
+            let db = fx.database.replace('"', "\"\"");
+            for (close, open) in [
+                ("IS_TEMPLATE true", "IS_TEMPLATE false"),
+                ("ALLOW_CONNECTIONS false", "ALLOW_CONNECTIONS true"),
+            ] {
+                fx.admin_in("postgres", &format!("ALTER DATABASE \"{db}\" {close}"))
+                    .await;
+                for pass in 0..2 {
+                    let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false)
+                        .await
+                        .unwrap();
+                    println!("{close}, pass {pass}: {r:?}");
+                    assert_eq!(r.deleted, 0, "{close}: {r:?}");
+                }
+                assert!(
+                    blobs(&store, &prefix).await.contains(&version),
+                    "{close}: the sweep deleted a blob a live row references"
+                );
+                fx.admin_in("postgres", &format!("ALTER DATABASE \"{db}\" {open}"))
+                    .await;
+                let (status, b) =
+                    object("GET", "/storage/v1/object/files/victim", &key, None, false).await;
+                assert_eq!((status, &b[..]), (200, &b"victim"[..]), "{close}");
+            }
+        })
+    })
+    .await;
+}
+
+/// Audit S8 (AC 4): main restored to before an upload; its backup alone references the
+/// object. Passes read the backup through a static compute and keep the blob; a branch made
+/// from the backup downloads it.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn audit_m8_backup_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let noted = fx.value("SELECT pg_current_wal_insert_lsn()").await;
+            let version = upload(&key, "kept-by-backup").await;
+            // As the API does: the branch is claimed for the restore first.
+            assert!(
+                fx.metadata
+                    .set_branch_status(fx.main, &[BranchStatus::Ready], BranchStatus::Resetting)
+                    .await
+                    .unwrap(),
+                "main was not ready"
+            );
+            fx.worker
+                .handle_branch_job(BranchJob::Restore {
+                    branch_id: fx.main,
+                    backup_id: BranchId::new(),
+                    backup_name: "main-before-restore-20261103T120000Z".into(),
+                    at: chelabase_nats::PointInTime::Lsn(noted),
+                })
+                .await
+                .expect("restore job");
+            let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+            assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+            let record = fx
+                .metadata
+                .list_branches(fx.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|b| b.kind == BranchKind::Backup)
+                .unwrap_or_else(|| panic!("no backup: main {main:?}"));
+            let backup = record.id;
+            assert_eq!(
+                (record.kind, record.status, record.endpoint_id.is_none()),
+                (BranchKind::Backup, BranchStatus::Ready, true)
+            );
+            let source = NoWindow(&fx.worker);
+            for pass in 0..3 {
+                let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false)
+                    .await
+                    .unwrap();
+                println!("pass {pass}: {r:?}");
+                assert_eq!(
+                    (r.blocked.as_deref(), r.referenced, r.deleted),
+                    (None, 1, 0),
+                    "{r:?}"
+                );
+            }
+            assert!(blobs(&store, &prefix).await.contains(&version));
+            // The static computes are gone: only the branch's own endpoint is left.
+            let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+            let left: Vec<String> = fx
+                .metadata
+                .list_branches(fx.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|b| b.endpoint_id)
+                .collect();
+            assert_eq!(left, [main.endpoint_id.clone().unwrap()]);
+            let from_backup = fx.child_of(backup, "from-backup").await;
+            let child_key = fx.secret_key(from_backup, "sw-from-backup").await;
+            let (status, b) = object(
+                "GET",
+                "/storage/v1/object/files/kept-by-backup",
+                &child_key,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!((status, &b[..]), (200, &b"kept-by-backup"[..]));
+        })
+    })
+    .await;
 }
 
 /// The blob keys under `prefix`, without it.

@@ -92,7 +92,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             && let Some(branch) = sweep_after
             && let Ok(Some(record)) = self.metadata.get_branch(branch).await
         {
-            self.sweep_requests.request(record.database_id);
+            self.sweep_requests.request(
+                record.database_id,
+                crate::storage_sweep::SweepCause::Event(uuid::Uuid::new_v4()),
+            );
         }
         result
     }

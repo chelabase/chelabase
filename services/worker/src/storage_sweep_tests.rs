@@ -42,6 +42,8 @@ struct State {
     /// Runs once, at the first `references` call (a change mid-pass).
     during: Option<Change>,
     expired: Vec<BranchId>,
+    /// The databases' clock (Postgres `clock_timestamp()`); `pass` sets it to the store's.
+    clock: Option<SystemTime>,
 }
 
 fn branch(kind: BranchKind) -> SweepBranch {
@@ -67,6 +69,7 @@ impl Source {
                     .collect(),
                 during: None,
                 expired: Vec::new(),
+                clock: None,
             }),
         }
     }
@@ -121,6 +124,7 @@ async fn exists(store: &MemoryStore, k: &str) -> bool {
 }
 
 async fn pass(src: &Source, store: &MemoryStore) -> SweepReport {
+    src.st().clock = Some(store.now());
     sweep_database(src, store, src.db, GRACE, false)
         .await
         .unwrap()
@@ -160,6 +164,46 @@ async fn sweep_deletes_an_old_unreferenced_blob_only_after_its_mark_outlives_the
             .unwrap()
             .is_empty()
     );
+}
+
+/// Audit S1: the store's clock leaps ahead of the databases' between two passes. The leap is
+/// refused, not taken as the mark's wait.
+#[tokio::test]
+async fn audit_a_store_clock_jump_does_not_collapse_the_mark_wait() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let orphan = blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    // 100 s of the databases' time; two days of the store's.
+    src.st().clock = Some(at(GRACE.as_secs() + 100));
+    store.set_now(at(GRACE.as_secs() + 2 * 86_400));
+    let r = sweep_database(&src, &store, src.db, GRACE, false).await.unwrap();
+    assert_eq!(r.deleted, 0, "{r:?}");
+    assert!(r.blocked.is_some(), "{r:?}");
+    assert!(exists(&store, &orphan).await);
+    // The same leap with the databases agreeing (and real time passing) is a normal pass.
+    store.set_now(at(GRACE.as_secs()) + Duration::from_secs(5000));
+    assert_eq!(pass(&src, &store).await.deleted, 1);
+}
+
+/// Audit N1: a mark older than its blob (a key written again) is not the blob's wait.
+#[tokio::test]
+async fn audit_a_mark_older_than_its_blob_is_not_honoured() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let v = Uuid::new_v4();
+    blob(&store, src.db, v).await;
+    store.set_now(at(GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    store.set_now(at(10_000));
+    let k = blob(&store, src.db, v).await;
+    store.set_now(at(10_000 + GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.deleted, r.marked), (0, 1), "{r:?}");
+    assert!(exists(&store, &k).await);
 }
 
 /// Deleted on one branch, kept on another (or moved: the same version): it stays, and its
@@ -669,6 +713,26 @@ mod worker_reads {
         w.handle_storage_sweep(db).await.unwrap();
         w.handle_storage_sweep(db).await.unwrap();
         assert_eq!(w.storage_sweep_refusals.load(Relaxed), 2);
+    }
+
+    /// Audit B2: a deleted database is queued again by the periodic job until its prefix is
+    /// purged, so a lost or swallowed purge request isn't lost for good.
+    #[tokio::test]
+    async fn audit_a_deleted_database_is_queued_again_by_the_periodic_job() {
+        let (mut w, _journal) = worker();
+        let store = Arc::new(MemoryStore::default());
+        w.blob_store = Some(store.clone());
+        let db = ready_database(&w).await;
+        blob(&store, db, Uuid::new_v4()).await;
+        w.handle_delete(db).await.unwrap();
+        assert_eq!(w.sweep_requests.sent(), [db]);
+        w.queue_storage_sweeps().await.unwrap();
+        assert_eq!(w.sweep_requests.sent(), [db, db], "the periodic job forgot the deleted database");
+        // Once purged, it isn't queued any more.
+        w.handle_storage_sweep(db).await.unwrap();
+        assert!(store.list(&format!("{db}/")).await.unwrap().is_empty());
+        w.queue_storage_sweeps().await.unwrap();
+        assert_eq!(w.sweep_requests.sent(), [db, db]);
     }
 
     /// Two sweeps of one database never overlap: the second waits for the lock.
