@@ -195,7 +195,7 @@ async fn the_managed_pool_opens_only_as_a_bare_service_role_live() {
         .await
         .unwrap();
     assert_eq!(rows[0].get::<_, String>(0), bare);
-    assert_eq!(rows[0].get::<_, String>(1), "pg_catalog, pg_temp");
+    assert_eq!(rows[0].get::<_, String>(1), "pg_catalog,pg_temp");
     drop(pool);
     scratch.drop().await;
 }
