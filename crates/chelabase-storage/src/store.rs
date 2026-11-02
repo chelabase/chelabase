@@ -124,8 +124,72 @@ pub trait ObjectStore: Send + Sync {
     /// Every object under `prefix`, in key order (pages are followed internally).
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError>;
 
+    /// Upload a body of unknown length. S3 rejects `PutObject` without a Content-Length, so
+    /// anything of at least [`STREAM_PART_SIZE`] goes through multipart in parts of that size
+    /// (at least the 5 MiB S3 minimum); the upload is aborted if the stream or a part fails.
+    /// Smaller bodies are a single `put`. With `if_none_match`, a multipart upload checks for the
+    /// key first, so a racing writer can still win.
+    async fn put_stream(
+        &self,
+        key: &str,
+        mut body: ByteStream,
+        opts: PutOptions,
+    ) -> Result<ObjectMeta, StorageError> {
+        use bytes::BytesMut;
+        use futures_util::StreamExt;
+
+        let mut buf = BytesMut::new();
+        while buf.len() < STREAM_PART_SIZE {
+            match body.next().await {
+                Some(chunk) => buf.extend_from_slice(&chunk?),
+                None => return self.put(key, buf.freeze(), opts).await,
+            }
+        }
+        if opts.if_none_match && self.head(key).await.is_ok() {
+            return Err(StorageError::PreconditionFailed);
+        }
+        let id = self
+            .multipart_create(key, opts.content_type.as_deref())
+            .await?;
+        let result = async {
+            let mut parts = Vec::new();
+            let mut ended = false;
+            loop {
+                while !ended && buf.len() < STREAM_PART_SIZE {
+                    match body.next().await {
+                        Some(chunk) => buf.extend_from_slice(&chunk?),
+                        None => ended = true,
+                    }
+                }
+                if buf.is_empty() {
+                    break;
+                }
+                let n = parts.len() as u32 + 1;
+                if n > 10_000 {
+                    return Err(StorageError::Other("stream exceeds 10000 parts".into()));
+                }
+                let part = buf.split_to(buf.len().min(STREAM_PART_SIZE)).freeze();
+                let etag = self.multipart_part(key, &id, n, part).await?;
+                parts.push(CompletedPart {
+                    part_number: n,
+                    etag,
+                });
+            }
+            self.multipart_complete(key, &id, parts).await
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.multipart_abort(key, &id).await;
+        }
+        result
+    }
+
     /// Start a multipart upload; returns the upload id.
-    async fn multipart_create(&self, key: &str) -> Result<String, StorageError>;
+    async fn multipart_create(
+        &self,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<String, StorageError>;
     /// Parts may be uploaded in any order; returns the part's etag.
     async fn multipart_part(
         &self,
@@ -144,6 +208,9 @@ pub trait ObjectStore: Send + Sync {
     /// Drop the upload and its parts; nothing remains.
     async fn multipart_abort(&self, key: &str, upload_id: &str) -> Result<(), StorageError>;
 }
+
+/// Part size for [`ObjectStore::put_stream`]: above S3's 5 MiB minimum.
+pub const STREAM_PART_SIZE: usize = 8 * 1024 * 1024;
 
 /// Collect a body stream into one buffer.
 pub async fn collect(mut body: ByteStream) -> Result<Bytes, StorageError> {

@@ -1,9 +1,18 @@
-use aws_credential_types::Credentials;
+use std::{
+    path::PathBuf,
+    time::{Duration, SystemTime},
+};
+
+use aws_credential_types::{
+    Credentials,
+    provider::{ProvideCredentials, error::CredentialsError, future},
+};
 use aws_sdk_s3::{
     Client,
     config::{
         BehaviorVersion, Region, RequestChecksumCalculation, ResponseChecksumValidation,
-        http::HttpResponse, retry::RetryConfig, timeout::TimeoutConfig,
+        StalledStreamProtectionConfig, http::HttpResponse, retry::RetryConfig,
+        timeout::TimeoutConfig,
     },
     error::{DisplayErrorContext, ProvideErrorMetadata, SdkError},
     primitives::ByteStream as SdkBody,
@@ -13,9 +22,58 @@ use bytes::Bytes;
 use futures_util::stream;
 
 use crate::{
-    ByteRange, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions, StorageConfig,
-    StorageError,
+    ByteRange, CompletedPart, CredentialSource, GetObject, ObjectMeta, ObjectStore, PutOptions,
+    StorageConfig, StorageError,
+    config::{ENV_ACCESS_KEY_FILE, ENV_SECRET_KEY_FILE, read_key_file},
 };
+
+/// How long the SDK may cache key-file credentials before asking us to re-read the files.
+const KEY_FILE_REREAD: Duration = Duration::from_secs(300);
+
+/// Credentials from two files. Each credentials value expires after [`KEY_FILE_REREAD`], so the
+/// SDK's cache calls back and a rotated file is picked up without a restart.
+#[derive(Debug)]
+pub struct KeyFileCredentials {
+    access_key_file: PathBuf,
+    secret_key_file: PathBuf,
+}
+
+impl KeyFileCredentials {
+    pub fn new(access_key_file: PathBuf, secret_key_file: PathBuf) -> Self {
+        Self {
+            access_key_file,
+            secret_key_file,
+        }
+    }
+
+    async fn load(&self) -> aws_credential_types::provider::Result {
+        // `ConfigError` never carries file contents, so it is safe to surface.
+        let read = |var, path: PathBuf| async move {
+            tokio::task::spawn_blocking(move || read_key_file(var, &path))
+                .await
+                .map_err(CredentialsError::provider_error)?
+                .map_err(CredentialsError::provider_error)
+        };
+        let access = read(ENV_ACCESS_KEY_FILE, self.access_key_file.clone()).await?;
+        let secret = read(ENV_SECRET_KEY_FILE, self.secret_key_file.clone()).await?;
+        Ok(Credentials::new(
+            access,
+            secret,
+            None,
+            Some(SystemTime::now() + KEY_FILE_REREAD),
+            "chelabase-key-files",
+        ))
+    }
+}
+
+impl ProvideCredentials for KeyFileCredentials {
+    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        future::ProvideCredentials::new(self.load())
+    }
+}
 
 /// [`ObjectStore`] over any S3-compatible service (SeaweedFS, Amazon S3, MinIO, ...).
 #[derive(Clone)]
@@ -25,14 +83,11 @@ pub struct S3Store {
 }
 
 impl S3Store {
-    pub fn new(cfg: &StorageConfig) -> Self {
-        let creds = Credentials::new(
-            &cfg.access_key,
-            &cfg.secret_key,
-            None,
-            None,
-            "chelabase-key-files",
-        );
+    pub async fn new(cfg: &StorageConfig) -> Self {
+        // `operation_attempt_timeout` covers sending the request and getting the response
+        // headers, not a response body being read, so a long download is not cut off by
+        // `request_timeout`. A stalled download is bounded by the SDK's stalled-stream
+        // protection instead: a body delivering nothing for `stream_idle_timeout` fails.
         let timeouts = TimeoutConfig::builder()
             .connect_timeout(cfg.connect_timeout)
             .operation_attempt_timeout(cfg.request_timeout)
@@ -40,13 +95,32 @@ impl S3Store {
         let mut b = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
-            .credentials_provider(creds)
             .force_path_style(cfg.path_style)
             .timeout_config(timeouts)
+            .stalled_stream_protection(
+                StalledStreamProtectionConfig::enabled()
+                    .grace_period(cfg.stream_idle_timeout)
+                    .build(),
+            )
             .retry_config(RetryConfig::standard().with_max_attempts(cfg.max_attempts))
             // Checksum trailers are not understood by every S3-compatible store.
             .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
             .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+        b = match &cfg.credentials {
+            CredentialSource::KeyFiles {
+                access_key_file,
+                secret_key_file,
+            } => b.credentials_provider(KeyFileCredentials::new(
+                access_key_file.clone(),
+                secret_key_file.clone(),
+            )),
+            CredentialSource::DefaultChain => b.credentials_provider(
+                aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
+                    .region(Region::new(cfg.region.clone()))
+                    .build()
+                    .await,
+            ),
+        };
         if let Some(endpoint) = &cfg.endpoint {
             b = b.endpoint_url(endpoint);
         }
@@ -202,15 +276,20 @@ impl ObjectStore for S3Store {
         Ok(out)
     }
 
-    async fn multipart_create(&self, key: &str) -> Result<String, StorageError> {
-        let out = self
+    async fn multipart_create(
+        &self,
+        key: &str,
+        content_type: Option<&str>,
+    ) -> Result<String, StorageError> {
+        let mut req = self
             .client
             .create_multipart_upload()
             .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(map_err)?;
+            .key(key);
+        if let Some(ct) = content_type {
+            req = req.content_type(ct);
+        }
+        let out = req.send().await.map_err(map_err)?;
         out.upload_id()
             .map(str::to_owned)
             .ok_or_else(|| StorageError::Other("no upload id returned".into()))
@@ -298,23 +377,39 @@ fn urlencoding_path(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
     use super::*;
+    use crate::collect;
 
     #[test]
     fn copy_source_is_percent_encoded() {
         assert_eq!(urlencoding_path("b/a dir/ü+x"), "b/a%20dir/%C3%BC%2Bx");
     }
 
-    #[tokio::test]
-    async fn connect_failure_is_transient() {
-        let dir = tempfile::tempdir().unwrap();
+    fn cfg(dir: &std::path::Path, endpoint: &str, extra: &[(&str, &str)]) -> StorageConfig {
         for n in ["a", "s"] {
-            std::fs::write(dir.path().join(n), "k").unwrap();
+            let p = dir.join(n);
+            if !p.exists() {
+                std::fs::write(p, "k").unwrap();
+            }
         }
-        let (a, s) = (dir.path().join("a"), dir.path().join("s"));
-        let cfg = StorageConfig::from_lookup(|k| {
+        let (a, s) = (dir.join("a"), dir.join("s"));
+        let extra: Vec<(String, String)> = extra
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        StorageConfig::from_lookup(|k| {
+            if let Some((_, v)) = extra.iter().find(|(ek, _)| ek == k) {
+                return Some(v.clone());
+            }
             Some(match k {
-                "CHELABASE_STORAGE_S3_ENDPOINT" => "http://127.0.0.1:1".into(),
+                "CHELABASE_STORAGE_S3_ENDPOINT" => endpoint.into(),
                 "CHELABASE_STORAGE_S3_BUCKET" => "b".into(),
                 "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE" => a.to_string_lossy().into(),
                 "CHELABASE_STORAGE_S3_SECRET_KEY_FILE" => s.to_string_lossy().into(),
@@ -322,8 +417,132 @@ mod tests {
                 _ => return None,
             })
         })
-        .unwrap();
-        let err = S3Store::new(&cfg).head("k").await.unwrap_err();
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = S3Store::new(&cfg(dir.path(), "http://127.0.0.1:1", &[]))
+            .await
+            .head("k")
+            .await
+            .unwrap_err();
         assert!(matches!(err, StorageError::Transient(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn rotated_key_files_are_picked_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, s) = (dir.path().join("a"), dir.path().join("s"));
+        std::fs::write(&a, "access-1\n").unwrap();
+        std::fs::write(&s, "secret-1\n").unwrap();
+        let p = KeyFileCredentials::new(a.clone(), s.clone());
+
+        let c1 = p.provide_credentials().await.unwrap();
+        assert_eq!(
+            (c1.access_key_id(), c1.secret_access_key()),
+            ("access-1", "secret-1")
+        );
+        // Expires, so the SDK's cache asks again.
+        assert!(c1.expiry().is_some());
+
+        std::fs::write(&a, "access-2\n").unwrap();
+        std::fs::write(&s, "secret-2\n").unwrap();
+        let c2 = p.provide_credentials().await.unwrap();
+        assert_eq!(
+            (c2.access_key_id(), c2.secret_access_key()),
+            ("access-2", "secret-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_key_file_is_a_credentials_error_without_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = KeyFileCredentials::new(dir.path().join("nope"), dir.path().join("nope2"));
+        let err = format!("{:?}", p.provide_credentials().await.unwrap_err());
+        assert!(
+            err.contains("CHELABASE_STORAGE_S3_ACCESS_KEY_FILE"),
+            "{err}"
+        );
+    }
+
+    /// One-shot HTTP server: answers any request with `body.len()` bytes, one byte every
+    /// `gap`, and goes silent for `stall` after `stall_after` bytes (if set).
+    async fn slow_server(body: &'static [u8], gap: Duration, stall_after: Option<usize>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = sock.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    return;
+                }
+                seen.extend_from_slice(&buf[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nETag: \"x\"\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            for (i, b) in body.iter().enumerate() {
+                if stall_after == Some(i) {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                tokio::time::sleep(gap).await;
+                if sock.write_all(&[*b]).await.is_err() {
+                    return;
+                }
+                let _ = sock.flush().await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn slow_but_steady_download_outlives_the_request_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        // 8 bytes at 150 ms: ~1.2 s in total, against a 500 ms request timeout.
+        let url = slow_server(b"abcdefgh", Duration::from_millis(150), None).await;
+        let c = cfg(
+            dir.path(),
+            &url,
+            &[
+                ("CHELABASE_STORAGE_S3_REQUEST_TIMEOUT", "500ms"),
+                ("CHELABASE_STORAGE_S3_STREAM_IDLE_TIMEOUT", "2s"),
+            ],
+        );
+        let got = S3Store::new(&c).await.get("k", None).await.unwrap();
+        assert_eq!(
+            collect(got.body).await.unwrap(),
+            Bytes::from_static(b"abcdefgh")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_download_fails_as_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = slow_server(b"abcdefgh", Duration::from_millis(10), Some(3)).await;
+        let c = cfg(
+            dir.path(),
+            &url,
+            &[("CHELABASE_STORAGE_S3_STREAM_IDLE_TIMEOUT", "400ms")],
+        );
+        let got = S3Store::new(&c).await.get("k", None).await.unwrap();
+        let start = std::time::Instant::now();
+        let res = tokio::time::timeout(Duration::from_secs(10), collect(got.body))
+            .await
+            .expect("stream hung");
+        assert!(matches!(res, Err(StorageError::Transient(_))), "{res:?}");
+        // The configured 400 ms idle timeout must apply, not the SDK's 5 s default grace period.
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            start.elapsed()
+        );
     }
 }

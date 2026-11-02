@@ -10,10 +10,10 @@ pub mod memory;
 pub mod s3;
 mod store;
 
-pub use config::{Backend, ConfigError, StorageConfig};
+pub use config::{Backend, ConfigError, CredentialSource, StorageConfig};
 pub use memory::MemoryStore;
 pub use s3::S3Store;
 pub use store::{
     ByteRange, ByteStream, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions,
-    StorageError, collect,
+    STREAM_PART_SIZE, StorageError, collect,
 };
