@@ -377,8 +377,9 @@ async fn sealed_lock() -> sqlx::PgConnection {
     advisory_lock("SELECT pg_advisory_lock_shared($1)").await
 }
 
-/// The environment's real key-check value, restored after a key-check test so
-/// running these tests never locks the local services out.
+/// The stored key-check value. Every key-check test runs on a [`KeyCheckScratch`] database,
+/// never the stack's own: a test that panicked half-way through rewriting the shared row would
+/// leave the stack's services refusing to start.
 async fn saved_key_check(client: &MetadataClient) -> Option<String> {
     sqlx::query_scalar("SELECT value FROM control_settings WHERE key = 'secrets_key_check'")
         .fetch_optional(client.pool())
@@ -405,27 +406,22 @@ async fn restore_key_check(client: &MetadataClient, saved: Option<String>) {
 #[ignore]
 async fn key_check_records_matches_and_refuses_a_different_key_while_credentials_exist() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
-    sqlx::query("DELETE FROM control_settings WHERE key = 'secrets_key_check'")
-        .execute(client.pool())
-        .await
-        .unwrap();
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
 
     let first = client.ensure_key_check("check-a", |v| v == "check-a").await.unwrap();
     let same = client.ensure_key_check("check-a2", |v| v == "check-a").await.unwrap();
 
     // Stored credentials exist (on a branch now): a different key must be refused.
-    let id = insert_pending(&client).await;
+    let id = insert_pending(client).await;
     sqlx::query("UPDATE branches SET owner_password_enc = 'v1:x' WHERE id = $1")
         .bind(id.as_uuid())
         .execute(client.pool())
         .await
         .unwrap();
     let other = client.ensure_key_check("check-b", |v| v == "check-b").await.unwrap();
-    cleanup(&client, id).await;
-    restore_key_check(&client, saved).await;
+    scratch.finish().await;
 
     assert_eq!(first, KeyCheck::Recorded);
     assert_eq!(same, KeyCheck::Matches);
@@ -644,22 +640,22 @@ impl SealedFixture {
 #[ignore]
 async fn key_check_refuses_when_only_one_column_is_sealed() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
     let mut wrong = Vec::new();
     for &(table, column, _) in chelabase_metadata::SECRETS_KEY_SEALED {
         // Other live binaries seal values without `sealed_lock`, so the count can move under
         // a check. A wrong count is retried while the environment moved (or the check lost a
         // deadlock to a writer), and fails once it is wrong with the environment stable.
         for attempt in 1..=KEY_CHECK_ATTEMPTS {
-            let before = sealed_values(&client).await;
-            let fixture = SealedFixture::new(&client, table, column).await;
-            restore_key_check(&client, Some("check-a".into())).await;
+            let before = sealed_values(client).await;
+            let fixture = SealedFixture::new(client, table, column).await;
+            restore_key_check(client, Some("check-a".into())).await;
             let outcome = client.ensure_key_check("check-b", |v| v == "check-b").await;
-            let after = sealed_values(&client).await;
-            let stored = saved_key_check(&client).await;
-            fixture.remove(&client).await;
+            let after = sealed_values(client).await;
+            let stored = saved_key_check(client).await;
+            fixture.remove(client).await;
             let report = format!(
                 "{table}.{column}: {outcome:?} ({before} before, {after} after), stored check {stored:?}"
             );
@@ -680,7 +676,7 @@ async fn key_check_refuses_when_only_one_column_is_sealed() {
             eprintln!("retrying {table}.{column}: the environment moved ({report})");
         }
     }
-    restore_key_check(&client, saved).await;
+    scratch.finish().await;
     assert!(wrong.is_empty(), "a wrong key was not refused: {wrong:#?}");
 }
 
@@ -746,34 +742,37 @@ async fn key_check_ignores_an_expired_grace_token() {
 #[ignore]
 async fn key_check_waits_for_an_inflight_sealed_write() {
     use chelabase_metadata::KeyCheck;
-    let client = client().await;
     let _lock = key_check_lock().await;
-    let saved = saved_key_check(&client).await;
-    let database = insert_pending(&client).await;
-    restore_key_check(&client, Some("check-a".into())).await;
-    let writer = raw_pool().await;
-    let mut tx = writer.begin().await.unwrap();
-    sqlx::query("UPDATE branches SET authenticator_password_enc = 'v1:x' WHERE id = $1")
-        .bind(main_of(database).as_uuid())
-        .execute(&mut *tx)
-        .await
-        .unwrap();
-    let check = client.ensure_key_check("check-b", |v| v == "check-b");
-    tokio::pin!(check);
-    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut check).await;
-    let (finished_early, outcome) = match early {
-        Ok(outcome) => {
-            tx.commit().await.unwrap();
-            (true, outcome)
-        }
-        Err(_) => {
-            tx.commit().await.unwrap();
-            (false, check.await)
-        }
+    let scratch = KeyCheckScratch::new().await;
+    let client = &scratch.client;
+    let database = insert_pending(client).await;
+    restore_key_check(client, Some("check-a".into())).await;
+    let (finished_early, outcome, stored) = {
+        let writer = client.pool().clone();
+        let mut tx = writer.begin().await.unwrap();
+        sqlx::query("UPDATE branches SET authenticator_password_enc = 'v1:x' WHERE id = $1")
+            .bind(main_of(database).as_uuid())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let check = client.ensure_key_check("check-b", |v| v == "check-b");
+        tokio::pin!(check);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut check).await;
+        let (finished_early, outcome) = match early {
+            Ok(outcome) => {
+                tx.commit().await.unwrap();
+                (true, outcome)
+            }
+            Err(_) => {
+                tx.commit().await.unwrap();
+                (false, check.await)
+            }
+        };
+        let stored = saved_key_check(client).await;
+        (finished_early, outcome, stored)
     };
-    let stored = saved_key_check(&client).await;
-    cleanup(&client, database).await;
-    restore_key_check(&client, saved).await;
+    cleanup(client, database).await;
+    scratch.finish().await;
     assert!(!finished_early, "the check finished while a sealed write was uncommitted: {outcome:?}");
     assert!(matches!(outcome, Ok(KeyCheck::Mismatch { sealed_rows }) if sealed_rows >= 1), "{outcome:?}");
     assert_eq!(stored.as_deref(), Some("check-a"));
