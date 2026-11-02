@@ -727,6 +727,19 @@ impl<S: ConnSource> Pools<S> {
         }
     }
 
+    /// New pools connecting with `source`'s credentials, within this one's budget: the same
+    /// service, branch slots and global cap (the managed pool beside a service's role
+    /// sessions: [`crate::ServicePool::beside`]). Info and pools are their own.
+    pub(crate) fn sharing_budget<T: ConnSource>(&self, source: T) -> Pools<T> {
+        Pools {
+            slots: self.slots.clone(),
+            permits: self.permits.clone(),
+            server_tls: self.server_tls.clone(),
+            service: self.service,
+            ..Pools::new(source, 0)
+        }
+    }
+
     /// The branch's connection info (cached; concurrent misses share one fetch).
     pub async fn info(&self, branch: Uuid) -> Result<Arc<ConnInfo>, ConnError> {
         self.infos

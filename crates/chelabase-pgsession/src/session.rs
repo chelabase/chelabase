@@ -159,7 +159,7 @@ impl Conn {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pools::{ConnError, ConnInfo, ConnSource, Pools, RESET_SQL};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -186,11 +186,11 @@ mod tests {
     /// A Postgres stand-in that records every simple query and answers it `OK`, or with an
     /// error when `fails` says so (given the query and how many resets it has seen,
     /// this one included). It tracks the transaction status the client reads.
-    struct Recorder {
-        port: u16,
-        queries: Arc<Mutex<Vec<String>>>,
+    pub(crate) struct Recorder {
+        pub(crate) port: u16,
+        pub(crate) queries: Arc<Mutex<Vec<String>>>,
         /// Sockets open now.
-        open: Arc<AtomicUsize>,
+        pub(crate) open: Arc<AtomicUsize>,
     }
 
     fn message(kind: u8, body: &[u8]) -> Vec<u8> {
@@ -211,7 +211,7 @@ mod tests {
         e
     }
 
-    async fn recorder(fails: fn(&str, usize) -> bool) -> Recorder {
+    pub(crate) async fn recorder(fails: fn(&str, usize) -> bool) -> Recorder {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let queries = Arc::new(Mutex::new(Vec::new()));
