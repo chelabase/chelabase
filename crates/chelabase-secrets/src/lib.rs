@@ -102,6 +102,8 @@ pub enum Purpose {
     /// A member's hidden login role password (`cb_m_…`, bound to its branch and name, see
     /// [`seal_member_role_password`]).
     MemberRole,
+    /// The `chelabase_storage` login's password on a branch (the storage service's own).
+    Storage,
 }
 
 impl Purpose {
@@ -112,6 +114,7 @@ impl Purpose {
             Purpose::DataKey => "data_key",
             Purpose::Role => "role",
             Purpose::MemberRole => "member_role",
+            Purpose::Storage => "storage",
         }
     }
 }
@@ -330,8 +333,9 @@ mod credential_tests {
     #[test]
     fn authenticator_and_data_key_purposes_round_trip_and_differ_in_aad() {
         let key = SecretKey::generate();
-        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey];
+        let all = [Purpose::Owner, Purpose::Authenticator, Purpose::DataKey, Purpose::Storage];
         assert_eq!(Purpose::Owner.as_str(), "owner");
+        assert_eq!(Purpose::Storage.as_str(), "storage");
         assert_eq!(Purpose::Authenticator.as_str(), "authenticator");
         assert_eq!(Purpose::DataKey.as_str(), "data_key");
         for sealed_for in all {

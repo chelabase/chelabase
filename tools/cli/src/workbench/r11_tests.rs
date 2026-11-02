@@ -29,6 +29,7 @@ const SECRET_FILES: &[&str] = &[
     "tokens/data-keys.token",
     "tokens/app-auth.token",
     "tokens/app-sessions.token",
+    "tokens/storage-internal.token",
     "tokens/proxy-api.token",
     "tokens/storcon-hook.token",
 ];

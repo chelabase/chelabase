@@ -108,6 +108,7 @@ impl Scratch {
                 max_rows: 10,
                 statement_timeout_ms: 5000,
                 max_connections: 4,
+                storage_max_connections: 2,
             },
             databases: vec![ServedDatabase {
                 name: self.db.clone(),

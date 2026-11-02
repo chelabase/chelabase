@@ -1,5 +1,6 @@
-//! Routes the gateway and the REST service call: a key's hash to its branch and role, and a
-//! branch's connection info. Neither serves data for a branch that isn't ready.
+//! Routes the gateway and the REST and storage services call: a key's hash to its branch and
+//! role, and a branch's connection info (as `authenticator`, or as storage's own
+//! `chelabase_storage` login). None serves data for a branch that isn't ready.
 
 use std::sync::Arc;
 
@@ -74,6 +75,14 @@ fn parse_hash(hash: &str) -> Option<[u8; 32]> {
     hex::decode(hash).ok()?.try_into().ok()
 }
 
+/// Who a connection route answers as: the data API's `authenticator` (rest, realtime and
+/// storage's role sessions) or the storage service's own `chelabase_storage` login.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Login {
+    Authenticator,
+    Storage,
+}
+
 /// Where and as whom the REST service connects to a branch, and which databases it serves. 404 for an unknown or deleted
 /// branch; 409 `{"status"}` when the branch isn't ready, has no endpoint, has no published
 /// Postgres address or has no `authenticator` password yet.
@@ -85,7 +94,28 @@ where
     M: NeonMetadataPort,
     L: ComputeLocator,
 {
-    let branch = BranchId(id);
+    connection(&state, BranchId(id), Login::Authenticator).await
+}
+
+/// [`branch_connection`] as the storage service's own login: `chelabase_storage` and its
+/// password (sealed `Purpose::Storage`), 409 until the worker stored one; no
+/// `replication_host`. Behind storage's bearer only.
+pub(super) async fn storage_connection<M, L>(
+    State(state): State<Arc<InternalState<M, L>>>,
+    Path(id): Path<Uuid>,
+) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
+    connection(&state, BranchId(id), Login::Storage).await
+}
+
+async fn connection<M, L>(state: &InternalState<M, L>, branch: BranchId, login: Login) -> Response
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
     let row = match state.metadata.branch_connection(branch).await {
         Ok(Some(row)) => row,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -107,10 +137,22 @@ where
     if row.status != BranchStatus::Ready {
         return not_ready();
     }
+    let (user, purpose, sealed) = match login {
+        Login::Authenticator => (
+            "authenticator",
+            Purpose::Authenticator,
+            row.authenticator_password_enc.as_deref(),
+        ),
+        Login::Storage => (
+            "chelabase_storage",
+            Purpose::Storage,
+            row.storage_password_enc.as_deref(),
+        ),
+    };
     let (Some(endpoint), Some(database), Some(sealed)) = (
         row.endpoint_id.as_deref(),
         row.database_name.as_deref(),
-        row.authenticator_password_enc.as_deref(),
+        sealed,
     ) else {
         return not_ready();
     };
@@ -122,22 +164,57 @@ where
             return not_ready();
         }
     };
-    let password = match open_credential(
-        &state.secrets,
-        &branch.to_string(),
-        Purpose::Authenticator,
-        sealed,
-    ) {
+    let password = match open_credential(&state.secrets, &branch.to_string(), purpose, sealed) {
         Ok(password) => password,
         Err(err) => {
-            error!(branch_id = %branch, "opening the authenticator password: {err}");
+            error!(branch_id = %branch, "opening the {user} password: {err}");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
+    let mut answer = json!({
+        "host": addr.ip().to_string(),
+        "port": addr.port(),
+        "database": database,
+        // U15: the service dials `host` and verifies the compute as this name, the only one
+        // its certificate carries.
+        "server_name": chelabase_neon::compute_tls::server_name(endpoint),
+        "user": user,
+        "password": password,
+        "status": row.status.as_str(),
+        "settings": {
+            "max_rows": row.settings.max_rows,
+            "statement_timeout_ms": row.settings.statement_timeout_ms,
+            "max_connections": row.settings.max_connections,
+            "storage_max_connections": row.settings.storage_max_connections,
+        },
+        // The databases the data API serves, main first.
+        "databases": row
+            .databases
+            .iter()
+            .map(|d| json!({ "name": d.name, "default_schema": d.default_schema }))
+            .collect::<Vec<_>>(),
+    });
+    if login == Login::Authenticator {
+        answer["replication_host"] = replication_host(state, branch, endpoint).await.into();
+    }
+    let mut response = Json(answer).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        "no-store".parse().unwrap(),
+    );
+    response
+}
+
+/// The compute's control-network address, for realtime's replication connection.
+async fn replication_host<M, L>(state: &InternalState<M, L>, branch: BranchId, endpoint: &str) -> Option<String>
+where
+    M: NeonMetadataPort,
+    L: ComputeLocator,
+{
     // SP11: realtime's replication connection dials the control network (the role only logs in
     // there). Rest ignores it; a locator that finds nothing, fails or hangs (a stuck Docker
     // daemon: bounded by `CONTROL_LOOKUP_TIMEOUT`) must not change or hold up the answer.
-    let replication_host = match tokio::time::timeout(
+    match tokio::time::timeout(
         CONTROL_LOOKUP_TIMEOUT,
         state.control_locator.address(endpoint),
     )
@@ -156,34 +233,5 @@ where
             );
             None
         }
-    };
-    let mut response = Json(json!({
-        "host": addr.ip().to_string(),
-        "port": addr.port(),
-        "database": database,
-        // U15: rest dials `host` and verifies the compute as this name, the only one its
-        // certificate carries.
-        "server_name": chelabase_neon::compute_tls::server_name(endpoint),
-        "replication_host": replication_host,
-        "user": "authenticator",
-        "password": password,
-        "status": row.status.as_str(),
-        "settings": {
-            "max_rows": row.settings.max_rows,
-            "statement_timeout_ms": row.settings.statement_timeout_ms,
-            "max_connections": row.settings.max_connections,
-        },
-        // The databases the data API serves, main first.
-        "databases": row
-            .databases
-            .iter()
-            .map(|d| json!({ "name": d.name, "default_schema": d.default_schema }))
-            .collect::<Vec<_>>(),
-    }))
-    .into_response();
-    response.headers_mut().insert(
-        axum::http::header::CACHE_CONTROL,
-        "no-store".parse().unwrap(),
-    );
-    response
+    }
 }

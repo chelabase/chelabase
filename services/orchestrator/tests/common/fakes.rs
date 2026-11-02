@@ -609,6 +609,7 @@ fn sample_database(tenant_id: TenantId) -> Db {
         max_rows: 1000,
         statement_timeout_ms: 8000,
         max_connections: 5,
+        storage_max_connections: 2,
     })
 }
 
@@ -1042,6 +1043,9 @@ impl MetadataPort for FakeMetadata {
                 }
                 if let Some(v) = patch.max_connections {
                     db.max_connections = v;
+                }
+                if let Some(v) = patch.storage_max_connections {
+                    db.storage_max_connections = v;
                 }
                 Ok(true)
             }

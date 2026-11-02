@@ -1358,6 +1358,8 @@ struct UpdateDatabaseRequest {
     max_rows: Option<i64>,
     statement_timeout_ms: Option<i64>,
     max_connections: Option<i64>,
+    /// Connections the storage service may hold to each branch, apart from `max_connections`.
+    storage_max_connections: Option<i64>,
 }
 
 /// A database's settings after a change.
@@ -1369,12 +1371,14 @@ struct DatabaseSettings {
     max_rows: i32,
     statement_timeout_ms: i32,
     max_connections: i32,
+    storage_max_connections: i32,
 }
 
 /// Bounds of the data API settings.
 const MAX_ROWS: std::ops::RangeInclusive<i64> = 1..=100_000;
 const STATEMENT_TIMEOUT_MS: std::ops::RangeInclusive<i64> = 100..=120_000;
 const MAX_CONNECTIONS: std::ops::RangeInclusive<i64> = 1..=50;
+const STORAGE_MAX_CONNECTIONS: std::ops::RangeInclusive<i64> = 1..=20;
 
 /// `^[a-z_][a-z0-9_]{0,62}$`.
 pub(crate) fn valid_schema_name(name: &str) -> bool {
@@ -1477,12 +1481,21 @@ where
         Ok(v) => v,
         Err(resp) => return resp.into_response(),
     };
+    let storage_max_connections = match in_range(
+        "storage_max_connections",
+        request.storage_max_connections,
+        &STORAGE_MAX_CONNECTIONS,
+    ) {
+        Ok(v) => v,
+        Err(resp) => return resp.into_response(),
+    };
     let patch = SettingsPatch {
         history_window: window,
         max_branches: max,
         max_rows,
         statement_timeout_ms,
         max_connections,
+        storage_max_connections,
     };
     match state
         .metadata
@@ -1517,6 +1530,7 @@ where
         max_rows: max_rows.unwrap_or(record.max_rows),
         statement_timeout_ms: statement_timeout_ms.unwrap_or(record.statement_timeout_ms),
         max_connections: max_connections.unwrap_or(record.max_connections),
+        storage_max_connections: storage_max_connections.unwrap_or(record.storage_max_connections),
     })
     .into_response()
 }

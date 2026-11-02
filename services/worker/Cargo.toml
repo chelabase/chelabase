@@ -46,6 +46,8 @@ uuid = { workspace = true }
 [dev-dependencies]
 worker = { path = ".", features = ["test-support"] }
 chelabase-auth = { workspace = true }
+# The managed pool's login check, asked as `chelabase_storage` in the storage login live test.
+chelabase-pgsession = { workspace = true }
 bollard = { workspace = true }
 tempfile = { workspace = true }
 sqlx = { workspace = true }

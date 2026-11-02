@@ -40,7 +40,7 @@ universe='[
   "K/neon/storage-tokens/metrics.token",
   "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
-  "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
+  "K/tokens/app-sessions.token", "K/tokens/storage-internal.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
   "S/env/stack.env",
@@ -82,7 +82,7 @@ expected='{
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
     "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/storage-internal.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   },
   "worker": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -146,7 +146,7 @@ expected='{
     "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/storage-internal.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
   }
 }'
 

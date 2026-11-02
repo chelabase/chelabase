@@ -41,5 +41,7 @@ export interface Database {
   project_id: ProjectId;
   statement_timeout_ms: number;
   status: DatabaseStatus;
+  /** Connections the storage service may hold to each branch. */
+  storage_max_connections: number;
   tenant_id: TenantId;
 }

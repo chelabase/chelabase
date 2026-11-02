@@ -111,6 +111,8 @@ pub struct DatabaseRecord {
     pub statement_timeout_ms: i32,
     /// Data API: connections this database's pool may hold.
     pub max_connections: i32,
+    /// Object storage: connections the storage service may hold to each branch.
+    pub storage_max_connections: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,7 +266,8 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 /// live test fails when a metadata column named like a sealed one is missing here.
 ///
 /// Seal sites: `owner_password_enc` (worker provision, branch create, reset: `Purpose::Owner`);
-/// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`); `data_api_keys.sealed`
+/// `authenticator_password_enc` (worker data API, `Purpose::Authenticator`);
+/// `storage_password_enc` (worker storage schema, `Purpose::Storage`); `data_api_keys.sealed`
 /// (orchestrator data keys, `Purpose::DataKey`); `neon_roles.password_enc` (worker roles, branch
 /// create, resync; orchestrator DDL: `seal_role_password`); `member_branch_roles.password_enc`
 /// (worker member roles, `seal_member_role_password`); `branch_auth_sync.password_sealed`
@@ -274,6 +277,7 @@ pub fn postgres_database_name(name: &str) -> Result<String, MetadataError> {
 pub const SECRETS_KEY_SEALED: &[(&str, &str, Option<&str>)] = &[
     ("branches", "owner_password_enc", None),
     ("branches", "authenticator_password_enc", None),
+    ("branches", "storage_password_enc", None),
     ("data_api_keys", "sealed", None),
     ("neon_roles", "password_enc", None),
     ("member_branch_roles", "password_enc", None),
@@ -805,7 +809,8 @@ impl MetadataClient {
                 d.error,
                 d.neon_tenant_id,
                 EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections
+                d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
+                d.storage_max_connections
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE d.id = $1
@@ -845,7 +850,8 @@ impl MetadataClient {
             SELECT d.id, d.project_id, p.tenant_id, d.name, d.status, d.database_name,
                    d.owner_role, d.error, d.neon_tenant_id,
                    EXTRACT(EPOCH FROM d.history_window)::BIGINT AS history_window_secs,
-                   d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections
+                   d.max_branches, d.max_rows, d.statement_timeout_ms, d.max_connections,
+                d.storage_max_connections
             FROM databases d
             JOIN projects p ON p.id = d.project_id
             WHERE p.tenant_id = $1 AND d.status <> 'deleted'
@@ -911,6 +917,7 @@ fn database_from_row(r: &sqlx::postgres::PgRow) -> DatabaseRecord {
         max_rows: r.get("max_rows"),
         statement_timeout_ms: r.get("statement_timeout_ms"),
         max_connections: r.get("max_connections"),
+        storage_max_connections: r.get("storage_max_connections"),
     }
 }
 
@@ -989,6 +996,7 @@ mod tests {
             max_rows: 1000,
             statement_timeout_ms: 8000,
             max_connections: 5,
+            storage_max_connections: 2,
         }
     }
 

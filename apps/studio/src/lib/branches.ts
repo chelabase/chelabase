@@ -240,9 +240,13 @@ export type SettingsErrors = Partial<Record<Exclude<keyof SettingsInput, "unit">
 const whole = (text: string) => (/^\d+$/.test(text.trim()) ? Number(text.trim()) : NaN);
 const inRange = (n: number, [min, max]: readonly [number, number]) => !Number.isNaN(n) && n >= min && n <= max;
 
+// What the settings form edits: storage's connection budget isn't on it yet (Studio m12), so a
+// save leaves it as it is.
+export type FormSettings = Omit<DatabaseSettings, "storage_max_connections">;
+
 export function parseSettings(
   input: SettingsInput,
-): { ok: true; settings: DatabaseSettings } | ({ ok: false } & SettingsErrors) {
+): { ok: true; settings: FormSettings } | ({ ok: false } & SettingsErrors) {
   const errors: SettingsErrors = {};
   const w = whole(input.window);
   const secs = w * (input.unit === "days" ? 86400 : 3600);

@@ -512,6 +512,8 @@ pub struct InternalState<M, L> {
     pub rest_token: String,
     /// Realtime's token: connection info and key lookups too (`require_any_bearer`, R10).
     pub realtime_token: String,
+    /// The storage service's token: its login's connection info, and the data connection info.
+    pub storage_token: String,
     /// Publishes realtime's events (the DDL hook's `pg_database.*`, the webhook's access ones).
     pub rt_events: Arc<dyn realtime::RtEvents>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
@@ -602,14 +604,26 @@ where
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
         .route("/internal/invites/open", post(invite::open::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
-    let rest_tokens: Arc<[Arc<str>]> =
-        Arc::new([state.rest_token.as_str().into(), realtime_token]);
+    // Storage's role sessions connect as `authenticator` too.
+    let storage_token: Arc<str> = state.storage_token.as_str().into();
+    let rest_tokens: Arc<[Arc<str>]> = Arc::new([
+        state.rest_token.as_str().into(),
+        realtime_token,
+        storage_token.clone(),
+    ]);
     let rest = Router::new()
         .route(
             "/internal/data/branches/{id}/connection",
             get(data::branch_connection::<M, L>),
         )
         .route_layer(middleware::from_fn_with_state(rest_tokens, require_any_bearer));
+    // The `chelabase_storage` login's password: storage's bearer only.
+    let storage = Router::new()
+        .route(
+            "/internal/storage/branches/{id}/connection",
+            get(data::storage_connection::<M, L>),
+        )
+        .route_layer(middleware::from_fn_with_state(storage_token, require_bearer));
     Router::new()
         .route("/health", get(health))
         .route(
@@ -626,6 +640,7 @@ where
         .merge(storcon)
         .merge(data_keys)
         .merge(rest)
+        .merge(storage)
         .merge(signup)
         .merge(app::routes(&state))
         .layer(TraceLayer::new_for_http())

@@ -2968,6 +2968,8 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         SettingsPatch { statement_timeout_ms: Some(120_001), ..Default::default() },
         SettingsPatch { max_connections: Some(0), ..Default::default() },
         SettingsPatch { max_connections: Some(51), ..Default::default() },
+        SettingsPatch { storage_max_connections: Some(0), ..Default::default() },
+        SettingsPatch { storage_max_connections: Some(21), ..Default::default() },
         // One bad field spoils the whole patch.
         SettingsPatch { max_branches: Some(9), max_rows: Some(0), ..Default::default() },
     ];
@@ -2982,6 +2984,7 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         max_rows: Some(100_000),
         statement_timeout_ms: Some(100),
         max_connections: Some(50),
+        storage_max_connections: Some(20),
         max_branches: Some(7),
         ..Default::default()
     };
@@ -3003,6 +3006,8 @@ async fn settings_patch_bounds_are_enforced_by_checks() {
         (defaults.max_rows, defaults.statement_timeout_ms, defaults.max_connections),
         (1000, 8000, 5)
     );
+    assert_eq!(defaults.storage_max_connections, 2);
+    assert_eq!((after.storage_max_connections, partial.storage_max_connections), (20, 20));
     assert_eq!(rejected, bad.len());
     assert_eq!(unchanged, defaults);
     assert!(applied);
@@ -3035,6 +3040,14 @@ async fn branch_connection_returns_settings() {
     // A second write never replaces it: a racing run reads the first one back.
     client.set_authenticator_password(main_of(id), "v1:later").await.unwrap();
     let with_password = client.branch_connection(main_of(id)).await.unwrap().expect("row");
+    client
+        .update_database_settings(id, &SettingsPatch { storage_max_connections: Some(7), ..Default::default() })
+        .await
+        .unwrap();
+    // The storage login's password and salt are stored together, once.
+    client.set_storage_password(main_of(id), "v1:storage", &[7; 16]).await.unwrap();
+    client.set_storage_password(main_of(id), "v1:later", &[8; 16]).await.unwrap();
+    let with_storage = client.branch_connection(main_of(id)).await.unwrap().expect("row");
     let missing = client.branch_connection(BranchId::new()).await.unwrap();
     let record = main_branch(&client, id).await;
     cleanup(&client, id).await;
@@ -3046,6 +3059,11 @@ async fn branch_connection_returns_settings() {
     assert_eq!(ready.authenticator_password_enc, None);
     assert_eq!((ready.settings.max_rows, ready.settings.statement_timeout_ms), (1000, 8000));
     assert_eq!(ready.settings.max_connections, 5);
+    assert_eq!(ready.settings.storage_max_connections, 2);
+    assert_eq!((ready.storage_password_enc.as_deref(), ready.storage_password_salt.as_deref()), (None, None));
+    assert_eq!(with_storage.settings.storage_max_connections, 7);
+    assert_eq!(with_storage.storage_password_enc.as_deref(), Some("v1:storage"));
+    assert_eq!(with_storage.storage_password_salt.as_deref(), Some(&[7u8; 16][..]));
     assert_eq!(with_password.authenticator_password_enc.as_deref(), Some("v1:auth"));
     assert_eq!(with_password.settings.max_rows, 50);
     assert!(missing.is_none());

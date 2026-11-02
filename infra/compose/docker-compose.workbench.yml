@@ -442,6 +442,7 @@ services:
       - CHELABASE_DATA_KEYS_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/data-keys.token
       - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
       - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
+      - CHELABASE_STORAGE_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storage-internal.token
       - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       # Connection strings name the proxy's published port on the host.
@@ -476,6 +477,7 @@ services:
       - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
       - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+      - {source: token-storage-internal, target: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
     depends_on: !override
@@ -865,6 +867,7 @@ secrets:
   token-data-keys: {file: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
   token-app-auth: {file: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
   token-app-sessions: {file: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
+  token-storage-internal: {file: "${CHELABASE_KEYS_DIR}/tokens/storage-internal.token"}
   token-proxy-api: {file: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
   token-storcon-hook: {file: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
   # Storage auth (user, 2026-10-16): the compute-JWT public key as SPKI PEM and the scoped

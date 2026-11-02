@@ -801,7 +801,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             let main_database = self.database_of(ep).await.ok();
             for database in served {
                 match self
-                    .data_api_healthy_in(ep, &database.name, &database.default_schema)
+                    .data_api_healthy_in(id, ep, &database.name, &database.default_schema)
                     .await
                 {
                     Ok(true) => {}

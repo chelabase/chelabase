@@ -165,6 +165,11 @@ pub const SEED_KEYS: &[SeedKey] = &[
         Rule::Secret,
     ),
     s(
+        "CHELABASE_SEED_STORAGE_INTERNAL_TOKEN",
+        "tokens/storage-internal.token",
+        Rule::Secret,
+    ),
+    s(
         "CHELABASE_SEED_PROXY_API_TOKEN",
         "tokens/proxy-api.token",
         Rule::Secret,
