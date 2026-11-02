@@ -2,13 +2,15 @@ use std::{
     collections::{BTreeMap, HashMap},
     hash::{DefaultHasher, Hash, Hasher},
     sync::Mutex,
+    time::SystemTime,
 };
 
 use bytes::Bytes;
 use futures_util::stream;
 
 use crate::{
-    ByteRange, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions, StorageError,
+    ByteRange, CompletedPart, DatedObject, GetObject, ObjectMeta, ObjectStore, OpenUpload,
+    PutOptions, StorageError,
 };
 
 /// In-process [`ObjectStore`] for tests.
@@ -24,12 +26,40 @@ struct State {
     uploads: HashMap<String, (String, BTreeMap<u32, Bytes>)>,
     next_upload: u64,
     uploads_started: usize,
+    /// The store's clock: [`MemoryStore::set_now`]'s time, else the system's.
+    now: Option<SystemTime>,
+    /// When each object was last written, by the store's clock.
+    modified: HashMap<String, SystemTime>,
+    /// When each open upload began.
+    initiated: HashMap<String, SystemTime>,
+}
+
+impl State {
+    fn now(&self) -> SystemTime {
+        self.now.unwrap_or_else(SystemTime::now)
+    }
+
+    fn write(&mut self, key: &str, body: Bytes) {
+        let now = self.now();
+        self.modified.insert(key.to_string(), now);
+        self.objects.insert(key.to_string(), body);
+    }
 }
 
 impl MemoryStore {
     /// How many multipart uploads have been created (for tests).
     pub fn uploads_started(&self) -> usize {
         self.state.lock().unwrap().uploads_started
+    }
+
+    /// Sets the store's clock (the times it lists) from now on.
+    pub fn set_now(&self, now: SystemTime) {
+        self.state.lock().unwrap().now = Some(now);
+    }
+
+    /// The store's clock.
+    pub fn now(&self) -> SystemTime {
+        self.state.lock().unwrap().now()
     }
 
     /// Multipart uploads neither completed nor aborted (for tests).
@@ -65,7 +95,7 @@ impl ObjectStore for MemoryStore {
             return Err(StorageError::PreconditionFailed);
         }
         let m = meta(key, &body);
-        st.objects.insert(key.to_string(), body);
+        st.write(key, body);
         Ok(m)
     }
 
@@ -103,7 +133,9 @@ impl ObjectStore for MemoryStore {
     }
 
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        self.state.lock().unwrap().objects.remove(key);
+        let mut st = self.state.lock().unwrap();
+        st.objects.remove(key);
+        st.modified.remove(key);
         Ok(())
     }
 
@@ -111,7 +143,7 @@ impl ObjectStore for MemoryStore {
         let mut st = self.state.lock().unwrap();
         let body = st.objects.get(src).cloned().ok_or(StorageError::NotFound)?;
         let m = meta(dst, &body);
-        st.objects.insert(dst.to_string(), body);
+        st.write(dst, body);
         Ok(m)
     }
 
@@ -125,6 +157,36 @@ impl ObjectStore for MemoryStore {
             .collect())
     }
 
+    async fn list_dated(&self, prefix: &str) -> Result<Vec<DatedObject>, StorageError> {
+        let st = self.state.lock().unwrap();
+        Ok(st
+            .objects
+            .range(prefix.to_string()..)
+            .take_while(|(k, _)| k.starts_with(prefix))
+            .map(|(k, b)| DatedObject {
+                key: k.clone(),
+                size: b.len() as u64,
+                modified: st.modified[k],
+            })
+            .collect())
+    }
+
+    async fn list_uploads(&self, prefix: &str) -> Result<Vec<OpenUpload>, StorageError> {
+        let st = self.state.lock().unwrap();
+        let mut out: Vec<OpenUpload> = st
+            .uploads
+            .iter()
+            .filter(|(_, (k, _))| k.starts_with(prefix))
+            .map(|(id, (k, _))| OpenUpload {
+                key: k.clone(),
+                upload_id: id.clone(),
+                initiated: st.initiated[id],
+            })
+            .collect();
+        out.sort_by(|a, b| (&a.key, &a.upload_id).cmp(&(&b.key, &b.upload_id)));
+        Ok(out)
+    }
+
     async fn multipart_create(
         &self,
         key: &str,
@@ -134,6 +196,8 @@ impl ObjectStore for MemoryStore {
         st.next_upload += 1;
         st.uploads_started += 1;
         let id = format!("upload-{}", st.next_upload);
+        let now = st.now();
+        st.initiated.insert(id.clone(), now);
         st.uploads
             .insert(id.clone(), (key.to_string(), BTreeMap::new()));
         Ok(id)
@@ -190,9 +254,10 @@ impl ObjectStore for MemoryStore {
             }
         }
         st.uploads.remove(upload_id);
+        st.initiated.remove(upload_id);
         let body = Bytes::from(out);
         let m = meta(key, &body);
-        st.objects.insert(key.to_string(), body);
+        st.write(key, body);
         Ok(m)
     }
 
@@ -201,6 +266,7 @@ impl ObjectStore for MemoryStore {
         match st.uploads.get(upload_id) {
             Some((k, _)) if k == key => {
                 st.uploads.remove(upload_id);
+                st.initiated.remove(upload_id);
                 Ok(())
             }
             _ => Err(StorageError::NotFound),
@@ -224,6 +290,27 @@ mod tests {
             items.push(Err(StorageError::Transient("boom".into())));
         }
         Box::pin(futures_util::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn times_come_from_the_stores_own_clock() {
+        use std::time::{Duration, SystemTime};
+        let s = MemoryStore::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        s.set_now(t0);
+        s.put("p/a", Bytes::from_static(b"x"), PutOptions::default())
+            .await
+            .unwrap();
+        let id = s.multipart_create("p/b", None).await.unwrap();
+        s.set_now(t0 + Duration::from_secs(60));
+        s.copy("p/a", "p/c").await.unwrap();
+        let listed = s.list_dated("p/").await.unwrap();
+        let times: Vec<_> = listed.iter().map(|o| (o.key.as_str(), o.modified)).collect();
+        assert_eq!(times, [("p/a", t0), ("p/c", t0 + Duration::from_secs(60))]);
+        let uploads = s.list_uploads("p/").await.unwrap();
+        assert_eq!(uploads.len(), 1);
+        assert_eq!((uploads[0].upload_id.as_str(), uploads[0].initiated), (id.as_str(), t0));
+        assert_eq!(s.now(), t0 + Duration::from_secs(60));
     }
 
     #[tokio::test]

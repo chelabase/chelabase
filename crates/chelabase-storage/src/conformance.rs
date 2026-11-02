@@ -13,6 +13,41 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     multipart_out_of_order(store, prefix).await;
     multipart_abort(store, prefix).await;
     unknown_length_stream(store, prefix).await;
+    dated_listing_and_open_uploads(store, prefix).await;
+}
+
+/// Objects list with the store's own times; open multipart uploads list until aborted.
+async fn dated_listing_and_open_uploads(store: &dyn ObjectStore, prefix: &str) {
+    use std::time::{Duration, SystemTime};
+    let dir = format!("{prefix}/dated/");
+    let key = format!("{dir}a");
+    store
+        .put(&key, Bytes::from_static(b"abc"), PutOptions::default())
+        .await
+        .unwrap();
+    // Another machine's clock: near ours, not equal.
+    let near = |t: SystemTime| {
+        let now = SystemTime::now();
+        t > now - Duration::from_secs(3600) && t < now + Duration::from_secs(3600)
+    };
+    let listed = store.list_dated(&dir).await.unwrap();
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!((listed[0].key.as_str(), listed[0].size), (key.as_str(), 3));
+    assert!(near(listed[0].modified), "{listed:?}");
+
+    let open = format!("{dir}open");
+    let id = store.multipart_create(&open, None).await.unwrap();
+    let uploads = store.list_uploads(&dir).await.unwrap();
+    let mine: Vec<_> = uploads.iter().filter(|u| u.upload_id == id).collect();
+    assert_eq!(mine.len(), 1, "{uploads:?}");
+    assert_eq!(mine[0].key, open);
+    assert!(near(mine[0].initiated), "{uploads:?}");
+    // Outside the prefix: not listed.
+    assert!(store.list_uploads(&format!("{prefix}/elsewhere/")).await.unwrap().is_empty());
+    store.multipart_abort(&open, &id).await.unwrap();
+    assert!(store.list_uploads(&dir).await.unwrap().iter().all(|u| u.upload_id != id));
+    store.delete(&key).await.unwrap();
+    assert!(store.list_dated(&dir).await.unwrap().is_empty());
 }
 
 async fn ranged_read(store: &dyn ObjectStore, prefix: &str) {

@@ -14,6 +14,6 @@ pub use config::{Backend, ConfigError, CredentialSource, StorageConfig};
 pub use memory::MemoryStore;
 pub use s3::S3Store;
 pub use store::{
-    ByteRange, ByteStream, CompletedPart, GetObject, ObjectMeta, ObjectStore, PutOptions,
+    ByteRange, ByteStream, CompletedPart, DatedObject, GetObject, ObjectMeta, ObjectStore, OpenUpload, PutOptions,
     STREAM_PART_SIZE, StorageError, collect,
 };

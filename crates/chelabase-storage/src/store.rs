@@ -88,6 +88,23 @@ pub struct ObjectMeta {
     pub etag: String,
 }
 
+/// A listed object with the store's own modification time (S3's `LastModified`): the store's
+/// clock, never the caller's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatedObject {
+    pub key: String,
+    pub size: u64,
+    pub modified: std::time::SystemTime,
+}
+
+/// A multipart upload neither completed nor aborted, with when the store says it began.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: std::time::SystemTime,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct PutOptions {
     pub content_type: Option<String>,
@@ -123,6 +140,18 @@ pub trait ObjectStore: Send + Sync {
     async fn copy(&self, src: &str, dst: &str) -> Result<ObjectMeta, StorageError>;
     /// Every object under `prefix`, in key order (pages are followed internally).
     async fn list(&self, prefix: &str) -> Result<Vec<ObjectMeta>, StorageError>;
+
+    /// Every object under `prefix` with its modification time, in key order. A store that
+    /// can't say refuses rather than guess.
+    async fn list_dated(&self, _prefix: &str) -> Result<Vec<DatedObject>, StorageError> {
+        Err(StorageError::Other("this store can't list modification times".into()))
+    }
+
+    /// The multipart uploads under `prefix` neither completed nor aborted. A store that can't
+    /// say refuses rather than answer none.
+    async fn list_uploads(&self, _prefix: &str) -> Result<Vec<OpenUpload>, StorageError> {
+        Err(StorageError::Other("this store can't list multipart uploads".into()))
+    }
 
     /// Upload a body of unknown length. S3 rejects `PutObject` without a Content-Length, so
     /// anything of at least [`STREAM_PART_SIZE`] goes through multipart in parts of that size
