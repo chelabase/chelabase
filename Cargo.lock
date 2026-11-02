@@ -770,6 +770,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-identity"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chelabase-http",
+ "chelabase-identity",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "urlencoding",
+ "uuid",
+]
+
+[[package]]
 name = "chelabase-init"
 version = "0.1.0"
 dependencies = [
@@ -971,6 +988,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chelabase-http",
+ "chelabase-identity",
  "chelabase-zitadel",
  "chrono",
  "hex",
