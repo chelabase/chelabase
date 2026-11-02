@@ -642,3 +642,264 @@ async fn psql(conn: &str, user: &str, password: &str, sql: &str) -> Result<Strin
         Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
+
+// --- Hardening (white-room audit of m3: B1, S1, S2, S3, N1, N2) ---------------------------
+
+const B1: &str = "00000000-0000-0000-0000-0000000000b1";
+
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn storage_schema_hardening_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { hardening(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn bootstrap(fx: &Fx) {
+    fx.worker
+        .bootstrap_data_api(
+            &fx.metadata.get_branch(fx.main).await.unwrap().unwrap(),
+            &fx.database,
+        )
+        .await
+        .expect("bootstrap");
+}
+
+/// A psql session to the compute that stays open (stdin piped).
+async fn session(fx: &Fx, user: &str, password: &str) -> tokio::process::Child {
+    let locator = DockerLocator::connect(
+        &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute".into()),
+        &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
+    )
+    .expect("the Docker client");
+    let addr = locator.postgres_addr(&fx.ep).await.unwrap().unwrap();
+    let conn = format!(
+        "host={} port={} dbname={} sslmode=prefer",
+        addr.ip(),
+        addr.port(),
+        fx.database
+    );
+    tokio::process::Command::new("psql")
+        .arg(conn)
+        .env("PGUSER", user)
+        .env("PGPASSWORD", password)
+        .args(["-X", "-qtA", "-v", "VERBOSITY=verbose"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn psql")
+}
+
+async fn send(child: &mut tokio::process::Child, sql: &str) {
+    use tokio::io::AsyncWriteExt;
+    let stdin = child.stdin.as_mut().unwrap();
+    stdin.write_all(sql.as_bytes()).await.unwrap();
+    stdin.write_all(b"\n").await.unwrap();
+    stdin.flush().await.unwrap();
+}
+
+async fn read_line(child: &mut tokio::process::Child) -> String {
+    use tokio::io::AsyncBufReadExt;
+    let mut reader = tokio::io::BufReader::new(child.stdout.as_mut().unwrap());
+    let mut line = String::new();
+    tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+        .await
+        .expect("a line from the session")
+        .unwrap();
+    line.trim().to_string()
+}
+
+/// The session's stdout after closing its stdin.
+async fn finish(mut child: tokio::process::Child) -> String {
+    drop(child.stdin.take());
+    let out = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+async fn hardening(fx: &Fx) {
+    fx.as_role_commit(
+        "chelabase_storage",
+        &format!("INSERT INTO storage.buckets (id, name) VALUES ('{B1}', 'avatars')"),
+    )
+    .await;
+    let mint = |v: &str, name: &str| {
+        format!(
+            "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES ('{v}', '{B1}', '{name}', 1, 'e', now() + interval '10 minutes')"
+        )
+    };
+
+    // B1: an owner event trigger never runs inside the policy helpers.
+    fx.owner(
+        "CREATE TABLE public.audit_log (u text, what text); GRANT ALL ON public.audit_log TO PUBLIC;
+         CREATE FUNCTION public.audit_et() RETURNS event_trigger LANGUAGE plpgsql AS $$ BEGIN
+           INSERT INTO public.audit_log VALUES (current_user, tg_tag);
+           IF current_user = 'chelabase_admin' THEN
+             EXECUTE 'CREATE FUNCTION storage.audit_backdoor() RETURNS void LANGUAGE sql AS $b$ SELECT $b$';
+           END IF; END $$;
+         CREATE EVENT TRIGGER audit_et ON ddl_command_end EXECUTE FUNCTION public.audit_et();",
+    )
+    .await
+    .expect("the owner's event trigger");
+    fx.owner("SELECT storage.create_policy('audit_et_p', 'objects', 'SELECT', ARRAY['anon']::name[], 'false')").await.expect("create a policy");
+    fx.owner("SELECT storage.drop_policy('audit_et_p', 'objects')")
+        .await
+        .expect("drop the policy");
+    // The trigger itself still works for the owner's own DDL.
+    fx.owner("CREATE TABLE public.audit_t (a int)")
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.value("SELECT count(*) FROM public.audit_log WHERE u = 'chelabase_admin'")
+            .await,
+        "0"
+    );
+    assert_ne!(
+        fx.value("SELECT count(*) FROM public.audit_log").await,
+        "0",
+        "the trigger fires for the owner"
+    );
+    assert_eq!(
+        fx.value("SELECT to_regprocedure('storage.audit_backdoor()') IS NULL")
+            .await,
+        "t"
+    );
+    fx.owner("DROP EVENT TRIGGER audit_et").await.unwrap();
+
+    // B1 (healing): whatever was planted in `storage` (an object, an ACL entry with grant
+    // option, a disabled trigger, a rule) makes the check fail and the next run removes it.
+    fx.admin("CREATE ROLE audit_x NOLOGIN").await;
+    fx.admin(
+        "BEGIN; SET LOCAL ROLE chelabase_admin;
+         CREATE FUNCTION storage.audit_backdoor() RETURNS void LANGUAGE sql SECURITY DEFINER AS $b$ SELECT $b$;
+         GRANT EXECUTE ON FUNCTION storage.audit_backdoor() TO PUBLIC;
+         GRANT ALL ON storage.upload_tickets, storage.objects TO audit_x WITH GRANT OPTION;
+         GRANT SELECT ON storage.upload_tickets TO anon;
+         CREATE VIEW storage.audit_v AS SELECT 1 AS one;
+         CREATE RULE audit_r AS ON INSERT TO storage.upload_tickets DO INSTEAD NOTHING;
+         ALTER TABLE storage.objects DISABLE TRIGGER protect_objects;
+         COMMIT;",
+    )
+    .await;
+    assert_eq!(
+        last_line(&fx.admin(&schema_check_sql("public")).await),
+        "f",
+        "the check notices the plant"
+    );
+    bootstrap(fx).await;
+    assert_eq!(last_line(&fx.admin(&schema_check_sql("public")).await), "t");
+    assert_eq!(fx.value("SELECT to_regprocedure('storage.audit_backdoor()') IS NULL AND to_regclass('storage.audit_v') IS NULL").await, "t");
+    assert_eq!(
+        fx.value(
+            "SELECT count(*) FROM pg_rewrite WHERE ev_class = 'storage.upload_tickets'::regclass"
+        )
+        .await,
+        "0"
+    );
+    assert_eq!(fx.value("SELECT has_table_privilege('audit_x', 'storage.objects', 'SELECT') OR has_table_privilege('anon', 'storage.upload_tickets', 'SELECT')").await, "f");
+    assert_eq!(fx.value("SELECT string_agg(tgname || '=' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid IN ('storage.objects'::regclass, 'storage.upload_tickets'::regclass) AND NOT tgisinternal").await, "guard_tickets=A,protect_objects=A");
+    fx.admin("DROP ROLE audit_x").await;
+
+    // S1: a session that reached chelabase_storage through another role is ended too.
+    fx.admin("CREATE ROLE audit_r1 NOLOGIN; CREATE ROLE audit_r2 LOGIN PASSWORD 'Audit-pw-r2x9'; GRANT chelabase_storage TO audit_r1; GRANT audit_r1 TO audit_r2;").await;
+    let mut transitive = session(fx, "audit_r2", "Audit-pw-r2x9").await;
+    send(
+        &mut transitive,
+        "SET ROLE chelabase_storage; SELECT 'is ' || current_user;",
+    )
+    .await;
+    assert_eq!(read_line(&mut transitive).await, "is chelabase_storage");
+    bootstrap(fx).await;
+    send(
+        &mut transitive,
+        &format!(
+            "{}; SELECT 'minted';",
+            mint("00000000-0000-0000-0000-0000000000d2", "d/r2")
+        ),
+    )
+    .await;
+    let out = finish(transitive).await;
+    assert!(
+        !out.contains("minted"),
+        "the transitive session outlived the lockdown: {out}"
+    );
+    assert_eq!(
+        fx.value("SELECT count(*) FROM storage.upload_tickets")
+            .await,
+        "0"
+    );
+    assert_eq!(
+        fx.value("SELECT pg_has_role('audit_r2', 'chelabase_storage', 'MEMBER')")
+            .await,
+        "f"
+    );
+    fx.admin("DROP ROLE audit_r2; DROP ROLE audit_r1;").await;
+
+    // S3: a stored default schema from before the reservation grants nothing on `storage`.
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "storage")
+        .await
+        .expect("set default schema");
+    fx.admin("DELETE FROM chelabase.bootstrap").await;
+    bootstrap(fx).await;
+    assert_eq!(
+        fx.value("SELECT has_function_privilege('authenticated', 'storage.create_policy(name, name, text, name[], text, text, boolean)', 'EXECUTE') OR has_table_privilege('authenticated', 'storage.objects', 'INSERT') OR has_table_privilege('anon', 'storage.objects', 'INSERT')").await,
+        "f"
+    );
+    fx.metadata
+        .set_database_default_schema(fx.main, &fx.database, "public")
+        .await
+        .expect("reset default schema");
+
+    // N1: expiry is the wall clock, not the transaction's start.
+    fx.as_role_commit(
+        "chelabase_storage",
+        &mint("00000000-0000-0000-0000-0000000000e1", "n/1")
+            .replace("interval '10 minutes'", "interval '1 second'"),
+    )
+    .await;
+    fx.owner("SELECT storage.create_policy('ins', 'objects', 'INSERT', ARRAY['authenticated']::name[], NULL, 'true')").await.unwrap();
+    assert_eq!(
+        fx.code("authenticated", &format!("SELECT pg_sleep(1.5); INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('{B1}', 'n/1', 1, 'e', '00000000-0000-0000-0000-0000000000e1')")).await,
+        "CB003",
+        "an expired ticket"
+    );
+
+    // N2: an unbalanced expression can't add a clause.
+    let err = fx.owner_err("SELECT storage.create_policy('audit_paren', 'objects', 'UPDATE', ARRAY['anon']::name[], 'false) WITH CHECK (false')").await;
+    assert!(
+        err.contains("42601") || err.contains("syntax error"),
+        "{err}"
+    );
+
+    // S2 (last: it moves the schema aside): a user's own `storage` schema doesn't stop the
+    // role's lockdown.
+    fx.admin("ALTER SCHEMA storage RENAME TO audit_storage_aside")
+        .await;
+    fx.owner("CREATE SCHEMA storage")
+        .await
+        .expect("the owner's own storage schema");
+    fx.admin(&format!(
+        "ALTER ROLE chelabase_storage LOGIN PASSWORD '{TAMPER_PASSWORD}' CONNECTION LIMIT 5"
+    ))
+    .await;
+    bootstrap(fx).await;
+    assert_eq!(fx.value("SELECT rolcanlogin || ' ' || (rolpassword IS NULL) || ' ' || rolconnlimit FROM pg_authid WHERE rolname = 'chelabase_storage'").await, "false true 0");
+    assert_eq!(
+        fx.value("SELECT nspowner::regrole FROM pg_namespace WHERE nspname = 'storage'")
+            .await,
+        OWNER,
+        "the user's schema is left alone"
+    );
+    fx.owner("DROP SCHEMA storage").await.unwrap();
+    fx.admin("ALTER SCHEMA audit_storage_aside RENAME TO storage")
+        .await;
+}

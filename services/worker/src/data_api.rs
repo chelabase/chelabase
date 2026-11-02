@@ -51,7 +51,7 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version
 /// The search path is pinned first (`cloud_admin` is a superuser; `to_regclass` is unqualified).
 pub fn schema_check_sql(schema: &str) -> String {
     let schema_literal = quote_literal(&quote_ident(schema));
-    let storage = crate::storage_schema::STORAGE_CHECK_SQL;
+    let storage = crate::storage_schema::storage_check_sql(crate::OWNER_ROLE);
     format!(
         "SET search_path = pg_catalog, pg_temp; {SCHEMA_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
@@ -242,6 +242,12 @@ fn data_api_script(owner_role: &str, authenticator_password: &str, schema: &str,
     let schema_literal = quote_literal(&schema_ident);
     let owner = quote_literal(owner_role);
     let claim_helpers = crate::app_users_sql::claim_helpers_body();
+    // A reserved default schema gets neither default privileges nor grants.
+    let schema_present = if reserved_default_schema(schema) {
+        "false".to_string()
+    } else {
+        format!("pg_catalog.to_regnamespace({schema_literal}) IS NOT NULL")
+    };
     format!(
         "BEGIN;
 SET search_path = pg_catalog, pg_temp;
@@ -395,7 +401,7 @@ CREATE EVENT TRIGGER chelabase_extension_functions ON ddl_command_end WHEN TAG I
 ALTER ROLE authenticator LOGIN NOINHERIT PASSWORD {password};
 ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 DO $$ BEGIN
-  IF pg_catalog.to_regnamespace({schema_literal}) IS NOT NULL THEN
+  IF {schema_present} THEN
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT SELECT ON TABLES TO anon;
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO authenticated;
     ALTER DEFAULT PRIVILEGES FOR ROLE {owner_role} IN SCHEMA {schema_ident} GRANT USAGE, SELECT ON SEQUENCES TO authenticated;
@@ -404,7 +410,7 @@ DO $$ BEGIN
   END IF;
 END $$;
 DO $$ DECLARE r record; BEGIN
-  IF pg_catalog.to_regnamespace({schema_literal}) IS NOT NULL{first_grants_guard} THEN
+  IF {schema_present}{first_grants_guard} THEN
     GRANT SELECT ON ALL TABLES IN SCHEMA {schema_ident} TO anon;
     GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA {schema_ident} TO authenticated;
     GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA {schema_ident} TO authenticated;
@@ -496,6 +502,17 @@ fn parse_role_ok(answer: &str) -> Option<(i64, bool)> {
         Some(_) => return None,
     };
     fields.next().is_none().then_some((oid, bypass))
+}
+
+/// A schema the data API never serves, so never granted as a default schema (S3): object
+/// storage's, Chelabase's own (`chelabase…`), Postgres's (`pg_…`, `information_schema`). The
+/// orchestrator refuses them when one is set; a value stored before they were reserved is
+/// skipped here.
+pub fn reserved_default_schema(schema: &str) -> bool {
+    schema == crate::storage_schema::STORAGE_SCHEMA
+        || schema.starts_with("chelabase")
+        || schema.starts_with("pg_")
+        || schema == "information_schema"
 }
 
 /// Roles Chelabase owns; never a secret key's.
@@ -629,6 +646,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         schema: &str,
         grant_existing: bool,
     ) -> anyhow::Result<()> {
+        if reserved_default_schema(schema) {
+            warn!(branch_id = %branch, %ep, database = %database_name, schema, "the stored default schema is reserved; the data API grants nothing on it");
+        }
         let password = self.authenticator_password(branch).await?;
         let script = data_api_script(OWNER_ROLE, &password, schema, grant_existing);
         let output = self.computes.admin_sql(ep, database_name, &script).await?;
