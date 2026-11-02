@@ -546,6 +546,16 @@ impl SealedFixture {
                     .await
                     .unwrap();
             }
+            // The storage login's password always has its salt beside it.
+            ("branches", "storage_password_enc") => {
+                sqlx::query(
+                    "UPDATE branches SET storage_password_enc = 'v1:x', storage_password_salt = '\\x00000000000000000000000000000000' WHERE id = $1",
+                )
+                .bind(branch)
+                .execute(pool)
+                .await
+                .unwrap();
+            }
             ("data_api_keys", "sealed") => {
                 sqlx::query(
                     "INSERT INTO data_api_keys (id, branch_id, kind, role, name, prefix, sha256, sealed)
