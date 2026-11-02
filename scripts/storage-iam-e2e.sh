@@ -11,9 +11,9 @@
 #
 # 1. Both buckets exist.
 # 2. Each identity works in its own bucket and is denied in the other (list, put, get, delete,
-#    path-style and virtual-host addressing), and ListBuckets shows only its own bucket.
+#    path-style), and ListBuckets shows only its own bucket.
 # 3. CopyObject and UploadPartCopy with the other bucket's key as the source are denied.
-# 4. Master (9333), volume (8080), filer (8888) and the S3 gRPC (18333) of seaweedfs are refused
+# 4. Master (9333), volume (8080), filer (8888) and the S3 server (8334) and its gRPC (18333, 18334) of seaweedfs are refused
 #    to a container on the network; only 8333 answers.
 # 5. No storage or admin key is in `docker inspect` of any container of the stack.
 #
@@ -38,9 +38,6 @@ neon_container="$(docker ps -q --filter "label=com.docker.compose.project=$proje
   --filter "label=com.docker.compose.service=safekeeper1" | head -n1)"
 [[ -n "$neon_container" ]] || { echo "[$LOG_PREFIX] FAIL: safekeeper1 isn't running" >&2; exit 1; }
 image="$(docker inspect -f '{{.Config.Image}}' "$neon_container")"
-sw_ip="$(docker inspect -f "{{with index .NetworkSettings.Networks \"$net\"}}{{.IPAddress}}{{end}}" \
-  "$(docker ps -q --filter "label=com.docker.compose.project=$project" --filter "label=com.docker.compose.service=seaweedfs" | head -n1)")"
-[[ -n "$sw_ip" ]] || { echo "[$LOG_PREFIX] FAIL: seaweedfs has no address on $net" >&2; exit 1; }
 
 key() { cat "$state/$1/$2"; } # key <dir> <access-key|secret-key>
 declare -A AK SK
@@ -49,13 +46,12 @@ for id in neon:s3 storage:storage-s3 admin:s3-admin; do
   SK[${id%%:*}]="$(key "${id#*:}" secret-key)"
 done
 
-# aws <identity> <style: path|virtual> <aws args…>; stdin is passed through. Virtual-host
-# addressing resolves `<bucket>.seaweedfs` to seaweedfs's address.
+# aws_as <identity> <style> <aws args…>; stdin is passed through. Path-style addressing only
+# (what Chelabase uses; SeaweedFS has no -s3.domainName here, so virtual-host names are no buckets).
 aws_as() {
   local id="$1" style="$2"
   shift 2
   docker run --rm -i --network "$net" \
-    --add-host "neon.seaweedfs:$sw_ip" --add-host "chelabase-storage.seaweedfs:$sw_ip" \
     -e "AWS_ACCESS_KEY_ID=${AK[$id]}" -e "AWS_SECRET_ACCESS_KEY=${SK[$id]}" -e AWS_DEFAULT_REGION=us-east-1 \
     -e "AWS_CONFIG_FILE=/tmp/aws-config" --entrypoint /bin/sh "$image" -c '
       printf "[default]\ns3 =\n    addressing_style = %s\n" "$1" >/tmp/aws-config; shift
@@ -88,7 +84,7 @@ cleanup() {
 trap cleanup EXIT
 for pair in neon:neon:chelabase-storage storage:chelabase-storage:neon; do
   id="${pair%%:*}" rest="${pair#*:}" own="${rest%%:*}" other="${rest#*:}"
-  for style in path virtual; do
+  for style in path; do
     echo "hello $id" | aws_as "$id" "$style" s3 cp - "s3://$own/$probe" >/dev/null &&
       ok "$id ($style) writes s3://$own" || fail "$id ($style) can't write its own bucket $own"
     expect_ok "$id ($style) lists s3://$own" "$id" "$style" s3 ls "s3://$own/iam-probe/"
@@ -116,7 +112,7 @@ for pair in neon:chelabase-storage storage:neon; do
   # A source object in the other bucket, put there by the identity that owns it.
   echo "secret of $other" | aws_as "$([[ $other == neon ]] && echo neon || echo storage)" path s3 cp - "s3://$other/$probe-src" >/dev/null ||
     fail "setup: could not write the copy source in $other"
-  for style in path virtual; do
+  for style in path; do
     expect_denied "$id ($style) CopyObject from $other" "$id" "$style" \
       s3api copy-object --bucket "$own" --key "$probe-copy" --copy-source "$other/$probe-src"
     upload_id="$(aws_as "$id" "$style" s3api create-multipart-upload --bucket "$own" --key "$probe-mpu" \
@@ -139,7 +135,7 @@ done
 probe_c="chelabase-iam-probe-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
 docker run -d --rm --name "$probe_c" --network "$net" --entrypoint sleep "$image" 120 >/dev/null
 trap 'docker rm -f "$probe_c" >/dev/null 2>&1 || true; cleanup' EXIT
-for port in 9333 19333 8080 18080 8888 18888 18333 8181 9101; do
+for port in 9333 19333 8080 18080 8888 18888 8334 18333 18334 8181 9101; do
   if docker exec "$probe_c" timeout 3 bash -c "</dev/tcp/seaweedfs/$port" >/dev/null 2>&1; then
     fail "seaweedfs:$port accepts a connection from the network"
   else

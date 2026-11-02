@@ -457,8 +457,9 @@ services:
   #   storage  the same on bucket `chelabase-storage` only
   #   admin    global Admin, for create-bucket only; no service holds it besides that one-shot
   # Neither service identity can reach the other's bucket. Master (9333), volume (8080) and filer
-  # (8888) have no auth and bypass S3 IAM, so every component binds to and advertises 127.0.0.1;
-  # only the S3 port (8333) listens on the network (`-s3.ip.bind`). The Iceberg and Lance catalog
+  # (8888) have no auth and bypass S3 IAM, and so do their gRPC ports (+10000) and the S3
+  # server's own; every component binds to and advertises 127.0.0.1, and only the relay on 8333
+  # (see the command) listens on the network. The Iceberg and Lance catalog
   # ports are off and the embedded IAM API is off, so identities change only through this file.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
@@ -487,7 +488,12 @@ services:
            "actions": ["Admin"]}]}
         EOT
         unset nak nsk sak ssk aak ask
-        exec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
+        # SeaweedFS's S3 server opens its gRPC port (S3 port + 10000, unauthenticated, an IAM
+        # cache service) on the same address as S3 itself, with no flag to split them. So S3
+        # listens on loopback (8334, gRPC 18334) and busybox `nc` relays the network's 8333 to it:
+        # a relay carries bytes only, so no other port of the S3 server is reachable.
+        nc -lk -p 8333 -e nc 127.0.0.1 8334 &
+        exec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.port=8334 -s3.ip.bind=127.0.0.1 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
     volumes:
       - neon_seaweedfs_data:/data
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/access-key, read_only: true, volume: {subpath: s3/access-key}}

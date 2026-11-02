@@ -218,9 +218,11 @@ done
 sw_cmd="$(jq -r '.services.seaweedfs.command | join("\n")' "$tmp/base.json")"
 for want in '"Read:neon", "Write:neon", "List:neon", "Tagging:neon"' \
   '"Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"' \
-  '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.ip.bind=0.0.0.0' '-s3.iam=false'; do
+  '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.port=8334' '-s3.ip.bind=127.0.0.1' '-s3.iam=false' \
+  'nc -lk -p 8333 -e nc 127.0.0.1 8334'; do
   grep -qF -- "$want" <<<"$sw_cmd" || err "seaweedfs: the command must contain: $want"
 done
+! grep -qF -e '0.0.0.0' <<<"$sw_cmd" || err "seaweedfs: nothing but the 8333 relay may listen on 0.0.0.0"
 [[ "$(grep -o '"Admin"' <<<"$sw_cmd" | wc -l)" == 1 ]] || err "seaweedfs: exactly one identity (admin) has global Admin"
 ! grep -qE '"(Read|Write|List|Tagging)"' <<<"$sw_cmd" || err "seaweedfs: no unscoped Read/Write/List/Tagging action"
 jq -r '.services["create-bucket"].entrypoint | join("\n")' "$tmp/base.json" |
