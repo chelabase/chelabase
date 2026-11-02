@@ -356,3 +356,68 @@ fn member_shape_is_the_header_algorithm() {
     let ed = URL_SAFE_NO_PAD.encode(br#"{"alg":"EdDSA","typ":"JWT"}"#);
     assert!(member_shaped(&format!("{ed}.e30.sig")));
 }
+
+// The internal identity names a tenant or a Zitadel org, never both, never a nil tenant; the
+// signer refuses to mint one and the verifier refuses one minted by hand.
+#[test]
+fn internal_identity_names_a_tenant_or_an_org() {
+    use chelabase_auth::internal::InternalClaims;
+    let (private, public) = generate_keypair_pem();
+    let signer = InternalSigner::from_pem(private.as_bytes()).unwrap();
+    let verifier = InternalVerifier::from_pem(public.as_bytes()).unwrap();
+    let mut identity = Identity {
+        sub: "u".into(),
+        org_id: "org-1".into(),
+        auth: AuthMethod::ManagementJwt,
+        request_id: "r".into(),
+        data: None,
+        email: None,
+        name: None,
+    };
+    assert!(
+        signer
+            .sign_for_tenant("orchestrator", &identity, Uuid::new_v4())
+            .is_err()
+    );
+    identity.org_id.clear();
+    assert!(
+        signer
+            .sign_for_tenant("orchestrator", &identity, Uuid::nil())
+            .is_err()
+    );
+    let tid = Uuid::new_v4();
+    let token = signer
+        .sign_for_tenant("orchestrator", &identity, tid)
+        .unwrap();
+    assert_eq!(
+        verifier.verify(&token, "orchestrator").unwrap().tenant_id,
+        Some(tid)
+    );
+
+    for (org, tenant) in [("org-1", Uuid::new_v4()), ("", Uuid::nil())] {
+        let claims = InternalClaims {
+            iss: "chelabase-gateway".into(),
+            aud: "orchestrator".into(),
+            iat: now(),
+            exp: now() + 60,
+            sub: "u".into(),
+            org_id: org.into(),
+            tenant_id: Some(tenant),
+            auth: AuthMethod::ManagementJwt,
+            rid: "r".into(),
+            data: None,
+            email: None,
+            name: None,
+        };
+        let token = encode(
+            &Header::new(Algorithm::EdDSA),
+            &claims,
+            &EncodingKey::from_ed_pem(private.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            verifier.verify(&token, "orchestrator").is_err(),
+            "{org:?} {tenant}"
+        );
+    }
+}
