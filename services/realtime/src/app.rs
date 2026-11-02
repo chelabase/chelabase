@@ -68,7 +68,19 @@ impl Deps {
             .oidc
             .clone()
             .context("the gateway's OIDC settings (CHELABASE_AUTH_HOST) are required")?;
-        let nats = chelabase_nats::connect(&config.nats)
+        // #119: auth's member tokens, with the OIDC settings' issuer (both the auth host).
+        let members = config
+            .member_jwt_public_key
+            .as_deref()
+            .map(|path| {
+                chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(path, &oidc.issuer)
+                    .map_err(|e| anyhow::anyhow!("CHELABASE_MEMBER_JWT_PUBLIC_KEY: {e}"))
+            })
+            .transpose()?;
+        if members.is_none() {
+            tracing::warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: every member token is refused");
+        }
+                let nats = chelabase_nats::connect(&config.nats)
             .await
             .with_context(|| format!("NATS at {}", config.nats.url))?;
         let valkey = Arc::new(
@@ -113,7 +125,7 @@ impl Deps {
         .await?;
         Ok(Self {
             identity,
-            verifier: Arc::new(OidcVerifier::new(oidc)),
+            verifier: Arc::new(OidcVerifier::new(oidc).with_member(members)),
             tickets: valkey.clone(),
             counters: valkey,
             bus,

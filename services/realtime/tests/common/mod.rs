@@ -67,6 +67,7 @@ pub fn token_in(sub: &str, org: &str, exp_in: i64) -> String {
     FakeVerifier::token(&MemberToken {
         sub: sub.into(),
         org_id: org.into(),
+        tenant_id: None,
         exp: (now() as i64 + exp_in) as u64,
         name: Some(format!("Name {sub}")),
         email: Some(format!("{sub}@example.com")),
@@ -234,6 +235,8 @@ pub struct Harness {
     signer: InternalSigner,
     verify_pem: String,
     rt: Option<Realtime>,
+    /// #119: the instances' token verifier instead of [`Self::verifier`] (the real one).
+    token_verifier: Option<Arc<dyn realtime::auth::TokenVerifier>>,
 }
 
 impl Harness {
@@ -243,6 +246,18 @@ impl Harness {
 
     /// One instance; `tune` adjusts its config (timings, limits) before it starts.
     pub async fn start_with(tune: impl FnOnce(&mut Config)) -> Self {
+        Self::start_full(tune, None).await
+    }
+
+    /// #119: one instance whose `auth` frames are checked by `verifier` (the production one).
+    pub async fn start_verifying(verifier: Arc<dyn realtime::auth::TokenVerifier>) -> Self {
+        Self::start_full(|_| {}, Some(verifier)).await
+    }
+
+    async fn start_full(
+        tune: impl FnOnce(&mut Config),
+        token_verifier: Option<Arc<dyn realtime::auth::TokenVerifier>>,
+    ) -> Self {
         let (signing_pem, verify_pem) = generate_keypair_pem();
         let key = TicketKey::generate();
         let orch = FakeOrchestrator::start().await;
@@ -263,6 +278,7 @@ impl Harness {
             signer: InternalSigner::from_pem(signing_pem.as_bytes()).unwrap(),
             verify_pem,
             rt: None,
+            token_verifier,
         };
         let rt = h.instance(|_| {}).await;
         h.rt = Some(rt);
@@ -277,7 +293,10 @@ impl Harness {
         tune(&mut config);
         let deps = Deps {
             identity: Arc::new(InternalVerifier::from_pem(self.verify_pem.as_bytes()).unwrap()),
-            verifier: self.verifier.clone(),
+            verifier: match &self.token_verifier {
+                Some(v) => v.clone(),
+                None => self.verifier.clone(),
+            },
             tickets: self.store.clone(),
             counters: self.store.clone(),
             bus: self.bus.clone(),
@@ -306,6 +325,22 @@ impl Harness {
             name: Some(format!("Name {sub}")),
         };
         self.signer.sign("realtime", &identity).unwrap()
+    }
+
+    /// #119: the gateway identity for a member token of `sub` naming `tenant`.
+    pub fn member_identity(&self, sub: &str, tenant: Uuid) -> String {
+        let identity = Identity {
+            sub: sub.into(),
+            org_id: String::new(),
+            auth: AuthMethod::ManagementJwt,
+            request_id: format!("rid-{}", Uuid::new_v4()),
+            data: None,
+            email: Some(format!("{sub}@example.com")),
+            name: Some(format!("Name {sub}")),
+        };
+        self.signer
+            .sign_for_tenant("realtime", &identity, tenant)
+            .unwrap()
     }
 
     /// `POST /v1/realtime/tickets` on `rt` with these headers: (status, headers, body).
@@ -342,6 +377,7 @@ impl Harness {
         let identity = TicketIdentity {
             sub: key_id.to_string(),
             org_id: String::new(),
+            tenant_id: None,
             auth: AuthMethod::DataKey,
             email: None,
             name: None,

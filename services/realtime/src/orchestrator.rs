@@ -8,7 +8,7 @@
 //! - `POST /internal/realtime/projects {token}` → 200 `{tenant_id, projects: [{project_id,
 //!   database_ids}]}`; refusals as 403 `forbidden`, 404 `not_found`, 401 with body
 //!   `{"error":{"code":"token_expired"}}`, 503 `unavailable`; a bare 401 is a wrong bearer.
-//! - `POST /internal/realtime/member {sub, org_id}` (T8-1, D7) → 200 `{allowed}`, asked before
+//! - `POST /internal/realtime/member {sub, org_id | tenant_id}` (T8-1, D7, #119) → 200 `{allowed}`, asked before
 //!   a Studio ticket is issued; anything else is "can't answer" (the ticket route's 503).
 //! - S13: 400, 401 (other than `token_expired` on `/projects`), 5xx, a body that isn't the
 //!   route's JSON and a timeout are `unavailable` (400/401 logged as configuration errors).
@@ -227,8 +227,12 @@ impl OrchestratorClient {
     /// T8-1, D7: whether the person may get a Studio ticket now (`/internal/realtime/member`).
     /// `Some(false)` for a refusal (any `allowed: false`, fails closed on an unknown reason);
     /// `None` when the orchestrator gives no usable answer in time.
-    pub async fn member_allowed(&self, sub: &str, org_id: &str) -> Option<bool> {
-        let body = json!({"sub": sub, "org_id": org_id});
+    /// #119: a member token's identity sends its `tenant_id` and no org.
+    pub async fn member_allowed(&self, sub: &str, org_id: &str, tenant_id: Option<uuid::Uuid>) -> Option<bool> {
+        let body = match tenant_id {
+            Some(tenant) => json!({"sub": sub, "tenant_id": tenant}),
+            None => json!({"sub": sub, "org_id": org_id}),
+        };
         match post(
             &self.http,
             format!("{}/internal/realtime/member", self.base_url),
