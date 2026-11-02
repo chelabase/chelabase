@@ -967,8 +967,11 @@ services:
         target: /run/chelabase/smtp.password
         read_only: true
         bind: {create_host_path: false}
-      - {type: tmpfs, target: /run/identity}
       - {type: tmpfs, target: /tmp}
+    # The entrypoint writes the database URL here as uid 10001: a long-form tmpfs mount is
+    # root's, so this one is set with its owner.
+    tmpfs:
+      - /run/identity:uid=10001,gid=10001,mode=0700
     healthcheck:
       <<: *app-health
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]

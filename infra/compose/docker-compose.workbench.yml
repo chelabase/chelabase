@@ -452,8 +452,9 @@ services:
       - *checkout-ro
       - *keys-mask
       - *checkout-mask
-      - {type: tmpfs, target: /run/identity}
       - {type: tmpfs, target: /tmp}
+    tmpfs: !override
+      - /run/identity:uid=${CHELABASE_UID},gid=${CHELABASE_GID},mode=0700
     secrets:
       - {source: identity-secret, target: "${CHELABASE_KEYS_DIR}/identity/secret"}
       - {source: identity-db-password, target: "${CHELABASE_KEYS_DIR}/identity/db.password"}

@@ -391,6 +391,10 @@ q '.services.identity.command | if type == "array" then join(" ") else . end' | 
 [[ "$(q '.services.identity.volumes[] | select(.source == "/w/feat-x") | .read_only // false')" == true ]] ||
   fail "identity mounts the checkout read-only"
 [[ -n "$(q '.services.identity.healthcheck.test // empty')" ]] || fail "identity has a healthcheck"
+# Its entrypoint writes the database URL into /run/identity as the service user: the tmpfs must
+# be that user's own, in both files (a root-owned tmpfs crash-loops the service).
+q '.services.identity.tmpfs // [] | .[]' | gq -Fx '/run/identity:uid=1000,gid=1000,mode=0700' ||
+  fail "identity's /run/identity tmpfs is the host user's own"
 [[ -z "$(q '.services.identity.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
   fail "identity must not get the Docker socket"
 q '.services.identity.depends_on | keys[]' | gq -x metadata-db || fail "identity waits for metadata-db"
@@ -431,4 +435,7 @@ bq '.services["init-bootstrap"].depends_on | keys[]' | gq -x identity || fail "b
 published_base="$(bq '[.services | to_entries[] | select(.value.ports) | .key] | unique | join(" ")')"
 [[ "$published_base" == "gateway proxy" ]] || fail "base: only the gateway and the proxy publish ports, got: $published_base"
 
+# auth-replacement m5 (#118): the base identity service owns its /run/identity tmpfs.
+bq '.services.identity.tmpfs // [] | .[]' | grep -Fqx '/run/identity:uid=10001,gid=10001,mode=0700' ||
+  fail "base identity's /run/identity tmpfs is uid 10001's own"
 echo "workbench-compose: ok"
