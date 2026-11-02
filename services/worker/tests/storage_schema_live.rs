@@ -185,7 +185,7 @@ const SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDE
     FROM pg_proc p WHERE p.pronamespace = 'storage'::regnamespace
   UNION ALL SELECT a.attrelid::regclass || '.' || a.attname || ':' || coalesce(a.attacl::text, '')
     FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relnamespace = 'storage'::regnamespace AND a.attnum > 0
-  UNION ALL SELECT t.tgname || ':' || t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+  UNION ALL SELECT t.tgname || ':' || t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
     WHERE c.relnamespace = 'storage'::regnamespace AND NOT t.tgisinternal
   UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '') || ':' || coalesce(obj_description(n.oid, 'pg_namespace'), '')
     FROM pg_namespace n WHERE n.nspname = 'storage'
@@ -216,7 +216,7 @@ async fn run(fx: &Fx) {
     // AC 1: both tables, chelabase_admin's, RLS enabled and forced, no policy.
     assert_eq!(
         fx.value("SELECT string_agg(relname || ' ' || relowner::regrole || ' ' || relrowsecurity || ' ' || relforcerowsecurity, ',' ORDER BY relname) FROM pg_class WHERE relnamespace = 'storage'::regnamespace AND relkind = 'r'").await,
-        "buckets chelabase_admin t t,objects chelabase_admin t t"
+        "buckets chelabase_admin true true,objects chelabase_admin true true"
     );
     assert_eq!(fx.value("SELECT count(*) FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid WHERE c.relnamespace = 'storage'::regnamespace").await, "0");
     assert_eq!(fx.value("SELECT rolbypassrls AND NOT rolsuper AND NOT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'").await, "t");
