@@ -1129,7 +1129,8 @@ mod tests {
         fetches: std::sync::atomic::AtomicUsize,
     }
 
-    impl ConnSource for Arc<EnablingSource> {
+    // A reference: `ConnSource` is another crate's trait, and `Arc` isn't local.
+    impl ConnSource for &'static EnablingSource {
         async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
             use std::sync::atomic::Ordering;
             self.fetches.fetch_add(1, Ordering::SeqCst);
@@ -1148,11 +1149,11 @@ mod tests {
     async fn a_newly_enabled_database_is_found_without_an_invalidate() {
         use crate::conn::INFO_REFRESH_AFTER;
         use std::sync::atomic::Ordering;
-        let source = Arc::new(EnablingSource {
+        let source: &'static EnablingSource = Box::leak(Box::new(EnablingSource {
             enabled: false.into(),
             fetches: 0.into(),
-        });
-        let engine = Engine::new(source.clone(), 10);
+        }));
+        let engine = Engine::new(source, 10);
         let branch = Uuid::new_v4();
         let name = |r: Result<(Arc<ConnInfo>, ServedDatabase), Failure>| match r {
             Ok((_, d)) => Ok(d.name),
