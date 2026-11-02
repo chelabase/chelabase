@@ -19,6 +19,7 @@ async-trait = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
 chelabase-http = { workspace = true }
+chelabase-identity = { workspace = true }
 chelabase-query = { workspace = true }
 chelabase-routes = { workspace = true }
 chelabase-secrets = { workspace = true }
