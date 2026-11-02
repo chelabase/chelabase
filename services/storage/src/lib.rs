@@ -9,4 +9,6 @@ pub mod buckets;
 pub mod config;
 pub mod engine;
 pub mod error;
+pub mod names;
+pub mod objects;
 pub mod openapi;

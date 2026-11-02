@@ -1314,6 +1314,7 @@ mod tests {
             port: 1,
             server_name: None,
             database: "main".into(),
+            database_id: None,
             user: "authenticator".into(),
             password: "x".into(),
             settings: rest::conn::Settings {

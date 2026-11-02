@@ -79,6 +79,59 @@ impl Failure {
         )
     }
 
+    /// 400: an object name that isn't allowed (checked before any statement).
+    pub fn invalid_name() -> Self {
+        Self::invalid_request(
+            "an object name is 1 to 1024 bytes of UTF-8 with no control characters, no leading `/`, and no empty or `..` segment",
+        )
+    }
+
+    /// 404: no object of that name the caller may see (missing or hidden alike).
+    pub fn object_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "object_not_found", "no such object")
+    }
+
+    /// 409: someone else changed the object (or took the name) first.
+    pub fn object_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "the object changed or was created meanwhile; try again",
+        )
+    }
+
+    /// 413: the body is over the bucket's file size limit.
+    pub fn too_large(limit: i64) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            format!("the object is over the bucket's limit of {limit} bytes"),
+        )
+    }
+
+    pub fn range_not_satisfiable() -> Self {
+        Self::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "range_not_satisfiable",
+            "the range is outside the object",
+        )
+    }
+
+    /// The object store failed (logged with the request id).
+    pub fn from_store(e: &chelabase_storage::StorageError, request_id: &str) -> Self {
+        match e {
+            chelabase_storage::StorageError::NotFound => Self::object_not_found(),
+            other => {
+                tracing::warn!(request_id, "the object store: {other}");
+                Self::new(
+                    StatusCode::BAD_GATEWAY,
+                    "storage_error",
+                    "the object store failed; try again",
+                )
+            }
+        }
+    }
+
     /// No connection to the branch's database.
     pub fn from_acquire(e: &AcquireError, request_id: &str) -> Self {
         match e {

@@ -102,6 +102,7 @@ impl Scratch {
             port: self.url.port().unwrap_or(5432),
             server_name: None,
             database: self.db.clone(),
+            database_id: None,
             user,
             password,
             settings: Settings {

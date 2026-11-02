@@ -11,6 +11,8 @@ pub enum Method {
     Put,
     Patch,
     Delete,
+    /// Only object storage's metadata read (`storage.head_object`).
+    Head,
 }
 
 impl Method {
@@ -21,6 +23,7 @@ impl Method {
             Method::Put => "PUT",
             Method::Patch => "PATCH",
             Method::Delete => "DELETE",
+            Method::Head => "HEAD",
         }
     }
 
@@ -33,6 +36,7 @@ impl Method {
             "PUT" => Some(Method::Put),
             "PATCH" => Some(Method::Patch),
             "DELETE" => Some(Method::Delete),
+            "HEAD" => Some(Method::Head),
             _ => None,
         }
     }
@@ -1279,6 +1283,21 @@ pub mod storage {
     /// Only an empty bucket.
     pub const DELETE_BUCKET: Endpoint =
         data("storage.delete_bucket", Method::Delete, "/storage/v1/bucket/{name}");
+
+    const OBJECT: &str = "/storage/v1/object/{bucket}/{*name}";
+    /// A streamed upload (POST, or PUT: the same route).
+    pub const UPLOAD_OBJECT: Endpoint = data("storage.upload_object", Method::Post, OBJECT);
+    pub const PUT_OBJECT: Endpoint = data("storage.put_object", Method::Put, OBJECT);
+    pub const DOWNLOAD_OBJECT: Endpoint = data("storage.download_object", Method::Get, OBJECT);
+    pub const HEAD_OBJECT: Endpoint = data("storage.head_object", Method::Head, OBJECT);
+    pub const DELETE_OBJECT: Endpoint = data("storage.delete_object", Method::Delete, OBJECT);
+    /// Several objects of a bucket, named in the body.
+    pub const DELETE_OBJECTS: Endpoint =
+        data("storage.delete_objects", Method::Delete, "/storage/v1/object/{bucket}");
+    pub const LIST_OBJECTS: Endpoint =
+        data("storage.list_objects", Method::Post, "/storage/v1/object/list/{bucket}");
+    pub const COPY_OBJECT: Endpoint = data("storage.copy_object", Method::Post, "/storage/v1/object/copy");
+    pub const MOVE_OBJECT: Endpoint = data("storage.move_object", Method::Post, "/storage/v1/object/move");
 }
 
 /// Every public endpoint the gateway exposes.
@@ -1442,6 +1461,15 @@ pub const ENDPOINTS: &[Endpoint] = &[
     storage::CREATE_BUCKET,
     storage::UPDATE_BUCKET,
     storage::DELETE_BUCKET,
+    storage::UPLOAD_OBJECT,
+    storage::PUT_OBJECT,
+    storage::DOWNLOAD_OBJECT,
+    storage::HEAD_OBJECT,
+    storage::DELETE_OBJECT,
+    storage::DELETE_OBJECTS,
+    storage::LIST_OBJECTS,
+    storage::COPY_OBJECT,
+    storage::MOVE_OBJECT,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1486,12 +1514,22 @@ fn match_in(endpoints: &'static [Endpoint], scope: Scope, method: &str, path: &s
 }
 
 /// If `template` matches `path`, return one flag per segment (`true` = literal
-/// segment), so literal matches compare greater than param matches.
+/// segment), so literal matches compare greater than param matches. A last `{*tail}` segment
+/// takes one or more non-empty segments.
 fn path_specificity(template: &str, path: &str) -> Option<Vec<bool>> {
     let template = template.strip_prefix('/')?;
     let path = path.strip_prefix('/')?;
     let template_segments: Vec<&str> = template.split('/').collect();
-    let path_segments: Vec<&str> = path.split('/').collect();
+    let mut path_segments: Vec<&str> = path.split('/').collect();
+    if let Some(last) = template_segments.last()
+        && last.starts_with("{*")
+    {
+        let fixed = template_segments.len() - 1;
+        if path_segments.len() <= fixed || path_segments[fixed..].iter().any(|p| p.is_empty()) {
+            return None;
+        }
+        path_segments.truncate(template_segments.len());
+    }
     if template_segments.len() != path_segments.len() {
         return None;
     }
@@ -1511,6 +1549,38 @@ fn path_specificity(template: &str, path: &str) -> Option<Vec<bool>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// m5 phase B: the object routes; a `{*name}` tail takes one or more segments, and a
+    /// literal segment still wins over it (`list`, `copy`, `move`).
+    #[test]
+    fn object_routes_take_a_multi_segment_name() {
+        for (method, path, name) in [
+            ("POST", "/storage/v1/object/avatars/a.png", "storage.upload_object"),
+            ("PUT", "/storage/v1/object/avatars/u1/2026/a.png", "storage.put_object"),
+            ("GET", "/storage/v1/object/avatars/u1/a.png", "storage.download_object"),
+            ("DELETE", "/storage/v1/object/avatars/u1/a.png", "storage.delete_object"),
+            ("DELETE", "/storage/v1/object/avatars", "storage.delete_objects"),
+            ("POST", "/storage/v1/object/list/avatars", "storage.list_objects"),
+            ("POST", "/storage/v1/object/copy", "storage.copy_object"),
+            ("POST", "/storage/v1/object/move", "storage.move_object"),
+        ] {
+            let Match::Found(ep) = match_endpoint(Scope::Api, method, path) else {
+                panic!("{method} {path} isn't routed");
+            };
+            assert_eq!(ep.name, name, "{method} {path}");
+            assert_eq!(ep.transfer(), Transfer::Stream);
+        }
+        for path in ["/storage/v1/object/avatars/", "/storage/v1/object/avatars//a"] {
+            assert_ne!(
+                match_endpoint(Scope::Api, "GET", path),
+                Match::Found(&storage::DOWNLOAD_OBJECT),
+                "{path}"
+            );
+        }
+        // A tail matches only as the last segment of a template.
+        assert_eq!(path_specificity("/a/{*rest}", "/a"), None);
+        assert_eq!(path_specificity("/a/{*rest}", "/a/b/c"), Some(vec![true, false]));
+    }
 
     /// m5: the storage service's bucket routes take any data key and stream (long timeouts,
     /// no body cap); every other route is a standard one.
@@ -2218,6 +2288,15 @@ mod tests {
             ("storage.create_bucket", Access::DataKey),
             ("storage.update_bucket", Access::DataKey),
             ("storage.delete_bucket", Access::DataKey),
+            ("storage.upload_object", Access::DataKey),
+            ("storage.put_object", Access::DataKey),
+            ("storage.download_object", Access::DataKey),
+            ("storage.head_object", Access::DataKey),
+            ("storage.delete_object", Access::DataKey),
+            ("storage.delete_objects", Access::DataKey),
+            ("storage.list_objects", Access::DataKey),
+            ("storage.copy_object", Access::DataKey),
+            ("storage.move_object", Access::DataKey),
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.

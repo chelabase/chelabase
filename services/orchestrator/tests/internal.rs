@@ -2207,6 +2207,7 @@ async fn key_lookup_404_for_unknown_or_bad_hex() {
 fn connection_row(status: BranchStatus, endpoint: Option<&str>, password: Option<String>) -> BranchConnectionRow {
     BranchConnectionRow {
         branch_id: BranchId::new(),
+        database_id: chelabase_types::DatabaseId(uuid::Uuid::from_u128(0xdb)),
         status,
         endpoint_id: endpoint.map(str::to_string),
         database_name: Some("web1".into()),
@@ -2279,6 +2280,7 @@ async fn storage_connection_opens_the_storage_password() {
             "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
             "port": 55432,
             "database": "web1",
+            "database_id": "00000000-0000-0000-0000-0000000000db",
             "server_name": "ep-1.compute.chelabase.internal",
             "user": "chelabase_storage",
             "password": "storage-pw",
@@ -2393,6 +2395,7 @@ async fn connection_opens_the_authenticator_password() {
             "host": std::net::Ipv4Addr::LOCALHOST.to_string(),
             "port": 55432,
             "database": "web1",
+            "database_id": "00000000-0000-0000-0000-0000000000db",
             "server_name": "ep-1.compute.chelabase.internal",
             "user": "authenticator",
             "password": "auth-pw",

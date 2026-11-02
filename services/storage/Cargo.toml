@@ -15,6 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
 axum = { workspace = true }
 chelabase-auth = { workspace = true }
 # The caller's role session and the managed pool, within the branch's storage budget.

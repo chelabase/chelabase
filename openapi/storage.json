@@ -339,6 +339,788 @@
           }
         ]
       }
+    },
+    "/storage/v1/object/copy": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Copy an object",
+        "description": "Reads the source as the caller, checks the destination's policies, copies the blob to a new version and writes the destination row as the caller.",
+        "operationId": "copyObject",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Relocate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`version_id` of the copy",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "404": {
+            "description": "The source is missing or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The destination exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/list/{bucket}": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "List a bucket's objects",
+        "description": "As the caller: only the objects its policies show. With a delimiter, each folder and each file once.",
+        "operationId": "listObjects",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ListObjects"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`items` (`name`, `folder`, `size`, `etag`, `content_type`, `updated_at`) and `next_cursor`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/move": {
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Move or rename an object",
+        "description": "Metadata only: the blob stays where it is. Moving to another bucket needs a ticket for the same version, written by storage once the caller can see the source.",
+        "operationId": "moveObject",
+        "parameters": [
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Relocate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Moved"
+          },
+          "404": {
+            "description": "The source is missing or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The destination exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/{bucket}": {
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete several objects",
+        "operationId": "deleteObjects",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeleteObjects"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`deleted`: the names deleted (those missing or hidden are left out)",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/storage/v1/object/{bucket}/{*name}": {
+      "get": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Download an object",
+        "description": "`Range` (one range) answers 206 with `Content-Range`; a matching `If-None-Match` answers 304.",
+        "operationId": "downloadObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "206": {
+            "description": "The range asked for"
+          },
+          "304": {
+            "description": "Not modified"
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or hidden from the caller",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "`range_not_satisfiable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload an object (as POST)",
+        "operationId": "putObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "As POST",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Upload an object",
+        "description": "Streams the body (any length, chunked included). Row level security on `storage.objects` decides, before any byte is stored and again when the row is written.",
+        "operationId": "uploadObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "description": "The object's name: no leading `/`, no empty or `..` segment, at most 1024 bytes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored: `bucket`, `name`, `version_id`, `size`, `etag`",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`invalid_request`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`permission_denied`: no policy allows it; `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`bucket_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`conflict`: the name is taken (no upsert), or another upload changed it first",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`too_large`: over the bucket's file size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "`storage_error`: the object store failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "`storage_unavailable`, `unavailable`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "Delete an object",
+        "operationId": "deleteObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "404": {
+            "description": "`object_not_found`: missing, or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "head": {
+        "tags": [
+          "storage"
+        ],
+        "summary": "An object's headers",
+        "operationId": "headObject",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "database",
+            "in": "query",
+            "description": "The Postgres database (the key's main one when left out).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upsert",
+            "in": "query",
+            "description": "Replace an existing object (also the `x-upsert: true` header).",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "download",
+            "in": "query",
+            "description": "Download as an attachment; the value is the file name (empty: the object's own).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object's headers"
+          },
+          "404": {
+            "description": "Missing or hidden"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
     }
   },
   "components": {
@@ -413,6 +1195,112 @@
               "null"
             ],
             "description": "Default false."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DeleteObjects": {
+        "type": "object",
+        "description": "Objects to delete.",
+        "required": [
+          "names"
+        ],
+        "properties": {
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "At most 1000."
+          }
+        },
+        "additionalProperties": false
+      },
+      "ListObjects": {
+        "type": "object",
+        "description": "A page of a bucket's objects.",
+        "properties": {
+          "cursor": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`next_cursor` of the previous page.",
+            "default": null
+          },
+          "delimiter": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Group names by the next occurrence of it after the prefix into folders (`/`, typically).",
+            "default": null
+          },
+          "limit": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "1 to 1000 (default 100).",
+            "default": null
+          },
+          "order": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`asc` (default) or `desc`.",
+            "default": null
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Only names starting with it.",
+            "default": ""
+          },
+          "search": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Only names containing it (case-insensitive).",
+            "default": null
+          },
+          "sort_by": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`name` (default), `size` or `updated_at`.",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "Relocate": {
+        "type": "object",
+        "description": "A copy or a move.",
+        "required": [
+          "bucket",
+          "from",
+          "to"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "to_bucket": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The destination bucket (default: the same)."
           }
         },
         "additionalProperties": false

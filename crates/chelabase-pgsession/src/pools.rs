@@ -131,6 +131,8 @@ pub struct ConnInfo {
     pub server_name: Option<String>,
     /// The main database's name.
     pub database: String,
+    /// The Chelabase database the branch belongs to; `None` from an orchestrator before it.
+    pub database_id: Option<Uuid>,
     pub user: String,
     pub password: String,
     pub settings: Settings,
@@ -173,6 +175,8 @@ struct WireConnInfo {
     #[serde(default)]
     server_name: Option<String>,
     database: String,
+    #[serde(default)]
+    database_id: Option<Uuid>,
     user: String,
     password: String,
     settings: WireSettings,
@@ -211,6 +215,7 @@ impl From<WireConnInfo> for ConnInfo {
             port: w.port,
             server_name: w.server_name,
             database: w.database,
+            database_id: w.database_id,
             user: w.user,
             password: w.password,
             settings: Settings {
@@ -1061,6 +1066,7 @@ pub mod test_support {
             port: 1,
             server_name: None,
             database: "main".into(),
+            database_id: Some(Uuid::nil()),
             user: "authenticator".into(),
             password: "pw".into(),
             settings: Settings {
@@ -1298,6 +1304,8 @@ mod tests {
             ]
         );
         assert_eq!(info.settings.max_connections, 4);
+        // Object storage's blob keys start with it; an older answer has none.
+        assert_eq!(info.database_id, None);
         assert_eq!(
             info.served("analytics").map(|d| d.default_schema.as_str()),
             Some("reporting")
@@ -1350,6 +1358,7 @@ mod tests {
             let body = serde_json::json!({
                 "host": "10.0.0.1", "port": 5432, "database": "main",
                 "user": "chelabase_storage", "password": "spw", "status": "ready",
+                "database_id": Uuid::from_u128(7),
                 "settings": { "max_rows": 1, "statement_timeout_ms": 1, "max_connections": 1 },
             })
             .to_string();
@@ -1378,6 +1387,7 @@ mod tests {
             "{request}"
         );
         assert_eq!(info.user, "chelabase_storage");
+        assert_eq!(info.database_id, Some(Uuid::from_u128(7)));
     }
 
     /// The shape before served databases existed: main alone, with the settings'
@@ -1525,6 +1535,7 @@ mod tests {
             port: parsed.port().unwrap_or(5432),
             server_name: None,
             database: a.clone(),
+            database_id: None,
             user: parsed.username().into(),
             password: parsed.password().unwrap_or_default().into(),
             settings: Settings {

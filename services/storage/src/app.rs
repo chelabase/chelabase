@@ -14,9 +14,9 @@ use chelabase_storage::ObjectStore;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::buckets;
 use crate::engine::Engine;
 use crate::error::Failure;
+use crate::{buckets, objects};
 
 /// The identity token's audience.
 pub const AUDIENCE: &str = "storage";
@@ -36,6 +36,17 @@ pub fn api_router<S: ConnSource, M: ConnSource>() -> OpenApiRouter<Arc<AppState<
     OpenApiRouter::new()
         .routes(routes!(buckets::list, buckets::create))
         .routes(routes!(buckets::update, buckets::delete))
+        .routes(routes!(
+            objects::upload,
+            objects::put,
+            objects::download,
+            objects::head,
+            objects::delete
+        ))
+        .routes(routes!(objects::delete_many))
+        .routes(routes!(objects::list))
+        .routes(routes!(objects::copy))
+        .routes(routes!(objects::r#move))
 }
 
 pub fn router<S: ConnSource, M: ConnSource>(state: Arc<AppState<S, M>>) -> Router {

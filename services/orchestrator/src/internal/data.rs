@@ -175,6 +175,7 @@ where
         "host": addr.ip().to_string(),
         "port": addr.port(),
         "database": database,
+        "database_id": row.database_id,
         // U15: the service dials `host` and verifies the compute as this name, the only one
         // its certificate carries.
         "server_name": chelabase_neon::compute_tls::server_name(endpoint),

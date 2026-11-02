@@ -80,11 +80,11 @@ pub struct Bucket {
     pub allowed_mime_types: Option<Vec<String>>,
 }
 
-fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
+pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
     move |e| QueryFailure::from_pg(&e, request_id)
 }
 
-fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
+pub(crate) fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
     json.map(|Json(t)| t)
         .map_err(|e| Failure::invalid_request(format!("the body: {}", e.body_text())))
 }

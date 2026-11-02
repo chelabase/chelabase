@@ -78,6 +78,14 @@ pub fn pick_database<'a>(
     }
 }
 
+/// A request's database and its blob keys' prefix ([`Engine::locate`]).
+#[derive(Debug, Clone)]
+pub struct Located {
+    pub database: String,
+    /// `{database_id}/{pg_database}/`: a version's blob is `{prefix}{version_id}`.
+    pub prefix: String,
+}
+
 pub struct Engine<S, M> {
     pools: Pools<S>,
     managed: ServicePool<M>,
@@ -127,6 +135,29 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             info = fresh;
         }
         pick_database(&info, requested, data.databases.as_deref()).cloned()
+    }
+
+    /// Where a request's objects live: the served database it asks for (schema checked) and
+    /// the blob keys' prefix, `{database_id}/{pg_database}/`.
+    pub async fn locate(
+        &self,
+        data: &DataIdentity,
+        requested: Option<&str>,
+        request_id: &str,
+    ) -> Result<Located, Failure> {
+        let served = self.served_database(data, requested).await?;
+        self.check_schema(data.branch_id, &served.name, request_id)
+            .await?;
+        let info = self
+            .pools
+            .info(data.branch_id)
+            .await
+            .map_err(|e| Failure::from_conn(&e))?;
+        let database_id = info.database_id.ok_or_else(Failure::storage_unavailable)?;
+        Ok(Located {
+            prefix: format!("{database_id}/{}/", served.name),
+            database: served.name,
+        })
     }
 
     /// 503 `storage_unavailable` unless the database's `storage` schema may be served
@@ -217,7 +248,8 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         Ok(rows.first().map_or(0, |r| r.get(0)))
     }
 
-    async fn managed(
+    /// A [`NamedStatement`] as `chelabase_storage` in `database` of `branch`.
+    pub async fn managed(
         &self,
         branch: Uuid,
         database: &str,
