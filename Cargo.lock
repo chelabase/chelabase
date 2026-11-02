@@ -1284,6 +1284,7 @@ dependencies = [
  "chelabase-auth",
  "chelabase-http",
  "chelabase-query",
+ "chelabase-schema",
  "chelabase-types",
  "deadpool-postgres",
  "moka",

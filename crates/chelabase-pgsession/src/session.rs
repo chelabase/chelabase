@@ -13,8 +13,9 @@
 //! the lease broken, and a broken or unfinished lease closes its connection instead of
 //! pooling it.
 //!
-//! No role, no run: a connection's client can't be read, and a [`Conn`] is no
-//! [`chelabase_query::QueryClient`].
+//! No role, no run: a connection's client can't be read, a [`Conn`] is no
+//! [`chelabase_query::QueryClient`], and a [`RoleSession`] runs statements only through its
+//! own methods, which apply the preamble (apart from its two fixed pre-transaction reads).
 //!
 //! ```compile_fail,E0616
 //! fn no_role_no_run(conn: chelabase_pgsession::Conn) {
@@ -26,6 +27,37 @@
 //! fn no_role_no_run(conn: &chelabase_pgsession::Conn) {
 //!     fn runs_on<C: chelabase_query::QueryClient>(_: &C) {}
 //!     runs_on(conn);
+//! }
+//! ```
+//!
+//! Nor does a session hand out its connection: no client before the preamble, so no
+//! statement as the login, and no owner path.
+//!
+//! ```compile_fail,E0599
+//! async fn as_the_login(conn: chelabase_pgsession::Conn, claims: &serde_json::Value) {
+//!     use chelabase_query::QueryClient;
+//!     conn.with_role_session("no_such_role", claims, None, async |s| {
+//!         let _ = s.lease().client().batch_execute("SELECT 1").await;
+//!     })
+//!     .await;
+//! }
+//! ```
+//!
+//! ```compile_fail,E0599
+//! async fn as_the_owner(conn: chelabase_pgsession::Conn, claims: &serde_json::Value) {
+//!     conn.with_role_session("authenticated", claims, None, async |s| {
+//!         let settings = s.settings(&s.info().databases[0]);
+//!         let _ = chelabase_query::engine::console_session(
+//!             s.lease(),
+//!             "main",
+//!             chelabase_query::RunAs::Owner { user: "authenticator" },
+//!             &settings,
+//!             "rid",
+//!             async |_, _| Ok(()),
+//!         )
+//!         .await;
+//!     })
+//!     .await;
 //! }
 //! ```
 //!
@@ -59,17 +91,33 @@
 //! # async fn f(pools: &chelabase_pgsession::Pools<chelabase_pgsession::InternalSource>) {
 //! let conn = pools.acquire(uuid::Uuid::nil(), "main").await.unwrap();
 //! let claims = serde_json::json!({ "sub": "u1" });
-//! conn.with_role_session("authenticated", &claims, None, async |session| {
-//!     let _run_as = session.run_as(); // always `RunAs::Role`
-//! })
-//! .await;
+//! let settings = chelabase_query::RunSettings {
+//!     max_rows: 10,
+//!     statement_timeout_ms: 1000,
+//!     default_schema: "public".into(),
+//!     reset_sql: chelabase_pgsession::RESET_SQL,
+//! };
+//! let _ = conn
+//!     .with_role_session("authenticated", &claims, None, async |session| {
+//!         session
+//!             .transaction("main", &settings, "rid", async |client, _version| {
+//!                 // After the preamble: as `authenticated`, with the claims.
+//!                 let _ = client;
+//!                 Ok(())
+//!             })
+//!             .await
+//!     })
+//!     .await;
 //! # }
 //! ```
 
 use std::sync::Arc;
 
-use chelabase_query::{Lease, RunAs, RunSettings};
+use chelabase_query::engine::{QueryCache, console_session, with_transaction};
+use chelabase_query::{Lease, Op, QueryClient, QueryFailure, RunAs, RunSettings, Schema};
 use serde_json::Value;
+use tokio_postgres::{Client, SimpleQueryMessage};
+use uuid::Uuid;
 
 use crate::pools::{Conn, ConnInfo, RESET_SQL, ServedDatabase};
 
@@ -84,9 +132,11 @@ pub fn run_settings(info: &ConnInfo, database: &ServedDatabase) -> RunSettings {
     }
 }
 
-/// A connection lent to one call as `role` with `claims` (see the module docs). Statements
-/// go through [`chelabase_query`] with [`Self::lease`] and [`Self::run_as`]. It holds its
-/// own copy of the role and claims (a borrowed one makes the session's future fail the
+/// A connection lent to one call as `role` with `claims` (see the module docs). Its
+/// statements run only through its own methods, each of which applies the role, claims and
+/// timeouts first ([`Self::run`], [`Self::transaction`], [`Self::schema`]), apart from the
+/// two fixed reads a request makes before its transaction ([`Self::owner_level`],
+/// [`Self::table_json`]). It holds its own copy of the role and claims (a borrowed one makes the session's future fail the
 /// `Send` check axum's handlers need).
 pub struct RoleSession {
     lease: Lease,
@@ -97,10 +147,111 @@ pub struct RoleSession {
 }
 
 impl RoleSession {
-    /// The leased connection, as `authenticator` until a preamble sets the role: the owner
-    /// check and catalog reads a caller makes before its transaction run on it.
-    pub fn lease(&self) -> &Lease {
-        &self.lease
+    /// Whether `role` is owner-level (`None`: it doesn't exist), asked as the login before
+    /// the session's transaction, on the session's own connection
+    /// ([`crate::owner_level::fetch_owner_level`]).
+    pub async fn owner_level(
+        &self,
+        role: &str,
+        request_id: &str,
+    ) -> Result<Option<bool>, tokio_postgres::Error> {
+        crate::owner_level::fetch_owner_level(&self.lease, role, request_id).await
+    }
+
+    /// The table `schema.table`'s model as the catalog's JSON (empty when there's no such
+    /// table), read as the login before the session's transaction (the catalog is readable
+    /// by every role), under `statement_timeout_ms`: the console cell read's first step.
+    pub async fn table_json(
+        &self,
+        schema: &str,
+        table: &str,
+        statement_timeout_ms: u64,
+    ) -> Result<String, tokio_postgres::Error> {
+        let client = self.lease.client();
+        client
+            .simple_query(&format!("SET statement_timeout = {statement_timeout_ms}"))
+            .await?;
+        Ok(client
+            .simple_query(&chelabase_schema::catalog::table_sql(schema, table))
+            .await?
+            .iter()
+            .find_map(|m| match m {
+                SimpleQueryMessage::Row(row) => row.get(0).map(str::to_owned),
+                _ => None,
+            })
+            .unwrap_or_default())
+    }
+
+    /// [`chelabase_query::run`] as the session's role: `op` in `key = (branch, database)`,
+    /// pipelined or sequential, in its own transaction.
+    pub async fn run(
+        &self,
+        cache: &QueryCache,
+        key: (Uuid, &str),
+        settings: &RunSettings,
+        budget: usize,
+        op: &Op,
+        request_id: &str,
+    ) -> Result<String, QueryFailure> {
+        chelabase_query::run(
+            &self.lease,
+            cache,
+            key,
+            self.run_as(),
+            settings,
+            budget,
+            op,
+            request_id,
+        )
+        .await
+    }
+
+    /// A transaction as the session's role ([`console_session`]): `f` runs after the
+    /// preamble, with the connection and the schema version; a failed preamble (a missing
+    /// role) never runs it.
+    pub async fn transaction<T>(
+        &self,
+        database: &str,
+        settings: &RunSettings,
+        request_id: &str,
+        f: impl AsyncFnOnce(&Client, &str) -> Result<T, QueryFailure>,
+    ) -> Result<T, QueryFailure> {
+        console_session(
+            &self.lease,
+            database,
+            self.run_as(),
+            settings,
+            request_id,
+            f,
+        )
+        .await
+    }
+
+    /// In its own transaction as the session's role: the schema of `key = (branch,
+    /// database)` ([`chelabase_query::load_schema`], which runs the preamble), then `f` with
+    /// the connection and that schema.
+    pub async fn schema<T>(
+        &self,
+        cache: &QueryCache,
+        key: (Uuid, &str),
+        statement_timeout_ms: i64,
+        request_id: &str,
+        f: impl AsyncFnOnce(&Client, &Arc<Schema>) -> Result<T, QueryFailure>,
+    ) -> Result<(Arc<Schema>, T), QueryFailure> {
+        with_transaction(&self.lease, RESET_SQL, request_id, async |client| {
+            let (schema, _, _) = chelabase_query::load_schema(
+                client,
+                cache,
+                key,
+                self.run_as(),
+                statement_timeout_ms,
+                request_id,
+            )
+            .await?;
+            let out = f(client, &schema).await?;
+            Ok((schema, out))
+        })
+        .await
     }
 
     /// The branch's connection info the connection was opened with.
@@ -319,7 +470,7 @@ pub(crate) mod tests {
     fn a_session_is_send(conn: Conn, claims: &serde_json::Value) {
         fn send<T: Send>(_: T) {}
         send(conn.with_role_session("r", claims, None, async |s| {
-            let _ = s.lease();
+            let _ = &s.lease;
             tokio::task::yield_now().await;
         }));
     }
@@ -358,8 +509,10 @@ pub(crate) mod tests {
         assert_eq!(PREAMBLE_SQL[..shared], GUARDED_PREAMBLE_SQL[..shared]);
     }
 
-    /// A role session runs as the role it was opened with, never as the owner, and its
-    /// transaction sends the pre-move opening and closing on the wire.
+    /// A role session's `run_as` is its own role, never the owner, and a transaction on its
+    /// connection opens and closes with the pre-move text on the wire. (This fake answers no
+    /// preamble, so the transaction here is `with_transaction`'s framing alone, from inside
+    /// the crate; the live `a_session_for_a_missing_role_runs_nothing_live` shows the role.)
     #[tokio::test]
     async fn a_role_sessions_wire_matches_the_pre_move_sequence() {
         let fake = recorder(|_, _| false).await;
@@ -376,7 +529,7 @@ pub(crate) mod tests {
                     chelabase_query::RunAs::Owner { .. } => panic!("a role session as the owner"),
                 }
                 let settings = s.settings(&s.info().databases[0]);
-                chelabase_query::with_transaction(s.lease(), settings.reset_sql, "rid", async |c| {
+                chelabase_query::with_transaction(&s.lease, settings.reset_sql, "rid", async |c| {
                     c.batch_execute("SELECT 1")
                         .await
                         .map_err(|e| chelabase_query::QueryFailure::from_pg(&e, "rid"))
@@ -418,7 +571,7 @@ pub(crate) mod tests {
             let conn = pools.acquire(branch, "main").await.unwrap();
             let _ = conn
                 .with_role_session("reader", &claims, None, async |s| {
-                    chelabase_query::with_transaction(s.lease(), RESET_SQL, "rid", async |_| Ok(()))
+                    chelabase_query::with_transaction(&s.lease, RESET_SQL, "rid", async |_| Ok(()))
                         .await
                 })
                 .await;
@@ -443,9 +596,9 @@ pub(crate) mod tests {
         let claims = serde_json::json!({});
         let conn = pools.acquire(Uuid::new_v4(), "main").await.unwrap();
         conn.with_role_session("reader", &claims, None, async |s| {
-            let check = crate::owner_level::fetch_owner_level(s.lease(), "reader", "rid").await;
+            let check = crate::owner_level::fetch_owner_level(&s.lease, "reader", "rid").await;
             assert!(check.is_err());
-            assert!(s.lease().is_broken());
+            assert!(s.lease.is_broken());
         })
         .await;
         assert_eq!(settle(&fake.open, 0).await, 0);
