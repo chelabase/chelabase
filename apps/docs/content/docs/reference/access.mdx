@@ -79,6 +79,10 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | GET | `/data/v1/schema` | secret data key | Data API key |
 | GET | `/data/v1/types` | secret data key | Data API key |
 | GET | `/health` | none | Public |
+| GET | `/storage/v1/bucket` | any data key | Data API key |
+| POST | `/storage/v1/bucket` | any data key | Data API key |
+| DELETE | `/storage/v1/bucket/\{name\}` | any data key | Data API key |
+| PATCH | `/storage/v1/bucket/\{name\}` | any data key | Data API key |
 | GET | `/v1/access-events` | Zitadel token | Tenant admin |
 | POST | `/v1/databases` | Zitadel token | Project Admin |
 | DELETE | `/v1/databases/\{id\}` | Zitadel token | Project Admin |

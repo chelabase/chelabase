@@ -1382,6 +1382,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-storage-service"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chelabase-auth",
+ "chelabase-pgsession",
+ "chelabase-query",
+ "chelabase-routes",
+ "chelabase-storage",
+ "chelabase-types",
+ "dotenvy",
+ "moka",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-postgres",
+ "tracing",
+ "tracing-subscriber",
+ "utoipa",
+ "utoipa-axum",
+ "uuid",
+]
+
+[[package]]
 name = "chelabase-typegen"
 version = "0.1.0"
 dependencies = [

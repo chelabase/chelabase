@@ -30,7 +30,8 @@ use worker::data_api::schema_check_sql;
 use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
-use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup};
+use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
+use serde_json::{Value, json};
 
 const OWNER: &str = "postgres";
 
@@ -1247,6 +1248,190 @@ async fn storage_login(fx: &Fx) {
     assert_eq!(fx.direct("chelabase_storage", &password, &service_login_check()).await.unwrap(), "t");
     assert_eq!(check().await, "t");
     fx.admin("DROP ROLE st_svc_grp").await;
+}
+
+// --- m5: the storage API through the gateway, as a data key, under RLS ----------------------
+
+fn gateway() -> String {
+    std::env::var("GATEWAY_URL")
+        .or_else(|_| std::env::var("CHELABASE_ENTRY_API_URL"))
+        .unwrap_or_else(|_| "http://api.chelabase.localhost:8000".into())
+}
+
+/// A management API call as the demo user (`chelabase dev token`): `(status, body)`.
+async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
+    let cli = std::env::var("CHELABASE_CLI").expect("CHELABASE_CLI (run through just workbench test)");
+    let token = tokio::process::Command::new(cli)
+        .args(["dev", "token"])
+        .current_dir(std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into))
+        .output()
+        .await
+        .expect("chelabase dev token");
+    assert!(token.status.success(), "chelabase dev token failed");
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{path}", gateway()))
+        .bearer_auth(String::from_utf8_lossy(&token.stdout).trim())
+        .timeout(Duration::from_secs(60));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let res = req.send().await.expect("the management API answers");
+    let status = res.status().as_u16();
+    (status, serde_json::from_str(&res.text().await.unwrap_or_default()).unwrap_or(Value::Null))
+}
+
+/// A storage API call with data key `key`: `(status, body)`.
+async fn storage(method: &str, path: &str, key: &str, body: Option<Value>) -> (u16, Value) {
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{path}", gateway()))
+        .bearer_auth(key)
+        .timeout(Duration::from_secs(30));
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let res = req.send().await.expect("the storage API answers");
+    let status = res.status().as_u16();
+    (status, serde_json::from_str(&res.text().await.unwrap_or_default()).unwrap_or(Value::Null))
+}
+
+impl Fx {
+    fn keys_path(&self) -> String {
+        format!("/v1/databases/{}/branches/{}/keys", self.id, self.main)
+    }
+
+    /// A secret key on `authenticated`, with the allow-list `databases` (`None`: every one).
+    async fn secret_key(&self, name: &str, databases: Option<Vec<String>>) -> String {
+        let (status, body) = api(
+            "POST",
+            &self.keys_path(),
+            Some(json!({ "name": name, "role": "authenticated", "databases": databases })),
+        )
+        .await;
+        assert_eq!(status, 201, "create key {name}: {body}");
+        body["key"].as_str().unwrap().to_string()
+    }
+
+    async fn public_key(&self) -> String {
+        let (status, body) = api("GET", &self.keys_path(), None).await;
+        assert_eq!(status, 200, "{body}");
+        body.as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["kind"] == "public")
+            .and_then(|k| k["key"].as_str())
+            .expect("a public key")
+            .to_string()
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_buckets_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_api_buckets(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_api_buckets(fx: &Fx) {
+    const BUCKETS: &str = "/storage/v1/bucket";
+    let secret = fx.secret_key("st-api", None).await;
+    let public = fx.public_key().await;
+
+    // No policy: nothing is visible, and creating is refused by RLS.
+    assert_eq!(storage("GET", BUCKETS, &secret, None).await, (200, json!([])));
+    let (status, body) = storage("POST", BUCKETS, &secret, Some(json!({ "name": "avatars" }))).await;
+    assert_eq!((status, &body["error"]["sqlstate"]), (403, &json!("42501")), "{body}");
+
+    // Policies for `authenticated` only, made through storage.create_policy as the owner.
+    for command in ["SELECT", "INSERT", "UPDATE", "DELETE"] {
+        let using = if command == "INSERT" { "NULL" } else { "'true'" };
+        let check = if matches!(command, "INSERT" | "UPDATE") { "'true'" } else { "NULL" };
+        fx.owner(&format!(
+            "SELECT storage.create_policy('b_{}', 'buckets', '{command}', ARRAY['authenticated']::name[], {using}, {check})",
+            command.to_lowercase()
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("create the {command} policy: {e}"));
+    }
+
+    let (status, body) = storage("POST", BUCKETS, &secret, Some(json!({ "name": "avatars", "file_size_limit": 1000 }))).await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!((&body["name"], &body["public"], &body["file_size_limit"]), (&json!("avatars"), &json!(false), &json!(1000)));
+    let (status, body) = storage("POST", BUCKETS, &secret, Some(json!({ "name": "avatars" }))).await;
+    assert_eq!(status, 409, "a second avatars: {body}");
+    let (status, body) = storage("POST", BUCKETS, &secret, Some(json!({ "name": "../x" }))).await;
+    assert_eq!(status, 400, "{body}");
+    let (status, list) = storage("GET", BUCKETS, &secret, None).await;
+    assert_eq!((status, list.as_array().map(Vec::len)), (200, Some(1)), "{list}");
+    assert_eq!(list[0]["name"], "avatars");
+    // The public key's role (anon) has no policy, and no DELETE grant: it sees nothing and
+    // can't delete.
+    assert_eq!(storage("GET", BUCKETS, &public, None).await, (200, json!([])));
+    assert_eq!(storage("DELETE", &format!("{BUCKETS}/avatars"), &public, None).await.0, 403);
+
+    let (status, body) = storage("PATCH", &format!("{BUCKETS}/avatars"), &secret, Some(json!({ "public": true }))).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(storage("GET", BUCKETS, &secret, None).await.1[0]["public"], true);
+    assert_eq!(storage("PATCH", &format!("{BUCKETS}/ghost"), &secret, Some(json!({ "public": true }))).await.0, 404);
+
+    // A key whose allow-list excludes the database it asks for: 403.
+    let listed = fx.secret_key("st-api-listed", Some(vec![fx.database.clone()])).await;
+    assert_eq!(storage("GET", BUCKETS, &listed, None).await.0, 200);
+    let (status, body) = storage("GET", &format!("{BUCKETS}?database=postgres"), &listed, None).await;
+    assert_eq!((status, &body["error"]["code"]), (403, &json!("database_not_allowed")), "{body}");
+
+    // A bucket holding an object isn't deleted: 409 with the count; empty again, it is.
+    let id = list[0]["id"].as_str().unwrap().to_string();
+    fx.admin(&format!(
+        "BEGIN; SET LOCAL ROLE chelabase_storage;
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role)
+  VALUES ('00000000-0000-0000-0000-0000000000e1', '{id}', 'a.png', 3, 'e', now() + interval '5 minutes', 'chelabase_storage');
+INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('{id}', 'a.png', 3, 'e', '00000000-0000-0000-0000-0000000000e1');
+COMMIT;"
+    ))
+    .await;
+    let (status, body) = storage("DELETE", &format!("{BUCKETS}/avatars"), &secret, None).await;
+    assert_eq!((status, &body["error"]["code"]), (409, &json!("bucket_not_empty")), "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("holds 1 object"), "{body}");
+    fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; DELETE FROM storage.objects; COMMIT;").await;
+    assert_eq!(storage("DELETE", &format!("{BUCKETS}/avatars"), &secret, None).await.0, 204);
+    assert_eq!(storage("GET", BUCKETS, &secret, None).await, (200, json!([])));
+}
+
+/// A database whose `storage` schema is a user's own: every route answers 503
+/// `storage_unavailable` (asked before any other storage request reached this database, so
+/// nothing is cached).
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_user_schema_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move {
+        let fx = &*task;
+        fx.admin("ALTER SCHEMA storage RENAME TO st_api_aside").await;
+        fx.owner("CREATE SCHEMA storage; CREATE TABLE storage.buckets (id uuid, name text)")
+            .await
+            .expect("the owner's own storage schema");
+        let secret = fx.secret_key("st-api-user-schema", None).await;
+        for (method, path, body) in [
+            ("GET", "/storage/v1/bucket", None),
+            ("POST", "/storage/v1/bucket", Some(json!({ "name": "x" }))),
+            ("PATCH", "/storage/v1/bucket/x", Some(json!({ "public": true }))),
+            ("DELETE", "/storage/v1/bucket/x", None),
+        ] {
+            let (status, body) = storage(method, path, &secret, body).await;
+            assert_eq!((status, &body["error"]["code"]), (503, &json!("storage_unavailable")), "{method} {path}: {body}");
+        }
+    })
+    .await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------

@@ -40,19 +40,20 @@ impl Site {
 }
 
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
-pub(super) const RUST_APPS: [&str; 6] =
-    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
+pub(super) const RUST_APPS: [&str; 7] =
+    ["orchestrator", "worker", "gateway", "auth", "rest", "realtime", "storage"];
 /// The apps that read the bootstrap's `demo.env` (the OIDC audiences, the demo ids).
 pub(super) const DEMO_ENV_READERS: &[&str] =
     &["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
 /// Every app container (the Rust apps and Studio; the sites are added by `--with`).
-pub(super) const APPS: [&str; 7] = [
+pub(super) const APPS: [&str; 8] = [
     "orchestrator",
     "worker",
     "gateway",
     "auth",
     "rest",
     "realtime",
+    "storage",
     "studio",
 ];
 /// The long-running infra services. Their one-shot helpers (`create-bucket`, `proxy-tls`,
@@ -76,7 +77,7 @@ pub(super) const INFRA: &[&str] = &[
 const FRONT: &[&str] = &["zitadel", "mailpit", "gateway"];
 /// Started after the first bootstrap.
 pub(super) const LATE_APPS: &[&str] =
-    &["orchestrator", "worker", "auth", "rest", "realtime", "studio"];
+    &["orchestrator", "worker", "auth", "rest", "realtime", "storage", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
 /// still building the image and the binaries (T3 review I2).
 const REAP_GRACE: u64 = 15 * 60;
@@ -1261,13 +1262,22 @@ fn cargo_build(stack: &Stack, apps: &[&str], cli: bool) -> anyhow::Result<()> {
     let mut cmd = Command::new("cargo");
     cmd.arg("build").current_dir(&stack.checkout);
     for app in apps {
-        cmd.args(["-p", app]);
+        cmd.args(["-p", package_of(app)]);
     }
     if cli {
         // `chelabase-init` too: the bootstrap runs it.
         cmd.args(["-p", "chelabase", "-p", "init"]);
     }
     run(cmd)
+}
+
+/// The cargo package that builds `app`'s binary (the storage service's crate name differs from
+/// its binary's, beside the `chelabase-storage` library).
+fn package_of(app: &str) -> &str {
+    match app {
+        "storage" => "chelabase-storage-service",
+        other => other,
+    }
 }
 
 /// How long any `compose up --wait` in `up` waits for its services to be healthy.

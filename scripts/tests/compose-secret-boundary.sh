@@ -209,6 +209,10 @@ for dir in storage-s3 grpc-tls; do
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
   [[ "$users" == "seaweedfs " ]] || err "services naming $dir/: got [$users], want [seaweedfs ]"
 done
+# m5: under the workbench the storage service mounts the `storage` identity too, and nobody
+# else does (the storage service is only in the overlay until its first image is published).
+users="$(jq -r '.services | to_entries[] | select(any(.value.volumes[]?; (.target // "") | contains("storage-s3/"))) | .key' "$tmp/wb.json" | sort | tr '\n' ' ')"
+[[ "$users" == "seaweedfs storage " ]] || err "workbench services mounting storage-s3/: got [$users], want [seaweedfs storage ]"
 ! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
   | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
   err "an admin S3 identity or key file is back"

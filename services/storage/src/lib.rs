@@ -1,0 +1,12 @@
+//! The storage service: buckets (and, from m5's next phase, objects) behind the gateway under
+//! `/storage/v1`. Every operation runs its metadata statement in `storage.*` as the caller's
+//! role and claims ([`engine`]), so row level security decides; [`error`] is the error body
+//! (the data API's envelope), [`app`] the HTTP edge, [`buckets`] the bucket routes and
+//! [`openapi`] their document.
+
+pub mod app;
+pub mod buckets;
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod openapi;

@@ -24,6 +24,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// reload). A site event stream gets it as its upstream read timeout too. Every other
 /// request, API or site, uses the configured upstream read timeout.
 const WEBSOCKET_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+/// A transfer route's (`Transfer::Stream`: object storage) upstream read timeout: an upload's
+/// answer comes only once its whole body is in (1 GiB at 1 MiB/s is about 17 minutes).
+const TRANSFER_READ_TIMEOUT: Duration = Duration::from_secs(3600);
+/// A transfer route's client idle timeout (the longest the client may pause sending its body).
+const TRANSFER_CLIENT_IDLE: Duration = Duration::from_secs(300);
 
 pub struct Gateway {
     pipeline: Pipeline,
@@ -148,6 +153,10 @@ impl ProxyHttp for Gateway {
                     // client side is read through the body reader, whose default is 60 s.
                     session.set_read_timeout(Some(WEBSOCKET_READ_TIMEOUT));
                 }
+                let upgrade = session.is_upgrade_req();
+                if let (_, Some(idle)) = api_timeouts(plan.endpoint, upgrade, self.read_timeout) {
+                    session.set_read_timeout(Some(idle));
+                }
                 ctx.plan = Some(plan);
                 Ok(false)
             }
@@ -189,11 +198,8 @@ impl ProxyHttp for Gateway {
                 (addr, timeout)
             }
             (None, Some(plan)) => {
-                let timeout = if plan.endpoint.websocket && session.is_upgrade_req() {
-                    WEBSOCKET_READ_TIMEOUT
-                } else {
-                    self.read_timeout
-                };
+                let (timeout, _) =
+                    api_timeouts(plan.endpoint, session.is_upgrade_req(), self.read_timeout);
                 (self.upstreams.addr(plan.endpoint.service), timeout)
             }
             (None, None) => return Err(Error::explain(ErrorType::InternalError, "no proxy plan")),
@@ -461,6 +467,24 @@ async fn resolve_upstream(addr: &str) -> Vec<SocketAddr> {
     match tokio::net::lookup_host(addr).await {
         Ok(addrs) => addrs.collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+/// An API route's upstream read timeout and client idle timeout (`None`: the default): a
+/// websocket upgrade's [`WEBSOCKET_READ_TIMEOUT`] both ways, a transfer route's
+/// [`TRANSFER_READ_TIMEOUT`] and [`TRANSFER_CLIENT_IDLE`], else `configured` and the default.
+/// No route has a body cap at the gateway.
+fn api_timeouts(
+    endpoint: &chelabase_routes::Endpoint,
+    upgrade: bool,
+    configured: Duration,
+) -> (Duration, Option<Duration>) {
+    if endpoint.websocket && upgrade {
+        return (WEBSOCKET_READ_TIMEOUT, Some(WEBSOCKET_READ_TIMEOUT));
+    }
+    match endpoint.transfer() {
+        chelabase_routes::Transfer::Stream => (TRANSFER_READ_TIMEOUT, Some(TRANSFER_CLIENT_IDLE)),
+        chelabase_routes::Transfer::Standard => (configured, None),
     }
 }
 
@@ -875,6 +899,26 @@ mod tests {
     }
 
     const CONFIGURED: Duration = Duration::from_secs(60);
+
+    /// m5: a storage (transfer) route gets the long upstream read and client idle timeouts; a
+    /// websocket upgrade its own; every other API route the configured read timeout and the
+    /// default client idle timeout.
+    #[test]
+    fn transfer_routes_get_the_long_timeouts() {
+        use chelabase_routes::{rest, storage, realtime};
+        assert_eq!(
+            api_timeouts(&storage::CREATE_BUCKET, false, CONFIGURED),
+            (TRANSFER_READ_TIMEOUT, Some(TRANSFER_CLIENT_IDLE))
+        );
+        assert_eq!(api_timeouts(&rest::QUERY, false, CONFIGURED), (CONFIGURED, None));
+        assert_eq!(
+            api_timeouts(&realtime::SOCKET, true, CONFIGURED),
+            (WEBSOCKET_READ_TIMEOUT, Some(WEBSOCKET_READ_TIMEOUT))
+        );
+        assert_eq!(api_timeouts(&realtime::SOCKET, false, CONFIGURED), (CONFIGURED, None));
+        assert!(TRANSFER_READ_TIMEOUT >= Duration::from_secs(3600));
+        assert!(TRANSFER_CLIENT_IDLE >= Duration::from_secs(300));
+    }
 
     #[test]
     fn a_site_websocket_gets_the_long_idle_limit() {
