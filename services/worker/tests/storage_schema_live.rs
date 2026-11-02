@@ -1429,9 +1429,20 @@ async fn storage_api_user_schema_live() {
             ("POST", "/storage/v1/bucket", Some(json!({ "name": "x" }))),
             ("PATCH", "/storage/v1/bucket/x", Some(json!({ "public": true }))),
             ("DELETE", "/storage/v1/bucket/x", None),
+            ("POST", "/storage/v1/object/x/a.txt", Some(json!({}))),
+            ("PUT", "/storage/v1/object/x/a.txt", Some(json!({}))),
+            ("GET", "/storage/v1/object/x/a.txt", None),
+            ("HEAD", "/storage/v1/object/x/a.txt", None),
+            ("DELETE", "/storage/v1/object/x/a.txt", None),
+            ("DELETE", "/storage/v1/object/x", Some(json!({ "names": ["a.txt"] }))),
+            ("POST", "/storage/v1/object/list/x", Some(json!({}))),
+            ("POST", "/storage/v1/object/copy", Some(json!({ "bucket": "x", "from": "a", "to": "b" }))),
+            ("POST", "/storage/v1/object/move", Some(json!({ "bucket": "x", "from": "a", "to": "b", "to_bucket": "y" }))),
         ] {
+            // A fresh database: nothing was cached, so every route asks the schema check.
             let (status, body) = storage(method, path, &secret, body).await;
-            assert_eq!((status, &body["error"]["code"]), (503, &json!("storage_unavailable")), "{method} {path}: {body}");
+            let code = if method == "HEAD" { json!("storage_unavailable") } else { body["error"]["code"].clone() };
+            assert_eq!((status, &code), (503, &json!("storage_unavailable")), "{method} {path}: {body}");
         }
     })
     .await;
@@ -1517,9 +1528,15 @@ const JSON: (&str, &str) = ("content-type", "application/json");
 
 impl Fx {
     /// The blob keys under this database's prefix, without it.
+    /// This database's blob prefix: `{database_id}/{datoid}/`.
+    async fn prefix(&self) -> String {
+        let oid = self.value("SELECT oid FROM pg_database WHERE datname = current_database()").await;
+        format!("{}/{oid}/", self.id)
+    }
+
     async fn blobs(&self, store: &chelabase_storage::S3Store) -> Vec<String> {
         use chelabase_storage::ObjectStore;
-        let prefix = format!("{}/{}/", self.id, self.database);
+        let prefix = self.prefix().await;
         store
             .list(&prefix)
             .await
@@ -1533,7 +1550,7 @@ impl Fx {
     /// leave nothing behind in the shared object store).
     async fn purge_blobs(&self, store: &chelabase_storage::S3Store) {
         use chelabase_storage::ObjectStore;
-        let prefix = format!("{}/{}/", self.id, self.database);
+        let prefix = self.prefix().await;
         for blob in store.list(&prefix).await.unwrap() {
             store.delete(&blob.key).await.unwrap();
         }
@@ -1627,7 +1644,7 @@ async fn storage_api_objects(fx: &Fx) {
     );
     assert_eq!(fx.blobs(&store).await, std::slice::from_ref(&version));
     let etag = made["etag"].as_str().unwrap().to_string();
-    let blob = store.head(&format!("{}/{}/{version}", fx.id, fx.database)).await.unwrap();
+    let blob = store.head(&format!("{}{version}", fx.prefix().await)).await.unwrap();
     assert_eq!(blob.etag.trim_matches('"'), etag);
 
     // Range and conditional reads, the download name, HEAD.
@@ -1640,6 +1657,11 @@ async fn storage_api_objects(fx: &Fx) {
     assert_eq!((status, &b[..]), (200, &b"hello world"[..]));
     assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"a.txt\""));
     assert_eq!(object("HEAD", &up("docs/a.txt"), &secret, None, &[]).await.0, 200);
+    assert_eq!(h["x-content-type-options"], "nosniff");
+    // N1: a zero-byte object with a range: 200, empty.
+    assert_eq!(object("POST", &up("empty"), &secret, Some(Vec::new().into()), &[]).await.0, 200);
+    let (status, _, b) = object("GET", &up("empty"), &secret, None, &[("range", "bytes=0-")]).await;
+    assert_eq!((status, b.len()), (200, 0));
 
     // A policy on size and content type: 403 whether declared or known only after the body,
     // and no blob stays.
@@ -1659,7 +1681,7 @@ async fn storage_api_objects(fx: &Fx) {
 
     // Names: `..`, control characters and 1025 bytes are 400. The `..` segment goes with an
     // encoded `/` around it: a client normalizes a bare `/%2E%2E/` away before sending.
-    for bad in ["a%2F..%2Fx", "..%2Fx", "a%01b", &"n".repeat(1025)] {
+    for bad in ["a%2F..%2Fx", "..%2Fx", "a%2F.%2Fx", "%EF%BC%8E%2Fx", "a%01b", &"n".repeat(1025)] {
         assert_eq!(object("POST", &up(bad), &secret, Some(b"x".to_vec().into()), &[]).await.0, 400, "{bad}");
     }
 
@@ -1734,7 +1756,7 @@ COMMIT;"
     .await;
     assert!(err.contains("CB003"), "the owner copied a version in: {err}");
     // The blob exists, under the other database's prefix.
-    let foreign_key = format!("{}/{}/{foreign}", Uuid::new_v4(), fx.database);
+    let foreign_key = format!("{}/{}{foreign}", Uuid::new_v4(), fx.prefix().await.split_once('/').unwrap().1);
     store.put(&foreign_key, bytes::Bytes::from_static(b"x"), Default::default()).await.unwrap();
     let got = object("GET", &up("foreign.bin"), &secret, None, &[]).await.0;
     store.delete(&foreign_key).await.unwrap();
@@ -1886,6 +1908,367 @@ async fn storage_api_slow_uploads(fx: &Fx) {
     // The 100 stalled uploads never reached the store (each was under one part), and the
     // 64 MiB blob is its only one.
     assert_eq!(fx.blobs(&store).await.len(), 1, "{:?}", fx.blobs(&store).await);
+}
+
+// --- m5 fix round (white-room audit) ------------------------------------------------------
+
+/// A live test's database with buckets `files` (and `other`, `capped` at 1000 bytes) every
+/// `authenticated` caller sees, and objects policies from `objects` (`(command, using, check)`).
+async fn objects_fixture(fx: &Fx, objects: &[(&str, &str, &str)]) -> String {
+    let secret = fx.secret_key("st-fix", None).await;
+    fx.bucket("files").await;
+    fx.bucket("other").await;
+    fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name, file_size_limit) VALUES ('capped', 1000); COMMIT;")
+        .await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
+    for (i, (command, using, check)) in objects.iter().enumerate() {
+        fx.owner(&format!(
+            "SELECT storage.create_policy('o_{i}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{command}: {e}"));
+    }
+    secret
+}
+
+/// Runs `f` on a fresh database; its blobs are purged and the database deleted, pass or fail.
+async fn with_fx(f: fn(Arc<Fx>) -> futures_util::future::BoxFuture<'static, ()>) {
+    let fx = Arc::new(Fx::provision().await);
+    let outcome = tokio::spawn(f(fx.clone())).await;
+    fx.purge_blobs(&object_store().await).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+fn tickets_sql(version: &str) -> String {
+    format!("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '{version}'")
+}
+
+/// B1: a refused cross-bucket move mints no ticket (the caller's UPDATE decides first in a
+/// rolled-back savepoint), so a later allowed move of the object, by another key, works.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_move_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/m.txt", &secret, Some(b"m".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let version = json_of(&b)["version_id"].as_str().unwrap().to_string();
+        let body = json!({ "bucket": "files", "from": "m.txt", "to": "m.txt", "to_bucket": "other" }).to_string();
+        // No UPDATE policy: the move is refused before any ticket.
+        let (status, _, b) = object("POST", "/storage/v1/object/move", &secret, Some(body.clone().into()), &[JSON]).await;
+        assert_eq!(status, 404, "{}", json_of(&b));
+        assert_eq!(fx.value(&tickets_sql(&version)).await, "0", "a refused move left a ticket");
+        fx.owner("SELECT storage.create_policy('o_update', 'objects', 'UPDATE', ARRAY['authenticated']::name[], 'true', 'true')")
+            .await
+            .unwrap();
+        let other = fx.secret_key("st-fix-mover", None).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/move", &other, Some(body.into()), &[JSON]).await;
+        assert_eq!(status, 204, "{}", json_of(&b));
+        assert_eq!(fx.value(&tickets_sql(&version)).await, "0");
+        assert_eq!(&object("GET", "/storage/v1/object/other/m.txt", &other, None, &[]).await.2[..], b"m");
+    }))
+    .await;
+}
+
+/// SF2 (AC 5): the INSERT policy dropped while the body streams: the final write obeys it
+/// (403), and no row, ticket or blob remains.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_policy_change_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        let slow = Some(paced_body(512 * 1024, 4, Duration::from_millis(500), None));
+        let (upload, ()) = tokio::join!(
+            object("POST", "/storage/v1/object/files/late.bin", &secret, slow, &[]),
+            async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                fx.owner("SELECT storage.drop_policy('o_1', 'objects')").await.unwrap();
+            },
+        );
+        assert_eq!((upload.0, json_of(&upload.2)["error"]["code"].clone()), (403, json!("not_allowed")), "{}", json_of(&upload.2));
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0");
+        assert!(fx.blobs(&store).await.is_empty());
+    }))
+    .await;
+}
+
+/// SF3 (AC 10): over the bucket's limit is 413 whether chunked or declared, with nothing left;
+/// exactly at it is 200.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_limit_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        let up = |n: &str| format!("/storage/v1/object/capped/{n}");
+        let chunked = Some(paced_body(2000, 5, Duration::ZERO, None));
+        assert_eq!(object("POST", &up("chunked"), &secret, chunked, &[]).await.0, 413);
+        assert_eq!(object("POST", &up("declared"), &secret, Some(vec![5u8; 2000].into()), &[]).await.0, 413);
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        assert!(fx.blobs(&store).await.is_empty());
+        let (status, _, b) = object("POST", &up("exact"), &secret, Some(vec![5u8; 1000].into()), &[]).await;
+        assert_eq!((status, json_of(&b)["size"].clone()), (200, json!(1000)));
+        assert_eq!(fx.blobs(&store).await.len(), 1);
+    }))
+    .await;
+}
+
+/// AC 10 as written: 1 GiB at 1 MiB/s through the gateway, about 18 minutes. Run on demand
+/// only (`-E 'test(gib)'`); routine runs leave it out with `-E 'not test(gib)'`. The 64 MiB
+/// paced test (`storage_api_slow_uploads_live`) covers the timeouts routinely.
+#[tokio::test]
+#[ignore = "on demand only: about 18 minutes"]
+async fn storage_api_gib_upload_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let total = 1usize << 30;
+        // 64 KiB every 62.5 ms: 1 MiB/s.
+        let body = Some(paced_body(total, 6, Duration::from_micros(62_500), None));
+        let started = Instant::now();
+        let (status, _, b) = object("POST", "/storage/v1/object/files/gib.bin", &secret, body, &[]).await;
+        assert_eq!((status, json_of(&b)["size"].clone()), (200, json!(total)), "{}", json_of(&b));
+        println!("1 GiB at 1 MiB/s took {:?}", started.elapsed());
+    }))
+    .await;
+}
+
+/// SF5 (AC 1 for an app user): a public key with the user's token uploads as `authenticated`
+/// with the user's claims; the row's owner is the token's `sub`, which an `owner =
+/// chelabase.user_id()` policy requires.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_app_user_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
+        let public = fx.public_key().await;
+        let user = Uuid::new_v4();
+        let token = fx.user_token(user).await;
+        let headers = [("chelabase-user", token.as_str())];
+        let (status, _, b) = object("POST", "/storage/v1/object/files/me.txt", &public, Some(b"me".to_vec().into()), &headers).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(fx.value("SELECT owner FROM storage.objects WHERE name = 'me.txt'").await, user.to_string());
+        assert_eq!(&object("GET", "/storage/v1/object/files/me.txt", &public, None, &headers).await.2[..], b"me");
+        // Without the token the public key's role (anon) has no policy.
+        assert_eq!(object("POST", "/storage/v1/object/files/anon.txt", &public, Some(b"x".to_vec().into()), &[]).await.0, 403);
+    }))
+    .await;
+}
+
+impl Fx {
+    /// An app-user access token for `user` in this project, with a live session.
+    async fn user_token(&self, user: Uuid) -> String {
+        use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
+        let sid = Uuid::new_v4();
+        let now = chrono::Utc::now();
+        let mut hash = [0u8; 32];
+        hash[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+        self.metadata
+            .insert_app_session(&chelabase_metadata::NewAppSession {
+                id: sid,
+                project_id: self.project,
+                user_id: user,
+                zitadel_session_id: "storage-live",
+                refresh_hash: hash,
+                expires_at: now + chrono::Duration::hours(1),
+            })
+            .await
+            .expect("insert the app session");
+        let path = |var: &str| std::path::PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("{var}")));
+        let signer = AppTokenSigner::from_pem_files(&path("CHELABASE_APP_JWT_PRIVATE_KEY"), &path("CHELABASE_APP_JWT_PUBLIC_KEY"))
+            .expect("the app JWT key pair");
+        let iat = now.timestamp() as u64;
+        signer
+            .sign(&AppClaims {
+                iss: APP_ISSUER.to_string(),
+                aud: app_audience(self.project.as_uuid()),
+                sub: user,
+                sid,
+                project: self.project.as_uuid(),
+                email: format!("{user}@example.com"),
+                email_verified: true,
+                role: "authenticated".to_string(),
+                iat,
+                exp: iat + 600,
+            })
+            .expect("sign the app token")
+    }
+}
+
+/// SF10: blobs are keyed by the Postgres database's OID, which a branch shares (a physical
+/// copy): an object uploaded on main is at the same key a child branch's row names.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_oid_prefix_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/o.txt", &secret, Some(b"o".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let version = json_of(&b)["version_id"].as_str().unwrap().to_string();
+        let oid_sql = "SELECT oid FROM pg_database WHERE datname = current_database()";
+        let main_oid = fx.value(oid_sql).await;
+        assert_eq!(fx.blobs(&store).await, std::slice::from_ref(&version), "under {}/{main_oid}/", fx.id);
+        let (_child, child_ep) = fx.child("oid-child").await;
+        let child_oid = last_line(&fx.admin_on(&child_ep, oid_sql).await.unwrap());
+        assert_eq!(child_oid, main_oid, "a branch shares the database's OID");
+        let child_version = last_line(&fx.admin_on(&child_ep, "SELECT version_id FROM storage.objects WHERE name = 'o.txt'").await.unwrap());
+        assert_eq!(child_version, version);
+    }))
+    .await;
+}
+
+// --- B2: the storage service in-process, against the real compute ---------------------------
+
+/// An object store that fails `put` or `copy` on demand (otherwise in memory).
+#[derive(Default)]
+struct FailingStore {
+    inner: chelabase_storage::MemoryStore,
+    fail_put: std::sync::atomic::AtomicBool,
+    fail_copy: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl chelabase_storage::ObjectStore for FailingStore {
+    async fn put(&self, key: &str, body: bytes::Bytes, opts: chelabase_storage::PutOptions) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        if self.fail_put.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(chelabase_storage::StorageError::Transient("injected put failure".into()));
+        }
+        self.inner.put(key, body, opts).await
+    }
+    async fn get(&self, key: &str, range: Option<chelabase_storage::ByteRange>) -> Result<chelabase_storage::GetObject, chelabase_storage::StorageError> {
+        self.inner.get(key, range).await
+    }
+    async fn head(&self, key: &str) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), chelabase_storage::StorageError> {
+        self.inner.delete(key).await
+    }
+    async fn copy(&self, src: &str, dst: &str) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        if self.fail_copy.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(chelabase_storage::StorageError::Transient("injected copy failure".into()));
+        }
+        self.inner.copy(src, dst).await
+    }
+    async fn list(&self, prefix: &str) -> Result<Vec<chelabase_storage::ObjectMeta>, chelabase_storage::StorageError> {
+        self.inner.list(prefix).await
+    }
+    async fn multipart_create(&self, key: &str, content_type: Option<&str>) -> Result<String, chelabase_storage::StorageError> {
+        self.inner.multipart_create(key, content_type).await
+    }
+    async fn multipart_part(&self, key: &str, id: &str, n: u32, body: bytes::Bytes) -> Result<String, chelabase_storage::StorageError> {
+        self.inner.multipart_part(key, id, n, body).await
+    }
+    async fn multipart_complete(&self, key: &str, id: &str, parts: Vec<chelabase_storage::CompletedPart>) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.inner.multipart_complete(key, id, parts).await
+    }
+    async fn multipart_abort(&self, key: &str, id: &str) -> Result<(), chelabase_storage::StorageError> {
+        self.inner.multipart_abort(key, id).await
+    }
+}
+
+/// The storage router in this process with `store`, reaching the stack's orchestrator and the
+/// branch's compute as the deployed service does; its base URL and an identity token for a
+/// secret key on `authenticated` of `branch`.
+async fn in_process_storage(store: Arc<FailingStore>, branch: BranchId) -> (String, String) {
+    use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, InternalVerifier, generate_keypair_pem};
+    let url = std::env::var("CHELABASE_INTERNAL_URL").unwrap_or_else(|_| "http://orchestrator:8083".into());
+    let token = std::fs::read_to_string(std::env::var("CHELABASE_STORAGE_INTERNAL_TOKEN_FILE").expect("the storage bearer"))
+        .unwrap()
+        .trim()
+        .to_string();
+    let ca = std::env::var("CHELABASE_COMPUTE_CA_FILE").expect("the compute CA");
+    let tls = chelabase_query::server_tls::ServerTls::from_ca_file(std::path::Path::new(&ca)).unwrap();
+    let pools = chelabase_pgsession::Pools::with_server_tls(chelabase_pgsession::InternalSource::new(&url, &token), 8, tls);
+    let (private, public) = generate_keypair_pem();
+    let state = Arc::new(storage::app::AppState {
+        engine: storage::engine::Engine::new(pools, chelabase_pgsession::InternalSource::storage_login(&url, &token)),
+        verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
+        store,
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, storage::app::router(state)).await });
+    let identity = Identity {
+        sub: Uuid::new_v4().to_string(),
+        org_id: String::new(),
+        auth: AuthMethod::DataKey,
+        request_id: "in-process".into(),
+        data: Some(DataIdentity {
+            branch_id: branch.as_uuid(),
+            key_id: Uuid::new_v4(),
+            kind: chelabase_types::data_key::DataKeyKind::Secret,
+            role: "authenticated".into(),
+            claims: json!({}),
+            databases: None,
+            project_id: None,
+            role_oid: None,
+            server_vouched: false,
+        }),
+        email: None,
+        name: None,
+    };
+    let signer = InternalSigner::from_pem(private.as_bytes()).unwrap();
+    (base, signer.sign(storage::app::AUDIENCE, &identity).unwrap())
+}
+
+async fn direct(base: &str, token: &str, method: &str, path: &str, body: Vec<u8>) -> (u16, Value) {
+    let res = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{base}{path}"))
+        .header(chelabase_auth::internal::IDENTITY_HEADER, token)
+        .header("content-type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    (status, res.json().await.unwrap_or_default())
+}
+
+/// B2: the object store failing on upload (put) or copy is 502 `storage_error`, with no row, no
+/// ticket and nothing in the store.
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_store_failure_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        use chelabase_storage::ObjectStore;
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        store.fail_put.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = direct(&base, &token, "POST", "/storage/v1/object/files/a.txt", b"hello".to_vec()).await;
+        assert_eq!((status, &body["error"]["code"]), (502, &json!("storage_error")), "{body}");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0");
+        assert!(store.list("").await.unwrap().is_empty());
+
+        store.fail_put.store(false, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = direct(&base, &token, "POST", "/storage/v1/object/files/a.txt", b"hello".to_vec()).await;
+        assert_eq!(status, 200, "{body}");
+        store.fail_copy.store(true, std::sync::atomic::Ordering::SeqCst);
+        let copy = json!({ "bucket": "files", "from": "a.txt", "to": "b.txt" }).to_string().into_bytes();
+        let (status, body) = direct(&base, &token, "POST", "/storage/v1/object/copy", copy).await;
+        assert_eq!((status, &body["error"]["code"]), (502, &json!("storage_error")), "{body}");
+        assert!(body["error"].get("detail").is_none() && body["error"].get("sqlstate").is_none(), "{body}");
+        assert_eq!(fx.value("SELECT string_agg(name, ',') FROM storage.objects").await, "a.txt");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0");
+        assert_eq!(store.list("").await.unwrap().len(), 1, "only a.txt's blob");
+    }))
+    .await;
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------

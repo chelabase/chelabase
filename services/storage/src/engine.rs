@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use chelabase_auth::internal::DataIdentity;
 use chelabase_pgsession::owner_level::{self, OwnerLevelCache, RoleRefused};
-use chelabase_pgsession::service::{ServiceError, Type};
+use chelabase_pgsession::service::ServiceError;
 use chelabase_pgsession::{
     ConnInfo, ConnSource, NamedStatement, Pools, ServedDatabase, Service, ServicePool,
     named_statement, storage_budget,
@@ -37,20 +37,30 @@ pub const MIN_SCHEMA_VERSION: u32 = 4;
 /// How long a database's schema check is trusted.
 pub const SCHEMA_CHECK_TTL: Duration = Duration::from_secs(30);
 
-/// The owner and the stamp of the database's `storage` schema (no row: there is none).
+/// The owner and the stamp of the database's `storage` schema (no row: there is none), and
+/// the database's OID (the blob keys' prefix).
 const STORAGE_SCHEMA: NamedStatement = named_statement!(
     "storage schema",
-    "SELECT r.rolname::pg_catalog.text, pg_catalog.obj_description(n.oid, 'pg_namespace') FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner WHERE n.nspname OPERATOR(pg_catalog.=) 'storage'",
+    "SELECT r.rolname::pg_catalog.text, pg_catalog.obj_description(n.oid, 'pg_namespace'), (SELECT d.oid::pg_catalog.int8 FROM pg_catalog.pg_database d WHERE d.datname OPERATOR(pg_catalog.=) pg_catalog.current_database()) FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_roles r ON r.oid OPERATOR(pg_catalog.=) n.nspowner WHERE n.nspname OPERATOR(pg_catalog.=) 'storage'",
     &[]
 );
 
-/// How many objects a bucket holds, whatever the caller may see (asked only after the caller's
-/// own delete of it was refused for holding objects).
-const BUCKET_OBJECTS: NamedStatement = named_statement!(
-    "bucket objects",
-    "SELECT pg_catalog.count(*) FROM storage.objects o JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) o.bucket_id WHERE b.name OPERATOR(pg_catalog.=) $1",
-    &[Type::TEXT]
-);
+/// A database OID as Postgres sends it (int8 here), when it is one.
+pub fn datoid_of(oid: Option<i64>) -> Option<u32> {
+    oid.and_then(|o| u32::try_from(o).ok())
+}
+
+/// A managed statement's failure as the caller sees it: never its message, detail or SQLSTATE
+/// (logged with the request id instead). A constraint (a ticket already minted for the
+/// version) is a fixed `conflict`; anything else, storage isn't available.
+pub fn managed_failure(f: QueryFailure, request_id: &str) -> Failure {
+    tracing::warn!(request_id, sqlstate = ?f.sqlstate, "storage's own statement failed: {}", f.message);
+    if f.sqlstate.as_deref().is_some_and(|s| s.starts_with("23")) {
+        Failure::object_conflict()
+    } else {
+        Failure::storage_unavailable()
+    }
+}
 
 /// Whether a `storage` schema owned by `owner` and stamped `stamp` may be served: Chelabase's
 /// own (`chelabase_admin`'s) at [`MIN_SCHEMA_VERSION`] or later. A user's own schema, no
@@ -91,7 +101,8 @@ pub struct Engine<S, M> {
     managed: ServicePool<M>,
     owner_level: OwnerLevelCache,
     /// `(branch, database)` → the schema check's answer.
-    schema_ok: moka::future::Cache<(Uuid, String), bool>,
+    /// `(branch, database)` → the database's OID when its schema may be served, else `None`.
+    schema_ok: moka::future::Cache<(Uuid, String), Option<u32>>,
 }
 
 impl<S: ConnSource, M: ConnSource> Engine<S, M> {
@@ -146,7 +157,8 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         request_id: &str,
     ) -> Result<Located, Failure> {
         let served = self.served_database(data, requested).await?;
-        self.check_schema(data.branch_id, &served.name, request_id)
+        let datoid = self
+            .check_schema(data.branch_id, &served.name, request_id)
             .await?;
         let info = self
             .pools
@@ -155,7 +167,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
             .map_err(|e| Failure::from_conn(&e))?;
         let database_id = info.database_id.ok_or_else(Failure::storage_unavailable)?;
         Ok(Located {
-            prefix: format!("{database_id}/{}/", served.name),
+            prefix: crate::names::object_prefix(database_id, datoid),
             database: served.name,
         })
     }
@@ -167,7 +179,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         branch: Uuid,
         database: &str,
         request_id: &str,
-    ) -> Result<(), Failure> {
+    ) -> Result<u32, Failure> {
         let key = (branch, database.to_owned());
         let ok = match self.schema_ok.get(&key).await {
             Some(ok) => ok,
@@ -175,16 +187,16 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                 let rows = self
                     .managed(branch, database, &STORAGE_SCHEMA, &[], request_id)
                     .await?;
-                let ok = match rows.first() {
-                    Some(row) => schema_acceptable(row.get(0), row.get(1)),
-                    None => false,
-                };
+                let ok = rows
+                    .first()
+                    .filter(|row| schema_acceptable(row.get(0), row.get(1)))
+                    .and_then(|row| datoid_of(row.get(2)));
                 self.schema_ok.insert(key, ok).await;
                 ok
             }
         };
-        if ok {
-            Ok(())
+        if let Some(datoid) = ok {
+            Ok(datoid)
         } else {
             tracing::warn!(request_id, branch_id = %branch, database, "the storage schema isn't Chelabase's current one");
             Err(Failure::storage_unavailable())
@@ -234,20 +246,6 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
         Ok((out, served.name))
     }
 
-    /// How many objects bucket `name` holds in `database`, asked as `chelabase_storage`.
-    pub async fn bucket_objects(
-        &self,
-        branch: Uuid,
-        database: &str,
-        name: &str,
-        request_id: &str,
-    ) -> Result<i64, Failure> {
-        let rows = self
-            .managed(branch, database, &BUCKET_OBJECTS, &[&name], request_id)
-            .await?;
-        Ok(rows.first().map_or(0, |r| r.get(0)))
-    }
-
     /// A [`NamedStatement`] as `chelabase_storage` in `database` of `branch`.
     pub async fn managed(
         &self,
@@ -267,7 +265,7 @@ impl<S: ConnSource, M: ConnSource> Engine<S, M> {
                     tracing::warn!(request_id, branch_id = %branch, statement = statement.name(), "the storage login: {e}");
                     Failure::storage_unavailable()
                 }
-                ServiceError::Query(f) => Failure(f),
+                ServiceError::Query(f) => managed_failure(f, request_id),
             })
     }
 
@@ -334,5 +332,42 @@ mod tests {
         }
         let none: Vec<String> = Vec::new();
         assert!(pick_database(&info, None, Some(&none)).is_err());
+    }
+
+    /// SF1: a managed statement's own failure never reaches the caller: a constraint (a ticket
+    /// already minted) is a fixed `conflict`, anything else a fixed 503; neither carries the
+    /// statement's message, detail or SQLSTATE.
+    #[test]
+    fn a_managed_failure_is_answered_with_a_fixed_code() {
+        let mut dup = QueryFailure::new(
+            axum::http::StatusCode::CONFLICT,
+            "conflict",
+            "duplicate key value violates unique constraint \"upload_tickets_pkey\"",
+        );
+        dup.detail = Some("Key (version_id)=(2212c5ca) already exists.".into());
+        dup.sqlstate = Some("23505".into());
+        let other = QueryFailure::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "relation storage.x does not exist",
+        );
+        for (f, status, code) in [(dup, 409, "conflict"), (other, 503, "storage_unavailable")] {
+            let out = managed_failure(f, "rid");
+            assert_eq!((out.0.status.as_u16(), out.0.code), (status, code));
+            assert!(out.0.detail.is_none() && out.0.sqlstate.is_none() && out.0.hint.is_none());
+            assert!(
+                !out.0.message.contains("upload_tickets") && !out.0.message.contains("storage.x"),
+                "{}",
+                out.0.message
+            );
+        }
+    }
+
+    /// SF10: the schema check also reads the database's OID, the blob keys' prefix.
+    #[test]
+    fn the_schema_check_reads_the_database_oid() {
+        assert_eq!(datoid_of(Some(16384)), Some(16384));
+        assert_eq!(datoid_of(Some(-1)), None);
+        assert_eq!(datoid_of(None), None);
     }
 }

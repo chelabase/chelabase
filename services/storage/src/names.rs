@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
-use chelabase_storage::{ByteStream, ObjectMeta, ObjectStore, PutOptions, StorageError};
+use chelabase_storage::{ByteRange, ByteStream, ObjectMeta, ObjectStore, PutOptions, StorageError};
 use futures_util::StreamExt;
 use uuid::Uuid;
 
@@ -14,13 +14,16 @@ use crate::error::Failure;
 /// The longest object name, in bytes of UTF-8.
 pub const MAX_NAME_BYTES: usize = 1024;
 
-/// 1 to [`MAX_NAME_BYTES`] bytes, no control character, no leading `/`, and no empty or `..`
-/// segment (so a name never climbs out of its bucket or doubles a separator).
+/// 1 to [`MAX_NAME_BYTES`] bytes, no control character, no leading `/`, no empty segment and
+/// none made only of dots (`.`, `..`, and their full-width `．`): clients normalise those away,
+/// so such an object would be out of reach.
 pub fn valid_object_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_BYTES
         && !name.chars().any(char::is_control)
-        && name.split('/').all(|s| !s.is_empty() && s != "..")
+        && name
+            .split('/')
+            .all(|s| !s.is_empty() && !s.chars().all(|c| c == '.' || c == '\u{ff0e}'))
 }
 
 pub fn check_object_name(name: &str) -> Result<(), Failure> {
@@ -38,9 +41,17 @@ pub fn version_key(prefix: &str, version: Uuid) -> String {
     format!("{prefix}{version}")
 }
 
-/// An upload's body while it streams, before its row exists.
-pub fn staging_key(prefix: &str, id: Uuid) -> String {
-    format!("{prefix}staging/{id}")
+/// A Postgres database's blob prefix: `{database_id}/{datoid}/`. The OID is stable across a
+/// rename and the same on every branch (a branch is a physical copy), and one database's
+/// prefix never starts with another's.
+pub fn object_prefix(database_id: Uuid, datoid: u32) -> String {
+    format!("{database_id}/{datoid}/")
+}
+
+/// The range to read: none for a zero-byte object (200 with the empty body, as the store
+/// refuses any range of it).
+pub fn range_for(size: u64, range: Option<ByteRange>) -> Option<ByteRange> {
+    range.filter(|_| size > 0)
 }
 
 /// `inline` or, with `?download=` (its value the file name; empty: the object's last segment),
@@ -136,8 +147,8 @@ pub enum Staged {
     Store(StorageError),
 }
 
-/// Streams `body` to `staging`; the staged blob's size and etag, or why not. Whatever failed,
-/// nothing stays at `staging`.
+/// Streams `body` to `staging` (the version's own key); the blob's size and etag, or why not.
+/// Whatever failed, nothing stays at the key.
 pub async fn stage(
     store: &dyn ObjectStore,
     staging: &str,
@@ -162,32 +173,18 @@ pub async fn stage(
     }
 }
 
-/// Promotes before the row: copies `staging` to `version_key`, then runs `write` (the
-/// caller's row). A failed copy is 502 and `write` never runs; a failed `write` deletes the
-/// version key's blob. The staging blob is deleted either way, so no row ever points at a
-/// missing blob and no blob outlives a refused row.
-pub async fn promote_then<T>(
+/// After the body is at `version_key` (random and unreferenced until its row exists): runs
+/// `write` (the ticket and the caller's row). A failed or refused `write` deletes the blob, so
+/// no blob outlives a refused row and no row ever points at a missing blob.
+pub async fn keep_if_written<T>(
     store: &dyn ObjectStore,
-    staging: &str,
     version_key: &str,
     write: impl AsyncFnOnce() -> Result<T, Failure>,
-    request_id: &str,
 ) -> Result<T, Failure> {
-    let out = match store.copy(staging, version_key).await {
-        Err(e) => {
-            tracing::warn!(request_id, version_key, "promoting an upload: {e}");
-            let _ = store.delete(version_key).await;
-            Err(Failure::store_failed())
-        }
-        Ok(_) => match write().await {
-            Ok(t) => Ok(t),
-            Err(f) => {
-                let _ = store.delete(version_key).await;
-                Err(f)
-            }
-        },
-    };
-    let _ = store.delete(staging).await;
+    let out = write().await;
+    if out.is_err() {
+        let _ = store.delete(version_key).await;
+    }
     out
 }
 
@@ -219,6 +216,13 @@ mod tests {
             "a\u{0}b",
             "a\nb",
             &"a".repeat(1025),
+            // N7: dot-only segments, full-width ones included.
+            "./x",
+            "a/.",
+            "a/./b",
+            "...",
+            "\u{ff0e}/x",
+            "a/\u{ff0e}\u{ff0e}",
         ] {
             assert!(!valid_object_name(bad), "{bad:?}");
         }
@@ -230,7 +234,35 @@ mod tests {
     fn keys_and_headers() {
         let v = Uuid::nil();
         assert_eq!(version_key("db/main/", v), format!("db/main/{v}"));
-        assert_eq!(staging_key("db/main/", v), format!("db/main/staging/{v}"));
+        // SF10: keyed by the Postgres database's OID: one database's prefix never starts with
+        // another's (a name like `main/staging` could).
+        let db = Uuid::nil();
+        assert_eq!(object_prefix(db, 16384), format!("{db}/16384/"));
+        let prefixes: Vec<String> = [1u32, 12, 123, 16384, 163840]
+            .iter()
+            .map(|o| object_prefix(db, *o))
+            .collect();
+        for a in &prefixes {
+            for b in &prefixes {
+                assert!(a == b || !b.starts_with(a.as_str()), "{b} nests in {a}");
+            }
+        }
+        // N1: a zero-byte object's range is ignored (200, empty body).
+        assert_eq!(
+            range_for(
+                0,
+                Some(ByteRange::From {
+                    start: 0,
+                    end: None
+                })
+            ),
+            None
+        );
+        let r = Some(ByteRange::From {
+            start: 0,
+            end: Some(4),
+        });
+        assert_eq!(range_for(11, r), r);
         assert_eq!(content_disposition("a/b.png", None), "inline");
         assert_eq!(
             content_disposition("a/b.png", Some("")),
@@ -281,64 +313,23 @@ mod tests {
         assert_eq!((meta.size, counter.bytes.load(Ordering::SeqCst)), (5, 5));
     }
 
-    /// The upload's promote comes before the row: a failed copy is 502, the write never runs
-    /// and nothing is left (no row can point at a missing blob).
+    /// A refused or failed row deletes the version's blob; a written one keeps exactly it.
     #[tokio::test]
-    async fn a_failed_promote_writes_no_row_and_leaves_nothing() {
-        let store = MemoryStore::default();
-        let ran = std::sync::atomic::AtomicBool::new(false);
-        // Nothing at the staging key: the copy fails.
-        let out = promote_then(
-            &store,
-            "p/staging/1",
-            "p/v1",
-            async || {
-                ran.store(true, Ordering::SeqCst);
-                Ok(())
-            },
-            "r",
-        )
-        .await;
-        assert_eq!(out.unwrap_err().0.status.as_u16(), 502);
-        assert!(
-            !ran.load(Ordering::SeqCst),
-            "the row was written without its blob"
-        );
-        assert!(store.list("p/").await.unwrap().is_empty());
-    }
-
-    /// A row refused after the promote leaves no blob at the version key (nor at the staging
-    /// key); an accepted one leaves exactly the version key.
-    #[tokio::test]
-    async fn a_refused_row_after_the_promote_leaves_no_blob() {
+    async fn a_refused_row_leaves_no_blob() {
         let store = MemoryStore::default();
         store
-            .put(
-                "p/staging/1",
-                Bytes::from_static(b"x"),
-                PutOptions::default(),
-            )
+            .put("p/v1", Bytes::from_static(b"x"), PutOptions::default())
             .await
             .unwrap();
-        let out: Result<(), Failure> = promote_then(
-            &store,
-            "p/staging/1",
-            "p/v1",
-            async || Err(Failure::object_conflict()),
-            "r",
-        )
-        .await;
+        let out: Result<(), Failure> =
+            keep_if_written(&store, "p/v1", async || Err(Failure::object_conflict())).await;
         assert_eq!(out.unwrap_err().0.status.as_u16(), 409);
         assert!(store.list("p/").await.unwrap().is_empty());
         store
-            .put(
-                "p/staging/2",
-                Bytes::from_static(b"y"),
-                PutOptions::default(),
-            )
+            .put("p/v2", Bytes::from_static(b"y"), PutOptions::default())
             .await
             .unwrap();
-        promote_then(&store, "p/staging/2", "p/v2", async || Ok(()), "r")
+        keep_if_written(&store, "p/v2", async || Ok(()))
             .await
             .unwrap();
         let keys: Vec<String> = store
