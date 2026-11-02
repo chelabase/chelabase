@@ -1403,7 +1403,8 @@ COMMIT;"
     .await;
     let (status, body) = storage("DELETE", &format!("{BUCKETS}/avatars"), &secret, None).await;
     assert_eq!((status, &body["error"]["code"]), (409, &json!("bucket_not_empty")), "{body}");
-    assert!(body["error"]["message"].as_str().unwrap().contains("holds 1 object"), "{body}");
+    // N5: no count (it would include objects the caller can't see).
+    assert!(body["error"]["message"].as_str().unwrap().contains("still holds objects"), "{body}");
     fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; DELETE FROM storage.objects; COMMIT;").await;
     assert_eq!(storage("DELETE", &format!("{BUCKETS}/avatars"), &secret, None).await.0, 204);
     assert_eq!(storage("GET", BUCKETS, &secret, None).await, (200, json!([])));
