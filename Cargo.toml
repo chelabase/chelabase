@@ -23,6 +23,7 @@ members = [
     "crates/chelabase-init",
     "crates/chelabase-http",
     "crates/chelabase-typegen",
+    "crates/chelabase-storage",
 ]
 
 [workspace.package]
@@ -45,6 +46,7 @@ chelabase-schema = { path = "crates/chelabase-schema" }
 chelabase-zitadel = { path = "crates/chelabase-zitadel" }
 chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
+chelabase-storage = { path = "crates/chelabase-storage" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }
@@ -124,6 +126,10 @@ tokio-postgres-rustls-improved = { version = "0.17.1", default-features = false,
 tar = "0.4.46"
 stringprep = "0.1.5"
 deadpool-postgres = { version = "0.14.2", default-features = false, features = ["rt_tokio_1"] }
+# Default features off for the SDK: `default-https-client` is rustls on aws-lc-rs (no ring), and
+# we build credentials ourselves from key files, so `aws-config` is not needed.
+aws-sdk-s3 = { version = "1.157.0", default-features = false, features = ["default-https-client", "rt-tokio", "behavior-version-latest"] }
+aws-credential-types = "1.2"
 
 [profile.dev]
 # File:line in backtraces without full debug info: smaller test binaries, faster links.
