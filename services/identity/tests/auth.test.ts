@@ -106,4 +106,28 @@ describeDb("caller auth", () => {
     expect(await schemaExists(h.db, other.schema)).toBe(false);
     expect((await call(h, "DELETE", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(204);
   });
+
+  // S1 (audit): the bootstrap has its own token, and it may only create a pool.
+  it("bootstrap_route_allow_list", async () => {
+    const p = newAppPool();
+    const created = await call(h, "POST", `/internal/v1/pools/${p.pool}`, { as: "bootstrap" });
+    expect(created.status).toBe(201);
+    expect(await schemaExists(h.db, p.schema)).toBe(true);
+    for (const [method, path] of [
+      ["DELETE", `/internal/v1/pools/${p.pool}`],
+      ["GET", `/internal/v1/pools/${p.pool}/users`],
+      ["POST", `/internal/v1/pools/${p.pool}/users`],
+      ["POST", `/internal/v1/pools/${p.pool}/sessions`],
+      ["POST", `/internal/v1/pools/${p.pool}/codes`],
+      ["GET", "/internal/v1/email/status"],
+    ] as const) {
+      const r = await call(h, method, path, {
+        as: "bootstrap",
+        body: { email: "a@x.io", password: "password-x-1", user_id: "u", kind: "invite", delivery: "return" },
+      });
+      expect(r.status, `${method} ${path}`).toBe(403);
+    }
+    expect(await schemaExists(h.db, p.schema)).toBe(true);
+    expect((await call(h, "DELETE", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(204);
+  });
 });

@@ -19,9 +19,12 @@
 #      the role's password); only `auth` mounts `auth/member-jwt.key`, and the member public key
 #      goes to auth, the gateway, the orchestrator and realtime only; `gateway/internal-signing.pem`
 #      is the gateway's alone; each `tokens/<caller>-identity.token` is mounted only by its
-#      caller and `identity` (the worker's also by the self-hosted bootstrap, which calls the
-#      worker's pool route). The workbench's runner, the test harness, sees every key and is left
-#      out of these checks.
+#      caller and `identity`. The bootstrap's own (`tokens/bootstrap-identity.token`, which
+#      identity lets create a pool and nothing else) goes to the self-hosted `init-bootstrap`
+#      and `identity`; under the workbench, to `identity` only (the workbench's bootstrap is a
+#      `docker run` of its own, checked in tools/cli). The workbench's runner, the test harness,
+#      sees the keys its live tests read and is left out of these checks, but never the
+#      bootstrap's token.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -90,12 +93,13 @@ proxy	tokens/proxy-api.token	ro
 init-secrets		rw
 init-bootstrap	db/metadata.password	ro
 init-bootstrap	identity/db.password	ro
-init-bootstrap	tokens/worker-identity.token	ro
+init-bootstrap	tokens/bootstrap-identity.token	ro
 identity	identity/secret	ro
 identity	identity/db.password	ro
 identity	tokens/auth-identity.token	ro
 identity	tokens/orchestrator-identity.token	ro
 identity	tokens/worker-identity.token	ro
+identity	tokens/bootstrap-identity.token	ro
 init-bootstrap	zitadel-pats/admin.pat	ro
 init-bootstrap	bootstrap	rw
 orchestrator	secrets/secrets.key	ro
@@ -232,12 +236,17 @@ for render in base wb; do
   boundary gateway/internal-signing.pem "gateway" "$render" "$tmp/readers.$render"
   boundary tokens/auth-identity.token "auth identity" "$render" "$tmp/readers.$render"
   boundary tokens/orchestrator-identity.token "identity orchestrator" "$render" "$tmp/readers.$render"
-  boundary tokens/worker-identity.token "identity${boot} worker" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-identity.token "identity worker" "$render" "$tmp/readers.$render"
+  boundary tokens/bootstrap-identity.token "identity${boot}" "$render" "$tmp/readers.$render"
   # Nothing else under identity/ is mounted, by anyone but identity (and the bootstrap's file).
   extra="$(awk -F'\t' '$1 != "runner" && $1 != "identity" && ($2 ~ /^identity(\/|$)/) &&
     !($1 == "init-bootstrap" && $2 == "identity/db.password") { print $1 ": " $2 }' "$tmp/readers.$render")"
   [[ -z "$extra" ]] || err "$render: identity/ files reach other services:"$'\n'"$extra"
 done
+# The bootstrap's token never reaches the runner (S1: init-bootstrap, the workbench's bootstrap
+# run and identity only).
+! awk -F'\t' '$1 == "runner" && $2 == "tokens/bootstrap-identity.token"' "$tmp/wb.have" | grep -q . ||
+  err "the workbench runner sees tokens/bootstrap-identity.token"
 # The workbench runner (the test harness) reads the identity files the live tests use.
 for f in identity/db.password tokens/worker-identity.token; do
   awk -F'\t' -v f="$f" '$1 == "runner" && $2 == f' "$tmp/wb.have" | grep -q . ||

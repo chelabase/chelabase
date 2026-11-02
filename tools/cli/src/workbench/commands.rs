@@ -1342,8 +1342,11 @@ pub fn bootstrap_args(
 }
 
 /// The keys-dir files [`bootstrap`] mounts for its identity step: the `chelabase_identity`
-/// role's password and the worker's identity token (the pool route is the worker's).
-const IDENTITY_BOOTSTRAP_FILES: [&str; 2] = ["identity/db.password", "tokens/worker-identity.token"];
+/// role's password and the bootstrap's own identity token (it may only create a pool).
+const IDENTITY_BOOTSTRAP_FILES: [&str; 2] = [
+    "identity/db.password",
+    "tokens/bootstrap-identity.token",
+];
 
 /// The env [`bootstrap`]'s container gets: the stack env's values of what the bootstrap reads,
 /// the admin PAT's path in the output dir, and the identity step's service URL and file paths
@@ -2347,15 +2350,16 @@ mod tests {
             .filter(|w| w[0] == "-v")
             .map(|w| w[1].as_str())
             .collect();
-        // m5 (#118): the identity step reads the role's password and the worker's identity token,
-        // each mounted alone, read-only, at its keys-dir path.
+        // m5 (#118): the identity step reads the role's password and its own identity token
+        // (S1: the bootstrap's, not the worker's), each mounted alone, read-only, at its
+        // keys-dir path.
         assert_eq!(
             volumes,
             [
                 "/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro",
                 "/s/zitadel:/s/zitadel",
                 "/m/.chelabase/identity/db.password:/m/.chelabase/identity/db.password:ro",
-                "/m/.chelabase/tokens/worker-identity.token:/m/.chelabase/tokens/worker-identity.token:ro",
+                "/m/.chelabase/tokens/bootstrap-identity.token:/m/.chelabase/tokens/bootstrap-identity.token:ro",
             ]
         );
         let names: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
@@ -2369,7 +2373,7 @@ mod tests {
         for e in [
             "CHELABASE_IDENTITY_URL=http://identity:8080",
             "CHELABASE_IDENTITY_DB_PASSWORD_FILE=/m/.chelabase/identity/db.password",
-            "CHELABASE_IDENTITY_TOKEN_FILE=/m/.chelabase/tokens/worker-identity.token",
+            "CHELABASE_IDENTITY_TOKEN_FILE=/m/.chelabase/tokens/bootstrap-identity.token",
         ] {
             assert!(envs.contains(&e.to_string()), "{e}: {envs:?}");
         }
@@ -2465,6 +2469,7 @@ mod key_phase_tests {
                 "identity/db.password",
                 "identity/secret",
                 "tokens/auth-identity.token",
+                "tokens/bootstrap-identity.token",
                 "tokens/orchestrator-identity.token",
                 "tokens/worker-identity.token",
             ]

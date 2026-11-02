@@ -270,17 +270,17 @@ services:
       CHELABASE_SMTP_PASSWORD_FILE: ${CHELABASE_SMTP_USER:+/run/chelabase/smtp.password}
       # The identity step (auth-replacement m5): the chelabase_identity role and its password
       # (identity/db.password), the identity_admin functions, then the members pool through the
-      # service's pool route, which is the worker's (so its token; the bootstrap already holds
-      # the metadata superuser's password).
+      # service's pool route, with the bootstrap's own token (identity lets it create a pool and
+      # nothing else).
       CHELABASE_IDENTITY_URL: http://identity:8080
       CHELABASE_IDENTITY_DB_PASSWORD_FILE: /run/chelabase/secrets/identity/db.password
-      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/bootstrap-identity.token
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap, volume: {subpath: bootstrap}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/db.password, read_only: true, volume: {subpath: identity/db.password}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/bootstrap-identity.token, read_only: true, volume: {subpath: tokens/bootstrap-identity.token}}
       - type: bind
         source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
         target: /run/chelabase/smtp.password
@@ -898,8 +898,8 @@ services:
 
   # The identity service (auth-replacement; Better Auth behind its own JSON API, replacing Zitadel,
   # whose services go in m13). Internal only: on the project network, no published port, no
-  # gateway route. auth, the orchestrator and the worker call it, each with its own bearer
-  # (tokens/<caller>-identity.token), which it checks per route.
+  # gateway route. auth, the orchestrator, the worker and the bootstrap call it, each with its
+  # own bearer (tokens/<caller>-identity.token), which it checks per route.
   # Its database is the metadata server's, as `chelabase_identity`: no CREATE on the database and
   # no grant on Chelabase's schemas; it owns only its pool schemas (identity_members,
   # identity_app_<hex>), made through identity_admin's SECURITY DEFINER functions. The bootstrap
@@ -951,6 +951,7 @@ services:
       CHELABASE_IDENTITY_AUTH_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
       CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
       CHELABASE_IDENTITY_WORKER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      CHELABASE_IDENTITY_BOOTSTRAP_TOKEN_FILE: /run/chelabase/secrets/tokens/bootstrap-identity.token
       CHELABASE_IDENTITY_POOL_CACHE_SIZE: ${CHELABASE_IDENTITY_POOL_CACHE_SIZE:-256}
       # Optional SMTP (unset: no email; codes go back to the caller only).
       CHELABASE_SMTP_HOST: ${CHELABASE_SMTP_HOST:-}
@@ -965,6 +966,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/auth-identity.token, read_only: true, volume: {subpath: tokens/auth-identity.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/bootstrap-identity.token, read_only: true, volume: {subpath: tokens/bootstrap-identity.token}}
       - type: bind
         source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
         target: /run/chelabase/smtp.password

@@ -659,6 +659,9 @@ async fn members_pool_idempotent() {
     };
     let base = std::env::var("CHELABASE_IDENTITY_URL")
         .unwrap_or_else(|_| "http://identity:8080".into());
+    // The worker's token: the pool route takes it too, and the runner never gets the
+    // bootstrap's own (tokens/bootstrap-identity.token, mounted in the bootstrap and identity
+    // only). The bootstrap's own run on `up` uses that one.
     let cfg = IdentityConfig::new(
         &base,
         &read("tokens/worker-identity.token"),

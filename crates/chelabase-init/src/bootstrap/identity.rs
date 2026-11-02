@@ -4,13 +4,13 @@
 //! `identity_admin.create_pool_schema` and runs Better Auth's migrations, both no-ops on a pool
 //! that is complete, and completes a half-made one).
 //!
-//! The pool route is the worker's (`services/identity/src/routes.ts`), so the bootstrap calls it
-//! with the worker's token: it is a one-shot that already holds the metadata superuser's
-//! password, so the token gives it nothing new.
+//! The bootstrap calls it with its own token (`tokens/bootstrap-identity.token`), which the
+//! service lets through to that one route only (`services/identity/src/routes.ts`), so the
+//! service tells the bootstrap from the worker and the worker's token stays with the worker.
 //!
 //! Environment ([`ENV_KEYS`]): `CHELABASE_IDENTITY_URL` (the service, e.g.
-//! `http://identity:8080`), `CHELABASE_IDENTITY_TOKEN_FILE` (the worker's
-//! `tokens/worker-identity.token`) and `CHELABASE_IDENTITY_DB_PASSWORD_FILE`
+//! `http://identity:8080`), `CHELABASE_IDENTITY_TOKEN_FILE` (the bootstrap's
+//! `tokens/bootstrap-identity.token`) and `CHELABASE_IDENTITY_DB_PASSWORD_FILE`
 //! (`identity/db.password`, the `chelabase_identity` role's password). All three are required.
 
 use anyhow::{Context, Result, bail};
@@ -48,8 +48,9 @@ impl IdentityConfig {
         if !(url.starts_with("http://") || url.starts_with("https://")) {
             bail!("CHELABASE_IDENTITY_URL must be an http(s) URL");
         }
-        let token_file = non_blank(&get, "CHELABASE_IDENTITY_TOKEN_FILE")
-            .context("CHELABASE_IDENTITY_TOKEN_FILE is required (the worker's identity token)")?;
+        let token_file = non_blank(&get, "CHELABASE_IDENTITY_TOKEN_FILE").context(
+            "CHELABASE_IDENTITY_TOKEN_FILE is required (the bootstrap's identity token)",
+        )?;
         let password_file = non_blank(&get, "CHELABASE_IDENTITY_DB_PASSWORD_FILE").context(
             "CHELABASE_IDENTITY_DB_PASSWORD_FILE is required (the identity role's password)",
         )?;

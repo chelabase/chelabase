@@ -2,8 +2,11 @@
 // from plain env values, matching the Rust services' house style.
 import { readFileSync } from "node:fs";
 
-/** The internal services allowed to call identity. Each has its own token file. */
-export const CALLERS = ["auth", "orchestrator", "worker"] as const;
+/**
+ * The internal services allowed to call identity. Each has its own token file. `bootstrap` is
+ * chelabase-init's bootstrap, which creates the members pool and nothing else.
+ */
+export const CALLERS = ["auth", "bootstrap", "orchestrator", "worker"] as const;
 export type Caller = (typeof CALLERS)[number];
 
 /**

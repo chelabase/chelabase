@@ -444,6 +444,7 @@ services:
       - CHELABASE_IDENTITY_AUTH_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/auth-identity.token
       - CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
       - CHELABASE_IDENTITY_WORKER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      - CHELABASE_IDENTITY_BOOTSTRAP_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/bootstrap-identity.token
       - CHELABASE_SMTP_HOST=mailpit
       - CHELABASE_SMTP_PORT=1025
       - CHELABASE_SMTP_TLS=none
@@ -461,6 +462,7 @@ services:
       - {source: token-auth-identity, target: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
       - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
       - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
+      - {source: token-bootstrap-identity, target: "${CHELABASE_KEYS_DIR}/tokens/bootstrap-identity.token"}
     depends_on: !override
       metadata-db:
         condition: service_healthy
@@ -922,6 +924,8 @@ secrets:
   token-auth-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
   token-orchestrator-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
   token-worker-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
+  # The bootstrap's (S1): identity reads it here; the bootstrap's own `docker run` mounts it.
+  token-bootstrap-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/bootstrap-identity.token"}
   compute-jwt-private: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
   compute-jwt-public: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
   nats-orchestrator: {file: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}

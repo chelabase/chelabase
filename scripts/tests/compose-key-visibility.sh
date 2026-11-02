@@ -43,6 +43,7 @@ universe='[
   "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
   "K/auth/member-jwt.key", "K/auth/member-jwt.pub", "K/identity/secret", "K/identity/db.password",
   "K/tokens/auth-identity.token", "K/tokens/orchestrator-identity.token", "K/tokens/worker-identity.token",
+  "K/tokens/bootstrap-identity.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
   "S/env/stack.env",
@@ -131,7 +132,7 @@ expected='{
     "C/scripts/tests/workbench-compose.sh": "ro",
     "K/identity/secret": "ro", "K/identity/db.password": "ro",
     "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro",
-    "K/tokens/worker-identity.token": "ro"
+    "K/tokens/worker-identity.token": "ro", "K/tokens/bootstrap-identity.token": "ro"
   },
   "studio": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "docs": { "C/scripts/tests/workbench-compose.sh": "rw" },
