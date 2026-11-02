@@ -853,7 +853,7 @@ async fn hardening(fx: &Fx) {
         "0"
     );
     assert_eq!(fx.value("SELECT has_table_privilege('audit_x', 'storage.objects', 'SELECT') OR has_table_privilege('anon', 'storage.upload_tickets', 'SELECT')").await, "f");
-    assert_eq!(fx.value("SELECT string_agg(tgname || '=' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid IN ('storage.objects'::regclass, 'storage.upload_tickets'::regclass) AND NOT tgisinternal").await, "guard_tickets=A,protect_objects=A");
+    assert_eq!(fx.value("SELECT string_agg(tgname || '=' || tgenabled::text, ',' ORDER BY tgname) FROM pg_trigger WHERE tgrelid IN ('storage.objects'::regclass, 'storage.upload_tickets'::regclass) AND NOT tgisinternal").await, "guard_tickets=A,protect_objects=A,touch_objects=A");
     fx.admin("DROP ROLE audit_x").await;
 
     // S1: a session that reached chelabase_storage through another role is ended too.
@@ -1529,6 +1529,17 @@ impl Fx {
             .collect()
     }
 
+    /// Deletes every blob under this database's prefix (the sweeper's job, m8: the tests
+    /// leave nothing behind in the shared object store).
+    async fn purge_blobs(&self, store: &chelabase_storage::S3Store) {
+        use chelabase_storage::ObjectStore;
+        let prefix = format!("{}/{}/", self.id, self.database);
+        for blob in store.list(&prefix).await.unwrap() {
+            store.delete(&blob.key).await.unwrap();
+        }
+        assert!(self.blobs(store).await.is_empty());
+    }
+
     /// A bucket, made as storage itself.
     async fn bucket(&self, name: &str) {
         self.admin(&format!(
@@ -1731,6 +1742,7 @@ COMMIT;"
     let mut deleted: Vec<String> = serde_json::from_value(json_of(&b)["deleted"].clone()).unwrap();
     deleted.sort();
     assert_eq!(deleted, ["race.bin"], "a hidden object isn't deleted either");
+    fx.purge_blobs(&store).await;
 }
 
 #[tokio::test]
@@ -1791,6 +1803,7 @@ async fn storage_api_list(fx: &Fx) {
     let listed = fx.secret_key("st-list-listed", Some(vec![fx.database.clone()])).await;
     let path = "/storage/v1/object/list/files?database=postgres";
     assert_eq!(object("POST", path, &listed, Some("{}".into()), &[JSON]).await.0, 403);
+    fx.purge_blobs(&object_store().await).await;
 }
 
 /// 100 uploads stalled mid-body hold no database connection: the data API and storage's own
@@ -1842,6 +1855,7 @@ async fn storage_api_slow_uploads(fx: &Fx) {
             .await
             .expect("the data API answers");
         assert_eq!(res.status().as_u16(), 200);
+        println!("with 100 stalled uploads: /data/v1/schema took {:?}", started.elapsed());
         assert!(started.elapsed() < Duration::from_secs(3), "the data API took {:?}", started.elapsed());
         assert_eq!(storage("GET", "/storage/v1/bucket", &secret, None).await.0, 200);
     }
@@ -1859,6 +1873,11 @@ async fn storage_api_slow_uploads(fx: &Fx) {
     assert_eq!(json_of(&b)["size"], total);
     assert!(took > Duration::from_secs(60), "the upload must outlast the default 60 s timeout: {took:?}");
     println!("64 MiB paced upload took {took:?}");
+    let store = object_store().await;
+    // The 100 stalled uploads never reached the store (each was under one part), and the
+    // 64 MiB blob is its only one.
+    assert_eq!(fx.blobs(&store).await.len(), 1, "{:?}", fx.blobs(&store).await);
+    fx.purge_blobs(&store).await;
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------
