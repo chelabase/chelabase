@@ -293,12 +293,16 @@ async fn identity_role_denied_on_chelabase_schemas() {
         for sql in [
             "CREATE TABLE public.cm_x (id int)",
             "CREATE TABLE chelabase.cm_x (id int)",
-            "CREATE TABLE cm_unqualified (id int)",
             "CREATE FUNCTION public.cm_f() RETURNS int LANGUAGE sql AS 'SELECT 1'",
             "CREATE VIEW chelabase.cm_v AS SELECT 1",
         ] {
             assert_eq!(sqlstate(&mut me, sql).await.as_deref(), Some("42501"), "{sql}");
         }
+        // Unqualified: with no USAGE on `public` its search path holds no schema at all.
+        assert_eq!(
+            sqlstate(&mut me, "CREATE TABLE cm_unqualified (id int)").await.as_deref(),
+            Some("3F000")
+        );
         // Not a superuser, no role attribute beyond LOGIN, a member of nothing, no CREATE.
         let (sup, createdb, createrole, bypass, member_of): (bool, bool, bool, bool, i64) =
             sqlx::query_as(
@@ -312,16 +316,38 @@ async fn identity_role_denied_on_chelabase_schemas() {
             .unwrap();
         assert!(!sup && !createdb && !createrole && !bypass, "{}", s.roles.login);
         assert_eq!(member_of, 0);
-        let can: (bool, bool, bool) = sqlx::query_as(
+        // B2 (audit): from its own pool schema it can't pin a Chelabase type or function (a
+        // dependency that would block Chelabase's own DDL).
+        sqlx::query("SELECT identity_admin.create_pool_schema('identity_members')")
+            .execute(&mut me)
+            .await
+            .unwrap();
+        for sql in [
+            "CREATE TABLE identity_members.pin (t public.tenants)",
+            "CREATE FUNCTION identity_members.pinf(x public.tenants) RETURNS int LANGUAGE sql AS 'SELECT 1'",
+        ] {
+            assert_eq!(sqlstate(&mut me, sql).await.as_deref(), Some("42501"), "{sql}");
+        }
+        // B2 (audit): not even PUBLIC's USAGE on `public`, so it can't reference Chelabase's
+        // types or functions.
+        let can: (bool, bool, bool, bool) = sqlx::query_as(
             "SELECT has_database_privilege($1, current_database(), 'CREATE'),
                     has_schema_privilege($1, 'public', 'CREATE'),
+                    has_schema_privilege($1, 'public', 'USAGE'),
                     has_schema_privilege($1, 'chelabase', 'USAGE')",
         )
         .bind(&s.roles.login)
         .fetch_one(&mut su)
         .await
         .unwrap();
-        assert_eq!(can, (false, false, false));
+        assert_eq!(can, (false, false, false, false));
+        // N1 (audit): a connection limit, so it can't exhaust the server's connections.
+        let limit: i32 = sqlx::query_scalar("SELECT rolconnlimit FROM pg_roles WHERE rolname = $1")
+            .bind(&s.roles.login)
+            .fetch_one(&mut su)
+            .await
+            .unwrap();
+        assert!((20..=100).contains(&limit), "rolconnlimit {limit}");
 
         // The success path: its own pool schema, made through the function, is its own.
         let pool = format!("identity_app_{}", hex32());
@@ -633,6 +659,9 @@ async fn members_pool_idempotent() {
     };
     let base = std::env::var("CHELABASE_IDENTITY_URL")
         .unwrap_or_else(|_| "http://identity:8080".into());
+    // The worker's token: the pool route takes it too, and the runner never gets the
+    // bootstrap's own (tokens/bootstrap-identity.token, mounted in the bootstrap and identity
+    // only). The bootstrap's own run on `up` uses that one.
     let cfg = IdentityConfig::new(
         &base,
         &read("tokens/worker-identity.token"),
@@ -664,4 +693,144 @@ async fn members_pool_idempotent() {
     );
     run(&w(), &url(), &cfg).await.unwrap();
     assert_eq!(state().await, first, "a second run changes nothing");
+}
+
+// N3 (audit): the database name is quoted as an identifier, so a name with a `"` works.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn identity_roles_quote_the_database_name() {
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url())
+        .await
+        .expect("metadata Postgres reachable");
+    let tag = hex32();
+    let db = format!("cm_ident_{tag}\"q");
+    let quoted = format!("\"{}\"", db.replace('"', "\"\""));
+    sqlx::raw_sql(AssertSqlSafe(format!("CREATE DATABASE {quoted}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let roles = IdentityRoles {
+        login: format!("cm_ident_{}", &tag[..12]),
+        owner: format!("cm_ident_{}_admin", &tag[..12]),
+    };
+    let opts = PgConnectOptions::from_str(&url()).unwrap().database(&db);
+    let (r, granted) = {
+        let mut su = PgConnection::connect_with(&opts).await.unwrap();
+        let r = ensure_identity_roles(&mut su, &roles, ROLE_PASSWORD).await;
+        let granted: Option<bool> = sqlx::query_scalar(
+            "SELECT has_database_privilege(r.rolname, current_database(), 'CREATE')
+               FROM pg_roles r WHERE r.rolname = $1",
+        )
+        .bind(&roles.owner)
+        .fetch_optional(&mut su)
+        .await
+        .unwrap();
+        su.close().await.unwrap();
+        (r, granted)
+    };
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await
+    .unwrap();
+    for role in [&roles.owner, &roles.login] {
+        sqlx::raw_sql(AssertSqlSafe(format!("DROP ROLE IF EXISTS {role}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+    }
+    r.unwrap();
+    assert_eq!(granted, Some(true));
+}
+
+/// `ensure_identity_roles`' advisory lock key ("cb_ident" as ASCII).
+const SETUP_LOCK_KEY: i64 = 0x6362_5f69_6465_6e74;
+
+// S2 (audit): a session holding the setup's advisory lock can't hang it. The setup gives up on
+// the lock after its lock_timeout (55P03), and the bootstrap's step waits for it within its
+// deadline, then succeeds once the lock is free.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn identity_roles_lock_wait_is_bounded() {
+    with_scratch(|s| async move {
+        let mut holder = s.superuser().await;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(SETUP_LOCK_KEY)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let mut su = s.superuser().await;
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ensure_identity_roles(&mut su, &s.roles, ROLE_PASSWORD),
+        )
+        .await
+        .expect("the setup gives up on a held lock instead of waiting forever");
+        let err = r.expect_err("the lock is held");
+        let code = err
+            .downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|d| d.code())
+            .map(|c| c.to_string());
+        assert_eq!(code.as_deref(), Some("55P03"), "{err:#}");
+        su.close().await.unwrap();
+        holder.close().await.unwrap();
+    })
+    .await;
+}
+
+// S2 (audit): the bootstrap's identity step treats the held lock as a wait inside its deadline
+// (an error naming the lock when the deadline passes), and finishes once the lock is released.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn bootstrap_identity_step_waits_out_the_lock() {
+    use chelabase_init::bootstrap::identity::ensure_roles;
+    use chelabase_init::bootstrap::retry::{Backoff, Waiter};
+    with_scratch(|s| async move {
+        let scratch_url = url_for(&s.db);
+        let mut holder = s.superuser().await;
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(SETUP_LOCK_KEY)
+            .execute(&mut holder)
+            .await
+            .unwrap();
+        let w = Waiter::new(std::time::Duration::from_secs(3), Backoff::default());
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            ensure_roles(&w, &scratch_url, &s.roles, ROLE_PASSWORD),
+        )
+        .await
+        .expect("bounded by the deadline")
+        .expect_err("the lock is held past the deadline");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed out") && msg.contains("lock"), "{msg}");
+
+        let w = Waiter::new(std::time::Duration::from_secs(60), Backoff::default());
+        let release = async {
+            // Released while the step waits for it.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            sqlx::query("SELECT pg_advisory_unlock($1)")
+                .bind(SETUP_LOCK_KEY)
+                .execute(&mut holder)
+                .await
+                .unwrap();
+        };
+        let (r, ()) = tokio::join!(
+            ensure_roles(&w, &scratch_url, &s.roles, ROLE_PASSWORD),
+            release
+        );
+        r.unwrap();
+        let made: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                .bind(&s.roles.login)
+                .fetch_one(&mut holder)
+                .await
+                .unwrap();
+        assert!(made);
+        holder.close().await.unwrap();
+    })
+    .await;
 }

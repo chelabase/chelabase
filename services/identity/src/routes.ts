@@ -75,6 +75,8 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
   ]),
   // Pool lifecycle and the users sync.
   worker: new Set<RouteId>(["pools.create", "pools.delete", "users.list", "users.get"]),
+  // chelabase-init's bootstrap: the members pool, created (idempotently) and nothing more.
+  bootstrap: new Set<RouteId>(["pools.create"]),
 };
 
 export interface Reply {

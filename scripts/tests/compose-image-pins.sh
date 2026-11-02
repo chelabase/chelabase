@@ -9,6 +9,12 @@
 #
 #   scripts/tests/compose-image-pins.sh [digests-file]
 #
+# It also renders the base file with docker-compose.build.yml (the self-hosted build from a
+# clone) and checks that every service the base file runs from a ghcr.io/chelabase image gets a
+# local chelabase/*:local image there, built or reused: a service the overlay misses would pull
+# a release image, which for an unpublished one (the identity service until the auth-replacement
+# epic's images are published from main) doesn't exist.
+#
 # Part of `just check` (offline, with no digests file).
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -68,6 +74,32 @@ for i in "${images[@]}"; do
     err "$i: compose and .env.example differ (${seen_compose[$i]} vs ${seen_env[$i]})"
   fi
 done
+
+# The build overlay: no app service is left on a release image (the Neon images are pinned
+# release images in both).
+build="$root/infra/compose/docker-compose.build.yml"
+render_images() { # render_images <-f args…>: "service image built" per line
+  env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE -u CHELABASE_IMAGE_REPO -u CHELABASE_IMAGE_TAG \
+    -u CHELABASE_IDENTITY_IMAGE_TAG docker compose -p chelabase-image-pins \
+    --project-directory "$root/infra/compose" "$@" --env-file "$envex" config --format json |
+    jq -r '.services | to_entries[]
+      | "\(.key) \(.value.image // "-") \(.value.build != null and .value.pull_policy == "build")"'
+}
+if base_images="$(render_images -f "$compose")" && built_images="$(render_images -f "$compose" -f "$build")"; then
+  while read -r svc img _; do
+    [[ "$img" == ghcr.io/chelabase/* && "$img" != ghcr.io/chelabase/neon-* ]] || continue
+    got="$(awk -v s="$svc" '$1 == s { print $2 }' <<<"$built_images")"
+    [[ "$got" =~ ^chelabase/[a-z]+:local$ ]] ||
+      err "docker-compose.build.yml: $svc runs $got, not a local build (base: $img)"
+  done <<<"$base_images"
+  # Each local image is built by a service of the overlay (the others reuse it).
+  for img in $(awk '$2 ~ /^chelabase\/[a-z]+:local$/ { print $2 }' <<<"$built_images" | sort -u); do
+    awk -v i="$img" '$2 == i && $3 == "true"' <<<"$built_images" | grep -q . ||
+      err "docker-compose.build.yml: nothing builds $img"
+  done
+else
+  err "rendering the base file with docker-compose.build.yml failed"
+fi
 
 if [[ -n "$digests" ]]; then
   [[ -f "$digests" ]] || { echo "compose-image-pins: no digests file $digests" >&2; exit 2; }

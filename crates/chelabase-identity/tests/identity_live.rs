@@ -9,7 +9,8 @@
 //! ```
 //!
 //! Pools are made and dropped with the worker's token; everything else uses the auth token.
-//! The code scenarios need m2's routes and fail without them.
+//! Every scenario drops the pools it made when it ends, passed or failed (each pool is a schema
+//! in the stack's metadata database). The code scenarios need m2's routes and fail without them.
 
 mod common;
 
@@ -35,24 +36,40 @@ fn live() -> Option<Live> {
     })
 }
 
-/// Makes the pools with the worker's token, runs `f`, then drops them.
+/// Runs `body` to the end (a panic included), then drops `pools` with the worker's token
+/// (a pool `body` never made, or already dropped, is fine), then fails as `body` did.
+async fn dropping_pools<Fut>(worker: &Identity, pools: &[Pool], body: Fut)
+where
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let outcome = tokio::spawn(body).await;
+    for p in pools {
+        let _ = worker.drop_pool(p).await;
+    }
+    if let Err(e) = outcome {
+        std::panic::resume_unwind(e.into_panic());
+    }
+}
+
+/// Makes the pools with the worker's token, runs `f`, then drops them, whatever happened.
 async fn with_pools<F, Fut>(n: usize, f: F)
 where
-    F: FnOnce(Identity, Vec<Pool>) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    F: FnOnce(Identity, Vec<Pool>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     let Some(l) = live() else {
         eprintln!("CHELABASE_IDENTITY_URL is unset: skipped");
         return;
     };
     let pools: Vec<Pool> = (0..n).map(|_| app_pool()).collect();
-    for p in &pools {
-        l.worker.create_pool(p).await.unwrap();
-    }
-    f(l.auth.clone(), pools.clone()).await;
-    for p in &pools {
-        let _ = l.worker.drop_pool(p).await;
-    }
+    let (worker, auth, made) = (l.worker.clone(), l.auth.clone(), pools.clone());
+    dropping_pools(&l.worker, &pools, async move {
+        for p in &made {
+            worker.create_pool(p).await.unwrap();
+        }
+        f(auth, made).await;
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -60,24 +77,25 @@ where
 async fn identity_live_pool_lifecycle_and_roles() {
     let Some(l) = live() else { return };
     let p = app_pool();
-    assert!(
-        matches!(
-            l.auth.create_pool(&p).await,
-            Err(IdentityError::Forbidden(_))
-        ),
-        "auth may not make pools"
-    );
-    l.worker.create_pool(&p).await.unwrap();
-    l.worker.create_pool(&p).await.unwrap();
-    assert_eq!(
-        l.auth.get_user(&p, "nobody").await.unwrap_err(),
-        IdentityError::NotFound(Missing::User)
-    );
-    l.worker.drop_pool(&p).await.unwrap();
-    assert_eq!(
-        l.auth.get_user(&p, "nobody").await.unwrap_err(),
-        IdentityError::NotFound(Missing::Pool)
-    );
+    let (auth, worker) = (l.auth.clone(), l.worker.clone());
+    dropping_pools(&l.worker, &[p], async move {
+        assert!(
+            matches!(auth.create_pool(&p).await, Err(IdentityError::Forbidden(_))),
+            "auth may not make pools"
+        );
+        worker.create_pool(&p).await.unwrap();
+        worker.create_pool(&p).await.unwrap();
+        assert_eq!(
+            auth.get_user(&p, "nobody").await.unwrap_err(),
+            IdentityError::NotFound(Missing::User)
+        );
+        worker.drop_pool(&p).await.unwrap();
+        assert_eq!(
+            auth.get_user(&p, "nobody").await.unwrap_err(),
+            IdentityError::NotFound(Missing::Pool)
+        );
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -130,8 +148,8 @@ async fn identity_live_user_lifecycle() {
 /// m2's scenarios. They fail when the service lacks the code routes; they do not skip.
 async fn with_codes<F, Fut>(n: usize, f: F)
 where
-    F: FnOnce(Identity, Vec<Pool>) -> Fut,
-    Fut: std::future::Future<Output = ()>,
+    F: FnOnce(Identity, Vec<Pool>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
 {
     if live().is_none() {
         eprintln!("CHELABASE_IDENTITY_URL is unset: skipped");

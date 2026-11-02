@@ -3,7 +3,7 @@
   "info": {
     "title": "Chelabase identity (internal)",
     "version": "0.1.0",
-    "description": "Internal identity service. Callers are auth, orchestrator and worker, each with its own bearer token; each route is limited to the callers listed in x-callers. A pool is `members` or `app-<lowercase uuid>`."
+    "description": "Internal identity service. Callers are auth, orchestrator, worker and bootstrap (chelabase-init's bootstrap), each with its own bearer token; each route is limited to the callers listed in x-callers. A pool is `members` or `app-<lowercase uuid>`."
   },
   "servers": [
     {
@@ -26,6 +26,7 @@
         "operationId": "createPool",
         "summary": "Create a pool's schema and run its migrations. Idempotent.",
         "x-callers": [
+          "bootstrap",
           "worker"
         ],
         "responses": {

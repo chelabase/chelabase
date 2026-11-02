@@ -39,6 +39,7 @@ for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verif
   tokens/proxy-api.token tokens/storcon-hook.token \
   auth/member-jwt.key auth/member-jwt.pub identity/secret identity/db.password \
   tokens/auth-identity.token tokens/orchestrator-identity.token tokens/worker-identity.token \
+  tokens/bootstrap-identity.token \
   neon/compute-jwt.pub.pem neon/storage-tokens/pageserver-api.jwt neon/storage-tokens/safekeeper-data.jwt \
   neon/storage-tokens/generations-api.jwt neon/storage-tokens/storcon-admin.jwt \
   stacks/other/secret; do

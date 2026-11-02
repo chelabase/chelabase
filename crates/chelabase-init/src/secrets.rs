@@ -222,6 +222,7 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/auth-identity.token", M, Gen::Token32, P),
     e("tokens/orchestrator-identity.token", M, Gen::Token32, P),
     e("tokens/worker-identity.token", M, Gen::Token32, P),
+    e("tokens/bootstrap-identity.token", M, Gen::Token32, P),
     e(
         "neon/compute-jwt.pub.pem",
         M,
@@ -2081,12 +2082,14 @@ mod tests {
     // auth-replacement m5 (#118): the identity service's files.
 
     /// The identity service's own files, its callers' bearers and the member-JWT pair.
-    const IDENTITY_FILES: [(&str, u32); 7] = [
+    const IDENTITY_FILES: [(&str, u32); 8] = [
         ("identity/secret", 0o600),
         ("identity/db.password", 0o600),
         ("tokens/auth-identity.token", 0o600),
         ("tokens/orchestrator-identity.token", 0o600),
         ("tokens/worker-identity.token", 0o600),
+        // S1 (audit): the bootstrap's own, so the service tells it from the worker.
+        ("tokens/bootstrap-identity.token", 0o600),
         ("auth/member-jwt.key", 0o600),
         ("auth/member-jwt.pub", 0o644),
     ];
@@ -2113,7 +2116,7 @@ mod tests {
         assert_eq!(mode(&t.path().join("identity")), 0o700);
         // The service refuses a secret or a caller token under 32 bytes, and puts the database
         // password into a URL: base64url only.
-        for file in &IDENTITY_FILES[..5] {
+        for file in &IDENTITY_FILES[..6] {
             let v = std::fs::read_to_string(t.path().join(file.0)).unwrap();
             assert!(v.len() >= 32, "{}", file.0);
             assert!(
@@ -2124,11 +2127,11 @@ mod tests {
             );
         }
         // Each caller has its own token.
-        let tokens: std::collections::BTreeSet<String> = IDENTITY_FILES[2..5]
+        let tokens: std::collections::BTreeSet<String> = IDENTITY_FILES[2..6]
             .iter()
             .map(|(f, _)| std::fs::read_to_string(t.path().join(f)).unwrap())
             .collect();
-        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens.len(), 4);
         // The member pair is a usable Ed25519 pair, and not the app-user pair.
         let signer = chelabase_auth::internal::InternalSigner::from_pem_file(
             &t.path().join("auth/member-jwt.key"),

@@ -26,6 +26,7 @@ export async function startHarness(overrides: Partial<Config> = {}): Promise<Har
     auth: randomBytes(32).toString("hex"),
     orchestrator: randomBytes(32).toString("hex"),
     worker: randomBytes(32).toString("hex"),
+    bootstrap: randomBytes(32).toString("hex"),
   };
   // The service connects as m5's login role, as on the stack; `db` stays the superuser's.
   const server = await startServer({

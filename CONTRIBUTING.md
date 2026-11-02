@@ -224,7 +224,7 @@ For a branch that exists only on origin, run `git fetch && git branch <branch> o
 Each worktree:
 
 - has its own `target/` directory, and compilation is shared machine-wide through sccache;
-- symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys; mounted read-only into every stack) and every stack's state;
+- symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys, member-JWT keys, the identity service's secret, database password and caller tokens; mounted read-only into every stack) and every stack's state;
 - runs its own stack from its own binaries: run `just workbench …` from inside the worktree. Another checkout's stack is reached with `--stack <slug>` (`down`, `purge`, `test`, `run`); `status` lists them all.
 
 `just workbench down` when you're done frees the slot. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from every `target/`.
@@ -382,6 +382,6 @@ scripts/tests/compose-image-pins.sh digests.txt
 - After your PR merges, remove its worktree (`just wt-remove <branch>`) and delete the branch.
 - Before building on a branch, `git fetch` and check whether origin has newer commits. Never force-push; if a push is rejected, fetch and integrate first.
 - Never run `cargo fmt` on the workspace; rustfmt only the files you create.
-- Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key or the compute-JWT key pair.
+- Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key, the compute-JWT key pair, the member-JWT pair (`auth/member-jwt.{key,pub}`), `identity/secret`, `identity/db.password` or the identity tokens (`tokens/{auth,orchestrator,worker,bootstrap}-identity.token`).
 - Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies.
 - `tokio-postgres` is pinned to the `chelabase/rust-postgres` fork by `rev` in the workspace `Cargo.toml`; return to crates.io once the upstream change is released (https://github.com/rust-postgres/rust-postgres/pull/1391).

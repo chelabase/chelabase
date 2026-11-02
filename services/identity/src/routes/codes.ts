@@ -27,11 +27,12 @@ const CODE_PATTERN = /^[0-9]{6}$/;
 /** Control characters (C0, DEL, C1) and line/paragraph separators: never in a header or a link. */
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
-/** The kinds each caller may create. auth: all; orchestrator: invites (member invites). */
+/** The kinds each caller may create. auth: all; orchestrator: invites (member invites); none else. */
 const CREATE_KINDS: Record<Caller, readonly CodeKind[]> = {
   auth: CODE_KINDS,
   orchestrator: ["invite"],
   worker: [],
+  bootstrap: [],
 };
 
 function oneOf<T extends string>(body: Record<string, unknown>, key: string, values: readonly T[]): T {
