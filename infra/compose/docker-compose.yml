@@ -212,11 +212,11 @@ services:
           [ -e "$$S/zitadel-pats/$$f" ] || (umask 077 && : >"$$S/zitadel-pats/$$f")
           chmod 0600 "$$S/zitadel-pats/$$f"
         done
-        # The object-store identities beside Neon's `s3/` pair (chelabase-init makes that one):
-        # `storage-s3/` for the storage service, scoped to bucket chelabase-storage, and
-        # `s3-admin/` for create-bucket alone (the only holder of global Admin). Each file is made
-        # only when missing, so an upgraded install keeps every key it has and only gains these.
-        # Same owner, group and mode as `s3/*`.
+        # The object-store identity `storage` (bucket chelabase-storage only) beside Neon's `s3/`
+        # pair (chelabase-init makes that one), and SeaweedFS's gRPC mutual TLS: one CA and a
+        # server and a client certificate (P-256, ten years). Each is made only when missing, so
+        # an upgraded install keeps every key it has and only gains these. Same owner, group and
+        # mode as `s3/*`; the CA key stays here (0600) and is mounted nowhere.
         new_key() { # <file under $$S> <length>
           [ -s "$$S/$$1" ] && return 0
           install -d -m 0700 "$$S/$${1%/*}"
@@ -226,8 +226,33 @@ services:
         }
         new_key storage-s3/access-key 20
         new_key storage-s3/secret-key 40
-        new_key s3-admin/access-key 20
-        new_key s3-admin/secret-key 40
+        T="$$S/grpc-tls"
+        install -d -m 0700 "$$T"
+        ec="-newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes"
+        if [ ! -s "$$T/ca.crt" ] || [ ! -s "$$T/ca.key" ]; then
+          rm -f "$$T/server.crt" "$$T/client.crt"
+          ( umask 077; openssl req -x509 $$ec -keyout "$$T/ca.key.tmp" -out "$$T/ca.crt.tmp" -days 3650 \
+              -subj "/CN=chelabase-seaweedfs-grpc-ca" -addext basicConstraints=critical,CA:TRUE \
+              -addext keyUsage=critical,keyCertSign,cRLSign )
+          chmod 0644 "$$T/ca.crt.tmp"
+          mv -f "$$T/ca.key.tmp" "$$T/ca.key"
+          mv -f "$$T/ca.crt.tmp" "$$T/ca.crt"
+        fi
+        for n in server:serverAuth client:clientAuth; do
+          f="$${n%%:*}"
+          [ -s "$$T/$$f.crt" ] && [ -s "$$T/$$f.key" ] && continue
+          ( umask 077
+            printf 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=%s\nsubjectAltName=DNS:seaweedfs,DNS:localhost,IP:127.0.0.1\n' "$${n#*:}" >"$$T/$$f.ext"
+            openssl req $$ec -keyout "$$T/$$f.key.tmp" -out "$$T/$$f.csr" -subj "/CN=seaweedfs-$$f" 2>/dev/null
+            openssl x509 -req -in "$$T/$$f.csr" -CA "$$T/ca.crt" -CAkey "$$T/ca.key" -days 3650 -extfile "$$T/$$f.ext" \
+              -set_serial "0x$$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" -out "$$T/$$f.crt.tmp" 2>/dev/null
+            rm -f "$$T/$$f.csr" "$$T/$$f.ext" )
+          chgrp 1000 "$$T/$$f.key.tmp" "$$T/$$f.crt.tmp"
+          chmod 0640 "$$T/$$f.key.tmp" "$$T/$$f.crt.tmp"
+          mv -f "$$T/$$f.key.tmp" "$$T/$$f.key"
+          mv -f "$$T/$$f.crt.tmp" "$$T/$$f.crt"
+        done
+        chgrp 1000 "$$T/ca.crt"
         # Zitadel takes its database passwords only from its environment or a config file: the
         # file, rendered from the two password files (no quote or backslash can be in them).
         umask 077
@@ -451,15 +476,19 @@ services:
 
   # All-in-one SeaweedFS (master, volume, filer, S3) for pageserver layers and safekeeper WAL,
   # and for user objects (bucket `chelabase-storage`, written by the storage service).
-  # Three S3 identities are rendered from their key files into a private file of the container
+  # Two S3 identities are rendered from their key files into a private file of the container
   # (SeaweedFS takes them only in that JSON; the key files hold no quote or backslash):
   #   neon     Read/Write/List/Tagging on bucket `neon` only (SeaweedFS reads `Action:bucket`)
   #   storage  the same on bucket `chelabase-storage` only
-  #   admin    global Admin, for create-bucket only; no service holds it besides that one-shot
-  # Neither service identity can reach the other's bucket. Master (9333), volume (8080) and filer
-  # (8888) have no auth and bypass S3 IAM, so every component binds to and advertises 127.0.0.1;
-  # only the S3 port (8333) listens on the network (`-s3.ip.bind`). The Iceberg and Lance catalog
-  # ports are off and the embedded IAM API is off, so identities change only through this file.
+  # No admin identity exists: both buckets are made over loopback by `weed shell` (below).
+  # Master (9333), volume (8080) and filer (8888) have no auth and bypass S3 IAM, and so do the
+  # gRPC ports (+10000) of those three and of the S3 server (18333). The first three bind to and
+  # advertise 127.0.0.1; S3 (8333) and its gRPC listen on the network, so every gRPC listener
+  # requires a client certificate of the stack's CA (security.toml, written from the mounted
+  # grpc-tls files; the paths are in it, no secret). The Iceberg and Lance catalog ports and the
+  # embedded IAM API are off, so identities change only through the s3.json.
+  # `weed server` stays the container's process (a crash restarts it); the bucket step is a
+  # background loop that touches /tmp/buckets-ready once both buckets are listed.
   seaweedfs:
     image: chrislusf/seaweedfs:4.47@sha256:ce9e796f1fe6f06968f4c04bdaf8f678dad9c8acdfef3d244133d71bfa6bf882
     restart: unless-stopped
@@ -472,8 +501,6 @@ services:
         nsk="$$(cat /run/chelabase/secrets/s3/secret-key)"
         sak="$$(cat /run/chelabase/secrets/storage-s3/access-key)"
         ssk="$$(cat /run/chelabase/secrets/storage-s3/secret-key)"
-        aak="$$(cat /run/chelabase/secrets/s3-admin/access-key)"
-        ask="$$(cat /run/chelabase/secrets/s3-admin/secret-key)"
         cat > /tmp/s3.json <<EOT
         {"identities": [
           {"name": "neon",
@@ -481,12 +508,29 @@ services:
            "actions": ["Read:neon", "Write:neon", "List:neon", "Tagging:neon"]},
           {"name": "storage",
            "credentials": [{"accessKey": "$$sak", "secretKey": "$$ssk"}],
-           "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]},
-          {"name": "admin",
-           "credentials": [{"accessKey": "$$aak", "secretKey": "$$ask"}],
-           "actions": ["Admin"]}]}
+           "actions": ["Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"]}]}
         EOT
-        unset nak nsk sak ssk aak ask
+        unset nak nsk sak ssk
+        D=/run/chelabase/secrets/grpc-tls
+        mkdir -p /etc/seaweedfs
+        {
+          echo '[grpc]'; echo "ca = \"$$D/ca.crt\""
+          for c in master volume filer s3; do
+            printf '[grpc.%s]\ncert = "%s/server.crt"\nkey = "%s/server.key"\nclient_cert = "%s/client.crt"\nclient_key = "%s/client.key"\n' "$$c" "$$D" "$$D" "$$D" "$$D"
+          done
+          printf '[grpc.client]\ncert = "%s/client.crt"\nkey = "%s/client.key"\n' "$$D" "$$D"
+        } > /etc/seaweedfs/security.toml
+        (
+          i=0
+          while [ "$$i" -lt 90 ]; do
+            out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.list\n' |
+              weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)"
+            if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage; then
+              touch /tmp/buckets-ready; exit 0
+            fi
+            i=$$((i + 1)); sleep 2
+          done
+        ) &
         exec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
     volumes:
       - neon_seaweedfs_data:/data
@@ -494,55 +538,32 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/s3/secret-key, read_only: true, volume: {subpath: s3/secret-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/access-key, read_only: true, volume: {subpath: s3-admin/access-key}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/secret-key, read_only: true, volume: {subpath: s3-admin/secret-key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/ca.crt, read_only: true, volume: {subpath: grpc-tls/ca.crt}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.crt, read_only: true, volume: {subpath: grpc-tls/server.crt}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/server.key, read_only: true, volume: {subpath: grpc-tls/server.key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.crt, read_only: true, volume: {subpath: grpc-tls/client.crt}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/grpc-tls/client.key, read_only: true, volume: {subpath: grpc-tls/client.key}}
+    # Healthy = both buckets exist and S3 answers an unsigned request with its error document.
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "8333"]
+      test:
+        - CMD-SHELL
+        - |
+          [ -e /tmp/buckets-ready ] && printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 8333 | grep -q '<Code>AccessDenied</Code>'
       interval: 2s
       retries: 60
     depends_on:
       init-secrets:
         condition: service_completed_successfully
 
-  # Makes both buckets with the admin identity, the only one that may create a bucket. It does
-  # not use Neon's keys, so it is not the way to check that `neon` can reach its bucket.
+  # Kept as the one-shot the Neon services wait on: seaweedfs is healthy once both buckets exist
+  # (made inside it), so this only waits for that. It holds no S3 credential.
   create-bucket:
     image: *neon-image
     restart: "no"
-    environment:
-      AWS_DEFAULT_REGION: us-east-1
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-        export AWS_ACCESS_KEY_ID="$$(cat /run/chelabase/secrets/s3-admin/access-key)"
-        export AWS_SECRET_ACCESS_KEY="$$(cat /run/chelabase/secrets/s3-admin/secret-key)"
-        for b in neon chelabase-storage; do
-          ok=
-          for i in $$(seq 60); do
-            aws --endpoint-url http://seaweedfs:8333 s3 mb s3://$$b 2>/dev/null ||
-              aws --endpoint-url http://seaweedfs:8333 s3 ls s3://$$b >/dev/null && { ok=1; break; }
-            sleep 2
-          done
-          [ -n "$$ok" ] || exit 1
-        done
-    volumes:
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/access-key, read_only: true, volume: {subpath: s3-admin/access-key}}
-      - {type: volume, source: secrets, target: /run/chelabase/secrets/s3-admin/secret-key, read_only: true, volume: {subpath: s3-admin/secret-key}}
+    entrypoint: ["/bin/true"]
     depends_on:
       seaweedfs:
         condition: service_healthy
-
-  # The storage service (epic object-storage m5) lands here. It reads only its own identity, from
-  # files, and reaches S3 only by URL (no shared volume, so SeaweedFS may be on another node):
-  #   environment:
-  #     CHELABASE_STORAGE_S3_ENDPOINT: http://seaweedfs:8333
-  #     CHELABASE_STORAGE_S3_BUCKET: chelabase-storage
-  #     CHELABASE_STORAGE_S3_ACCESS_KEY_FILE: /run/chelabase/secrets/storage-s3/access-key
-  #     CHELABASE_STORAGE_S3_SECRET_KEY_FILE: /run/chelabase/secrets/storage-s3/secret-key
-  #   volumes:
-  #     - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/access-key, read_only: true, volume: {subpath: storage-s3/access-key}}
-  #     - {type: volume, source: secrets, target: /run/chelabase/secrets/storage-s3/secret-key, read_only: true, volume: {subpath: storage-s3/secret-key}}
 
   storage-broker:
     image: *neon-image
