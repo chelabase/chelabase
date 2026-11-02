@@ -22,7 +22,7 @@ use chelabase_metadata::{
     BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient, NewBranch,
 };
 use chelabase_nats::BranchJob;
-use chelabase_neon::ComputeBackend;
+use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
 use chelabase_secrets::{Purpose, open_credential};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use worker::config::RealWorker;
@@ -128,6 +128,58 @@ impl Fx {
         .await
     }
 
+    /// `sql` as `role`, committed.
+    async fn as_role_commit(&self, role: &str, sql: &str) -> String {
+        self.admin(&format!("BEGIN; SET LOCAL ROLE {role}; {sql}; COMMIT;"))
+            .await
+    }
+
+    /// The SQLSTATE `statement` fails with as `role` on `ep` (`ok` when it succeeds),
+    /// rolled back either way.
+    async fn code_on(&self, ep: &str, role: &str, statement: &str) -> String {
+        let quoted = format!("'{}'", statement.replace('\'', "''"));
+        let sql = format!(
+            "BEGIN;
+CREATE FUNCTION pg_temp.try(q text) RETURNS text LANGUAGE plpgsql AS $t$ BEGIN EXECUTE q; RETURN 'ok'; EXCEPTION WHEN OTHERS THEN RETURN SQLSTATE; END $t$;
+SET LOCAL ROLE {role};
+SELECT pg_temp.try({quoted});
+ROLLBACK;"
+        );
+        last_line_matching(
+            &self
+                .admin_on(ep, &sql)
+                .await
+                .unwrap_or_else(|e| panic!("{sql}: {e}")),
+        )
+    }
+
+    async fn code(&self, role: &str, statement: &str) -> String {
+        self.code_on(&self.ep, role, statement).await
+    }
+
+    /// `sql` as `user` with `password`, straight to the compute's Postgres (the proxy knows
+    /// only the roles in the compute spec).
+    async fn direct(&self, user: &str, password: &str, sql: &str) -> Result<String, String> {
+        let locator = DockerLocator::connect(
+            &std::env::var("CHELABASE_COMPUTE_NETWORK")
+                .unwrap_or_else(|_| "chelabase_compute".into()),
+            &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
+        )
+        .expect("the Docker client");
+        let addr = locator
+            .postgres_addr(&self.ep)
+            .await
+            .expect("the compute's Postgres address")
+            .expect("a published Postgres port");
+        let conn = format!(
+            "host={} port={} dbname={} sslmode=prefer",
+            addr.ip(),
+            addr.port(),
+            self.database
+        );
+        psql(&conn, user, password, sql).await
+    }
+
     /// SQL as the owner through the proxy.
     async fn owner(&self, sql: &str) -> Result<String, String> {
         psql(
@@ -185,16 +237,18 @@ const SHAPE_SQL: &str = "SELECT pg_catalog.md5(pg_catalog.string_agg(x, '|' ORDE
     FROM pg_proc p WHERE p.pronamespace = 'storage'::regnamespace
   UNION ALL SELECT a.attrelid::regclass || '.' || a.attname || ':' || coalesce(a.attacl::text, '')
     FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relnamespace = 'storage'::regnamespace AND a.attnum > 0
-  UNION ALL SELECT t.tgname || ':' || t.tgenabled FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+  UNION ALL SELECT t.tgname || ':' || t.tgenabled::text FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
     WHERE c.relnamespace = 'storage'::regnamespace AND NOT t.tgisinternal
   UNION ALL SELECT 'schema:' || n.nspowner::regrole || ':' || coalesce(n.nspacl::text, '') || ':' || coalesce(obj_description(n.oid, 'pg_namespace'), '')
     FROM pg_namespace n WHERE n.nspname = 'storage'
   UNION ALL SELECT 'policy:' || y.polname FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid WHERE c.relnamespace = 'storage'::regnamespace
 ) s";
 
-/// A bucket and an object, written as the storage role.
+/// A bucket and an object, written as the storage role (with the object's ticket).
 const SEED_SQL: &str = "BEGIN; SET LOCAL ROLE chelabase_storage;
 INSERT INTO storage.buckets (id, name) VALUES ('00000000-0000-0000-0000-0000000000b1', 'avatars');
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at)
+  VALUES ('00000000-0000-0000-0000-0000000000c1', '00000000-0000-0000-0000-0000000000b1', 'u1/me.png', 3, 'e1', now() + interval '5 minutes');
 INSERT INTO storage.objects (bucket_id, name, owner, size, etag, version_id)
   VALUES ('00000000-0000-0000-0000-0000000000b1', 'u1/me.png', '00000000-0000-0000-0000-0000000000a1', 3, 'e1', '00000000-0000-0000-0000-0000000000c1');
 COMMIT;";
@@ -216,7 +270,7 @@ async fn run(fx: &Fx) {
     // AC 1: both tables, chelabase_admin's, RLS enabled and forced, no policy.
     assert_eq!(
         fx.value("SELECT string_agg(relname || ' ' || relowner::regrole || ' ' || relrowsecurity || ' ' || relforcerowsecurity, ',' ORDER BY relname) FROM pg_class WHERE relnamespace = 'storage'::regnamespace AND relkind = 'r'").await,
-        "buckets chelabase_admin t t,objects chelabase_admin t t"
+        "buckets chelabase_admin true true,objects chelabase_admin true true,upload_tickets chelabase_admin false false"
     );
     assert_eq!(fx.value("SELECT count(*) FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid WHERE c.relnamespace = 'storage'::regnamespace").await, "0");
     assert_eq!(fx.value("SELECT rolbypassrls AND NOT rolsuper AND NOT rolcanlogin FROM pg_roles WHERE rolname = 'chelabase_storage'").await, "t");
@@ -251,10 +305,12 @@ async fn run(fx: &Fx) {
         "UPDATE storage.objects SET bucket_id = bucket_id, etag = 'forged'",
         "INSERT INTO storage.objects (bucket_id, name, version_id) VALUES ('00000000-0000-0000-0000-0000000000b1', 'x', gen_random_uuid())",
         "SET session_replication_role = replica; UPDATE storage.objects SET version_id = gen_random_uuid()",
+        "SET ROLE chelabase_storage",
     ] {
         let err = fx.owner_err(sql).await;
         assert!(
-            err.contains("42501")
+            err.contains("CB003")
+                || err.contains("42501")
                 || err.contains("must be owner")
                 || err.contains("permission denied"),
             "{sql}: {err}"
@@ -293,7 +349,7 @@ async fn run(fx: &Fx) {
     for sql in [
         "INSERT INTO storage.objects (name) VALUES ('x')",
         "INSERT INTO storage.objects (bucket_id, name) VALUES ('00000000-0000-0000-0000-0000000000b1', 'x')",
-        "UPDATE storage.objects SET size = 1",
+        "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES (gen_random_uuid(), gen_random_uuid(), 'x', 1, 'e', now())",
         "SELECT storage.create_policy('p', 'objects', 'SELECT', ARRAY['authenticated']::name[], 'true')",
     ] {
         let err = fx.as_role("authenticated", sql).await.expect_err(sql);
@@ -324,18 +380,96 @@ async fn run(fx: &Fx) {
         .await,
         "t"
     );
-    // Allowed columns only, under the policy.
-    let err = fx
-        .as_role(
-            "authenticated",
-            "UPDATE storage.objects SET version_id = gen_random_uuid()",
-        )
+    // Without an UPDATE policy an update reaches no row.
+    fx.as_role("authenticated", "UPDATE storage.objects SET size = 1")
         .await
-        .expect_err("version_id");
-    assert!(err.contains("permission denied"), "{err}");
+        .expect("an update no policy allows");
+    assert_eq!(fx.value("SELECT size FROM storage.objects").await, "3");
+
+    // Tickets: a caller's insert under its policy needs one; RLS (42501) and the ticket
+    // trigger (CB003) refuse with different codes.
+    fx.owner("SELECT storage.create_policy('insert_avatars', 'objects', 'INSERT', ARRAY['authenticated']::name[], NULL, E'bucket_id = ''00000000-0000-0000-0000-0000000000b1''::uuid AND size < 100')").await.expect("an insert policy");
+    let insert = |size: u32| {
+        format!(
+            "INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('00000000-0000-0000-0000-0000000000b1', 'u1/a.png', {size}, 'e2', '00000000-0000-0000-0000-0000000000c2')"
+        )
+    };
+    assert_eq!(
+        fx.code("authenticated", &insert(500)).await,
+        "42501",
+        "RLS refuses size 500"
+    );
+    assert_eq!(
+        fx.code("authenticated", &insert(5)).await,
+        "CB003",
+        "no ticket"
+    );
+    let mint = "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES ('00000000-0000-0000-0000-0000000000c2', '00000000-0000-0000-0000-0000000000b1', 'u1/a.png', 5, 'e2', now() + interval '5 minutes')";
+    // A ticket for other values doesn't do.
+    fx.as_role_commit("chelabase_storage", mint).await;
+    assert_eq!(
+        fx.code("authenticated", &insert(5).replace("'e2'", "'e3'"))
+            .await,
+        "CB003",
+        "another etag"
+    );
+    // Expiry beyond the cap, and a ticket from the owner (pg_write_all_data), are refused.
+    assert_eq!(
+        fx.code(
+            "chelabase_storage",
+            &mint.replace("c2'", "c9'").replace("5 minutes", "1 day")
+        )
+        .await,
+        "22023"
+    );
+    let err = fx.owner_err(&mint.replace("c2'", "c8'")).await;
+    assert!(err.contains("CB004"), "the owner mints: {err}");
+    assert_eq!(fx.code("authenticated", "INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at) VALUES (gen_random_uuid(), gen_random_uuid(), 'x', 1, 'e', now())").await, "42501");
+    // The matching ticket: stored once, the ticket gone; the same ticket again: CB003.
+    fx.as_role_commit("authenticated", &insert(5)).await;
+    assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets WHERE version_id = '00000000-0000-0000-0000-0000000000c2'").await, "0");
+    assert_eq!(
+        fx.value("SELECT size || ' ' || etag FROM storage.objects WHERE name = 'u1/a.png'")
+            .await,
+        "5 e2"
+    );
+    fx.as_role_commit(
+        "chelabase_storage",
+        "DELETE FROM storage.objects WHERE name = 'u1/a.png'",
+    )
+    .await;
+    assert_eq!(
+        fx.code("authenticated", &insert(5)).await,
+        "CB003",
+        "a used ticket"
+    );
+    // A rename changes no managed column: no ticket needed (RLS still decides).
+    fx.as_role_commit(
+        "chelabase_storage",
+        "UPDATE storage.objects SET name = 'u1/renamed.png' WHERE name = 'u1/me.png'",
+    )
+    .await;
+
+    // A ticket left on main when the branch is made.
+    fx.as_role_commit(
+        "chelabase_storage",
+        &mint
+            .replace("c2'", "c3'")
+            .replace("'u1/a.png'", "'u1/b.png'"),
+    )
+    .await;
 
     // AC (branch): a child has the parent's rows and its policy.
     let (_child, child_ep) = fx.child("storage-child").await;
+    // The child has the ticket row but not the timeline it was minted on: unusable there.
+    assert_eq!(last_line(&fx.admin_on(&child_ep, "SELECT count(*) FROM storage.upload_tickets WHERE version_id = '00000000-0000-0000-0000-0000000000c3'").await.unwrap()), "1");
+    assert_eq!(
+        fx.code_on(&child_ep, "authenticated", "INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('00000000-0000-0000-0000-0000000000b1', 'u1/b.png', 5, 'e2', '00000000-0000-0000-0000-0000000000c3')").await,
+        "CB003",
+        "a parent's ticket on the child"
+    );
+    // ...while on main it still works.
+    fx.as_role_commit("authenticated", "INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) VALUES ('00000000-0000-0000-0000-0000000000b1', 'u1/b.png', 5, 'e2', '00000000-0000-0000-0000-0000000000c3')").await;
     assert_eq!(last_line(&fx.admin_on(&child_ep, "SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = 'avatars'").await.unwrap()), "1");
     assert_eq!(
         last_line(
@@ -356,6 +490,75 @@ async fn run(fx: &Fx) {
     let json = serde_json::to_string(&model).unwrap();
     assert!(!json.contains("\"storage\""), "{json}");
 
+    // AC (pre-created role): whatever was made of chelabase_storage is undone by the next
+    // bootstrap, and a ticket from then is void.
+    fx.admin("CREATE ROLE st_member LOGIN; CREATE TABLE public.st_owned (a int); ALTER TABLE public.st_owned OWNER TO chelabase_storage;").await;
+    fx.admin(&format!("ALTER ROLE chelabase_storage LOGIN PASSWORD '{TAMPER_PASSWORD}' CONNECTION LIMIT 5; ALTER ROLE chelabase_storage SET work_mem = '1MB';
+GRANT chelabase_storage TO st_member WITH ADMIN OPTION; GRANT {OWNER} TO chelabase_storage;")).await;
+    fx.as_role_commit(
+        "chelabase_storage",
+        &mint
+            .replace("c2'", "c4'")
+            .replace("'u1/a.png'", "'u1/c.png'"),
+    )
+    .await;
+    fx.direct("chelabase_storage", TAMPER_PASSWORD, "SELECT 1")
+        .await
+        .expect("the tampered role logs in");
+    fx.worker
+        .bootstrap_data_api(
+            &fx.metadata.get_branch(fx.main).await.unwrap().unwrap(),
+            &fx.database,
+        )
+        .await
+        .expect("bootstrap after the tamper");
+    assert_eq!(
+        fx.value("SELECT rolcanlogin || ' ' || (rolpassword IS NULL) || ' ' || rolconnlimit || ' ' || rolbypassrls || ' ' || rolinherit FROM pg_authid WHERE rolname = 'chelabase_storage'").await,
+        "false true 0 true false"
+    );
+    assert_eq!(fx.value("SELECT coalesce(string_agg(array_to_string(setconfig, ','), ';'), '') FROM pg_db_role_setting WHERE setrole = 'chelabase_storage'::regrole").await, "search_path=pg_catalog, pg_temp");
+    assert_eq!(fx.value("SELECT count(*) FROM pg_auth_members WHERE roleid = 'chelabase_storage'::regrole OR member = 'chelabase_storage'::regrole").await, "0");
+    assert_eq!(
+        fx.value("SELECT relowner::regrole FROM pg_class WHERE oid = 'public.st_owned'::regclass")
+            .await,
+        OWNER
+    );
+    assert_eq!(
+        fx.value("SELECT count(*) FROM storage.upload_tickets")
+            .await,
+        "0",
+        "tickets from the tampered time are void"
+    );
+    let err = fx
+        .direct("chelabase_storage", TAMPER_PASSWORD, "SELECT 1")
+        .await
+        .expect_err("no login");
+    assert!(!err.is_empty());
+    // Neither the owner nor authenticator can become it.
+    let err = fx.owner_err("SET ROLE chelabase_storage").await;
+    assert!(err.contains("permission denied"), "{err}");
+    let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+    let authenticator_password = open_credential(
+        &fx.worker.key,
+        &main.id.to_string(),
+        Purpose::Authenticator,
+        main.authenticator_password_enc
+            .as_deref()
+            .expect("authenticator password"),
+    )
+    .unwrap();
+    let err = fx
+        .direct(
+            "authenticator",
+            &authenticator_password,
+            "SET ROLE chelabase_storage",
+        )
+        .await
+        .expect_err("authenticator");
+    assert!(err.contains("permission denied"), "{err}");
+    fx.admin("DROP TABLE public.st_owned; DROP ROLE st_member;")
+        .await;
+
     fx.owner("SELECT storage.drop_policy('own_rows', 'objects')")
         .await
         .expect("drop the policy");
@@ -367,6 +570,18 @@ async fn run(fx: &Fx) {
         ),
         "0"
     );
+}
+
+/// The password the tamper scenario gives `chelabase_storage`.
+const TAMPER_PASSWORD: &str = "tamper-Passw0rd-3c9e";
+
+/// The last line of `out` that looks like a SQLSTATE or `ok` (psql echoes BEGIN/SET/ROLLBACK).
+fn last_line_matching(out: &str) -> String {
+    out.lines()
+        .map(str::trim)
+        .rfind(|l| *l == "ok" || (l.len() == 5 && l.chars().all(|c| c.is_ascii_alphanumeric())))
+        .unwrap_or_else(|| panic!("no SQLSTATE in {out:?}"))
+        .to_string()
 }
 
 fn last_line(out: &str) -> String {

@@ -1337,3 +1337,20 @@ where
         Err(err) => err.into_response(),
     }
 }
+
+#[cfg(test)]
+mod storage_role_tests {
+    use super::*;
+
+    /// Object storage m3: no API-made role is named `chelabase_storage…` or joins one.
+    #[test]
+    fn storage_roles_are_reserved_for_memberships_and_names() {
+        for target in ["chelabase_storage", "chelabase_storage_x", "Chelabase_Storage"] {
+            let member_of = [target.to_string()];
+            let err = check_settings("app", "postgres", None, Some(&member_of)).expect_err(target);
+            assert_eq!(err.status, 422, "{target}");
+            assert!(check_any_role_name(target).is_err() || is_membership_reserved(target), "{target}");
+            assert_eq!(check_login_role_name(target), Err(RoleNameError::Reserved), "{target}");
+        }
+    }
+}
