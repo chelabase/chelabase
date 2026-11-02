@@ -60,7 +60,6 @@ export function DataApiTypes({ databaseId, branchId, databases, defaultDatabase 
   const field = "h-8 border border-input bg-background px-2 text-sm";
   return (
     <section aria-label="Generated types" className="min-w-0 space-y-2">
-      <h3 className="text-sm font-medium">Generated types</h3>
       <p className="text-xs text-muted-foreground">
         <code>db.ts</code> for this branch: the tables, views and functions a secret key with this role can reach.
       </p>
