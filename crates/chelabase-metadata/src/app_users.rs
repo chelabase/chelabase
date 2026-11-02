@@ -133,7 +133,7 @@ pub struct AppSession {
     pub id: Uuid,
     pub project_id: ProjectId,
     pub user_id: Uuid,
-    pub zitadel_session_id: String,
+    pub identity_session_id: String,
     pub created_at: DateTime<Utc>,
     pub last_used_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -145,7 +145,7 @@ pub struct NewAppSession<'a> {
     pub id: Uuid,
     pub project_id: ProjectId,
     pub user_id: Uuid,
-    pub zitadel_session_id: &'a str,
+    pub identity_session_id: &'a str,
     pub refresh_hash: [u8; 32],
     pub expires_at: DateTime<Utc>,
 }
@@ -156,7 +156,7 @@ impl std::fmt::Debug for NewAppSession<'_> {
             .field("id", &self.id)
             .field("project_id", &self.project_id)
             .field("user_id", &self.user_id)
-            .field("zitadel_session_id", &self.zitadel_session_id)
+            .field("identity_session_id", &self.identity_session_id)
             .field("refresh_hash", &"<redacted>")
             .field("expires_at", &self.expires_at)
             .finish()
@@ -238,7 +238,7 @@ fn session_from_row(r: &PgRow) -> AppSession {
         id: r.get("id"),
         project_id: ProjectId(r.get("project_id")),
         user_id: r.get("user_id"),
-        zitadel_session_id: r.get("zitadel_session_id"),
+        identity_session_id: r.get("identity_session_id"),
         created_at: r.get("created_at"),
         last_used_at: r.get("last_used_at"),
         expires_at: r.get("expires_at"),
@@ -612,14 +612,14 @@ impl MetadataClient {
 
     pub async fn insert_app_session(&self, s: &NewAppSession<'_>) -> Result<(), MetadataError> {
         sqlx::query(
-            "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+            "INSERT INTO app_sessions (id, project_id, user_id, identity_session_id, refresh_hash,
                  expires_at)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(s.id)
         .bind(s.project_id.as_uuid())
         .bind(s.user_id)
-        .bind(s.zitadel_session_id)
+        .bind(s.identity_session_id)
         .bind(s.refresh_hash.as_slice())
         .bind(s.expires_at)
         .execute(&self.pool)
@@ -630,7 +630,7 @@ impl MetadataClient {
     /// The session, revoked or not.
     pub async fn app_session(&self, id: Uuid) -> Result<Option<AppSession>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+            "SELECT id, project_id, user_id, identity_session_id, created_at, last_used_at,
                     expires_at, revoked_at
              FROM app_sessions WHERE id = $1",
         )
@@ -657,7 +657,7 @@ impl MetadataClient {
     ) -> Result<RefreshOutcome, MetadataError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, refresh_hash, prev_refresh_hash,
+            "SELECT id, project_id, user_id, identity_session_id, refresh_hash, prev_refresh_hash,
                     grace_refresh_sealed, grace_until, created_at, last_used_at, expires_at,
                     revoked_at, now() AS now
              FROM app_sessions WHERE id = $1 FOR UPDATE",
@@ -695,7 +695,7 @@ impl MetadataClient {
                      expires_at = LEAST(now() + make_interval(secs => $5),
                                         created_at + make_interval(secs => $6))
                  WHERE id = $1
-                 RETURNING id, project_id, user_id, zitadel_session_id, created_at,
+                 RETURNING id, project_id, user_id, identity_session_id, created_at,
                            last_used_at, expires_at, revoked_at",
             )
             .bind(id)
@@ -715,7 +715,7 @@ impl MetadataClient {
                 _ => {
                     let revoked = sqlx::query(
                         "UPDATE app_sessions SET revoked_at = now() WHERE id = $1
-                         RETURNING id, project_id, user_id, zitadel_session_id, created_at,
+                         RETURNING id, project_id, user_id, identity_session_id, created_at,
                                    last_used_at, expires_at, revoked_at",
                     )
                     .bind(id)
@@ -744,7 +744,7 @@ impl MetadataClient {
         cap: Duration,
     ) -> Result<PeekOutcome, MetadataError> {
         let row = sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, refresh_hash, prev_refresh_hash,
+            "SELECT id, project_id, user_id, identity_session_id, refresh_hash, prev_refresh_hash,
                     grace_until, grace_refresh_sealed IS NOT NULL AS has_sealed, created_at,
                     last_used_at, expires_at, revoked_at, now() AS now
              FROM app_sessions WHERE id = $1",
@@ -793,7 +793,7 @@ impl MetadataClient {
         Ok(sqlx::query(
             "UPDATE app_sessions SET revoked_at = now()
              WHERE id = $1 AND project_id = $2 AND revoked_at IS NULL
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(id)
@@ -816,7 +816,7 @@ impl MetadataClient {
             "UPDATE app_sessions SET revoked_at = now()
              WHERE id = $1 AND project_id = $2 AND revoked_at IS NULL
                AND (refresh_hash = $3 OR prev_refresh_hash = $3)
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(id)
@@ -842,7 +842,7 @@ impl MetadataClient {
              WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL
                AND ($3::uuid IS NULL OR id <> $3)
                AND ($4::timestamptz IS NULL OR created_at < $4)
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(project.as_uuid())
@@ -861,7 +861,7 @@ impl MetadataClient {
         Ok(sqlx::query(
             "UPDATE app_sessions SET revoked_at = now()
              WHERE project_id = $1 AND revoked_at IS NULL
-             RETURNING id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+             RETURNING id, project_id, user_id, identity_session_id, created_at, last_used_at,
                        expires_at, revoked_at",
         )
         .bind(project.as_uuid())
@@ -879,7 +879,7 @@ impl MetadataClient {
         user: Uuid,
     ) -> Result<Vec<AppSession>, MetadataError> {
         Ok(sqlx::query(
-            "SELECT id, project_id, user_id, zitadel_session_id, created_at, last_used_at,
+            "SELECT id, project_id, user_id, identity_session_id, created_at, last_used_at,
                     expires_at, revoked_at
              FROM app_sessions
              WHERE project_id = $1 AND user_id = $2 AND revoked_at IS NULL AND expires_at > now()

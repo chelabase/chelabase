@@ -940,7 +940,7 @@ fn add_member(w: &FakeWorker, db: chelabase_types::DatabaseId, roles: &[&str]) -
     state.members.push(MemberRecord {
         id: member,
         tenant_id: record.tenant_id,
-        zitadel_user_id: format!("z-{member}"),
+        identity_user_id: format!("z-{member}"),
         email: None,
         display_name: "m".into(),
         tenant_admin: false,
@@ -2405,7 +2405,7 @@ async fn reconcile_reads_grant_sources() {
         state.members.push(MemberRecord {
             id: lonely,
             tenant_id: record.tenant_id,
-            zitadel_user_id: format!("z-{lonely}"),
+            identity_user_id: format!("z-{lonely}"),
             email: None,
             display_name: "o".into(),
             tenant_admin: false,
@@ -2615,7 +2615,7 @@ fn add_tenant_admin(w: &FakeWorker, db: chelabase_types::DatabaseId) -> Uuid {
     w.metadata.state().members.push(MemberRecord {
         id: member,
         tenant_id: record.tenant_id,
-        zitadel_user_id: format!("z-{member}"),
+        identity_user_id: format!("z-{member}"),
         email: None,
         display_name: "admin".into(),
         tenant_admin: true,

@@ -251,7 +251,7 @@ pub struct FakeState {
     /// T6: every personal-login record (any database), as `personal_login_records` reads them
     /// (`qualifies` is whatever the test sets).
     pub personal_logins: Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>,
-    /// T7: each member's personal-row endpoints, as `revoke_logins_for_zitadel_user` returns
+    /// T7: each member's personal-row endpoints, as `revoke_logins_for_identity_user` returns
     /// them (revoked logins' rows included, as the real read does).
     pub login_endpoints: HashMap<uuid::Uuid, Vec<chelabase_metadata::personal_logins::LoginEndpoint>>,
     /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
@@ -703,15 +703,15 @@ impl FakeMetadata {
         self.state().project_auth.get(&project).cloned()
     }
 
-    /// A live app session of `user`, with Zitadel session `zitadel_session_id`.
-    pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, zitadel_session_id: &str) -> uuid::Uuid {
+    /// A live app session of `user`, with Zitadel session `identity_session_id`.
+    pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, identity_session_id: &str) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now();
         self.state().app_sessions.push(AppSession {
             id,
             project_id: project,
             user_id: user,
-            zitadel_session_id: zitadel_session_id.to_string(),
+            identity_session_id: identity_session_id.to_string(),
             created_at: now,
             last_used_at: now,
             expires_at: now + chrono::Duration::days(30),
@@ -2366,7 +2366,7 @@ impl WorkerMetadata for FakeMetadata {
             .members
             .iter()
             .filter(|m| m.offboarded)
-            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
+            .map(|m| (m.tenant_id, m.id, m.identity_user_id.clone()))
             .collect();
         rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
         Ok(rows)
@@ -2377,13 +2377,13 @@ impl WorkerMetadata for FakeMetadata {
     async fn clear_offboarded(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<bool, MetadataError> {
         let mut state = self.write("clear_offboarded")?;
         let Some(m) = state
             .members
             .iter_mut()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id && m.offboarded)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id && m.offboarded)
         else {
             return Ok(false);
         };
@@ -2486,7 +2486,7 @@ impl WorkerMetadata for FakeMetadata {
             .members
             .iter()
             .filter(|m| state.personal_logins.iter().any(|l| l.member_id == m.id && !l.revoked))
-            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
+            .map(|m| (m.tenant_id, m.id, m.identity_user_id.clone()))
             .collect();
         rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
         Ok(rows)
@@ -2494,18 +2494,18 @@ impl WorkerMetadata for FakeMetadata {
 
     /// As the metadata's: the tenant's member with this Zitadel user has every login revoked
     /// (`revoked`, no verifier) and the member's endpoints come back; an unknown user: empty.
-    async fn revoke_logins_for_zitadel_user(
+    async fn revoke_logins_for_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
         // `write` journals the call once (the tests count one entry per revocation).
-        let mut state = self.write("revoke_logins_for_zitadel_user")?;
+        let mut state = self.write("revoke_logins_for_identity_user")?;
         let state = &mut *state;
         let Some(member) = state
             .members
             .iter()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id)
             .map(|m| m.id)
         else {
             return Ok(Vec::new());

@@ -5555,7 +5555,7 @@ impl Au {
             id: uuid::Uuid::new_v4(),
             project_id: self.project.id,
             user_id: user,
-            zitadel_session_id: zitadel_session.into(),
+            identity_session_id: zitadel_session.into(),
             created_at: now,
             last_used_at: now,
             expires_at: now + chrono::Duration::days(30),
@@ -6005,7 +6005,7 @@ async fn get_user_and_sessions() {
     for key in ["id", "created_at", "last_used_at", "expires_at"] {
         assert!(sessions[0][key].is_string(), "{key}");
     }
-    assert!(sessions[0].get("zitadel_session_id").is_none());
+    assert!(sessions[0].get("identity_session_id").is_none());
     let (status, _) = au.call(Method::GET, &format!("/users/{}", uuid::Uuid::new_v4()), None).await;
     assert_eq!(status, 404);
 }
@@ -6781,7 +6781,7 @@ impl Branching {
 
     /// The member row of `sub` (made by its first request).
     fn member_of_sub(&self, sub: &str) -> uuid::Uuid {
-        self.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == sub).expect("a member row").id
+        self.metadata.members.lock().unwrap().iter().find(|m| m.identity_user_id == sub).expect("a member row").id
     }
 
     async fn run_as(&self, sub: &str, branch: BranchId, role: Option<&str>) -> reqwest::Response {
@@ -9275,7 +9275,7 @@ async fn removed_member_is_refused_with_a_valid_token() {
     assert_eq!(code_of(&err), "not_found");
     // The request neither revives the member nor makes a new one.
     assert_eq!(w.metadata.member(w.tenant, "bob").unwrap().status, MemberStatus::Removed);
-    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "bob").count(), 1);
+    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.identity_user_id == "bob").count(), 1);
 
     // A removed tenant admin is refused too, on every project.
     w.metadata.set_member(w.tenant, DEFAULT_SUB, |m| m.status = MemberStatus::Removed);
@@ -9466,7 +9466,7 @@ async fn open_signup_creates_pending_member() {
     let path = format!("/v1/databases/{}", w.db);
     let err = error_of(w.app.send_as("hal", "org-1", Method::GET, &path, None).await, 403).await;
     assert_eq!(code_of(&err), "pending_approval");
-    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.zitadel_user_id == "hal").count(), 1);
+    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.identity_user_id == "hal").count(), 1);
     assert_eq!(w.metadata.events.lock().unwrap().len(), 1, "no second event");
 }
 
@@ -9707,7 +9707,7 @@ async fn pending_never_becomes_first_admin() {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
-    metadata.members.lock().unwrap().retain(|m| m.zitadel_user_id != DEFAULT_SUB); // no admin yet
+    metadata.members.lock().unwrap().retain(|m| m.identity_user_id != DEFAULT_SUB); // no admin yet
     metadata.open_signups.lock().unwrap().insert(tenant, true);
     let pat = metadata.add_member(tenant, "pat", MemberStatus::Pending, false);
     let app = spawn_app_full(metadata.clone(), FakeJobs::default(), "http://127.0.0.1:9", Mode::SelfHosted, 10).await;
@@ -10543,7 +10543,7 @@ async fn act_as_chain_reachable_role_allowed() {
     let ok = body_of(w.app.send_as("dan", "org-1", Method::POST, &console, Some(query.clone())).await).await;
     assert!(!access_refusal(&ok), "{ok}");
     // The sql editor takes the same chain, through dan's member role (granted `billing_admin`).
-    let dan = w.metadata.members.lock().unwrap().iter().find(|m| m.zitadel_user_id == "dan").unwrap().id;
+    let dan = w.metadata.members.lock().unwrap().iter().find(|m| m.identity_user_id == "dan").unwrap().id;
     let role_name = chelabase_types::role_name::member_role_name(dan);
     let password_enc =
         chelabase_secrets::seal_member_role_password(&w.app.key, w.dev.as_uuid(), &role_name, "pw").unwrap();
@@ -10845,7 +10845,7 @@ async fn invite_creates_zitadel_user_and_invited_member() {
     // Metadata: an invited member with its (inert) grant, an invite, one event.
     let id: uuid::Uuid = member["id"].as_str().unwrap().parse().unwrap();
     let stored = t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == id).cloned().unwrap();
-    assert_eq!((stored.zitadel_user_id.as_str(), stored.status), (user.id.as_str(), MemberStatus::Invited));
+    assert_eq!((stored.identity_user_id.as_str(), stored.status), (user.id.as_str(), MemberStatus::Invited));
     assert_eq!(t.grant_of(id), Some(GrantRow { platform_role: PlatformRole::Developer, pg_roles: vec!["app".into()] }));
     assert_eq!(t.actions(), vec!["invite_created"]);
     // Everyone in the tenant sees the invited member and its open invite.

@@ -217,14 +217,14 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         &self,
         zitadel_org_id: &str,
         nonce_hash: [u8; 32],
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError>> + Send;
 
     /// What the open invite of this Zitadel user shows (`None` when it has none).
     fn open_invite_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
 
     /// [`MetadataClient::invite_expiry_for_user`]: the stored expiry of this Zitadel user's
@@ -232,7 +232,7 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     /// (`None` when it has none).
     fn invite_expiry_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> impl Future<Output = Result<Option<(DateTime<Utc>, bool)>, MetadataError>> + Send;
 
     /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
@@ -244,10 +244,10 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     /// Members hub D4: the tenant member with this Zitadel user loses every live personal
     /// login (`identity_offboarded`); returns every personal row of theirs (revoked ones
     /// included); an unknown user has none.
-    fn revoke_logins_for_zitadel_user(
+    fn revoke_logins_for_identity_user(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> impl Future<
         Output = Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError>,
     > + Send;
@@ -257,7 +257,7 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     fn clear_offboarded(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 }
 
@@ -420,15 +420,15 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn open_invite_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError> {
-        MetadataClient::open_invite_for_user(self, zitadel_user_id).await
+        MetadataClient::open_invite_for_user(self, identity_user_id).await
     }
     async fn invite_expiry_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
-        MetadataClient::invite_expiry_for_user(self, zitadel_user_id).await
+        MetadataClient::invite_expiry_for_user(self, identity_user_id).await
     }
     async fn signup_facts(&self, zitadel_org_id: &str) -> Result<Option<SignUpFacts>, MetadataError> {
         let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
@@ -464,13 +464,13 @@ impl NeonMetadataPort for MetadataClient {
         &self,
         zitadel_org_id: &str,
         nonce_hash: [u8; 32],
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError> {
         let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
             return Ok(None);
         };
-        MetadataClient::claim_setup(self, tenant, nonce_hash, zitadel_user_id, replace_stale)
+        MetadataClient::claim_setup(self, tenant, nonce_hash, identity_user_id, replace_stale)
             .await
             .map(Some)
     }
@@ -480,19 +480,19 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<chelabase_types::TenantId>, MetadataError> {
         MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await
     }
-    async fn revoke_logins_for_zitadel_user(
+    async fn revoke_logins_for_identity_user(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        MetadataClient::revoke_logins_for_zitadel_user(self, tenant, zitadel_user_id).await
+        MetadataClient::revoke_logins_for_identity_user(self, tenant, identity_user_id).await
     }
     async fn clear_offboarded(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<bool, MetadataError> {
-        MetadataClient::clear_offboarded(self, tenant, zitadel_user_id).await
+        MetadataClient::clear_offboarded(self, tenant, identity_user_id).await
     }
 }
 

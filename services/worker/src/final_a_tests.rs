@@ -65,7 +65,7 @@ fn member(tenant: TenantId, zitadel: &str) -> MemberRecord {
     MemberRecord {
         id: Uuid::new_v4(),
         tenant_id: tenant,
-        zitadel_user_id: zitadel.to_string(),
+        identity_user_id: zitadel.to_string(),
         email: None,
         display_name: "m".into(),
         tenant_admin: false,
@@ -509,7 +509,7 @@ async fn a_pass_where_every_user_is_missing_revokes_nothing() {
     assert!(
         !entries(&w.metadata.journal)
             .iter()
-            .any(|e| e.starts_with("metadata.revoke_logins_for_zitadel_user")),
+            .any(|e| e.starts_with("metadata.revoke_logins_for_identity_user")),
         "{:?}",
         entries(&w.metadata.journal)
     );

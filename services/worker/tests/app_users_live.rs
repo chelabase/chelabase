@@ -299,7 +299,7 @@ impl Fx {
                 id: sid,
                 project_id: self.project,
                 user_id: user,
-                zitadel_session_id: "app-users-live",
+                identity_session_id: "app-users-live",
                 refresh_hash: rand_hash(),
                 expires_at: now + chrono::Duration::hours(1),
             })

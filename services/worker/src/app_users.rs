@@ -436,7 +436,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| format!("revoking the user's sessions: {e}"))?;
         for session in revoked {
             if let Err(e) = zitadel
-                .delete_session_admin(&session.zitadel_session_id)
+                .delete_session_admin(&session.identity_session_id)
                 .await
             {
                 warn!(%project, %user, session = %session.id, "deleting the Zitadel session: {e}");

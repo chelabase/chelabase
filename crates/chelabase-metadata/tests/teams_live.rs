@@ -158,7 +158,7 @@ impl Scratch {
             .await
             .unwrap()
             .unwrap()
-            .zitadel_user_id
+            .identity_user_id
     }
 }
 
@@ -532,7 +532,7 @@ async fn invite_teams_are_deduplicated_and_revoking_drops_them() {
     };
     let teams = [sx.clone(), sx.clone()];
     let invite = NewInvite {
-        zitadel_user_id: "zi",
+        identity_user_id: "zi",
         email: "i@x.com",
         expires_at: Utc::now() + Duration::days(7),
         token_hash: [7; 32],

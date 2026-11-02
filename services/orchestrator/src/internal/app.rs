@@ -179,7 +179,7 @@ async fn end_zitadel_sessions<M, L>(state: &InternalState<M, L>, sessions: &[App
         return;
     };
     for s in sessions {
-        if let Err(err) = zitadel.delete_session_admin(&s.zitadel_session_id).await {
+        if let Err(err) = zitadel.delete_session_admin(&s.identity_session_id).await {
             warn!(session_id = %s.id, "deleting the Zitadel session: {err}");
         }
     }
@@ -304,7 +304,7 @@ where
 struct CreateSession {
     project_id: ProjectId,
     user_id: Uuid,
-    zitadel_session_id: String,
+    identity_session_id: String,
 }
 
 async fn create_session<M, L>(
@@ -323,7 +323,7 @@ where
         id,
         project_id: body.project_id,
         user_id: body.user_id,
-        zitadel_session_id: &body.zitadel_session_id,
+        identity_session_id: &body.identity_session_id,
         refresh_hash: token_hash(&token),
         expires_at,
     };
@@ -616,7 +616,7 @@ where
                 // 500, so Zitadel delivers the event again (nothing after it has run).
                 let rows = match state
                     .metadata
-                    .revoke_logins_for_zitadel_user(tenant, &event.aggregate_id)
+                    .revoke_logins_for_identity_user(tenant, &event.aggregate_id)
                     .await
                 {
                     Ok(rows) => rows,

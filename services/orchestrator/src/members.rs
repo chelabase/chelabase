@@ -317,7 +317,7 @@ pub trait MembersPort: Send + Sync + 'static {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
@@ -612,13 +612,13 @@ impl MembersPort for MetadataClient {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         grants: &[(Uuid, GrantRow)],
         teams: &[TeamSeen],
     ) -> Result<MemberListing, AccessWriteError> {
-        MetadataClient::add_existing_user(self, actor, tenant, zitadel_user_id, email, name, grants, teams)
+        MetadataClient::add_existing_user(self, actor, tenant, identity_user_id, email, name, grants, teams)
             .await
     }
 
@@ -2131,7 +2131,7 @@ where
             ));
         }
         Some(EmailMatch::One(user)) => {
-            match state.metadata.member_by_zitadel(tenant, &user.id).await {
+            match state.metadata.member_by_identity_user(tenant, &user.id).await {
                 Ok(Some(m)) if m.status != MemberStatus::Removed => m,
                 Ok(row) => {
                     let usable = user.state == UserState::Active && user.has_password;
@@ -2194,7 +2194,7 @@ where
     info!(request_id = %principal.request_id, member_id = %existing.id, changed = changed.len(), "invite: granted to an existing member");
     if !changed.is_empty() {
         // A grant replaced by a lower one takes access away like a grant put (P4).
-        let who = [(existing.id, existing.zitadel_user_id.clone())];
+        let who = [(existing.id, existing.identity_user_id.clone())];
         access_changed_for(state, principal.tenant_id, &who, changed).await;
     }
     let member = match member_view(state, principal, existing.clone()).await {
@@ -2364,7 +2364,7 @@ where
                 actor,
                 principal.tenant_id,
                 NewInvite {
-                    zitadel_user_id: &user,
+                    identity_user_id: &user,
                     email,
                     expires_at,
                     token_hash: token.hash,
@@ -2807,7 +2807,7 @@ where
     }
     if changed {
         info!(request_id = %principal.request_id, member_id = %id, tenant_admin = body.tenant_admin, "member: tenant admin changed");
-        access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], Vec::new()).await;
+        access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], Vec::new()).await;
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
@@ -2861,7 +2861,7 @@ where
             .map_err(|err| write_failed("remove member", err, "member not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, "member: removed");
-    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
@@ -2875,10 +2875,10 @@ where
             .await
             .map_err(|err| internal("remove member: other memberships", err))
     );
-    if !shared && let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
+    if !shared && let Err(err) = deactivate_for_removal(z, &m.identity_user_id).await {
         return zitadel_failed("remove member: deactivate user", &err).into_response();
     }
-    if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
+    if let Err(err) = z.delete_user_sessions(&m.identity_user_id).await {
         return zitadel_failed("remove member: end sessions", &err).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
@@ -2955,7 +2955,7 @@ where
         }
     };
     info!(request_id = %principal.request_id, member_id = %id, grants = rows.len(), teams = seen.len(), "member: approved");
-    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], invite_projects(&rows, &seen)).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], invite_projects(&rows, &seen)).await;
     let access = written_access(&listing.member, &visible, &rows, &seen);
     Json(Member::new(listing, None, access)).into_response()
 }
@@ -3009,7 +3009,7 @@ where
                 .map_err(|err| write_failed("decline member", err, "member not found"))
         );
         info!(request_id = %principal.request_id, member_id = %id, "member: declined");
-        access_changed(&state, principal.tenant_id, Some(&m.zitadel_user_id));
+        access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
     }
     let z = tri!(admin_zitadel(&state));
     // As a removal: deactivated only when this was the user's last membership.
@@ -3020,10 +3020,10 @@ where
             .await
             .map_err(|err| internal("decline member: other memberships", err))
     );
-    if !shared && let Err(err) = deactivate_for_removal(z, &m.zitadel_user_id).await {
+    if !shared && let Err(err) = deactivate_for_removal(z, &m.identity_user_id).await {
         return zitadel_failed("decline member: deactivate user", &err).into_response();
     }
-    if let Err(err) = z.delete_user_sessions(&m.zitadel_user_id).await {
+    if let Err(err) = z.delete_user_sessions(&m.identity_user_id).await {
         return zitadel_failed("decline member: end sessions", &err).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
@@ -3140,15 +3140,15 @@ where
     if m.status == MemberStatus::Active {
         info!(request_id = %principal.request_id, member_id = %id, "member: suspended");
     }
-    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
     let z = tri!(admin_zitadel(&state));
     // The sessions end even when the lock failed: one made while the user was reactivated
     // doesn't survive the 503.
-    let locked = lock_for_suspension(z, &m.zitadel_user_id).await;
-    let ended = z.delete_user_sessions(&m.zitadel_user_id).await;
+    let locked = lock_for_suspension(z, &m.identity_user_id).await;
+    let ended = z.delete_user_sessions(&m.identity_user_id).await;
     if let Err(err) = locked {
         return zitadel_step_failed("suspend member: lock user", &err, "suspend").into_response();
     }
@@ -3200,20 +3200,20 @@ where
     );
     if m.status == MemberStatus::Suspended {
         info!(request_id = %principal.request_id, member_id = %id, "member: reinstated");
-        access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], projects).await;
+        access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], projects).await;
         if m.tenant_admin {
             reconcile_tenant(&state, principal.tenant_id).await;
         }
     }
     let z = tri!(admin_zitadel(&state));
-    if let Err(err) = z.unlock_user(&m.zitadel_user_id).await {
+    if let Err(err) = z.unlock_user(&m.identity_user_id).await {
         return zitadel_step_failed("reinstate member: unlock user", &err, "reinstate").into_response();
     }
     // A suspend whose lock failed after its reactivate left the user inactive again (see
     // `lock_for_suspension`): reinstating instead of retrying it reactivates the user, so the
     // member can sign in.
-    let reactivated = match z.get_user(&m.zitadel_user_id).await {
-        Ok(Some(u)) if u.state == UserState::Inactive => z.reactivate_user_settled(&m.zitadel_user_id).await,
+    let reactivated = match z.get_user(&m.identity_user_id).await {
+        Ok(Some(u)) if u.state == UserState::Inactive => z.reactivate_user_settled(&m.identity_user_id).await,
         Ok(_) => Ok(()),
         Err(err) => Err(err),
     };
@@ -3290,7 +3290,7 @@ where
     };
     info!(request_id = %principal.request_id, member_id = %id, revoked = live, "member: postgres access revoked");
     let rotated_branches = rotated_branches(&state, id, &touched).await;
-    access_changed_for(&state, principal.tenant_id, &[(id, m.zitadel_user_id.clone())], touched).await;
+    access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
@@ -3481,12 +3481,12 @@ where
     let z = tri!(admin_zitadel(&state));
     let mut reset = false;
     if delivery == Delivery::Link {
-        match z.get_user(&m.zitadel_user_id).await {
+        match z.get_user(&m.identity_user_id).await {
             Ok(Some(u)) if u.has_password => return link_refused(z).await.into_response(),
             Ok(_) => {}
             Err(err) => return zitadel_failed("resend invite: read user", &err).into_response(),
         }
-        match z.has_auth_methods(&m.zitadel_user_id).await {
+        match z.has_auth_methods(&m.identity_user_id).await {
             Ok(true) => return link_refused(z).await.into_response(),
             // Gone: the code call below says so.
             Ok(false) => {}
@@ -3495,7 +3495,7 @@ where
         }
     } else {
         // Gone: the code call below says so.
-        match z.get_user(&m.zitadel_user_id).await {
+        match z.get_user(&m.identity_user_id).await {
             Ok(Some(u)) => match needs_reset_code(z, &u).await {
                 Ok(r) => reset = r,
                 Err(err) => return zitadel_failed("resend invite: read auth methods", &err).into_response(),
@@ -3507,11 +3507,11 @@ where
     // A new token per send: the earlier link's stops describing the invite.
     let token = InviteToken::mint();
     let sent = match delivery {
-        Delivery::Email => mail_code(&state, z, &m.zitadel_user_id, reset, &token).await.map(|()| None),
+        Delivery::Email => mail_code(&state, z, &m.identity_user_id, reset, &token).await.map(|()| None),
         Delivery::Link => z
-            .return_invite_code(&m.zitadel_user_id)
+            .return_invite_code(&m.identity_user_id)
             .await
-            .map(|code| Some(invite_link(&state, &m.zitadel_user_id, &code, &token))),
+            .map(|code| Some(invite_link(&state, &m.identity_user_id, &code, &token))),
     };
     let invite_url = match sent {
         Ok(url) => url,
@@ -3593,7 +3593,7 @@ where
     // I4: the metadata revoke first, under the member's lock; then Zitadel. A revoked invite
     // whose member is still removed retries the Zitadel step; any other closed one is 409.
     let user = if revoked.is_some() && accepted.is_none() && m.status == MemberStatus::Removed {
-        m.zitadel_user_id.clone()
+        m.identity_user_id.clone()
     } else if revoked.is_some() || accepted.is_some() || m.status != MemberStatus::Invited {
         return closed();
     } else {
@@ -3734,7 +3734,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, platform_role = grant.platform_role.as_str(), "grant: put");
-        access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
+        access_changed_for(&state, principal.tenant_id, &[(member_id, member.identity_user_id.clone())], vec![id]).await;
     }
     match tri!(project_grant(&state, id, member_id).await) {
         Some(view) => Json(view).into_response(),
@@ -3800,7 +3800,7 @@ where
         }
     }
     info!(request_id = %principal.request_id, project_id = %id, %member_id, "grant: deleted");
-    access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
+    access_changed_for(&state, principal.tenant_id, &[(member_id, member.identity_user_id.clone())], vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -3905,7 +3905,7 @@ where
     };
     if changed {
         info!(request_id = %principal.request_id, project_id = %id, %member_id, database_id = %body.database_id, "override: put");
-        access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
+        access_changed_for(&state, principal.tenant_id, &[(member_id, member.identity_user_id.clone())], vec![id]).await;
     }
     let mut pg_roles = o.pg_roles;
     if let Some(roles) = pg_roles.as_mut() {
@@ -3985,7 +3985,7 @@ where
         }
     }
     info!(request_id = %principal.request_id, project_id = %id, %member_id, %database_id, "override: deleted");
-    access_changed_for(&state, principal.tenant_id, &[(member_id, member.zitadel_user_id.clone())], vec![id]).await;
+    access_changed_for(&state, principal.tenant_id, &[(member_id, member.identity_user_id.clone())], vec![id]).await;
     StatusCode::NO_CONTENT.into_response()
 }
 

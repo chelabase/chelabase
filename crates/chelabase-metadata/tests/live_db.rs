@@ -506,7 +506,7 @@ impl KeyCheckScratch {
 async fn insert_grace_session(client: &MetadataClient, grace_secs: f64) -> uuid::Uuid {
     let session = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+        "INSERT INTO app_sessions (id, project_id, user_id, identity_session_id, refresh_hash,
                                    grace_refresh_sealed, grace_until, expires_at)
          VALUES ($1, $2, gen_random_uuid(), 'key-check', decode('00', 'hex'), 'v1:x',
                  now() + make_interval(secs => $3), now() + interval '1 hour')",
@@ -570,7 +570,7 @@ impl SealedFixture {
             ("member_branch_roles", "password_enc") => {
                 let member = uuid::Uuid::new_v4();
                 sqlx::query(
-                    "INSERT INTO members (id, tenant_id, zitadel_user_id, status)
+                    "INSERT INTO members (id, tenant_id, identity_user_id, status)
                      VALUES ($1, $2, $3, 'active')",
                 )
                 .bind(member)
@@ -5537,7 +5537,7 @@ fn new_session<'a>(project: ProjectId, user: uuid::Uuid, refresh: u8) -> NewAppS
         id: uuid::Uuid::new_v4(),
         project_id: project,
         user_id: user,
-        zitadel_session_id: "zs-1",
+        identity_session_id: "zs-1",
         refresh_hash: hash(refresh),
         expires_at: chrono::Utc::now() + chrono::Duration::days(1),
     }
@@ -8423,4 +8423,87 @@ async fn an_exemption_name_may_hold_any_character_but_nul() {
     cleanup(&client, id).await;
     assert!(added.unwrap());
     assert_eq!(listed.unwrap(), ["a\u{1}b"]);
+}
+
+// --- Identity ids -----------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn identity_id_columns_renamed() {
+    let client = client().await;
+    let pool = client.pool();
+    for (table, column) in [
+        ("members", "identity_user_id"),
+        ("invites", "identity_user_id"),
+        ("setup_claims", "identity_user_id"),
+        ("app_sessions", "identity_session_id"),
+    ] {
+        let found: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(found, 1, "{table}.{column} exists");
+    }
+    let old: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' \
+         AND column_name IN ('zitadel_user_id', 'zitadel_session_id')",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(old, 0, "no column keeps the old name");
+    let constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint WHERE conrelid IN ('public.members'::regclass, 'public.setup_claims'::regclass) \
+         AND conname LIKE '%identity_user_id%' ORDER BY conname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(constraints, ["members_tenant_id_identity_user_id_key", "setup_claims_identity_user_id_check"]);
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname LIKE '%zitadel_user_id%' OR conname LIKE '%zitadel_session_id%'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0, "no constraint keeps the old name");
+}
+
+#[tokio::test]
+#[ignore]
+async fn members_unique_identity_user_per_tenant() {
+    let client = client().await;
+    let pool = client.pool();
+    let user = format!("dup-{}", hex32());
+    let insert = "INSERT INTO members (id, tenant_id, identity_user_id, status) VALUES ($1, $2, $3, 'active')";
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    sqlx::query(insert).bind(first).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await.unwrap();
+    let dup = sqlx::query(insert).bind(second).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await;
+    sqlx::query("DELETE FROM members WHERE id = $1").bind(first).execute(pool).await.unwrap();
+    let err = dup.expect_err("a second row for the same user in the tenant is refused");
+    let constraint = err.as_database_error().and_then(|e| e.constraint().map(str::to_string));
+    assert_eq!(constraint.as_deref(), Some("members_tenant_id_identity_user_id_key"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn search_path_pinned_and_chelabase_schema_owned() {
+    let client = client().await;
+    for _ in 0..3 {
+        let path: String = sqlx::query_scalar("SHOW search_path").fetch_one(client.pool()).await.unwrap();
+        assert_eq!(path, "public");
+    }
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'chelabase'",
+    )
+    .fetch_optional(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner.as_deref(), Some("chelabase"));
 }

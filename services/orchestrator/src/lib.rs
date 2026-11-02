@@ -591,10 +591,10 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<chelabase_metadata::BranchBusy>, MetadataError>> + Send;
 
     /// The tenant's member with this Zitadel user id, whatever its status.
-    fn member_by_zitadel(
+    fn member_by_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> impl Future<Output = Result<Option<MemberRecord>, MetadataError>> + Send;
 
     /// The caller's member row, made (or an invited one activated) on its first request, with
@@ -605,7 +605,7 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
     fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
@@ -1198,24 +1198,24 @@ impl MetadataPort for MetadataClient {
         MetadataClient::branch_has_busy_merge(self, branch).await
     }
 
-    async fn member_by_zitadel(
+    async fn member_by_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<MemberRecord>, MetadataError> {
-        MetadataClient::member_by_zitadel(self, tenant, zitadel_user_id).await
+        MetadataClient::member_by_identity_user(self, tenant, identity_user_id).await
     }
 
     async fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
     ) -> Result<MemberRecord, MetadataError> {
         // The setup-bound claim: only the account a code-gated sign-up bound claims the admin.
-        MetadataClient::admit_member(self, tenant, zitadel_user_id, email, name, admission).await
+        MetadataClient::admit_member(self, tenant, identity_user_id, email, name, admission).await
     }
 
     async fn grant_sources(
@@ -1959,7 +1959,7 @@ async fn resolve_member<M: MetadataPort, J>(
     }
     let existing = state
         .metadata
-        .member_by_zitadel(tenant, &caller.sub)
+        .member_by_identity_user(tenant, &caller.sub)
         .await
         .map_err(failed)?;
     let existing = match existing {
@@ -2175,7 +2175,7 @@ pub(crate) async fn read_only_principal<M: MetadataPort, J>(
     let Some(tenant_id) = lookup_tenant(state, &claims.org_id).await? else {
         return Ok(None);
     };
-    let member = state.metadata.member_by_zitadel(tenant_id, &claims.sub).await?;
+    let member = state.metadata.member_by_identity_user(tenant_id, &claims.sub).await?;
     Ok(Some(AuthPrincipal {
         sub: claims.sub.clone(),
         org_id: claims.org_id.clone(),

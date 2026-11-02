@@ -71,7 +71,7 @@ pub trait Metadata: Send + Sync {
     fn bootstrap_admin(
         &self,
         tenant: Uuid,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: Option<&str>,
     ) -> impl Future<Output = Result<()>> + Send;
 }
@@ -198,11 +198,11 @@ impl Metadata for SqlMetadata {
     async fn bootstrap_admin(
         &self,
         tenant: Uuid,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: Option<&str>,
     ) -> Result<()> {
         self.client
-            .bootstrap_admin(TenantId(tenant), zitadel_user_id, email.unwrap_or(""))
+            .bootstrap_admin(TenantId(tenant), identity_user_id, email.unwrap_or(""))
             .await?;
         Ok(())
     }

@@ -33,7 +33,7 @@ pub struct AppBranchInfo {
 pub struct CreateSession {
     pub project_id: Uuid,
     pub user_id: Uuid,
-    pub zitadel_session_id: String,
+    pub identity_session_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

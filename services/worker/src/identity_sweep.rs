@@ -100,7 +100,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             }
             match self
                 .metadata
-                .revoke_logins_for_zitadel_user(*tenant, zitadel_user)
+                .revoke_logins_for_identity_user(*tenant, zitadel_user)
                 .await
             {
                 Ok(endpoints) => {
@@ -261,7 +261,7 @@ mod tests {
             state.members.push(MemberRecord {
                 id: member,
                 tenant_id: tenant,
-                zitadel_user_id: zitadel.to_string(),
+                identity_user_id: zitadel.to_string(),
                 email: None,
                 display_name: "m".into(),
                 tenant_admin: false,
@@ -307,7 +307,7 @@ mod tests {
         fn revoke_writes(&self) -> usize {
             entries(&self.journal)
                 .iter()
-                .filter(|e| e.starts_with("metadata.revoke_logins_for_zitadel_user"))
+                .filter(|e| e.starts_with("metadata.revoke_logins_for_identity_user"))
                 .count()
         }
     }
@@ -416,7 +416,7 @@ mod tests {
             assert!(journal.contains(&now), "{now} missing: {journal:?}");
             assert!(journal.contains(&later), "{later} missing: {journal:?}");
             assert!(
-                position(&s.journal, "metadata.revoke_logins_for_zitadel_user")
+                position(&s.journal, "metadata.revoke_logins_for_identity_user")
                     < position(&s.journal, &now),
                 "the cache was told before the revocation was written: {journal:?}"
             );
@@ -464,7 +464,7 @@ mod tests {
         s.w.metadata.state().members.push(MemberRecord {
             id: member_without,
             tenant_id: tenant,
-            zitadel_user_id: "z-no-logins".into(),
+            identity_user_id: "z-no-logins".into(),
             email: None,
             display_name: "n".into(),
             tenant_admin: false,
@@ -547,7 +547,7 @@ mod tests {
         s.w.metadata.state().members.push(MemberRecord {
             id: member,
             tenant_id: tenant,
-            zitadel_user_id: zitadel.to_string(),
+            identity_user_id: zitadel.to_string(),
             email: None,
             display_name: "m".into(),
             tenant_admin: false,

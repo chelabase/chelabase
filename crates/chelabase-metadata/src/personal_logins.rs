@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::members::{
     AccessAction, AccessWriteError, MemberStatus, NewEvent, Tx, lock_member,
-    lock_member_by_zitadel, lock_tenant, member_tenant, other_active_admins, touched_projects,
+    lock_member_by_identity_user, lock_tenant, member_tenant, other_active_admins, touched_projects,
 };
 use crate::{MetadataClient, MetadataError};
 
@@ -964,13 +964,13 @@ impl MetadataClient {
     /// has every live login revoked (`identity_offboarded`; one event when any was live, by no
     /// actor). Returns every personal row of the member, revoked earlier ones included, so a
     /// retried delivery still clears the proxy cache. An unknown user: empty, no write.
-    pub async fn revoke_logins_for_zitadel_user(
+    pub async fn revoke_logins_for_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Vec<LoginEndpoint>, MetadataError> {
         let mut tx = self.pool.begin().await?;
-        let Some(m) = lock_member_by_zitadel(&mut tx, tenant.as_uuid(), zitadel_user_id).await?
+        let Some(m) = lock_member_by_identity_user(&mut tx, tenant.as_uuid(), identity_user_id).await?
         else {
             return Ok(Vec::new());
         };
@@ -997,10 +997,10 @@ impl MetadataClient {
     pub async fn clear_offboarded(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<bool, MetadataError> {
         let mut tx = self.pool.begin().await?;
-        let Some(m) = lock_member_by_zitadel(&mut tx, tenant.as_uuid(), zitadel_user_id).await?
+        let Some(m) = lock_member_by_identity_user(&mut tx, tenant.as_uuid(), identity_user_id).await?
         else {
             return Ok(false);
         };
@@ -1015,14 +1015,14 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// D7: `(tenant, member, zitadel_user_id)` of every member marked offboarded (the sweep
+    /// D7: `(tenant, member, identity_user_id)` of every member marked offboarded (the sweep
     /// looks them up to clear the mark once Zitadel shows the user active), by tenant then
     /// member.
     pub async fn offboarded_members(
         &self,
     ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
         let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT tenant_id, id, zitadel_user_id FROM members
+            "SELECT tenant_id, id, identity_user_id FROM members
              WHERE offboarded_at IS NOT NULL ORDER BY tenant_id, id",
         )
         .fetch_all(&self.pool)
@@ -1033,13 +1033,13 @@ impl MetadataClient {
             .collect())
     }
 
-    /// `(tenant, member, zitadel_user_id)` of every member holding a login that isn't revoked
+    /// `(tenant, member, identity_user_id)` of every member holding a login that isn't revoked
     /// (expired ones included: a reset renews them), for the identity sweep.
     pub async fn members_with_live_logins(
         &self,
     ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
         let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT DISTINCT m.tenant_id, m.id, m.zitadel_user_id
+            "SELECT DISTINCT m.tenant_id, m.id, m.identity_user_id
              FROM personal_logins l JOIN members m ON m.id = l.member_id
              WHERE l.revoked_at IS NULL
              ORDER BY m.tenant_id, m.id",

@@ -107,7 +107,7 @@ struct FakeMetadata {
     /// fills it, the fake does to test the per-role levels, T2).
     #[allow(clippy::type_complexity)]
     team_grants: Arc<Mutex<HashMap<(uuid::Uuid, uuid::Uuid), Vec<Grant>>>>,
-    /// Reads of a member row (`member_by_zitadel` and `admit_member` each read it once).
+    /// Reads of a member row (`member_by_identity_user` and `admit_member` each read it once).
     member_reads: Arc<AtomicUsize>,
     /// Reads of a branch's roles (`list_roles`).
     role_reads: Arc<AtomicUsize>,
@@ -185,7 +185,7 @@ struct FakeLogin {
 struct FakeInvite {
     id: uuid::Uuid,
     member_id: uuid::Uuid,
-    zitadel_user_id: String,
+    identity_user_id: String,
     expires_at: chrono::DateTime<chrono::Utc>,
     /// SHA-256 of the link's token.
     token_hash: [u8; 32],
@@ -273,7 +273,7 @@ impl FakeMetadata {
             .lock()
             .unwrap()
             .iter()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == sub)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == sub)
             .cloned()
     }
 
@@ -284,7 +284,7 @@ impl FakeMetadata {
         self.members.lock().unwrap().push(MemberRecord {
             id,
             tenant_id: tenant,
-            zitadel_user_id: sub.into(),
+            identity_user_id: sub.into(),
             email: Some(format!("{sub}@example.test")),
             display_name: sub.into(),
             tenant_admin,
@@ -324,26 +324,26 @@ impl FakeMetadata {
         let mut members = self.members.lock().unwrap();
         let m = members
             .iter_mut()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == sub)
+            .find(|m| m.tenant_id == tenant && m.identity_user_id == sub)
             .expect("member");
         change(m);
     }
 
     /// An open invite for `member` (an `invited` one the test made with `add_member`).
     fn add_open_invite(&self, member: uuid::Uuid) {
-        let zitadel_user_id = self
+        let identity_user_id = self
             .members
             .lock()
             .unwrap()
             .iter()
             .find(|m| m.id == member)
             .expect("member")
-            .zitadel_user_id
+            .identity_user_id
             .clone();
         self.invites.lock().unwrap().push(FakeInvite {
             id: uuid::Uuid::new_v4(),
             member_id: member,
-            zitadel_user_id,
+            identity_user_id,
             expires_at: chrono::Utc::now() + chrono::Duration::hours(72),
             token_hash: [3; 32],
             revoked: false,
@@ -1836,9 +1836,9 @@ impl MetadataPort for FakeMetadata {
         Ok(self.busy(branch))
     }
 
-    async fn member_by_zitadel(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<Option<MemberRecord>, MetadataError> {
+    async fn member_by_identity_user(&self, tenant: TenantId, identity_user_id: &str) -> Result<Option<MemberRecord>, MetadataError> {
         self.member_reads.fetch_add(1, Ordering::SeqCst);
-        Ok(self.member(tenant, zitadel_user_id))
+        Ok(self.member(tenant, identity_user_id))
     }
 
     /// As the real one: a removed or pending member is returned as is, an invited one is
@@ -1847,7 +1847,7 @@ impl MetadataPort for FakeMetadata {
     async fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: chelabase_metadata::members::Admission,
@@ -1856,7 +1856,7 @@ impl MetadataPort for FakeMetadata {
         self.member_reads.fetch_add(1, Ordering::SeqCst);
         let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
         let mut members = self.members.lock().unwrap();
-        if let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id) {
+        if let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id) {
             // S6: a suspended member is returned as is, like a removed or pending one.
             if !matches!(m.status, MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended) {
                 if m.status == MemberStatus::Invited {
@@ -1886,7 +1886,7 @@ impl MetadataPort for FakeMetadata {
             .iter()
             .any(|m| m.tenant_id == tenant && m.status == MemberStatus::Active && m.tenant_admin);
         let bound = self.setup_claims.lock().unwrap().get(&tenant).cloned();
-        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == zitadel_user_id);
+        let claims = !has_admin && bound.as_deref().is_none_or(|u| u == identity_user_id);
         let status = match (claims, admission) {
             (true, _) | (false, Admission::Active) => MemberStatus::Active,
             (false, Admission::Pending) => MemberStatus::Pending,
@@ -1895,7 +1895,7 @@ impl MetadataPort for FakeMetadata {
         let record = MemberRecord {
             id: uuid::Uuid::new_v4(),
             tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             email,
             display_name: name.into(),
             tenant_admin: claims,
@@ -3088,7 +3088,7 @@ impl FakeMetadata {
             if i.revoked || i.accepted {
                 return Err(AccessWriteError::Conflict("the invite is no longer open".into()));
             }
-            (i.member_id, i.zitadel_user_id.clone())
+            (i.member_id, i.identity_user_id.clone())
         };
         let m = self.members.lock().unwrap().iter().find(|m| m.id == member).cloned().unwrap();
         if m.status != MemberStatus::Invited {
@@ -4034,11 +4034,11 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         new: chelabase_metadata::members::NewInvite<'_>,
     ) -> FakeWrite<(chelabase_metadata::members::MemberListing, uuid::Uuid)> {
         use chelabase_metadata::members::{AccessWriteError, NewInvite};
-        let NewInvite { zitadel_user_id, email, expires_at, token_hash, grants, teams } = new;
+        let NewInvite { identity_user_id, email, expires_at, token_hash, grants, teams } = new;
         // P25: the teams must still be what the check read, or nothing is written.
         self.teams_seen_hold(tenant, teams)?;
         let email = email.trim().to_lowercase();
-        let existing = self.member(tenant, zitadel_user_id);
+        let existing = self.member(tenant, identity_user_id);
         if existing.as_ref().is_some_and(|m| m.status != MemberStatus::Removed) {
             return Err(AccessWriteError::Conflict("already a member".into()));
         }
@@ -4053,7 +4053,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         let record = MemberRecord {
             id,
             tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             email: Some(email.clone()),
             display_name: String::new(),
             tenant_admin: false,
@@ -4070,7 +4070,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         self.invites.lock().unwrap().push(FakeInvite {
             id: invite,
             member_id: id,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             expires_at,
             token_hash,
             revoked: false,
@@ -4090,7 +4090,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         &self,
         actor: uuid::Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         grants: &[(uuid::Uuid, GrantRow)],
@@ -4101,7 +4101,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         self.teams_seen_hold(tenant, teams)?;
         let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
         // R29: any row with the user, a removed one included, comes back only by invite code.
-        if self.member(tenant, zitadel_user_id).is_some() {
+        if self.member(tenant, identity_user_id).is_some() {
             return Err(AccessWriteError::Conflict("already a member, or removed".into()));
         }
         let id = uuid::Uuid::new_v4();
@@ -4109,7 +4109,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         let record = MemberRecord {
             id,
             tenant_id: tenant,
-            zitadel_user_id: zitadel_user_id.into(),
+            identity_user_id: identity_user_id.into(),
             email: email.clone(),
             display_name: name.into(),
             tenant_admin: false,
@@ -4207,10 +4207,10 @@ impl orchestrator::members::MembersPort for FakeMetadata {
 
     async fn has_other_membership(&self, member: uuid::Uuid) -> Result<bool, MetadataError> {
         let members = self.members.lock().unwrap();
-        let Some(user) = members.iter().find(|m| m.id == member).map(|m| m.zitadel_user_id.clone()) else {
+        let Some(user) = members.iter().find(|m| m.id == member).map(|m| m.identity_user_id.clone()) else {
             return Ok(false);
         };
-        Ok(members.iter().any(|m| m.id != member && m.zitadel_user_id == user && m.status != MemberStatus::Removed))
+        Ok(members.iter().any(|m| m.id != member && m.identity_user_id == user && m.status != MemberStatus::Removed))
     }
 
     async fn decline_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<String> {
@@ -4223,7 +4223,7 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         }
         self.members.lock().unwrap().iter_mut().find(|x| x.id == member).unwrap().status = MemberStatus::Removed;
         self.log(Change::new(m.tenant_id, Some(actor), "member_declined", Some(member)).before(json!({ "status": "pending" })).after(json!({ "status": "removed" })));
-        Ok(m.zitadel_user_id)
+        Ok(m.identity_user_id)
     }
 
     async fn set_tenant_display_name(
@@ -4661,7 +4661,7 @@ impl FakeMetadata {
             .iter()
             .map(|id| {
                 let m = self.members.lock().unwrap().iter().find(|m| m.id == *id).cloned().ok_or(TeamWriteError::MemberNotFound)?;
-                Ok((m.id, m.zitadel_user_id))
+                Ok((m.id, m.identity_user_id))
             })
             .collect::<TeamWriteResult<_>>()?;
         let reached = TeamWrite { changed: false, affected: affected.clone(), projects: projects.clone() };

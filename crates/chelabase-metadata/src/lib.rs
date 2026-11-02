@@ -393,8 +393,7 @@ const LOCK_CONNECTIONS: u32 = 8;
 
 impl MetadataClient {
     pub async fn connect(config: &MetadataConfig) -> Result<Self, MetadataError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
+        let pool = Self::pool_options(10)
             .connect(&config.database_url)
             .await?;
         Ok(Self {
@@ -405,8 +404,7 @@ impl MetadataClient {
 
     /// A client that connects on first use (tests that never reach the database).
     pub fn connect_lazy(config: &MetadataConfig) -> Result<Self, MetadataError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(10)
+        let pool = Self::pool_options(10)
             .connect_lazy(&config.database_url)?;
         Ok(Self {
             pool,
@@ -414,17 +412,26 @@ impl MetadataClient {
         })
     }
 
+    /// Every connection pins `search_path=public`, so no role-named schema can shadow `public`.
+    fn pool_options(max_connections: u32) -> PgPoolOptions {
+        PgPoolOptions::new().max_connections(max_connections).after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET search_path = public").execute(&mut *conn).await?;
+                Ok(())
+            })
+        })
+    }
+
     /// Connects on first use: only the worker takes endpoint locks.
     fn lock_pool(config: &MetadataConfig) -> Result<PgPool, MetadataError> {
-        Ok(PgPoolOptions::new()
-            .max_connections(LOCK_CONNECTIONS)
+        Ok(Self::pool_options(LOCK_CONNECTIONS)
             .acquire_timeout(ENDPOINT_LOCK_TIMEOUT)
             .connect_lazy(&config.database_url)?)
     }
 
     pub async fn migrate(&self) -> Result<(), MetadataError> {
         // Embedded at build time: a new migration file alone doesn't rebuild this, so touch
-        // this file when adding one (last: 20261014000006).
+        // this file when adding one (last: 20261103000001).
         sqlx::migrate!("./migrations").run(&self.pool).await?;
         info!(
             demo_tenant = %DEMO_TENANT_ID,
