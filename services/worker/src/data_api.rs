@@ -51,12 +51,13 @@ pub const SCHEMA_CHECK_SQL: &str = "SELECT to_regclass('chelabase.schema_version
 /// The search path is pinned first (`cloud_admin` is a superuser; `to_regclass` is unqualified).
 pub fn schema_check_sql(schema: &str) -> String {
     let schema_literal = quote_literal(&quote_ident(schema));
+    let storage = crate::storage_schema::STORAGE_CHECK_SQL;
     format!(
         "SET search_path = pg_catalog, pg_temp; {SCHEMA_CHECK_SQL} \
      AND NOT EXISTS (SELECT FROM pg_catalog.pg_namespace n \
        JOIN pg_catalog.pg_roles r ON r.rolname OPERATOR(pg_catalog.=) 'authenticator' \
        WHERE n.oid OPERATOR(pg_catalog.=) pg_catalog.to_regnamespace({schema_literal})::pg_catalog.oid \
-         AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE'))"
+         AND NOT pg_catalog.has_schema_privilege(r.oid, n.oid, 'USAGE')){storage}"
     )
 }
 
@@ -498,9 +499,10 @@ fn parse_role_ok(answer: &str) -> Option<(i64, bool)> {
 }
 
 /// Roles Chelabase owns; never a secret key's.
-const RESERVED_ROLES: [&str; 4] = [
+const RESERVED_ROLES: [&str; 5] = [
     AUTHENTICATOR,
     "chelabase_admin",
+    crate::storage_schema::STORAGE_ROLE,
     crate::app_users_sql::USERS_SYNC_ROLE,
     crate::realtime::REALTIME_ROLE,
 ];
@@ -636,7 +638,15 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if let Some(aside) = quarantined(&output) {
             warn!(branch_id = %branch, %ep, database = %database_name, "a chelabase schema Chelabase didn't make (or one tampered with) was renamed to {aside}; a fresh one was installed");
         }
-        Ok(())
+        let storage = crate::storage_schema::storage_schema_sql(OWNER_ROLE);
+        match self.computes.admin_sql(ep, database_name, &storage).await {
+            Ok(_) => Ok(()),
+            Err(e) if crate::storage_schema::foreign_schema(&format!("{e:#}")) => {
+                warn!(branch_id = %branch, %ep, database = %database_name, "the storage schema isn't Chelabase's (a user's own); it was left alone and storage isn't installed here");
+                Ok(())
+            }
+            Err(e) => Err(e).context("installing the storage schema"),
+        }
     }
 
     /// A reset or restore rewinds `GRANT <role> TO authenticator`, but secret keys survive

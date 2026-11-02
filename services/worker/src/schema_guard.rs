@@ -428,6 +428,20 @@ mod guard_text {
         }
     }
 
+    /// Object storage m3 (AC 6): the guard exempts no schema but temporary ones, so on a
+    /// protected branch DDL on `storage` (dropping it, altering its tables or policies) is
+    /// refused like any other; elsewhere Postgres refuses it, `chelabase_admin` owning it.
+    #[test]
+    fn the_storage_schema_gets_no_exemption() {
+        for settings in test_settings() {
+            let sql = schema_guard_sql(&settings);
+            for f in ["chelabase_guard.refuse_ddl", "chelabase_guard.refuse_drop"] {
+                let b = body(&sql, f);
+                assert!(!b.contains("storage") && !b.contains("nspname") && !b.contains("schema_name OPERATOR"), "{b}");
+            }
+        }
+    }
+
     // PB T3: also over the presence and removal scripts, and `encode` / `convert_to` (the
     // login rule's exemption comparison).
     #[test]

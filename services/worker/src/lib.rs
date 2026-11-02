@@ -62,6 +62,7 @@ pub mod rt_events;
 pub mod safekeepers;
 pub mod schema_base;
 pub mod settings;
+pub mod storage_schema;
 #[cfg(test)]
 mod t4_tests;
 pub mod token_refresh;
