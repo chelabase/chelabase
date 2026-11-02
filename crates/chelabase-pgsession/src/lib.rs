@@ -8,6 +8,9 @@ pub mod pools;
 pub mod service;
 pub mod session;
 
+#[cfg(test)]
+mod live_tests;
+
 pub use pools::*;
 pub use service::{NamedStatement, ServicePool};
 pub use session::{RoleSession, run_settings};
