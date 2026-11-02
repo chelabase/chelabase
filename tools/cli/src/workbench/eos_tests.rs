@@ -42,6 +42,8 @@ fn the_machine_keys_are_in_the_stack_env_before_any_bootstrap() {
         ("CHELABASE_AUTH_COOKIE_KEY", "/m/.chelabase/auth/cookie.key"),
         ("CHELABASE_APP_JWT_PRIVATE_KEY", "/m/.chelabase/auth/app-jwt.key"),
         ("CHELABASE_APP_JWT_PUBLIC_KEY", "/m/.chelabase/auth/app-jwt.pub"),
+        ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", "/m/.chelabase/auth/member-jwt.key"),
+        ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", "/m/.chelabase/auth/member-jwt.pub"),
         (
             "CHELABASE_ZITADEL_JWKS_URL",
             "http://auth.feat-x.chelabase.localhost:8137/oauth/v2/keys",

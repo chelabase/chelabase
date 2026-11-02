@@ -45,8 +45,9 @@ pub(super) const RUST_APPS: [&str; 6] =
 /// The apps that read the bootstrap's `demo.env` (the OIDC audiences, the demo ids).
 pub(super) const DEMO_ENV_READERS: &[&str] =
     &["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
-/// Every app container (the Rust apps and Studio; the sites are added by `--with`).
-pub(super) const APPS: [&str; 7] = [
+/// Every app container (the Rust apps, Studio and the identity service; the sites are added by
+/// `--with`).
+pub(super) const APPS: [&str; 8] = [
     "orchestrator",
     "worker",
     "gateway",
@@ -54,6 +55,7 @@ pub(super) const APPS: [&str; 7] = [
     "rest",
     "realtime",
     "studio",
+    "identity",
 ];
 /// The long-running infra services. Their one-shot helpers (`create-bucket`, `proxy-tls`,
 /// `register-safekeepers`) start as dependencies of the services that wait on them.
@@ -72,8 +74,10 @@ pub(super) const INFRA: &[&str] = &[
     "pageserver",
     "proxy",
 ];
-/// Started with the infra: the bootstrap reaches Zitadel through the gateway.
-const FRONT: &[&str] = &["zitadel", "mailpit", "gateway"];
+/// Started with the infra and waited on until healthy: the bootstrap reaches Zitadel through the
+/// gateway and creates the identity service's members pool through it. Identity runs the
+/// checkout's TypeScript sources (no build); a change to them needs `workbench restart identity`.
+pub(super) const FRONT: &[&str] = &["zitadel", "mailpit", "gateway", "identity"];
 /// Started after the first bootstrap.
 pub(super) const LATE_APPS: &[&str] =
     &["orchestrator", "worker", "auth", "rest", "realtime", "studio"];
@@ -1303,6 +1307,7 @@ pub fn bootstrap_args(
     };
     let (out, bin) = (out.display().to_string(), bin.display().to_string());
     let tool = "/usr/local/bin/chelabase-init";
+    let keys = get("CHELABASE_KEYS_DIR")?;
     let mut args: Vec<String> = [
         "run",
         "--rm",
@@ -1314,11 +1319,15 @@ pub fn bootstrap_args(
         &format!("{bin}:{tool}:ro"),
         "-v",
         &format!("{out}:{out}"),
-        "--entrypoint",
-        tool,
     ]
     .map(str::to_string)
     .to_vec();
+    // The identity step's two files, each alone and read-only (m5, #118).
+    for file in IDENTITY_BOOTSTRAP_FILES {
+        let path = format!("{keys}/{file}");
+        args.extend(["-v".to_string(), format!("{path}:{path}:ro")]);
+    }
+    args.extend(["--entrypoint".to_string(), tool.to_string()]);
     for (k, _) in bootstrap_env(env, Path::new(&out)) {
         // `-e NAME`: docker takes the value from its own environment (see [`bootstrap`]), so
         // no value (the metadata URL carries its password) is on the command line.
@@ -1332,18 +1341,38 @@ pub fn bootstrap_args(
     Ok(args)
 }
 
+/// The keys-dir files [`bootstrap`] mounts for its identity step: the `chelabase_identity`
+/// role's password and the worker's identity token (the pool route is the worker's).
+const IDENTITY_BOOTSTRAP_FILES: [&str; 2] = ["identity/db.password", "tokens/worker-identity.token"];
+
 /// The env [`bootstrap`]'s container gets: the stack env's values of what the bootstrap reads,
-/// and the admin PAT's path in the output dir.
+/// the admin PAT's path in the output dir, and the identity step's service URL and file paths
+/// (set here, never in stack.env: no app reads them from there).
 pub fn bootstrap_env(env: &HashMap<String, String>, out: &Path) -> Vec<(String, String)> {
+    let set_here = [
+        "CHELABASE_ZITADEL_ADMIN_PAT_FILE",
+        "CHELABASE_IDENTITY_URL",
+        "CHELABASE_IDENTITY_DB_PASSWORD_FILE",
+        "CHELABASE_IDENTITY_TOKEN_FILE",
+    ];
     let mut pairs: Vec<(String, String)> = chelabase_init::bootstrap::ENV_KEYS
         .iter()
-        .filter(|k| **k != "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
+        .filter(|k| !set_here.contains(k))
         .filter_map(|k| env.get(*k).map(|v| (k.to_string(), v.clone())))
         .collect();
     pairs.push((
         "CHELABASE_ZITADEL_ADMIN_PAT_FILE".into(),
         format!("{}/admin.pat", out.display()),
     ));
+    pairs.push(("CHELABASE_IDENTITY_URL".into(), "http://identity:8080".into()));
+    if let Some(keys) = env.get("CHELABASE_KEYS_DIR") {
+        let [password, token] = IDENTITY_BOOTSTRAP_FILES;
+        pairs.push((
+            "CHELABASE_IDENTITY_DB_PASSWORD_FILE".into(),
+            format!("{keys}/{password}"),
+        ));
+        pairs.push(("CHELABASE_IDENTITY_TOKEN_FILE".into(), format!("{keys}/{token}")));
+    }
     pairs
 }
 
@@ -2270,6 +2299,7 @@ mod tests {
             ("CHELABASE_GID", "1001"),
             ("CHELABASE_WORKBENCH_IMAGE", "chelabase-workbench:abc"),
             ("CHELABASE_METADATA_DATABASE_URL", "postgres://chelabase:s3cret@metadata-db:5432/m"),
+            ("CHELABASE_KEYS_DIR", "/m/.chelabase"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2317,9 +2347,16 @@ mod tests {
             .filter(|w| w[0] == "-v")
             .map(|w| w[1].as_str())
             .collect();
+        // m5 (#118): the identity step reads the role's password and the worker's identity token,
+        // each mounted alone, read-only, at its keys-dir path.
         assert_eq!(
             volumes,
-            ["/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro", "/s/zitadel:/s/zitadel"]
+            [
+                "/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro",
+                "/s/zitadel:/s/zitadel",
+                "/m/.chelabase/identity/db.password:/m/.chelabase/identity/db.password:ro",
+                "/m/.chelabase/tokens/worker-identity.token:/m/.chelabase/tokens/worker-identity.token:ro",
+            ]
         );
         let names: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
         let envs: Vec<String> = bootstrap_env(&env, Path::new("/s/zitadel"))
@@ -2329,6 +2366,16 @@ mod tests {
         assert_eq!(names.len(), envs.len(), "every value is named on the argv: {names:?}");
         assert!(envs.contains(&"CHELABASE_ZITADEL_ADMIN_PAT_FILE=/s/zitadel/admin.pat".to_string()), "{envs:?}");
         assert!(envs.contains(&"CHELABASE_ZITADEL_UPSTREAM=http://zitadel:8080".to_string()), "{envs:?}");
+        for e in [
+            "CHELABASE_IDENTITY_URL=http://identity:8080",
+            "CHELABASE_IDENTITY_DB_PASSWORD_FILE=/m/.chelabase/identity/db.password",
+            "CHELABASE_IDENTITY_TOKEN_FILE=/m/.chelabase/tokens/worker-identity.token",
+        ] {
+            assert!(envs.contains(&e.to_string()), "{e}: {envs:?}");
+        }
+        for k in chelabase_init::bootstrap::identity::ENV_KEYS {
+            assert!(names.contains(k), "{k} reaches the bootstrap: {names:?}");
+        }
         assert!(!envs.iter().any(|e| e.starts_with("CHELABASE_KEYS_DIR")), "{envs:?}");
         assert!(!joined.contains("docker.sock"));
         assert!(
@@ -2398,7 +2445,30 @@ mod key_phase_tests {
 
         let changed = ensure_stack_secrets(&main, &state).unwrap();
         assert!(!changed.nats && !changed.valkey, "{changed:?}");
-        assert_eq!(snapshot(&keys, &state), keys_before, "the shared keys dir is untouched");
+        // The shared keys dir keeps every file as it was; the only new ones are the identity
+        // service's (auth-replacement m5), which the old key phase predates.
+        let keys_after = snapshot(&keys, &state);
+        for (p, v) in &keys_before {
+            assert_eq!(keys_after.get(p), Some(v), "{}", p.display());
+        }
+        let mut added: Vec<String> = keys_after
+            .keys()
+            .filter(|p| !keys_before.contains_key(*p))
+            .map(|p| p.strip_prefix(&keys).unwrap().display().to_string())
+            .collect();
+        added.sort();
+        assert_eq!(
+            added,
+            [
+                "auth/member-jwt.key",
+                "auth/member-jwt.pub",
+                "identity/db.password",
+                "identity/secret",
+                "tokens/auth-identity.token",
+                "tokens/orchestrator-identity.token",
+                "tokens/worker-identity.token",
+            ]
+        );
         let state_after = snapshot(&state, &state.join("none"));
         for (p, v) in &state_before {
             assert_eq!(state_after.get(p), Some(v), "{}", p.display());

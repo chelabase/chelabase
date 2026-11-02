@@ -41,6 +41,8 @@ universe='[
   "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
   "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
+  "K/auth/member-jwt.key", "K/auth/member-jwt.pub", "K/identity/secret", "K/identity/db.password",
+  "K/tokens/auth-identity.token", "K/tokens/orchestrator-identity.token", "K/tokens/worker-identity.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
   "S/env/stack.env",
@@ -82,7 +84,8 @@ expected='{
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
     "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/tokens/orchestrator-identity.token": "ro", "K/auth/member-jwt.pub": "ro"
   },
   "worker": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -92,20 +95,22 @@ expected='{
     "K/compute-ca/ca.crt": "rw", "K/compute-ca/ca.key": "rw",
     "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw",
     "K/realtime-tls/current/client.crt": "rw", "K/realtime-tls/current/client.key": "rw", "K/realtime-tls/current/ca.crt": "rw",
-    "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro"
+    "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro",
+    "K/tokens/worker-identity.token": "ro"
   },
   "gateway": {
     "C/scripts/tests/workbench-compose.sh": "ro",
-    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro",
+    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro", "K/auth/member-jwt.pub": "ro",
     "K/tokens/data-keys.token": "ro", "K/tokens/app-sessions.token": "ro"
   },
   "auth": {
     "C/scripts/tests/workbench-compose.sh": "ro",
     "S/zitadel/admin.pat": "ro", "S/zitadel/login-client.pat": "ro",
     "K/auth/cookie.key": "ro", "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
+    "K/auth/member-jwt.key": "ro", "K/auth/member-jwt.pub": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
-    "K/tokens/app-auth.token": "ro"
+    "K/tokens/app-auth.token": "ro", "K/tokens/auth-identity.token": "ro"
   },
   "rest": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -119,7 +124,14 @@ expected='{
     "K/compute-ca/ca.crt": "ro",
     "K/realtime-tls/current/client.crt": "ro", "K/realtime-tls/current/client.key": "ro", "K/realtime-tls/current/ca.crt": "ro",
     "K/nats/realtime.password": "ro", "K/valkey/realtime.password": "ro",
-    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro"
+    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
+    "K/auth/member-jwt.pub": "ro"
+  },
+  "identity": {
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "K/identity/secret": "ro", "K/identity/db.password": "ro",
+    "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro",
+    "K/tokens/worker-identity.token": "ro"
   },
   "studio": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "docs": { "C/scripts/tests/workbench-compose.sh": "rw" },
@@ -146,7 +158,9 @@ expected='{
     "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/auth/member-jwt.key": "ro", "K/auth/member-jwt.pub": "ro", "K/identity/secret": "ro", "K/identity/db.password": "ro",
+    "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro", "K/tokens/worker-identity.token": "ro"
   }
 }'
 
@@ -309,7 +323,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs gateway landing orchestrator realtime rest runner studio worker" ]] ||
+  [[ "$mounting" == "auth docs gateway identity landing orchestrator realtime rest runner studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

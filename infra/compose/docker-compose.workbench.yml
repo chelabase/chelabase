@@ -424,6 +424,48 @@ services:
 
   # --- The app tier: the checkout's host-built debug binaries in the workbench image ---------
 
+  # The identity service from the checkout's TypeScript sources (Node runs them directly; no
+  # build), on the workbench image. It keeps the base's entrypoint (the database URL into a
+  # private tmpfs from the password file), healthcheck, read-only root and networks (default
+  # only, no port). No env file: it reads only the settings below. Its mail goes to Mailpit, in
+  # plain SMTP. `up` starts it with the front tier and waits for it before the bootstrap; a
+  # change to its sources needs `just workbench restart identity`.
+  identity:
+    <<: *workbench
+    command: ["node", "${CHELABASE_CHECKOUT}/services/identity/src/main.ts"]
+    environment: !override
+      - CHELABASE_IDENTITY_HOST=0.0.0.0
+      - CHELABASE_IDENTITY_PORT=8080
+      - CHELABASE_IDENTITY_DB_USER=chelabase_identity
+      - CHELABASE_IDENTITY_DB_HOST=metadata-db:5432
+      - CHELABASE_IDENTITY_DB_NAME=chelabase_metadata
+      - CHELABASE_IDENTITY_DB_PASSWORD_FILE=${CHELABASE_KEYS_DIR}/identity/db.password
+      - CHELABASE_IDENTITY_SECRET_FILE=${CHELABASE_KEYS_DIR}/identity/secret
+      - CHELABASE_IDENTITY_AUTH_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/auth-identity.token
+      - CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
+      - CHELABASE_IDENTITY_WORKER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      - CHELABASE_SMTP_HOST=mailpit
+      - CHELABASE_SMTP_PORT=1025
+      - CHELABASE_SMTP_TLS=none
+      - CHELABASE_SMTP_FROM=noreply@${CHELABASE_AUTH_HOST_NAME:?set by chelabase workbench (stack.env)}
+    volumes: !override
+      - *checkout-ro
+      - *keys-mask
+      - *checkout-mask
+      - {type: tmpfs, target: /run/identity}
+      - {type: tmpfs, target: /tmp}
+    secrets:
+      - {source: identity-secret, target: "${CHELABASE_KEYS_DIR}/identity/secret"}
+      - {source: identity-db-password, target: "${CHELABASE_KEYS_DIR}/identity/db.password"}
+      - {source: token-auth-identity, target: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
+      - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
+      - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
+    depends_on: !override
+      metadata-db:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+
   # Each app: its env files and its own variables (`environment: !override` drops the base's
   # self-hosted settings, which would win over the env files), its key files as Compose secrets at
   # their keys-dir paths (`volumes: !override` drops the base's `secrets` volume mounts), and the
@@ -451,6 +493,8 @@ services:
       - CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-sessions.token
       - CHELABASE_PROXY_API_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/proxy-api.token
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
+      - CHELABASE_IDENTITY_URL=http://identity:8080
+      - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
       # Connection strings name the proxy's published port on the host.
       - CHELABASE_PROXY_PG_PORT=${CHELABASE_PROXY_PORT}
       # Bare names: taken from the caller's env, unset when it has none. The runner's live tests
@@ -485,6 +529,8 @@ services:
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
+      - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
     depends_on: !override
       metadata-db:
         condition: service_healthy
@@ -516,6 +562,8 @@ services:
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
       - CHELABASE_STORAGE_TOKEN_REFRESH_SECS=${CHELABASE_STORAGE_TOKEN_REFRESH_SECS:-3600}
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
+      - CHELABASE_IDENTITY_URL=http://identity:8080
+      - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
     group_add: ["${CHELABASE_DOCKER_GID}"]
     volumes: !override
       - *checkout-ro
@@ -533,6 +581,7 @@ services:
       - {source: nats-worker, target: "${CHELABASE_KEYS_DIR}/nats/worker.password"}
       - {source: valkey-control, target: "${CHELABASE_KEYS_DIR}/valkey/control.password"}
       - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
+      - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
     depends_on: !override
       metadata-db:
         condition: service_healthy
@@ -587,6 +636,7 @@ services:
     secrets:
       - {source: internal-signing, target: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
       - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
       - {source: token-data-keys, target: "${CHELABASE_KEYS_DIR}/tokens/data-keys.token"}
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
     healthcheck:
@@ -606,6 +656,8 @@ services:
     environment: !override
       # RT1 T1 (S27): the bearer it sends to the orchestrator's internal app routes.
       - CHELABASE_APP_AUTH_INTERNAL_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/app-auth.token
+      - CHELABASE_IDENTITY_URL=http://identity:8080
+      - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/auth-identity.token
     volumes: !override
       - *checkout-ro
       - *keys-mask
@@ -616,9 +668,12 @@ services:
       - {source: cookie, target: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
       - {source: app-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
       - {source: app-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+      - {source: member-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.key"}
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
       - {source: internal-verify, target: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
       - {source: compute-ca-cert, target: "${CHELABASE_KEYS_DIR}/compute-ca/ca.crt"}
       - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
+      - {source: token-auth-identity, target: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
     # auth has no health route here: any HTTP answer (even a 404) means it is serving.
     healthcheck:
       test: ["CMD", "curl", "-sS", "-o", "/dev/null", "http://127.0.0.1:8084/"]
@@ -683,6 +738,7 @@ services:
       - {source: realtime-pg, target: "${CHELABASE_KEYS_DIR}/realtime/pg.password"}
       - {source: realtime-ticket, target: "${CHELABASE_KEYS_DIR}/realtime/ticket.key"}
       - {source: realtime-internal, target: "${CHELABASE_KEYS_DIR}/realtime/internal.token"}
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
     depends_on: !override
       nats:
         condition: service_healthy
@@ -765,6 +821,7 @@ services:
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       - CHELABASE_REALTIME_TLS_DIR=${CHELABASE_KEYS_DIR}/realtime-tls
       - CHELABASE_REALTIME_LOGIN_CIDRS=${CHELABASE_REALTIME_LOGIN_CIDRS:?set by chelabase workbench (stack.env)}
+      - CHELABASE_IDENTITY_URL=http://identity:8080
     group_add: ["${CHELABASE_DOCKER_GID}"]
     # The static address is in the member-login rule's address list. On the compute network:
     # live tests dial computes like the services do.
@@ -817,6 +874,13 @@ services:
       - {source: storage-generations-api, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/generations-api.jwt"}
       - {source: storage-storcon-admin, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/storcon-admin.jwt"}
       - {source: storage-metrics, target: "${CHELABASE_KEYS_DIR}/neon/storage-tokens/metrics.token"}
+      - {source: member-jwt-private, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.key"}
+      - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
+      - {source: identity-secret, target: "${CHELABASE_KEYS_DIR}/identity/secret"}
+      - {source: identity-db-password, target: "${CHELABASE_KEYS_DIR}/identity/db.password"}
+      - {source: token-auth-identity, target: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
+      - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
+      - {source: token-worker-identity, target: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
 
 # The stack's control subnet, from the registry's control slot; computes take addresses from the
 # upper /23 only.
@@ -845,6 +909,15 @@ secrets:
   cookie: {file: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}
   app-jwt-private: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.key"}
   app-jwt-public: {file: "${CHELABASE_KEYS_DIR}/auth/app-jwt.pub"}
+  # auth-replacement m5: the member JWT pair, the identity service's own files and each caller's
+  # identity bearer.
+  member-jwt-private: {file: "${CHELABASE_KEYS_DIR}/auth/member-jwt.key"}
+  member-jwt-public: {file: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
+  identity-secret: {file: "${CHELABASE_KEYS_DIR}/identity/secret"}
+  identity-db-password: {file: "${CHELABASE_KEYS_DIR}/identity/db.password"}
+  token-auth-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/auth-identity.token"}
+  token-orchestrator-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
+  token-worker-identity: {file: "${CHELABASE_KEYS_DIR}/tokens/worker-identity.token"}
   compute-jwt-private: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pem"}
   compute-jwt-public: {file: "${CHELABASE_KEYS_DIR}/neon/compute-jwt.pub"}
   nats-orchestrator: {file: "${CHELABASE_KEYS_DIR}/nats/orchestrator.password"}

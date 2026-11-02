@@ -16,6 +16,8 @@
 # `*_FILE` settings or key paths; no secret is ever an environment value, an argument or in this
 # file. Every value read from .env has a default here or fails `up` naming .env.
 #
+# The identity service (auth-replacement) is internal: no published port, no gateway route.
+#
 # Two services are published: the gateway (CHELABASE_HTTP_ADDR:CHELABASE_HTTP_PORT) and the
 # proxy's Postgres and SQL-over-HTTP ports (CHELABASE_PROXY_ADDR, CHELABASE_PROXY_PORT and
 # CHELABASE_PROXY_HTTP_PORT). Everything else talks over the project network by service name;
@@ -115,6 +117,10 @@ x-app-env: &app-env
   CHELABASE_AUTH_COOKIE_KEY: /run/chelabase/secrets/auth/cookie.key
   CHELABASE_APP_JWT_PRIVATE_KEY: /run/chelabase/secrets/auth/app-jwt.key
   CHELABASE_APP_JWT_PUBLIC_KEY: /run/chelabase/secrets/auth/app-jwt.pub
+  # auth-replacement m5: the member JWT pair (auth signs; the gateway, the orchestrator and
+  # realtime verify). Never the app-user pair: the two audiences stay apart.
+  CHELABASE_MEMBER_JWT_PRIVATE_KEY: /run/chelabase/secrets/auth/member-jwt.key
+  CHELABASE_MEMBER_JWT_PUBLIC_KEY: /run/chelabase/secrets/auth/member-jwt.pub
   CHELABASE_COMPUTE_JWT_DIR: /run/chelabase/secrets/neon
   CHELABASE_COMPUTE_CA_DIR: /run/chelabase/secrets/compute-ca
   CHELABASE_COMPUTE_CA_FILE: /run/chelabase/secrets/compute-ca/ca.crt
@@ -262,10 +268,19 @@ services:
       CHELABASE_SMTP_USER: ${CHELABASE_SMTP_USER:-}
       CHELABASE_SMTP_FROM: ${CHELABASE_SMTP_FROM:-}
       CHELABASE_SMTP_PASSWORD_FILE: ${CHELABASE_SMTP_USER:+/run/chelabase/smtp.password}
+      # The identity step (auth-replacement m5): the chelabase_identity role and its password
+      # (identity/db.password), the identity_admin functions, then the members pool through the
+      # service's pool route, which is the worker's (so its token; the bootstrap already holds
+      # the metadata superuser's password).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_DB_PASSWORD_FILE: /run/chelabase/secrets/identity/db.password
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap, volume: {subpath: bootstrap}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/db.password, read_only: true, volume: {subpath: identity/db.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
       - type: bind
         source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
         target: /run/chelabase/smtp.password
@@ -278,6 +293,8 @@ services:
         condition: service_healthy
       orchestrator:
         condition: service_started
+      identity:
+        condition: service_healthy
 
   # --- Infra -------------------------------------------------------------------------------
   metadata-db:
@@ -879,6 +896,88 @@ services:
   # name. The gateway is the one way in from the host for HTTP (the proxy for Postgres). CHELABASE_IMAGE_REPO and
   # CHELABASE_IMAGE_TAG pick the images (docker-compose.build.yml builds them from the clone).
 
+  # The identity service (auth-replacement; Better Auth behind its own JSON API, replacing Zitadel,
+  # whose services go in m13). Internal only: on the project network, no published port, no
+  # gateway route. auth, the orchestrator and the worker call it, each with its own bearer
+  # (tokens/<caller>-identity.token), which it checks per route.
+  # Its database is the metadata server's, as `chelabase_identity`: no CREATE on the database and
+  # no grant on Chelabase's schemas; it owns only its pool schemas (identity_members,
+  # identity_app_<hex>), made through identity_admin's SECURITY DEFINER functions. The bootstrap
+  # makes the role and sets its password from identity/db.password (so the service answers its
+  # health route before that, and its first database call waits for the bootstrap). The service
+  # takes its database URL only from a file: the entrypoint writes it from the password file
+  # (base64url, checked) into a private tmpfs. Outgoing mail: .env's CHELABASE_SMTP_* (the
+  # password from the host file CHELABASE_SMTP_PASSWORD_PATH, as for the bootstrap).
+  # The image isn't published yet: until the release scripts pin it, build it
+  # (`docker buildx bake -f infra/images/docker-bake.hcl identity`) and set
+  # CHELABASE_IDENTITY_IMAGE_TAG to its tag.
+  identity:
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:${CHELABASE_IDENTITY_IMAGE_TAG:-unpublished}
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        umask 077
+        pw=""
+        IFS= read -r pw <"$$CHELABASE_IDENTITY_DB_PASSWORD_FILE" || [ -n "$$pw" ]
+        case "$$pw" in
+          "" | *[!A-Za-z0-9_-]*)
+            echo "identity: $$CHELABASE_IDENTITY_DB_PASSWORD_FILE must hold one base64url line" >&2
+            exit 1 ;;
+        esac
+        # The user info is one argument: no password is ever in this file's text.
+        printf 'postgres://%s@%s/%s\n' "$$CHELABASE_IDENTITY_DB_USER:$$pw" \
+          "$$CHELABASE_IDENTITY_DB_HOST" "$$CHELABASE_IDENTITY_DB_NAME" >/run/identity/database.url
+        unset pw
+        export CHELABASE_IDENTITY_DATABASE_URL_FILE=/run/identity/database.url
+        exec "$$@"
+      - identity
+    command: ["node", "src/main.ts"]
+    environment:
+      CHELABASE_IDENTITY_HOST: 0.0.0.0
+      CHELABASE_IDENTITY_PORT: "8080"
+      CHELABASE_IDENTITY_DB_USER: chelabase_identity
+      CHELABASE_IDENTITY_DB_HOST: metadata-db:5432
+      CHELABASE_IDENTITY_DB_NAME: chelabase_metadata
+      CHELABASE_IDENTITY_DB_PASSWORD_FILE: /run/chelabase/secrets/identity/db.password
+      CHELABASE_IDENTITY_SECRET_FILE: /run/chelabase/secrets/identity/secret
+      CHELABASE_IDENTITY_AUTH_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
+      CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
+      CHELABASE_IDENTITY_WORKER_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
+      CHELABASE_IDENTITY_POOL_CACHE_SIZE: ${CHELABASE_IDENTITY_POOL_CACHE_SIZE:-256}
+      # Optional SMTP (unset: no email; codes go back to the caller only).
+      CHELABASE_SMTP_HOST: ${CHELABASE_SMTP_HOST:-}
+      CHELABASE_SMTP_PORT: ${CHELABASE_SMTP_PORT:-}
+      CHELABASE_SMTP_TLS: ${CHELABASE_SMTP_TLS:-}
+      CHELABASE_SMTP_USER: ${CHELABASE_SMTP_USER:-}
+      CHELABASE_SMTP_FROM: ${CHELABASE_SMTP_FROM:-}
+      CHELABASE_SMTP_PASSWORD_FILE: ${CHELABASE_SMTP_USER:+/run/chelabase/smtp.password}
+    volumes:
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/secret, read_only: true, volume: {subpath: identity/secret}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/identity/db.password, read_only: true, volume: {subpath: identity/db.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/auth-identity.token, read_only: true, volume: {subpath: tokens/auth-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
+      - type: bind
+        source: ${CHELABASE_SMTP_PASSWORD_PATH:-/dev/null}
+        target: /run/chelabase/smtp.password
+        read_only: true
+        bind: {create_host_path: false}
+      - {type: tmpfs, target: /run/identity}
+      - {type: tmpfs, target: /tmp}
+    healthcheck:
+      <<: *app-health
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"]
+    depends_on:
+      init-secrets:
+        condition: service_completed_successfully
+      metadata-db:
+        condition: service_healthy
+
   orchestrator:
     image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/orchestrator:${CHELABASE_IMAGE_TAG:-4017ed0cd293@sha256:7b025a936a3c9c899bf0109720acc8089f4819d23a5d242c987372599c455b5b}
     restart: unless-stopped
@@ -920,6 +1019,9 @@ services:
       CHELABASE_APP_SESSIONS_INTERNAL_TOKEN_FILE: /run/chelabase/secrets/tokens/app-sessions.token
       CHELABASE_PROXY_API_TOKEN_FILE: /run/chelabase/secrets/tokens/proxy-api.token
       CHELABASE_STORCON_HOOK_TOKEN_FILE: /run/chelabase/secrets/tokens/storcon-hook.token
+      # auth-replacement m5: its identity bearer.
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/orchestrator-identity.token
     # The default network for the apps, `control` for its TLS connections to computes (a static
     # address in the member-login rule), and `compute` (P4): computes call its hooks listener
     # (8083) as `orchestrator`.
@@ -942,6 +1044,8 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/proxy-api.token, read_only: true, volume: {subpath: tokens/proxy-api.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/storcon-hook.token, read_only: true, volume: {subpath: tokens/storcon-hook.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/orchestrator-identity.token, read_only: true, volume: {subpath: tokens/orchestrator-identity.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, read_only: true, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/db/metadata.password, read_only: true, volume: {subpath: db/metadata.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/setup/setup.code, read_only: true, volume: {subpath: setup/setup.code}}
@@ -992,6 +1096,9 @@ services:
       CHELABASE_MEMBER_ROLES_SWEEP_SECS: ${CHELABASE_MEMBER_ROLES_SWEEP_SECS:-}
       CHELABASE_IDENTITY_SWEEP_SECS: ${CHELABASE_IDENTITY_SWEEP_SECS:-}
       CHELABASE_WORKER_REMOVE_ORPHANS: ${CHELABASE_WORKER_REMOVE_ORPHANS:-}
+      # auth-replacement m5: its identity bearer (pool lifecycle, the users sync).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/worker-identity.token
     # P4: it dials computes (compute_ctl) on the compute network.
     networks:
       default: {}
@@ -1003,6 +1110,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/nats/worker.password, read_only: true, volume: {subpath: nats/worker.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/valkey/control.password, read_only: true, volume: {subpath: valkey/control.password}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/pg.password, read_only: true, volume: {subpath: realtime/pg.password}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/worker-identity.token, read_only: true, volume: {subpath: tokens/worker-identity.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca, volume: {subpath: compute-ca}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/orchestrator-tls, volume: {subpath: orchestrator-tls}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, volume: {subpath: realtime-tls}}
@@ -1064,6 +1172,7 @@ services:
     volumes:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-signing.pem, read_only: true, volume: {subpath: gateway/internal-signing.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/data-keys.token, read_only: true, volume: {subpath: tokens/data-keys.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-sessions.token, read_only: true, volume: {subpath: tokens/app-sessions.token}}
       # The bootstrap's ids (never its signing key), as a dir: a rewritten id is seen at once.
@@ -1093,6 +1202,9 @@ services:
       # .env's tunables (blank = the service's default).
       CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
       CHELABASE_APP_ACCESS_TTL_SECS: ${CHELABASE_APP_ACCESS_TTL_SECS:-}
+      # auth-replacement m5: its identity bearer (member and app-user flows).
+      CHELABASE_IDENTITY_URL: http://identity:8080
+      CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token
     networks:
       default: {}
       compute: {}
@@ -1100,9 +1212,12 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/cookie.key, read_only: true, volume: {subpath: auth/cookie.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.key, read_only: true, volume: {subpath: auth/app-jwt.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/app-jwt.pub, read_only: true, volume: {subpath: auth/app-jwt.pub}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.key, read_only: true, volume: {subpath: auth/member-jwt.key}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/gateway/internal-verify.pem, read_only: true, volume: {subpath: gateway/internal-verify.pem}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/compute-ca/ca.crt, read_only: true, volume: {subpath: compute-ca/ca.crt}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/app-auth.token, read_only: true, volume: {subpath: tokens/app-auth.token}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/tokens/auth-identity.token, read_only: true, volume: {subpath: tokens/auth-identity.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/admin.pat, read_only: true, volume: {subpath: zitadel-pats/admin.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/zitadel-pats/login-client.pat, read_only: true, volume: {subpath: zitadel-pats/login-client.pat}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
@@ -1177,6 +1292,7 @@ services:
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/ticket.key, read_only: true, volume: {subpath: realtime/ticket.key}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime/internal.token, read_only: true, volume: {subpath: realtime/internal.token}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/realtime-tls, read_only: true, volume: {subpath: realtime-tls}}
+      - {type: volume, source: secrets, target: /run/chelabase/secrets/auth/member-jwt.pub, read_only: true, volume: {subpath: auth/member-jwt.pub}}
       - {type: volume, source: secrets, target: /run/chelabase/secrets/bootstrap/ids, read_only: true, volume: {subpath: bootstrap/ids}}
     healthcheck:
       <<: *app-health

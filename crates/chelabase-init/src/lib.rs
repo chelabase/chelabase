@@ -12,6 +12,7 @@ pub mod fsx;
 pub mod kinds;
 pub mod owners;
 pub mod random;
+pub mod roles;
 pub mod secrets;
 pub mod seed;
 

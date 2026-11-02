@@ -791,3 +791,19 @@ fn realtime_is_one_of_the_stacks_rust_apps() {
     assert!(restart_targets(&[]).unwrap().contains(&"realtime".to_string()), "restart with no app named");
     assert_eq!(restart_targets(&["realtime".into()]).unwrap(), ["realtime"]);
 }
+
+// auth-replacement m5 (#118): `up` starts identity with the front tier and waits for it to be
+// healthy before the bootstrap (which creates its members pool through it); it is an app of the
+// stack (restartable, checked by `test --stack`), not a Rust app (no binary, no demo.env).
+#[test]
+fn identity_starts_before_the_bootstrap() {
+    use super::commands::{APPS, DEMO_ENV_READERS, FRONT, INFRA, LATE_APPS, RUST_APPS, restart_targets};
+    assert!(FRONT.contains(&"identity"), "{FRONT:?}");
+    assert!(APPS.contains(&"identity"), "{APPS:?}");
+    assert!(!LATE_APPS.contains(&"identity"), "{LATE_APPS:?}");
+    assert!(!RUST_APPS.contains(&"identity"), "{RUST_APPS:?}");
+    assert!(!DEMO_ENV_READERS.contains(&"identity"));
+    assert!(!INFRA.contains(&"identity"));
+    assert_eq!(restart_targets(&["identity".into()]).unwrap(), ["identity"]);
+    assert!(!restart_targets(&[]).unwrap().contains(&"identity".to_string()));
+}
