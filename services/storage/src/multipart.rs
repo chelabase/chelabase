@@ -4,18 +4,19 @@
 //! - **Create** (`POST /upload/{bucket}/{*name}`): the declared type against the bucket's list
 //!   (415), m5's pre-check as the caller (the INSERT, or upsert, in a rolled-back savepoint:
 //!   403), then the S3 upload and the session row, written as storage itself and bound to the
-//!   caller's role and `sub`, the database's OID and (by `guard_sessions`) the timeline.
+//!   caller's role, `sub` and data key, the database's OID and (by `guard_sessions`) the timeline.
 //! - **Part** (`PUT /upload/session/{id}/{n}`): 5 MiB to 100 MiB (the last may be smaller),
 //!   counted as it arrives and held to the bucket's limit less the other parts' bytes (413);
 //!   part 1's first bytes are sniffed (415). The part's buffer is reserved from the process's
 //!   [`crate::limits::InFlight`] cap first (503 `busy`). A resent part replaces the earlier one.
 //! - **Complete** (`POST /upload/session/{id}/complete`): parts 1..n with no gap, the total
 //!   against the bucket's current limit (413, the S3 upload aborted), the pre-check again
-//!   (403, aborted), then the S3 upload is completed and m5's ticket flow writes the row as the
+//!   (403, aborted), then the session is claimed (its row deleted: a losing concurrent
+//!   completion is 409), the S3 upload completed and m5's ticket flow writes the row as the
 //!   caller (RLS decides once more; a refused row deletes the blob).
 //! - **Abort** (`DELETE /upload/session/{id}`) and **list** (`GET`).
 //!
-//! A session is the caller's only: another role or `sub`, another timeline (a branch copies
+//! A session is the caller's only: another role, `sub` or data key, another timeline (a branch copies
 //! the row) or another database answers 404 `upload_not_found`, as a missing one. After 24 hours
 //! it answers 410 and its S3 upload is aborted; m8's sweeper deletes the expired rows and any
 //! multipart upload no live session names.
@@ -169,7 +170,7 @@ fn over(budget: u64, limit: Option<u64>) -> Failure {
 /// A session row, written as storage itself; `timeline_id` is stamped by `guard_sessions`.
 const OPEN: NamedStatement = named_statement!(
     "open upload",
-    "INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, parts, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::pg_catalog.name, $10, '{}'::pg_catalog.jsonb, pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+) interval '24 hours') RETURNING pg_catalog.date_part('epoch', expires_at)::pg_catalog.int8",
+    "INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::pg_catalog.name, $10, $11, '{}'::pg_catalog.jsonb, pg_catalog.clock_timestamp() OPERATOR(pg_catalog.+) interval '24 hours') RETURNING pg_catalog.date_part('epoch', expires_at)::pg_catalog.int8",
     &[
         Type::UUID,
         Type::UUID,
@@ -180,15 +181,16 @@ const OPEN: NamedStatement = named_statement!(
         Type::BOOL,
         Type::INT8,
         Type::TEXT,
+        Type::UUID,
         Type::UUID
     ]
 );
 
-/// The caller's session (its id, role and owner, this timeline) with its bucket's limits.
+/// The caller's session (its id, role, owner and key, this timeline) with its bucket's limits.
 const SESSION: NamedStatement = named_statement!(
     "upload session",
-    "SELECT s.bucket_id, s.name, s.version_id, s.upload_id, s.content_type, s.upsert, s.datoid, s.parts::pg_catalog.text, pg_catalog.date_part('epoch', s.expires_at)::pg_catalog.int8, b.name, b.file_size_limit, b.allowed_mime_types FROM storage.upload_sessions s JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) s.bucket_id WHERE s.id OPERATOR(pg_catalog.=) $1 AND s.caller_role OPERATOR(pg_catalog.=) $2::pg_catalog.name AND s.owner IS NOT DISTINCT FROM $3 AND s.timeline_id OPERATOR(pg_catalog.=) pg_catalog.current_setting('neon.timeline_id', true)",
-    &[Type::UUID, Type::TEXT, Type::UUID]
+    "SELECT s.bucket_id, s.name, s.version_id, s.upload_id, s.content_type, s.upsert, s.datoid, s.parts::pg_catalog.text, pg_catalog.date_part('epoch', s.expires_at)::pg_catalog.int8, b.name, b.file_size_limit, b.allowed_mime_types FROM storage.upload_sessions s JOIN storage.buckets b ON b.id OPERATOR(pg_catalog.=) s.bucket_id WHERE s.id OPERATOR(pg_catalog.=) $1 AND s.caller_role OPERATOR(pg_catalog.=) $2::pg_catalog.name AND s.owner IS NOT DISTINCT FROM $3 AND s.key_id OPERATOR(pg_catalog.=) $4 AND s.timeline_id OPERATOR(pg_catalog.=) pg_catalog.current_setting('neon.timeline_id', true)",
+    &[Type::UUID, Type::TEXT, Type::UUID, Type::UUID]
 );
 
 /// Records a part (a resent one replaces the earlier) through `storage.record_part`: true,
@@ -199,11 +201,55 @@ const RECORD: NamedStatement = named_statement!(
     &[Type::UUID, Type::INT4, Type::INT8, Type::TEXT]
 );
 
+/// A completion's claim: the session's row, deleted by exactly one completion.
+const CLAIM: NamedStatement = named_statement!(
+    "claim upload",
+    "DELETE FROM storage.upload_sessions WHERE id OPERATOR(pg_catalog.=) $1 RETURNING id",
+    &[Type::UUID]
+);
+
 const CLOSE: NamedStatement = named_statement!(
     "close upload",
     "DELETE FROM storage.upload_sessions WHERE id OPERATOR(pg_catalog.=) $1",
     &[Type::UUID]
 );
+
+/// Who a session belongs to: the caller's role, `sub` and data key. A lookup matches all
+/// three ([`SESSION`]), so anyone else's id is 404.
+#[derive(Debug, PartialEq, Eq)]
+struct Binding<'a> {
+    role: &'a str,
+    owner: Option<Uuid>,
+    key_id: Uuid,
+}
+
+fn binding(data: &DataIdentity) -> Binding<'_> {
+    Binding {
+        role: &data.role,
+        owner: owner_of(data),
+        key_id: data.key_id,
+    }
+}
+
+/// The completion's claim on its session ([`CLAIM`]): only the one completion that deleted
+/// the row goes on; a losing concurrent one is 409, never a second S3 completion (which S3
+/// may accept, and whose refused row would delete the winner's blob).
+fn claimed(rows: usize) -> Result<(), Failure> {
+    if rows == 0 {
+        Err(Failure::object_conflict())
+    } else {
+        Ok(())
+    }
+}
+
+/// The S3 completion's failure, after the claim: the upload gone means another completion
+/// (or an abort) took it: 409.
+fn completion_failure(e: &StorageError, rid: &str) -> Failure {
+    match e {
+        StorageError::NotFound => Failure::object_conflict(),
+        other => Failure::from_store(other, rid),
+    }
+}
 
 /// A session as the routes use it.
 struct Loaded {
@@ -240,14 +286,14 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         rid: &str,
     ) -> Result<Loaded, Failure> {
         let id: Uuid = id.parse().map_err(|_| Failure::upload_not_found())?;
-        let owner = owner_of(data);
+        let who = binding(data);
         let rows = self
             .engine
             .managed(
                 data.branch_id,
                 &at.database,
                 &SESSION,
-                &[&id, &data.role, &owner],
+                &[&id, &who.role, &who.owner, &who.key_id],
                 rid,
             )
             .await?;
@@ -299,18 +345,9 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         }
     }
 
-    /// Ends `s`: its S3 upload aborted (unless `completed`) and its row deleted.
-    async fn close(
-        &self,
-        data: &DataIdentity,
-        at: &Located,
-        s: &Loaded,
-        completed: bool,
-        rid: &str,
-    ) {
-        if !completed {
-            self.abort_upload(s, rid).await;
-        }
+    /// Ends `s`: its S3 upload aborted and its row deleted.
+    async fn close(&self, data: &DataIdentity, at: &Located, s: &Loaded, rid: &str) {
+        self.abort_upload(s, rid).await;
         if let Err(f) = self
             .engine
             .managed(data.branch_id, &at.database, &CLOSE, &[&s.id], rid)
@@ -413,6 +450,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
                 &i64::from(datoid),
                 &data.role,
                 &row.owner,
+                &data.key_id,
             ],
             &rid,
         )
@@ -584,7 +622,7 @@ pub async fn abort<S: ConnSource, M: ConnSource>(
         .locate(&data, q.database.as_deref(), &rid)
         .await?;
     let s = state.session(&data, &at, &id, &rid).await?;
-    state.close(&data, &at, &s, false, &rid).await;
+    state.close(&data, &at, &s, &rid).await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -602,7 +640,7 @@ pub async fn abort<S: ConnSource, M: ConnSource>(
         (status = 400, description = "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: the policies no longer allow it", body = StorageErrorEnvelope),
         (status = 404, description = "`upload_not_found`", body = StorageErrorEnvelope),
-        (status = 409, description = "`conflict`: the name was taken, or the object changed meanwhile", body = StorageErrorEnvelope),
+        (status = 409, description = "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won", body = StorageErrorEnvelope),
         (status = 410, description = "`upload_expired`", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
@@ -631,7 +669,7 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
         Ok(plan) => plan,
         Err(f) => {
             if terminal(&f) {
-                state.close(&data, &at, &s, false, &rid).await;
+                state.close(&data, &at, &s, &rid).await;
             }
             return Err(f);
         }
@@ -655,16 +693,30 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
         Ok(e) => e,
         Err(f) => {
             if terminal(&f) {
-                state.close(&data, &at, &s, false, &rid).await;
+                state.close(&data, &at, &s, &rid).await;
             }
             return Err(f);
         }
     };
-    let meta = state
+    // Exactly one completion claims the session (its row deleted); a losing concurrent one is
+    // 409 and never reaches S3, so it can't delete the winner's blob. From here a failure
+    // can't be retried: the upload is aborted.
+    let claim = state
+        .engine
+        .managed(data.branch_id, &at.database, &CLAIM, &[&s.id], &rid)
+        .await?;
+    claimed(claim.len())?;
+    let meta = match state
         .store
         .multipart_complete(&s.key, &s.upload_id, parts)
         .await
-        .map_err(|e| store_failure(&e, &rid))?;
+    {
+        Ok(meta) => meta,
+        Err(e) => {
+            state.abort_upload(&s, &rid).await;
+            return Err(completion_failure(&e, &rid));
+        }
+    };
     // The S3 upload is gone either way now; the row, a refused or failed one, as m5's.
     let written = names::keep_if_written(state.store.as_ref(), &s.key, async || {
         if meta.size != total {
@@ -682,7 +734,6 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
             .await
     })
     .await;
-    state.close(&data, &at, &s, true, &rid).await;
     written?;
     Ok(Json(json!({
         "bucket": s.bucket, "name": row.name, "version_id": row.version, "size": row.size, "etag": row.etag,
@@ -794,6 +845,73 @@ mod tests {
             assert_eq!(s.plan(None, now).unwrap_err().0.status.as_u16(), 410);
         }
         assert_eq!(s.parts.len(), 1);
+    }
+
+    fn identity(role: &str, sub: Option<Uuid>, key_id: Uuid) -> DataIdentity {
+        serde_json::from_value(json!({
+            "branch_id": Uuid::nil(), "key_id": key_id, "kind": "secret", "role": role,
+            "claims": sub.map_or(json!({}), |s| json!({ "sub": s.to_string() })),
+        }))
+        .unwrap()
+    }
+
+    /// AC 9 (review): a session is bound to the caller's role, `sub` and data key: a second
+    /// key on the same role, another user or another role each binds differently, and the
+    /// lookup matches all three.
+    #[test]
+    fn a_session_is_bound_to_role_owner_and_key() {
+        let (k1, k2, user) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mine = identity("authenticated", Some(user), k1);
+        let b = binding(&mine);
+        assert_eq!(
+            b,
+            Binding {
+                role: "authenticated",
+                owner: Some(user),
+                key_id: k1
+            }
+        );
+        for other in [
+            identity("authenticated", Some(user), k2),
+            identity("authenticated", None, k1),
+            identity("authenticated", Some(Uuid::new_v4()), k1),
+            identity("anon", Some(user), k1),
+        ] {
+            assert_ne!(binding(&other), b, "{other:?}");
+        }
+        let sql = SESSION.sql();
+        for part in [
+            "s.caller_role OPERATOR(pg_catalog.=) $2::pg_catalog.name",
+            "s.owner IS NOT DISTINCT FROM $3",
+            "s.key_id OPERATOR(pg_catalog.=) $4",
+            "s.timeline_id OPERATOR(pg_catalog.=) pg_catalog.current_setting('neon.timeline_id', true)",
+        ] {
+            assert!(sql.contains(part), "{part}: {sql}");
+        }
+        assert!(
+            OPEN.sql().contains("caller_role, owner, key_id, parts"),
+            "{}",
+            OPEN.sql()
+        );
+    }
+
+    /// Review: of two concurrent completions only the one that claimed the session goes on;
+    /// the other is 409 `conflict`, and an upload gone at S3 after the claim is 409 too.
+    #[test]
+    fn a_losing_concurrent_completion_is_409() {
+        assert!(claimed(1).is_ok());
+        let lost = claimed(0).unwrap_err();
+        assert_eq!((lost.0.status.as_u16(), lost.0.code), (409, "conflict"));
+        let gone = completion_failure(&StorageError::NotFound, "r");
+        assert_eq!((gone.0.status.as_u16(), gone.0.code), (409, "conflict"));
+        let other = completion_failure(&StorageError::Transient("x".into()), "r");
+        assert_eq!(other.0.status.as_u16(), 502);
+        assert!(
+            CLAIM
+                .sql()
+                .starts_with("DELETE FROM storage.upload_sessions")
+                && CLAIM.sql().ends_with("RETURNING id")
+        );
     }
 
     #[derive(Debug, Clone)]

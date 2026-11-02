@@ -1858,7 +1858,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the name was taken, or the object changed meanwhile",
+            "description": "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won",
             "content": {
               "application/json": {
                 "schema": {

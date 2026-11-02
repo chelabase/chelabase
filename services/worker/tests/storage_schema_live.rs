@@ -313,7 +313,7 @@ async fn run(fx: &Fx) {
     );
     // m7: upload sessions are storage's alone: the owner (`pg_write_all_data`) writes none,
     // `authenticated` neither reads nor records a part; storage itself opens one.
-    let open = "INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, parts, expires_at) VALUES (gen_random_uuid(), gen_random_uuid(), 'x', gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', NULL, '{}', clock_timestamp() + interval '1 hour')";
+    let open = "INSERT INTO storage.upload_sessions (id, bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, expires_at) VALUES (gen_random_uuid(), gen_random_uuid(), 'x', gen_random_uuid(), 'u', 'a/b', false, 1, 'authenticated', NULL, gen_random_uuid(), '{}', clock_timestamp() + interval '1 hour')";
     let err = fx.owner_err(open).await;
     assert!(err.contains("CB004"), "the owner opens a session: {err}");
     assert_eq!(fx.code("authenticated", "SELECT * FROM storage.upload_sessions").await, "42501");
@@ -2903,8 +2903,9 @@ async fn storage_multipart_lost_permission_live() {
     .await;
 }
 
-/// AC 9: another caller's session id (another app user, or a secret key without a user) is
-/// 404 on every session route, and the owner's session is untouched.
+/// AC 9: another caller's session id (another app user, a secret key without a user, or a
+/// second secret key on the same role) is 404 on every session route, and the owner's session
+/// is untouched.
 #[tokio::test]
 #[ignore = "needs the workbench stack with the storage service"]
 async fn storage_multipart_other_callers_session_live() {
@@ -2919,6 +2920,16 @@ async fn storage_multipart_other_callers_session_live() {
         assert_eq!(status, 200, "{b}");
         let id = b["id"].as_str().unwrap().to_string();
         assert_eq!(put_part(&public, &id, 1, b"a".to_vec(), &as_alice).await.0, 200);
+        // A secret key's own session: another secret key on the same role can't reach it.
+        let (status, b) = open_upload(&secret, "files", "keyed.bin", "application/octet-stream", &[]).await;
+        assert_eq!(status, 200, "{b}");
+        let keyed = b["id"].as_str().unwrap().to_string();
+        let second = fx.secret_key("st-fix-second", None).await;
+        for (method, tail) in [("GET", ""), ("POST", "/complete"), ("DELETE", "")] {
+            assert_eq!(session_call(&second, method, &keyed, tail, &[]).await.0, 404, "{method} {tail}");
+        }
+        assert_eq!(put_part(&second, &keyed, 1, b"evil".to_vec(), &[]).await.0, 404);
+        assert_eq!(session_call(&secret, "GET", &keyed, "", &[]).await.0, 200);
         for (key, headers) in [(public.as_str(), &as_bob[..]), (secret.as_str(), &[][..])] {
             assert_eq!(put_part(key, &id, 1, b"evil".to_vec(), headers).await.0, 404);
             for (method, tail) in [("GET", ""), ("POST", "/complete"), ("DELETE", "")] {

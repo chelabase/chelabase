@@ -291,6 +291,7 @@ CREATE TABLE IF NOT EXISTS storage.upload_sessions (
   datoid bigint NOT NULL,
   caller_role name NOT NULL,
   owner uuid,
+  key_id uuid NOT NULL,
   parts jsonb NOT NULL,
   timeline_id text NOT NULL,
   expires_at timestamptz NOT NULL,
@@ -702,8 +703,8 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'CB004', MESSAGE = 'storage.upload_sessions is written by Chelabase storage only';
   END IF;
   IF TG_OP = 'UPDATE' THEN
-    IF (NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.timeline_id, NEW.created_at)
-      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.timeline_id, OLD.created_at)
+    IF (NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.key_id, NEW.timeline_id, NEW.created_at)
+      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.key_id, OLD.timeline_id, OLD.created_at)
       OR NEW.expires_at > OLD.expires_at THEN
       RAISE EXCEPTION USING ERRCODE = '22023', MESSAGE = 'storage.upload_sessions: only the parts change, and the expiry only comes sooner';
     END IF;
@@ -2008,6 +2009,8 @@ mod tests {
             "datoid bigint NOT NULL",
             "caller_role name NOT NULL",
             "owner uuid",
+            // Bound to the data key that opened it, too (m7 review).
+            "key_id uuid NOT NULL",
             "parts jsonb NOT NULL",
             "timeline_id text NOT NULL",
             "expires_at timestamptz NOT NULL",
@@ -2034,7 +2037,7 @@ mod tests {
             "NEW.timeline_id := pg_catalog.current_setting('neon.timeline_id', true);",
             "NEW.expires_at > clock_timestamp() + interval '24 hours'",
             "NEW.expires_at > OLD.expires_at",
-            "(NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.timeline_id, NEW.created_at)\n      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.timeline_id, OLD.created_at)",
+            "(NEW.id, NEW.bucket_id, NEW.name, NEW.version_id, NEW.upload_id, NEW.content_type, NEW.upsert, NEW.datoid, NEW.caller_role, NEW.owner, NEW.key_id, NEW.timeline_id, NEW.created_at)\n      IS DISTINCT FROM (OLD.id, OLD.bucket_id, OLD.name, OLD.version_id, OLD.upload_id, OLD.content_type, OLD.upsert, OLD.datoid, OLD.caller_role, OLD.owner, OLD.key_id, OLD.timeline_id, OLD.created_at)",
         ] {
             assert!(GUARD_SESSIONS_BODY.contains(part), "{part}: {GUARD_SESSIONS_BODY}");
         }
