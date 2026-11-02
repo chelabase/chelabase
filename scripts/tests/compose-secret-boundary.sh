@@ -54,10 +54,11 @@ seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
 seaweedfs	storage-s3/access-key	ro
 seaweedfs	storage-s3/secret-key	ro
-seaweedfs	s3-admin/access-key	ro
-seaweedfs	s3-admin/secret-key	ro
-create-bucket	s3-admin/access-key	ro
-create-bucket	s3-admin/secret-key	ro
+seaweedfs	grpc-tls/ca.crt	ro
+seaweedfs	grpc-tls/server.crt	ro
+seaweedfs	grpc-tls/server.key	ro
+seaweedfs	grpc-tls/client.crt	ro
+seaweedfs	grpc-tls/client.key	ro
 safekeeper1	s3/access-key	ro
 safekeeper1	s3/secret-key	ro
 safekeeper1	neon/compute-jwt.pub.pem	ro
@@ -177,7 +178,7 @@ jq -r --arg k "$keys/" --arg st "$state" --arg z "$state/zitadel" '.services | t
     elif (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|storage-s3/|s3-admin/|zitadel/|zitadel-config/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|storage-s3/|grpc-tls/|zitadel/|zitadel-config/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true
@@ -188,47 +189,47 @@ for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   fi
 done
 
-# 4. The object-store keys (m2 of epic object-storage). The table pins who mounts which file:
-# Neon's `s3/` pair is mounted by seaweedfs and the four Neon services, `storage-s3/` by
-# seaweedfs only (until the storage service lands), `s3-admin/` by seaweedfs and create-bucket.
-# Here: no service gets a key file from its environment, command or a bind (a value there shows
-# up in `docker inspect`), and the one place a key file's content is read into a variable is the
-# seaweedfs / Neon entrypoints, never an `environment:` entry.
+# 4. The object-store keys and SeaweedFS's gRPC TLS files (epic object-storage m2). The table
+# pins who mounts which file: Neon's `s3/` pair by seaweedfs and the four Neon services,
+# `storage-s3/` and `grpc-tls/` by seaweedfs only (until the storage service lands). Here: no
+# service gets one of them from its environment or a bind (a value there shows up in `docker
+# inspect`), no admin identity or key file exists, and only seaweedfs names these paths at all.
 leaks="$(jq -r '.services | to_entries[] | .key as $s
   | ((.value.environment // {}) | to_entries[]
        | select(.key | test("^(AWS_(ACCESS_KEY_ID|SECRET_ACCESS_KEY)|CHELABASE_STORAGE_S3_(ACCESS|SECRET)_KEY)$"))
        | "\($s): environment \(.key) is set in the base file"),
     ((.value.volumes // [])[] | select(.type == "bind")
-       | select(.source | test("storage-s3|s3-admin|/s3/"))
+       | select(.source | test("storage-s3|grpc-tls|/s3/"))
        | "\($s): bind \(.source)")' "$tmp/base.json")"
 [[ -z "$leaks" ]] || err "an object-store key reaches a service through its environment or a bind:"$'\n'"$leaks"
-# The only services that name a `storage-s3/` or `s3-admin/` path at all (mounts, command, env);
-# init-secrets, which makes the files, is the one besides.
-for dir in storage-s3 s3-admin; do
+# init-secrets, which makes the files, is the one name besides seaweedfs.
+for dir in storage-s3 grpc-tls; do
   users="$(jq -r --arg d "$dir/" '.services | to_entries[]
     | select(.key != "init-secrets" and (.value | tojson | contains($d))) | .key' "$tmp/base.json" | sort | tr '\n' ' ')"
-  case "$dir" in
-    storage-s3) want_users="seaweedfs " ;;
-    s3-admin) want_users="create-bucket seaweedfs " ;;
-  esac
-  [[ "$users" == "$want_users" ]] || err "services naming $dir/: got [$users], want [$want_users]"
+  [[ "$users" == "seaweedfs " ]] || err "services naming $dir/: got [$users], want [seaweedfs ]"
 done
+! jq -e '[.services | to_entries[] | select(.key == "seaweedfs" or .key == "create-bucket" or (.key | startswith("safekeeper")) or .key == "pageserver")
+  | select(.value | tojson | test("s3-admin|\"admin\"|Admin"))] | length > 0' "$tmp/base.json" >/dev/null ||
+  err "an admin S3 identity or key file is back"
 
-# The same wiring in the base file: the three identities, bucket-scoped actions, loopback binds.
+# The same wiring in the base file: two identities with bucket-scoped actions, mTLS on every
+# gRPC listener, S3 directly on the network, no relay, buckets made inside, a real healthcheck.
 sw_cmd="$(jq -r '.services.seaweedfs.command | join("\n")' "$tmp/base.json")"
 for want in '"Read:neon", "Write:neon", "List:neon", "Tagging:neon"' \
   '"Read:chelabase-storage", "Write:chelabase-storage", "List:chelabase-storage", "Tagging:chelabase-storage"' \
-  '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.port=8334' '-s3.ip.bind=127.0.0.1' '-s3.iam=false' \
-  'nc -lk -p 8333 -e nc 127.0.0.1 8334'; do
+  '-ip=127.0.0.1' '-ip.bind=127.0.0.1' '-s3.ip.bind=0.0.0.0' '-s3.iam=false' 'exec weed server' \
+  '/etc/seaweedfs/security.toml' '[grpc.%s]' 'for c in master volume filer s3' '[grpc.client]' \
+  's3.bucket.create -name neon' 's3.bucket.create -name chelabase-storage' '/tmp/buckets-ready'; do
   grep -qF -- "$want" <<<"$sw_cmd" || err "seaweedfs: the command must contain: $want"
 done
-! grep -qF -e '0.0.0.0' <<<"$sw_cmd" || err "seaweedfs: nothing but the 8333 relay may listen on 0.0.0.0"
-[[ "$(grep -o '"Admin"' <<<"$sw_cmd" | wc -l)" == 1 ]] || err "seaweedfs: exactly one identity (admin) has global Admin"
+! grep -qE 'nc -lk|"Admin"|"name": "admin"|-s3.port=' <<<"$sw_cmd" || err "seaweedfs: no relay, no admin identity, no moved S3 port"
 ! grep -qE '"(Read|Write|List|Tagging)"' <<<"$sw_cmd" || err "seaweedfs: no unscoped Read/Write/List/Tagging action"
-jq -r '.services["create-bucket"].entrypoint | join("\n")' "$tmp/base.json" |
-  grep -qF -- "for b in neon chelabase-storage" || err "create-bucket makes buckets neon and chelabase-storage"
-! jq -r '.services["create-bucket"].entrypoint | join("\n")' "$tmp/base.json" | grep -qF "secrets/s3/" ||
-  err "create-bucket must use the admin key, not Neon's"
+hc="$(jq -r '.services.seaweedfs.healthcheck.test | join(" ")' "$tmp/base.json")"
+for want in '/tmp/buckets-ready' '8333' '<Code>AccessDenied</Code>'; do
+  grep -qF -- "$want" <<<"$hc" || err "seaweedfs: the healthcheck must be an S3-level request ($want)"
+done
+[[ "$(jq -c '.services["create-bucket"] | [.volumes // [], .environment // {}, .depends_on.seaweedfs.condition]' "$tmp/base.json")" == '[[],{},"service_healthy"]' ]] ||
+  err "create-bucket holds no volume or credential and only waits for seaweedfs to be healthy"
 
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

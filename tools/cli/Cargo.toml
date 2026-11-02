@@ -22,6 +22,7 @@ chelabase-typegen = { workspace = true }
 chelabase-types = { workspace = true }
 chelabase-zitadel = { workspace = true }
 clap = { workspace = true }
+rcgen = { workspace = true }
 hex = { workspace = true }
 jsonwebtoken = { workspace = true }
 reqwest = { workspace = true }
