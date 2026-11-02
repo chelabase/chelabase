@@ -26,7 +26,7 @@ function "index_annotations" {
 }
 
 group "default" {
-  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio"]
+  targets = ["gateway", "orchestrator", "worker", "rest", "auth", "realtime", "init", "server", "studio", "identity"]
 }
 
 target "_app" {
@@ -91,7 +91,7 @@ target "studio" {
   tags       = ["${REPO}/studio:${TAG}"]
 }
 # The internal identity service (Node, Better Auth); its own Dockerfile, no cargo build.
-# Not in the default group yet: compose and the publish scripts pick it up with m5.
+# In the default group (`just images`); not in the release scripts yet (publish, pin, image-inputs).
 target "identity" {
   context    = "."
   dockerfile = "infra/images/identity.Dockerfile"

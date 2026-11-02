@@ -25,7 +25,7 @@ main="$tmp/m"
 keys="$main/.chelabase"
 checkout="$main/.worktrees/x"
 state="$keys/stacks/x"
-mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrator-tls/v1,nats,valkey,realtime,tokens} \
+mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrator-tls/v1,nats,valkey,realtime,tokens,identity} \
   "$state"/{env,nats,valkey,zitadel,neon,logs,test,runner} "$keys/stacks/other" "$checkout"
 # RT1 T1: the service secrets (S1, S27) and the storage auth files exist too; the orchestrator
 # reads its own NATS and Valkey passwords, realtime's internal token and the internal bearers.
@@ -37,6 +37,8 @@ for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verif
   realtime/pg.password realtime/ticket.key realtime/internal.token \
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token \
   tokens/proxy-api.token tokens/storcon-hook.token \
+  auth/member-jwt.key auth/member-jwt.pub identity/secret identity/db.password \
+  tokens/auth-identity.token tokens/orchestrator-identity.token tokens/worker-identity.token \
   neon/compute-jwt.pub.pem neon/storage-tokens/pageserver-api.jwt neon/storage-tokens/safekeeper-data.jwt \
   neon/storage-tokens/generations-api.jwt neon/storage-tokens/storcon-admin.jwt \
   stacks/other/secret; do
@@ -72,13 +74,15 @@ readable=(secrets/secrets.key gateway/internal-verify.pem neon/compute-jwt.pem n
   orchestrator-tls/current/client.crt orchestrator-tls/current/client.key orchestrator-tls/current/ca.crt
   nats/orchestrator.password valkey/control.password realtime/internal.token
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token
-  tokens/proxy-api.token tokens/storcon-hook.token stacks/x/zitadel/admin.pat)
+  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub
+  stacks/x/zitadel/admin.pat)
 expected="$(printf '%s\n' "$keys/secrets/secrets.key" "$keys/gateway/internal-verify.pem" \
   "$keys/neon/compute-jwt.pem" "$keys/neon/compute-jwt.pub" "$keys/orchestrator-tls/current" \
   "$keys/orchestrator-tls/v1/client.crt" "$keys/orchestrator-tls/v1/client.key" "$keys/orchestrator-tls/v1/ca.crt" \
   "$keys/nats/orchestrator.password" "$keys/valkey/control.password" "$keys/realtime/internal.token" \
   "$keys/tokens/rest-internal.token" "$keys/tokens/data-keys.token" "$keys/tokens/app-auth.token" \
   "$keys/tokens/app-sessions.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
+  "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" \
   "$state/zitadel/admin.pat" | sort)"
 
 script='set -e

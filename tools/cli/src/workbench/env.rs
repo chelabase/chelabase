@@ -422,6 +422,9 @@ pub fn render_stack_env(example: &str, input: &StackEnvInput) -> String {
             "CHELABASE_APP_JWT_PUBLIC_KEY",
             auth_dir.join(app_keys::PUBLIC_FILE),
         ),
+        // The member JWT pair (auth-replacement m5): auth signs, the others verify.
+        ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", auth_dir.join("member-jwt.key")),
+        ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", auth_dir.join("member-jwt.pub")),
     ] {
         lines.set(key, path(&file));
     }

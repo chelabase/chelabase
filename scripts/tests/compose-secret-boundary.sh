@@ -14,6 +14,14 @@
 #      with the same mode. Install-part files (database, S3, Zitadel, setup code, NATS/Valkey
 #      auth files, the bootstrap's outputs) have no keys-dir counterpart: the workbench keeps
 #      them in each stack's state dir or uses its fixed dev values.
+#   4. the identity service's boundary (auth-replacement m5), in both renders: only `identity`
+#      mounts `identity/*` (the bootstrap also reads `identity/db.password`, self-hosted: it sets
+#      the role's password); only `auth` mounts `auth/member-jwt.key`, and the member public key
+#      goes to auth, the gateway, the orchestrator and realtime only; `gateway/internal-signing.pem`
+#      is the gateway's alone; each `tokens/<caller>-identity.token` is mounted only by its
+#      caller and `identity` (the worker's also by the self-hosted bootstrap, which calls the
+#      worker's pool route). The workbench's runner, the test harness, sees every key and is left
+#      out of these checks.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 dir="$root/infra/compose"
@@ -81,6 +89,13 @@ proxy	valkey/proxy.password	ro
 proxy	tokens/proxy-api.token	ro
 init-secrets		rw
 init-bootstrap	db/metadata.password	ro
+init-bootstrap	identity/db.password	ro
+init-bootstrap	tokens/worker-identity.token	ro
+identity	identity/secret	ro
+identity	identity/db.password	ro
+identity	tokens/auth-identity.token	ro
+identity	tokens/orchestrator-identity.token	ro
+identity	tokens/worker-identity.token	ro
 init-bootstrap	zitadel-pats/admin.pat	ro
 init-bootstrap	bootstrap	rw
 orchestrator	secrets/secrets.key	ro
@@ -96,6 +111,8 @@ orchestrator	tokens/app-auth.token	ro
 orchestrator	tokens/app-sessions.token	ro
 orchestrator	tokens/proxy-api.token	ro
 orchestrator	tokens/storcon-hook.token	ro
+orchestrator	tokens/orchestrator-identity.token	ro
+orchestrator	auth/member-jwt.pub	ro
 orchestrator	orchestrator-tls	ro
 orchestrator	db/metadata.password	ro
 orchestrator	setup/setup.code	ro
@@ -107,6 +124,7 @@ worker	neon/compute-jwt.pub	ro
 worker	nats/worker.password	ro
 worker	valkey/control.password	ro
 worker	realtime/pg.password	ro
+worker	tokens/worker-identity.token	ro
 worker	compute-ca	rw
 worker	orchestrator-tls	rw
 worker	realtime-tls	rw
@@ -114,12 +132,16 @@ worker	db/metadata.password	ro
 worker	zitadel-pats/admin.pat	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
+gateway	auth/member-jwt.pub	ro
 gateway	tokens/data-keys.token	ro
 gateway	tokens/app-sessions.token	ro
 gateway	bootstrap/ids	ro
 auth	auth/cookie.key	ro
 auth	auth/app-jwt.key	ro
 auth	auth/app-jwt.pub	ro
+auth	auth/member-jwt.key	ro
+auth	auth/member-jwt.pub	ro
+auth	tokens/auth-identity.token	ro
 auth	gateway/internal-verify.pem	ro
 auth	compute-ca/ca.crt	ro
 auth	tokens/app-auth.token	ro
@@ -137,6 +159,7 @@ realtime	realtime/pg.password	ro
 realtime	realtime/ticket.key	ro
 realtime	realtime/internal.token	ro
 realtime	realtime-tls	ro
+realtime	auth/member-jwt.pub	ro
 realtime	bootstrap/ids	ro
 EOF
 
@@ -182,6 +205,43 @@ for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
     err "$svc mounts other secret files than under the workbench:"
     cat "$tmp/diff" >&2
   fi
+done
+
+# 4. The identity boundary, in the base file and under the workbench (the runner left out).
+# who <file> <render>: the services mounting <file> (or a directory above it), sorted, one line.
+who() {
+  awk -F'\t' -v f="$1" '$1 != "runner" && ($2 == f || index(f, $2 "/") == 1 || $2 == "") { print $1 }' "$2" |
+    LC_ALL=C sort -u | paste -sd' ' -
+}
+boundary() { # boundary <file> <expected services> <render label> <render file>
+  local got
+  got="$(who "$1" "$4")"
+  [[ "$got" == "$2" ]] || err "$3: $1 is mounted by [$got], expected [$2]"
+}
+for render in base wb; do
+  file="$tmp/have"
+  [[ "$render" == wb ]] && file="$tmp/wb.have"
+  # The base's init-secrets mounts the whole volume (it writes it): not a reader.
+  grep -v $'^init-secrets\t' "$file" >"$tmp/readers.$render" || true
+  boot=" init-bootstrap"
+  [[ "$render" == wb ]] && boot=""
+  boundary identity/secret "identity" "$render" "$tmp/readers.$render"
+  boundary identity/db.password "identity${boot}" "$render" "$tmp/readers.$render"
+  boundary auth/member-jwt.key "auth" "$render" "$tmp/readers.$render"
+  boundary auth/member-jwt.pub "auth gateway orchestrator realtime" "$render" "$tmp/readers.$render"
+  boundary gateway/internal-signing.pem "gateway" "$render" "$tmp/readers.$render"
+  boundary tokens/auth-identity.token "auth identity" "$render" "$tmp/readers.$render"
+  boundary tokens/orchestrator-identity.token "identity orchestrator" "$render" "$tmp/readers.$render"
+  boundary tokens/worker-identity.token "identity${boot} worker" "$render" "$tmp/readers.$render"
+  # Nothing else under identity/ is mounted, by anyone but identity (and the bootstrap's file).
+  extra="$(awk -F'\t' '$1 != "runner" && $1 != "identity" && ($2 ~ /^identity(\/|$)/) &&
+    !($1 == "init-bootstrap" && $2 == "identity/db.password") { print $1 ": " $2 }' "$tmp/readers.$render")"
+  [[ -z "$extra" ]] || err "$render: identity/ files reach other services:"$'\n'"$extra"
+done
+# The workbench runner (the test harness) reads the identity files the live tests use.
+for f in identity/db.password tokens/worker-identity.token; do
+  awk -F'\t' -v f="$f" '$1 == "runner" && $2 == f' "$tmp/wb.have" | grep -q . ||
+    err "the workbench runner doesn't see $f (members_pool_idempotent reads it)"
 done
 
 [[ "$fail" == 0 ]] || exit 1

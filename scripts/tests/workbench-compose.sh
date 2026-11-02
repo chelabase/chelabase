@@ -377,4 +377,58 @@ mt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sourc
 [[ "$mt_mounts" == "runner:true" ]] || fail "metrics.token: read-only for the runner, nobody else; got: $mt_mounts"
 # S7: Valkey TLS is off in the stack (platform mode turns it on).
 [[ "$(env_of realtime CHELABASE_VALKEY_TLS)" == off ]] || fail "realtime: CHELABASE_VALKEY_TLS=off in the stack"
+# auth-replacement m5 (#118): the identity service runs from the checkout's sources on the
+# workbench image, on the default network only, with no host port and no gateway route.
+[[ "$(q '.services.identity // empty | length')" -gt 0 ]] || fail "the stack runs identity"
+[[ "$(q '.services.identity.ports // [] | length')" == 0 ]] || fail "identity publishes no host port"
+[[ "$(q '.services.identity.networks // {} | keys | join(" ")')" == default ]] ||
+  fail "identity is on the default network only, got: $(q '.services.identity.networks // {} | keys | join(" ")')"
+[[ "$(q '.services.identity.image')" == chelabase-workbench:fixture000000 ]] || fail "identity runs the workbench image"
+[[ "$(q '.services.identity.user')" == 1000:1000 ]] || fail "identity runs as the host user"
+[[ "$(q '.services.identity.profiles // [] | length')" == 0 ]] || fail "identity starts by default"
+q '.services.identity.command | if type == "array" then join(" ") else . end' | gq -F 'services/identity/src/main.ts' ||
+  fail "identity runs the checkout's identity sources"
+[[ "$(q '.services.identity.volumes[] | select(.source == "/w/feat-x") | .read_only // false')" == true ]] ||
+  fail "identity mounts the checkout read-only"
+[[ -n "$(q '.services.identity.healthcheck.test // empty')" ]] || fail "identity has a healthcheck"
+[[ -z "$(q '.services.identity.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
+  fail "identity must not get the Docker socket"
+q '.services.identity.depends_on | keys[]' | gq -x metadata-db || fail "identity waits for metadata-db"
+want_env identity CHELABASE_IDENTITY_SECRET_FILE "$K/identity/secret"
+want_env identity CHELABASE_IDENTITY_DB_PASSWORD_FILE "$K/identity/db.password"
+for c in AUTH ORCHESTRATOR WORKER; do
+  lc="$(tr '[:upper:]' '[:lower:]' <<<"$c")"
+  want_env identity "CHELABASE_IDENTITY_${c}_TOKEN_FILE" "$K/tokens/$lc-identity.token"
+done
+for s in auth orchestrator worker; do
+  want_env "$s" CHELABASE_IDENTITY_TOKEN_FILE "$K/tokens/$s-identity.token"
+  want_eff "$s" CHELABASE_IDENTITY_URL http://identity:8080
+done
+# Workbench mail goes to Mailpit, in plain SMTP.
+want_env identity CHELABASE_SMTP_HOST mailpit
+want_env identity CHELABASE_SMTP_TLS none
+# The gateway has no upstream for it.
+! q '.services.gateway.environment // {} | to_entries[] | .value' | gq -E '//identity(:|/|$)' ||
+  fail "the gateway must have no identity upstream"
+
+# The base file: the identity image, no host port, the internal network only.
+base="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-base-x \
+  -f "$root/infra/compose/docker-compose.yml" --env-file "$root/infra/compose/.env.example" \
+  config --no-env-resolution --format json)" || fail "base compose config failed"
+bq() { jq -r "$1" <<<"$base"; }
+[[ "$(bq '.services.identity.ports // [] | length')" == 0 ]] || fail "base: identity publishes no host port"
+[[ "$(bq '.services.identity.networks // {} | keys | join(" ")')" == default ]] || fail "base: identity is on the default network only"
+bq '.services.identity.image' | gq -E '/identity:' || fail "base: identity runs the identity image"
+[[ "$(bq '.services.identity.user')" == 10001:10001 ]] || fail "base: identity runs as the app user"
+[[ -n "$(bq '.services.identity.healthcheck.test // empty')" ]] || fail "base: identity has a healthcheck"
+for d in metadata-db init-secrets; do
+  bq '.services.identity.depends_on | keys[]' | gq -x "$d" || fail "base: identity waits for $d"
+done
+bq '.services["init-bootstrap"].depends_on | keys[]' | gq -x identity || fail "base: the bootstrap waits for identity"
+[[ "$(bq '.services.identity.read_only // false')" == true ]] || fail "base: identity's root filesystem is read-only"
+! bq '.services.gateway.environment // {} | to_entries[] | .value' | gq -E '//identity(:|/|$)' ||
+  fail "base: the gateway must have no identity upstream"
+published_base="$(bq '[.services | to_entries[] | select(.value.ports) | .key] | unique | join(" ")')"
+[[ "$published_base" == "gateway proxy" ]] || fail "base: only the gateway and the proxy publish ports, got: $published_base"
+
 echo "workbench-compose: ok"

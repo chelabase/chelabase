@@ -24,6 +24,8 @@
 //!    the demo machine user in self-hosted mode). Without `--demo` no admin is set: the setup
 //!    code's claim decides it.
 //! 10. The output ids, then the Actions target last (its host, the orchestrator, must resolve).
+//! 11. The identity service ([`identity`]): the `chelabase_identity` role, its password and the
+//!     `identity_admin` functions ([`crate::roles`]), then the `members` pool (idempotent).
 //!
 //! Every wait shares one deadline (`--timeout`, default 10 minutes) and retries readiness
 //! only: no connection, a 502/503/504, a readiness probe's 404, an unmigrated schema, an
@@ -58,8 +60,10 @@
 //! `CHELABASE_METADATA_DATABASE_URL` (its password from
 //! `CHELABASE_METADATA_DATABASE_PASSWORD_FILE` when set), `CHELABASE_ORCHESTRATOR_HEALTH_URL`
 //! (default `http://orchestrator:8083/health`; `none` skips the probe),
-//! `CHELABASE_ZITADEL_ACTIONS_ENDPOINT`, and `CHELABASE_SMTP_HOST|PORT|USER|PASSWORD_FILE|FROM`.
+//! `CHELABASE_ZITADEL_ACTIONS_ENDPOINT`, `CHELABASE_SMTP_HOST|PORT|USER|PASSWORD_FILE|FROM`, and
+//! the identity step's `CHELABASE_IDENTITY_URL|TOKEN_FILE|DB_PASSWORD_FILE` ([`identity`]).
 
+pub mod identity;
 pub mod outputs;
 pub mod requests;
 pub mod retry;
@@ -120,6 +124,9 @@ pub const ENV_KEYS: &[&str] = &[
     "CHELABASE_SMTP_USER",
     "CHELABASE_SMTP_PASSWORD_FILE",
     "CHELABASE_SMTP_FROM",
+    "CHELABASE_IDENTITY_URL",
+    "CHELABASE_IDENTITY_TOKEN_FILE",
+    "CHELABASE_IDENTITY_DB_PASSWORD_FILE",
 ];
 
 /// The PAT Zitadel just wrote may not be accepted for a few seconds: a 401 on the first call
@@ -330,8 +337,11 @@ async fn wait_for_pat(w: &Waiter, path: &Path) -> Result<String> {
     .await
 }
 
-/// `chelabase-init bootstrap`: the real Zitadel, metadata database and orchestrator.
+/// `chelabase-init bootstrap`: the real Zitadel, metadata database, orchestrator and identity
+/// service. The identity step's settings are read from the process environment ([`identity`]),
+/// before anything else happens.
 pub async fn run(cfg: &Config, demo: Demo) -> Result<()> {
+    let identity_cfg = identity::IdentityConfig::from_lookup(|k| std::env::var(k).ok())?;
     let w = Waiter::new(cfg.timeout, cfg.backoff);
     let pat = wait_for_pat(&w, &cfg.admin_pat_file).await?;
     let api = zitadel::HttpZitadel::via_upstream(&cfg.zitadel_upstream, &cfg.auth_host, &pat);
@@ -348,7 +358,12 @@ pub async fn run(cfg: &Config, demo: Demo) -> Result<()> {
             .await
         }
         None => run_with(cfg, demo, &api, &metadata, &NoProbe).await,
-    }
+    }?;
+    // After the metadata migrations (run_with waited for them): the roles' grants name the
+    // `chelabase` schema they make.
+    identity::run(&w, &cfg.metadata_url, &identity_cfg).await?;
+    info!("bootstrap complete (identity included)");
+    Ok(())
 }
 
 /// A Zitadel call's error as a readiness answer: unavailable is "not yet", anything else fails.

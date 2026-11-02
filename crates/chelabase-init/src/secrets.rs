@@ -12,6 +12,8 @@
 //! | `gateway/internal-signing.pem`, `gateway/internal-verify.pem` | the gateway's internal-identity pair |
 //! | `auth/cookie.key` | auth's cookie key |
 //! | `auth/app-jwt.key`, `auth/app-jwt.pub` | the app-user JWT pair |
+//! | `auth/member-jwt.key`, `auth/member-jwt.pub` | the member JWT pair (auth signs; never the app-user pair) |
+//! | `identity/{secret,db.password}` | the identity service's Better Auth secret and its database password |
 //! | `neon/compute-jwt.pem`, `neon/compute-jwt.pub` | the compute-JWT pair |
 //! | `neon/compute-jwt.pub.pem` | derived: its public key as SPKI PEM |
 //! | `neon/storage-tokens/*.jwt` | derived: the scoped storage tokens |
@@ -20,7 +22,7 @@
 //! | `orchestrator-tls/`, `realtime-tls/` | client pairs (`current` -> `v<secs>/`), renewed when due |
 //! | `nats/*.password`, `valkey/*.password` | NATS and Valkey user passwords |
 //! | `realtime/{pg.password,ticket.key,internal.token}` | realtime's secrets |
-//! | `tokens/*.token` | the internal bearers |
+//! | `tokens/*.token` | the internal bearers (`*-identity.token`: each identity caller's own) |
 //!
 //! The install part holds what each install has on its own (in the workbench it goes under
 //! each stack's state dir; self-hosted, it is the same root):
@@ -84,6 +86,7 @@ pub enum Part {
 pub enum Pair {
     Internal,
     AppJwt,
+    MemberJwt,
     ComputeJwt,
     ComputeCa,
 }
@@ -95,6 +98,9 @@ pub enum Gen {
     SecretKey,
     /// 32 random bytes as 43 base64url characters.
     Text32,
+    /// [`Gen::Text32`], never seeded: its reader needs at least 32 bytes (a seed may hold 16) or
+    /// puts it in a URL (a seed may hold URL metacharacters).
+    Token32,
     /// 32 random bytes, raw.
     Raw32,
     /// One half of a pair (`private` true for the private key).
@@ -176,6 +182,10 @@ pub const LAYOUT: &[Entry] = &[
     e("auth/cookie.key", M, Gen::SecretKey, P),
     e("auth/app-jwt.key", M, half(Pair::AppJwt, true), P),
     e("auth/app-jwt.pub", M, half(Pair::AppJwt, false), PUB),
+    e("auth/member-jwt.key", M, half(Pair::MemberJwt, true), P),
+    e("auth/member-jwt.pub", M, half(Pair::MemberJwt, false), PUB),
+    e("identity/secret", M, Gen::Token32, P),
+    e("identity/db.password", M, Gen::Token32, P),
     e("neon/compute-jwt.pem", M, half(Pair::ComputeJwt, true), P),
     e(
         "neon/compute-jwt.pub",
@@ -209,6 +219,9 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/app-sessions.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
+    e("tokens/auth-identity.token", M, Gen::Token32, P),
+    e("tokens/orchestrator-identity.token", M, Gen::Token32, P),
+    e("tokens/worker-identity.token", M, Gen::Token32, P),
     e(
         "neon/compute-jwt.pub.pem",
         M,
@@ -485,8 +498,17 @@ fn check_content(entry: &Entry, bytes: &[u8]) -> std::result::Result<(), String>
         Gen::SetupCode if is_setup_code(text()?.trim()) => Ok(()),
         Gen::SetupCode => Err("not a setup code (XXXX-XXXX-XXXX-XXXX-XXXX)".to_string()),
         Gen::Text32 | Gen::Password { .. } | Gen::Alnum { .. } | Gen::Steps => blank(text()?),
+        Gen::Token32 => {
+            let t = text()?;
+            blank(t)?;
+            if t.trim().len() < 32 {
+                Err("shorter than 32 characters".to_string())
+            } else {
+                Ok(())
+            }
+        }
         Gen::Pair {
-            pair: Pair::Internal | Pair::AppJwt,
+            pair: Pair::Internal | Pair::AppJwt | Pair::MemberJwt,
             private,
         } => {
             let ok = if private {
@@ -516,7 +538,7 @@ fn check_pair(pair: Pair, private: &[u8], public: &[u8]) -> std::result::Result<
         String::from_utf8_lossy(public),
     );
     let ok = match pair {
-        Pair::Internal | Pair::AppJwt => true,
+        Pair::Internal | Pair::AppJwt | Pair::MemberJwt => true,
         Pair::ComputeJwt => chelabase_neon::ComputeSigner::new(&k, &p).is_ok(),
         Pair::ComputeCa => chelabase_neon::compute_tls::ComputeCa::from_pem(&p, &k).is_ok(),
     };
@@ -857,6 +879,7 @@ impl Run<'_> {
         for pair in [
             Pair::Internal,
             Pair::AppJwt,
+            Pair::MemberJwt,
             Pair::ComputeJwt,
             Pair::ComputeCa,
         ] {
@@ -959,7 +982,7 @@ impl Run<'_> {
                 Gen::SecretKey => chelabase_secrets::SecretKey::generate()
                     .to_base64()
                     .into_bytes(),
-                Gen::Text32 => crate::random::text32().into_bytes(),
+                Gen::Text32 | Gen::Token32 => crate::random::text32().into_bytes(),
                 Gen::Raw32 => crate::random::bytes::<32>().to_vec(),
                 Gen::Password { dev: fixed } if dev => fixed.as_bytes().to_vec(),
                 Gen::Password { .. } => crate::random::text32().into_bytes(),
@@ -1001,7 +1024,9 @@ impl Run<'_> {
     /// Both halves of a pair; if the public half can't be written, the private one goes again.
     fn create_pair(&mut self, pair: Pair) -> Result<()> {
         let (private, public) = match pair {
-            Pair::Internal | Pair::AppJwt => chelabase_auth::internal::generate_keypair_pem(),
+            Pair::Internal | Pair::AppJwt | Pair::MemberJwt => {
+                chelabase_auth::internal::generate_keypair_pem()
+            }
             Pair::ComputeJwt => {
                 let (pem, x) = chelabase_neon::jwt::generate_keypair();
                 (pem, format!("{x}\n"))
@@ -2033,12 +2058,167 @@ mod tests {
             .into_keys()
             .map(|p| p.display().to_string())
             .collect();
+        // The identity files (m5, #118) came after the legacy generators were frozen as this
+        // baseline: only `ensure_secrets` makes them.
         let layout: std::collections::BTreeSet<String> = LAYOUT
             .iter()
             .filter(|e| e.part == Part::Machine || matches!(e.make, Gen::Derived(_)))
+            .filter(|e| {
+                e.make != Gen::Token32
+                    && !matches!(
+                        e.make,
+                        Gen::Pair {
+                            pair: Pair::MemberJwt,
+                            ..
+                        }
+                    )
+            })
             .map(|e| e.path.to_string())
             .collect();
         assert_eq!(made, layout);
+    }
+
+    // auth-replacement m5 (#118): the identity service's files.
+
+    /// The identity service's own files, its callers' bearers and the member-JWT pair.
+    const IDENTITY_FILES: [(&str, u32); 7] = [
+        ("identity/secret", 0o600),
+        ("identity/db.password", 0o600),
+        ("tokens/auth-identity.token", 0o600),
+        ("tokens/orchestrator-identity.token", 0o600),
+        ("tokens/worker-identity.token", 0o600),
+        ("auth/member-jwt.key", 0o600),
+        ("auth/member-jwt.pub", 0o644),
+    ];
+
+    #[test]
+    fn identity_entries_modes() {
+        let t = tmp();
+        let o = opts();
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        let (uid, gid) = me();
+        for (file, want) in IDENTITY_FILES {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == file)
+                .unwrap_or_else(|| panic!("{file} is not in the layout"));
+            assert_eq!(entry.part, Part::Machine, "{file}");
+            let p = t.path().join(file);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert!(meta.is_file(), "{file}");
+            assert_eq!((meta.uid(), meta.gid(), mode(&p)), (uid, gid, want), "{file}");
+            assert!(report.created.contains(&p), "{file}");
+        }
+        // Owner-only directory: nothing below it is group-readable.
+        assert_eq!(mode(&t.path().join("identity")), 0o700);
+        // The service refuses a secret or a caller token under 32 bytes, and puts the database
+        // password into a URL: base64url only.
+        for file in &IDENTITY_FILES[..5] {
+            let v = std::fs::read_to_string(t.path().join(file.0)).unwrap();
+            assert!(v.len() >= 32, "{}", file.0);
+            assert!(
+                v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{}",
+                file.0
+            );
+        }
+        // Each caller has its own token.
+        let tokens: std::collections::BTreeSet<String> = IDENTITY_FILES[2..5]
+            .iter()
+            .map(|(f, _)| std::fs::read_to_string(t.path().join(f)).unwrap())
+            .collect();
+        assert_eq!(tokens.len(), 3);
+        // The member pair is a usable Ed25519 pair, and not the app-user pair.
+        let signer = chelabase_auth::internal::InternalSigner::from_pem_file(
+            &t.path().join("auth/member-jwt.key"),
+        )
+        .unwrap();
+        let verifier = chelabase_auth::internal::InternalVerifier::from_pem_file(
+            &t.path().join("auth/member-jwt.pub"),
+        )
+        .unwrap();
+        let id = chelabase_auth::internal::Identity {
+            sub: "u".into(),
+            org_id: "o".into(),
+            auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
+            request_id: "r".into(),
+            data: None,
+            email: None,
+            name: None,
+        };
+        verifier.verify(&signer.sign("a", &id).unwrap(), "a").unwrap();
+        assert_ne!(
+            std::fs::read(t.path().join("auth/member-jwt.key")).unwrap(),
+            std::fs::read(t.path().join("auth/app-jwt.key")).unwrap()
+        );
+        // None of them is seedable (a seed's rules allow 16 characters and URL metacharacters).
+        for (file, _) in IDENTITY_FILES {
+            assert!(
+                crate::seed::SEED_KEYS.iter().all(|k| k.path != file),
+                "{file}"
+            );
+        }
+        // A loose mode on one of them is refused, naming it, and nothing is written.
+        let p = t.path().join("identity/db.password");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = snapshot(t.path());
+        let err = format!("{:#}", ensure_secrets(t.path(), &o).unwrap_err());
+        assert!(err.contains(&p.display().to_string()), "{err}");
+        assert_eq!(snapshot(t.path()), before);
+    }
+
+    #[test]
+    fn never_overwrite_member_jwt() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let before = snapshot(t.path());
+        // A rerun keeps every identity file byte for byte (and its mtime and mode).
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+        for (file, _) in IDENTITY_FILES {
+            assert!(again.kept.contains(&t.path().join(file)), "{file}");
+        }
+        // One missing secret is made alone; the pair and the others stay.
+        std::fs::remove_file(t.path().join("identity/secret")).unwrap();
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(r.created, [t.path().join("identity/secret")]);
+        let after = snapshot(t.path());
+        for (file, _) in &IDENTITY_FILES[1..] {
+            assert_eq!(after[Path::new(file)], before[Path::new(file)], "{file}");
+        }
+        // Half the member pair is refused, not completed: a new private key would sign tokens
+        // the kept public key can't verify.
+        std::fs::remove_file(t.path().join("auth/member-jwt.pub")).unwrap();
+        let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
+        assert!(
+            err.contains("member-jwt.pub") && err.contains("delete both"),
+            "{err}"
+        );
+        assert!(!t.path().join("auth/member-jwt.pub").exists());
+        assert_eq!(
+            std::fs::read(t.path().join("auth/member-jwt.key")).unwrap(),
+            before[Path::new("auth/member-jwt.key")].0
+        );
+        // A key that doesn't parse is refused, and stays as it is.
+        let t = populated_with_two_missing();
+        for (file, bad) in [
+            ("auth/member-jwt.key", &b"garbage"[..]),
+            ("auth/member-jwt.pub", b"garbage"),
+            ("identity/secret", b"\n"),
+            ("tokens/worker-identity.token", b"  \n"),
+        ] {
+            let keep = std::fs::read(t.path().join(file)).unwrap();
+            std::fs::write(t.path().join(file), bad).unwrap();
+            let before = snapshot(t.path());
+            let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
+            assert!(
+                err.contains(&t.path().join(file).display().to_string()),
+                "{file}: {err}"
+            );
+            assert_eq!(snapshot(t.path()), before, "{file}");
+            std::fs::write(t.path().join(file), keep).unwrap();
+        }
     }
 
     // m12 (#23): seeds from the compose .env.
