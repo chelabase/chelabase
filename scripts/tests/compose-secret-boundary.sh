@@ -231,5 +231,26 @@ done
 [[ "$(jq -c '.services["create-bucket"] | [.volumes // [], .environment // {}, .depends_on.seaweedfs.condition]' "$tmp/base.json")" == '[[],{},"service_healthy"]' ]] ||
   err "create-bucket holds no volume or credential and only waits for seaweedfs to be healthy"
 
+# Neon's S3 endpoint is one setting (default the compose SeaweedFS), in the safekeepers' args and
+# the pageserver's config, so it can be pointed at another host without editing the file. The
+# bucket step may run 8 minutes, so the healthcheck's start_period covers it.
+endpoint_uses() { # endpoint_uses <json>: "<service>=<endpoint>" for the three safekeepers and the pageserver
+  local svc
+  for svc in pageserver safekeeper1 safekeeper2 safekeeper3; do
+    jq -r --arg s "$svc" '.services[$s].command | map(tostring) | join(" ")' <<<"$1" |
+      grep -oP "(?<![_a-z])endpoint='[^']*'" | sed "s|^endpoint='|$svc=|; s|'\$||"
+  done | sort | tr '\n' ' ' | sed 's/ $//'
+}
+want_default="pageserver=http://seaweedfs:8333 safekeeper1=http://seaweedfs:8333 safekeeper2=http://seaweedfs:8333 safekeeper3=http://seaweedfs:8333"
+[[ "$(endpoint_uses "$(cat "$tmp/base.json")")" == "$want_default" ]] ||
+  err "Neon's S3 endpoint must default to http://seaweedfs:8333 in all four services; got: $(endpoint_uses "$(cat "$tmp/base.json")")"
+over="$(CHELABASE_NEON_S3_ENDPOINT=http://other.example:9000 compose chelabase-boundary "$root/infra/compose/.env.example" -f "$root/infra/compose/docker-compose.yml")"
+[[ "$(endpoint_uses "$over")" == "${want_default//http:\/\/seaweedfs:8333/http://other.example:9000}" ]] ||
+  err "CHELABASE_NEON_S3_ENDPOINT must change Neon's S3 endpoint in all four services"
+[[ "$(jq -r '.services.seaweedfs.healthcheck.start_period' "$tmp/base.json")" == 8m0s ]] ||
+  err "seaweedfs: the healthcheck start_period must cover the bucket step's 8 minutes"
+grep -qF 'kill 1' <<<"$sw_cmd" && grep -qF 'last weed shell output' <<<"$sw_cmd" ||
+  err "seaweedfs: the bucket step must log the last output and end the container when it gives up"
+
 [[ "$fail" == 0 ]] || exit 1
 echo "compose-secret-boundary: ok ($(wc -l <"$tmp/have") secret mounts, $(jq '.services | length' "$tmp/base.json") services)"

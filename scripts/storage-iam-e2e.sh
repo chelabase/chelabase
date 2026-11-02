@@ -182,6 +182,22 @@ code="$(docker exec "$probe_c" curl -sS -o /dev/null -w '%{http_code}' --max-tim
   -d 'Action=ListUsers&Version=2010-05-08' "$endpoint/" || true)"
 [[ "$code" != 200 ]] && ok "the embedded IAM API doesn't answer (got $code)" || fail "the embedded IAM API answers 200"
 
+# Virtual-host addressing (AC 6): SeaweedFS has no -s3.domainName here, so a `Host: neon.seaweedfs`
+# header must not select bucket neon for the storage key. It must neither list neon's contents or
+# name the bucket, nor return its object (curl signs the request with the storage key).
+for path in "/" "/?list-type=2" "/$probe"; do
+  body="$(docker exec "$probe_c" curl -sS --max-time 5 --aws-sigv4 "aws:amz:us-east-1:s3" \
+    --user "${AK[storage]}:${SK[storage]}" -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+    -H "Host: neon.seaweedfs:8333" -w '\nHTTP %{http_code}' "$endpoint$path" 2>&1 || true)"
+  if grep -qE "<Name>neon</Name>|<Key>iam-probe|hello neon|HTTP 200" <<<"$body" && ! grep -q "<Name>chelabase-storage</Name>" <<<"$body"; then
+    fail "Host: neon.seaweedfs reached bucket neon with the storage key on $path: $body"
+  elif grep -q "<Name>neon</Name>" <<<"$body"; then
+    fail "Host: neon.seaweedfs shows bucket neon to the storage key on $path"
+  else
+    ok "Host: neon.seaweedfs does not reach bucket neon with the storage key ($path)"
+  fi
+done
+
 # grpc_checks <container> <host> <port>: no cert fails the handshake, plain text fails, the cert works.
 grpc_checks() {
   local c="$1" host="$2" port="$3"

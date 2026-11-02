@@ -403,4 +403,21 @@ done
 [[ "$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .source == "neon_seaweedfs_data")) | .key] | join(" ")')" == seaweedfs ]] ||
   fail "only seaweedfs mounts its data volume (S3 is reached by URL only)"
 
+# Neon's S3 endpoint is the base file's one setting, default http://seaweedfs:8333, for the
+# safekeepers and the pageserver under the workbench too.
+neon_endpoints() { # neon_endpoints <json>
+  local svc
+  for svc in pageserver safekeeper1 safekeeper2 safekeeper3; do
+    jq -r --arg s "$svc" '.services[$s].command | map(tostring) | join(" ")' <<<"$1" |
+      grep -oP "(?<![_a-z])endpoint='[^']*'" | sed "s|^endpoint='|$svc=|; s|'\$||"
+  done | sort | tr '\n' ' ' | sed 's/ $//'
+}
+[[ "$(neon_endpoints "$config")" == "pageserver=http://seaweedfs:8333 safekeeper1=http://seaweedfs:8333 safekeeper2=http://seaweedfs:8333 safekeeper3=http://seaweedfs:8333" ]] ||
+  fail "Neon's S3 endpoint defaults to http://seaweedfs:8333 under the workbench; got: $(neon_endpoints "$config")"
+over="$(CHELABASE_NEON_S3_ENDPOINT=http://other.example:9000 env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x \
+  -f "$root/infra/compose/docker-compose.yml" -f "$root/infra/compose/docker-compose.workbench.yml" \
+  --env-file "$fixture" --profile sites --profile runner config --no-env-resolution --format json)"
+[[ "$(neon_endpoints "$over")" == "pageserver=http://other.example:9000 safekeeper1=http://other.example:9000 safekeeper2=http://other.example:9000 safekeeper3=http://other.example:9000" ]] ||
+  fail "CHELABASE_NEON_S3_ENDPOINT changes Neon's S3 endpoint under the workbench; got: $(neon_endpoints "$over")"
+
 echo "workbench-compose: ok"

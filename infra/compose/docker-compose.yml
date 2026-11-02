@@ -233,7 +233,7 @@ services:
           rm -f "$$T/server.crt" "$$T/client.crt"
           ( umask 077; openssl req -x509 $$ec -keyout "$$T/ca.key.tmp" -out "$$T/ca.crt.tmp" -days 3650 \
               -subj "/CN=chelabase-seaweedfs-grpc-ca" -addext basicConstraints=critical,CA:TRUE \
-              -addext keyUsage=critical,keyCertSign,cRLSign )
+              -addext keyUsage=critical,keyCertSign,cRLSign 2>/dev/null )
           chmod 0644 "$$T/ca.crt.tmp"
           mv -f "$$T/ca.key.tmp" "$$T/ca.key"
           mv -f "$$T/ca.crt.tmp" "$$T/ca.crt"
@@ -520,16 +520,23 @@ services:
           done
           printf '[grpc.client]\ncert = "%s/client.crt"\nkey = "%s/client.key"\n' "$$D" "$$D"
         } > /etc/seaweedfs/security.toml
+        # The bucket step: up to 40 tries of at most 10s + 2s (8 minutes; the healthcheck's
+        # start_period covers it). On exhaustion it logs the last output and ends the container
+        # (SIGTERM to weed, PID 1), so the restart policy retries and the reason is in the logs.
+        # On success it stays as a `sleep` instead of exiting, so weed never has a zombie child.
         (
-          i=0
-          while [ "$$i" -lt 90 ]; do
+          i=0; out=
+          while [ "$$i" -lt 40 ]; do
             out="$$(printf 's3.bucket.create -name neon\ns3.bucket.create -name chelabase-storage\ns3.bucket.list\n' |
-              weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)"
+              timeout 10 weed shell -master=127.0.0.1:9333 -filer=127.0.0.1:8888 2>&1 || true)"
             if printf '%s' "$$out" | grep -qw neon && printf '%s' "$$out" | grep -qw chelabase-storage; then
-              touch /tmp/buckets-ready; exit 0
+              touch /tmp/buckets-ready; exec sleep 2147483647
             fi
             i=$$((i + 1)); sleep 2
           done
+          echo "seaweedfs: buckets neon and chelabase-storage not created after 40 tries; last weed shell output:" >&2
+          printf '%s\n' "$$out" >&2
+          kill 1
         ) &
         exec weed server -ip=127.0.0.1 -ip.bind=127.0.0.1 -s3 -s3.ip.bind=0.0.0.0 -s3.iam=false -s3.port.iceberg=0 -s3.port.lance=0 -s3.config=/tmp/s3.json -dir=/data -volume.max=64 -master.volumeSizeLimitMB=1024
     volumes:
@@ -551,6 +558,7 @@ services:
           [ -e /tmp/buckets-ready ] && printf 'GET / HTTP/1.0\r\n\r\n' | nc -w 3 127.0.0.1 8333 | grep -q '<Code>AccessDenied</Code>'
       interval: 2s
       retries: 60
+      start_period: 8m
     depends_on:
       init-secrets:
         condition: service_completed_successfully
@@ -596,7 +604,7 @@ services:
       - --advertise-pg=safekeeper1:5454
       - --availability-zone=az-1
       - --broker-endpoint=http://storage-broker:50051
-      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - "--remote-storage={endpoint='${CHELABASE_NEON_S3_ENDPOINT:-http://seaweedfs:8333}', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
       - --pg-auth-public-key-path=/run/storage-auth.pub.pem
       - --http-auth-public-key-path=/run/storage-auth.pub.pem
       - --auth-token-path=/run/safekeeper-data.jwt
@@ -635,7 +643,7 @@ services:
       - --advertise-pg=safekeeper2:5454
       - --availability-zone=az-2
       - --broker-endpoint=http://storage-broker:50051
-      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - "--remote-storage={endpoint='${CHELABASE_NEON_S3_ENDPOINT:-http://seaweedfs:8333}', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
       - --pg-auth-public-key-path=/run/storage-auth.pub.pem
       - --http-auth-public-key-path=/run/storage-auth.pub.pem
       - --auth-token-path=/run/safekeeper-data.jwt
@@ -674,7 +682,7 @@ services:
       - --advertise-pg=safekeeper3:5454
       - --availability-zone=az-3
       - --broker-endpoint=http://storage-broker:50051
-      - "--remote-storage={endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
+      - "--remote-storage={endpoint='${CHELABASE_NEON_S3_ENDPOINT:-http://seaweedfs:8333}', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/safekeeper/'}"
       - --pg-auth-public-key-path=/run/storage-auth.pub.pem
       - --http-auth-public-key-path=/run/storage-auth.pub.pem
       - --auth-token-path=/run/safekeeper-data.jwt
@@ -794,7 +802,7 @@ services:
         control_plane_api='http://storage-controller:1234/upcall/v1/'
         control_plane_api_token='$$(cat /run/generations-api.jwt)'
         virtual_file_io_mode='buffered'
-        remote_storage={ endpoint='http://seaweedfs:8333', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }
+        remote_storage={ endpoint='${CHELABASE_NEON_S3_ENDPOINT:-http://seaweedfs:8333}', bucket_name='neon', bucket_region='us-east-1', prefix_in_bucket='/pageserver' }
         EOT
         echo '{"host":"pageserver","port":6400,"http_host":"pageserver","http_port":9898,"availability_zone_id":"az-1"}' > /data/.neon/metadata.json
         exec pageserver -D /data/.neon --auth-token-file=/run/safekeeper-data.jwt
