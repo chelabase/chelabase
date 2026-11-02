@@ -1,17 +1,16 @@
-//! The fake's m2 routes (#115): `POST /pools/{pool}/codes`, `POST /pools/{pool}/codes/verify`.
-//! (`GET /email/status` is in the parent's router.) Kept apart so they are easy to adjust once
-//! m2's real `openapi.json` is known. Assumed behaviour, from #115's acceptance criteria:
+//! The fake's m2 routes: `POST /pools/{pool}/codes`, `POST /pools/{pool}/codes/verify`.
+//! (`GET /email/status` is in the parent's router.) Mirrors `services/identity/src/routes/codes.ts`
+//! and `email/codes.ts`:
 //!
-//! - A code is six digits, bound to `(pool, user, kind)`, single use. TTL 15 minutes, 7 days for
-//!   `invite`. Another kind's code never opens it.
-//! - A wrong code is `400 code_invalid` and counts; at 5 wrong, the code is locked and every
-//!   further try (the right code too) is `429 code_locked` until a new code is issued.
-//! - Issuing a new code replaces the old one; the attempts of a still-open code carry over
-//!   (a new code does not give a fresh five), but a locked code's replacement starts clean.
-//! - An unknown user on verify is `code_invalid`, not `user_not_found` (enumeration resistance).
-//! - `verify` marks the email verified. `reset` and `invite` need `new_password` (400
-//!   `invalid_request` / `weak_password` without consuming the code), set it, and revoke every
-//!   session of the user; `invite` also marks the email verified.
+//! - A code is six digits, bound to `(pool, user, kind)`; kinds are strict. TTL 15 minutes, 7
+//!   days for `invite`. A new code replaces the old one and resets the attempts.
+//! - Any wrong, expired, used, replaced or locked code, or an unknown user, is `400
+//!   invalid_code`. A code allows 5 wrong guesses; after that every guess is refused.
+//! - `verify` refuses `new_password`. `reset` and `invite` require it (400 `invalid_request`;
+//!   400 `weak_password` before the code is spent), set it, mark the email verified and revoke
+//!   every session of the user.
+//! - `delivery: email` is 409 `email_not_configured` without SMTP (checked before the user).
+//!   The fake does not model caller tokens, so the orchestrator's invite-only rule is not here.
 
 use super::{Inner, Reply, SentCode, check_password, refuse, str_field, user_idx, user_out};
 use crate::codes::CodeKind;
@@ -74,29 +73,27 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         ));
     }
     let (now, configured) = (i.now(), i.email_configured);
+    if delivery == "email" && !configured {
+        return Err(refuse(409, "email_not_configured", "no SMTP is configured"));
+    }
     i.next += 1;
     let code = format!("{:06}", (i.next * 7919 + 100_003) % 1_000_000);
     let p = super::pool_mut(i, pool)?;
     let email = p.users[user_idx(p, user_id)?].email.clone();
-    if delivery == "email" && !configured {
-        return Err(refuse(409, "email_not_configured", "no SMTP is configured"));
-    }
-    let key = (user_id.to_string(), kind);
-    let carried = p
-        .codes
-        .get(&key)
-        .filter(|c| c.expires > now && c.attempts < MAX_ATTEMPTS)
-        .map_or(0, |c| c.attempts);
     let expires = now + ttl(kind);
     p.codes.insert(
-        key,
+        (user_id.to_string(), kind),
         CodeRow {
             code: code.clone(),
             expires,
-            attempts: carried,
+            attempts: 0,
         },
     );
-    let mut out = json!({ "expires_at": expires.to_rfc3339_opts(SecondsFormat::Millis, true) });
+    let mut out = json!({
+        "kind": kind.as_str(),
+        "delivery": delivery,
+        "expires_at": expires.to_rfc3339_opts(SecondsFormat::Millis, true),
+    });
     if delivery == "return" {
         out["code"] = json!(code);
     } else {
@@ -115,10 +112,33 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
     let user_id = str_field(body, "user_id")?;
     let kind = kind_of(body)?;
     let given = str_field(body, "code")?;
-    let new_password = body.get("new_password").and_then(Value::as_str);
+    if given.len() != 6 || !given.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(refuse(400, "invalid_request", "code must be six digits"));
+    }
+    let new_password = match (kind, body.get("new_password")) {
+        (CodeKind::Verify, None) => None,
+        (CodeKind::Verify, Some(_)) => {
+            return Err(refuse(
+                400,
+                "invalid_request",
+                "new_password is only for reset and invite codes",
+            ));
+        }
+        (_, Some(Value::String(pw))) if !pw.is_empty() => Some(pw.as_str()),
+        _ => return Err(refuse(400, "invalid_request", "new_password is required")),
+    };
+    if let Some(pw) = new_password {
+        check_password(pw)?;
+    }
     let now = i.now();
     let p = super::pool_mut(i, pool)?;
-    let invalid = || refuse(400, "code_invalid", "the code is not valid");
+    let invalid = || {
+        refuse(
+            400,
+            "invalid_code",
+            "the code is wrong, expired, used up or was replaced",
+        )
+    };
     let at = user_idx(p, user_id).map_err(|_| invalid())?;
     let key = (user_id.to_string(), kind);
     let row = p.codes.get_mut(&key).ok_or_else(invalid)?;
@@ -127,11 +147,7 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         return Err(invalid());
     }
     if row.attempts >= MAX_ATTEMPTS {
-        return Err(refuse(
-            429,
-            "code_locked",
-            "too many wrong codes: ask for a new one",
-        ));
+        return Err(invalid());
     }
     if row.code != given {
         row.attempts += 1;

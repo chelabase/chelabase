@@ -2,7 +2,7 @@
 //! against `FakeIdentity` (tests/fake.rs) and the live service (tests/identity_live.rs).
 #![allow(dead_code)]
 
-use chelabase_identity::{CodeKind, Delivery, Identity, IdentityError, NewUser, Pool};
+use chelabase_identity::{CodeKind, CodeRequest, Delivery, Identity, IdentityError, NewUser, Pool};
 use uuid::Uuid;
 
 pub const PW: &str = "correct horse 9";
@@ -207,13 +207,22 @@ pub async fn code_single_use(id: &Identity, pool: &Pool) {
         .await
         .unwrap();
     let issued = id
-        .create_code(pool, &u.id, CodeKind::Verify, Delivery::Return)
+        .create_code(
+            pool,
+            &CodeRequest::new(&u.id, CodeKind::Verify, Delivery::Return),
+        )
         .await
         .unwrap();
+    assert_eq!(
+        (issued.kind, issued.delivery),
+        (CodeKind::Verify, Delivery::Return)
+    );
     let code = issued.code.expect("return delivery gives the code back");
-    id.verify_code(pool, &u.id, CodeKind::Verify, &code, None)
+    let verified = id
+        .verify_code(pool, &u.id, CodeKind::Verify, &code, None)
         .await
         .unwrap();
+    assert!(verified.email_verified);
     assert!(id.get_user(pool, &u.id).await.unwrap().email_verified);
     // Reusing it fails.
     assert_eq!(
@@ -224,7 +233,7 @@ pub async fn code_single_use(id: &Identity, pool: &Pool) {
     );
 }
 
-/// m2 AC 2: five wrong codes lock the code; the right one is then refused.
+/// m2 AC 2: five wrong codes lock the code; the right one is then refused, like any wrong one.
 pub async fn code_lockout(id: &Identity, pool: &Pool) {
     let u = id
         .create_user(
@@ -237,39 +246,95 @@ pub async fn code_lockout(id: &Identity, pool: &Pool) {
         )
         .await
         .unwrap();
-    let code = id
-        .create_code(pool, &u.id, CodeKind::Reset, Delivery::Return)
-        .await
-        .unwrap()
-        .code
-        .unwrap();
+    let code = issue(id, pool, &u.id, CodeKind::Reset).await;
     let wrong = if code == "000000" { "111111" } else { "000000" };
     for _ in 0..5 {
         let e = id
             .verify_code(pool, &u.id, CodeKind::Reset, wrong, Some("n3w password!"))
             .await
             .unwrap_err();
-        assert!(
-            matches!(e, IdentityError::CodeInvalid | IdentityError::CodeLocked),
-            "{e:?}"
-        );
+        assert_eq!(e, IdentityError::CodeInvalid);
     }
     assert_eq!(
         id.verify_code(pool, &u.id, CodeKind::Reset, &code, Some("n3w password!"))
             .await
             .unwrap_err(),
-        IdentityError::CodeLocked
+        IdentityError::CodeInvalid
     );
-    // A new code is required, and works.
-    let fresh = id
-        .create_code(pool, &u.id, CodeKind::Reset, Delivery::Return)
-        .await
-        .unwrap()
-        .code
-        .unwrap();
+    // A new code is required, and works (the counter starts again).
+    let fresh = issue(id, pool, &u.id, CodeKind::Reset).await;
     id.verify_code(pool, &u.id, CodeKind::Reset, &fresh, Some("n3w password!"))
         .await
         .unwrap();
+}
+
+/// A weak password costs no attempt; a code of another kind never works; verify takes no password.
+pub async fn code_strictness(id: &Identity, pool: &Pool) {
+    let uid = user(id, pool, &email("strict")).await;
+    let code = issue(id, pool, &uid, CodeKind::Reset).await;
+    for _ in 0..6 {
+        let e = id
+            .verify_code(pool, &uid, CodeKind::Reset, &code, Some("short"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(e, IdentityError::Invalid { ref code, .. } if code == "weak_password"),
+            "{e:?}"
+        );
+    }
+    // Reset needs a password; verify refuses one.
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Reset, &code, None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, IdentityError::Invalid { ref code, .. } if code == "invalid_request"),
+        "{e:?}"
+    );
+    // The reset code is not an invite code or a verify code.
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Invite, &code, Some("n3w password!"))
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeInvalid);
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Verify, &code, None)
+        .await
+        .unwrap_err();
+    assert_eq!(e, IdentityError::CodeInvalid);
+    let vcode = issue(id, pool, &uid, CodeKind::Verify).await;
+    let e = id
+        .verify_code(pool, &uid, CodeKind::Verify, &vcode, Some("n3w password!"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(e, IdentityError::Invalid { ref code, .. } if code == "invalid_request"),
+        "{e:?}"
+    );
+    // The code survived all of that.
+    id.verify_code(pool, &uid, CodeKind::Reset, &code, Some("n3w password!"))
+        .await
+        .unwrap();
+    // A new code replaces the old one.
+    let a = issue(id, pool, &uid, CodeKind::Invite).await;
+    let b = issue(id, pool, &uid, CodeKind::Invite).await;
+    if a != b {
+        assert_eq!(
+            id.verify_code(pool, &uid, CodeKind::Invite, &a, Some("n3w password!"))
+                .await
+                .unwrap_err(),
+            IdentityError::CodeInvalid
+        );
+    }
+}
+
+/// A code, delivered by `return`.
+pub async fn issue(id: &Identity, pool: &Pool, user_id: &str, kind: CodeKind) -> String {
+    id.create_code(pool, &CodeRequest::new(user_id, kind, Delivery::Return))
+        .await
+        .unwrap()
+        .code
+        .unwrap()
 }
 
 /// m2 AC 4: a code made in one pool is refused in another, even for the same email.
@@ -278,7 +343,7 @@ pub async fn code_cross_pool(id: &Identity, a: &Pool, b: &Pool) {
     let ua = user(id, a, &mail).await;
     let ub = user(id, b, &mail).await;
     let code = id
-        .create_code(a, &ua, CodeKind::Reset, Delivery::Return)
+        .create_code(a, &CodeRequest::new(&ua, CodeKind::Reset, Delivery::Return))
         .await
         .unwrap()
         .code
@@ -308,7 +373,10 @@ pub async fn reset_revokes_sessions(id: &Identity, pool: &Pool) {
     let uid = user(id, pool, &mail).await;
     let s = id.sign_in(pool, &mail, PW).await.unwrap();
     let code = id
-        .create_code(pool, &uid, CodeKind::Reset, Delivery::Return)
+        .create_code(
+            pool,
+            &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Return),
+        )
         .await
         .unwrap()
         .code

@@ -9,7 +9,7 @@
 //! ```
 //!
 //! Pools are made and dropped with the worker's token; everything else uses the auth token.
-//! The code scenarios run only when the service has m2's routes.
+//! The code scenarios need m2's routes and fail without them.
 
 mod common;
 
@@ -127,18 +127,14 @@ async fn identity_live_user_lifecycle() {
     .await;
 }
 
-/// m2's scenarios; skipped when the service predates m2.
+/// m2's scenarios. They fail when the service lacks the code routes; they do not skip.
 async fn with_codes<F, Fut>(n: usize, f: F)
 where
     F: FnOnce(Identity, Vec<Pool>) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
-    let Some(l) = live() else { return };
-    if matches!(
-        l.auth.email_status().await,
-        Err(IdentityError::NotFound(Missing::Route))
-    ) {
-        eprintln!("the service has no code routes yet: skipped");
+    if live().is_none() {
+        eprintln!("CHELABASE_IDENTITY_URL is unset: skipped");
         return;
     }
     with_pools(n, f).await;
@@ -179,4 +175,21 @@ async fn identity_live_reset_revokes_sessions() {
         common::reset_revokes_sessions(&id, &p[0]).await
     })
     .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_code_strictness() {
+    with_codes(1, |id, p| async move {
+        common::code_strictness(&id, &p[0]).await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_email_status() {
+    let Some(l) = live() else { return };
+    // Answers whether or not SMTP is configured.
+    l.auth.email_status().await.unwrap();
 }

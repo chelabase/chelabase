@@ -3,14 +3,6 @@
 use chelabase_identity::ops::OPERATIONS;
 use std::collections::BTreeSet;
 
-/// m2's routes (#115), not yet in the spec of this checkout. Remove an entry once
-/// `openapi.json` lists it; the test accepts either way.
-const PENDING_M2: &[(&str, &str)] = &[
-    ("POST", "/internal/v1/pools/{pool}/codes"),
-    ("POST", "/internal/v1/pools/{pool}/codes/verify"),
-    ("GET", "/internal/v1/email/status"),
-];
-
 fn spec_operations() -> BTreeSet<(String, String)> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -31,12 +23,10 @@ fn spec_operations() -> BTreeSet<(String, String)> {
 
 #[test]
 fn every_path_has_a_method() {
-    let mut want = spec_operations();
-    assert!(want.len() >= 16, "the spec has at least m1's 16 operations");
-    want.extend(
-        PENDING_M2
-            .iter()
-            .map(|(m, p)| (m.to_string(), p.to_string())),
+    let want = spec_operations();
+    assert!(
+        want.len() >= 19,
+        "the spec has at least m1's and m2's 19 operations"
     );
     let have: Vec<(String, String)> = OPERATIONS
         .iter()
@@ -58,9 +48,10 @@ fn operation_ids_match_the_spec() {
     let doc: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     for o in OPERATIONS {
-        if let Some(op) = doc["paths"][o.path][o.method.to_lowercase()].as_object() {
-            assert_eq!(op["operationId"], o.operation_id, "{} {}", o.method, o.path);
-        }
+        let op = doc["paths"][o.path][o.method.to_lowercase()]
+            .as_object()
+            .expect("in the spec");
+        assert_eq!(op["operationId"], o.operation_id, "{} {}", o.method, o.path);
     }
 }
 

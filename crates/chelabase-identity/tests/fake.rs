@@ -14,7 +14,7 @@ async fn setup(n: usize) -> (FakeIdentity, chelabase_identity::Identity, Vec<Poo
 }
 
 use chelabase_identity::mock::FakeIdentity;
-use chelabase_identity::{CodeKind, Delivery, IdentityError, Missing, Pool};
+use chelabase_identity::{CodeKind, CodeRequest, Delivery, IdentityError, Missing, Pool};
 use common::*;
 use std::time::Duration;
 
@@ -141,13 +141,19 @@ async fn return_vs_email_delivery() {
     let pool = app_pool();
     let uid = f.with_user(&pool, "m@example.com", PW);
     let returned = id
-        .create_code(&pool, &uid, CodeKind::Verify, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Verify, Delivery::Return),
+        )
         .await
         .unwrap();
     assert!(returned.code.is_some());
     assert!(f.codes_sent().is_empty(), "return delivery sends nothing");
     let mailed = id
-        .create_code(&pool, &uid, CodeKind::Verify, Delivery::Email)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Verify, Delivery::Email),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -175,18 +181,24 @@ async fn no_smtp_409() {
     let pool = app_pool();
     let uid = f.with_user(&pool, "m@example.com", PW);
     assert_eq!(
-        id.create_code(&pool, &uid, CodeKind::Verify, Delivery::Email)
-            .await
-            .unwrap_err(),
+        id.create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Verify, Delivery::Email)
+        )
+        .await
+        .unwrap_err(),
         IdentityError::EmailNotConfigured
     );
     // `return` still works without SMTP.
     assert!(
-        id.create_code(&pool, &uid, CodeKind::Verify, Delivery::Return)
-            .await
-            .unwrap()
-            .code
-            .is_some()
+        id.create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Verify, Delivery::Return)
+        )
+        .await
+        .unwrap()
+        .code
+        .is_some()
     );
 }
 
@@ -197,13 +209,19 @@ async fn ttl_per_kind() {
     let pool = app_pool();
     let uid = f.with_user(&pool, "t@example.com", PW);
     let reset = id
-        .create_code(&pool, &uid, CodeKind::Reset, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Return),
+        )
         .await
         .unwrap()
         .code
         .unwrap();
     let invite = id
-        .create_code(&pool, &uid, CodeKind::Invite, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Invite, Delivery::Return),
+        )
         .await
         .unwrap()
         .code
@@ -227,7 +245,10 @@ async fn ttl_per_kind() {
     .await
     .unwrap();
     let again = id
-        .create_code(&pool, &uid, CodeKind::Invite, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Invite, Delivery::Return),
+        )
         .await
         .unwrap()
         .code
@@ -247,14 +268,20 @@ async fn reset_does_not_clobber_invite() {
     let pool = app_pool();
     let uid = f.with_user(&pool, "c@example.com", PW);
     let invite = id
-        .create_code(&pool, &uid, CodeKind::Invite, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Invite, Delivery::Return),
+        )
         .await
         .unwrap()
         .code
         .unwrap();
-    id.create_code(&pool, &uid, CodeKind::Reset, Delivery::Return)
-        .await
-        .unwrap();
+    id.create_code(
+        &pool,
+        &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Return),
+    )
+    .await
+    .unwrap();
     id.verify_code(
         &pool,
         &uid,
@@ -273,7 +300,10 @@ async fn a_code_is_bound_to_its_kind() {
     let pool = app_pool();
     let uid = f.with_user(&pool, "k@example.com", PW);
     let verify = id
-        .create_code(&pool, &uid, CodeKind::Verify, Delivery::Return)
+        .create_code(
+            &pool,
+            &CodeRequest::new(&uid, CodeKind::Verify, Delivery::Return),
+        )
         .await
         .unwrap()
         .code
@@ -296,9 +326,65 @@ async fn code_for_unknown_user_is_not_found() {
     f.with_pool(&pool);
     assert_eq!(
         f.client()
-            .create_code(&pool, "nobody", CodeKind::Verify, Delivery::Return)
+            .create_code(
+                &pool,
+                &CodeRequest::new("nobody", CodeKind::Verify, Delivery::Return)
+            )
             .await
             .unwrap_err(),
         IdentityError::NotFound(Missing::User)
     );
+}
+
+#[tokio::test]
+async fn code_strictness() {
+    let (_f, id, p) = setup(1).await;
+    common::code_strictness(&id, &p[0]).await;
+}
+
+#[tokio::test]
+async fn email_send_failure_is_its_own_refusal() {
+    let (f, id, p) = setup(1).await;
+    let uid = f.with_user(&p[0], "s@example.com", PW);
+    f.fail("/codes", 502, "email_send_failed", 1);
+    let e = id
+        .create_code(
+            &p[0],
+            &CodeRequest::new(&uid, CodeKind::Reset, Delivery::Email),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(e, IdentityError::EmailSendFailed(_)), "{e:?}");
+    assert!(!e.is_retryable());
+}
+
+#[tokio::test]
+async fn a_new_code_resets_the_attempts() {
+    let (f, id, p) = setup(1).await;
+    let uid = f.with_user(&p[0], "r@example.com", PW);
+    let first = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    let wrong = if first == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    for _ in 0..4 {
+        id.verify_code(&p[0], &uid, CodeKind::Reset, wrong, Some("n3w password!"))
+            .await
+            .unwrap_err();
+    }
+    let second = common::issue(&id, &p[0], &uid, CodeKind::Reset).await;
+    let wrong = if second == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    for _ in 0..4 {
+        id.verify_code(&p[0], &uid, CodeKind::Reset, wrong, Some("n3w password!"))
+            .await
+            .unwrap_err();
+    }
+    id.verify_code(&p[0], &uid, CodeKind::Reset, &second, Some("n3w password!"))
+        .await
+        .unwrap();
 }

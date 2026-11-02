@@ -27,8 +27,7 @@ fn classify_status() {
         (401, body("bad_credentials"), E::BadCredentials),
         (401, body("session_revoked"), E::SessionRevoked),
         (401, body("unauthorized"), E::Unauthorized(m())),
-        (400, body("code_invalid"), E::CodeInvalid),
-        (429, body("code_locked"), E::CodeLocked),
+        (400, body("invalid_code"), E::CodeInvalid),
         (
             400,
             body("invalid_request"),
@@ -106,6 +105,7 @@ fn classify_status() {
             },
         ),
         // The service failed, or never answered: retry.
+        (502, body("email_send_failed"), E::EmailSendFailed(m())),
         (500, body("internal"), E::Unavailable("500".into())),
         (
             502,

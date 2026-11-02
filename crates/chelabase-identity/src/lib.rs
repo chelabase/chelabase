@@ -16,6 +16,6 @@ pub mod rules;
 mod types;
 
 pub use client::Identity;
-pub use codes::{CodeKind, Delivery, EmailStatus, IssuedCode};
+pub use codes::{CodeKind, CodeRequest, Delivery, EmailStatus, IssuedCode};
 pub use error::{IdentityError, Missing, classify_status};
 pub use types::{NewUser, Pool, SessionInfo, SessionView, SignedIn, User, UserPage};

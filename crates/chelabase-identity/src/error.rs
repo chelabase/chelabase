@@ -1,6 +1,6 @@
 //! The service's refusals, typed. The codes come from `services/identity/src/http.ts` and
-//! `routes.ts` (m1); the two code refusals (`code_invalid`, `code_locked`) and
-//! `email_not_configured` are m2's, assumed from #115.
+//! `routes.ts` (m1); `invalid_code`, `email_not_configured` and
+//! `email_send_failed` are m2's.
 
 use serde::Deserialize;
 
@@ -29,12 +29,10 @@ pub enum IdentityError {
     /// The session was revoked while it was being made.
     #[error("session revoked")]
     SessionRevoked,
-    /// The code is wrong, expired, used, or was never issued.
+    /// The code is wrong, expired, used, replaced or locked out (5 wrong guesses), or the user
+    /// is unknown. The service answers all of them alike (`invalid_code`), so neither can this.
     #[error("code invalid")]
     CodeInvalid,
-    /// Too many wrong attempts: a new code is needed.
-    #[error("code locked")]
-    CodeLocked,
     /// `delivery: "email"` was asked for and no SMTP is configured.
     #[error("email is not configured")]
     EmailNotConfigured,
@@ -58,6 +56,10 @@ pub enum IdentityError {
     /// No answer, a timeout, a 5xx, a redirect or an unreadable answer.
     #[error("identity unavailable: {0}")]
     Unavailable(String),
+    /// The SMTP server refused the message (502 `email_send_failed`). The service answered, so
+    /// this is not `Unavailable`; the caller decides whether to try again.
+    #[error("email send failed: {0}")]
+    EmailSendFailed(String),
     /// The client could not be set up (token file, URL).
     #[error("identity client config: {0}")]
     Config(String),
@@ -82,6 +84,12 @@ struct Body {
 pub fn classify_status(status: u16, body: &str) -> Option<IdentityError> {
     if (200..300).contains(&status) {
         return None;
+    }
+    if status == 502
+        && let Ok(Body { error, message }) = serde_json::from_str::<Body>(body)
+        && error == "email_send_failed"
+    {
+        return Some(IdentityError::EmailSendFailed(message));
     }
     if !(400..500).contains(&status) {
         return Some(IdentityError::Unavailable(status.to_string()));
@@ -108,8 +116,7 @@ pub fn classify_status(status: u16, body: &str) -> Option<IdentityError> {
         "banned" => E::Banned,
         "bad_credentials" => E::BadCredentials,
         "session_revoked" => E::SessionRevoked,
-        "code_invalid" => E::CodeInvalid,
-        "code_locked" => E::CodeLocked,
+        "invalid_code" => E::CodeInvalid,
         "unauthorized" => E::Unauthorized(message),
         "forbidden" => E::Forbidden(message),
         "invalid_request" | "invalid_pool" | "invalid_email" | "weak_password" | "bad_request"
