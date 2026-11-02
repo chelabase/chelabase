@@ -661,6 +661,10 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let storage = crate::storage_schema::storage_schema_sql(OWNER_ROLE);
         match self.computes.admin_sql(ep, database_name, &storage).await {
             Ok(_) => Ok(()),
+            Err(e) if let Some(why) = crate::storage_schema::newer_schema(&format!("{e:#}")) => {
+                warn!(branch_id = %branch, %ep, database = %database_name, "{why}");
+                Ok(())
+            }
             Err(e) if crate::storage_schema::foreign_schema(&format!("{e:#}")) => {
                 warn!(branch_id = %branch, %ep, database = %database_name, "the storage schema isn't Chelabase's (a user's own); it was left alone and storage isn't installed here");
                 Ok(())
