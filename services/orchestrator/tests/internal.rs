@@ -98,7 +98,7 @@ struct FakeNeon {
     /// RT1 T6: Zitadel org id -> the tenant bound to it.
     tenants: Arc<Mutex<HashMap<String, TenantId>>>,
     /// Members hub T8: each (tenant, Zitadel user id)'s personal-login rows, which
-    /// `revoke_logins_for_zitadel_user` answers (every row of the member, revoked ones
+    /// `revoke_logins_for_identity_user` answers (every row of the member, revoked ones
     /// included; an unknown user has none); each revocation asked for, in order; and while
     /// `fail_revocation` is set, the revocation write fails (a database error).
     login_rows: Arc<Mutex<LoginRows>>,
@@ -683,7 +683,7 @@ impl NeonMetadataPort for FakeNeon {
         self.check()?;
         let st = self.setup.lock().unwrap();
         Ok(st.claims.get(zitadel_org_id).map(|user| chelabase_metadata::members::SetupClaim {
-            zitadel_user_id: user.clone(),
+            identity_user_id: user.clone(),
             created_at: chrono::Utc::now(),
             has_member_row: st.member_rows.contains(user),
         }))
@@ -693,7 +693,7 @@ impl NeonMetadataPort for FakeNeon {
         &self,
         zitadel_org_id: &str,
         nonce_hash: [u8; 32],
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError> {
         use chelabase_metadata::members::SetupClaimOutcome::{AlreadyClaimed, Bound, Refused};
@@ -710,27 +710,27 @@ impl NeonMetadataPort for FakeNeon {
         st.nonces.remove(&nonce_hash);
         let outcome = match st.claims.get(zitadel_org_id).cloned() {
             None => Bound,
-            Some(u) if u == zitadel_user_id => Bound,
+            Some(u) if u == identity_user_id => Bound,
             Some(u) if replace_stale == Some(u.as_str()) && !st.member_rows.contains(&u) => Bound,
             Some(_) => AlreadyClaimed,
         };
         if outcome == Bound {
-            st.claims.insert(zitadel_org_id.into(), zitadel_user_id.into());
+            st.claims.insert(zitadel_org_id.into(), identity_user_id.into());
         }
         Ok(Some(outcome))
     }
 
-    async fn open_invite_for_user(&self, zitadel_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
+    async fn open_invite_for_user(&self, identity_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
         self.check()?;
-        Ok(self.invites.lock().unwrap().get(zitadel_user_id).cloned())
+        Ok(self.invites.lock().unwrap().get(identity_user_id).cloned())
     }
 
     async fn invite_expiry_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<InviteExpiry>, MetadataError> {
         self.check()?;
-        Ok(self.invite_expiries.lock().unwrap().get(zitadel_user_id).copied())
+        Ok(self.invite_expiries.lock().unwrap().get(identity_user_id).copied())
     }
 
     async fn tenant_by_org(&self, zitadel_org_id: &str) -> Result<Option<TenantId>, MetadataError> {
@@ -741,30 +741,30 @@ impl NeonMetadataPort for FakeNeon {
         Ok(self.tenants.lock().unwrap().get(zitadel_org_id).copied())
     }
 
-    async fn clear_offboarded(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<bool, MetadataError> {
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
         self.check()?;
         if *self.fail_clear.lock().unwrap() {
             return Err(MetadataError::Config("the clear failed".into()));
         }
-        self.clears.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
+        self.clears.lock().unwrap().push((tenant, identity_user_id.to_string()));
         Ok(true)
     }
 
-    async fn revoke_logins_for_zitadel_user(
+    async fn revoke_logins_for_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Vec<LoginEndpoint>, MetadataError> {
         self.check()?;
         if *self.fail_revocation.lock().unwrap() {
             return Err(MetadataError::Config("the revocation write failed".into()));
         }
-        self.revocations.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
+        self.revocations.lock().unwrap().push((tenant, identity_user_id.to_string()));
         Ok(self
             .login_rows
             .lock()
             .unwrap()
-            .get(&(tenant, zitadel_user_id.to_string()))
+            .get(&(tenant, identity_user_id.to_string()))
             .cloned()
             .unwrap_or_default())
     }
@@ -811,7 +811,7 @@ impl NeonMetadataPort for FakeNeon {
                 id: n.id,
                 project_id: n.project_id,
                 user_id: n.user_id,
-                zitadel_session_id: n.zitadel_session_id.into(),
+                identity_session_id: n.identity_session_id.into(),
                 created_at: now,
                 last_used_at: now,
                 expires_at: n.expires_at,
@@ -4220,7 +4220,7 @@ impl AppApp {
             .post_json(
                 "/internal/app/sessions",
                 Some(APP_AUTH_TOKEN),
-                json!({ "project_id": project, "user_id": user, "zitadel_session_id": zsid }),
+                json!({ "project_id": project, "user_id": user, "identity_session_id": zsid }),
             )
             .await;
         assert_eq!(status, 201, "{body}");
@@ -4315,7 +4315,7 @@ fn auth_routes(w: &AppWorld) -> Vec<(&'static str, String, Value)> {
         (
             "POST",
             "/internal/app/sessions".into(),
-            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs" }),
+            json!({ "project_id": w.project, "user_id": user, "identity_session_id": "zs" }),
         ),
         (
             "POST",
@@ -4562,7 +4562,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
         .post_json(
             "/internal/app/sessions",
             Some(APP_AUTH_TOKEN),
-            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs1" }),
+            json!({ "project_id": w.project, "user_id": user, "identity_session_id": "zs1" }),
         )
         .await;
     assert_eq!(status, 201, "{body}");
@@ -4584,7 +4584,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
     assert_eq!(stored.hash, sha256(token), "the hash covers the whole token");
     assert_eq!(stored.s.user_id, user);
     assert_eq!(stored.s.project_id, w.project);
-    assert_eq!(stored.s.zitadel_session_id, "zs1");
+    assert_eq!(stored.s.identity_session_id, "zs1");
     // Two sessions never share a secret.
     let (_, other) = a.create_session(w.project, user, "zs2").await;
     assert_ne!(other.split_once('.').unwrap().1, secret);

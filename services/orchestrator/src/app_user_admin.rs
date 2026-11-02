@@ -359,7 +359,7 @@ where
         ApiError::internal()
     })?;
     for session in revoked {
-        if let Err(err) = z.delete_session_admin(&session.zitadel_session_id).await {
+        if let Err(err) = z.delete_session_admin(&session.identity_session_id).await {
             warn!(%user, "end zitadel session: {err}");
         }
     }

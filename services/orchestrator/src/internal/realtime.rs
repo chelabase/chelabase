@@ -474,7 +474,7 @@ where
             return Refusal::Unavailable.response();
         }
     };
-    match state.metadata.member_by_zitadel(tenant, &request.sub).await {
+    match state.metadata.member_by_identity_user(tenant, &request.sub).await {
         Ok(Some(member)) if member.in_good_standing() => {
             Json(json!({ "allowed": true })).into_response()
         }

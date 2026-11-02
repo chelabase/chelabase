@@ -76,7 +76,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         if let Some(zitadel) = zitadel {
             for session in revoked {
                 if let Err(e) = zitadel
-                    .delete_session_admin(&session.zitadel_session_id)
+                    .delete_session_admin(&session.identity_session_id)
                     .await
                 {
                     warn!(%project, session = %session.id, "deleting the Zitadel session: {e}");

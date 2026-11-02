@@ -19,7 +19,7 @@ pub const INTERNAL_TOKEN: &str = "chelabase-dev-app-auth";
 pub struct FakeSession {
     pub project_id: Uuid,
     pub user_id: Uuid,
-    pub zitadel_session_id: String,
+    pub identity_session_id: String,
     pub token: String,
     /// The token before the last rotation: presented again, it gets the grace answer.
     pub previous: Option<String>,
@@ -124,7 +124,7 @@ async fn create_session(State(s): S, Json(b): Json<Value>) -> Response {
         FakeSession {
             project_id: b["project_id"].as_str().unwrap().parse().unwrap(),
             user_id: b["user_id"].as_str().unwrap().parse().unwrap(),
-            zitadel_session_id: b["zitadel_session_id"].as_str().unwrap().into(),
+            identity_session_id: b["identity_session_id"].as_str().unwrap().into(),
             token: token.clone(),
             previous: None,
             grace_over: false,
@@ -440,7 +440,7 @@ impl FakeInternal {
             FakeSession {
                 project_id,
                 user_id,
-                zitadel_session_id: String::new(),
+                identity_session_id: String::new(),
                 token,
                 previous,
                 grace_over: false,

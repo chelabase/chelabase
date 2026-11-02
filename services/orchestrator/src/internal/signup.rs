@@ -274,13 +274,13 @@ where
         }
     };
     let replace = match current {
-        Some(c) if c.zitadel_user_id != b.user_id && !c.has_member_row => {
-            if !is_user_id(&c.zitadel_user_id) {
+        Some(c) if c.identity_user_id != b.user_id && !c.has_member_row => {
+            if !is_user_id(&c.identity_user_id) {
                 None
             } else {
                 // Only a definite not-found is "gone"; an unreadable answer fails closed.
-                match zitadel.user_is_gone(&c.zitadel_user_id).await {
-                    Ok(true) => Some(c.zitadel_user_id),
+                match zitadel.user_is_gone(&c.identity_user_id).await {
+                    Ok(true) => Some(c.identity_user_id),
                     Ok(false) => None,
                     Err(e) => return unavailable(&format!("Zitadel lookup failed: {e}")),
                 }

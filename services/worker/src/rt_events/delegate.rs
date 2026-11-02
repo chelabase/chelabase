@@ -691,12 +691,12 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.members_with_live_logins().await
     }
 
-    async fn revoke_logins_for_zitadel_user(
+    async fn revoke_logins_for_identity_user(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        self.inner.revoke_logins_for_zitadel_user(tenant, zitadel_user_id).await
+        self.inner.revoke_logins_for_identity_user(tenant, identity_user_id).await
     }
 
     async fn offboarded_members(&self) -> Result<Vec<(chelabase_types::TenantId, Uuid, String)>, MetadataError> {
@@ -706,9 +706,9 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
     async fn clear_offboarded(
         &self,
         tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<bool, MetadataError> {
-        self.inner.clear_offboarded(tenant, zitadel_user_id).await
+        self.inner.clear_offboarded(tenant, identity_user_id).await
     }
 
     async fn upsert_member_branch_role_if(

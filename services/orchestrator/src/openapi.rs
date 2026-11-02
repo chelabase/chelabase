@@ -590,17 +590,17 @@ impl MetadataPort for Doc {
     async fn branch_has_busy_merge(&self, branch: BranchId) -> Result<Option<chelabase_metadata::BranchBusy>, MetadataError> {
         match *self {}
     }
-    async fn member_by_zitadel(
+    async fn member_by_identity_user(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<MemberRecord>, MetadataError> {
         match *self {}
     }
     async fn admit_member(
         &self,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         admission: chelabase_metadata::members::Admission,
@@ -972,7 +972,7 @@ impl members::MembersPort for Doc {
         &self,
         actor: Uuid,
         tenant: TenantId,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         email: &str,
         name: &str,
         grants: &[(Uuid, chelabase_metadata::members::GrantRow)],

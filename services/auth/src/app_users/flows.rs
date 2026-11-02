@@ -797,7 +797,7 @@ async fn open_checked(
         .create_session(&CreateSession {
             project_id: info.project_id,
             user_id,
-            zitadel_session_id: session.id.clone(),
+            identity_session_id: session.id.clone(),
         })
         .await
     {
