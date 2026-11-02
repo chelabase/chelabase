@@ -4,8 +4,8 @@
 # m7 split the one file in two (REV was 2a4d327e, the last single-file commit); m8 made the base
 # file the self-hosted install, and the overlay sets back every key it changed, so REV is now the
 # commit m8 started from (ca3b59c4). auth-replacement m5 (#118) changed the workbench stack on
-# purpose (the identity service, its secrets and its callers' settings), so REV is now that
-# commit (e1a546e8). At a REV with only docker-compose.yml, that file alone is the reference.
+# purpose (the identity service, its secrets and its callers' settings), so REV is now its
+# last compose commit (c1c0e02e, the identity tmpfs owner fix). At a REV with only docker-compose.yml, that file alone is the reference.
 #
 #   scripts/tests/compose-overlay-equiv.sh [--env-file <stack.env>] [--rev <git rev>]
 #
@@ -26,7 +26,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
 # The last intended change of the workbench shape: auth-replacement m5 (the identity service).
-rev=e1a546e8
+rev=c1c0e02e
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;
