@@ -188,6 +188,33 @@ async fn identity_live_code_strictness() {
 
 #[tokio::test]
 #[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_email_change_kills_codes() {
+    with_codes(1, |id, p| async move {
+        common::email_change_kills_codes(&id, &p[0]).await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_invite_refused_for_established_account() {
+    with_codes(1, |id, p| async move {
+        common::invite_refused_for_established_account(&id, &p[0]).await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_invite_works_for_preregistered_account() {
+    with_codes(1, |id, p| async move {
+        common::invite_works_for_preregistered_account(&id, &p[0]).await
+    })
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
 async fn identity_live_email_status() {
     let Some(l) = live() else { return };
     // Answers whether or not SMTP is configured.

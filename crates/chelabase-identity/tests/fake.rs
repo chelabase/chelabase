@@ -207,7 +207,7 @@ async fn ttl_per_kind() {
     let f = FakeIdentity::start().await;
     let id = f.client();
     let pool = app_pool();
-    let uid = f.with_user(&pool, "t@example.com", PW);
+    let uid = f.with_invited_user(&pool, "t@example.com");
     let reset = id
         .create_code(
             &pool,
@@ -244,6 +244,8 @@ async fn ttl_per_kind() {
     )
     .await
     .unwrap();
+    // The first invitee is established now; invite another.
+    let uid = f.with_invited_user(&pool, "t2@example.com");
     let again = id
         .create_code(
             &pool,
@@ -266,7 +268,7 @@ async fn reset_does_not_clobber_invite() {
     let f = FakeIdentity::start().await;
     let id = f.client();
     let pool = app_pool();
-    let uid = f.with_user(&pool, "c@example.com", PW);
+    let uid = f.with_invited_user(&pool, "c@example.com");
     let invite = id
         .create_code(
             &pool,
@@ -387,4 +389,22 @@ async fn a_new_code_resets_the_attempts() {
     id.verify_code(&p[0], &uid, CodeKind::Reset, &second, Some("n3w password!"))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn email_change_kills_codes() {
+    let (_f, id, p) = setup(1).await;
+    common::email_change_kills_codes(&id, &p[0]).await;
+}
+
+#[tokio::test]
+async fn invite_refused_for_established_account() {
+    let (_f, id, p) = setup(1).await;
+    common::invite_refused_for_established_account(&id, &p[0]).await;
+}
+
+#[tokio::test]
+async fn invite_works_for_preregistered_account() {
+    let (_f, id, p) = setup(1).await;
+    common::invite_works_for_preregistered_account(&id, &p[0]).await;
 }

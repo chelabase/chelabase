@@ -6,6 +6,10 @@
 //!   days for `invite`. A new code replaces the old one and resets the attempts.
 //! - Any wrong, expired, used, replaced or locked code, or an unknown user, is `400
 //!   invalid_code`. A code allows 5 wrong guesses; after that every guess is refused.
+//! - A code is bound to the email it was sent to: a guess against another address never
+//!   matches (and counts as a wrong guess), so changing a user's email kills their codes.
+//! - An `invite` is refused for an established account (a password and a verified email): 409
+//!   `invite_refused` when issued, `invalid_code` when verified, before the guess is counted.
 //! - `verify` refuses `new_password`. `reset` and `invite` require it (400 `invalid_request`;
 //!   400 `weak_password` before the code is spent), set it, mark the email verified and revoke
 //!   every session of the user.
@@ -21,9 +25,16 @@ pub const MAX_ATTEMPTS: u32 = 5;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CodeRow {
+    /// The user's email when the code was issued.
+    pub email: String,
     pub code: String,
     pub expires: DateTime<Utc>,
     pub attempts: u32,
+}
+
+/// A password and a verified email: an invite never overwrites that, a reset does.
+fn established(u: &super::FUser) -> bool {
+    u.verified && u.password.is_some()
 }
 
 fn kind_of(body: &Value) -> Result<CodeKind, super::Refusal> {
@@ -79,11 +90,20 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
     i.next += 1;
     let code = format!("{:06}", (i.next * 7919 + 100_003) % 1_000_000);
     let p = super::pool_mut(i, pool)?;
-    let email = p.users[user_idx(p, user_id)?].email.clone();
+    let u = &p.users[user_idx(p, user_id)?];
+    if kind == CodeKind::Invite && established(u) {
+        return Err(refuse(
+            409,
+            "invite_refused",
+            "the user already has a password and a verified email; use a reset code",
+        ));
+    }
+    let email = u.email.clone();
     let expires = now + ttl(kind);
     p.codes.insert(
         (user_id.to_string(), kind),
         CodeRow {
+            email: email.clone(),
             code: code.clone(),
             expires,
             attempts: 0,
@@ -140,6 +160,10 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
         )
     };
     let at = user_idx(p, user_id).map_err(|_| invalid())?;
+    if kind == CodeKind::Invite && established(&p.users[at]) {
+        return Err(invalid());
+    }
+    let current = p.users[at].email.clone();
     let key = (user_id.to_string(), kind);
     let row = p.codes.get_mut(&key).ok_or_else(invalid)?;
     if row.expires <= now {
@@ -149,7 +173,7 @@ fn verify(i: &mut Inner, pool: &str, body: &Value) -> Reply {
     if row.attempts >= MAX_ATTEMPTS {
         return Err(invalid());
     }
-    if row.code != given {
+    if row.code != given || row.email != current {
         row.attempts += 1;
         return Err(invalid());
     }

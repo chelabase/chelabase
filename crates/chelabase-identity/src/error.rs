@@ -1,6 +1,6 @@
 //! The service's refusals, typed. The codes come from `services/identity/src/http.ts` and
-//! `routes.ts` (m1); `invalid_code`, `email_not_configured` and
-//! `email_send_failed` are m2's.
+//! `routes.ts` (m1); `invalid_code`, `email_not_configured`,
+//! `invite_refused` and `email_send_failed` are m2's.
 
 use serde::Deserialize;
 
@@ -33,6 +33,10 @@ pub enum IdentityError {
     /// is unknown. The service answers all of them alike (`invalid_code`), so neither can this.
     #[error("code invalid")]
     CodeInvalid,
+    /// An invite code was asked for an established account (a password and a verified email):
+    /// 409 `invite_refused`. Send a reset code instead.
+    #[error("invite refused: {0}")]
+    InviteRefused(String),
     /// `delivery: "email"` was asked for and no SMTP is configured.
     #[error("email is not configured")]
     EmailNotConfigured,
@@ -112,6 +116,7 @@ pub fn classify_status(status: u16, body: &str) -> Option<IdentityError> {
         "session_not_found" => E::NotFound(Missing::Session),
         "not_found" => E::NotFound(Missing::Route),
         "conflict" => E::Conflict(message),
+        "invite_refused" => E::InviteRefused(message),
         "email_not_configured" => E::EmailNotConfigured,
         "banned" => E::Banned,
         "bad_credentials" => E::BadCredentials,
