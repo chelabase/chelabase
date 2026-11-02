@@ -20,7 +20,7 @@ use tracing::info;
 
 use super::retry::{Check, Waiter};
 use super::{HttpProbe, Probe, non_blank, read_secret_file};
-use crate::roles::{IdentityRoles, ensure_identity_roles};
+use crate::roles::{IdentityRoles, ensure_identity_roles, is_lock_timeout};
 
 /// Every environment variable this step reads.
 pub const ENV_KEYS: &[&str] = &[
@@ -71,26 +71,37 @@ impl IdentityConfig {
 }
 
 /// The roles and functions in the metadata database, as its superuser (`metadata_url`); waits
-/// while the database isn't up.
-pub async fn ensure_roles(w: &Waiter, metadata_url: &str, cfg: &IdentityConfig) -> Result<()> {
-    let mut conn = w
-        .until("the metadata database (identity roles)", || async {
-            match sqlx::PgConnection::connect(metadata_url).await {
-                Ok(c) => Ok(Check::Ready(c)),
-                Err(e) => match super::tenant::sql_not_ready(&e) {
+/// while the database isn't up, and while another session holds the setup's lock (each attempt
+/// gives up on it after [`crate::roles::LOCK_TIMEOUT`]), both within `w`'s deadline.
+pub async fn ensure_roles(
+    w: &Waiter,
+    metadata_url: &str,
+    roles: &IdentityRoles,
+    password: &str,
+) -> Result<()> {
+    w.until("the metadata database (identity roles)", || async {
+        let mut conn = match sqlx::PgConnection::connect(metadata_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                return match super::tenant::sql_not_ready(&e) {
                     Some(reason) => Ok(Check::Wait(reason)),
                     None => {
                         Err(anyhow::Error::new(e).context("connecting to the metadata database"))
                     }
-                },
+                };
             }
-        })
-        .await?;
-    let result = ensure_identity_roles(&mut conn, &IdentityRoles::default(), &cfg.db_password)
-        .await
-        .context("bootstrap step: the identity roles");
-    let _ = conn.close().await;
-    result
+        };
+        let result = ensure_identity_roles(&mut conn, roles, password).await;
+        let _ = conn.close().await;
+        match result {
+            Ok(()) => Ok(Check::Ready(())),
+            Err(e) if is_lock_timeout(&e) => Ok(Check::Wait(
+                "another session holds the identity roles' setup lock".into(),
+            )),
+            Err(e) => Err(e.context("bootstrap step: the identity roles")),
+        }
+    })
+    .await
 }
 
 /// One `POST /internal/v1/pools/<pool>`: `Ready` on a 2xx, `Wait` while the service isn't
@@ -123,7 +134,7 @@ pub async fn create_pool(
 
 /// The whole step: the roles, the service's health, then the `members` pool.
 pub async fn run(w: &Waiter, metadata_url: &str, cfg: &IdentityConfig) -> Result<()> {
-    ensure_roles(w, metadata_url, cfg).await?;
+    ensure_roles(w, metadata_url, &IdentityRoles::default(), &cfg.db_password).await?;
     info!("identity: the chelabase_identity role and identity_admin functions are in place");
     let health = HttpProbe::new("the identity service", &format!("{}/health", cfg.url));
     w.until(&health.name(), || health.check()).await?;

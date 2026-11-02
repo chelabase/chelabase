@@ -2,8 +2,9 @@
 //!
 //! - **`chelabase_identity`** ([`IdentityRoles::login`]): the service's own LOGIN role. Not a
 //!   superuser, no `CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`, `NOINHERIT`, a member of no
-//!   role, no `CREATE` on the database and no grant on `public` or `chelabase` (it keeps only
-//!   what `PUBLIC` has, which reaches none of Chelabase's tables). It owns its pool schemas
+//!   role, no `CREATE` on the database and no privilege on `public` or `chelabase`, not even
+//!   `USAGE` (see [`ensure_identity_roles`] on `PUBLIC`'s), so it can't name a Chelabase type or
+//!   function either. At most [`CONNECTION_LIMIT`] connections. It owns its pool schemas
 //!   (`identity_members`, `identity_app_<32 hex>`) and nothing else.
 //! - **`chelabase_identity_admin`** ([`IdentityRoles::owner`]): `NOLOGIN`, not a superuser, with
 //!   `CREATE` on the database and membership in the login role (to create schemas it owns and
@@ -19,7 +20,9 @@
 //!
 //! [`ensure_identity_roles`] makes all of it and corrects drift (attributes, memberships,
 //! grants, the functions' bodies and owners) on every run, under one transaction-scoped advisory
-//! lock, so concurrent runs serialise. The password is sent as a SCRAM verifier, never as text,
+//! lock, so concurrent runs serialise. The lock is open to every role that can connect, so the
+//! wait for it is bounded by [`LOCK_TIMEOUT`]: a session holding it fails the run with 55P03
+//! ([`is_lock_timeout`]), which the bootstrap retries within its deadline. The password is sent as a SCRAM verifier, never as text,
 //! and only when the stored verifier doesn't match the file's password.
 
 use anyhow::{Context, Result, bail};
@@ -31,6 +34,27 @@ pub const POOL_SCHEMA_PATTERN: &str = "^identity_(members|app_[0-9a-f]{32})$";
 pub const ADMIN_SCHEMA: &str = "identity_admin";
 /// `pg_advisory_xact_lock` key of [`ensure_identity_roles`] ("cb_ident" as ASCII).
 const LOCK_KEY: i64 = 0x6362_5f69_6465_6e74;
+/// The longest [`ensure_identity_roles`] waits for its lock (or any other lock), as a
+/// `lock_timeout`. Past it the run fails with 55P03 and the bootstrap tries again.
+pub const LOCK_TIMEOUT: &str = "5s";
+/// The login role's `CONNECTION LIMIT`, so a compromised service can't take every connection
+/// of the metadata server (`max_connections` 100 by default). The service's shared pool holds
+/// at most 10, and each pool creation in flight opens one more for its migration (the service
+/// doesn't bound how many run at once: its concurrency test runs 24), so this leaves room for
+/// a burst of creations, or two instances side by side during a restart, and still keeps half
+/// the server for everyone else.
+pub const CONNECTION_LIMIT: u32 = 50;
+
+/// Whether `err` is a lock wait that hit [`LOCK_TIMEOUT`] (SQLSTATE 55P03, `lock_not_available`):
+/// someone else holds the lock, so the run may be tried again.
+pub fn is_lock_timeout(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| {
+        e.downcast_ref::<sqlx::Error>()
+            .and_then(|e| e.as_database_error())
+            .and_then(|d| d.code())
+            .is_some_and(|c| c == "55P03")
+    })
+}
 
 /// The two roles' names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,6 +217,12 @@ pub async fn ensure_identity_roles(
     }
     let (login, owner) = (roles.login.as_str(), roles.owner.as_str());
     let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    // Bounded: any role that can connect may hold this key.
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{LOCK_TIMEOUT}'"
+    )))
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("SELECT pg_catalog.pg_advisory_xact_lock($1)")
         .bind(LOCK_KEY)
         .execute(&mut *tx)
@@ -201,9 +231,19 @@ pub async fn ensure_identity_roles(
 
     const NOT: &str = "NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS";
     if !role_exists(conn, login).await? {
-        exec(conn, format!("CREATE ROLE {login} LOGIN NOINHERIT {NOT}")).await?;
+        exec(
+            conn,
+            format!(
+                "CREATE ROLE {login} LOGIN NOINHERIT {NOT} CONNECTION LIMIT {CONNECTION_LIMIT}"
+            ),
+        )
+        .await?;
     }
-    exec(conn, format!("ALTER ROLE {login} LOGIN NOINHERIT {NOT}")).await?;
+    exec(
+        conn,
+        format!("ALTER ROLE {login} LOGIN NOINHERIT {NOT} CONNECTION LIMIT {CONNECTION_LIMIT}"),
+    )
+    .await?;
     if !role_exists(conn, owner).await? {
         exec(conn, format!("CREATE ROLE {owner} NOLOGIN {NOT}")).await?;
     }
@@ -244,22 +284,22 @@ pub async fn ensure_identity_roles(
     .await?;
     set_password(conn, login, password).await?;
 
-    // Database: the admin role creates schemas; the login role only connects.
-    let db: String = sqlx::query_scalar("SELECT pg_catalog.current_database()::text")
-        .fetch_one(&mut *conn)
-        .await?;
-    exec(
-        conn,
-        format!(r#"GRANT CREATE ON DATABASE "{db}" TO {owner}"#),
-    )
-    .await?;
-    exec(
-        conn,
-        format!(r#"REVOKE CREATE ON DATABASE "{db}" FROM {login}"#),
-    )
-    .await?;
-    // No direct grant on Chelabase's schemas or what is in them (PUBLIC's are not the login
-    // role's to lose, and reach no table: the metadata tables grant nothing to PUBLIC).
+    // Database: the admin role creates schemas; the login role only connects. The name is
+    // quoted by the server (`%I`).
+    let db: String =
+        sqlx::query_scalar("SELECT pg_catalog.quote_ident(pg_catalog.current_database())")
+            .fetch_one(&mut *conn)
+            .await?;
+    exec(conn, format!("GRANT CREATE ON DATABASE {db} TO {owner}")).await?;
+    exec(conn, format!("REVOKE CREATE ON DATABASE {db} FROM {login}")).await?;
+    // Schema `public`: PUBLIC's default USAGE would let the login role name Chelabase's types
+    // and functions from its own schemas (a column of type `public.tenants` pins that table
+    // against Chelabase's own DDL). A PUBLIC grant can't be withheld from one role, so it goes
+    // for everyone: the metadata database's only other role is its owner, `chelabase` (the
+    // superuser every app and the migrations connect as), which has `public` through
+    // `pg_database_owner` anyway. A future role that needs `public` gets its own GRANT.
+    // No direct grant on Chelabase's schemas or what is in them either (the metadata tables
+    // grant nothing to PUBLIC, and `chelabase` was never PUBLIC's).
     for schema in ["public", "chelabase"] {
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_namespace WHERE nspname = $1)",
@@ -268,6 +308,9 @@ pub async fn ensure_identity_roles(
         .fetch_one(&mut *conn)
         .await?;
         if exists {
+            if schema == "public" {
+                exec(conn, "REVOKE ALL ON SCHEMA public FROM PUBLIC".to_string()).await?;
+            }
             for role in [login, owner] {
                 exec(
                     conn,
