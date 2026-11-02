@@ -217,6 +217,8 @@ pub struct SweepReport {
     pub purged: bool,
     /// Why the pass stopped before deleting anything.
     pub blocked: Option<String>,
+    /// The branch whose status stopped it, with that status.
+    pub blocked_branch: Option<(BranchId, BranchStatus)>,
 }
 
 fn blob_prefix(db: DatabaseId) -> String {
@@ -265,6 +267,9 @@ fn timelines(branches: &[SweepBranch]) -> BTreeSet<String> {
         .collect()
 }
 
+/// Why a pass couldn't read every branch; with the branch and its status when that was it.
+type Refusal = (String, Option<(BranchId, BranchStatus)>);
+
 /// The references of `branches` (backups only with `backups`), or why they can't all be read.
 async fn enumerate<S: SweepSource>(
     source: &S,
@@ -272,15 +277,21 @@ async fn enumerate<S: SweepSource>(
     branches: &[SweepBranch],
     expire: bool,
     backups: bool,
-) -> Result<(HashSet<Uuid>, u64), String> {
+) -> Result<(HashSet<Uuid>, u64), Refusal> {
     let mut refs = HashSet::new();
     let mut tickets = 0;
     for b in branches {
         if b.status != BranchStatus::Ready {
-            return Err(format!("branch {} is {}", b.id, b.status.as_str()));
+            let why = format!("branch {} is {}", b.id, b.status.as_str());
+            return Err((why, Some((b.id, b.status))));
         }
         if b.pending_timeline.is_some() {
-            return Err(format!("branch {} has a reset or restore in flight", b.id));
+            let why = format!(
+                "branch {} is {} with a reset or restore in flight",
+                b.id,
+                b.status.as_str()
+            );
+            return Err((why, Some((b.id, b.status))));
         }
         if b.kind == BranchKind::Backup && !backups {
             continue;
@@ -289,7 +300,7 @@ async fn enumerate<S: SweepSource>(
         let (found, deleted) = source
             .references(db, b, expire)
             .await
-            .map_err(|e| format!("branch {}: {e}", b.id))?;
+            .map_err(|e| (format!("branch {}: {e}", b.id), None))?;
         refs.extend(found);
         tickets += deleted;
     }
@@ -330,7 +341,10 @@ pub async fn sweep_database<S: SweepSource>(
     }
     let (mut refs, tickets) = match enumerate(source, db, &first.branches, !dry_run, true).await {
         Ok(found) => found,
-        Err(why) => return blocked(report, why),
+        Err((why, branch)) => {
+            report.blocked_branch = branch;
+            return blocked(report, why);
+        }
     };
     report.tickets_deleted = tickets;
     let blobs = store
@@ -371,7 +385,10 @@ pub async fn sweep_database<S: SweepSource>(
     }
     match enumerate(source, db, &again.branches, false, false).await {
         Ok((found, _)) => refs.extend(found),
-        Err(why) => return blocked(report, why),
+        Err((why, branch)) => {
+            report.blocked_branch = branch;
+            return blocked(report, why);
+        }
     }
     let retention = first.retention.max(again.retention);
 
@@ -812,6 +829,21 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let settings = self.storage_sweep;
         let report =
             sweep_database(self, store.as_ref(), db, settings.grace, settings.dry_run).await?;
+        // A branch stuck in a status that refuses every pass means the database's storage only
+        // grows: counted, and named in the warning.
+        if let Some((branch, status)) = report.blocked_branch {
+            let refusals = self
+                .storage_sweep_refusals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            warn!(
+                database_id = %db,
+                branch_id = %branch,
+                status = status.as_str(),
+                refusals,
+                "storage sweep refused: a branch isn't ready, so nothing in this database is deleted"
+            );
+        }
         match &report.blocked {
             Some(why) => warn!(database_id = %db, ?report, "storage sweep deleted nothing: {why}"),
             None => info!(database_id = %db, ?report, "storage sweep"),

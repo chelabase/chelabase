@@ -225,7 +225,15 @@ async fn sweep_fails_closed_on_an_unreadable_branch() {
     );
     src.st().branches[1].0.pending_timeline = None;
     src.st().branches[1].0.status = BranchStatus::Failed;
-    assert!(pass(&src, &store).await.blocked.unwrap().contains("failed"));
+    let failed = src.st().branches[1].0.id;
+    let r = pass(&src, &store).await;
+    let why = r.blocked.clone().unwrap();
+    assert!(
+        why.contains(&failed.to_string()) && why.contains("failed"),
+        "{why}"
+    );
+    // The branch and its status, for the log and the refusal count.
+    assert_eq!(r.blocked_branch, Some((failed, BranchStatus::Failed)));
     assert!(exists(&store, &orphan).await);
     src.st().status = DatabaseStatus::Deleting;
     assert!(
@@ -636,6 +644,31 @@ mod worker_reads {
         let other = ready_database(&w).await;
         assert_eq!(w.queue_storage_sweeps().await.unwrap(), 1);
         assert_eq!(w.sweep_requests.sent().last(), Some(&other));
+    }
+
+    /// A pass a branch's status refuses is counted (and logged with the database, branch and
+    /// status): a branch stuck failed means storage only grows.
+    #[tokio::test]
+    async fn sweep_refusals_by_a_branch_status_are_counted() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut w, _journal) = worker();
+        let store = Arc::new(MemoryStore::default());
+        w.blob_store = Some(store.clone());
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db);
+        w.computes.answer("datallowconn", &databases(&["app"]));
+        w.computes.answer("chelabase_storage_here", &refs(&[]));
+        w.handle_storage_sweep(db).await.unwrap();
+        assert_eq!(w.storage_sweep_refusals.load(Relaxed), 0);
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&main.id)
+            .unwrap()
+            .status = BranchStatus::Failed;
+        w.handle_storage_sweep(db).await.unwrap();
+        w.handle_storage_sweep(db).await.unwrap();
+        assert_eq!(w.storage_sweep_refusals.load(Relaxed), 2);
     }
 
     /// Two sweeps of one database never overlap: the second waits for the lock.

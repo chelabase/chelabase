@@ -551,6 +551,7 @@ pub fn build_with(
         blob_store: None,
         storage_sweep: Default::default(),
         sweep_requests: Default::default(),
+        storage_sweep_refusals: Default::default(),
     })
 }
 

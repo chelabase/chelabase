@@ -4151,6 +4151,7 @@ pub fn worker() -> (FakeWorker, Journal) {
         blob_store: None,
         storage_sweep: Default::default(),
         sweep_requests: Default::default(),
+        storage_sweep_refusals: Default::default(),
     };
     (worker, journal)
 }

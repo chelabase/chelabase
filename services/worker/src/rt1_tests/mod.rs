@@ -181,6 +181,7 @@ pub(crate) fn rt_worker() -> Rt {
         blob_store: w.blob_store,
         storage_sweep: w.storage_sweep,
         sweep_requests: w.sweep_requests,
+        storage_sweep_refusals: w.storage_sweep_refusals,
     };
     Rt {
         w,
