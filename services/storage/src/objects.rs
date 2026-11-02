@@ -30,6 +30,7 @@ use axum::response::{IntoResponse, Response};
 use chelabase_auth::internal::DataIdentity;
 use chelabase_pgsession::service::Type;
 use chelabase_pgsession::{ConnSource, NamedStatement, named_statement};
+use chelabase_query::QueryFailure;
 use chelabase_storage::ByteRange;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -37,7 +38,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::app::{AppState, identity};
-use crate::buckets::{body, pg};
+use crate::buckets::body;
 use crate::engine::Located;
 use crate::error::Failure;
 use crate::names::{self, Staged, check_object_name};
@@ -68,6 +69,45 @@ const TICKET: NamedStatement = named_statement!(
 
 /// The trigger's code for a row its ticket doesn't vouch for.
 const TICKET_MISSING: &str = "CB003";
+
+/// A database error as this module reads it: the trigger's [`TICKET_MISSING`] keeps its
+/// SQLSTATE (a 409 until a step reads it), everything else maps as the data API does.
+pub fn db_failure(code: &str, message: &str, request_id: &str) -> QueryFailure {
+    struct Db<'a>(&'a str, &'a str);
+    impl chelabase_query::error::DbFields for Db<'_> {
+        fn code(&self) -> &str {
+            self.0
+        }
+        fn message(&self) -> &str {
+            self.1
+        }
+        fn detail(&self) -> Option<&str> {
+            None
+        }
+        fn hint(&self) -> Option<&str> {
+            None
+        }
+        fn constraint(&self) -> Option<&str> {
+            None
+        }
+    }
+    if code == TICKET_MISSING {
+        let mut f = QueryFailure::new(StatusCode::CONFLICT, "conflict", message);
+        f.sqlstate = Some(code.to_owned());
+        return f;
+    }
+    QueryFailure::from_db(&Db(code, message), request_id)
+}
+
+/// [`crate::buckets::pg`], keeping `CB003` ([`db_failure`]).
+fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
+    move |e| match e.as_db_error() {
+        Some(db) if db.code().code() == TICKET_MISSING => {
+            db_failure(TICKET_MISSING, db.message(), request_id)
+        }
+        _ => QueryFailure::from_pg(&e, request_id),
+    }
+}
 
 /// The row an upload or copy writes.
 struct Row {
@@ -974,12 +1014,33 @@ pub async fn list<S: ConnSource, M: ConnSource>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chelabase_query::QueryFailure;
 
     fn failure(sqlstate: &str) -> Failure {
         let mut f = QueryFailure::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "x");
         f.sqlstate = Some(sqlstate.into());
         Failure(f)
+    }
+
+    /// The trigger's `CB003` keeps its SQLSTATE (the data API's mapping has no row for it and
+    /// would make it a 500 without one): the pre-check reads it as "the policy passed", the
+    /// final write as a lost race.
+    #[test]
+    fn a_missing_ticket_keeps_its_sqlstate() {
+        let f = db_failure(
+            TICKET_MISSING,
+            "storage.objects: the row matches no unused upload ticket",
+            "r",
+        );
+        assert_eq!(
+            (f.status, f.sqlstate.as_deref()),
+            (StatusCode::CONFLICT, Some(TICKET_MISSING))
+        );
+        assert_eq!(final_failure(Failure(f)).0.code, "conflict");
+        let rls = db_failure("42501", "new row violates row-level security policy", "r");
+        assert_eq!(
+            (rls.status, rls.sqlstate.as_deref()),
+            (StatusCode::FORBIDDEN, Some("42501"))
+        );
     }
 
     /// AC: a lost race (the ticket no longer matches, or the name was taken) is 409; a policy

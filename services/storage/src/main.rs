@@ -20,8 +20,9 @@ async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "storage=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "storage=info,chelabase_query=info,chelabase_pgsession=info".into()
+            }),
         )
         .init();
     let config = Config::from_env()?;
