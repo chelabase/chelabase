@@ -2706,6 +2706,7 @@ impl WorkerMetadata for FakeMetadata {
             let db = state.databases.get(&b.database_id)?;
             Some(BranchConnectionRow {
                 branch_id: b.id,
+                database_id: b.database_id,
                 status: b.status,
                 endpoint_id: b.endpoint_id.clone(),
                 database_name: db.database_name.clone(),

@@ -79,6 +79,88 @@ impl Failure {
         )
     }
 
+    /// 400: an object name that isn't allowed (checked before any statement).
+    pub fn invalid_name() -> Self {
+        Self::invalid_request(
+            "an object name is 1 to 1024 bytes of UTF-8 with no control characters, no leading `/`, and no empty or `..` segment",
+        )
+    }
+
+    /// 404: no object of that name the caller may see (missing or hidden alike).
+    pub fn object_not_found() -> Self {
+        Self::new(StatusCode::NOT_FOUND, "object_not_found", "no such object")
+    }
+
+    /// 409: someone else changed the object (or took the name) first.
+    pub fn object_conflict() -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            "conflict",
+            "the object changed or was created meanwhile; try again",
+        )
+    }
+
+    /// 413: the body is over the bucket's file size limit.
+    pub fn too_large(limit: i64) -> Self {
+        Self::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "too_large",
+            format!("the object is over the bucket's limit of {limit} bytes"),
+        )
+    }
+
+    pub fn range_not_satisfiable() -> Self {
+        Self::new(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "range_not_satisfiable",
+            "the range is outside the object",
+        )
+    }
+
+    /// 502: the object store failed (the caller logs why).
+    pub fn store_failed() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "storage_error",
+            "the object store failed; try again",
+        )
+    }
+
+    /// 403 on the object routes: row level security refused the operation, or the caller
+    /// can't see the bucket. One answer for both, whether the bucket exists or not.
+    pub fn not_allowed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "not_allowed",
+            "the caller may not do this in this bucket",
+        )
+    }
+
+    /// An object route's statement failure: RLS's 42501 becomes [`Self::not_allowed`], so a
+    /// refusal can't be told apart from a bucket the caller can't see.
+    pub fn refusal(self) -> Self {
+        if self.0.sqlstate.as_deref() == Some("42501") {
+            Self::not_allowed()
+        } else {
+            self
+        }
+    }
+
+    /// The object store failed (logged with the request id).
+    pub fn from_store(e: &chelabase_storage::StorageError, request_id: &str) -> Self {
+        match e {
+            chelabase_storage::StorageError::NotFound => Self::object_not_found(),
+            other => {
+                tracing::warn!(request_id, "the object store: {other}");
+                Self::new(
+                    StatusCode::BAD_GATEWAY,
+                    "storage_error",
+                    "the object store failed; try again",
+                )
+            }
+        }
+    }
+
     /// No connection to the branch's database.
     pub fn from_acquire(e: &AcquireError, request_id: &str) -> Self {
         match e {
@@ -183,5 +265,26 @@ mod tests {
         );
         let (status, _, _) = body(Failure::from_acquire(&AcquireError::NotServed, "r")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A bucket the caller can't see (missing or hidden alike) and an RLS refusal of the object
+    /// operation answer the same bytes.
+    #[tokio::test]
+    async fn a_hidden_bucket_and_a_refusal_answer_alike() {
+        let mut rls = QueryFailure::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "new row violates row-level security policy for table \"objects\"",
+        );
+        rls.sqlstate = Some("42501".into());
+        let refused = Failure(rls).refusal().into_response();
+        let hidden = Failure::not_allowed().into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let bytes =
+            |r: Response| async { axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap() };
+        assert_eq!(bytes(refused).await, bytes(hidden).await);
+        // Anything else keeps its own answer.
+        let other = Failure::object_conflict().refusal();
+        assert_eq!(other.0.code, "conflict");
     }
 }

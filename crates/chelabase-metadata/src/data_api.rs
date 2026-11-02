@@ -41,7 +41,7 @@
 
 use std::fmt;
 
-use chelabase_types::{BranchId, ProjectId};
+use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use chelabase_types::data_key::DataKeyKind;
 use chrono::{DateTime, Utc};
 use sqlx::Row;
@@ -197,6 +197,8 @@ pub struct ServedDatabase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchConnectionRow {
     pub branch_id: BranchId,
+    /// The Chelabase database the branch belongs to (object storage's blob keys start with it).
+    pub database_id: DatabaseId,
     pub status: BranchStatus,
     pub endpoint_id: Option<String>,
     /// The Postgres database inside the compute (the database's, shared by its branches).
@@ -647,7 +649,7 @@ impl MetadataClient {
         branch: BranchId,
     ) -> Result<Option<BranchConnectionRow>, MetadataError> {
         let row = sqlx::query(
-            "SELECT b.id, b.status, b.endpoint_id, b.authenticator_password_enc,
+            "SELECT b.id, b.database_id, b.status, b.endpoint_id, b.authenticator_password_enc,
                     b.storage_password_enc, b.storage_password_salt,
                     d.database_name, d.max_rows, d.statement_timeout_ms, d.max_connections,
                     d.storage_max_connections
@@ -664,6 +666,7 @@ impl MetadataClient {
         let databases = self.served_databases(branch).await?;
         Ok(Some(BranchConnectionRow {
             branch_id: BranchId(r.get("id")),
+            database_id: DatabaseId(r.get("database_id")),
             status: BranchStatus::parse(r.get("status"))?,
             endpoint_id: r.get("endpoint_id"),
             database_name: r.get("database_name"),

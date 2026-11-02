@@ -39,6 +39,25 @@ fn check_name(name: &str) -> Result<(), Failure> {
     }
 }
 
+/// Literal segments the storage routes use where a bucket name goes (`/object/list/…`,
+/// `/object/copy`, …, and the ones later milestones add): never a bucket's name.
+pub const RESERVED_BUCKET_NAMES: [&str; 7] = [
+    "list", "copy", "move", "sign", "public", "upload", "resolve",
+];
+
+/// A bucket's new name (create, rename): valid and not reserved.
+fn check_new_name(name: &str) -> Result<(), Failure> {
+    check_name(name)?;
+    if RESERVED_BUCKET_NAMES.contains(&name) {
+        return Err(Failure::new(
+            StatusCode::BAD_REQUEST,
+            "reserved_bucket_name",
+            format!("`{name}` is reserved by the storage routes"),
+        ));
+    }
+    Ok(())
+}
+
 /// `?database=`: the Postgres database (the key's main one when left out).
 #[derive(Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -80,11 +99,11 @@ pub struct Bucket {
     pub allowed_mime_types: Option<Vec<String>>,
 }
 
-fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
+pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
     move |e| QueryFailure::from_pg(&e, request_id)
 }
 
-fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
+pub(crate) fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
     json.map(|Json(t)| t)
         .map_err(|e| Failure::invalid_request(format!("the body: {}", e.body_text())))
 }
@@ -140,7 +159,7 @@ pub async fn list<S: ConnSource, M: ConnSource>(
     security(("bearer" = [])),
     responses(
         (status = 201, description = "Created", body = Bucket),
-        (status = 400, description = "`invalid_request`, `invalid_value`", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_request`, `invalid_value`, `reserved_bucket_name`", body = StorageErrorEnvelope),
         (status = 403, description = "`permission_denied` (no policy allows it), `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: a bucket of that name exists", body = StorageErrorEnvelope),
         (status = 503, description = "`storage_unavailable`, `unavailable`", body = StorageErrorEnvelope),
@@ -154,7 +173,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
 ) -> Result<Response, Failure> {
     let (data, rid) = identity(&state, &headers)?;
     let new = body(json)?;
-    check_name(&new.name)?;
+    check_new_name(&new.name)?;
     // No RETURNING: it would need a SELECT policy too.
     let bucket = Bucket {
         id: Uuid::new_v4(),
@@ -189,7 +208,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
     security(("bearer" = [])),
     responses(
         (status = 204, description = "Changed"),
-        (status = 400, description = "`invalid_request`, `invalid_value`", body = StorageErrorEnvelope),
+        (status = 400, description = "`invalid_request`, `invalid_value`, `reserved_bucket_name`", body = StorageErrorEnvelope),
         (status = 403, description = "`permission_denied`, `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 404, description = "`bucket_not_found`: missing, or hidden from the caller", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the new name is taken", body = StorageErrorEnvelope),
@@ -207,7 +226,7 @@ pub async fn update<S: ConnSource, M: ConnSource>(
     let change = body(json)?;
     check_name(&name)?;
     if let Some(new) = &change.name {
-        check_name(new)?;
+        check_new_name(new)?;
     }
     let (changed, _) = state
         .engine
@@ -288,6 +307,41 @@ pub fn is_not_empty(f: &Failure) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new bucket name may not be a literal segment the storage routes use where a bucket
+    /// name goes (today's and the ones later milestones add): 400 `reserved_bucket_name`.
+    #[test]
+    fn route_segments_are_reserved_bucket_names() {
+        for name in [
+            "list", "copy", "move", "sign", "public", "upload", "resolve",
+        ] {
+            let err = check_new_name(name).unwrap_err();
+            assert_eq!(
+                (err.0.status.as_u16(), err.0.code),
+                (400, "reserved_bucket_name"),
+                "{name}"
+            );
+        }
+        assert!(check_new_name("avatars").is_ok());
+        assert_eq!(check_new_name("Bad").unwrap_err().0.code, "invalid_request");
+        for ep in chelabase_routes::ENDPOINTS
+            .iter()
+            .filter(|e| e.service == chelabase_routes::Service::Storage)
+        {
+            for base in ["/storage/v1/object/", "/storage/v1/bucket/"] {
+                if let Some(rest) = ep.path.strip_prefix(base) {
+                    let first = rest.split('/').next().unwrap();
+                    if !first.starts_with('{') {
+                        assert!(
+                            RESERVED_BUCKET_NAMES.contains(&first),
+                            "{} uses `{first}`",
+                            ep.name
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// AC: a bucket's name is checked before any statement.
     #[test]

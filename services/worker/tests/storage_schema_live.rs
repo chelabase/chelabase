@@ -31,7 +31,9 @@ use worker::storage_schema::{self, storage_schema_sql};
 
 mod common;
 use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 const OWNER: &str = "postgres";
 
@@ -486,6 +488,11 @@ async fn run(fx: &Fx) {
         "UPDATE storage.objects SET name = 'u1/renamed.png' WHERE name = 'u1/me.png'",
     )
     .await;
+    // m5 phase B (schema 5): every update stamps updated_at.
+    assert_eq!(
+        fx.value("SELECT updated_at > created_at FROM storage.objects WHERE name = 'u1/renamed.png'").await,
+        "t"
+    );
 
     // A ticket left on main when the branch is made.
     fx.as_role_commit(
@@ -1432,6 +1439,426 @@ async fn storage_api_user_schema_live() {
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
+}
+
+// --- m5 phase B: objects through the gateway ------------------------------------------------
+
+/// The object store as the storage service sees it (the stack's `storage` identity).
+async fn object_store() -> chelabase_storage::S3Store {
+    let state = std::env::var("CHELABASE_STACK_DIR")
+        .expect("CHELABASE_STACK_DIR (run through just workbench test)");
+    let cfg = chelabase_storage::StorageConfig::from_lookup(|k| {
+        Some(match k {
+            "CHELABASE_STORAGE_BACKEND" => "seaweedfs".into(),
+            "CHELABASE_STORAGE_S3_ENDPOINT" => "http://seaweedfs:8333".into(),
+            "CHELABASE_STORAGE_S3_BUCKET" => "chelabase-storage".into(),
+            "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE" => format!("{state}/storage-s3/access-key"),
+            "CHELABASE_STORAGE_S3_SECRET_KEY_FILE" => format!("{state}/storage-s3/secret-key"),
+            _ => return None,
+        })
+    })
+    .expect("the object store's settings");
+    chelabase_storage::S3Store::new(&cfg).await
+}
+
+/// An object call with data key `key`: `(status, headers, body)`; status 0 when the client's
+/// own body failed.
+async fn object(
+    method: &str,
+    path: &str,
+    key: &str,
+    body: Option<reqwest::Body>,
+    headers: &[(&str, &str)],
+) -> (u16, reqwest::header::HeaderMap, bytes::Bytes) {
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{}{path}", gateway()))
+        .bearer_auth(key)
+        .timeout(Duration::from_secs(600));
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    if let Some(body) = body {
+        req = req.body(body);
+    }
+    match req.send().await {
+        Ok(res) => {
+            let (status, headers) = (res.status().as_u16(), res.headers().clone());
+            (status, headers, res.bytes().await.unwrap_or_default())
+        }
+        Err(_) => (0, Default::default(), bytes::Bytes::new()),
+    }
+}
+
+/// `total` bytes of `fill` in 64 KiB chunks, `pause` apart; with `fail_after`, an error once
+/// that many bytes are out.
+fn paced_body(total: usize, fill: u8, pause: Duration, fail_after: Option<usize>) -> reqwest::Body {
+    const CHUNK: usize = 64 * 1024;
+    let stream = futures_util::stream::unfold(0usize, move |sent| async move {
+        if sent >= total {
+            return None;
+        }
+        if fail_after.is_some_and(|f| sent >= f) {
+            return Some((Err(std::io::Error::other("the client's body failed")), total));
+        }
+        if !pause.is_zero() {
+            tokio::time::sleep(pause).await;
+        }
+        let n = CHUNK.min(total - sent);
+        Some((Ok(bytes::Bytes::from(vec![fill; n])), sent + n))
+    });
+    reqwest::Body::wrap_stream(stream)
+}
+
+fn json_of(b: &bytes::Bytes) -> Value {
+    serde_json::from_slice(b).unwrap_or(Value::Null)
+}
+
+const JSON: (&str, &str) = ("content-type", "application/json");
+
+impl Fx {
+    /// The blob keys under this database's prefix, without it.
+    async fn blobs(&self, store: &chelabase_storage::S3Store) -> Vec<String> {
+        use chelabase_storage::ObjectStore;
+        let prefix = format!("{}/{}/", self.id, self.database);
+        store
+            .list(&prefix)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.key[prefix.len()..].to_string())
+            .collect()
+    }
+
+    /// A bucket, made as storage itself.
+    async fn bucket(&self, name: &str) {
+        self.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{name}'); COMMIT;"
+        ))
+        .await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_objects_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_api_objects(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_api_objects(fx: &Fx) {
+    use chelabase_storage::ObjectStore;
+    let store = object_store().await;
+    let secret = fx.secret_key("st-obj", None).await;
+    let up = |name: &str| format!("/storage/v1/object/files/{name}");
+    fx.bucket("files").await;
+    fx.bucket("other").await;
+    fx.bucket("secret").await;
+    // Object routes need the bucket visible to the caller: every bucket but `secret`.
+    let visible = "'name <> ''secret'''";
+    fx.owner(&format!("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], {visible}, NULL)"))
+        .await
+        .unwrap();
+
+    // A bucket the caller can't see and one that doesn't exist answer the same bytes.
+    let hidden = object("POST", "/storage/v1/object/secret/a.txt", &secret, Some(b"x".to_vec().into()), &[]).await;
+    let missing = object("POST", "/storage/v1/object/ghost/a.txt", &secret, Some(b"x".to_vec().into()), &[]).await;
+    assert_eq!((hidden.0, &hidden.2), (missing.0, &missing.2));
+    assert_eq!((hidden.0, json_of(&hidden.2)["error"]["code"].clone()), (403, json!("not_allowed")));
+    let hidden = object("GET", "/storage/v1/object/secret/a.txt", &secret, None, &[]).await;
+    let missing_get = object("GET", "/storage/v1/object/ghost/a.txt", &secret, None, &[]).await;
+    assert_eq!((hidden.0, &hidden.2), (missing_get.0, &missing_get.2));
+
+    // No object policy: the same 403, and nothing reached the object store.
+    let (status, _, b) = object("POST", &up("a.txt"), &secret, Some(b"hello".to_vec().into()), &[]).await;
+    assert_eq!(status, 403, "{}", json_of(&b));
+    assert_eq!(b, missing.2, "an RLS refusal answers as a hidden bucket");
+    assert!(fx.blobs(&store).await.is_empty());
+
+    // Policies: `hidden/…` can't be read; 666 bytes and text/html can't be written.
+    let check = "'(size IS NULL OR size <> 666) AND content_type <> ''text/html'''";
+    for (name, command, using, check) in [
+        ("o_select", "SELECT", "'name NOT LIKE ''hidden/%'''", "NULL"),
+        ("o_insert", "INSERT", "NULL", check),
+        ("o_update", "UPDATE", "'true'", check),
+        ("o_delete", "DELETE", "'true'", "NULL"),
+    ] {
+        fx.owner(&format!(
+            "SELECT storage.create_policy('{name}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{name}: {e}"));
+    }
+
+    // The happy path: the row, the blob at its version's key, no staging left.
+    let (status, _, b) = object(
+        "POST",
+        &up("docs/a.txt"),
+        &secret,
+        Some(b"hello world".to_vec().into()),
+        &[("content-type", "text/plain")],
+    )
+    .await;
+    assert_eq!(status, 200, "{}", json_of(&b));
+    let made = json_of(&b);
+    let version = made["version_id"].as_str().unwrap().to_string();
+    assert_eq!(made["size"], 11);
+    assert_eq!(
+        fx.value("SELECT size || ' ' || content_type || ' ' || version_id FROM storage.objects WHERE name = 'docs/a.txt'")
+            .await,
+        format!("11 text/plain {version}")
+    );
+    assert_eq!(fx.blobs(&store).await, std::slice::from_ref(&version));
+    let etag = made["etag"].as_str().unwrap().to_string();
+    let blob = store.head(&format!("{}/{}/{version}", fx.id, fx.database)).await.unwrap();
+    assert_eq!(blob.etag.trim_matches('"'), etag);
+
+    // Range and conditional reads, the download name, HEAD.
+    let (status, h, b) = object("GET", &up("docs/a.txt"), &secret, None, &[("range", "bytes=0-4")]).await;
+    assert_eq!((status, &b[..]), (206, &b"hello"[..]));
+    assert_eq!(h["content-range"], "bytes 0-4/11");
+    let tag = h["etag"].to_str().unwrap().to_string();
+    assert_eq!(object("GET", &up("docs/a.txt"), &secret, None, &[("if-none-match", &tag)]).await.0, 304);
+    let (status, h, b) = object("GET", &format!("{}?download=", up("docs/a.txt")), &secret, None, &[]).await;
+    assert_eq!((status, &b[..]), (200, &b"hello world"[..]));
+    assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"a.txt\""));
+    assert_eq!(object("HEAD", &up("docs/a.txt"), &secret, None, &[]).await.0, 200);
+
+    // A policy on size and content type: 403 whether declared or known only after the body,
+    // and no blob stays.
+    let before = fx.blobs(&store).await;
+    assert_eq!(object("POST", &up("big.bin"), &secret, Some(vec![0u8; 666].into()), &[]).await.0, 403, "declared 666 bytes");
+    let chunked = Some(paced_body(666, 1, Duration::ZERO, None));
+    assert_eq!(object("POST", &up("big2.bin"), &secret, chunked, &[]).await.0, 403, "a chunked 666 bytes");
+    let html = [("content-type", "text/html")];
+    assert_eq!(object("POST", &up("x.html"), &secret, Some(b"<p>".to_vec().into()), &html).await.0, 403, "text/html");
+    assert_eq!(fx.blobs(&store).await, before);
+
+    // A body that fails midway leaves no row and no blob.
+    let broken = Some(paced_body(1 << 20, 2, Duration::ZERO, Some(256 * 1024)));
+    assert_ne!(object("POST", &up("broken.bin"), &secret, broken, &[]).await.0, 200);
+    assert_eq!(fx.value("SELECT count(*) FROM storage.objects WHERE name = 'broken.bin'").await, "0");
+    assert_eq!(fx.blobs(&store).await, before);
+
+    // Names: `..`, control characters and 1025 bytes are 400.
+    for bad in ["a/%2E%2E/x", "a%01b", &"n".repeat(1025)] {
+        assert_eq!(object("POST", &up(bad), &secret, Some(b"x".to_vec().into()), &[]).await.0, 400, "{bad}");
+    }
+
+    // A hidden object is 404 on read, head, copy and move.
+    assert_eq!(object("POST", &up("hidden/h.txt"), &secret, Some(b"h".to_vec().into()), &[]).await.0, 200);
+    assert_eq!(object("GET", &up("hidden/h.txt"), &secret, None, &[]).await.0, 404);
+    assert_eq!(object("HEAD", &up("hidden/h.txt"), &secret, None, &[]).await.0, 404);
+    for route in ["copy", "move"] {
+        let body = json!({ "bucket": "files", "from": "hidden/h.txt", "to": format!("seen-{route}.txt") });
+        let path = format!("/storage/v1/object/{route}");
+        assert_eq!(object("POST", &path, &secret, Some(body.to_string().into()), &[JSON]).await.0, 404, "{route}");
+    }
+
+    // Copy (a new version and blob), a cross-bucket move (metadata only), then a download.
+    let body = json!({ "bucket": "files", "from": "docs/a.txt", "to": "docs/b.txt" });
+    let (status, _, b) = object("POST", "/storage/v1/object/copy", &secret, Some(body.to_string().into()), &[JSON]).await;
+    assert_eq!(status, 200, "{}", json_of(&b));
+    let body = json!({ "bucket": "files", "from": "docs/b.txt", "to": "moved/b.txt", "to_bucket": "other" });
+    let (status, _, b) = object("POST", "/storage/v1/object/move", &secret, Some(body.to_string().into()), &[JSON]).await;
+    assert_eq!(status, 204, "{}", json_of(&b));
+    let (status, _, b) = object("GET", "/storage/v1/object/other/moved/b.txt", &secret, None, &[]).await;
+    assert_eq!((status, &b[..]), (200, &b"hello world"[..]));
+
+    // Without upsert an existing name is 409; with it, the object is replaced and its
+    // updated_at advances (schema 5's trigger).
+    assert_eq!(object("POST", &up("docs/a.txt"), &secret, Some(b"x".to_vec().into()), &[]).await.0, 409);
+    let stamped = "SELECT updated_at::text FROM storage.objects WHERE name = 'docs/a.txt'";
+    let before_upsert = fx.value(stamped).await;
+    let upsert = [("x-upsert", "true")];
+    let (status, _, b) = object("PUT", &up("docs/a.txt"), &secret, Some(b"v2".to_vec().into()), &upsert).await;
+    assert_eq!(status, 200, "{}", json_of(&b));
+    assert_eq!(&object("GET", &up("docs/a.txt"), &secret, None, &[]).await.2[..], &b"v2"[..]);
+    let after_upsert = fx.value(stamped).await;
+    let advanced = fx.value(&format!("SELECT '{after_upsert}'::timestamptz > '{before_upsert}'::timestamptz")).await;
+    assert_eq!(advanced, "t", "updated_at {before_upsert} -> {after_upsert}");
+
+    // Racing upserts of one existing name: one wins, the other is 409, and the winner's row and
+    // blob stay.
+    assert_eq!(object("POST", &up("race.bin"), &secret, Some(b"0".to_vec().into()), &[]).await.0, 200);
+    let slow = || Some(paced_body(512 * 1024, 7, Duration::from_millis(100), None));
+    let race = up("race.bin");
+    let (a, b) = tokio::join!(
+        object("PUT", &race, &secret, slow(), &upsert),
+        object("PUT", &race, &secret, slow(), &upsert),
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 409], "{} / {}", json_of(&a.2), json_of(&b.2));
+    let winner = if a.0 == 200 { json_of(&a.2) } else { json_of(&b.2) };
+    let version = winner["version_id"].as_str().unwrap().to_string();
+    assert_eq!(fx.value("SELECT version_id FROM storage.objects WHERE name = 'race.bin'").await, version);
+    let blobs = fx.blobs(&store).await;
+    assert!(blobs.contains(&version), "{blobs:?}");
+    assert!(!blobs.iter().any(|k| k.starts_with("staging/")), "{blobs:?}");
+
+    // A row carrying another database's version, written past the triggers by a superuser (the
+    // owner can't: the trigger wants a ticket only storage writes): its blob lives under that
+    // database's prefix, so the download is 404.
+    let foreign = Uuid::new_v4();
+    store
+        .put(&format!("{}/{}/{foreign}", Uuid::new_v4(), fx.database), bytes::Bytes::from_static(b"x"), Default::default())
+        .await
+        .unwrap();
+    fx.admin(&format!(
+        "BEGIN; SET LOCAL session_replication_role = replica;
+INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) SELECT id, 'foreign.bin', 1, 'e', '{foreign}' FROM storage.buckets WHERE name = 'files';
+COMMIT;"
+    ))
+    .await;
+    let err = fx.owner_err(&format!(
+        "UPDATE storage.objects SET version_id = '{foreign}' WHERE name = 'race.bin'"
+    ))
+    .await;
+    assert!(err.contains("CB003"), "the owner copied a version in: {err}");
+    assert_eq!(object("GET", &up("foreign.bin"), &secret, None, &[]).await.0, 404);
+
+    // Delete one and many: rows only (the blobs wait for the sweeper).
+    assert_eq!(object("DELETE", &up("docs/a.txt"), &secret, None, &[]).await.0, 204);
+    assert_eq!(object("DELETE", &up("docs/a.txt"), &secret, None, &[]).await.0, 404);
+    let body = json!({ "names": ["race.bin", "hidden/h.txt", "nope"] });
+    let (status, _, b) = object("DELETE", "/storage/v1/object/files", &secret, Some(body.to_string().into()), &[JSON]).await;
+    assert_eq!(status, 200, "{}", json_of(&b));
+    let mut deleted: Vec<String> = serde_json::from_value(json_of(&b)["deleted"].clone()).unwrap();
+    deleted.sort();
+    assert_eq!(deleted, ["race.bin"], "a hidden object isn't deleted either");
+}
+
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_api_list_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_api_list(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_api_list(fx: &Fx) {
+    let secret = fx.secret_key("st-list", None).await;
+    fx.bucket("files").await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
+    fx.owner("SELECT storage.create_policy('o_all', 'objects', 'ALL', ARRAY['authenticated']::name[], 'true', 'true')")
+        .await
+        .unwrap();
+    for name in ["a/1", "a/2", "b/1", "c", "d"] {
+        let path = format!("/storage/v1/object/files/{name}");
+        let (status, _, b) = object("POST", &path, &secret, Some(b"x".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{name}: {}", json_of(&b));
+    }
+    let list = async |body: Value| {
+        let path = "/storage/v1/object/list/files";
+        let (status, _, b) = object("POST", path, &secret, Some(body.to_string().into()), &[JSON]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        json_of(&b)
+    };
+    let names = |page: &Value| -> Vec<(String, bool)> {
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| (i["name"].as_str().unwrap().to_string(), i["folder"].as_bool().unwrap()))
+            .collect()
+    };
+    let item = |n: &str, folder: bool| (n.to_string(), folder);
+    // Folders and files once each, paged.
+    let first = list(json!({ "delimiter": "/", "limit": 2 })).await;
+    assert_eq!(names(&first), [item("a/", true), item("b/", true)]);
+    let second = list(json!({ "delimiter": "/", "limit": 2, "cursor": first["next_cursor"] })).await;
+    assert_eq!(names(&second), [item("c", false), item("d", false)]);
+    assert!(second["next_cursor"].is_null(), "{second}");
+    let folder = list(json!({ "prefix": "a/", "delimiter": "/" })).await;
+    assert_eq!(names(&folder), [item("a/1", false), item("a/2", false)]);
+    assert_eq!(names(&list(json!({ "search": "B/" })).await), [item("b/1", false)]);
+    let desc = list(json!({ "order": "desc", "limit": 1 })).await;
+    assert_eq!(names(&desc), [item("d", false)]);
+    let next = list(json!({ "order": "desc", "limit": 1, "cursor": desc["next_cursor"] })).await;
+    assert_eq!(names(&next), [item("c", false)]);
+    // A key whose list excludes the database asked for: 403.
+    let listed = fx.secret_key("st-list-listed", Some(vec![fx.database.clone()])).await;
+    let path = "/storage/v1/object/list/files?database=postgres";
+    assert_eq!(object("POST", path, &listed, Some("{}".into()), &[JSON]).await.0, 403);
+}
+
+/// 100 uploads stalled mid-body hold no database connection: the data API and storage's own
+/// routes on the branch answer as usual meanwhile. Then a 64 MiB upload paced over about 80 s
+/// (past the gateway's 60 s default read timeout) completes through the gateway.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service; about two minutes"]
+async fn storage_api_slow_uploads_live() {
+    let fx = Arc::new(Fx::provision().await);
+    let task = fx.clone();
+    let outcome = tokio::spawn(async move { storage_api_slow_uploads(&task).await }).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+async fn storage_api_slow_uploads(fx: &Fx) {
+    let secret = fx.secret_key("st-slow", None).await;
+    fx.bucket("files").await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
+    fx.owner("SELECT storage.create_policy('o_all', 'objects', 'ALL', ARRAY['authenticated']::name[], 'true', 'true')")
+        .await
+        .unwrap();
+    let stalled: Vec<_> = (0..100)
+        .map(|i| {
+            let secret = secret.clone();
+            tokio::spawn(async move {
+                // One byte, then nothing.
+                let body = futures_util::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from_static(b"x")) })
+                    .chain(futures_util::stream::pending());
+                let path = format!("/storage/v1/object/files/stalled-{i}");
+                object("POST", &path, &secret, Some(reqwest::Body::wrap_stream(body)), &[]).await
+            })
+        })
+        .collect();
+    // Every stalled upload passes its pre-check (one at a time within storage's budget) and
+    // then waits on its body.
+    tokio::time::sleep(Duration::from_secs(15)).await;
+    for _ in 0..5 {
+        let started = Instant::now();
+        let res = reqwest::Client::new()
+            .get(format!("{}/data/v1/schema", gateway()))
+            .bearer_auth(&secret)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .expect("the data API answers");
+        assert_eq!(res.status().as_u16(), 200);
+        assert!(started.elapsed() < Duration::from_secs(3), "the data API took {:?}", started.elapsed());
+        assert_eq!(storage("GET", "/storage/v1/bucket", &secret, None).await.0, 200);
+    }
+    for task in stalled {
+        task.abort();
+    }
+
+    let started = Instant::now();
+    let total = 64usize << 20;
+    // 64 KiB every 80 ms: about 0.8 MiB/s.
+    let body = Some(paced_body(total, 3, Duration::from_millis(80), None));
+    let (status, _, b) = object("POST", "/storage/v1/object/files/big.bin", &secret, body, &[]).await;
+    let took = started.elapsed();
+    assert_eq!(status, 200, "{}", json_of(&b));
+    assert_eq!(json_of(&b)["size"], total);
+    assert!(took > Duration::from_secs(60), "the upload must outlast the default 60 s timeout: {took:?}");
+    println!("64 MiB paced upload took {took:?}");
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------

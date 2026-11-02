@@ -56,3 +56,9 @@ proptest = { workspace = true }
 chelabase-neon = { workspace = true, features = ["fake"] }
 chelabase-zitadel = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["test-util"] }
+# The storage API live tests: the object store's blobs, and streamed (throttled, failing,
+# stalled) upload bodies.
+chelabase-storage = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
