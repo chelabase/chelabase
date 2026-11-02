@@ -81,10 +81,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 4;
+pub const STORAGE_SCHEMA_VERSION: u32 = 5;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 4";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 5";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -362,6 +362,14 @@ REVOKE ALL ON FUNCTION storage.protect_objects() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER protect_objects AFTER INSERT OR UPDATE ON storage.objects
   FOR EACH ROW EXECUTE FUNCTION storage.protect_objects();
 ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER protect_objects;
+CREATE OR REPLACE FUNCTION storage.touch_objects() RETURNS trigger
+  LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS
+$f${TOUCH_OBJECTS_BODY}$f$;
+ALTER FUNCTION storage.touch_objects() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.touch_objects() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER touch_objects BEFORE UPDATE ON storage.objects
+  FOR EACH ROW EXECUTE FUNCTION storage.touch_objects();
+ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER touch_objects;
 DO $$ BEGIN
   IF pg_catalog.to_regtype('storage.object_ref') IS NULL THEN
     CREATE TYPE storage.object_ref AS (bucket_id uuid, name text);
@@ -501,10 +509,11 @@ pub fn storage_check_sql(owner_role: &str, verifier: Option<&str>) -> String {
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_proc p WHERE p.pronamespace OPERATOR(pg_catalog.=) n.oid \
                AND ((p.proname OPERATOR(pg_catalog.=) 'protect_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${PROTECT_OBJECTS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'guard_tickets' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_TICKETS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'touch_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${TOUCH_OBJECTS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'consume_ticket' AND p.prosecdef AND p.proowner OPERATOR(pg_catalog.=) r.oid \
-                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 3 \
+                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 4 \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
-               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 2 \
+               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 3 \
              AND (SELECT pg_catalog.array_agg(v ORDER BY v) FROM (SELECT {default_entry} AS v FROM pg_catalog.pg_attrdef x \
                JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid \
                JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.adrelid AND a.attnum OPERATOR(pg_catalog.=) x.adnum \
@@ -537,7 +546,7 @@ pub fn foreign_objects_sql() -> String {
         "SELECT pg_catalog.format('DROP ROUTINE IF EXISTS %s CASCADE', p.oid::pg_catalog.regprocedure) FROM pg_catalog.pg_proc p \
   WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND p.oid::pg_catalog.regprocedure::pg_catalog.text OPERATOR(pg_catalog.<>) ALL (ARRAY[\
 'storage.foldername(text)', 'storage.filename(text)', 'storage.extension(text)', 'storage.object_ref(uuid,text)', \
-'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', \
+'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', 'storage.touch_objects()', \
 'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)']) \
 UNION ALL SELECT pg_catalog.format('DROP %s IF EXISTS %s CASCADE', CASE c.relkind WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' \
     WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, c.oid::pg_catalog.regclass) \
@@ -557,6 +566,7 @@ UNION ALL SELECT pg_catalog.format('DROP STATISTICS IF EXISTS storage.%I', x.stx
 UNION ALL SELECT pg_catalog.format('DROP TRIGGER IF EXISTS %I ON %s CASCADE', t.tgname, t.tgrelid::pg_catalog.regclass) FROM pg_catalog.pg_trigger t \
   JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND NOT t.tgisinternal \
     AND NOT ((t.tgname OPERATOR(pg_catalog.=) 'protect_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'touch_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
       OR (t.tgname OPERATOR(pg_catalog.=) 'guard_tickets' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets')) \
 UNION ALL SELECT pg_catalog.format('DROP RULE IF EXISTS %I ON %s CASCADE', w.rulename, w.ev_class::pg_catalog.regclass) FROM pg_catalog.pg_rewrite w \
   JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND c.relkind OPERATOR(pg_catalog.=) 'r' \
@@ -581,7 +591,7 @@ fn acl_entries_sql() -> String {
     WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) c.relowner \
   UNION ALL SELECT 'ON ROUTINE ' OPERATOR(pg_catalog.||) p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, \
       CASE WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) THEN ARRAY['{{owner}}'] \
-        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
+        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
     FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) p.proowner \
   UNION ALL SELECT 'ON TYPE ' OPERATOR(pg_catalog.||) t.oid::pg_catalog.regtype::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, ARRAY['public'] \
     FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a WHERE t.typnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) t.typowner"
@@ -630,6 +640,15 @@ BEGIN
     RAISE EXCEPTION USING ERRCODE = 'CB003', MESSAGE = 'storage.objects: the row matches no unused upload ticket for this role and owner';
   END IF;
   RETURN NULL;
+END
+";
+
+/// `touch_objects`'s body: every update of an object (an upsert's overwrite included) stamps
+/// `updated_at`, which callers can't write themselves.
+pub const TOUCH_OBJECTS_BODY: &str = "
+BEGIN
+  NEW.updated_at := pg_catalog.clock_timestamp();
+  RETURN NEW;
 END
 ";
 
@@ -1851,6 +1870,35 @@ mod tests {
         let scripts: Vec<String> = w.computes.sql.lock().unwrap().iter()
             .filter(|(_, _, s)| s.starts_with(STORAGE_SCHEMA_MARK)).map(|(_, _, s)| s.clone()).collect();
         assert_eq!(scripts, [storage_schema_sql("postgres", &own, Some(&parent))]);
+    }
+
+
+    /// m5 phase B: every update of an object (an upsert's overwrite included) advances its
+    /// `updated_at`, through a BEFORE UPDATE trigger installed, owned, checked and healed like
+    /// the others; the schema is version 5.
+    #[test]
+    fn storage_schema_objects_updated_at_advances() {
+        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (5, "chelabase storage schema 5"));
+        let sql = sql();
+        for part in [
+            "CREATE OR REPLACE FUNCTION storage.touch_objects() RETURNS trigger\n  LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS",
+            &format!("$f${TOUCH_OBJECTS_BODY}$f$"),
+            "ALTER FUNCTION storage.touch_objects() OWNER TO CURRENT_USER;",
+            "REVOKE ALL ON FUNCTION storage.touch_objects() FROM PUBLIC;",
+            "CREATE OR REPLACE TRIGGER touch_objects BEFORE UPDATE ON storage.objects\n  FOR EACH ROW EXECUTE FUNCTION storage.touch_objects();",
+            "ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER touch_objects;",
+        ] {
+            assert!(sql.contains(part), "{part}");
+        }
+        assert!(TOUCH_OBJECTS_BODY.contains("NEW.updated_at := pg_catalog.clock_timestamp();"));
+        let check = storage_check_sql("postgres", Some(VERIFIER));
+        assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'touch_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${TOUCH_OBJECTS_BODY}$b$)")), "{check}");
+        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 4"), "four checked functions: {check}");
+        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 3"), "three triggers: {check}");
+        let foreign = foreign_objects_sql();
+        assert!(foreign.contains("'storage.touch_objects()'"), "{foreign}");
+        assert!(foreign.contains("(t.tgname OPERATOR(pg_catalog.=) 'touch_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects')"), "{foreign}");
+        assert!(acl_entries_sql().contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects']"));
     }
 
 }
