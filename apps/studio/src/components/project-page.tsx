@@ -294,7 +294,7 @@ function DatabasesTable({
                   ) : open.view === "merges" ? (
                     <MergesList projectId={projectId} databaseId={db.database_id} />
                   ) : (
-                    <ConnectPanel apiUrl={apiUrl} database={db} />
+                    <ConnectPanel projectId={projectId} apiUrl={apiUrl} database={db} />
                   )}
                   </div>
                 </td>

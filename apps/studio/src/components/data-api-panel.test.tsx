@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { getListKeysQueryKey, type Branch, type BranchDatabaseView, type DataApiSchema, type DataKey } from "@chelabase/management-client";
 import { fakeFetch, jsonResponse, sequence, type FakeFetch, type FakeHandler } from "@/test/fake-fetch";
 import { renderWithQuery } from "@/test/render";
-import { DataApiPanel } from "./data-api-panel";
+import { DataApiEndpoint, DataApiExposure, DataApiRls, DataApiSecretKeys, DataApiTypesFor, useDataApi } from "./data-api-panel";
 
 const branch = { id: "br", name: "main", kind: "normal", status: "ready" } as unknown as Branch;
 const PUB = "chk_pub_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
@@ -46,14 +46,28 @@ const sent = (f: FakeFetch) => f.calls.map((r) => `${r.method} ${new URL(r.url).
 
 function setup(routes: Record<string, FakeHandler> = {}, pgDatabase?: string) {
   const f = fakeFetch({ [DATABASES]: () => jsonResponse(databases), [KEYS]: () => jsonResponse(keys), [SCHEMA]: () => jsonResponse(emptySchema), ...routes });
-  const ui = (pg?: string) => <DataApiPanel databaseId="db" branch={branch} apiUrl="http://gw/" pgDatabase={pg} />;
+  const ui = (pg?: string) => <Sections pgDatabase={pg} />;
   const result = renderWithQuery(ui(pgDatabase), { fetch: f });
   return { ...result, fetch: f, pick: (pg: string) => result.rerender(ui(pg)) };
 }
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("DataApiPanel", () => {
+/** The Data API page's sections on one hook, as the page composes them. */
+function Sections({ pgDatabase }: { pgDatabase?: string }) {
+  const api = useDataApi("db", branch.id, pgDatabase);
+  return (
+    <div>
+      <DataApiEndpoint api={api} apiUrl="http://gw/" />
+      <DataApiExposure api={api} />
+      <DataApiRls api={api} />
+      <DataApiSecretKeys api={api} />
+      <DataApiTypesFor api={api} />
+    </div>
+  );
+}
+
+describe("Data API sections", () => {
   it("loads the keys and schema for the branch", async () => {
     const { fetch } = setup();
     await screen.findByText(PUB);

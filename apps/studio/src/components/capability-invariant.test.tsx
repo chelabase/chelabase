@@ -240,7 +240,7 @@ const CONTROLS: Control[] = [
   // The owner connection lives in the Connect panel (a branch's, for the header's branch and database).
   {
     name: "Owner connection in Connect", operationId: "getBranchConnection",
-    ui: () => <ConnectPanel database={database as never} apiUrl="http://gw" />,
+    ui: () => <ConnectPanel projectId="p1" database={database as never} apiUrl="http://gw" />,
     routes: {
       "GET /v1/databases/d1/branches/m/connection": ok({
         host: "h", port: 4432, database: "web1", user: "o", password: "pw", uri: "postgresql://o@h:4432/web1",

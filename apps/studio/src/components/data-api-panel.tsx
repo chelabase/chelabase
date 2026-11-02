@@ -6,7 +6,6 @@ import {
   useGetDataApiSchema,
   useListBranchDatabases,
   useListKeys,
-  type Branch,
   type BranchDatabaseView,
 } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
@@ -18,15 +17,6 @@ import { DataApiDatabases, KeyDatabases } from "./data-api-databases";
 import { DataApiKeys } from "./data-api-keys";
 import { DataApiTypes } from "./data-api-types";
 import { RlsWarning } from "./rls-warning";
-
-export interface DataApiPanelProps {
-  databaseId: string;
-  branch: Branch;
-  /** The gateway's base URL (`VITE_API_URL`); the endpoint is `${apiUrl}/data/v1/query`. */
-  apiUrl: string;
-  /** The Postgres database picked (the Connect panel's header picks it); left out or unknown, the branch's main one. */
-  pgDatabase?: string;
-}
 
 /**
  * One branch's data API: the keys, the branch's Postgres databases (with the one picked) and the
@@ -79,9 +69,9 @@ export function useDataApi(databaseId: string, branchId: string, pgDatabase: str
 
 export type DataApi = ReturnType<typeof useDataApi>;
 
-/** The endpoint and the public key, each with Copy, and Rotate public key (Developer's, rotateKey). */
-export function DataApiEndpoint({ api, apiUrl }: { api: DataApi; apiUrl: string }) {
-  const canRotate = useProjectCaps().atLeast("developer");
+/** The endpoint and the public key, each with Copy, and Rotate public key (Developer's, rotateKey) unless `readOnly`. */
+export function DataApiEndpoint({ api, apiUrl, readOnly = false }: { api: DataApi; apiUrl: string; readOnly?: boolean }) {
+  const canRotate = useProjectCaps().atLeast("developer") && !readOnly;
   const { keys, publicKey, busy, rotating, setRotating, rotatePublic } = api;
   const endpoint = `${apiUrl.replace(/\/+$/, "")}/data/v1/query`;
   const reasonId = useId();
@@ -203,30 +193,4 @@ export function DataApiTypesFor({ api }: { api: DataApi }) {
   const { databaseId, branchId, databases, pickedDb } = api;
   if (!canDownload || databases === null) return null;
   return <DataApiTypes databaseId={databaseId} branchId={branchId} databases={databases} defaultDatabase={pickedDb?.name} />;
-}
-
-/**
- * One branch's data API in two columns that stack on narrow screens: the endpoint, public key and
- * what it reaches, then the secret keys and client setup.
- */
-export function DataApiPanel({ databaseId, branch, apiUrl, pgDatabase }: DataApiPanelProps) {
-  const api = useDataApi(databaseId, branch.id, pgDatabase);
-  return (
-    <div
-      aria-label={`Data API for ${branch.name}`}
-      role="group"
-      className="grid gap-4 text-sm [grid-template-columns:repeat(auto-fit,minmax(320px,1fr))]"
-    >
-      <section aria-label="Data API" className="min-w-0 space-y-3 border p-3">
-        <h3 className="font-medium">Data API</h3>
-        <DataApiEndpoint api={api} apiUrl={apiUrl} />
-        <DataApiExposure api={api} />
-        <DataApiRls api={api} />
-      </section>
-      <section aria-label="Secret keys and client setup" className="min-w-0 space-y-3 border p-3">
-        <DataApiSecretKeys api={api} />
-        <DataApiTypesFor api={api} />
-      </section>
-    </div>
-  );
 }
