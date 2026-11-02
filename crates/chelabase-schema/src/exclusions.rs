@@ -5,14 +5,16 @@
 
 /// Schemas never read: Postgres's own, and Chelabase's (`chelabase`: the data API bootstrap;
 /// `chelabase_merge`: the merge's recovery marker, P1; `chelabase_guard`: the protected-branch
-/// DDL guard, TE-A P5).
-pub const EXCLUDED_SCHEMAS: [&str; 6] = [
+/// DDL guard, TE-A P5; `storage`: object metadata, `services/worker/src/storage_schema.rs`,
+/// whose rows and policies stay per branch).
+pub const EXCLUDED_SCHEMAS: [&str; 7] = [
     "pg_catalog",
     "information_schema",
     "pg_toast",
     "chelabase",
     "chelabase_merge",
     "chelabase_guard",
+    "storage",
 ];
 
 /// Schema name prefixes never read: TOAST schemas (`pg_toast`, `pg_toast_temp_<n>`) and
@@ -106,5 +108,15 @@ mod tests {
     #[test]
     fn the_guard_schema_is_excluded() {
         assert!(EXCLUDED_SCHEMAS.contains(&"chelabase_guard"));
+    }
+
+    /// Object storage m3: the `storage` schema (its tables, rows' policies, helpers) is never
+    /// read, so compare and merge never plan a change to it, and the hub's privilege ops
+    /// refuse it like `chelabase`.
+    #[test]
+    fn exclusions_cover_the_storage_schema() {
+        assert!(EXCLUDED_SCHEMAS.contains(&"storage"));
+        assert!(crate::ddl::hidden_schema("storage"));
+        assert!(!crate::ddl::hidden_schema("storage2") && !crate::ddl::hidden_schema("public"));
     }
 }

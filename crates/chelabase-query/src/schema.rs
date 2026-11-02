@@ -29,11 +29,14 @@ use crate::query::Name;
 use crate::sql::{Catalog, ColumnInfo, FnLookupError, FunctionInfo, TableInfo, quote_ident};
 
 /// Schemas never exposed, whatever the grants: Chelabase's own machinery, Postgres's and
-/// Neon's own. `pg_temp_*` and `pg_toast_temp_*` are hidden too ([`is_reserved`]).
+/// Neon's own. `pg_temp_*`, `pg_toast_temp_*` and every `chelabase…` schema are hidden too
+/// ([`is_reserved`]).
 pub const RESERVED_SCHEMAS: &[&str] = &[
     "chelabase",
     // The protected-branch DDL guard (worker `schema_guard`).
     "chelabase_guard",
+    // Object metadata (worker `storage_schema`): served by the storage service only.
+    "storage",
     "pg_catalog",
     "information_schema",
     "pg_toast",
@@ -54,6 +57,7 @@ const ROLE_VIEWS: u64 = 64;
 
 pub fn is_reserved(schema: &str) -> bool {
     RESERVED_SCHEMAS.contains(&schema)
+        || schema.starts_with("chelabase")
         || schema.starts_with("pg_temp_")
         || schema.starts_with("pg_toast_temp_")
 }
@@ -62,7 +66,7 @@ pub fn is_reserved(schema: &str) -> bool {
 /// as `int8`, since `to_json` writes an `oid` as a string).
 pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
   'namespaces', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(n.oid::int8, n.nspname)), '[]')
-    FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_')),
+    FROM pg_catalog.pg_namespace n WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')),
   'types', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(t.oid::int8, n.nspname, t.typname, t.typtype,
       t.typelem::int8, t.typbasetype::int8, t.typcategory, t.typlen, pg_catalog.format_type(t.oid, NULL))), '[]')
     FROM pg_catalog.pg_type t JOIN pg_catalog.pg_namespace n ON n.oid = t.typnamespace),
@@ -82,21 +86,21 @@ pub const INTROSPECT_SQL: &str = "SELECT pg_catalog.json_build_object(
         JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid AND a.attnum = k.attnum
         WHERE con.conrelid = c.oid AND con.contype = 'p'))), '[]')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_')),
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')),
   'functions', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(p.oid::int8, n.nspname, p.proname, p.prokind,
       p.proretset, p.prorettype::int8, p.proargtypes::oid[]::int8[], p.proallargtypes::int8[], p.proargmodes::text[], p.proargnames,
       p.pronargdefaults, p.provariadic <> 0,
       EXISTS (SELECT FROM pg_catalog.pg_depend d WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
         AND d.objid = p.oid AND d.deptype = 'e'))), '[]')
     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^pg_(toast_)?temp_'))
+    WHERE NOT (n.nspname = ANY ($1) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'))
 )::text";
 
 /// `$1` = the role (`text`), `$2` = [`RESERVED_SCHEMAS`] (`text[]`). One row, one `text` column: the JSON
 /// [`Visibility`] reads.
 pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
   'schemas', (SELECT coalesce(pg_catalog.json_agg(n.oid::int8), '[]') FROM pg_catalog.pg_namespace n
-    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')),
   'tables', (SELECT coalesce(pg_catalog.json_agg(pg_catalog.json_build_array(c.oid::int8,
       pg_catalog.has_any_column_privilege($1::name, c.oid, 'SELECT'),
@@ -104,11 +108,11 @@ pub const VISIBILITY_SQL: &str = "SELECT pg_catalog.json_build_object(
       pg_catalog.has_any_column_privilege($1::name, c.oid, 'UPDATE'),
       pg_catalog.has_table_privilege($1::name, c.oid, 'DELETE'))), '[]')
     FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f') AND NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')),
   'functions', (SELECT coalesce(pg_catalog.json_agg(p.oid::int8), '[]')
     FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
-    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^pg_(toast_)?temp_')
+    WHERE NOT (n.nspname = ANY ($2) OR n.nspname ~ '^(pg_(toast_)?temp_|chelabase)')
       AND pg_catalog.has_schema_privilege($1::name, n.oid, 'USAGE')
       AND pg_catalog.has_function_privilege($1::name, p.oid, 'EXECUTE'))
 )::text";
@@ -832,6 +836,33 @@ mod tests {
     #[test]
     fn the_guard_schema_is_reserved() {
         assert!(is_reserved("chelabase_guard"));
+    }
+
+    /// Object storage m3: `/data/v1` never serves `storage` (the storage service does) or any
+    /// `chelabase…` schema (the merge's marker, a quarantined bootstrap schema, …).
+    #[test]
+    fn the_storage_and_chelabase_schemas_are_reserved() {
+        for schema in ["storage", "chelabase", "chelabase_merge", "chelabase_quarantine_1"] {
+            assert!(is_reserved(schema), "{schema}");
+        }
+        for schema in ["public", "storage_app", "app_chelabase"] {
+            assert!(!is_reserved(schema), "{schema}");
+        }
+        assert!(RESERVED_SCHEMAS.contains(&"storage"));
+        // The SQL hides them too, by the same list and prefix.
+        assert!(INTROSPECT_SQL.contains("n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'"), "{INTROSPECT_SQL}");
+        assert!(!INTROSPECT_SQL.contains("n.nspname ~ '^pg_(toast_)?temp_'"));
+        assert!(!VISIBILITY_SQL.contains("n.nspname ~ '^pg_(toast_)?temp_'"));
+        assert!(VISIBILITY_SQL.contains("n.nspname ~ '^(pg_(toast_)?temp_|chelabase)'"));
+        // A relation the SQL returned anyway never reaches the planner's catalog.
+        let relation = |oid: u32, schema: &str, name: &str| (oid, schema.to_string(), name.to_string(), "r".to_string(), true, false, vec![], vec![]);
+        let raw = Raw {
+            relations: vec![relation(1, "storage", "objects"), relation(2, "chelabase_merge", "marker"), relation(3, "public", "t")],
+            ..Raw::default()
+        };
+        let schema = Schema::build("v".into(), raw);
+        let names: Vec<(&str, &str)> = schema.tables.iter().map(|t| (t.schema.as_str(), t.name.as_str())).collect();
+        assert_eq!(names, [("public", "t")]);
     }
 
     fn td(name: &str, array: bool, enum_ref: Option<&str>) -> TypeDesc {

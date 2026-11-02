@@ -4104,6 +4104,26 @@ async fn default_schema_patch_validates_and_invalidates() {
     assert_eq!(seen.lock().unwrap().len(), 2);
 }
 
+/// Object storage m3: `storage` and Chelabase's or Postgres's own schemas are never a default
+/// schema, with or without `grant_existing` (whose grants would cover `storage.objects`).
+#[tokio::test]
+async fn default_schema_refuses_reserved_schemas() {
+    let t = branching().await;
+    let main = t.seeded();
+    let path = t.pg(main, "web1");
+    for schema in ["storage", "chelabase", "chelabase_merge", "chelabase_x", "pg_catalog", "pg_toast", "information_schema"] {
+        for grant_existing in [false, true] {
+            let body = json!({ "default_schema": schema, "grant_existing": grant_existing });
+            let err = error_of(t.send(Method::PATCH, &path, Some(body)).await, 422).await;
+            assert_eq!(message_of(&err), format!("default_schema {schema:?} is reserved"), "{schema}");
+        }
+    }
+    assert_eq!(t.metadata.pg_database(main, "web1").default_schema, "public");
+    assert!(t.data_api_calls().is_empty());
+    // A name that only starts like one is fine.
+    assert_eq!(t.send(Method::PATCH, &path, Some(json!({ "default_schema": "storage_app" }))).await.status(), 200);
+}
+
 #[tokio::test]
 async fn patch_default_schema_passes_grant_existing() {
     let t = branching().await;
