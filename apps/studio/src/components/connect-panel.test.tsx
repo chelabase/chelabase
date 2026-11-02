@@ -91,14 +91,19 @@ function setup(list: FakeHandler, role: "viewer" | "developer" | "admin" = "deve
     path: "/",
     component: () => (
       <ProjectCapsContext.Provider value={caps}>
-        <ConnectPanel apiUrl="http://gw" database={summary} />
+        <ConnectPanel apiUrl="http://gw" projectId="p1" database={summary} />
       </ProjectCapsContext.Provider>
     ),
   });
   const member = createRoute({ getParentRoute: () => root, path: "/app/members/$memberId", component: () => <p>member page</p> });
-  const router = createRouter({ routeTree: root.addChildren([home, member]), history: createMemoryHistory({ initialEntries: ["/"] }) });
+  const dataApi = createRoute({
+    getParentRoute: () => root,
+    path: "/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}",
+    component: () => <p>data api page</p>,
+  });
+  const router = createRouter({ routeTree: root.addChildren([home, member, dataApi]), history: createMemoryHistory({ initialEntries: ["/"] }) });
   renderWithQuery(<RouterProvider router={router} />, { fetch: f });
-  return f;
+  return Object.assign(f, { router });
 }
 
 const threeBranches = () => jsonResponse([b("dev"), b("main"), b("bak", { kind: "backup" }), b("busy", { status: "provisioning" })]);
@@ -106,46 +111,51 @@ const threeBranches = () => jsonResponse([b("dev"), b("main"), b("bak", { kind: 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("ConnectPanel", () => {
-  it("shows main's endpoint and keys, and swaps them when another branch is picked", async () => {
+  it("shows the endpoint and public key with Copy, and only a link to manage them", async () => {
     const f = setup(threeBranches);
     expect(await screen.findByRole("heading", { name: "Connect to web1" })).toBeInTheDocument();
     expect(await screen.findByText("chk_pub_MAIN")).toBeInTheDocument();
-    expect(await screen.findByText("main-secret")).toBeInTheDocument();
     expect(screen.getByText("http://gw/data/v1/query")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy endpoint" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy public key" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Manage Data API" })).toBeInTheDocument();
     const picker = screen.getByLabelText("Branch") as HTMLSelectElement;
     expect(Array.from(picker.options).map((o) => o.text)).toEqual(["dev", "main"]);
-    expect(picker).toHaveValue("id-main");
+    for (const name of [/Rotate/, /Create key/, /Revoke/, /Download types/i, /Enable data API/, /Disable data API/, /Edit databases/]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument();
+    }
+    expect(screen.queryByText("main-secret")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Types database")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Public key databases/)).not.toBeInTheDocument();
     await userEvent.selectOptions(picker, "dev");
     expect(await screen.findByText("chk_pub_DEV")).toBeInTheDocument();
-    expect(await screen.findByText("dev-secret")).toBeInTheDocument();
-    expect(screen.queryByText("main-secret")).not.toBeInTheDocument();
     await waitFor(() => expect(keyPaths(f).at(-1)).toBe("/v1/databases/db/branches/id-dev/keys"));
   });
 
-  it("follows the Postgres database picked in the Data API column", async () => {
-    const f = setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("app")]);
-    const picker = (await screen.findByLabelText("Postgres DB")) as HTMLSelectElement;
-    expect(picker).toHaveValue("web1");
-    await userEvent.selectOptions(picker, "app");
-    await waitFor(() => {
-      const schemas = f.calls.map((r) => new URL(r.url)).filter((u) => u.pathname.endsWith("/data-api/schema"));
-      expect(schemas.at(-1)?.searchParams.get("database")).toBe("app");
-    });
-    // One picker only: the Data API column no longer carries its own, and the types follow the header.
-    expect(screen.getAllByLabelText(/^(Postgres DB|Database)$/)).toHaveLength(1);
-    const types = screen.getByLabelText("Types database") as HTMLSelectElement;
-    expect(types.options[types.selectedIndex].text).toBe("app");
-    expect(screen.getByRole("button", { name: /Download types/i })).toBeInTheDocument();
+  it("links Manage Data API to the picked branch and Postgres database", async () => {
+    const f = setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("analytics")]);
+    await userEvent.selectOptions(await screen.findByLabelText("Branch"), "dev");
+    await userEvent.selectOptions(await screen.findByLabelText("Postgres DB"), "analytics");
+    const link = await screen.findByRole("link", { name: "Manage Data API" });
+    expect(link).toHaveAttribute("href", "/app/data-api/p1/db/id-dev/analytics");
+    await userEvent.click(link);
+    expect(await screen.findByText("data api page")).toBeInTheDocument();
+    expect(f.router.state.location.pathname).toBe("/app/data-api/p1/db/id-dev/analytics");
   });
 
-  it("hides every mutating control and the logins line from a Viewer", async () => {
+  it("says the Data API is off for a Postgres database it doesn't serve, next to the link", async () => {
+    const f = setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("later", { data_api: "off" })]);
+    await userEvent.selectOptions(await screen.findByLabelText("Postgres DB"), "later");
+    expect(await screen.findByText(/Data API is off for later/)).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Manage Data API" })).toHaveAttribute("href", "/app/data-api/p1/db/id-main/later");
+    expect(f.calls.some((r) => new URL(r.url).searchParams.get("database") === "later")).toBe(false);
+  });
+
+  it("gives a Viewer the endpoint and link but no logins line", async () => {
     setup(threeBranches, "viewer");
     expect(await screen.findByText("chk_pub_MAIN")).toBeInTheDocument();
-    await screen.findByText("main-secret");
     expect(screen.queryByRole("button", { name: "Rotate public key" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Create key" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Revoke/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Download types/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Manage Data API" })).toBeInTheDocument();
     expect(screen.queryByText(/personal Postgres login/)).not.toBeInTheDocument();
   });
 

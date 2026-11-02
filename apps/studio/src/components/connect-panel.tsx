@@ -5,16 +5,18 @@ import { useProjectCaps } from "@/lib/capabilities";
 import { errorText } from "@/lib/errors";
 import { DatabasePicker } from "./data-api-databases";
 import { ConnectionDetails } from "./connection-details";
-import { DataApiPanel } from "./data-api-panel";
+import { DATA_API_ROUTE } from "./app-shell/rail-items";
+import { DataApiEndpoint, useDataApi } from "./data-api-panel";
 
 export interface ConnectPanelProps {
+  projectId: string;
   database: DatabaseSummary;
   /** The gateway's base URL, for the data API endpoint. */
   apiUrl: string;
 }
 
 /** Connect to a database: pick a ready branch (main by default), then its Data API and keys. */
-export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
+export function ConnectPanel({ projectId, database, apiUrl }: ConnectPanelProps) {
   const id = database.database_id;
   const list = useListBranches(id);
   const [picked, setPicked] = useState<string | null>(null);
@@ -100,8 +102,54 @@ export function ConnectPanel({ database, apiUrl }: ConnectPanelProps) {
         </section>
       )}
       {current && (
-        <DataApiPanel key={current.id} databaseId={id} branch={current} apiUrl={apiUrl} pgDatabase={pickedDb?.name} />
+        <ConnectDataApi
+          key={current.id}
+          projectId={projectId}
+          databaseId={id}
+          branchId={current.id}
+          apiUrl={apiUrl}
+          pgDatabase={pickedDb?.name}
+        />
       )}
+    </section>
+  );
+}
+
+/** What to connect the Data API with: the endpoint and public key, and the page that manages them. */
+function ConnectDataApi({
+  projectId,
+  databaseId,
+  branchId,
+  apiUrl,
+  pgDatabase,
+}: {
+  projectId: string;
+  databaseId: string;
+  branchId: string;
+  apiUrl: string;
+  pgDatabase: string | undefined;
+}) {
+  const api = useDataApi(databaseId, branchId, pgDatabase);
+  const off = api.pickedDb && api.pickedDb.data_api !== "on";
+  return (
+    <section aria-label="Data API" className="space-y-3 text-sm">
+      <h3 className="font-semibold">Data API</h3>
+      <DataApiEndpoint api={api} apiUrl={apiUrl} readOnly />
+      {api.error && (
+        <p role="alert" className="text-destructive">
+          {api.error}
+        </p>
+      )}
+      <p className="text-muted-foreground">
+        {off && <>The Data API is off for {api.pickedDb!.name}. </>}
+        <Link
+          to={DATA_API_ROUTE}
+          params={{ projectId, databaseId, branchId, pgDatabase: api.pickedDb?.name }}
+          className="underline underline-offset-4 hover:text-foreground"
+        >
+          Manage Data API
+        </Link>
+      </p>
     </section>
   );
 }
