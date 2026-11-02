@@ -63,6 +63,9 @@ pub mod safekeepers;
 pub mod schema_base;
 pub mod settings;
 pub mod storage_schema;
+pub mod storage_sweep;
+#[cfg(test)]
+mod storage_sweep_tests;
 #[cfg(test)]
 mod t4_tests;
 pub mod token_refresh;
@@ -157,4 +160,13 @@ pub struct Worker<M, S, C, N, P> {
     /// The `chelabase_realtime` role's password (`CHELABASE_REALTIME_PG_PASSWORD_FILE`, RT1
     /// T5). `None`: the role is neither created nor granted anything (the fakes by default).
     pub realtime_password: Option<String>,
+    /// The object store user blobs live in, for the storage sweep (`CHELABASE_STORAGE_*`);
+    /// `None`: no sweep runs.
+    pub blob_store: Option<storage_sweep::BlobStore>,
+    /// The storage sweep's grace period, period and dry run.
+    pub storage_sweep: storage_sweep::SweepSettings,
+    /// Storage sweep jobs (`chelabase.storage_sweep`), connected by the process.
+    pub sweep_requests: storage_sweep::SweepRequests,
+    /// Storage sweep passes a branch's status refused (stuck branches mean storage only grows).
+    pub storage_sweep_refusals: std::sync::atomic::AtomicU64,
 }
