@@ -1555,6 +1555,8 @@ async fn storage_api_objects_live() {
     let fx = Arc::new(Fx::provision().await);
     let task = fx.clone();
     let outcome = tokio::spawn(async move { storage_api_objects(&task).await }).await;
+    // Pass or fail, nothing stays in the shared object store.
+    fx.purge_blobs(&object_store().await).await;
     fx.teardown().await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
@@ -1655,8 +1657,9 @@ async fn storage_api_objects(fx: &Fx) {
     assert_eq!(fx.value("SELECT count(*) FROM storage.objects WHERE name = 'broken.bin'").await, "0");
     assert_eq!(fx.blobs(&store).await, before);
 
-    // Names: `..`, control characters and 1025 bytes are 400.
-    for bad in ["a/%2E%2E/x", "a%01b", &"n".repeat(1025)] {
+    // Names: `..`, control characters and 1025 bytes are 400. The `..` segment goes with an
+    // encoded `/` around it: a client normalizes a bare `/%2E%2E/` away before sending.
+    for bad in ["a%2F..%2Fx", "..%2Fx", "a%01b", &"n".repeat(1025)] {
         assert_eq!(object("POST", &up(bad), &secret, Some(b"x".to_vec().into()), &[]).await.0, 400, "{bad}");
     }
 
@@ -1712,16 +1715,15 @@ async fn storage_api_objects(fx: &Fx) {
     assert!(blobs.contains(&version), "{blobs:?}");
     assert!(!blobs.iter().any(|k| k.starts_with("staging/")), "{blobs:?}");
 
-    // A row carrying another database's version, written past the triggers by a superuser (the
-    // owner can't: the trigger wants a ticket only storage writes): its blob lives under that
+    // A row carrying another database's version (the owner can't write one: the trigger wants
+    // a ticket only storage writes, and it fires even with session_replication_role = replica;
+    // here written with a ticket as chelabase_storage itself): its blob lives under that
     // database's prefix, so the download is 404.
     let foreign = Uuid::new_v4();
-    store
-        .put(&format!("{}/{}/{foreign}", Uuid::new_v4(), fx.database), bytes::Bytes::from_static(b"x"), Default::default())
-        .await
-        .unwrap();
     fx.admin(&format!(
-        "BEGIN; SET LOCAL session_replication_role = replica;
+        "BEGIN; SET LOCAL ROLE chelabase_storage;
+INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role)
+  SELECT '{foreign}', id, 'foreign.bin', 1, 'e', now() + interval '5 minutes', 'chelabase_storage' FROM storage.buckets WHERE name = 'files';
 INSERT INTO storage.objects (bucket_id, name, size, etag, version_id) SELECT id, 'foreign.bin', 1, 'e', '{foreign}' FROM storage.buckets WHERE name = 'files';
 COMMIT;"
     ))
@@ -1731,7 +1733,12 @@ COMMIT;"
     ))
     .await;
     assert!(err.contains("CB003"), "the owner copied a version in: {err}");
-    assert_eq!(object("GET", &up("foreign.bin"), &secret, None, &[]).await.0, 404);
+    // The blob exists, under the other database's prefix.
+    let foreign_key = format!("{}/{}/{foreign}", Uuid::new_v4(), fx.database);
+    store.put(&foreign_key, bytes::Bytes::from_static(b"x"), Default::default()).await.unwrap();
+    let got = object("GET", &up("foreign.bin"), &secret, None, &[]).await.0;
+    store.delete(&foreign_key).await.unwrap();
+    assert_eq!(got, 404);
 
     // Delete one and many: rows only (the blobs wait for the sweeper).
     assert_eq!(object("DELETE", &up("docs/a.txt"), &secret, None, &[]).await.0, 204);
@@ -1742,7 +1749,6 @@ COMMIT;"
     let mut deleted: Vec<String> = serde_json::from_value(json_of(&b)["deleted"].clone()).unwrap();
     deleted.sort();
     assert_eq!(deleted, ["race.bin"], "a hidden object isn't deleted either");
-    fx.purge_blobs(&store).await;
 }
 
 #[tokio::test]
@@ -1751,6 +1757,8 @@ async fn storage_api_list_live() {
     let fx = Arc::new(Fx::provision().await);
     let task = fx.clone();
     let outcome = tokio::spawn(async move { storage_api_list(&task).await }).await;
+    // Pass or fail, nothing stays in the shared object store.
+    fx.purge_blobs(&object_store().await).await;
     fx.teardown().await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
@@ -1803,7 +1811,6 @@ async fn storage_api_list(fx: &Fx) {
     let listed = fx.secret_key("st-list-listed", Some(vec![fx.database.clone()])).await;
     let path = "/storage/v1/object/list/files?database=postgres";
     assert_eq!(object("POST", path, &listed, Some("{}".into()), &[JSON]).await.0, 403);
-    fx.purge_blobs(&object_store().await).await;
 }
 
 /// 100 uploads stalled mid-body hold no database connection: the data API and storage's own
@@ -1815,6 +1822,8 @@ async fn storage_api_slow_uploads_live() {
     let fx = Arc::new(Fx::provision().await);
     let task = fx.clone();
     let outcome = tokio::spawn(async move { storage_api_slow_uploads(&task).await }).await;
+    // Pass or fail, nothing stays in the shared object store.
+    fx.purge_blobs(&object_store().await).await;
     fx.teardown().await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
@@ -1877,7 +1886,6 @@ async fn storage_api_slow_uploads(fx: &Fx) {
     // The 100 stalled uploads never reached the store (each was under one part), and the
     // 64 MiB blob is its only one.
     assert_eq!(fx.blobs(&store).await.len(), 1, "{:?}", fx.blobs(&store).await);
-    fx.purge_blobs(&store).await;
 }
 
 // --- Mixed versions: a newer schema is never downgraded --------------------------------------
