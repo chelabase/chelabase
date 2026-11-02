@@ -71,11 +71,11 @@ impl Failure {
     }
 
     /// 409: the bucket still holds `objects` objects.
-    pub fn bucket_not_empty(name: &str, objects: i64) -> Self {
+    pub fn bucket_not_empty(name: &str) -> Self {
         Self::new(
             StatusCode::CONFLICT,
             "bucket_not_empty",
-            format!("bucket `{name}` holds {objects} object(s); delete them first"),
+            format!("bucket `{name}` still holds objects; delete them first"),
         )
     }
 
@@ -255,13 +255,13 @@ mod tests {
         let (status, retry, json) = body(f.into()).await;
         assert_eq!((status, retry), (StatusCode::FORBIDDEN, None));
         assert_eq!(json["error"]["sqlstate"], "42501");
-        let (status, _, json) = body(Failure::bucket_not_empty("avatars", 3)).await;
+        // N5: no count (it would include objects the caller can't see).
+        let (status, _, json) = body(Failure::bucket_not_empty("avatars")).await;
         assert_eq!(status, StatusCode::CONFLICT);
+        let message = json["error"]["message"].as_str().unwrap();
         assert!(
-            json["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("holds 3 object(s)")
+            message.contains("still holds objects") && !message.chars().any(|c| c.is_ascii_digit()),
+            "{message}"
         );
         let (status, _, _) = body(Failure::from_acquire(&AcquireError::NotServed, "r")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);

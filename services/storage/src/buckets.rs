@@ -286,15 +286,9 @@ pub async fn delete<S: ConnSource, M: ConnSource>(
     match deleted {
         Ok((0, _)) => Err(Failure::bucket_not_found(&name)),
         Ok(_) => Ok(StatusCode::NO_CONTENT.into_response()),
-        // The objects' foreign key: the caller's delete passed its policy, but objects remain.
-        // Their count is storage's own read, after the caller's session ended.
-        Err(f) if is_not_empty(&f) => {
-            let objects = state
-                .engine
-                .bucket_objects(data.branch_id, &database, &name, &rid)
-                .await?;
-            Err(Failure::bucket_not_empty(&name, objects))
-        }
+        // The objects' foreign key: the caller's delete passed its policy, but objects remain
+        // (no count: it would include objects the caller can't see).
+        Err(f) if is_not_empty(&f) => Err(Failure::bucket_not_empty(&name)),
         Err(f) => Err(f),
     }
 }

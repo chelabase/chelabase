@@ -45,7 +45,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 worker = { path = ".", features = ["test-support"] }
-chelabase-auth = { workspace = true }
+chelabase-auth = { workspace = true, features = ["keygen"] }
 # The managed pool's login check, asked as `chelabase_storage` in the storage login live test.
 chelabase-pgsession = { workspace = true }
 bollard = { workspace = true }
@@ -62,3 +62,8 @@ chelabase-storage = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
+# The storage service in-process (its failure paths, against a real compute): its router, the
+# compute TLS, and an object store that fails on demand.
+chelabase-storage-service = { path = "../storage" }
+chelabase-query = { workspace = true }
+async-trait = { workspace = true }

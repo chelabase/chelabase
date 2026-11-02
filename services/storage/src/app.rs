@@ -21,8 +21,9 @@ use crate::{buckets, objects};
 /// The identity token's audience.
 pub const AUDIENCE: &str = "storage";
 
-/// The largest bucket request body (a JSON object).
-pub const MAX_BUCKET_BODY: usize = 64 * 1024;
+/// The largest JSON request body: delete-many's 1000 names of up to 1024 bytes, with room for
+/// their quoting (object uploads stream, unlimited here).
+pub const MAX_JSON_BODY: usize = 2 * 1024 * 1024;
 
 pub struct AppState<S, M> {
     pub engine: Engine<S, M>,
@@ -53,7 +54,7 @@ pub fn router<S: ConnSource, M: ConnSource>(state: Arc<AppState<S, M>>) -> Route
     api_router()
         .split_for_parts()
         .0
-        .layer(DefaultBodyLimit::max(MAX_BUCKET_BODY))
+        .layer(DefaultBodyLimit::max(MAX_JSON_BODY))
         .route("/health", get(health))
         .with_state(state)
 }
@@ -161,5 +162,118 @@ mod tests {
                 .as_u16(),
             401
         );
+    }
+    /// The orchestrator can't say where the branch is.
+    struct Unreachable;
+
+    impl chelabase_pgsession::ConnSource for Unreachable {
+        async fn fetch(
+            &self,
+            _branch: Uuid,
+        ) -> Result<chelabase_pgsession::ConnInfo, chelabase_pgsession::ConnError> {
+            Err(chelabase_pgsession::ConnError::Unreachable("down".into()))
+        }
+    }
+
+    /// The router on a local port with `pools` (as authenticator) and `managed`; its base URL
+    /// and a valid identity token for a secret key on `authenticated`.
+    async fn serve<S: chelabase_pgsession::ConnSource, M: chelabase_pgsession::ConnSource>(
+        pools: S,
+        managed: M,
+    ) -> (String, String) {
+        let (private, public) = generate_keypair_pem();
+        let signer = InternalSigner::from_pem(private.as_bytes()).unwrap();
+        let state = Arc::new(AppState {
+            engine: Engine::new(Pools::new(pools, 4), managed),
+            verifier: InternalVerifier::from_pem(public.as_bytes()).unwrap(),
+            store: Arc::new(chelabase_storage::MemoryStore::default()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, router(state)).await });
+        let mut key = data();
+        key.kind = DataKeyKind::Secret;
+        key.role = "authenticated".into();
+        (
+            base,
+            signer.sign(AUDIENCE, &identity_of(Some(key))).unwrap(),
+        )
+    }
+
+    // A plain client against a local test server (clippy.toml allows it in tests only).
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    async fn call(
+        base: &str,
+        token: &str,
+        method: &str,
+        path: &str,
+        body: Vec<u8>,
+    ) -> (u16, Option<String>, serde_json::Value) {
+        let res = reqwest::Client::new()
+            .request(method.parse().unwrap(), format!("{base}{path}"))
+            .header(IDENTITY_HEADER, token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        let retry = res
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_owned());
+        let status = res.status().as_u16();
+        (status, retry, res.json().await.unwrap_or_default())
+    }
+
+    /// B2: the orchestrator unreachable is 503 with `Retry-After` on an object route.
+    #[tokio::test]
+    async fn an_unreachable_orchestrator_is_a_503_with_retry_after() {
+        let (base, token) = serve(Unreachable, Unreachable).await;
+        for (method, path) in [
+            ("POST", "/storage/v1/object/b/a.txt"),
+            ("GET", "/storage/v1/object/b/a.txt"),
+        ] {
+            let (status, retry, json) = call(&base, &token, method, path, b"x".to_vec()).await;
+            assert_eq!(
+                (status, retry.as_deref()),
+                (503, Some("2")),
+                "{method} {path}: {json}"
+            );
+            assert_eq!(json["error"]["code"], "unavailable");
+        }
+    }
+
+    /// B2: storage's own login refused (the compute refuses every connection here) is 503
+    /// `storage_unavailable`, before the body is read.
+    #[tokio::test]
+    async fn a_refused_storage_login_is_storage_unavailable() {
+        let (base, token) = serve(RefusedSource, RefusedSource).await;
+        let (status, retry, json) = call(
+            &base,
+            &token,
+            "POST",
+            "/storage/v1/object/b/a.txt",
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!((status, retry.as_deref()), (503, Some("2")), "{json}");
+        assert_eq!(json["error"]["code"], "storage_unavailable");
+        assert!(
+            json["error"].get("detail").is_none() && json["error"].get("sqlstate").is_none(),
+            "{json}"
+        );
+    }
+
+    /// N8: delete-many takes its advertised 1000 names of 1024 bytes (it fails here only at
+    /// the unreachable orchestrator, after the body was read).
+    #[tokio::test]
+    async fn delete_many_takes_a_thousand_long_names() {
+        let (base, token) = serve(Unreachable, Unreachable).await;
+        let names: Vec<String> = (0..1000)
+            .map(|i| format!("{i:04}{}", "n".repeat(1020)))
+            .collect();
+        let body = serde_json::to_vec(&serde_json::json!({ "names": names })).unwrap();
+        let (status, _, json) = call(&base, &token, "DELETE", "/storage/v1/object/b", body).await;
+        assert_eq!(status, 503, "{json}");
     }
 }

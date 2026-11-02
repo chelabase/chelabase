@@ -67,6 +67,13 @@ const TICKET: NamedStatement = named_statement!(
     ]
 );
 
+/// Withdraws a ticket the row it was minted for didn't take (a refused or failed write).
+const UNTICKET: NamedStatement = named_statement!(
+    "unticket",
+    "DELETE FROM storage.upload_tickets WHERE version_id OPERATOR(pg_catalog.=) $1 AND bucket_id OPERATOR(pg_catalog.=) $2 AND name OPERATOR(pg_catalog.=) $3",
+    &[Type::UUID, Type::UUID, Type::TEXT]
+);
+
 /// The trigger's code for a row its ticket doesn't vouch for.
 const TICKET_MISSING: &str = "CB003";
 
@@ -260,7 +267,24 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         rid: &str,
     ) -> Result<(), Failure> {
         self.ticket(data, at, row, rid).await?;
-        self.final_write(data, at, row, expected, upsert, rid).await
+        let out = self.final_write(data, at, row, expected, upsert, rid).await;
+        if out.is_err() {
+            self.unticket(data, at, row, rid).await;
+        }
+        out
+    }
+
+    /// Withdraws `row`'s ticket after its write failed (best effort: it expires anyway).
+    async fn unticket(&self, data: &DataIdentity, at: &Located, row: &Row, rid: &str) {
+        let params: [&(dyn tokio_postgres::types::ToSql + Sync); 3] =
+            [&row.version, &row.bucket, &row.name];
+        if let Err(f) = self
+            .engine
+            .managed(data.branch_id, &at.database, &UNTICKET, &params, rid)
+            .await
+        {
+            tracing::warn!(request_id = rid, "withdrawing a ticket: {}", f.0.message);
+        }
     }
 
     /// Step 3: the ticket for `row` (its version, real size and etag), the caller's role and
@@ -382,12 +406,13 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
         version: Uuid::new_v4(),
     };
     let expected = state.precheck(&data, &at, &row, upsert, &rid).await?;
-    let staging = names::staging_key(&at.prefix, Uuid::new_v4());
+    // Straight to the version's own key: random, and unreferenced until the row exists.
+    let key = names::version_key(&at.prefix, row.version);
     let (stream, counter) =
         names::counted(request.into_data_stream(), limit.map(|l| l.max(0) as u64));
     let meta = names::stage(
         state.store.as_ref(),
-        &staging,
+        &key,
         stream,
         &counter,
         Some(row.content_type.clone()),
@@ -399,24 +424,11 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
     })?;
     row.size = Some(meta.size as i64);
     row.etag = Some(meta.etag.trim_matches('"').to_owned());
-    // The ticket, then the blob at its version's key, then the row: a row never points at a
-    // missing blob, and a refused row leaves no blob behind.
-    if let Err(f) = state.ticket(&data, &at, &row, &rid).await {
-        let _ = state.store.delete(&staging).await;
-        return Err(f);
-    }
-    let key = names::version_key(&at.prefix, row.version);
-    names::promote_then(
-        state.store.as_ref(),
-        &staging,
-        &key,
-        async || {
-            state
-                .final_write(&data, &at, &row, expected, upsert, &rid)
-                .await
-        },
-        &rid,
-    )
+    // After the body: the ticket (its real size and etag), then the caller's row. A refused or
+    // failed write deletes the blob and withdraws the ticket.
+    names::keep_if_written(state.store.as_ref(), &key, async || {
+        state.write(&data, &at, &row, expected, upsert, &rid).await
+    })
     .await?;
     Ok(Json(json!({
         "bucket": bucket, "name": row.name, "version_id": row.version, "size": row.size, "etag": row.etag,
@@ -536,6 +548,11 @@ fn object_headers(found: &Found, name: &str, download: Option<&str>) -> HeaderMa
         names::content_disposition(name, download),
     );
     h.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    // Never sniffed into another type (m6 adds the sandbox and attachment rules).
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     h
 }
 
@@ -577,6 +594,8 @@ pub async fn download<S: ConnSource, M: ConnSource>(
         Some(r) => Some(ByteRange::parse(r).map_err(|_| Failure::range_not_satisfiable())?),
         None => None,
     };
+    // A zero-byte object answers 200 with its empty body whatever the range.
+    let range = names::range_for(found.size.max(0) as u64, range);
     let span = match range {
         Some(r) => Some(
             r.resolve(found.size.max(0) as u64)
@@ -783,7 +802,8 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
     };
     let expected = state.precheck(&data, &at, &row, false, &rid).await?;
     // Only after the caller may read the source and write the destination: the blob is copied
-    // to the new version's key, deleted again if the row isn't written.
+    // to the new version's key, deleted again if the row isn't written. One `CopyObject`: on
+    // AWS S3 that copies at most 5 GB, above which it needs `UploadPartCopy` (m7).
     let key = names::version_key(&at.prefix, row.version);
     let meta = state
         .store
@@ -836,42 +856,62 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
         Some(b) if b != r.bucket => state.bucket(&data, &at, b, &rid).await?,
         _ => (from_id, None),
     };
-    if to_id != from_id {
-        let size = src.size;
-        let etag = src.etag.clone();
-        state
-            .engine
-            .managed(
-                data.branch_id,
-                &at.database,
-                &TICKET,
-                &[
-                    &src.version,
-                    &to_id,
-                    &r.to,
-                    &size,
-                    &etag,
-                    &data.role,
-                    &src.owner,
-                ],
-                &rid,
-            )
+    const MOVE: &str = "UPDATE storage.objects SET bucket_id = $3, name = $4 WHERE bucket_id = $1 AND name = $2 AND version_id = $5";
+    // A cross-bucket move changes a managed column, so it needs a ticket: minted only once the
+    // caller's policies passed the same UPDATE in a rolled-back savepoint.
+    let ticketed = (to_id != from_id).then(|| Row {
+        bucket: to_id,
+        name: r.to.clone(),
+        owner: src.owner,
+        size: Some(src.size),
+        content_type: src.content_type.clone(),
+        etag: Some(src.etag.clone()),
+        version: src.version,
+    });
+    if let Some(row) = &ticketed {
+        let (passed, _) = state
+            .caller(&data, &at, &rid, async |c, _| {
+                c.batch_execute("SAVEPOINT premove")
+                    .await
+                    .map_err(pg(&rid))?;
+                let tried = c
+                    .execute(MOVE, &[&from_id, &r.from, &to_id, &r.to, &src.version])
+                    .await
+                    .map_err(pg(&rid));
+                c.batch_execute("ROLLBACK TO SAVEPOINT premove")
+                    .await
+                    .map_err(pg(&rid))?;
+                Ok(match tried {
+                    Err(f) if f.sqlstate.as_deref() == Some(TICKET_MISSING) => Ok(()),
+                    Err(f) => Err(final_failure(Failure(f).refusal())),
+                    Ok(0) => Err(Failure::object_not_found()),
+                    // A ticket happened to match: the policy passed all the same.
+                    Ok(_) => Ok(()),
+                })
+            })
             .await?;
+        passed?;
+        state.ticket(&data, &at, row, &rid).await?;
     }
-    let (moved, _) = state
+    let moved = state
         .caller(&data, &at, &rid, async |c, _| {
-            c.execute(
-                "UPDATE storage.objects SET bucket_id = $3, name = $4 WHERE bucket_id = $1 AND name = $2 AND version_id = $5",
-                &[&from_id, &r.from, &to_id, &r.to, &src.version],
-            )
-            .await
-            .map_err(pg(&rid))
+            c.execute(MOVE, &[&from_id, &r.from, &to_id, &r.to, &src.version])
+                .await
+                .map_err(pg(&rid))
         })
         .await
-        .map_err(final_failure)?;
-    if moved == 0 {
-        return Err(Failure::object_not_found());
+        .map_err(final_failure)
+        .and_then(|(moved, _)| {
+            if moved == 0 {
+                Err(Failure::object_not_found())
+            } else {
+                Ok(())
+            }
+        });
+    if let (Err(_), Some(row)) = (&moved, &ticketed) {
+        state.unticket(&data, &at, row, &rid).await;
     }
+    moved?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -1079,6 +1119,21 @@ mod tests {
                 .unwrap()
                 .contains("(key, key) > ($5::text::text, $6)")
         );
+    }
+
+    /// Every download and HEAD answer says `nosniff`.
+    #[test]
+    fn downloads_are_never_sniffed() {
+        let found = Found {
+            version: Uuid::nil(),
+            size: 1,
+            etag: "e".into(),
+            content_type: "text/html".into(),
+            owner: None,
+        };
+        let h = object_headers(&found, "a.html", None);
+        assert_eq!(h[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+        assert_eq!(h[header::CONTENT_TYPE], "text/html");
     }
 
     /// The owner is the caller's `sub` when it's a uuid (an app user), else none.
