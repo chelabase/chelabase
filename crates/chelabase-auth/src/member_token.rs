@@ -110,6 +110,7 @@ impl MemberTokenSigner {
     }
 }
 
+#[derive(Clone)]
 pub struct MemberTokenVerifier {
     key: DecodingKey,
     kid: String,
