@@ -408,3 +408,46 @@ async fn invite_works_for_preregistered_account() {
     let (_f, id, p) = setup(1).await;
     common::invite_works_for_preregistered_account(&id, &p[0]).await;
 }
+
+/// The fake's ids are UUIDs like the service's, and `search_users` matches part of the email,
+/// ignoring case.
+#[tokio::test]
+async fn ids_are_uuids_and_search_matches_part_of_the_email() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let pool = Pool::App(uuid::Uuid::new_v4());
+    id.create_pool(&pool).await.unwrap();
+    let a = id
+        .create_user(
+            &pool,
+            &chelabase_identity::NewUser {
+                email: "Find.Me@x.io",
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let b = f.with_user(&pool, "findme+2@x.io", PW);
+    f.with_user(&pool, "other@x.io", PW);
+    assert!(uuid::Uuid::parse_str(&a.id).is_ok(), "{}", a.id);
+    assert!(uuid::Uuid::parse_str(&b).is_ok(), "{b}");
+    let (sid, _) = f.with_session(&pool, &b);
+    assert!(uuid::Uuid::parse_str(&sid).is_ok(), "{sid}");
+
+    let page = id.search_users(&pool, "FIND", 50, 0).await.unwrap();
+    let ids: Vec<_> = page.users.iter().map(|u| u.id.clone()).collect();
+    assert_eq!((ids, page.total), (vec![a.id.clone(), b.clone()], 2));
+    let page = id.search_users(&pool, "me+2@", 50, 0).await.unwrap();
+    assert_eq!(
+        page.users.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(),
+        [b.as_str()]
+    );
+    assert_eq!(id.list_users(&pool, 50, 0).await.unwrap().total, 3);
+    assert!(
+        f.calls()
+            .iter()
+            .any(|c| c.starts_with("GET ") && c.contains("/users")),
+        "{:?}",
+        f.calls()
+    );
+}

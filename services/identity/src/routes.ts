@@ -118,8 +118,11 @@ const MAX_TOKEN = 512;
 const MAX_REASON = 512;
 const MAX_PAGE = 200;
 const DEFAULT_PAGE = 50;
-/** Better Auth ids are random alphanumeric strings; the raw segment must look like one. */
+/** The raw `:id` segment's charset; anything else is a bad request. */
 export const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+/** Ids are UUIDs (`generateId: "uuid"`, `uuid` columns): any other id names nothing. */
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const isUuid = (id: string): boolean => UUID_PATTERN.test(id);
 /**
  * A session token as the bearer plugin accepts it: RFC 6750's b64token charset, plus `%` for a
  * URL-encoded signed token. Anything else (CR, LF, spaces) could not form a header anyway.
@@ -200,7 +203,8 @@ export async function context(auth: Auth): Promise<Context> {
 }
 
 export async function requireUser(ctx: Context, id: string): Promise<BaUser> {
-  const user = (await ctx.internalAdapter.findUserById(id)) as BaUser | null;
+  // A non-UUID would reach Postgres as an invalid `uuid` literal.
+  const user = isUuid(id) ? ((await ctx.internalAdapter.findUserById(id)) as BaUser | null) : null;
   if (!user) throw new HttpError(404, "user_not_found", "no such user");
   return user;
 }
@@ -211,6 +215,7 @@ export async function requireUser(ctx: Context, id: string): Promise<BaUser> {
  * plus getSession's rule that an expired session does not resolve.
  */
 async function findSessionById(ctx: Context, id: string): Promise<{ session: BaSession; user: BaUser } | null> {
+  if (!isUuid(id)) return null;
   const row = (await ctx.adapter.findOne({
     model: "session",
     where: [{ field: "id", value: id }],
@@ -282,20 +287,32 @@ const ROUTES: readonly Route[] = [
     },
   },
   {
-    // Mirrors `listUsers` (/admin/list-users), oldest first so pages are stable.
+    // Mirrors `listUsers` (/admin/list-users), oldest first so pages are stable. `search`
+    // narrows to emails containing it, ignoring case; `total` counts the matches.
     id: "users.list",
     method: "GET",
     rest: ["users"],
     async handle({ registry, pool, query }) {
       const limit = intParam(query, "limit", DEFAULT_PAGE, 1, MAX_PAGE);
       const offset = intParam(query, "offset", 0, 0, 1_000_000_000);
+      const search = query.get("search") ?? "";
+      if (search.length > MAX_EMAIL) {
+        throw new HttpError(400, "invalid_request", `search must be at most ${MAX_EMAIL} characters`);
+      }
+      // Part of the email, ignoring case. The adapter builds `LIKE '%…%'` without escaping, so
+      // LIKE's own wildcards (and its escape character) are escaped here to match literally.
+      const where = search
+        ? [{ field: "email", operator: "contains" as const, mode: "insensitive" as const, value: search.replace(/[\\%_]/g, "\\$&") }]
+        : undefined;
       return registry.use(pool, async (auth) => {
         const ctx = await context(auth);
-        const users = (await ctx.internalAdapter.listUsers(limit, offset, {
-          field: "createdAt",
-          direction: "asc",
-        })) as BaUser[];
-        const total = await ctx.internalAdapter.countTotalUsers();
+        const users = (await ctx.internalAdapter.listUsers(
+          limit,
+          offset,
+          { field: "createdAt", direction: "asc" },
+          where,
+        )) as BaUser[];
+        const total = await ctx.internalAdapter.countTotalUsers(where);
         return { status: 200, body: { users: users.map(userOut), total, limit, offset } };
       });
     },
