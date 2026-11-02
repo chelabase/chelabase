@@ -23,6 +23,19 @@ struct State {
     /// upload id -> (key, part number -> body)
     uploads: HashMap<String, (String, BTreeMap<u32, Bytes>)>,
     next_upload: u64,
+    uploads_started: usize,
+}
+
+impl MemoryStore {
+    /// How many multipart uploads have been created (for tests).
+    pub fn uploads_started(&self) -> usize {
+        self.state.lock().unwrap().uploads_started
+    }
+
+    /// Multipart uploads neither completed nor aborted (for tests).
+    pub fn uploads_open(&self) -> usize {
+        self.state.lock().unwrap().uploads.len()
+    }
 }
 
 fn etag(b: &[u8]) -> String {
@@ -112,9 +125,14 @@ impl ObjectStore for MemoryStore {
             .collect())
     }
 
-    async fn multipart_create(&self, key: &str) -> Result<String, StorageError> {
+    async fn multipart_create(
+        &self,
+        key: &str,
+        _content_type: Option<&str>,
+    ) -> Result<String, StorageError> {
         let mut st = self.state.lock().unwrap();
         st.next_upload += 1;
+        st.uploads_started += 1;
         let id = format!("upload-{}", st.next_upload);
         st.uploads
             .insert(id.clone(), (key.to_string(), BTreeMap::new()));
@@ -197,6 +215,51 @@ mod tests {
     #[tokio::test]
     async fn passes_conformance_suite() {
         crate::conformance::run(&MemoryStore::default(), "t").await;
+    }
+
+    fn chunks(n: usize, chunk: usize, then_err: bool) -> crate::ByteStream {
+        let mut items: Vec<Result<Bytes, StorageError>> =
+            (0..n).map(|_| Ok(Bytes::from(vec![7u8; chunk]))).collect();
+        if then_err {
+            items.push(Err(StorageError::Transient("boom".into())));
+        }
+        Box::pin(futures_util::stream::iter(items))
+    }
+
+    #[tokio::test]
+    async fn put_stream_uses_multipart_for_large_bodies() {
+        let s = MemoryStore::default();
+        let m = s
+            .put_stream("big", chunks(12, 1 << 20, false), PutOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(m.size, 12 << 20);
+        assert_eq!(s.uploads_started(), 1);
+        assert_eq!(s.uploads_open(), 0);
+        assert_eq!(s.head("big").await.unwrap().size, 12 << 20);
+    }
+
+    #[tokio::test]
+    async fn put_stream_small_body_is_a_single_put() {
+        let s = MemoryStore::default();
+        s.put_stream("small", chunks(3, 1000, false), PutOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(s.uploads_started(), 0);
+        assert_eq!(s.head("small").await.unwrap().size, 3000);
+    }
+
+    #[tokio::test]
+    async fn put_stream_aborts_on_error() {
+        let s = MemoryStore::default();
+        let err = s
+            .put_stream("bad", chunks(12, 1 << 20, true), PutOptions::default())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Transient(_)));
+        assert_eq!(s.uploads_started(), 1);
+        assert_eq!(s.uploads_open(), 0);
+        assert!(matches!(s.head("bad").await, Err(StorageError::NotFound)));
     }
 
     #[test]

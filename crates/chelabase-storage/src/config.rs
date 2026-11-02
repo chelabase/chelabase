@@ -1,4 +1,8 @@
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 pub const ENV_BACKEND: &str = "CHELABASE_STORAGE_BACKEND";
 pub const ENV_ENDPOINT: &str = "CHELABASE_STORAGE_S3_ENDPOINT";
@@ -9,6 +13,7 @@ pub const ENV_ACCESS_KEY_FILE: &str = "CHELABASE_STORAGE_S3_ACCESS_KEY_FILE";
 pub const ENV_SECRET_KEY_FILE: &str = "CHELABASE_STORAGE_S3_SECRET_KEY_FILE";
 pub const ENV_CONNECT_TIMEOUT: &str = "CHELABASE_STORAGE_S3_CONNECT_TIMEOUT";
 pub const ENV_REQUEST_TIMEOUT: &str = "CHELABASE_STORAGE_S3_REQUEST_TIMEOUT";
+pub const ENV_STREAM_IDLE_TIMEOUT: &str = "CHELABASE_STORAGE_S3_STREAM_IDLE_TIMEOUT";
 pub const ENV_MAX_ATTEMPTS: &str = "CHELABASE_STORAGE_S3_MAX_ATTEMPTS";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +37,19 @@ pub enum ConfigError {
     },
 }
 
+/// Where S3 credentials come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// Key files, re-read periodically so rotating them needs no restart.
+    KeyFiles {
+        access_key_file: PathBuf,
+        secret_key_file: PathBuf,
+    },
+    /// The AWS default chain (env, web identity/IRSA, EKS Pod Identity, ECS, instance profile).
+    /// Only for backend `s3`.
+    DefaultChain,
+}
+
 #[derive(Clone)]
 pub struct StorageConfig {
     pub backend: Backend,
@@ -40,10 +58,13 @@ pub struct StorageConfig {
     pub region: String,
     pub bucket: String,
     pub path_style: bool,
-    pub access_key: String,
-    pub secret_key: String,
+    pub credentials: CredentialSource,
     pub connect_timeout: Duration,
+    /// Per attempt, covering sending the request and receiving the response headers. It does
+    /// not bound a response body being streamed; [`stream_idle_timeout`](Self::stream_idle_timeout) does.
     pub request_timeout: Duration,
+    /// Longest gap between two chunks of a streamed download before it fails as Transient.
+    pub stream_idle_timeout: Duration,
     pub max_attempts: u32,
 }
 
@@ -56,10 +77,10 @@ impl fmt::Debug for StorageConfig {
             .field("region", &self.region)
             .field("bucket", &self.bucket)
             .field("path_style", &self.path_style)
-            .field("access_key", &"<redacted>")
-            .field("secret_key", &"<redacted>")
+            .field("credentials", &self.credentials)
             .field("connect_timeout", &self.connect_timeout)
             .field("request_timeout", &self.request_timeout)
+            .field("stream_idle_timeout", &self.stream_idle_timeout)
             .field("max_attempts", &self.max_attempts)
             .finish()
     }
@@ -126,21 +147,20 @@ impl StorageConfig {
                     }
                 })?,
             };
-        let read_key = |var: &'static str| {
-            let path = opt(var).ok_or(ConfigError::Missing(var))?;
-            let raw = std::fs::read_to_string(&path).map_err(|e| ConfigError::KeyFile {
-                var,
-                path: path.clone(),
-                kind: e.kind(),
-            })?;
-            let key = raw.trim_end_matches(['\n', '\r']).to_string();
-            if key.is_empty() {
-                return Err(ConfigError::Invalid {
-                    var,
-                    reason: format!("key file {path} is empty"),
-                });
+        let credentials = match (opt(ENV_ACCESS_KEY_FILE), opt(ENV_SECRET_KEY_FILE)) {
+            (Some(a), Some(s)) => {
+                let (access_key_file, secret_key_file) = (PathBuf::from(a), PathBuf::from(s));
+                // Fail at load, not at the first request.
+                read_key_file(ENV_ACCESS_KEY_FILE, &access_key_file)?;
+                read_key_file(ENV_SECRET_KEY_FILE, &secret_key_file)?;
+                CredentialSource::KeyFiles {
+                    access_key_file,
+                    secret_key_file,
+                }
             }
-            Ok(key)
+            (None, None) if backend == Backend::S3 => CredentialSource::DefaultChain,
+            (None, _) => return Err(ConfigError::Missing(ENV_ACCESS_KEY_FILE)),
+            (_, None) => return Err(ConfigError::Missing(ENV_SECRET_KEY_FILE)),
         };
         Ok(Self {
             backend,
@@ -148,13 +168,30 @@ impl StorageConfig {
             region,
             bucket,
             path_style,
-            access_key: read_key(ENV_ACCESS_KEY_FILE)?,
-            secret_key: read_key(ENV_SECRET_KEY_FILE)?,
+            credentials,
             connect_timeout: duration(ENV_CONNECT_TIMEOUT, Duration::from_secs(5))?,
             request_timeout: duration(ENV_REQUEST_TIMEOUT, Duration::from_secs(60))?,
+            stream_idle_timeout: duration(ENV_STREAM_IDLE_TIMEOUT, Duration::from_secs(30))?,
             max_attempts,
         })
     }
+}
+
+/// Read a key file, trimming the trailing newline. Errors never include the contents.
+pub fn read_key_file(var: &'static str, path: &Path) -> Result<String, ConfigError> {
+    let raw = std::fs::read_to_string(path).map_err(|e| ConfigError::KeyFile {
+        var,
+        path: path.display().to_string(),
+        kind: e.kind(),
+    })?;
+    let key = raw.trim_end_matches(['\n', '\r']).to_string();
+    if key.is_empty() {
+        return Err(ConfigError::Invalid {
+            var,
+            reason: format!("key file {} is empty", path.display()),
+        });
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -292,8 +329,21 @@ mod tests {
             (ENV_SECRET_KEY_FILE, &k.secret),
         ]))
         .unwrap();
-        assert_eq!(c.access_key, "access-id");
-        assert_eq!(c.secret_key, "secret-val");
+        let CredentialSource::KeyFiles {
+            access_key_file,
+            secret_key_file,
+        } = &c.credentials
+        else {
+            panic!("expected key files");
+        };
+        assert_eq!(
+            read_key_file(ENV_ACCESS_KEY_FILE, access_key_file).unwrap(),
+            "access-id"
+        );
+        assert_eq!(
+            read_key_file(ENV_SECRET_KEY_FILE, secret_key_file).unwrap(),
+            "secret-val"
+        );
     }
 
     #[test]
@@ -323,5 +373,57 @@ mod tests {
         ]))
         .unwrap();
         assert!(!format!("{c:?}").contains("TOPSECRET"));
+    }
+
+    #[test]
+    fn s3_without_key_files_uses_the_default_chain() {
+        let c = StorageConfig::from_lookup(env(&[
+            (ENV_BACKEND, "s3"),
+            (ENV_REGION, "r"),
+            (ENV_BUCKET, "b"),
+        ]))
+        .unwrap();
+        assert!(matches!(c.credentials, CredentialSource::DefaultChain));
+    }
+
+    #[test]
+    fn seaweedfs_still_requires_key_files() {
+        let err = StorageConfig::from_lookup(env(&[(ENV_ENDPOINT, "http://x"), (ENV_BUCKET, "b")]))
+            .unwrap_err();
+        assert!(err.to_string().contains(ENV_ACCESS_KEY_FILE), "{err}");
+    }
+
+    #[test]
+    fn only_one_key_file_is_an_error() {
+        let k = keys("ak", "sk");
+        let err = StorageConfig::from_lookup(env(&[
+            (ENV_BACKEND, "s3"),
+            (ENV_REGION, "r"),
+            (ENV_BUCKET, "b"),
+            (ENV_ACCESS_KEY_FILE, &k.access),
+        ]))
+        .unwrap_err();
+        assert!(err.to_string().contains(ENV_SECRET_KEY_FILE), "{err}");
+    }
+
+    #[test]
+    fn stream_idle_timeout_defaults_and_overrides() {
+        let k = keys("ak", "sk");
+        let base = [
+            (ENV_ENDPOINT, "http://x"),
+            (ENV_BUCKET, "b"),
+            (ENV_ACCESS_KEY_FILE, k.access.as_str()),
+            (ENV_SECRET_KEY_FILE, k.secret.as_str()),
+        ];
+        let c = StorageConfig::from_lookup(env(&base)).unwrap();
+        assert_eq!(c.stream_idle_timeout, Duration::from_secs(30));
+        let mut with = base.to_vec();
+        with.push((ENV_STREAM_IDLE_TIMEOUT, "7s"));
+        assert_eq!(
+            StorageConfig::from_lookup(env(&with))
+                .unwrap()
+                .stream_idle_timeout,
+            Duration::from_secs(7)
+        );
     }
 }

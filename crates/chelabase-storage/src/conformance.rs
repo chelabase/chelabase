@@ -12,6 +12,7 @@ pub async fn run(store: &dyn ObjectStore, prefix: &str) {
     copy_list_delete(store, prefix).await;
     multipart_out_of_order(store, prefix).await;
     multipart_abort(store, prefix).await;
+    unknown_length_stream(store, prefix).await;
 }
 
 async fn ranged_read(store: &dyn ObjectStore, prefix: &str) {
@@ -127,7 +128,7 @@ async fn multipart_out_of_order(store: &dyn ObjectStore, prefix: &str) {
     let p2 = Bytes::from(vec![b'2'; 5 * 1024 * 1024]);
     let p3 = Bytes::from_static(b"tail");
 
-    let id = store.multipart_create(&key).await.unwrap();
+    let id = store.multipart_create(&key, None).await.unwrap();
     let e3 = store
         .multipart_part(&key, &id, 3, p3.clone())
         .await
@@ -173,7 +174,7 @@ async fn multipart_out_of_order(store: &dyn ObjectStore, prefix: &str) {
 
 async fn multipart_abort(store: &dyn ObjectStore, prefix: &str) {
     let key = format!("{prefix}/aborted");
-    let id = store.multipart_create(&key).await.unwrap();
+    let id = store.multipart_create(&key, None).await.unwrap();
     store
         .multipart_part(&key, &id, 1, Bytes::from_static(b"x"))
         .await
@@ -202,4 +203,28 @@ async fn multipart_abort(store: &dyn ObjectStore, prefix: &str) {
         store.multipart_complete(&key, &id, vec![]).await,
         Err(StorageError::NotFound)
     ));
+}
+
+/// A 12 MiB body with no known length must land intact (via multipart, parts of 8 MiB).
+async fn unknown_length_stream(store: &dyn ObjectStore, prefix: &str) {
+    let key = format!("{prefix}/stream");
+    let chunks: Vec<Result<Bytes, StorageError>> = (0..12u8)
+        .map(|i| Ok(Bytes::from(vec![i; 1024 * 1024])))
+        .collect();
+    let meta = store
+        .put_stream(
+            &key,
+            Box::pin(futures_util::stream::iter(chunks)),
+            PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(meta.size, 12 * 1024 * 1024);
+
+    let got = collect(store.get(&key, None).await.unwrap().body)
+        .await
+        .unwrap();
+    let want: Vec<u8> = (0..12u8).flat_map(|i| vec![i; 1024 * 1024]).collect();
+    assert!(got == want, "streamed object differs");
+    store.delete(&key).await.unwrap();
 }
