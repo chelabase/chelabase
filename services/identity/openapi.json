@@ -725,7 +725,7 @@
             "$ref": "#/components/responses/Error"
           },
           "401": {
-            "description": "`bad_credentials`",
+            "description": "`bad_credentials`, or `session_revoked` when a concurrent revoke deleted the new session",
             "content": {
               "application/json": {
                 "schema": {

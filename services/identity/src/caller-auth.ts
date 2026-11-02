@@ -11,6 +11,13 @@ export class CallerAuth {
   private readonly digests: [Caller, Buffer][];
 
   constructor(tokens: ReadonlyMap<Caller, string>) {
+    // A shared token would resolve to whichever caller is compared last.
+    const seen = new Map<string, Caller>();
+    for (const [caller, token] of tokens) {
+      const other = seen.get(token);
+      if (other) throw new Error(`caller tokens: ${other} and ${caller} share a token; each caller needs its own`);
+      seen.set(token, caller);
+    }
     this.digests = [...tokens].map(([caller, token]) => [caller, digest(token)]);
   }
 

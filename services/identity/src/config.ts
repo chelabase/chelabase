@@ -8,8 +8,10 @@ export type Caller = (typeof CALLERS)[number];
 
 /**
  * Cached Better Auth instances. `bench/pools.ts` measured 307 KiB RSS per cached pool (200
- * pools, Node 24, default max_connections=100): 256 pools cost about 77 MiB. All instances
- * share one pg pool, so the cache size does not change the connection count.
+ * pools, Node 24, default max_connections=100): 256 pools cost about 77 MiB. On Node 26.13
+ * (the image's runtime) the same run showed no growth (-36 KiB/pool): RSS was already at the
+ * high-water mark left by migrating the 200 pools, so treat 307 KiB as the upper estimate.
+ * All instances share one pg pool, so the cache size does not change the connection count.
  */
 export const DEFAULT_POOL_CACHE_SIZE = 256;
 

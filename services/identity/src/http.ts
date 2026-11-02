@@ -63,6 +63,8 @@ export function toHttpError(err: unknown): HttpError {
   if (err instanceof PoolNotFound) return new HttpError(404, "pool_not_found", err.message);
   // undefined_table: the pool's schema was dropped while this request was using it.
   if (pgCode(err) === "42P01") return new HttpError(404, "pool_not_found", "pool does not exist");
+  // unique_violation: a concurrent create or email change took the email after our check.
+  if (pgCode(err) === "23505") return new HttpError(409, "conflict", "a concurrent request already holds this value");
   if (err instanceof APIError) {
     const code = typeof err.body?.code === "string" ? err.body.code : "";
     const mapped = BETTER_AUTH_CODES[code];
