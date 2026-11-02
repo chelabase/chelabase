@@ -1278,6 +1278,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "chelabase-pgsession"
+version = "0.1.0"
+dependencies = [
+ "chelabase-auth",
+ "chelabase-http",
+ "chelabase-query",
+ "chelabase-types",
+ "deadpool-postgres",
+ "moka",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls-improved",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "chelabase-query"
 version = "0.1.0"
 dependencies = [
@@ -4312,6 +4334,7 @@ dependencies = [
  "chelabase-metadata",
  "chelabase-nats",
  "chelabase-neon",
+ "chelabase-pgsession",
  "chelabase-query",
  "chelabase-routes",
  "chelabase-schema",

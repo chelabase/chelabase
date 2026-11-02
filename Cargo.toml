@@ -24,6 +24,7 @@ members = [
     "crates/chelabase-http",
     "crates/chelabase-typegen",
     "crates/chelabase-storage",
+    "crates/chelabase-pgsession",
 ]
 
 [workspace.package]
@@ -47,6 +48,7 @@ chelabase-zitadel = { path = "crates/chelabase-zitadel" }
 chelabase-init = { path = "crates/chelabase-init" }
 chelabase-typegen = { path = "crates/chelabase-typegen" }
 chelabase-storage = { path = "crates/chelabase-storage" }
+chelabase-pgsession = { path = "crates/chelabase-pgsession" }
 
 axum = "0.8.9"
 utoipa = { version = "6.0.0", features = ["chrono", "uuid"] }

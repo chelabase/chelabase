@@ -1,0 +1,38 @@
+[package]
+name = "chelabase-pgsession"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Chelabase's connections to a branch's compute: where it is, pools within the branch's connection budget, and the per-request role session the data API and storage share"
+
+[dependencies]
+# The owner-level checks take the key's identity.
+chelabase-auth = { workspace = true }
+chelabase-http = { workspace = true }
+# `Lease`, `QueryClient`, the compute TLS (`ServerTls`) and the session's transaction.
+chelabase-query = { workspace = true }
+chelabase-types = { workspace = true }
+deadpool-postgres = { workspace = true }
+moka = { workspace = true }
+serde = { workspace = true }
+# A role session's JWT claims.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+# The pools' TLS to computes, verified against the platform CA (U15).
+tokio-postgres-rustls-improved = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+# The fakes rest's own tests use (`test_support`, `Pools::warm`, `Pools::cached`).
+test-support = []
+
+[dev-dependencies]
+# The live bound test's URL.
+reqwest = { workspace = true }
+# The live tests' own admin sessions.
+sqlx = { workspace = true }
+# Paused-clock tests.
+tokio = { workspace = true, features = ["test-util"] }
