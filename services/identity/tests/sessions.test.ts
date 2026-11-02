@@ -59,6 +59,15 @@ describeDb("sessions", () => {
     expect((await call(h, "DELETE", `${base()}/sessions/${a.session_id}`)).status).toBe(404);
   });
 
+  // S3: a token outside the bearer charset is bad input, not a crash.
+  it("lookup_rejects_control_characters", async () => {
+    for (const token of ["abc\r\nx: 1", "abc\nx", "abc\rx", "a b"]) {
+      const r = await lookup(token);
+      expect(r.status, JSON.stringify(token)).toBe(400);
+      expect(r.body.error).toBe("invalid_request");
+    }
+  });
+
   it("a session id from another pool is not found", async () => {
     const other = newAppPool().pool;
     await createPool(h, other);

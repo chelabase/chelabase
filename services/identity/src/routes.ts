@@ -49,7 +49,8 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
     "sessions.revoke",
     "sessions.revoke_all",
   ]),
-  // App-user admin in the management API: no sign-in, no session tokens, no passwords.
+  // App-user admin in the management API: no sign-in and no session tokens. It may set an
+  // initial password when it creates a user, but never changes one afterwards.
   orchestrator: new Set<RouteId>([
     "users.create",
     "users.list",
@@ -96,6 +97,11 @@ const MAX_PAGE = 200;
 const DEFAULT_PAGE = 50;
 /** Better Auth ids are random alphanumeric strings; the raw segment must look like one. */
 const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+/**
+ * A session token as the bearer plugin accepts it: RFC 6750's b64token charset, plus `%` for a
+ * URL-encoded signed token. Anything else (CR, LF, spaces) could not form a header anyway.
+ */
+const TOKEN_PATTERN = /^[A-Za-z0-9._~+/=%-]{1,512}$/;
 
 function str(body: Record<string, unknown>, key: string, max: number): string {
   const v = body[key];
@@ -191,6 +197,17 @@ async function findSessionById(ctx: Context, id: string): Promise<{ session: BaS
   const { user, ...session } = row;
   if (new Date(session.expiresAt).getTime() <= Date.now()) return null;
   return { session, user };
+}
+
+/**
+ * A banned user has no live session. A sign-in that races a ban can insert its session after
+ * the ban's sweep (the admin plugin checks `banned` before the insert, the ban deletes
+ * sessions after its update), so every read re-checks and deletes what it finds.
+ */
+async function dropIfBanned(ctx: Context, session: BaSession, user: BaUser): Promise<boolean> {
+  if (user.banned !== true) return false;
+  await ctx.internalAdapter.deleteSession(session.token);
+  return true;
 }
 
 /**
@@ -390,11 +407,21 @@ const ROUTES: readonly Route[] = [
       const password = str(body, "password", MAX_PASSWORD);
       return registry.use(pool, async (auth) => {
         const signedIn = await auth.api.signInEmail({ body: { email, password } });
+        const ctx = await context(auth);
         const found = await auth.api.getSession({
           headers: bearerHeaders(signedIn.token),
           query: { disableCookieCache: true, disableRefresh: true },
         });
-        if (!found) throw new Error("a session just created did not resolve");
+        if (!found) {
+          // A concurrent ban or revoke deleted the new session before it was read back.
+          const user = (await ctx.internalAdapter.findUserById(signedIn.user.id)) as BaUser | null;
+          if (user?.banned === true) throw new HttpError(403, "banned", "user is banned");
+          throw new HttpError(401, "session_revoked", "the new session was revoked during sign-in");
+        }
+        // The ban committed between the admin plugin's check and the insert.
+        if (await dropIfBanned(ctx, found.session as BaSession, found.user as BaUser)) {
+          throw new HttpError(403, "banned", "user is banned");
+        }
         return {
           status: 201,
           body: { session_id: found.session.id, session_token: signedIn.token, user: userOut(found.user as BaUser) },
@@ -408,12 +435,13 @@ const ROUTES: readonly Route[] = [
     rest: ["sessions", "lookup"],
     async handle({ registry, pool, body }) {
       const token = str(body, "token", MAX_TOKEN);
+      if (!TOKEN_PATTERN.test(token)) throw new HttpError(400, "invalid_request", "token has characters a session token never has");
       return registry.use(pool, async (auth) => {
         const found = await auth.api.getSession({
           headers: bearerHeaders(token),
           query: { disableCookieCache: true },
         });
-        if (!found) throw new HttpError(404, "session_not_found", "no live session for this token");
+        if (!found || (await dropIfBanned(await context(auth), found.session as BaSession, found.user as BaUser))) throw new HttpError(404, "session_not_found", "no live session for this token");
         return {
           status: 200,
           body: { session: sessionOut(found.session as BaSession), user: userOut(found.user as BaUser) },
@@ -427,8 +455,9 @@ const ROUTES: readonly Route[] = [
     rest: ["sessions", ":id"],
     async handle({ registry, pool, id }) {
       return registry.use(pool, async (auth) => {
-        const found = await findSessionById(await context(auth), id);
-        if (!found) throw new HttpError(404, "session_not_found", "no live session with this id");
+        const ctx = await context(auth);
+        const found = await findSessionById(ctx, id);
+        if (!found || (await dropIfBanned(ctx, found.session, found.user))) throw new HttpError(404, "session_not_found", "no live session with this id");
         return { status: 200, body: { session: sessionOut(found.session), user: userOut(found.user) } };
       });
     },
