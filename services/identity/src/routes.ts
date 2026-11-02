@@ -8,9 +8,11 @@
 import * as z from "zod";
 import type { Auth } from "./better-auth.ts";
 import type { Caller } from "./config.ts";
+import type { Mailer } from "./email/mailer.ts";
 import { HttpError, type Json } from "./http.ts";
 import { parsePoolName, type PoolRef } from "./pool-name.ts";
 import type { PoolRegistry } from "./registry.ts";
+import { codeRoutes, emailStatusRoute } from "./routes/codes.ts";
 
 export type RouteId =
   | "pools.create"
@@ -28,7 +30,10 @@ export type RouteId =
   | "sessions.lookup"
   | "sessions.get"
   | "sessions.revoke"
-  | "sessions.revoke_all";
+  | "sessions.revoke_all"
+  | "codes.create"
+  | "codes.verify"
+  | "email.status";
 
 /** What each caller may do. Anything not listed answers 403. */
 export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
@@ -48,9 +53,13 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
     "sessions.get",
     "sessions.revoke",
     "sessions.revoke_all",
+    "codes.create",
+    "codes.verify",
+    "email.status",
   ]),
   // App-user admin in the management API: no sign-in and no session tokens. It may set an
-  // initial password when it creates a user, but never changes one afterwards.
+  // initial password when it creates a user, but never changes one afterwards. It may create
+  // invite codes (only that kind; see routes/codes.ts) but never check one.
   orchestrator: new Set<RouteId>([
     "users.create",
     "users.list",
@@ -61,6 +70,8 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
     "users.delete",
     "sessions.revoke",
     "sessions.revoke_all",
+    "codes.create",
+    "email.status",
   ]),
   // Pool lifecycle and the users sync.
   worker: new Set<RouteId>(["pools.create", "pools.delete", "users.list", "users.get"]),
@@ -71,7 +82,9 @@ export interface Reply {
   body?: Json;
 }
 
-interface Ctx {
+export interface Ctx {
+  caller: Caller;
+  mailer: Mailer;
   registry: PoolRegistry;
   pool: PoolRef;
   /** The `:id` path segment, already checked against ID_PATTERN. */
@@ -80,12 +93,20 @@ interface Ctx {
   body: Record<string, unknown>;
 }
 
-interface Route {
+export interface Route {
   id: RouteId;
   method: string;
   /** Path segments after `/internal/v1/pools/{pool}`; `:id` matches one id segment. */
   rest: readonly string[];
   handle(ctx: Ctx): Promise<Reply>;
+}
+
+/** A route outside any pool: `path` is the whole path. */
+export interface GlobalRoute {
+  id: RouteId;
+  method: string;
+  path: string;
+  handle(ctx: Pick<Ctx, "caller" | "mailer">): Promise<Reply>;
 }
 
 const MAX_EMAIL = 320;
@@ -96,7 +117,7 @@ const MAX_REASON = 512;
 const MAX_PAGE = 200;
 const DEFAULT_PAGE = 50;
 /** Better Auth ids are random alphanumeric strings; the raw segment must look like one. */
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
+export const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 /**
  * A session token as the bearer plugin accepts it: RFC 6750's b64token charset, plus `%` for a
  * URL-encoded signed token. Anything else (CR, LF, spaces) could not form a header anyway.
@@ -129,7 +150,7 @@ function intParam(query: URLSearchParams, key: string, fallback: number, min: nu
   return n;
 }
 
-interface BaUser {
+export interface BaUser {
   id: string;
   email: string;
   name: string;
@@ -170,13 +191,13 @@ function bearerHeaders(token: string): Headers {
   return new Headers({ authorization: `Bearer ${token}` });
 }
 
-type Context = Awaited<Auth["$context"]>;
+export type Context = Awaited<Auth["$context"]>;
 
-async function context(auth: Auth): Promise<Context> {
+export async function context(auth: Auth): Promise<Context> {
   return auth.$context;
 }
 
-async function requireUser(ctx: Context, id: string): Promise<BaUser> {
+export async function requireUser(ctx: Context, id: string): Promise<BaUser> {
   const user = (await ctx.internalAdapter.findUserById(id)) as BaUser | null;
   if (!user) throw new HttpError(404, "user_not_found", "no such user");
   return user;
@@ -214,7 +235,7 @@ async function dropIfBanned(ctx: Context, session: BaSession, user: BaUser): Pro
  * Better Auth's password length limits (`assertPasswordNotTooShort` / `...TooLong` in
  * dist/utils/password.mjs, which the package does not export), read from its own config.
  */
-function checkPasswordLength(ctx: Context, password: string): void {
+export function checkPasswordLength(ctx: Context, password: string): void {
   const { minPasswordLength, maxPasswordLength } = ctx.password.config;
   if (password.length < minPasswordLength || password.length > maxPasswordLength) {
     throw new HttpError(400, "weak_password", `password must be ${minPasswordLength} to ${maxPasswordLength} characters`);
@@ -491,20 +512,28 @@ const ROUTES: readonly Route[] = [
       });
     },
   },
+  ...codeRoutes(),
 ];
+
+const GLOBAL_ROUTES: readonly GlobalRoute[] = [emailStatusRoute()];
 
 const PREFIX = "/internal/v1/pools/";
 
-export interface Match {
-  route: Route;
-  /** The raw (undecoded) pool segment; validated by `resolvePool`. */
-  poolSegment: string;
-  /** The raw `:id` segment, if the route has one; validated by `resolveId`. */
-  idSegment: string;
-}
+export type Match =
+  | {
+      global: false;
+      route: Route;
+      /** The raw (undecoded) pool segment; validated by `resolvePool`. */
+      poolSegment: string;
+      /** The raw `:id` segment, if the route has one; validated by `resolveId`. */
+      idSegment: string;
+    }
+  | { global: true; route: GlobalRoute };
 
 /** The route for a method and raw path, or null. Path segments are never decoded. */
 export function match(method: string, path: string): Match | null {
+  const fixed = GLOBAL_ROUTES.find((r) => r.method === method && r.path === path);
+  if (fixed) return { global: true, route: fixed };
   if (!path.startsWith(PREFIX)) return null;
   const [poolSegment = "", ...rest] = path.slice(PREFIX.length).split("/");
   for (const route of ROUTES) {
@@ -515,7 +544,7 @@ export function match(method: string, path: string): Match | null {
       idSegment = rest[i]!;
       return true;
     });
-    if (ok) return { route, poolSegment, idSegment };
+    if (ok) return { global: false, route, poolSegment, idSegment };
   }
   return null;
 }

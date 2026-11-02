@@ -15,6 +15,24 @@ export type Caller = (typeof CALLERS)[number];
  */
 export const DEFAULT_POOL_CACHE_SIZE = 256;
 
+/**
+ * How the SMTP connection is secured: `starttls` (required STARTTLS, the default), `tls`
+ * (implicit TLS, the default on port 465) or `none` (plain text; local sinks such as Mailpit).
+ */
+export const SMTP_TLS_MODES = ["starttls", "tls", "none"] as const;
+export type SmtpTls = (typeof SMTP_TLS_MODES)[number];
+
+export interface SmtpConfig {
+  host: string;
+  port: number;
+  tls: SmtpTls;
+  /** Sender address, e.g. `Chelabase <noreply@example.com>`. */
+  from: string;
+  /** Both or neither. */
+  user?: string;
+  password?: string;
+}
+
 export interface Config {
   /** Postgres URL for the `chelabase_identity` role. */
   databaseUrl: string;
@@ -23,6 +41,8 @@ export interface Config {
   /** Each caller's bearer token. A caller without a token cannot call at all. */
   callerTokens: ReadonlyMap<Caller, string>;
   poolCacheSize: number;
+  /** Outgoing mail. Unset: no email delivery, codes can only be returned to the caller. */
+  smtp?: SmtpConfig;
   host: string;
   port: number;
 }
@@ -48,6 +68,32 @@ function secretFromEnv(env: NodeJS.ProcessEnv, name: string): string | undefined
 function required<T>(value: T | undefined, name: string): T {
   if (value === undefined) throw new Error(`${name} is not set`);
   return value;
+}
+
+function nonBlank(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const v = env[name]?.trim();
+  return v ? v : undefined;
+}
+
+/** `CHELABASE_SMTP_*`, the same variables chelabase-init reads, plus `CHELABASE_SMTP_TLS`. */
+export function smtpFromEnv(env: NodeJS.ProcessEnv): SmtpConfig | undefined {
+  const password = secretFromEnv(env, "CHELABASE_SMTP_PASSWORD");
+  const host = nonBlank(env, "CHELABASE_SMTP_HOST");
+  if (host === undefined) return undefined;
+  const rawPort = nonBlank(env, "CHELABASE_SMTP_PORT");
+  const port = rawPort === undefined ? 587 : Number(rawPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("CHELABASE_SMTP_PORT is not a port");
+  const from = nonBlank(env, "CHELABASE_SMTP_FROM");
+  if (from === undefined) throw new Error("CHELABASE_SMTP_HOST is set without CHELABASE_SMTP_FROM (the sender address)");
+  const user = nonBlank(env, "CHELABASE_SMTP_USER");
+  if ((user === undefined) !== (password === undefined)) {
+    throw new Error("set both CHELABASE_SMTP_USER and CHELABASE_SMTP_PASSWORD_FILE, or neither");
+  }
+  const tls = nonBlank(env, "CHELABASE_SMTP_TLS") ?? (port === 465 ? "tls" : "starttls");
+  if (!(SMTP_TLS_MODES as readonly string[]).includes(tls)) {
+    throw new Error(`CHELABASE_SMTP_TLS must be one of ${SMTP_TLS_MODES.join(", ")}`);
+  }
+  return { host, port, tls: tls as SmtpTls, from, ...(user === undefined ? {} : { user, password: password! }) };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -76,11 +122,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   }
   const port = Number(env.CHELABASE_IDENTITY_PORT ?? 8080);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("CHELABASE_IDENTITY_PORT is invalid");
+  const smtp = smtpFromEnv(env);
   return {
     databaseUrl,
     secret,
     callerTokens,
     poolCacheSize,
+    ...(smtp === undefined ? {} : { smtp }),
     host: env.CHELABASE_IDENTITY_HOST ?? "0.0.0.0",
     port,
   };

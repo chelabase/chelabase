@@ -1,0 +1,10 @@
+Subject: Your {{project}} verification code
+
+Your {{project}} verification code is:
+
+    {{code}}
+
+Enter it to confirm your email address. It expires in {{expires}} and works once.
+Enter it at: {{link}}
+
+If you didn't ask for this, you can ignore this email.

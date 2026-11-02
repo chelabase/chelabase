@@ -38,3 +38,13 @@ test-group = "stack-serial"
 [[profile.default.overrides]]
 filter = 'package(chelabase-metadata) & binary(members_live)'
 test-group = "stack-serial"
+
+# `purge_app_sessions` clears every session's sealed grace token past its window, table-wide.
+# Tests that hold such a session (the peek test compares rows before and after) never run beside
+# the purge tests.
+[test-groups.app-sessions-purge]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(chelabase-metadata) & binary(live_db) & test(/^(purge_app_sessions_|peek_answers_like_refresh_and_writes_nothing$)/)'
+test-group = "app-sessions-purge"
