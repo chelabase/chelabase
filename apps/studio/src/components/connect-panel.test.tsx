@@ -151,6 +151,20 @@ describe("ConnectPanel", () => {
     expect(f.calls.some((r) => new URL(r.url).searchParams.get("database") === "later")).toBe(false);
   });
 
+  it("links the system database's Manage Data API without a Postgres database, so the page opens on main", async () => {
+    setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("postgres", { origin: "system", data_api: "off" })]);
+    await userEvent.selectOptions(await screen.findByLabelText("Postgres DB"), "postgres");
+    await waitFor(() => expect(screen.getByRole("link", { name: "Manage Data API" })).toHaveAttribute("href", "/app/data-api/p1/db/id-main"));
+    expect(screen.getByText(/Data API can't serve the system database/)).toBeInTheDocument();
+  });
+
+  it("says a Postgres database's Data API is enabling, not off", async () => {
+    setup(threeBranches, "developer", [dbRow("web1", { main: true }), dbRow("slow", { data_api: "enabling" })]);
+    await userEvent.selectOptions(await screen.findByLabelText("Postgres DB"), "slow");
+    expect(await screen.findByText(/Data API is enabling for slow/)).toBeInTheDocument();
+    expect(screen.queryByText(/Data API is off/)).not.toBeInTheDocument();
+  });
+
   it("gives a Viewer the endpoint and link but no logins line", async () => {
     setup(threeBranches, "viewer");
     expect(await screen.findByText("chk_pub_MAIN")).toBeInTheDocument();
