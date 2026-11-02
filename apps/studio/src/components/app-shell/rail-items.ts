@@ -1,12 +1,12 @@
-import { BookOpenText, Boxes, SquareTerminal, Table2, Users, type LucideIcon } from "lucide-react";
+import { BookOpenText, Boxes, KeyRound, SquareTerminal, Table2, Users, type LucideIcon } from "lucide-react";
 import { projectCaps } from "@/lib/capabilities";
 import type { MeResponse } from "@chelabase/management-client";
 
 export type RailLink = {
   kind: "link";
-  id: "projects" | "tables" | "sql" | "api" | "members";
+  id: "projects" | "tables" | "sql" | "data-api" | "api" | "members";
   label: string;
-  to: "/app" | "/app/tables" | "/app/sql" | "/app/api" | "/app/members";
+  to: "/app" | "/app/tables" | "/app/sql" | "/app/data-api" | "/app/api" | "/app/members";
   icon: LucideIcon;
 };
 export type RailPlaceholder = { kind: "placeholder"; id: string; label: "Placeholder"; icon: LucideIcon };
@@ -17,6 +17,7 @@ export const RAIL_ENTRIES: readonly RailEntry[] = [
   { kind: "link", id: "projects", label: "Projects", to: "/app", icon: Boxes },
   { kind: "link", id: "tables", label: "Table editor", to: "/app/tables", icon: Table2 },
   { kind: "link", id: "sql", label: "SQL editor", to: "/app/sql", icon: SquareTerminal },
+  { kind: "link", id: "data-api", label: "Data API", to: "/app/data-api", icon: KeyRound },
   { kind: "link", id: "api", label: "API reference", to: "/app/api", icon: BookOpenText },
   { kind: "link", id: "members", label: "Members", to: "/app/members", icon: Users },
 ];
@@ -26,6 +27,9 @@ export const TABLES_ROUTE = "/app/tables/{-$projectId}/{-$databaseId}/{-$branchI
 
 /** The SQL editor's route: every level is an optional segment, so the rail links to it bare. */
 export const SQL_ROUTE = "/app/sql/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}" as const;
+
+/** The Data API page's route: every level is an optional segment, so the rail links to it bare. */
+export const DATA_API_ROUTE = "/app/data-api/{-$projectId}/{-$databaseId}/{-$branchId}/{-$pgDatabase}" as const;
 
 /** The SQL editor needs Developer: the caller must be one on some database (Viewers read through Tables). */
 export function canUseSql(me: MeResponse | undefined): boolean {
@@ -49,6 +53,8 @@ export function isRailItemActive(id: RailLink["id"], pathname: string): boolean 
       return pathname === "/app/tables" || pathname.startsWith("/app/tables/");
     case "sql":
       return pathname === "/app/sql" || pathname.startsWith("/app/sql/");
+    case "data-api":
+      return pathname === "/app/data-api" || pathname.startsWith("/app/data-api/");
     case "api":
       return pathname === "/app/api" || pathname.startsWith("/app/api/");
     case "members":

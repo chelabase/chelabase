@@ -19,6 +19,15 @@ describe("isRailItemActive", () => {
     expect(isRailItemActive("projects", "/app/sql")).toBe(false);
   });
 
+  it("data_api_item_active_on_data_api_routes", () => {
+    expect(isRailItemActive("data-api", "/app/data-api")).toBe(true);
+    expect(isRailItemActive("data-api", "/app/data-api/p1/d1/b1/app")).toBe(true);
+    expect(isRailItemActive("data-api", "/app/data-apix")).toBe(false);
+    expect(isRailItemActive("data-api", "/app/api")).toBe(false);
+    expect(isRailItemActive("api", "/app/data-api")).toBe(false);
+    expect(isRailItemActive("projects", "/app/data-api")).toBe(false);
+  });
+
   it("projects is active on /app, /app/ and /app/projects/p1", () => {
     expect(isRailItemActive("projects", "/app")).toBe(true);
     expect(isRailItemActive("projects", "/app/")).toBe(true);
@@ -50,15 +59,16 @@ describe("isRailItemActive", () => {
 });
 
 describe("RAIL_ENTRIES", () => {
-  it("lists Projects, Table editor, SQL editor, API reference and Members (last) in order", () => {
+  it("lists Projects, Table editor, SQL editor, Data API, API reference and Members (last) in order", () => {
     expect(RAIL_ENTRIES.map((e) => [e.kind, e.id, e.label])).toEqual([
       ["link", "projects", "Projects"],
       ["link", "tables", "Table editor"],
       ["link", "sql", "SQL editor"],
+      ["link", "data-api", "Data API"],
       ["link", "api", "API reference"],
       ["link", "members", "Members"],
     ]);
-    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/api", "/app/members"]);
+    expect(RAIL_ENTRIES.flatMap((e) => (e.kind === "link" ? [e.to] : []))).toEqual(["/app", "/app/tables", "/app/sql", "/app/data-api", "/app/api", "/app/members"]);
   });
 });
 

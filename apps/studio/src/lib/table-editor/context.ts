@@ -14,6 +14,8 @@ export const LEVELS: readonly (keyof EditorParams)[] = ["projectId", "databaseId
 export const LAST_KEY = "chelabase.studio.tables.last";
 /** The SQL editor's own last place (its levels stop at the Postgres database). */
 export const SQL_LAST_KEY = "chelabase.studio.sql.last";
+/** The Data API page's own last place (its levels stop at the Postgres database too). */
+export const DATA_API_LAST_KEY = "chelabase.studio.data-api.last";
 
 /** The URL of a place: each present level up to the first missing one. */
 export function editorPath(p: EditorParams): string {
@@ -42,7 +44,7 @@ export function editorRouteParams(p: EditorParams): Record<keyof EditorParams, s
   };
 }
 
-/** The SQL editor's route params: the place down to the Postgres database, `undefined` for a missing level. */
+/** The SQL editor's and the Data API page's route params: the place down to the Postgres database, `undefined` for a missing level. */
 export function sqlRouteParams(p: EditorParams): Pick<Record<keyof EditorParams, string | undefined>, "projectId" | "databaseId" | "branchId" | "pgDatabase"> {
   const { projectId, databaseId, branchId, pgDatabase } = editorRouteParams(p);
   return { projectId, databaseId, branchId, pgDatabase };
