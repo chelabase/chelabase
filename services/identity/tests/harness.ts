@@ -7,7 +7,7 @@ import pg from "pg";
 import { describe } from "vitest";
 import type { Caller, Config } from "../src/config.ts";
 import { startServer, type RunningServer } from "../src/server.ts";
-import { ADMIN_FIXTURE } from "./admin-fixture.ts";
+import { ADMIN_FIXTURE, identityLoginUrl } from "./admin-fixture.ts";
 
 export const TEST_DB_URL = process.env.CHELABASE_IDENTITY_TEST_DB_URL;
 export const describeDb = describe.skipIf(!TEST_DB_URL);
@@ -27,8 +27,9 @@ export async function startHarness(overrides: Partial<Config> = {}): Promise<Har
     orchestrator: randomBytes(32).toString("hex"),
     worker: randomBytes(32).toString("hex"),
   };
+  // The service connects as m5's login role, as on the stack; `db` stays the superuser's.
   const server = await startServer({
-    databaseUrl: TEST_DB_URL!,
+    databaseUrl: identityLoginUrl(TEST_DB_URL!),
     secret: randomBytes(32).toString("hex"),
     callerTokens: new Map(Object.entries(tokens) as [Caller, string][]),
     poolCacheSize: 16,

@@ -6,7 +6,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import pg from "pg";
 import { parsePoolName, type PoolRef } from "../src/pool-name.ts";
 import { PoolRegistry } from "../src/registry.ts";
-import { ADMIN_FIXTURE } from "../tests/admin-fixture.ts";
+import { ADMIN_FIXTURE, identityLoginUrl } from "../tests/admin-fixture.ts";
 
 const url = process.env.CHELABASE_IDENTITY_TEST_DB_URL;
 if (!url) throw new Error("set CHELABASE_IDENTITY_TEST_DB_URL");
@@ -23,7 +23,7 @@ function rss(): number {
 
 const db = new pg.Pool({ connectionString: url, max: 1 });
 await db.query(ADMIN_FIXTURE);
-const registry = new PoolRegistry(url, randomBytes(32).toString("hex"), n);
+const registry = new PoolRegistry(identityLoginUrl(url), randomBytes(32).toString("hex"), n);
 const pools: PoolRef[] = Array.from({ length: n }, () => parsePoolName(`app-${randomUUID()}`)!);
 
 try {

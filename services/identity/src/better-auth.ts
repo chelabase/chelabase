@@ -2,9 +2,9 @@
 // schema and the pg pool differ.
 import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { admin, bearer } from "better-auth/plugins";
-import { PostgresDialect } from "kysely";
 import type pg from "pg";
 import { CodeStore, codesSchemaPlugin } from "./email/codes.ts";
+import { PoolDialect } from "./pool-dialect.ts";
 
 /**
  * Better Auth wants a base URL for callbacks and redirects. Its HTTP handler is never
@@ -25,7 +25,8 @@ function plugins() {
  *
  * `schemaName` set: every query is schema-qualified (runtime). Left out: Better Auth targets
  * the connection's `current_schema()` and never emits `CREATE SCHEMA` (migrations, which run
- * as a role without database CREATE; the schema already exists by then).
+ * as a role without database CREATE; the schema already exists by then). Either way Better
+ * Auth's introspection reads that one schema only (see pool-dialect.ts).
  */
 export function authOptions(pool: pg.Pool, secret: string, schema: string | undefined) {
   return {
@@ -33,7 +34,7 @@ export function authOptions(pool: pg.Pool, secret: string, schema: string | unde
     baseURL: BASE_URL,
     secret,
     database: {
-      dialect: new PostgresDialect({ pool }),
+      dialect: new PoolDialect({ pool }, schema),
       type: "postgres",
       ...(schema === undefined ? {} : { schemaName: schema }),
     },
