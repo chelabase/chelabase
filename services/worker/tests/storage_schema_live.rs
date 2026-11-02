@@ -488,6 +488,11 @@ async fn run(fx: &Fx) {
         "UPDATE storage.objects SET name = 'u1/renamed.png' WHERE name = 'u1/me.png'",
     )
     .await;
+    // m5 phase B (schema 5): every update stamps updated_at.
+    assert_eq!(
+        fx.value("SELECT updated_at > created_at FROM storage.objects WHERE name = 'u1/renamed.png'").await,
+        "t"
+    );
 
     // A ticket left on main when the branch is made.
     fx.as_role_commit(
@@ -1552,10 +1557,26 @@ async fn storage_api_objects(fx: &Fx) {
     let up = |name: &str| format!("/storage/v1/object/files/{name}");
     fx.bucket("files").await;
     fx.bucket("other").await;
+    fx.bucket("secret").await;
+    // Object routes need the bucket visible to the caller: every bucket but `secret`.
+    let visible = "'name <> ''secret'''";
+    fx.owner(&format!("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], {visible}, NULL)"))
+        .await
+        .unwrap();
 
-    // No policy: 403, and nothing reached the object store.
+    // A bucket the caller can't see and one that doesn't exist answer the same bytes.
+    let hidden = object("POST", "/storage/v1/object/secret/a.txt", &secret, Some(b"x".to_vec().into()), &[]).await;
+    let missing = object("POST", "/storage/v1/object/ghost/a.txt", &secret, Some(b"x".to_vec().into()), &[]).await;
+    assert_eq!((hidden.0, &hidden.2), (missing.0, &missing.2));
+    assert_eq!((hidden.0, json_of(&hidden.2)["error"]["code"].clone()), (403, json!("not_allowed")));
+    let hidden = object("GET", "/storage/v1/object/secret/a.txt", &secret, None, &[]).await;
+    let missing_get = object("GET", "/storage/v1/object/ghost/a.txt", &secret, None, &[]).await;
+    assert_eq!((hidden.0, &hidden.2), (missing_get.0, &missing_get.2));
+
+    // No object policy: the same 403, and nothing reached the object store.
     let (status, _, b) = object("POST", &up("a.txt"), &secret, Some(b"hello".to_vec().into()), &[]).await;
     assert_eq!(status, 403, "{}", json_of(&b));
+    assert_eq!(b, missing.2, "an RLS refusal answers as a hidden bucket");
     assert!(fx.blobs(&store).await.is_empty());
 
     // Policies: `hidden/…` can't be read; 666 bytes and text/html can't be written.
@@ -1648,12 +1669,18 @@ async fn storage_api_objects(fx: &Fx) {
     let (status, _, b) = object("GET", "/storage/v1/object/other/moved/b.txt", &secret, None, &[]).await;
     assert_eq!((status, &b[..]), (200, &b"hello world"[..]));
 
-    // Without upsert an existing name is 409; with it, the object is replaced.
+    // Without upsert an existing name is 409; with it, the object is replaced and its
+    // updated_at advances (schema 5's trigger).
     assert_eq!(object("POST", &up("docs/a.txt"), &secret, Some(b"x".to_vec().into()), &[]).await.0, 409);
+    let stamped = "SELECT updated_at::text FROM storage.objects WHERE name = 'docs/a.txt'";
+    let before_upsert = fx.value(stamped).await;
     let upsert = [("x-upsert", "true")];
     let (status, _, b) = object("PUT", &up("docs/a.txt"), &secret, Some(b"v2".to_vec().into()), &upsert).await;
     assert_eq!(status, 200, "{}", json_of(&b));
     assert_eq!(&object("GET", &up("docs/a.txt"), &secret, None, &[]).await.2[..], &b"v2"[..]);
+    let after_upsert = fx.value(stamped).await;
+    let advanced = fx.value(&format!("SELECT '{after_upsert}'::timestamptz > '{before_upsert}'::timestamptz")).await;
+    assert_eq!(advanced, "t", "updated_at {before_upsert} -> {after_upsert}");
 
     // Racing upserts of one existing name: one wins, the other is 409, and the winner's row and
     // blob stay.
@@ -1721,6 +1748,9 @@ async fn storage_api_list_live() {
 async fn storage_api_list(fx: &Fx) {
     let secret = fx.secret_key("st-list", None).await;
     fx.bucket("files").await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
     fx.owner("SELECT storage.create_policy('o_all', 'objects', 'ALL', ARRAY['authenticated']::name[], 'true', 'true')")
         .await
         .unwrap();
@@ -1781,6 +1811,9 @@ async fn storage_api_slow_uploads_live() {
 async fn storage_api_slow_uploads(fx: &Fx) {
     let secret = fx.secret_key("st-slow", None).await;
     fx.bucket("files").await;
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)")
+        .await
+        .unwrap();
     fx.owner("SELECT storage.create_policy('o_all', 'objects', 'ALL', ARRAY['authenticated']::name[], 'true', 'true')")
         .await
         .unwrap();

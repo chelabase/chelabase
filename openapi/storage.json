@@ -115,7 +115,7 @@
             }
           },
           "400": {
-            "description": "`invalid_request`, `invalid_value`",
+            "description": "`invalid_request`, `invalid_value`, `reserved_bucket_name`",
             "content": {
               "application/json": {
                 "schema": {
@@ -283,7 +283,7 @@
             "description": "Changed"
           },
           "400": {
-            "description": "`invalid_request`, `invalid_value`",
+            "description": "`invalid_request`, `invalid_value`, `reserved_bucket_name`",
             "content": {
               "application/json": {
                 "schema": {
@@ -918,17 +918,7 @@
             }
           },
           "403": {
-            "description": "`permission_denied`: no policy allows it; `database_not_allowed`, `role_not_allowed`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/StorageErrorEnvelope"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "`bucket_not_found`",
+            "description": "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`",
             "content": {
               "application/json": {
                 "schema": {

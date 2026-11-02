@@ -162,25 +162,30 @@ pub async fn stage(
     }
 }
 
-/// After the row's statement (`finish`): on success the staged blob becomes `version_key`; on
-/// failure it is deleted (its ticket simply expires). The staged blob never outlives the call.
-pub async fn settle<T>(
+/// Promotes before the row: copies `staging` to `version_key`, then runs `write` (the
+/// caller's row). A failed copy is 502 and `write` never runs; a failed `write` deletes the
+/// version key's blob. The staging blob is deleted either way, so no row ever points at a
+/// missing blob and no blob outlives a refused row.
+pub async fn promote_then<T>(
     store: &dyn ObjectStore,
     staging: &str,
     version_key: &str,
-    finish: Result<T, Failure>,
+    write: impl AsyncFnOnce() -> Result<T, Failure>,
     request_id: &str,
 ) -> Result<T, Failure> {
-    let out = match finish {
-        Ok(t) => store
-            .copy(staging, version_key)
-            .await
-            .map(|_| t)
-            .map_err(|e| {
-                tracing::error!(request_id, version_key, "promoting a committed upload: {e}");
-                Failure::from_store(&e, request_id)
-            }),
-        Err(f) => Err(f),
+    let out = match store.copy(staging, version_key).await {
+        Err(e) => {
+            tracing::warn!(request_id, version_key, "promoting an upload: {e}");
+            let _ = store.delete(version_key).await;
+            Err(Failure::store_failed())
+        }
+        Ok(_) => match write().await {
+            Ok(t) => Ok(t),
+            Err(f) => {
+                let _ = store.delete(version_key).await;
+                Err(f)
+            }
+        },
     };
     let _ = store.delete(staging).await;
     out
@@ -276,10 +281,36 @@ mod tests {
         assert_eq!((meta.size, counter.bytes.load(Ordering::SeqCst)), (5, 5));
     }
 
-    /// AC: a refused row deletes the staged blob (nothing at the version key); an accepted one
-    /// moves it to the version key, and the staging key is gone either way.
+    /// The upload's promote comes before the row: a failed copy is 502, the write never runs
+    /// and nothing is left (no row can point at a missing blob).
     #[tokio::test]
-    async fn settle_promotes_or_deletes_the_staged_blob() {
+    async fn a_failed_promote_writes_no_row_and_leaves_nothing() {
+        let store = MemoryStore::default();
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        // Nothing at the staging key: the copy fails.
+        let out = promote_then(
+            &store,
+            "p/staging/1",
+            "p/v1",
+            async || {
+                ran.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            "r",
+        )
+        .await;
+        assert_eq!(out.unwrap_err().0.status.as_u16(), 502);
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the row was written without its blob"
+        );
+        assert!(store.list("p/").await.unwrap().is_empty());
+    }
+
+    /// A row refused after the promote leaves no blob at the version key (nor at the staging
+    /// key); an accepted one leaves exactly the version key.
+    #[tokio::test]
+    async fn a_refused_row_after_the_promote_leaves_no_blob() {
         let store = MemoryStore::default();
         store
             .put(
@@ -289,12 +320,15 @@ mod tests {
             )
             .await
             .unwrap();
-        let refused: Result<(), Failure> = Err(Failure::object_conflict());
-        assert!(
-            settle(&store, "p/staging/1", "p/v1", refused, "r")
-                .await
-                .is_err()
-        );
+        let out: Result<(), Failure> = promote_then(
+            &store,
+            "p/staging/1",
+            "p/v1",
+            async || Err(Failure::object_conflict()),
+            "r",
+        )
+        .await;
+        assert_eq!(out.unwrap_err().0.status.as_u16(), 409);
         assert!(store.list("p/").await.unwrap().is_empty());
         store
             .put(
@@ -304,7 +338,7 @@ mod tests {
             )
             .await
             .unwrap();
-        settle(&store, "p/staging/2", "p/v2", Ok(()), "r")
+        promote_then(&store, "p/staging/2", "p/v2", async || Ok(()), "r")
             .await
             .unwrap();
         let keys: Vec<String> = store

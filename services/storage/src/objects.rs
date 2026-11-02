@@ -1,7 +1,10 @@
 //! `/storage/v1/object`: upload, download, head, delete, copy, move and list. Every route runs
 //! its metadata statement in `storage.objects` as the caller (row level security decides)
 //! before it touches the object store; an object the caller's policies hide is 404, as a
-//! missing one. A bucket's id (a managed column) is looked up as storage itself.
+//! missing one. Every route first looks the bucket up as the caller: callers need a SELECT
+//! policy on `storage.buckets`. A bucket they can't see answers 403 `not_allowed`, exactly as an
+//! RLS refusal of the operation does, whether it exists or not; only then is its id (a managed
+//! column) and limit read as storage itself.
 //!
 //! An upload (m3's tickets; no Postgres transaction is held across the body):
 //! 1. pre-check as the caller: the existing row's version (if any) and, in a savepoint rolled
@@ -110,13 +113,39 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         bucket: &str,
         rid: &str,
     ) -> Result<(Uuid, Option<i64>), Failure> {
+        // As the caller first: a bucket it can't see answers as a refusal, whether it exists.
+        let (seen, _) = self
+            .caller(data, at, rid, async |c, _| {
+                c.query_opt("SELECT 1 FROM storage.buckets WHERE name = $1", &[&bucket])
+                    .await
+                    .map_err(pg(rid))
+            })
+            .await?;
+        if seen.is_none() {
+            return Err(Failure::not_allowed());
+        }
         let rows = self
             .engine
             .managed(data.branch_id, &at.database, &BUCKET, &[&bucket], rid)
             .await?;
         rows.first()
             .map(|r| (r.get(0), r.get(1)))
-            .ok_or_else(|| Failure::bucket_not_found(bucket))
+            .ok_or_else(Failure::not_allowed)
+    }
+
+    /// [`crate::engine::Engine::as_caller`] in the located database, a refusal as
+    /// [`Failure::not_allowed`].
+    async fn caller<T>(
+        &self,
+        data: &DataIdentity,
+        at: &Located,
+        rid: &str,
+        f: impl AsyncFnOnce(&tokio_postgres::Client, &str) -> Result<T, chelabase_query::QueryFailure>,
+    ) -> Result<(T, String), Failure> {
+        self.engine
+            .as_caller(data, Some(&at.database), rid, f)
+            .await
+            .map_err(Failure::refusal)
     }
 
     /// Pre-check (step 1): the version of the row the caller sees at the name (`None`: none),
@@ -131,8 +160,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         rid: &str,
     ) -> Result<Option<Uuid>, Failure> {
         let (seen, _) = self
-            .engine
-            .as_caller(data, Some(&at.database), rid, async |c, _| {
+            .caller(data, at, rid, async |c, _| {
                 let seen = c
                     .query_opt(
                         "SELECT version_id FROM storage.objects WHERE bucket_id = $1 AND name = $2",
@@ -170,7 +198,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                     Err(f) if f.sqlstate.as_deref() == Some("23505") => {
                         Err(Failure::object_conflict())
                     }
-                    Err(f) => Err(Failure(f)),
+                    Err(f) => Err(Failure(f).refusal()),
                     // A ticket happened to match: the policy passed all the same.
                     Ok(_) => Ok(seen.flatten()),
                 })
@@ -179,7 +207,8 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         seen
     }
 
-    /// Steps 3 and 4: the ticket, then the caller's own write of `row`. `expected`: the version
+    /// Steps 3 and 4 (copy: its blob is already at the version key): the ticket, then the
+    /// caller's own write of `row`. `expected`: the version
     /// the pre-check saw at the name (an upsert replaces only it).
     async fn write(
         &self,
@@ -188,6 +217,19 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         row: &Row,
         expected: Option<Uuid>,
         upsert: bool,
+        rid: &str,
+    ) -> Result<(), Failure> {
+        self.ticket(data, at, row, rid).await?;
+        self.final_write(data, at, row, expected, upsert, rid).await
+    }
+
+    /// Step 3: the ticket for `row` (its version, real size and etag), the caller's role and
+    /// owner, written as storage itself.
+    async fn ticket(
+        &self,
+        data: &DataIdentity,
+        at: &Located,
+        row: &Row,
         rid: &str,
     ) -> Result<(), Failure> {
         let size = row.size.unwrap_or_default();
@@ -208,9 +250,22 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
                 rid,
             )
             .await?;
+        Ok(())
+    }
+
+    /// Step 4: the caller's own write of `row`; `expected`: the version the pre-check saw at
+    /// the name (an upsert replaces only it).
+    async fn final_write(
+        &self,
+        data: &DataIdentity,
+        at: &Located,
+        row: &Row,
+        expected: Option<Uuid>,
+        upsert: bool,
+        rid: &str,
+    ) -> Result<(), Failure> {
         let (written, _) = self
-            .engine
-            .as_caller(data, Some(&at.database), rid, async |c, _| {
+            .caller(data, at, rid, async |c, _| {
                 let base: [&(dyn tokio_postgres::types::ToSql + Sync); 7] = [
                     &row.bucket,
                     &row.name,
@@ -304,9 +359,25 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
     })?;
     row.size = Some(meta.size as i64);
     row.etag = Some(meta.etag.trim_matches('"').to_owned());
-    let written = state.write(&data, &at, &row, expected, upsert, &rid).await;
+    // The ticket, then the blob at its version's key, then the row: a row never points at a
+    // missing blob, and a refused row leaves no blob behind.
+    if let Err(f) = state.ticket(&data, &at, &row, &rid).await {
+        let _ = state.store.delete(&staging).await;
+        return Err(f);
+    }
     let key = names::version_key(&at.prefix, row.version);
-    names::settle(state.store.as_ref(), &staging, &key, written, &rid).await?;
+    names::promote_then(
+        state.store.as_ref(),
+        &staging,
+        &key,
+        async || {
+            state
+                .final_write(&data, &at, &row, expected, upsert, &rid)
+                .await
+        },
+        &rid,
+    )
+    .await?;
     Ok(Json(json!({
         "bucket": bucket, "name": row.name, "version_id": row.version, "size": row.size, "etag": row.etag,
     }))
@@ -326,8 +397,7 @@ async fn upload_object<S: ConnSource, M: ConnSource>(
     responses(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
         (status = 400, description = "`invalid_request`", body = StorageErrorEnvelope),
-        (status = 403, description = "`permission_denied`: no policy allows it; `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
-        (status = 404, description = "`bucket_not_found`", body = StorageErrorEnvelope),
+        (status = 403, description = "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`: over the bucket's file size limit", body = StorageErrorEnvelope),
         (status = 502, description = "`storage_error`: the object store failed", body = StorageErrorEnvelope),
@@ -386,8 +456,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     ) -> Result<(Uuid, Found), Failure> {
         let (bucket_id, _) = self.bucket(data, at, bucket, rid).await?;
         let (row, _) = self
-            .engine
-            .as_caller(data, Some(&at.database), rid, async |c, _| {
+            .caller(data, at, rid, async |c, _| {
                 c.query_opt(
                     "SELECT version_id, size, etag, content_type, owner FROM storage.objects WHERE bucket_id = $1 AND name = $2 AND version_id IS NOT NULL",
                     &[&bucket_id, &name],
@@ -552,8 +621,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         let at = self.engine.locate(data, q.database.as_deref(), rid).await?;
         let (bucket_id, _) = self.bucket(data, &at, bucket, rid).await?;
         let (deleted, _) = self
-            .engine
-            .as_caller(data, Some(&at.database), rid, async |c, _| {
+            .caller(data, &at, rid, async |c, _| {
                 let rows = c
                     .query("DELETE FROM storage.objects WHERE bucket_id = $1 AND name = ANY($2) RETURNING name", &[&bucket_id, &names])
                     .await
@@ -751,8 +819,7 @@ pub async fn r#move<S: ConnSource, M: ConnSource>(
             .await?;
     }
     let (moved, _) = state
-        .engine
-        .as_caller(&data, Some(&at.database), &rid, async |c, _| {
+        .caller(&data, &at, &rid, async |c, _| {
             c.execute(
                 "UPDATE storage.objects SET bucket_id = $3, name = $4 WHERE bucket_id = $1 AND name = $2 AND version_id = $5",
                 &[&from_id, &r.from, &to_id, &r.to, &src.version],
@@ -865,8 +932,7 @@ pub async fn list<S: ConnSource, M: ConnSource>(
     let delimiter = l.delimiter.unwrap_or_default();
     let fetch = limit + 1;
     let (rows, _) = state
-        .engine
-        .as_caller(&data, Some(&at.database), &rid, async |c, _| {
+        .caller(&data, &at, &rid, async |c, _| {
             c.query(
                 &sql,
                 &[

@@ -117,6 +117,35 @@ impl Failure {
         )
     }
 
+    /// 502: the object store failed (the caller logs why).
+    pub fn store_failed() -> Self {
+        Self::new(
+            StatusCode::BAD_GATEWAY,
+            "storage_error",
+            "the object store failed; try again",
+        )
+    }
+
+    /// 403 on the object routes: row level security refused the operation, or the caller
+    /// can't see the bucket. One answer for both, whether the bucket exists or not.
+    pub fn not_allowed() -> Self {
+        Self::new(
+            StatusCode::FORBIDDEN,
+            "not_allowed",
+            "the caller may not do this in this bucket",
+        )
+    }
+
+    /// An object route's statement failure: RLS's 42501 becomes [`Self::not_allowed`], so a
+    /// refusal can't be told apart from a bucket the caller can't see.
+    pub fn refusal(self) -> Self {
+        if self.0.sqlstate.as_deref() == Some("42501") {
+            Self::not_allowed()
+        } else {
+            self
+        }
+    }
+
     /// The object store failed (logged with the request id).
     pub fn from_store(e: &chelabase_storage::StorageError, request_id: &str) -> Self {
         match e {
@@ -236,5 +265,26 @@ mod tests {
         );
         let (status, _, _) = body(Failure::from_acquire(&AcquireError::NotServed, "r")).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// A bucket the caller can't see (missing or hidden alike) and an RLS refusal of the object
+    /// operation answer the same bytes.
+    #[tokio::test]
+    async fn a_hidden_bucket_and_a_refusal_answer_alike() {
+        let mut rls = QueryFailure::new(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "new row violates row-level security policy for table \"objects\"",
+        );
+        rls.sqlstate = Some("42501".into());
+        let refused = Failure(rls).refusal().into_response();
+        let hidden = Failure::not_allowed().into_response();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let bytes =
+            |r: Response| async { axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap() };
+        assert_eq!(bytes(refused).await, bytes(hidden).await);
+        // Anything else keeps its own answer.
+        let other = Failure::object_conflict().refusal();
+        assert_eq!(other.0.code, "conflict");
     }
 }
