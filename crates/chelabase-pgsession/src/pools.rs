@@ -3,10 +3,9 @@
 //! Connection info comes from the orchestrator's internal listener and is cached 60 s (or
 //! until [`Pools::invalidate`]). Each served database of a branch gets its own
 //! deadpool-postgres pool (dropped after 5 minutes unused); every pool of a branch waits on
-//! one set of branch slots (the service's share of `max_connections`: [`Settings::share`],
-//! so the services together stay within it), and one global semaphore caps connections
-//! across every branch. Open connections, idle ones included, stay within that share per
-//! branch too: before a pool may open one, idle connections of the branch's other pools
+//! one set of branch slots (the service's [`Budget`]: rest's is `max_connections`), and one
+//! global semaphore caps connections across every branch. Open connections, idle ones
+//! included, stay within that budget per branch too: before a pool may open one, idle connections of the branch's other pools
 //! are closed, least recently used pool first and oldest connection first
 //! ([`idle_to_close`], [`oldest_first`]). A reaper closes connections idle past
 //! [`CONNECTION_IDLE`]. A connection that fails to open (the compute moved after a reset or
@@ -71,8 +70,9 @@ pub struct Settings {
     pub max_connections: u32,
 }
 
-/// A service that opens connections to a branch's compute. Each has its own share of the
-/// branch's `max_connections` ([`Settings::share`]), so together they never open more.
+/// A service that opens connections to a branch's compute, each within its own per-branch
+/// [`Budget`]: rest the branch's data API `max_connections` ([`data_api_budget`]), storage
+/// its own setting, passed in by its caller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Service {
     /// The data API (rest).
@@ -82,9 +82,6 @@ pub enum Service {
 }
 
 impl Service {
-    /// Every service that shares a branch's connections.
-    pub const ALL: [Service; 2] = [Service::Rest, Service::Storage];
-
     /// The `application_name` its connections open with.
     pub fn application_name(self) -> &'static str {
         match self {
@@ -94,18 +91,12 @@ impl Service {
     }
 }
 
-impl Settings {
-    /// How many of the branch's `max_connections` (at least 1) `service` may hold open:
-    /// storage a fifth, rounded up, from 2 on (none below: a one-connection branch is the
-    /// data API's), rest the rest. The shares add up to `max_connections`.
-    pub fn share(&self, service: Service) -> u32 {
-        let max = self.max_connections.max(1);
-        let storage = if max >= 2 { max.div_ceil(5) } else { 0 };
-        match service {
-            Service::Rest => max - storage,
-            Service::Storage => storage,
-        }
-    }
+/// How many connections a service may hold open to one branch, from the branch's info.
+pub type Budget = fn(&ConnInfo) -> u32;
+
+/// Rest's budget: the branch's data API `max_connections` (at least 1).
+pub fn data_api_budget(info: &ConnInfo) -> u32 {
+    info.settings.max_connections.max(1)
 }
 
 /// A database the branch's data API serves.
@@ -136,11 +127,6 @@ pub struct ConnInfo {
 }
 
 impl ConnInfo {
-    /// `service`'s share of the branch's connections ([`Settings::share`]).
-    pub fn share(&self, service: Service) -> u32 {
-        self.settings.share(service)
-    }
-
     /// The served database named `name`.
     pub fn served(&self, name: &str) -> Option<&ServedDatabase> {
         self.databases.iter().find(|d| d.name == name)
@@ -657,8 +643,10 @@ pub struct Pools<S> {
     permits: Arc<Semaphore>,
     /// The platform CA computes are verified against (U15); `None` only for the fakes.
     server_tls: Option<ServerTls>,
-    /// Whose share of each branch's connections the pools stay within.
+    /// Whose connections these are (their `application_name`).
     service: Service,
+    /// How many connections to each branch they may hold open.
+    budget: Budget,
 }
 
 /// Failing to open a connection, before any statement: worth a fresh look at where the
@@ -708,13 +696,16 @@ impl<S: ConnSource> Pools<S> {
             permits: Arc::new(Semaphore::new(max_connections)),
             server_tls: None,
             service: Service::Rest,
+            budget: data_api_budget,
         }
     }
 
-    /// The pools as `service`'s (rest's by default): each branch's connections stay within
-    /// its share, and they open with its `application_name`.
-    pub fn for_service(mut self, service: Service) -> Self {
+    /// The pools as `service`'s (rest's, within [`data_api_budget`], by default): each
+    /// branch's connections stay within `budget` (0: none are opened), and they open with the
+    /// service's `application_name`.
+    pub fn for_service(mut self, service: Service, budget: Budget) -> Self {
         self.service = service;
+        self.budget = budget;
         self
     }
 
@@ -736,6 +727,7 @@ impl<S: ConnSource> Pools<S> {
             permits: self.permits.clone(),
             server_tls: self.server_tls.clone(),
             service: self.service,
+            budget: self.budget,
             ..Pools::new(source, 0)
         }
     }
@@ -804,17 +796,17 @@ impl<S: ConnSource> Pools<S> {
         let p = Arc::new(DbPool::with_connector(
             info.clone(),
             config,
-            info.share(self.service).max(1) as usize,
+            (self.budget)(info).max(1) as usize,
             connector,
         ));
         self.pools.insert(key, p.clone()).await;
         Ok(p)
     }
 
-    /// The branch's slots and pools, resized in place when `max_connections` changed: the
-    /// service's share of them.
+    /// The branch's slots and pools, resized in place when the service's budget (rest's:
+    /// `max_connections`) changed.
     async fn branch(&self, branch: Uuid, info: &ConnInfo) -> Arc<BranchSlots> {
-        let size = info.share(self.service) as usize;
+        let size = (self.budget)(info) as usize;
         let slots = self
             .slots
             .get_with(branch, async { Arc::new(BranchSlots::new(size)) })
@@ -884,8 +876,8 @@ impl<S: ConnSource> Pools<S> {
             if info.served(database).is_none() {
                 return Err(AcquireError::NotServed);
             }
-            // A branch too small to give the service a connection.
-            let cap = info.share(self.service);
+            // A service with no connections to this branch.
+            let cap = (self.budget)(&info);
             if cap == 0 {
                 return Err(AcquireError::Busy);
             }
@@ -961,8 +953,7 @@ impl<S: ConnSource> Pools<S> {
 pub mod test_support {
     use super::*;
 
-    /// A branch serving `main` (`public`) and `analytics` (`reporting`), 3 connections
-    /// (rest's share: 2).
+    /// A branch serving `main` (`public`) and `analytics` (`reporting`), 2 connections.
     pub fn two_databases() -> ConnInfo {
         ConnInfo {
             host: "127.0.0.1".into(),
@@ -974,7 +965,7 @@ pub mod test_support {
             settings: Settings {
                 max_rows: 1000,
                 statement_timeout_ms: 8000,
-                max_connections: 3,
+                max_connections: 2,
             },
             databases: vec![
                 ServedDatabase {
@@ -1271,11 +1262,11 @@ mod tests {
         // Another branch has its own.
         let other = pools.slots(Uuid::new_v4(), &info).await;
         assert!(!Arc::ptr_eq(&slots, &other));
-        // A new `max_connections` resizes the branch's slots (to rest's share: 4 of 5).
+        // A new `max_connections` resizes the branch's slots.
         let mut bigger = (*info).clone();
         bigger.settings.max_connections = 5;
         let resized = pools.slots(branch, &Arc::new(bigger)).await;
-        assert_eq!(resized.available_permits(), 4);
+        assert_eq!(resized.available_permits(), 5);
     }
 
     fn load(size: u32, idle: usize, age_secs: u64) -> PoolLoad {
@@ -1331,9 +1322,9 @@ mod tests {
         }
     }
 
-    /// [`idle_to_close`] end to end: two databases of one branch with `max_connections` 3
-    /// (rest's share: 2). Two connections left idle in one, then one taken in the other:
-    /// rest never has more than 2 open.
+    /// [`idle_to_close`] end to end: two databases of one branch with `max_connections` 2.
+    /// Two connections left idle in one, then one taken in the other: the branch never has
+    /// more than 2 open.
     #[tokio::test]
     #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
     async fn open_connections_stay_within_the_branch_cap_live() {
@@ -1362,7 +1353,7 @@ mod tests {
             settings: Settings {
                 max_rows: 10,
                 statement_timeout_ms: 1000,
-                max_connections: 3,
+                max_connections: 2,
             },
             databases: [&a, &b]
                 .iter()
@@ -1437,31 +1428,27 @@ mod tests {
         }
     }
 
-    /// Every service's share together never passes the branch's `max_connections`, for
-    /// every value a branch may have; rest always keeps one, and storage has one from 2 on.
-    #[test]
-    fn the_services_shares_fit_the_branch_cap() {
+    /// Rest's budget is the branch's data API `max_connections`, as before services had
+    /// budgets (at least one connection).
+    #[tokio::test]
+    async fn rests_budget_is_the_branch_max_connections() {
         for max in 0..=60u32 {
-            let settings = Settings {
-                max_rows: 1,
-                statement_timeout_ms: 1,
-                max_connections: max,
-            };
-            let total: u32 = Service::ALL.iter().map(|s| settings.share(*s)).sum();
-            assert!(total <= max.max(1), "{total} shares of {max}");
-            assert!(settings.share(Service::Rest) >= 1, "rest at {max}");
-            if max >= 2 {
-                assert!(settings.share(Service::Storage) >= 1, "storage at {max}");
-            }
+            let mut info = super::test_support::two_databases();
+            info.settings.max_connections = max;
+            assert_eq!(data_api_budget(&info), max.max(1));
         }
+        let pools = Pools::new(super::test_support::RefusedSource, 1);
+        assert_eq!(pools.service, Service::Rest);
+        let info = super::test_support::two_databases();
+        assert_eq!((pools.budget)(&info), info.settings.max_connections);
     }
 
-    /// Two services' pools against one branch (here in one process; in production rest and
-    /// storage, each with its own [`Pools`]): however many connections each asks for at
-    /// once, the branch's open connections stay within `max_connections`, each service
-    /// within its share.
+    /// Rest and storage against one branch (here in one process; in production each service
+    /// has its own [`Pools`]): however many connections each asks for at once, each stays
+    /// within its own budget, rest the branch's `max_connections` and storage the budget its
+    /// caller passes, and storage holding all of its own takes nothing from rest.
     #[tokio::test]
-    async fn two_services_stay_within_the_branch_cap() {
+    async fn each_service_stays_within_its_own_budget() {
         use std::sync::atomic::Ordering;
         let fake = super::test_support::fake_pg(super::test_support::Answer::Ready).await;
         struct Five(u16);
@@ -1474,11 +1461,12 @@ mod tests {
             }
         }
         let rest = Arc::new(Pools::new(Five(fake.port), 100));
-        let storage = Arc::new(Pools::new(Five(fake.port), 100).for_service(Service::Storage));
+        let storage =
+            Arc::new(Pools::new(Five(fake.port), 100).for_service(Service::Storage, |_| 2));
         let branch = Uuid::new_v4();
         let mut tries = Vec::new();
-        for (i, pools) in std::iter::repeat_n(&rest, 8)
-            .chain(std::iter::repeat_n(&storage, 8))
+        for (i, pools) in std::iter::repeat_n(&storage, 8)
+            .chain(std::iter::repeat_n(&rest, 8))
             .enumerate()
         {
             let pools = pools.clone();
@@ -1494,13 +1482,14 @@ mod tests {
         for t in tries {
             held.push(t.await.unwrap());
         }
-        let (got_rest, got_storage) = (
+        let (got_storage, got_rest) = (
             held[..8].iter().flatten().count(),
             held[8..].iter().flatten().count(),
         );
+        assert_eq!(got_storage, 2, "storage within its budget");
+        assert_eq!(got_rest, 5, "rest gets all of max_connections beside storage");
         let open = fake.open.load(Ordering::SeqCst);
-        assert!(open <= 5, "{open} connections open for a branch capped at 5");
-        assert_eq!((got_rest, got_storage), (4, 1), "each service's share");
+        assert!(open <= 7, "{open} connections open for budgets of 5 and 2");
         drop(held);
     }
 
@@ -1527,9 +1516,9 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(shrunk.available_permits(), 1);
-        // Growing while one is held (rest's share of 4: 3).
+        // Growing while one is held.
         let one = shrunk.clone().try_acquire_owned().unwrap();
-        let grown = pools.slots(branch, &with(4)).await;
+        let grown = pools.slots(branch, &with(3)).await;
         assert!(Arc::ptr_eq(&slots, &grown));
         assert_eq!(grown.available_permits(), 2);
         drop(one);

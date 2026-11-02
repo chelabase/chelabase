@@ -6,8 +6,8 @@
 //! statement runs in its own transaction on a reset session (`[ROLLBACK;] BEGIN; RESET_SQL`
 //! … `COMMIT; RESET_SQL`); a failed reset or a cancelled call closes the connection.
 //!
-//! Its connections count against the same service's share of each branch's connections as
-//! its role sessions ([`ServicePool::beside`]).
+//! Its connections count against the same service's per-branch budget as its role
+//! sessions ([`ServicePool::beside`]).
 //!
 //! A statement's text is `'static`: a request's text can't become one.
 //!
@@ -184,7 +184,7 @@ pub struct ServicePool<S> {
 impl<S: ConnSource> ServicePool<S> {
     /// Pools connecting with `source`'s credentials (the service's own login), within the
     /// same budget as `role_pools`, the service's role-session pools: the branch slots and
-    /// the global cap are shared, so both together stay within the service's share.
+    /// the global cap are shared, so both together stay within the service's budget.
     pub fn beside<R: ConnSource>(role_pools: &Pools<R>, source: S) -> Self {
         ServicePool {
             pools: role_pools.sharing_budget(source),
@@ -283,13 +283,13 @@ mod tests {
         }
     }
 
-    /// The managed pool counts against the same service's share as its role sessions: with
-    /// storage's one connection of five held by a role session, the managed pool gets none.
+    /// The managed pool counts against the same service's budget as its role sessions: with
+    /// storage's one connection held by a role session, the managed pool gets none.
     #[tokio::test]
     async fn the_managed_pool_shares_its_services_budget() {
         let fake =
             crate::pools::test_support::fake_pg(crate::pools::test_support::Answer::Ready).await;
-        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage);
+        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage, |_| 1);
         let managed = ServicePool::beside(&roles, Five(fake.port));
         let branch = Uuid::new_v4();
         let held = roles.acquire(branch, "main").await.unwrap();
@@ -300,7 +300,7 @@ mod tests {
         .await;
         assert!(
             waited.is_err(),
-            "the managed pool opened past storage's share"
+            "the managed pool opened past storage's budget"
         );
         drop(held);
         assert!(managed.pools.acquire(branch, "main").await.is_ok());
@@ -312,7 +312,7 @@ mod tests {
     #[tokio::test]
     async fn a_managed_statements_session_sql_is_the_reset_only() {
         let fake = crate::session::tests::recorder(|_, _| false).await;
-        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage);
+        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage, |_| 1);
         let managed = ServicePool::beside(&roles, Five(fake.port));
         const WRITE: NamedStatement = NamedStatement::new(
             "write ticket",
@@ -339,7 +339,7 @@ mod tests {
     async fn a_managed_statement_runs_as_the_service_on_a_reset_session() {
         let fake =
             crate::pools::test_support::fake_pg(crate::pools::test_support::Answer::Ready).await;
-        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage);
+        let roles = crate::Pools::new(Five(fake.port), 100).for_service(Service::Storage, |_| 1);
         let managed = ServicePool::beside(&roles, Five(fake.port));
         const WRITE: NamedStatement = NamedStatement::new(
             "write ticket",
