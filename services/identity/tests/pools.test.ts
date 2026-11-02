@@ -149,6 +149,21 @@ describeDb("pools", () => {
       await cold.close();
     }
   });
+
+  // Better Auth's schema check still runs, against the pool's own schema: a missing column
+  // fails the pool's first request instead of a query halfway through it.
+  it("schema_check_reads_the_pools_own_schema", async () => {
+    const a = newAppPool();
+    await createPool(h, a.pool);
+    await h.db.query(`ALTER TABLE "${a.schema}"."user" DROP COLUMN "banReason"`);
+    const cold = await startHarness();
+    try {
+      const r = await call(cold, "POST", `/internal/v1/pools/${a.pool}/users`, { body: { email: "g@x.io" } });
+      expect(r.status, JSON.stringify(r.body)).toBe(500);
+    } finally {
+      await cold.close();
+    }
+  });
 });
 
 // AC 6: a bad pool name is refused with 400 before any SQL runs. The server here points at a
