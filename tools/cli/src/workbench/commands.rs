@@ -75,8 +75,9 @@ pub(super) const INFRA: &[&str] = &[
     "proxy",
 ];
 /// Started with the infra and waited on until healthy: the bootstrap reaches Zitadel through the
-/// gateway and creates the identity service's members pool through it. Identity runs the
-/// checkout's TypeScript sources (no build); a change to them needs `workbench restart identity`.
+/// gateway, and creates the identity service's members pool by calling `http://identity:8080`
+/// directly on the stack network (identity has no gateway route). Identity runs the checkout's
+/// TypeScript sources (no build); a change to them needs `workbench restart identity`.
 pub(super) const FRONT: &[&str] = &["zitadel", "mailpit", "gateway", "identity"];
 /// Started after the first bootstrap.
 pub(super) const LATE_APPS: &[&str] =
@@ -1698,21 +1699,9 @@ pub fn status() -> anyhow::Result<()> {
     }
     let t = now();
     for e in &registry.stacks {
-        let marker = if e.slug == here.slug {
-            " (this checkout)"
-        } else {
-            ""
-        };
-        let state = match e.running_since {
-            Some(since) => format!("running, up {}", fmt_uptime(t.saturating_sub(since))),
-            None => "stopped".to_string(),
-        };
-        let h = hosts(&e.slug, e.gateway_port);
-        println!("{}{marker}: {state}", e.slug);
-        println!("  checkout  {}", e.checkout.display());
-        println!("  gateway   {}  proxy {}", e.gateway_port, e.proxy_port);
-        println!("  studio    {}", h.studio);
-        println!("  api       {}", h.api);
+        for line in status_lines(e, &here.slug, t) {
+            println!("{line}");
+        }
     }
     let queue = queued(&here.stacks_dir)?;
     if queue.is_empty() {
@@ -1722,6 +1711,28 @@ pub fn status() -> anyhow::Result<()> {
         println!("queue (oldest first): {}", slugs.join(", "));
     }
     Ok(())
+}
+
+/// One stack's lines in `status` (`here` is this checkout's slug, `t` now in Unix seconds).
+fn status_lines(e: &Entry, here: &str, t: u64) -> Vec<String> {
+    let marker = if e.slug == here {
+        " (this checkout)"
+    } else {
+        ""
+    };
+    let state = match e.running_since {
+        Some(since) => format!("running, up {}", fmt_uptime(t.saturating_sub(since))),
+        None => "stopped".to_string(),
+    };
+    let h = hosts(&e.slug, e.gateway_port);
+    vec![
+        format!("{}{marker}: {state}", e.slug),
+        format!("  checkout  {}", e.checkout.display()),
+        format!("  gateway   {}  proxy {}", e.gateway_port, e.proxy_port),
+        format!("  studio    {}", h.studio),
+        format!("  api       {}", h.api),
+        "  identity  http://identity:8080 (stack network only, no host port)".to_string(),
+    ]
 }
 
 /// The stack `env`, `psql`, `logs` and `exec` act on: the recorded one in a task worktree, else
@@ -2025,6 +2036,28 @@ fn proxy_ip(stack: &Stack) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // N2 (audit, #118): `status` lists the internal identity service with each stack.
+    #[test]
+    fn status_lists_identity() {
+        let e = Entry {
+            slug: "feat-x".into(),
+            checkout: PathBuf::from("/r/.worktrees/feat-x"),
+            gateway_port: 8137,
+            proxy_port: 4537,
+            created_at: 0,
+            running_since: Some(100),
+            control_slot: None,
+        };
+        let lines = status_lines(&e, "feat-x", 160);
+        assert_eq!(lines[0], "feat-x (this checkout): running, up 1m");
+        assert!(
+            lines.iter().any(|l| l.starts_with("  identity ")
+                && l.contains("http://identity:8080")
+                && l.contains("no host port")),
+            "{lines:#?}"
+        );
+    }
 
     #[test]
     fn a_checkout_maps_to_its_slug() {
