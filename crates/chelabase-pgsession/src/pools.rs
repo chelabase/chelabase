@@ -92,7 +92,8 @@ impl Service {
 }
 
 /// How many connections a service may hold open to one branch, from the branch's info.
-pub type Budget = fn(&ConnInfo) -> u32;
+/// It may carry the caller's own setting (storage's per-branch budget).
+pub type Budget = Arc<dyn Fn(&ConnInfo) -> u32 + Send + Sync>;
 
 /// Rest's budget: the branch's data API `max_connections` (at least 1).
 pub fn data_api_budget(info: &ConnInfo) -> u32 {
@@ -455,19 +456,21 @@ fn build_pool(config: tokio_postgres::Config, max_size: usize) -> Pool {
 }
 
 /// Whether the connection is a bare service login, `$1`: logged in as it, no superuser, no
-/// `CREATEROLE`, no members and a member of nothing (directly or not), so it can't take on
-/// any other role.
+/// `CREATEROLE`, `CREATEDB` or `REPLICATION` (`OWNER_LEVEL_SQL`'s attributes), no members
+/// and a member of nothing (directly or not), so it can't take on any other role.
+/// `BYPASSRLS` is allowed: storage's login has it by design, and with no memberships it
+/// can't pass it on.
 pub const SERVICE_LOGIN_SQL: &str = "SELECT session_user::pg_catalog.text OPERATOR(pg_catalog.=) $1 \
      AND current_user::pg_catalog.text OPERATOR(pg_catalog.=) $1 \
-     AND NOT r.rolsuper AND NOT r.rolcreaterole \
+     AND NOT r.rolsuper AND NOT r.rolcreaterole AND NOT r.rolcreatedb AND NOT r.rolreplication \
      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_auth_members m \
          WHERE m.member OPERATOR(pg_catalog.=) r.oid OR m.roleid OPERATOR(pg_catalog.=) r.oid) \
      AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles o WHERE o.oid OPERATOR(pg_catalog.<>) r.oid \
          AND pg_catalog.pg_has_role(r.oid, o.oid, 'MEMBER')) \
      FROM pg_catalog.pg_roles r WHERE r.rolname OPERATOR(pg_catalog.=) session_user";
 
-/// The `post_create` hook that refuses a connection unless it's the bare service login
-/// `user` ([`SERVICE_LOGIN_SQL`]).
+/// The hook that refuses a connection unless it's the bare service login `user`
+/// ([`SERVICE_LOGIN_SQL`]): run when it opens and before every checkout.
 fn service_login_hook(user: String) -> deadpool_postgres::Hook {
     deadpool_postgres::Hook::async_fn(move |client, _| {
         let user = user.clone();
@@ -510,7 +513,9 @@ fn build_pool_with(
         .runtime(Runtime::Tokio1)
         .wait_timeout(Some(ACQUIRE_TIMEOUT));
     if let Some(user) = service_login {
-        builder = builder.post_create(service_login_hook(user));
+        builder = builder
+            .post_create(service_login_hook(user.clone()))
+            .pre_recycle(service_login_hook(user));
     }
     builder
         .build()
@@ -740,7 +745,7 @@ impl<S: ConnSource> Pools<S> {
             permits: Arc::new(Semaphore::new(max_connections)),
             server_tls: None,
             service: Service::Rest,
-            budget: data_api_budget,
+            budget: Arc::new(data_api_budget),
             managed: false,
         }
     }
@@ -748,9 +753,13 @@ impl<S: ConnSource> Pools<S> {
     /// The pools as `service`'s (rest's, within [`data_api_budget`], by default): each
     /// branch's connections stay within `budget` (0: none are opened), and they open with the
     /// service's `application_name`.
-    pub fn for_service(mut self, service: Service, budget: Budget) -> Self {
+    pub fn for_service(
+        mut self,
+        service: Service,
+        budget: impl Fn(&ConnInfo) -> u32 + Send + Sync + 'static,
+    ) -> Self {
         self.service = service;
-        self.budget = budget;
+        self.budget = Arc::new(budget);
         self
     }
 
@@ -772,7 +781,7 @@ impl<S: ConnSource> Pools<S> {
             permits: self.permits.clone(),
             server_tls: self.server_tls.clone(),
             service: self.service,
-            budget: self.budget,
+            budget: self.budget.clone(),
             managed: true,
             ..Pools::new(source, 0)
         }

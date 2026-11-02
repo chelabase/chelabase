@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 use crate::conn::owner_level::{self, OwnerLevelCache, RoleRefused, owner_level_cache};
 use crate::conn::{
-    AcquireError, ConnError, ConnInfo, ConnSource, Pools, RoleSession, ServedDatabase,
+    AcquireError, ConnError, ConnInfo, ConnSource, NoRole, Pools, RoleSession, ServedDatabase,
 };
 use crate::error::ApiError;
 
@@ -502,6 +502,7 @@ impl<S: ConnSource> Engine<S> {
                 .await
         })
         .await
+        .map_err(no_role)?
     }
 
     async fn cell_on(
@@ -594,6 +595,7 @@ impl<S: ConnSource> Engine<S> {
             )
         })
         .await
+        .map_err(no_role)?
     }
 
     /// `GET /data/v1/schema?database=`: what the key's role can reach in the database,
@@ -636,7 +638,7 @@ impl<S: ConnSource> Engine<S> {
             .schemas_for(
                 data.branch_id,
                 &served,
-                &data.role,
+                Some(&data.role),
                 &[&data.role],
                 guard,
                 request_id,
@@ -664,7 +666,7 @@ impl<S: ConnSource> Engine<S> {
         let names = internal_schema_roles(role);
         let guard = role.map_or(Guard::None, Guard::Console);
         let (schema, views, default_schema, _) = self
-            .schemas_for(branch, &served, "none", &names, guard, request_id)
+            .schemas_for(branch, &served, None, &names, guard, request_id)
             .await?;
         let roles: Vec<(&str, &Visibility)> = names
             .iter()
@@ -674,12 +676,14 @@ impl<S: ConnSource> Engine<S> {
         Ok(schema.to_json(&default_schema, &roles, true))
     }
 
-    /// The schema and the roles' views, on a leased connection (see [`Self::run`]).
+    /// The schema and the roles' views, on a leased connection (see [`Self::run`]), in a
+    /// session of `role`, or of the login itself (`None`: the internal schema route, as
+    /// before the move).
     async fn schemas_for(
         &self,
         branch: Uuid,
         database: &ServedDatabase,
-        role: &str,
+        role: Option<&str>,
         roles: &[&str],
         guard: Guard<'_>,
         request_id: &str,
@@ -687,8 +691,7 @@ impl<S: ConnSource> Engine<S> {
         let conn = self.acquire(branch, &database.name, request_id).await?;
         let info = conn.info.clone();
         let claims = Value::Object(Default::default());
-        let out = conn
-            .with_role_session(role, &claims, guard.role_oid(), async |session| {
+        let work = async |session: &RoleSession| {
                 self.guard(session, branch, guard, request_id)
                     .await?;
                 Ok::<_, Failure>(
@@ -708,11 +711,22 @@ impl<S: ConnSource> Engine<S> {
                         )
                         .await?,
                 )
-            })
-            .await;
+            };
+        let out = match role {
+            Some(role) => conn
+                .with_role_session(role, &claims, guard.role_oid(), work)
+                .await
+                .map_err(no_role)?,
+            None => conn.with_login_session(work).await,
+        };
         let (schema, views) = out?;
         Ok((schema, views, database.default_schema.clone(), info))
     }
+}
+
+/// A request naming no role (`none`, or nothing): as the role doesn't exist.
+fn no_role(e: NoRole) -> ApiError {
+    ApiError::unknown_role(&e.0)
 }
 
 /// Why no connection could be had, as the client sees it (the cause is logged).

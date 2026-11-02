@@ -156,12 +156,15 @@ const WHO: NamedStatement = crate::named_statement!(
 );
 
 /// The managed pool opens only as a bare service role: a superuser, a role with any
-/// membership either way, or one that can create roles is refused before any statement.
+/// membership either way, or one that can create roles or databases or replicate is refused
+/// before any statement. BYPASSRLS is allowed (storage's login has it by design).
 #[tokio::test]
 #[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
 async fn the_managed_pool_opens_only_as_a_bare_service_role_live() {
     let scratch = Scratch::new().await;
-    let bare = scratch.role("pgs_svc", "LOGIN PASSWORD 'pw'").await;
+    let bare = scratch
+        .role("pgs_svc", "LOGIN PASSWORD 'pw' BYPASSRLS")
+        .await;
     let member = scratch.role("pgs_member", "LOGIN PASSWORD 'pw'").await;
     scratch
         .sql(&format!("GRANT pg_read_all_data TO {member}"))
@@ -172,6 +175,12 @@ async fn the_managed_pool_opens_only_as_a_bare_service_role_live() {
     let creator = scratch
         .role("pgs_creator", "LOGIN PASSWORD 'pw' CREATEROLE")
         .await;
+    let replicator = scratch
+        .role("pgs_repl", "LOGIN PASSWORD 'pw' REPLICATION BYPASSRLS")
+        .await;
+    let db_creator = scratch
+        .role("pgs_createdb", "LOGIN PASSWORD 'pw' CREATEDB")
+        .await;
     let branch = Uuid::new_v4();
 
     for (name, user) in [
@@ -179,6 +188,8 @@ async fn the_managed_pool_opens_only_as_a_bare_service_role_live() {
         ("a member of pg_read_all_data", Some(member.as_str())),
         ("a role with a member", Some(granter.as_str())),
         ("a CREATEROLE role", Some(creator.as_str())),
+        ("a REPLICATION role", Some(replicator.as_str())),
+        ("a CREATEDB role", Some(db_creator.as_str())),
     ] {
         let (_roles, pool) = managed(&scratch, user);
         let out = pool.query(branch, &scratch.db, &WHO, &[], "rid").await;
@@ -263,6 +274,7 @@ async fn a_session_for_a_missing_role_runs_nothing_live() {
                 .await
             })
             .await
+            .expect("a role")
         }
     };
 
@@ -284,6 +296,74 @@ async fn a_session_for_a_missing_role_runs_nothing_live() {
             !ran.load(std::sync::atomic::Ordering::SeqCst),
             "{name}: a statement ran"
         );
+    }
+    drop(pools);
+    scratch.drop().await;
+}
+
+/// A membership granted after a managed connection was pooled is caught on its next
+/// checkout: the pooled connection isn't used, and no new one opens.
+#[tokio::test]
+#[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
+async fn a_grant_after_pooling_closes_the_managed_pool_live() {
+    let scratch = Scratch::new().await;
+    let bare = scratch.role("pgs_svc", "LOGIN PASSWORD 'pw'").await;
+    let target = scratch.role("pgs_target", "NOLOGIN").await;
+    let (_roles, pool) = managed(&scratch, Some(&bare));
+    let branch = Uuid::new_v4();
+    let sql: &'static str =
+        format!("SELECT pg_catalog.set_config('role', '{target}', false)::text").leak();
+    let escalate = NamedStatement::unchecked_for_tests("escalate", sql);
+    let before = pool.query(branch, &scratch.db, &escalate, &[], "rid").await;
+    assert!(
+        matches!(&before, Err(ServiceError::Query(f)) if f.message.contains("permission denied")
+            || f.sqlstate.as_deref() == Some("42501")),
+        "before the grant: {:?}",
+        before.map(|rows| rows.len())
+    );
+    scratch.sql(&format!("GRANT {target} TO {bare}")).await;
+    let after = pool.query(branch, &scratch.db, &escalate, &[], "rid").await;
+    assert!(
+        matches!(after, Err(ServiceError::Acquire(_))),
+        "after the grant, on the pooled connection: {:?}",
+        after.map(|rows| rows.len())
+    );
+    drop(pool);
+    scratch.drop().await;
+}
+
+/// A role session for `none` (Postgres's word for no role) runs nothing: it isn't the
+/// login's.
+#[tokio::test]
+#[ignore = "needs a Postgres: CHELABASE_METADATA_DATABASE_URL or the workbench stack's metadata Postgres"]
+async fn a_role_session_for_none_runs_nothing_live() {
+    let scratch = Scratch::new().await;
+    let pools = Pools::new(Fixed(scratch.info(None)), 10);
+    let branch = Uuid::new_v4();
+    let claims = serde_json::json!({});
+    let db = scratch.db.clone();
+    for role in ["none", ""] {
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let conn = pools.acquire(branch, &db).await.unwrap();
+        let out = conn
+            .with_role_session(role, &claims, None, async |s| {
+                let settings = s.settings(&s.info().databases[0]);
+                s.transaction(&db, &settings, "rid", async |c, _version| {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                    let row = c
+                        .query_one("SELECT current_user::text", &[])
+                        .await
+                        .map_err(|e| chelabase_query::QueryFailure::from_pg(&e, "rid"))?;
+                    Ok(row.get::<_, String>(0))
+                })
+                .await
+            })
+            .await;
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "{role:?} ran a statement: {out:?}"
+        );
+        assert_eq!(out.unwrap_err(), crate::session::NoRole(role.to_owned()));
     }
     drop(pools);
     scratch.drop().await;

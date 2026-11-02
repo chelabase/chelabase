@@ -1,0 +1,11 @@
+error[E0599]: no associated function or constant named `__literal_only_use_named_statement_macro` found for struct `NamedStatement` in the current scope
+ --> tests/ui/statement_hidden_constructor.rs:7:37
+  |
+7 |     let statement = NamedStatement::__literal_only_use_named_statement_macro(
+  |                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ associated function or constant not found in `NamedStatement`
+  |
+note: if you're trying to build a new `NamedStatement`, consider using `NamedStatement::of` which returns `NamedStatement`
+ --> src/service.rs
+  |
+  |     pub const fn of<T: StatementText>() -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

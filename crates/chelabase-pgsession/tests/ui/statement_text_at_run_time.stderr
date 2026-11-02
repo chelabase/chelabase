@@ -1,0 +1,15 @@
+error[E0015]: cannot call non-const associated function `<String as From<&str>>::from` in constants
+ --> tests/ui/statement_text_at_run_time.rs:8:31
+  |
+8 |     const SQL: &'static str = String::from("DELETE FROM storage.objects").leak();
+  |                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: calls in constants are limited to constant functions, tuple structs and tuple variants
+
+error[E0015]: cannot call non-const method `String::leak::<'_>` in constants
+ --> tests/ui/statement_text_at_run_time.rs:8:75
+  |
+8 |     const SQL: &'static str = String::from("DELETE FROM storage.objects").leak();
+  |                                                                           ^^^^^^
+  |
+  = note: calls in constants are limited to constant functions, tuple structs and tuple variants
