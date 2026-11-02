@@ -15,13 +15,15 @@ export interface TabsProps<T extends string> {
   onValueChange: (value: T) => void;
   /** The current tab's content; it is rendered as that tab's panel. */
   children: ReactNode;
+  /** Extra classes for the tab strip only (e.g. page gutters when the panel runs full width). */
+  listClassName?: string;
 }
 
 /**
  * A tab strip and the current panel. Arrow keys move between tabs, Enter or Space opens one; the
  * current tab is chalk with a 2px sand rule, the rest chalk-dim, all on one hairline.
  */
-export function Tabs<T extends string>({ label, items, value, onValueChange, children }: TabsProps<T>) {
+export function Tabs<T extends string>({ label, items, value, onValueChange, children, listClassName = "" }: TabsProps<T>) {
   const scroller = useScrollFade<HTMLDivElement>();
   // A strip that scrolls (a phone) keeps the current tab in view.
   useEffect(() => {
@@ -30,7 +32,7 @@ export function Tabs<T extends string>({ label, items, value, onValueChange, chi
   }, [value]);
   return (
     <TabsPrimitive.Root value={value} onValueChange={(next) => onValueChange(next as T)} className="space-y-6">
-      <div ref={scroller.ref} onScroll={scroller.onScroll} style={scroller.style} className="overflow-x-auto">
+      <div ref={scroller.ref} onScroll={scroller.onScroll} style={scroller.style} className={`overflow-x-auto ${listClassName}`}>
       <TabsPrimitive.List aria-label={label} className="flex w-max min-w-full gap-1 border-b border-line">
         {items.map((item) => (
           <TabsPrimitive.Tab
