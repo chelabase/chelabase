@@ -57,7 +57,6 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
-/// Members hub T8: personal-login rows by (tenant, identity user id).
 
 /// An invite's stored expiry and whether the database clock calls it open.
 type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
@@ -94,7 +93,7 @@ struct FakeNeon {
     /// accepted (expired or not), and whether the database clock calls it open.
     invite_expiries: Arc<Mutex<HashMap<String, InviteExpiry>>>,
     /// #126: identity user id -> `(tenant, token hash)` of each accepted invite, newest first.
-    accepted: Arc<Mutex<HashMap<String, Vec<(TenantId, Option<Vec<u8>>)>>>>,
+    accepted: Arc<Mutex<HashMap<String, orchestrator::internal::AcceptedInvites>>>,
     /// Final round A: each offboarded mark cleared (D7), a clear that fails while
     /// `fail_clear` is set, and a tenant lookup that fails while `fail_tenant_lookup` is (T8-2).
     clears: Arc<Mutex<Vec<(TenantId, String)>>>,
@@ -5007,6 +5006,33 @@ async fn revoke_other_project_session_is_a_no_op() {
             json!({ "project_id": w.project }),
         )
         .await;
+    assert_eq!(status, 204);
+}
+
+// Review nit 8: app sign-out ends the identity session too, and each step is attempted on
+// every call: when ending the identity session failed, signing out again ends it (the app
+// session is already revoked by then), and a session of another project is never touched.
+#[tokio::test]
+async fn a_repeated_sign_out_ends_an_identity_session_the_first_one_missed() {
+    let w = app_world();
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
+    let path = format!("/internal/app/sessions/{sid}/revoke");
+    z.fake.fail(&format!("DELETE /internal/v1/pools/{}/sessions/", z.pool), 503, "internal", 1);
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
+    assert_eq!(status, 204);
+    assert!(a.revoked(sid));
+    assert!(eventually(|| z.revoked() == ["zs1"]).await, "{:?}", z.fake.calls());
+    assert_eq!(z.count(), 1, "the first try failed");
+    // Another project's sign-out of this session id does nothing.
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.bare_project })).await;
+    assert_eq!(status, 204);
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
+    assert_eq!(status, 204);
+    assert!(eventually(|| z.count() == 0).await, "the retry didn't end it: {:?}", z.fake.calls());
+    // Idempotent once both are gone.
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
     assert_eq!(status, 204);
 }
 

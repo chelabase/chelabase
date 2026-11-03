@@ -37,6 +37,7 @@ fn token(sub: &str, tenant: Uuid, exp: u64) -> MemberToken {
     MemberToken {
         sub: sub.into(),
         tenant_id: Some(tenant),
+        sid: format!("sid-{sub}"),
         exp,
         name: None,
         email: None,
@@ -108,6 +109,7 @@ async fn the_member_verifier_returns_the_members_exp() {
         MemberToken {
             sub: "ana".into(),
             tenant_id: Some(T1),
+            sid: claims.sid.clone(),
             exp: claims.exp,
             name: Some("Ana".into()),
             email: Some("ana@example.com".into()),

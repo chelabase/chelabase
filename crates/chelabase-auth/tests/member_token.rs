@@ -163,13 +163,13 @@ fn internal_token_refused() {
     };
     let internal = InternalSigner::from_pem(gw_private.as_bytes()).unwrap();
     let token = internal
-        .sign_for_tenant("orchestrator", &identity, Uuid::new_v4())
+        .sign_for_tenant("orchestrator", &identity, Uuid::new_v4(), "sid-1")
         .unwrap();
     assert_eq!(k.verifier.verify(&token), Err(MemberTokenError::Invalid));
     // Even one the member key signed (no `kid`, another issuer and audience).
     let on_member_key = InternalSigner::from_pem(k.private.as_bytes()).unwrap();
     let token = on_member_key
-        .sign_for_tenant(MEMBER_AUDIENCE, &identity, Uuid::new_v4())
+        .sign_for_tenant(MEMBER_AUDIENCE, &identity, Uuid::new_v4(), "sid-1")
         .unwrap();
     assert_eq!(k.verifier.verify(&token), Err(MemberTokenError::Invalid));
 
@@ -305,6 +305,16 @@ fn tenant_and_subject_required() {
         k.verifier.verify(&k.signer.sign(&no_sub).unwrap()),
         Err(MemberTokenError::Invalid)
     );
+    // Review fix 1: the session is what logout and a reset end; a token naming none is refused.
+    for sid in ["", " "] {
+        let mut no_sid = claims();
+        no_sid.sid = sid.into();
+        assert_eq!(
+            k.verifier.verify(&k.signer.sign(&no_sid).unwrap()),
+            Err(MemberTokenError::Invalid),
+            "sid {sid:?}"
+        );
+    }
 }
 
 // AC 6: expired more than 30 s ago is refused; within the leeway passes. `iat` in the future
@@ -374,17 +384,25 @@ fn internal_identity_never_names_the_nil_tenant() {
     };
     assert!(
         signer
-            .sign_for_tenant("orchestrator", &identity, Uuid::nil())
+            .sign_for_tenant("orchestrator", &identity, Uuid::nil(), "sid-1")
             .is_err()
     );
     let tid = Uuid::new_v4();
-    let token = signer
-        .sign_for_tenant("orchestrator", &identity, tid)
-        .unwrap();
-    assert_eq!(
-        verifier.verify(&token, "orchestrator").unwrap().tenant_id,
-        Some(tid)
+    // Review fix 1: a member identity names its session, which the orchestrator checks.
+    assert!(
+        signer
+            .sign_for_tenant("orchestrator", &identity, tid, " ")
+            .is_err()
     );
+    let token = signer
+        .sign_for_tenant("orchestrator", &identity, tid, "sid-1")
+        .unwrap();
+    let claims = verifier.verify(&token, "orchestrator").unwrap();
+    assert_eq!(claims.tenant_id, Some(tid));
+    assert_eq!(claims.sid.as_deref(), Some("sid-1"));
+    // A data key's identity names neither.
+    let token = signer.sign("orchestrator", &identity).unwrap();
+    assert_eq!(verifier.verify(&token, "orchestrator").unwrap().sid, None);
 
     let claims = InternalClaims {
         iss: "chelabase-gateway".into(),
@@ -398,6 +416,7 @@ fn internal_identity_never_names_the_nil_tenant() {
         data: None,
         email: None,
         name: None,
+    sid: Some("sid-1".into()),
     };
     let token = encode(
         &Header::new(Algorithm::EdDSA),

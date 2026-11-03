@@ -38,6 +38,8 @@ use chelabase_types::access::{Grant, GrantSources, Narrowing, PgRole, PlatformRo
 /// The test identity's subject: the default caller, an active tenant admin of every tenant
 /// `bind_org` binds (so tests written before members keep their meaning).
 const DEFAULT_SUB: &str = "user-1";
+/// The identity session every test token names (review fix 1).
+const DEFAULT_SID: &str = "00000000-0000-4000-8000-00000000051d";
 
 type KeyRow = (DataKeyRecord, [u8; 32]);
 /// A key store, a key id and the role name it takes.
@@ -354,11 +356,6 @@ impl FakeMetadata {
             revoked: false,
             accepted: false,
         });
-    }
-
-    /// Sets (or clears) when the tenant's admin was claimed.
-    fn set_setup_claim(&self, tenant: TenantId, user: &str) {
-        self.setup_claims.lock().unwrap().insert(tenant, user.into());
     }
 
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
@@ -1442,7 +1439,8 @@ impl MetadataPort for FakeMetadata {
                 && existing.pg_database == new.pg_database
                 && existing.schema_name == new.schema_name
                 && existing.table_name == new.table_name;
-            if existing.status == AppUsersStatus::Failed && same {
+            let on_hold = existing.status == AppUsersStatus::Disabling && existing.error.is_some();
+            if (existing.status == AppUsersStatus::Failed || on_hold) && same {
                 existing.status = AppUsersStatus::Enabling;
                 existing.error = None;
                 existing.email_verification = new.email_verification;
@@ -2643,7 +2641,7 @@ impl TestApp {
     /// The gateway's internal token for `identity` in `tenant` (`None`: no tenant).
     fn sign(&self, identity: &Identity, tenant: Option<TenantId>) -> String {
         match tenant {
-            Some(t) => self.signer.sign_for_tenant(Service::Orchestrator.name(), identity, t.as_uuid()),
+            Some(t) => self.signer.sign_for_tenant(Service::Orchestrator.name(), identity, t.as_uuid(), DEFAULT_SID),
             None => self.signer.sign(Service::Orchestrator.name(), identity),
         }
         .unwrap()
@@ -2796,7 +2794,7 @@ async fn spawn_app_core(
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
     identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
-    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None, None, identity_service)
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None, None, identity_service, None)
         .await
 }
 
@@ -2830,6 +2828,7 @@ async fn spawn_app_member_tokens_with(
         None,
         Some(members),
         None,
+        None,
     )
     .await
 }
@@ -2848,6 +2847,7 @@ async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: O
         tenant,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2864,6 +2864,7 @@ async fn spawn_app_core_with(
     operator_tenant: Option<TenantId>,
     member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
     identity_service: Option<chelabase_identity::Identity>,
+    member_sessions: Option<Arc<orchestrator::member_sessions::MemberSessions>>,
 ) -> TestApp {
     let rt_events = FakeRtEvents::default();
     // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in
@@ -2890,6 +2891,8 @@ async fn spawn_app_core_with(
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
         console: Console::default(),
+        member_sessions: member_sessions
+            .unwrap_or_else(|| Arc::new(orchestrator::member_sessions::MemberSessions::assume_live())),
         identity_service,
         users_db,
         sql_editor: Default::default(),

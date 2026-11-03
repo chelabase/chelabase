@@ -2570,6 +2570,26 @@ async fn app_users_disabled_409() {
     assert_eq!(code(&a), "app_users_disabled");
 }
 
+/// Review S5: a sign-up asks the orchestrator afresh before it makes the identity user, so one
+/// that arrives after a disable began (while `enabled` is still cached) makes no account for the
+/// disable to drop with the pool.
+#[tokio::test]
+async fn sign_up_checks_the_uncached_status_before_making_a_user() {
+    let h = harness().await;
+    h.add_user("ada@example.com", true).await;
+    // Caches `enabled` for the branch.
+    assert_eq!(h.sign_in("ada@example.com", PW).await.status, StatusCode::OK);
+    let mut disabling = info(h.project, h.branch, false);
+    disabling["status"] = json!("disabling");
+    h.internal.set_branch(h.branch, disabling);
+    // Sign-in still answers from the cache (unchanged here); sign-up does not.
+    let a = h
+        .post("sign-up", json!({"email": "bob@example.com", "password": PW}), None)
+        .await;
+    assert_eq!((a.status, code(&a)), (StatusCode::CONFLICT, "app_users_disabled"), "{}", a.body);
+    assert_eq!(h.fake.user_by_email(&h.pool(), "bob@example.com"), None, "no identity user");
+}
+
 /// #123: an enabled project's app users sign in from its identity pool. A branch of another
 /// project is still disabled.
 #[tokio::test]

@@ -39,6 +39,11 @@ async fn main() -> anyhow::Result<()> {
         warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: realtime refuses every member token");
     }
     let operator_tenant = orchestrator::internal::config::operator_tenant(|name| std::env::var(name).ok())?;
+    // Review fix 1: how long a member token's session answer is reused.
+    let member_session_window = orchestrator::member_sessions::window(
+        std::env::var("CHELABASE_MEMBER_SESSION_CHECK_SECS").ok().as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     // Unset is a startup error (P13); empty means no address rule.
     let member_logins = internal_config.member_logins()?;
     let realtime_logins = internal_config.realtime_logins()?;
@@ -164,6 +169,10 @@ async fn main() -> anyhow::Result<()> {
         )?),
         console: Console::default(),
         identity_service: identity_service(),
+        member_sessions: Arc::new(orchestrator::member_sessions::MemberSessions::new(
+            identity_service(),
+            member_session_window,
+        )),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,

@@ -947,6 +947,13 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
             Err(e) => return Err(row_error(e, &info)),
         }
     }
+    // Review S5: the status as the orchestrator has it now, not the cached one. A disable that
+    // began within the cache's 30 s checked the pool was empty; a user made after that would
+    // be dropped with the pool. (A retry above has just read it afresh.)
+    if !retried {
+        app.branches.invalidate(&caller.branch_id).await;
+        info = branch_info(app, caller).await?;
+    }
     // 2. The identity user.
     let created = s
         .identity

@@ -5,7 +5,7 @@ import type { Config } from "./config.ts";
 import { createMailer } from "./email/mailer.ts";
 import { readBody, toHttpError, type Json } from "./http.ts";
 import { PoolRegistry } from "./registry.ts";
-import { ALLOW, match, resolveId, resolvePool } from "./routes.ts";
+import { ALLOW, match, poolKind, resolveId, resolvePool } from "./routes.ts";
 
 export interface RunningServer {
   url: string;
@@ -34,7 +34,8 @@ export async function startServer(config: Config): Promise<RunningServer> {
     if (!caller) return send(res, 401, { error: "unauthorized", message: "missing or unknown caller token" });
     const m = match(req.method ?? "", path);
     if (!m) return send(res, 404, { error: "not_found", message: "no such route" });
-    if (!ALLOW[caller].has(m.route.id)) {
+    const kinds = ALLOW[caller].get(m.route.id);
+    if (!kinds) {
       return send(res, 403, { error: "forbidden", message: `${caller} may not call ${m.route.id}` });
     }
     try {
@@ -43,6 +44,10 @@ export async function startServer(config: Config): Promise<RunningServer> {
         return send(res, reply.status, reply.body);
       }
       const pool = resolvePool(m.poolSegment);
+      // The pool scope: a route this caller may call, on a kind of pool it may not touch.
+      if (!kinds.includes(poolKind(pool))) {
+        return send(res, 403, { error: "forbidden", message: `${caller} may not call ${m.route.id} on ${poolKind(pool)} pools` });
+      }
       const id = resolveId(m.route, m.idSegment);
       const body = await readBody(req);
       const reply = await m.route.handle({ caller, mailer, registry, pool, id, query: new URLSearchParams(search), body });

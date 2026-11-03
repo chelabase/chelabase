@@ -182,8 +182,8 @@ async fn valkey_down_means_503_for_the_upgrade() {
     );
 }
 
-// #22: the internal health check is readiness too: 503 while the OIDC verifier can't check
-// tokens (its audiences aren't written yet), 200 once it can.
+// #22: the internal health check is readiness too: 503 while the member-token verifier can't
+// check tokens, 200 once it can.
 #[tokio::test]
 async fn health_waits_for_the_token_audiences() {
     let h = Harness::start().await;

@@ -1478,6 +1478,8 @@ mod member_tokens {
         let claims = stack.verify.verify(&seen[IDENTITY_HEADER], "orchestrator").unwrap();
         assert_eq!(claims.sub, "user_ana");
         assert_eq!(claims.tenant_id, Some(tid));
+        // Review fix 1: the member token's session, which the orchestrator checks is live.
+        assert_eq!(claims.sid.as_deref(), Some("sess_1"));
         assert_eq!(claims.auth, chelabase_auth::internal::AuthMethod::ManagementJwt);
         assert_eq!(claims.email.as_deref(), Some("ana@example.com"));
         assert_eq!(claims.name.as_deref(), Some("Ana Lima"));
@@ -1533,7 +1535,7 @@ mod member_tokens {
             email: None,
             name: None,
         };
-        bad.push(("internal token", internal.sign_for_tenant("orchestrator", &identity, tid).unwrap()));
+        bad.push(("internal token", internal.sign_for_tenant("orchestrator", &identity, tid, "sess_1").unwrap()));
 
         // `alg: none` (`{"alg":"none"}`) over a good token's payload.
         let good = stack.keys.sign(&stack.claims(tid));

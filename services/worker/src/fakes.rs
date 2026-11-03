@@ -2794,7 +2794,7 @@ impl WorkerMetadata for FakeMetadata {
         if let Some(a) = state
             .project_auth
             .get_mut(&project)
-            .filter(|a| a.status == AppUsersStatus::Enabled)
+            .filter(|a| matches!(a.status, AppUsersStatus::Enabled | AppUsersStatus::Disabling))
             .filter(|a| a.error.as_deref() != error)
         {
             a.error = error.map(str::to_string);

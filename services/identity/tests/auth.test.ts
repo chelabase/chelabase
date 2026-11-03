@@ -107,12 +107,13 @@ describeDb("caller auth", () => {
     expect((await call(h, "DELETE", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(204);
   });
 
-  // S1 (audit): the bootstrap has its own token, and it may only create a pool.
+  // S1 (audit): the bootstrap has its own token, and it may only create the members pool.
   it("bootstrap_route_allow_list", async () => {
-    const p = newAppPool();
-    const created = await call(h, "POST", `/internal/v1/pools/${p.pool}`, { as: "bootstrap" });
+    const created = await call(h, "POST", "/internal/v1/pools/members", { as: "bootstrap" });
     expect(created.status).toBe(201);
-    expect(await schemaExists(h.db, p.schema)).toBe(true);
+    expect(await schemaExists(h.db, "identity_members")).toBe(true);
+    const p = newAppPool();
+    expect((await call(h, "POST", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(201);
     for (const [method, path] of [
       ["DELETE", `/internal/v1/pools/${p.pool}`],
       ["GET", `/internal/v1/pools/${p.pool}/users`],
@@ -128,6 +129,59 @@ describeDb("caller auth", () => {
       expect(r.status, `${method} ${path}`).toBe(403);
     }
     expect(await schemaExists(h.db, p.schema)).toBe(true);
+    expect((await call(h, "DELETE", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(204);
+  });
+
+  // Review nit 6: each caller reaches only the pools its flows need. The worker manages and
+  // reads app pools only; the bootstrap creates the members pool only; the orchestrator reads
+  // member sessions by id, and member-only routes stay members-only.
+  it("pool_scoped_allow_list", async () => {
+    expect((await call(h, "POST", "/internal/v1/pools/members", { as: "bootstrap" })).status).toBe(201);
+    const p = newAppPool();
+    expect((await call(h, "POST", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(201);
+    const member = await call(h, "POST", "/internal/v1/pools/members/users", {
+      body: { email: `scope-${Date.now()}@x.io`, password: "password-x-1", email_verified: true },
+    });
+    expect(member.status).toBe(201);
+    const id = member.body.user.id as string;
+    const refused: [string, string, string, "worker" | "bootstrap" | "orchestrator"][] = [
+      // The worker never touches the members pool.
+      ["POST", "/internal/v1/pools/members", "pools.create", "worker"],
+      ["GET", "/internal/v1/pools/members/users?limit=2", "users.list", "worker"],
+      ["GET", `/internal/v1/pools/members/users/${id}`, "users.get", "worker"],
+      // The bootstrap never makes an app pool.
+      ["POST", `/internal/v1/pools/${newAppPool().pool}`, "pools.create", "bootstrap"],
+      // Member-only routes of the orchestrator.
+      ["POST", `/internal/v1/pools/${p.pool}/codes`, "codes.create", "orchestrator"],
+      ["POST", `/internal/v1/pools/${p.pool}/users/${id}/invite-notice`, "invite.notice", "orchestrator"],
+      ["GET", `/internal/v1/pools/${p.pool}/sessions/${id}`, "sessions.get", "orchestrator"],
+      // App-only routes of the orchestrator.
+      ["PUT", `/internal/v1/pools/members/users/${id}/email`, "users.set_email", "orchestrator"],
+      ["DELETE", `/internal/v1/pools/members/sessions/${id}`, "sessions.revoke", "orchestrator"],
+    ];
+    for (const [method, path, route, as] of refused) {
+      const r = await call(h, method, path, {
+        as,
+        body: { email: "b@x.io", user_id: id, kind: "invite", delivery: "return", link: "https://x.io/a" },
+      });
+      expect(r.status, `${as} ${method} ${path}`).toBe(403);
+      expect(r.body, `${as} ${method} ${path}`).toMatchObject({ error: "forbidden" });
+      expect(r.body.message, `${as} ${method} ${path}`).toContain(route);
+    }
+    // What each flow needs still answers.
+    expect((await call(h, "GET", `/internal/v1/pools/${p.pool}/users?limit=2`, { as: "worker" })).status).toBe(200);
+    expect((await call(h, "GET", `/internal/v1/pools/members/users/${id}`, { as: "orchestrator" })).status).toBe(200);
+    expect((await call(h, "GET", `/internal/v1/pools/${p.pool}/users?limit=2`, { as: "orchestrator" })).status).toBe(200);
+    const signedIn = await call(h, "POST", "/internal/v1/pools/members/sessions", {
+      body: { email: member.body.user.email, password: "password-x-1" },
+    });
+    expect(signedIn.status).toBe(201);
+    const sid = signedIn.body.session_id as string;
+    const got = await call(h, "GET", `/internal/v1/pools/members/sessions/${sid}`, { as: "orchestrator" });
+    expect(got.status).toBe(200);
+    expect(got.body.session.id).toBe(sid);
+    // An invalid pool is still the caller's bad request, not a scope refusal.
+    expect((await call(h, "GET", "/internal/v1/pools/Members/users", { as: "worker" })).status).toBe(400);
     expect((await call(h, "DELETE", `/internal/v1/pools/${p.pool}`, { as: "worker" })).status).toBe(204);
   });
 });

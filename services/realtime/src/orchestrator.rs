@@ -8,8 +8,9 @@
 //! - `POST /internal/realtime/projects {token}` → 200 `{tenant_id, projects: [{project_id,
 //!   database_ids}]}`; refusals as 403 `forbidden`, 404 `not_found`, 401 with body
 //!   `{"error":{"code":"token_expired"}}`, 503 `unavailable`; a bare 401 is a wrong bearer.
-//! - `POST /internal/realtime/member {sub, tenant_id}` (T8-1, D7, #119) → 200 `{allowed}`, asked before
-//!   a Studio ticket is issued; anything else is "can't answer" (the ticket route's 503).
+//! - `POST /internal/realtime/member {sub, tenant_id, sid}` (T8-1, D7, #119) → 200 `{allowed}`,
+//!   asked before a Studio ticket is issued (the orchestrator also requires the member token's
+//!   identity session `sid` to be live); anything else is "can't answer" (the ticket route's 503).
 //! - S13: 400, 401 (other than `token_expired` on `/projects`), 5xx, a body that isn't the
 //!   route's JSON and a timeout are `unavailable` (400/401 logged as configuration errors).
 //!   An unknown refusal reason is `forbidden` (fails closed).
@@ -227,13 +228,19 @@ impl OrchestratorClient {
     /// T8-1, D7: whether the person may get a Studio ticket now (`/internal/realtime/member`).
     /// `Some(false)` for a refusal (any `allowed: false`, fails closed on an unknown reason);
     /// `None` when the orchestrator gives no usable answer in time.
-    /// #119: the member token's identity sends its `tenant_id`; one without a tenant is
-    /// refused here without asking.
-    pub async fn member_allowed(&self, sub: &str, tenant_id: Option<uuid::Uuid>) -> Option<bool> {
-        let Some(tenant) = tenant_id else {
+    /// #119: the member token's identity sends its `tenant_id`, and its identity session `sid`
+    /// (which the orchestrator requires live); one without either is refused here without
+    /// asking.
+    pub async fn member_allowed(
+        &self,
+        sub: &str,
+        tenant_id: Option<uuid::Uuid>,
+        sid: Option<&str>,
+    ) -> Option<bool> {
+        let (Some(tenant), Some(sid)) = (tenant_id, sid) else {
             return Some(false);
         };
-        let body = json!({"sub": sub, "tenant_id": tenant});
+        let body = json!({"sub": sub, "tenant_id": tenant, "sid": sid});
         match post(
             &self.http,
             format!("{}/internal/realtime/member", self.base_url),

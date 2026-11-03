@@ -583,7 +583,8 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         project: ProjectId,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
-    /// Records or clears reconcile's last error on an `enabled` row only.
+    /// Records or clears reconcile's last error on an `enabled` row, or a disable's on a
+    /// `disabling` one.
     fn set_app_users_error(
         &self,
         project: ProjectId,

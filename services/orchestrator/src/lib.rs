@@ -48,6 +48,7 @@ mod app_users;
 mod data_keys;
 pub mod internal;
 pub mod members;
+pub mod member_sessions;
 mod merges;
 mod openapi;
 mod personal_logins;
@@ -1797,6 +1798,9 @@ pub struct AppState<M, J> {
     /// users' admin actions on the project's pool. `None` when either is unset or the token
     /// can't be read; those routes then answer 503 `identity_unavailable`.
     pub identity_service: Option<chelabase_identity::Identity>,
+    /// Whether a member token's identity session is still live (review fix 1): checked on
+    /// every member-token request, cached briefly, failing closed.
+    pub member_sessions: Arc<member_sessions::MemberSessions>,
     /// The one write path to a project's users table.
     pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     /// Studio's SQL editor: runs in flight and the data-role grant cache.
@@ -1883,6 +1887,8 @@ struct Caller {
     /// The token's email and name claims, when it carries them.
     email: Option<String>,
     name: Option<String>,
+    /// The member token's identity session (`sid`), which must still be live.
+    sid: Option<String>,
 }
 
 impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for Caller
@@ -1915,6 +1921,7 @@ where
             request_id: claims.rid,
             email: claims.email,
             name: claims.name,
+            sid: claims.sid,
         })
     }
 }
@@ -1948,6 +1955,15 @@ async fn resolve_member<M: MetadataPort, J>(
         error!("resolve member: {err}");
         ApiError::internal()
     };
+    // Review fix 1: the token's identity session must still be live (logout and a password
+    // reset end it). Fails closed when identity can't say.
+    match state.member_sessions.check(&caller.sub, caller.sid.as_deref()).await {
+        member_sessions::Liveness::Live => {}
+        member_sessions::Liveness::Ended => {
+            return Err(ApiError::unauthorized("the session has ended; sign in again"));
+        }
+        member_sessions::Liveness::Unavailable => return Err(identity_unavailable()),
+    }
     let member = state
         .metadata
         .member_by_identity_user(tenant, &caller.sub)
@@ -1977,6 +1993,15 @@ async fn caller_tenant<M: MetadataPort, J>(
     caller: &Caller,
 ) -> Result<Option<TenantId>, ApiError> {
     Ok(caller.tenant_id)
+}
+
+/// The identity service can't say whether a member token's session is live (503).
+fn identity_unavailable() -> ApiError {
+    ApiError::new(
+        503,
+        chelabase_types::api_error::ErrorCode::IdentityUnavailable,
+        "the identity service can't be reached; try again",
+    )
 }
 
 /// #119: a member token's tenant no longer exists.

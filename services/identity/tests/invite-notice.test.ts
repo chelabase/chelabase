@@ -76,9 +76,10 @@ describeDb("invite notice", () => {
   it("notice_is_members_only", async () => {
     const pool = newAppPool().pool;
     await createPool(h, pool);
+    // The orchestrator's allow-list refuses an app pool before the route's own check.
     const r = await notice(mailed, "00000000-0000-4000-8000-000000000000", { link: LINK }, "orchestrator", `/internal/v1/pools/${pool}`);
-    expect(r.status).toBe(400);
-    expect(r.body.error).toBe("invalid_pool");
+    expect(r.status).toBe(403);
+    expect(r.body.error).toBe("forbidden");
   });
 
   it("notice_without_smtp_is_409", async () => {

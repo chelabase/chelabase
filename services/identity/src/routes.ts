@@ -36,51 +36,75 @@ export type RouteId =
   | "invite.notice"
   | "email.status";
 
-/** What each caller may do. Anything not listed answers 403. */
-export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
-  // Member and app-user flows: everything but pool lifecycle.
-  auth: new Set<RouteId>([
-    "users.create",
-    "users.list",
-    "users.get",
-    "users.set_email",
-    "users.set_password",
-    "users.verify_email",
-    "users.ban",
-    "users.unban",
-    "users.delete",
-    "sessions.create",
-    "sessions.lookup",
-    "sessions.get",
-    "sessions.revoke",
-    "sessions.revoke_all",
-    "codes.create",
-    "codes.verify",
-    "email.status",
+/** A kind of pool: `members`, or any project's `app-<uuid>`. */
+export type PoolKind = "members" | "app";
+
+const MEMBERS: readonly PoolKind[] = ["members"];
+const APP: readonly PoolKind[] = ["app"];
+const BOTH: readonly PoolKind[] = ["members", "app"];
+/** A route outside any pool (`email.status`): the kinds don't apply. */
+const NO_POOL: readonly PoolKind[] = [];
+
+/**
+ * What each caller may do, and on which kinds of pool. Anything not listed answers 403, and so
+ * does a listed route on a pool of another kind.
+ */
+export const ALLOW: Record<Caller, ReadonlyMap<RouteId, readonly PoolKind[]>> = {
+  // Member and app-user flows: everything but pool lifecycle, on both kinds of pool.
+  auth: new Map<RouteId, readonly PoolKind[]>([
+    ["users.create", BOTH],
+    ["users.list", BOTH],
+    ["users.get", BOTH],
+    ["users.set_email", BOTH],
+    ["users.set_password", BOTH],
+    ["users.verify_email", BOTH],
+    ["users.ban", BOTH],
+    ["users.unban", BOTH],
+    ["users.delete", BOTH],
+    ["sessions.create", BOTH],
+    ["sessions.lookup", BOTH],
+    ["sessions.get", BOTH],
+    ["sessions.revoke", BOTH],
+    ["sessions.revoke_all", BOTH],
+    ["codes.create", BOTH],
+    ["codes.verify", BOTH],
+    ["email.status", NO_POOL],
   ]),
-  // App-user admin in the management API: no sign-in and no session tokens. It may set an
-  // initial password when it creates a user, but never changes one afterwards. It may create
-  // invite codes (only that kind; see routes/codes.ts) but never check one, and it alone sends
-  // the code-less invite notice to an existing account.
-  orchestrator: new Set<RouteId>([
-    "users.create",
-    "users.list",
-    "users.get",
-    "users.set_email",
-    "users.ban",
-    "users.unban",
-    "users.delete",
-    "sessions.revoke",
-    "sessions.revoke_all",
-    "codes.create",
-    "invite.notice",
-    "email.status",
+  // Members (invite, remove, suspend, the member-token session check) and app-user admin in
+  // the management API: no sign-in and no session tokens. It may set an initial password when
+  // it creates a user, but never changes one afterwards. It may create invite codes (only that
+  // kind; see routes/codes.ts) but never check one, and it alone sends the code-less invite
+  // notice to an existing account. Each route only on the pools those flows use.
+  orchestrator: new Map<RouteId, readonly PoolKind[]>([
+    ["users.create", BOTH],
+    ["users.list", BOTH],
+    ["users.get", BOTH],
+    ["users.set_email", APP],
+    ["users.ban", BOTH],
+    ["users.unban", BOTH],
+    ["users.delete", BOTH],
+    // A member token's `sid` is checked against its identity session.
+    ["sessions.get", MEMBERS],
+    // An app session's identity session ends with it.
+    ["sessions.revoke", APP],
+    ["sessions.revoke_all", BOTH],
+    ["codes.create", MEMBERS],
+    ["invite.notice", MEMBERS],
+    ["email.status", NO_POOL],
   ]),
-  // Pool lifecycle and the users sync.
-  worker: new Set<RouteId>(["pools.create", "pools.delete", "users.list", "users.get"]),
+  // App pools' lifecycle and the users sync; never the members pool.
+  worker: new Map<RouteId, readonly PoolKind[]>([
+    ["pools.create", APP],
+    ["pools.delete", APP],
+    ["users.list", APP],
+    ["users.get", APP],
+  ]),
   // chelabase-init's bootstrap: the members pool, created (idempotently) and nothing more.
-  bootstrap: new Set<RouteId>(["pools.create"]),
+  bootstrap: new Map<RouteId, readonly PoolKind[]>([["pools.create", MEMBERS]]),
 };
+
+/** The kind of a resolved pool. */
+export const poolKind = (pool: PoolRef): PoolKind => (pool.name === "members" ? "members" : "app");
 
 export interface Reply {
   status: number;

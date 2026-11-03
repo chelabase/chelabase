@@ -9600,6 +9600,7 @@ async fn mw_with(mode: Mode, with_identity: bool) -> Mw {
         Some(ops),
         None,
         with_identity.then(|| identity.client()),
+        None,
     )
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
@@ -15489,7 +15490,7 @@ async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
 /// The gateway's identity for a member token of person `sub` naming `tenant`.
 fn member_identity_token(app: &TestApp, sub: &str, tenant: uuid::Uuid) -> String {
     app.signer
-        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub), tenant)
+        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub), tenant, DEFAULT_SID)
         .unwrap()
 }
 

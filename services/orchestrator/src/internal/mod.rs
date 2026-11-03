@@ -46,6 +46,9 @@ use tower_http::trace::TraceLayer;
 /// The DDL receiver's body limit (T5): a forwarded delta is a few hundred bytes.
 pub(crate) const DDL_BODY_LIMIT: usize = 64 * 1024;
 
+/// `(tenant, token_hash)` of each accepted invite of one identity user, newest first.
+pub type AcceptedInvites = Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>;
+
 /// The metadata the internal routes read. Abstracted so tests can use an in-memory fake.
 pub trait NeonMetadataPort: Send + Sync + 'static {
     /// The DDL receiver's transaction.
@@ -235,7 +238,7 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     fn accepted_invites_for_user(
         &self,
         identity_user_id: &str,
-    ) -> impl Future<Output = Result<Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>, MetadataError>> + Send;
+    ) -> impl Future<Output = Result<AcceptedInvites, MetadataError>> + Send;
 
     /// The tenants this identity user is an active or pending member of.
     fn member_tenants(
@@ -474,7 +477,7 @@ impl NeonMetadataPort for MetadataClient {
     async fn accepted_invites_for_user(
         &self,
         identity_user_id: &str,
-    ) -> Result<Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>, MetadataError> {
+    ) -> Result<AcceptedInvites, MetadataError> {
         MetadataClient::accepted_invites_for_user(self, identity_user_id).await
     }
     async fn member_tenants(

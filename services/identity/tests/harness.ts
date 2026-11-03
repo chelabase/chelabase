@@ -86,9 +86,13 @@ export async function schemaExists(db: pg.Pool, schema: string): Promise<boolean
   return r.rowCount === 1;
 }
 
-/** Creates a pool as the worker would and fails the test if it doesn't answer 2xx. */
+/**
+ * Creates a pool as its owner would (the bootstrap makes `members`, the worker app pools) and
+ * fails the test if it doesn't answer 2xx.
+ */
 export async function createPool(h: Harness, pool: string): Promise<void> {
-  const r = await call(h, "POST", `/internal/v1/pools/${pool}`, { as: "worker" });
+  const as = pool === "members" ? "bootstrap" : "worker";
+  const r = await call(h, "POST", `/internal/v1/pools/${pool}`, { as });
   if (r.status !== 201 && r.status !== 200) {
     throw new Error(`create pool ${pool}: ${r.status} ${JSON.stringify(r.body)}`);
   }

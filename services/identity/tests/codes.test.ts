@@ -27,6 +27,8 @@ describeDb("codes", () => {
     });
     pool = newAppPool().pool;
     await createPool(h, pool);
+    // Invites from the orchestrator are members-pool only.
+    await createPool(h, "members");
   });
   afterAll(async () => {
     await h?.close();
@@ -56,7 +58,7 @@ describeDb("codes", () => {
   const wrong = (code: string, k = 1) => String((Number(code) + k) % 1_000_000).padStart(6, "0");
   const signIn = (email: string, password: string, p = pool) =>
     call(h, "POST", `${base(p)}/sessions`, { body: { email, password } });
-  const lookup = (token: string) => call(h, "POST", `${base()}/sessions/lookup`, { body: { token } });
+  const lookup = (token: string, p = pool) => call(h, "POST", `${base(p)}/sessions/lookup`, { body: { token } });
 
   // AC 1
   it("verify_single_use", async () => {
@@ -291,17 +293,18 @@ describeDb("codes", () => {
 
   // S1: an invite never overwrites an established account (a password and a verified email).
   it("invite_refused_for_user_with_password", async () => {
-    const user = await createUser("password-est-0");
-    expect((await call(h, "POST", `${base()}/users/${user.id}/verify-email`)).status).toBe(200);
+    const m = "members";
+    const user = await createUser("password-est-0", m);
+    expect((await call(h, "POST", `${base(m)}/users/${user.id}/verify-email`)).status).toBe(200);
     for (const as of ["auth", "orchestrator"] as const) {
-      const r = await call(h, "POST", `${base()}/codes`, { as, body: { user_id: user.id, kind: "invite", delivery: "return" } });
+      const r = await call(h, "POST", `${base(m)}/codes`, { as, body: { user_id: user.id, kind: "invite", delivery: "return" } });
       expect(r.status, JSON.stringify(r.body)).toBe(409);
       expect(r.body.error).toBe("invite_refused");
       expect(r.body.code).toBeUndefined();
     }
     // Other kinds are unaffected.
-    expect((await call(h, "POST", `${base()}/codes`, { body: { user_id: user.id, kind: "reset", delivery: "return" } })).status).toBe(201);
-    expect((await signIn(user.email, "password-est-0")).status).toBe(201);
+    expect((await call(h, "POST", `${base(m)}/codes`, { body: { user_id: user.id, kind: "reset", delivery: "return" } })).status).toBe(201);
+    expect((await signIn(user.email, "password-est-0", m)).status).toBe(201);
   });
 
   it("invite_refused_at_verify_once_established", async () => {
@@ -328,31 +331,35 @@ describeDb("codes", () => {
 
   it("invite_accepted_for_preregistered_user", async () => {
     // A password but an unverified email: a pre-registered account the invite completes.
-    const user = await createUser("password-pre-0");
-    const s = await signIn(user.email, "password-pre-0");
+    const m = "members";
+    const user = await createUser("password-pre-0", m);
+    const s = await signIn(user.email, "password-pre-0", m);
     expect(s.status).toBe(201);
-    const { code } = await issue(user.id, "invite", pool);
-    const orch = await call(h, "POST", `${base()}/codes`, { as: "orchestrator", body: { user_id: user.id, kind: "invite", delivery: "return" } });
+    const { code } = await issue(user.id, "invite", m);
+    const orch = await call(h, "POST", `${base(m)}/codes`, { as: "orchestrator", body: { user_id: user.id, kind: "invite", delivery: "return" } });
     expect(orch.status).toBe(201);
     // The orchestrator's code replaced the first.
-    expect((await verify(user.id, "invite", code, { new_password: "password-pre-1" })).status).toBe(400);
-    const r = await verify(user.id, "invite", orch.body.code, { new_password: "password-pre-1" });
+    expect((await verify(user.id, "invite", code, { new_password: "password-pre-1" }, m)).status).toBe(400);
+    const r = await verify(user.id, "invite", orch.body.code, { new_password: "password-pre-1" }, m);
     expect(r.status).toBe(200);
     expect(r.body.user.email_verified).toBe(true);
-    expect((await lookup(s.body.session_token)).status).toBe(404);
-    expect((await signIn(user.email, "password-pre-0")).status).toBe(401);
-    expect((await signIn(user.email, "password-pre-1")).status).toBe(201);
+    expect((await lookup(s.body.session_token, m)).status).toBe(404);
+    expect((await signIn(user.email, "password-pre-0", m)).status).toBe(401);
+    expect((await signIn(user.email, "password-pre-1", m)).status).toBe(201);
   });
 
   it("caller_allow_list", async () => {
-    const user = await createUser();
-    const create = (as: "auth" | "orchestrator" | "worker", kind: string) =>
-      call(h, "POST", `${base()}/codes`, { as, body: { user_id: user.id, kind, delivery: "return" } });
+    const m = "members";
+    const user = await createUser(undefined, m);
+    const create = (as: "auth" | "orchestrator" | "worker", kind: string, p = m) =>
+      call(h, "POST", `${base(p)}/codes`, { as, body: { user_id: user.id, kind, delivery: "return" } });
     expect((await create("orchestrator", "invite")).status).toBe(201);
     expect((await create("orchestrator", "reset")).status).toBe(403);
     expect((await create("orchestrator", "verify")).status).toBe(403);
+    // App users have no invites: the orchestrator's codes are members-pool only.
+    expect((await create("orchestrator", "invite", pool)).status).toBe(403);
     expect((await create("worker", "invite")).status).toBe(403);
-    expect((await call(h, "POST", `${base()}/codes/verify`, { as: "orchestrator", body: {} })).status).toBe(403);
+    expect((await call(h, "POST", `${base(m)}/codes/verify`, { as: "orchestrator", body: {} })).status).toBe(403);
     expect((await call(h, "GET", "/internal/v1/email/status", { as: "orchestrator" })).status).toBe(200);
     expect((await call(h, "GET", "/internal/v1/email/status", { as: "worker" })).status).toBe(403);
   });
