@@ -9,7 +9,7 @@
 use axum::extract::Request;
 use axum::{Json, Router};
 use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
-use chelabase_auth::test_support::MockJwks;
+use chelabase_auth::test_support::MemberKeys;
 use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,8 @@ use tokio::net::TcpListener;
 
 const E2E_PROJECT: &str = "33333333-3333-4333-8333-333333333333";
 const STUDIO: &str = "http://127.0.0.1:3999";
+/// The tenant every management token here names.
+const TENANT: uuid::Uuid = uuid::Uuid::from_u128(0x7e7e);
 const STUDIO_HOST: &str = "127.0.0.1:3999";
 
 /// The most recent request the mock upstream received: headers plus `:uri`.
@@ -26,7 +28,7 @@ type Seen = Arc<Mutex<Option<HashMap<String, String>>>>;
 
 struct Stack {
     base: String,
-    jwks: MockJwks,
+    keys: MemberKeys,
     verify: InternalVerifier,
     seen: Seen,
     _gateway: GatewayProcess,
@@ -109,14 +111,14 @@ fn refused_upstream() -> (String, tokio::net::TcpSocket) {
     (format!("http://127.0.0.1:{port}"), socket)
 }
 
-/// Spawn the gateway binary in front of `upstream_url`, trusting `jwks`.
-async fn spawn_gateway(upstream_url: &str, jwks: &MockJwks) -> (String, InternalVerifier, GatewayProcess) {
-    spawn_gateway_with(upstream_url, jwks, &[]).await
+/// Spawn the gateway binary in front of `upstream_url`, trusting `keys`' member tokens.
+async fn spawn_gateway(upstream_url: &str, keys: &MemberKeys) -> (String, InternalVerifier, GatewayProcess) {
+    spawn_gateway_with(upstream_url, keys, &[]).await
 }
 
 async fn spawn_gateway_with(
     upstream_url: &str,
-    jwks: &MockJwks,
+    keys: &MemberKeys,
     extra_env: &[(&str, &str)],
 ) -> (String, InternalVerifier, GatewayProcess) {
     let (private_pem, public_pem) = generate_keypair_pem();
@@ -130,6 +132,8 @@ async fn spawn_gateway_with(
         let workdir = tempfile::tempdir().unwrap();
         let signing_key = workdir.path().join("internal-signing.pem");
         std::fs::write(&signing_key, &private_pem).unwrap();
+        let member_key = workdir.path().join("member-jwt.pub");
+        std::fs::write(&member_key, &keys.public_pem).unwrap();
 
         let port = free_port();
         let mut command = Command::new(env!("CARGO_BIN_EXE_gateway"));
@@ -139,11 +143,9 @@ async fn spawn_gateway_with(
             .env("CHELABASE_PUBLIC_SCHEME", "http")
             .env("CHELABASE_API_HOST", std::net::Ipv4Addr::LOCALHOST.to_string())
             .env("CHELABASE_STUDIO_HOST", STUDIO_HOST)
-            .env("CHELABASE_AUTH_HOST", jwks.issuer().trim_start_matches("http://"))
+            .env("CHELABASE_AUTH_HOST", keys.issuer().trim_start_matches("http://"))
             .env("CHELABASE_ORCHESTRATOR_URL", upstream_url)
-            .env("CHELABASE_ZITADEL_ISSUER", jwks.issuer())
-            .env("CHELABASE_ZITADEL_JWKS_URL", jwks.jwks_url())
-            .env("CHELABASE_ZITADEL_AUDIENCES", chelabase_auth::test_support::MOCK_AUDIENCE)
+            .env("CHELABASE_MEMBER_JWT_PUBLIC_KEY", &member_key)
             // The development bearers (this test stands in for the workbench).
             .env("CHELABASE_DEV_DEFAULTS", "1")
             .env("CHELABASE_INTERNAL_SIGNING_KEY", &signing_key)
@@ -269,12 +271,12 @@ fn dropping_the_guard_kills_a_child_that_never_became_ready() {
 }
 
 async fn start_stack() -> Stack {
-    let jwks = MockJwks::start().await;
+    let keys = MemberKeys::new();
     let (upstream, seen) = spawn_upstream().await;
-    let (base, verify, gateway) = spawn_gateway(&upstream, &jwks).await;
+    let (base, verify, gateway) = spawn_gateway(&upstream, &keys).await;
     Stack {
         base,
-        jwks,
+        keys,
         verify,
         seen,
         _gateway: gateway,
@@ -283,7 +285,7 @@ async fn start_stack() -> Stack {
 
 impl Stack {
     fn bearer(&self) -> String {
-        format!("Bearer {}", self.jwks.token_for_org("user-1", "org-1", 300))
+        format!("Bearer {}", self.keys.token("user-1", TENANT, 300))
     }
 
     fn upstream_saw(&self) -> Option<HashMap<String, String>> {
@@ -315,7 +317,7 @@ async fn authenticated_request_reaches_upstream_with_internal_identity_only() {
         .verify
         .verify(&seen[IDENTITY_HEADER], "orchestrator")
         .expect("forwarded identity is the gateway-minted one, not the forged header");
-    assert_eq!(claims.org_id, "org-1");
+    assert_eq!(claims.tenant_id, Some(TENANT));
     assert_eq!(claims.rid, response_rid);
     assert_eq!(seen["x-request-id"], response_rid);
     assert_eq!(seen["x-forwarded-proto"], "http");
@@ -493,7 +495,7 @@ async fn proxied_response_carries_cors_headers_for_studio() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_down_is_502_json() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (dead_upstream, _reserved) = refused_upstream();
     let (base, _verify, _gateway) = spawn_gateway(&dead_upstream, &jwks).await;
 
@@ -530,7 +532,7 @@ async fn spawn_truncating_upstream() -> String {
 // gateway must not splice its own JSON error into the client's body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_failure_after_response_started_does_not_inject_error_body() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let upstream = spawn_truncating_upstream().await;
     let (base, _verify, _gateway) = spawn_gateway(&upstream, &jwks).await;
 
@@ -569,7 +571,7 @@ async fn forwarded_headers_are_replaced_not_trusted() {
 // `X-Forwarded-For` address, one address only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_trusted_proxy_forwards_the_client_address() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (upstream, seen) = spawn_upstream().await;
     let (base, _verify, _gateway) =
         spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "127.0.0.0/8, ::1")]).await;
@@ -597,7 +599,7 @@ async fn a_trusted_proxy_forwards_the_client_address() {
 // from a forged header (one naming a trusted hop too): the apps see the peer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_forged_header_from_an_untrusted_peer_is_ignored() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (upstream, seen) = spawn_upstream().await;
     let (base, _verify, _gateway) =
         spawn_gateway_with(&upstream, &jwks, &[("CHELABASE_GATEWAY_TRUSTED_PROXIES", "10.0.0.0/8")]).await;
@@ -625,36 +627,25 @@ async fn an_unknown_host_is_404_with_an_empty_body() {
     assert!(stack.upstream_saw().is_none());
 }
 
+// #126: the auth host names the member tokens' issuer only; the gateway routes it nowhere, so
+// nothing there falls through to another upstream.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_auth_host_reaches_zitadel_with_host_and_bearer_unchanged() {
-    let jwks = MockJwks::start().await;
-    let (api, _) = spawn_upstream().await;
-    let (zitadel, seen) = spawn_upstream().await;
-    let (base, _verify, _gateway) =
-        spawn_gateway_with(&api, &jwks, &[("CHELABASE_ZITADEL_UPSTREAM", zitadel.as_str())]).await;
+async fn the_auth_host_is_routed_nowhere() {
+    let jwks = MemberKeys::new();
+    let (api, seen) = spawn_upstream().await;
+    let (base, _verify, _gateway) = spawn_gateway(&api, &jwks).await;
     let auth_host = jwks.issuer().trim_start_matches("http://").to_string();
-    let resp = reqwest::Client::new()
-        .get(format!("{base}/management/v1/orgs/me"))
-        .header(reqwest::header::HOST, &auth_host)
-        .header("authorization", "Bearer zitadel-pat")
-        .header("origin", STUDIO)
-        .header("chelabase-server-key", "chk_sec_never-forwarded")
-        .header("chelabase-client-ip", "203.0.113.9")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    assert!(resp.headers().get("access-control-allow-origin").is_none());
-    let seen = seen.lock().unwrap().clone().expect("the Zitadel upstream was reached");
-    assert_eq!(seen["host"], auth_host);
-    assert_eq!(seen["authorization"], "Bearer zitadel-pat");
-    assert_eq!(seen[":uri"], "/management/v1/orgs/me");
-    assert!(!seen.contains_key(IDENTITY_HEADER));
-    // #49: the app-server headers are the gateway's alone, on a site too.
-    assert!(!seen.contains_key("chelabase-server-key") && !seen.contains_key("chelabase-client-ip"));
-    assert_eq!(seen["x-forwarded-for"], "127.0.0.1");
-    assert_eq!(seen["x-forwarded-proto"], "http");
-    assert_eq!(seen["x-forwarded-host"], auth_host);
+    for path in ["/", "/auth/v1/sign-in", "/oauth/v2/keys", "/v1/databases"] {
+        let resp = reqwest::Client::new()
+            .get(format!("{base}{path}"))
+            .header(reqwest::header::HOST, &auth_host)
+            .header("authorization", format!("Bearer {}", jwks.token("user-1", TENANT, 300)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+    }
+    assert!(seen.lock().unwrap().is_none(), "nothing was proxied");
 }
 
 async fn read_head(sock: &mut tokio::net::TcpStream) -> String {
@@ -688,7 +679,7 @@ async fn spawn_upgrade_upstream() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_studio_host_passes_websocket_upgrades() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let studio = spawn_upgrade_upstream().await;
     let (base, _verify, _gateway) =
@@ -740,7 +731,7 @@ async fn spawn_eager_upgrade_upstream() -> String {
 /// trip used to lose that race about half the time; 32 sequential ones prove the fix.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_websocket_upgrade_survives_a_101_that_beats_the_request_end() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let studio = spawn_eager_upgrade_upstream().await;
     let (base, _verify, _gateway) =
@@ -765,7 +756,7 @@ async fn a_websocket_upgrade_survives_a_101_that_beats_the_request_end() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_site_upstream_down_is_502_plain_text() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let (down, _socket) = refused_upstream();
     let (base, _verify, _gateway) =
@@ -826,7 +817,7 @@ async fn spawn_event_stream_upstream() -> String {
 // `text/event-stream`) may sit idle like a websocket, past the upstream read timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_site_event_stream_may_idle_past_the_upstream_timeout() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let stream = spawn_event_stream_upstream().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
@@ -852,7 +843,7 @@ async fn a_site_event_stream_may_idle_past_the_upstream_timeout() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upstream_that_never_answers_is_504_json() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let upstream = spawn_silent_upstream().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
         &upstream,
@@ -880,7 +871,7 @@ async fn upstream_that_never_answers_is_504_json() {
 // Hostname upstreams (Compose/k8s service names) resolve asynchronously.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hostname_upstream_is_resolved() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (upstream, seen) = spawn_upstream().await;
     let by_name = upstream.replace(&std::net::Ipv4Addr::LOCALHOST.to_string(), "localhost");
     let (base, _verify, _gateway) = spawn_gateway(&by_name, &jwks).await;
@@ -927,7 +918,7 @@ async fn spawn_internal_listener() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_authorization_header_is_not_forwarded_to_rest() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (rest, seen) = spawn_upstream().await;
     let internal = spawn_internal_listener().await;
     let (base, verify, _gateway) = spawn_gateway_with(
@@ -963,7 +954,7 @@ async fn client_authorization_header_is_not_forwarded_to_rest() {
 // The gateway's own flat errors (here a failed proxy) use the shared shape on data routes too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_failures_are_json_on_data_routes_too() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (dead_rest, _reserved) = refused_upstream();
     let internal = spawn_internal_listener().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
@@ -996,7 +987,7 @@ async fn proxy_failures_are_json_on_data_routes_too() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chelabase_user_header_is_stripped_upstream() {
     use chelabase_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (rest, seen) = spawn_upstream().await;
     let internal = spawn_internal_listener().await;
     let dir = tempfile::tempdir().unwrap();
@@ -1070,7 +1061,7 @@ async fn chelabase_user_header_is_stripped_upstream() {
 // upgrades and event streams (`Accept: text/event-stream`) may stay open up to an hour.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hung_site_request_times_out_like_the_api() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let silent = spawn_silent_upstream().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
@@ -1150,7 +1141,7 @@ async fn spawn_recording_upgrade_upstream() -> (String, Arc<Mutex<Option<String>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_realtime_socket_route_passes_an_upgrade_with_its_ticket_and_no_client_identity() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, api_seen) = spawn_upstream().await;
     let (realtime, realtime_head) = spawn_recording_upgrade_upstream().await;
     let (base, _verify, _gateway) =
@@ -1181,7 +1172,7 @@ async fn the_realtime_socket_route_passes_an_upgrade_with_its_ticket_and_no_clie
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dead_realtime_upstream_answers_a_socket_upgrade_with_502() {
     // The W16 failure path (the log text itself is asserted in realtime_proxy.rs).
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (api, _) = spawn_upstream().await;
     let (dead, _socket) = refused_upstream();
     let (base, _verify, _gateway) = spawn_gateway_with(&api, &jwks, &[("CHELABASE_REALTIME_URL", dead.as_str())]).await;
@@ -1246,7 +1237,7 @@ async fn spawn_secret_key_listener() -> String {
 /// API's `GET /data/v1/types` and on the management API's types download.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn types_etag_if_none_match_and_304_pass_through() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (upstream, seen) = spawn_types_upstream().await;
     let internal = spawn_secret_key_listener().await;
     let (base, _verify, _gateway) = spawn_gateway_with(
@@ -1260,7 +1251,7 @@ async fn types_etag_if_none_match_and_304_pass_through() {
     )
     .await;
     let key = chelabase_types::data_key::generate(chelabase_types::data_key::DataKeyKind::Secret).key;
-    let management = format!("Bearer {}", jwks.token_for_org("user-1", "org-1", 300));
+    let management = format!("Bearer {}", jwks.token("user-1", TENANT, 300));
     let routes = [
         (format!("{base}/data/v1/types"), format!("Bearer {key}")),
         (
@@ -1327,7 +1318,7 @@ async fn spawn_key_listener(keys: Vec<(String, serde_json::Value)>) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
     use chelabase_types::data_key::{generate, DataKeyKind};
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let (auth, seen) = spawn_upstream().await;
     let public = generate(DataKeyKind::Public).key;
     let secret = generate(DataKeyKind::Secret).key;
@@ -1412,4 +1403,158 @@ async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
     let saw = seen.lock().unwrap().clone().expect("the upstream was called");
     assert!(!saw.contains_key("chelabase-server-key") && !saw.contains_key("chelabase-client-ip"));
     assert_eq!(saw["x-forwarded-for"], "127.0.0.1");
+}
+
+// #119: member tokens signed by auth (`auth/member-jwt.key`), verified with the public key.
+mod member_tokens {
+    use super::*;
+    use chelabase_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
+    use chelabase_auth::member_token::{MemberClaims, MemberTokenSigner, MEMBER_AUDIENCE};
+    use uuid::Uuid;
+
+    struct MemberStack {
+        base: String,
+        keys: MemberKeys,
+        verify: InternalVerifier,
+        seen: Seen,
+        _gateway: GatewayProcess,
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// A gateway with `CHELABASE_MEMBER_JWT_PUBLIC_KEY` set (`with_key`) or unset.
+    async fn member_stack(with_key: bool) -> MemberStack {
+        let keys = MemberKeys::new();
+        let (upstream, seen) = spawn_upstream().await;
+        // Blank is unset: no member verify key.
+        let env: Vec<(&str, &str)> =
+            if with_key { vec![] } else { vec![("CHELABASE_MEMBER_JWT_PUBLIC_KEY", "")] };
+        let (base, verify, gateway) = spawn_gateway_with(&upstream, &keys, &env).await;
+        MemberStack { base, keys, verify, seen, _gateway: gateway }
+    }
+
+    impl MemberStack {
+        fn claims(&self, tid: Uuid) -> MemberClaims {
+            MemberClaims {
+                iss: self.keys.issuer().to_string(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: "user_ana".into(),
+                tid,
+                sid: "sess_1".into(),
+                email: "ana@example.com".into(),
+                name: "Ana Lima".into(),
+                iat: now(),
+                exp: now() + 300,
+            }
+        }
+
+        async fn post(&self, bearer: &str) -> reqwest::Response {
+            reqwest::Client::new()
+                .post(format!("{}/v1/databases", self.base))
+                .header("authorization", format!("Bearer {bearer}"))
+                .json(&serde_json::json!({ "name": "demo" }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        fn upstream_saw(&self) -> Option<HashMap<String, String>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    // AC 1: the request reaches the orchestrator as that member of tenant `tid`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_token_reaches_orchestrator() {
+        let stack = member_stack(true).await;
+        let tid = Uuid::new_v4();
+        let token = stack.keys.sign(&stack.claims(tid));
+        let resp = stack.post(&token).await;
+        assert_eq!(resp.status(), 200);
+        let seen = stack.upstream_saw().expect("upstream was called");
+        assert!(!seen.contains_key("authorization"));
+        let claims = stack.verify.verify(&seen[IDENTITY_HEADER], "orchestrator").unwrap();
+        assert_eq!(claims.sub, "user_ana");
+        assert_eq!(claims.tenant_id, Some(tid));
+        // Review fix 1: the member token's session, which the orchestrator checks is live.
+        assert_eq!(claims.sid.as_deref(), Some("sess_1"));
+        assert_eq!(claims.auth, chelabase_auth::internal::AuthMethod::ManagementJwt);
+        assert_eq!(claims.email.as_deref(), Some("ana@example.com"));
+        assert_eq!(claims.name.as_deref(), Some("Ana Lima"));
+    }
+
+    // AC 2, AC 3, AC 6 at the gateway: each is 401 and never proxied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bad_member_tokens_are_401_and_never_proxied() {
+        let stack = member_stack(true).await;
+        let tid = Uuid::new_v4();
+        let mut bad: Vec<(&str, String)> = Vec::new();
+
+        let (other_private, other_public) = generate_keypair_pem();
+        let foreign = MemberTokenSigner::from_pem(other_private.as_bytes(), other_public.as_bytes(), stack.keys.issuer()).unwrap();
+        bad.push(("foreign key", foreign.sign(&stack.claims(tid)).unwrap()));
+
+        let mut wrong_aud = stack.claims(tid);
+        wrong_aud.aud = app_audience(Uuid::new_v4());
+        bad.push(("aud", stack.keys.sign(&wrong_aud)));
+        let mut wrong_iss = stack.claims(tid);
+        wrong_iss.iss = "http://evil.example".into();
+        bad.push(("iss", stack.keys.sign(&wrong_iss)));
+        let mut expired = stack.claims(tid);
+        expired.iat = now() - 400;
+        expired.exp = now() - 31;
+        bad.push(("expired", stack.keys.sign(&expired)));
+
+        let project = Uuid::new_v4();
+        let app = AppClaims {
+            iss: APP_ISSUER.into(),
+            aud: app_audience(project),
+            sub: Uuid::new_v4(),
+            sid: Uuid::new_v4(),
+            project,
+            email: "a@example.com".into(),
+            email_verified: true,
+            role: "authenticated".into(),
+            iat: now(),
+            exp: now() + 300,
+        };
+        let (app_private, app_public) = generate_keypair_pem();
+        let app_signer = AppTokenSigner::from_pem(app_private.as_bytes(), app_public.as_bytes()).unwrap();
+        bad.push(("app token", app_signer.sign(&app).unwrap()));
+
+        // The gateway's own internal token, minted by another gateway key.
+        let (gw_private, _) = generate_keypair_pem();
+        let internal = chelabase_auth::internal::InternalSigner::from_pem(gw_private.as_bytes()).unwrap();
+        let identity = chelabase_auth::internal::Identity {
+            sub: "user_ana".into(),
+            auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
+            request_id: "r".into(),
+            data: None,
+            email: None,
+            name: None,
+        };
+        bad.push(("internal token", internal.sign_for_tenant("orchestrator", &identity, tid, "sess_1").unwrap()));
+
+        // `alg: none` (`{"alg":"none"}`) over a good token's payload.
+        let good = stack.keys.sign(&stack.claims(tid));
+        let payload = good.split('.').nth(1).unwrap();
+        bad.push(("alg none", format!("eyJhbGciOiJub25lIn0.{payload}.")));
+
+        for (what, token) in bad {
+            let resp = stack.post(&token).await;
+            assert_eq!(resp.status(), 401, "{what}");
+            assert!(stack.upstream_saw().is_none(), "{what} was proxied");
+        }
+    }
+
+    // Without the member key, every bearer is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_token_without_the_key_is_401() {
+        let stack = member_stack(false).await;
+        let token = stack.keys.sign(&stack.claims(Uuid::new_v4()));
+        assert_eq!(stack.post(&token).await.status(), 401);
+        assert!(stack.upstream_saw().is_none());
+    }
 }

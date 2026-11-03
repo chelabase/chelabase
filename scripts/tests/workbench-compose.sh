@@ -71,13 +71,13 @@ for s in orchestrator worker runner; do
     fail "$s gets the Docker socket"
   q ".services[\"$s\"].group_add[]?" | gq -x 973 || fail "$s joins the docker group"
 done
-for s in gateway auth rest studio zitadel mailpit metadata-db; do
+for s in gateway auth rest studio mailpit metadata-db; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/var/run/docker.sock\") | .source")" ]] ||
     fail "$s must not get the Docker socket"
 done
 
 # Which key and state files each service sees: compose-key-visibility.sh (U10). Only the runner
-# mounts the whole state dir (read-write, at its own path); the apps get single state files.
+# mounts the whole state dir (read-write, at its own path); the apps get none of it.
 for s in orchestrator worker gateway auth rest realtime studio; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/m/.chelabase/stacks/feat-x\") | .target")" ]] ||
     fail "$s must not mount the whole state dir"
@@ -85,20 +85,13 @@ done
 [[ "$(q '.services.runner.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
   fail "runner mounts the state dir read-write at its own path"
 
-[[ "$(q '.services.zitadel.volumes[] | select(.target == "/zitadel-bootstrap") | .source')" == /m/.chelabase/stacks/feat-x/zitadel ]] ||
-  fail "zitadel's PATs go to the stack's state dir"
-[[ "$(q '.services.zitadel.user // empty')" == 1000:1000 ]] ||
-  fail "zitadel runs as the stack's uid:gid, so the PATs it writes are the host user's"
-[[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALDOMAIN')" == auth.feat-x.chelabase.localhost ]] ||
-  fail "zitadel's domain is the stack's auth host"
-[[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALPORT')" == 8137 ]] ||
-  fail "zitadel's port is the stack's gateway port"
-[[ "$(q '.services.zitadel.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2')" == "http://studio.feat-x.chelabase.localhost:8137/login?authRequest=" ]] ||
-  fail "zitadel sends sign-ins to the stack's Studio"
-for s in zitadel mailpit; do
-  [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
+# The one exception: the orchestrator reads the stack's setup code (#126), checked below.
+for s in orchestrator worker gateway auth rest realtime studio; do
+  [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\"))
+    | select(\"$s:\" + .source != \"orchestrator:/m/.chelabase/stacks/feat-x/setup/setup.code\") | .source")" ]] ||
+    fail "$s mounts nothing from the state dir (it opens no state file)"
 done
-for s in orchestrator worker gateway auth rest; do
+for s in mailpit identity orchestrator worker gateway auth rest; do
   [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
 done
 
@@ -143,7 +136,7 @@ tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sour
 # --- RT1 T1 (R11): the compute network (P4, W14) ---------------------------------------------
 # Computes join `<project>_compute` (+ control). On it: what a compute needs (pageserver,
 # safekeepers, the storage broker, the orchestrator's hooks listener) and the clients that dial
-# computes. Never NATS, Valkey, a database, Zitadel, Mailpit, SeaweedFS, the gateway or Studio.
+# computes. Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the gateway or Studio.
 [[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
 on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
@@ -153,7 +146,7 @@ for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 saf
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
 done
 [[ "$(q '.services.runner.networks | keys | sort | join(" ")')" == "compute control default" ]] || fail "the runner is on default, control and compute"
-for s in nats valkey metadata-db zitadel-db storcon-db zitadel mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
+for s in nats valkey metadata-db storcon-db identity mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
   [[ "$(q ".services[\"$s\"].networks // {} | has(\"compute\")")" == false ]] || fail "$s must not be on the compute network"
 done
 # The orchestrator answers computes as `orchestrator` there (CHELABASE_CONTROL_PLANE_URI).
@@ -318,10 +311,8 @@ done
 [[ -z "$(q '.services.realtime.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
   fail "realtime must not get the Docker socket"
 [[ -z "$(q '.services.realtime.ports // [] | .[]?')" ]] || fail "realtime publishes no port (the gateway is the way in)"
-for f in /m/.chelabase/stacks/feat-x/env/stack.env /m/.chelabase/stacks/feat-x/zitadel/demo.env; do
-  q '.services.realtime.env_file[]? | if type == "object" then .path else . end' | gq -x "$f" ||
-    fail "realtime reads $f (demo.env: the OIDC audiences, as the gateway)"
-done
+q '.services.realtime.env_file[]? | if type == "object" then .path else . end' |
+  gq -x /m/.chelabase/stacks/feat-x/env/stack.env || fail "realtime reads the stack env"
 grep -q '8088/health' <<<"$(q '.services.realtime.healthcheck.test // [] | join(" ")')" ||
   fail "realtime's healthcheck asks its internal listener's /health (8088)"
 for dep in nats valkey; do
@@ -377,4 +368,89 @@ mt_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sourc
 [[ "$mt_mounts" == "runner:true" ]] || fail "metrics.token: read-only for the runner, nobody else; got: $mt_mounts"
 # S7: Valkey TLS is off in the stack (platform mode turns it on).
 [[ "$(env_of realtime CHELABASE_VALKEY_TLS)" == off ]] || fail "realtime: CHELABASE_VALKEY_TLS=off in the stack"
+# auth-replacement m5 (#118): the identity service runs from the checkout's sources on the
+# workbench image, on the default network only, with no host port and no gateway route.
+[[ "$(q '.services.identity // empty | length')" -gt 0 ]] || fail "the stack runs identity"
+[[ "$(q '.services.identity.ports // [] | length')" == 0 ]] || fail "identity publishes no host port"
+[[ "$(q '.services.identity.networks // {} | keys | join(" ")')" == default ]] ||
+  fail "identity is on the default network only, got: $(q '.services.identity.networks // {} | keys | join(" ")')"
+[[ "$(q '.services.identity.image')" == chelabase-workbench:fixture000000 ]] || fail "identity runs the workbench image"
+[[ "$(q '.services.identity.user')" == 1000:1000 ]] || fail "identity runs as the host user"
+[[ "$(q '.services.identity.profiles // [] | length')" == 0 ]] || fail "identity starts by default"
+q '.services.identity.command | if type == "array" then join(" ") else . end' | gq -F 'services/identity/src/main.ts' ||
+  fail "identity runs the checkout's identity sources"
+[[ "$(q '.services.identity.volumes[] | select(.source == "/w/feat-x") | .read_only // false')" == true ]] ||
+  fail "identity mounts the checkout read-only"
+[[ -n "$(q '.services.identity.healthcheck.test // empty')" ]] || fail "identity has a healthcheck"
+# Its entrypoint writes the database URL into /run/identity as the service user: the tmpfs must
+# be that user's own, in both files (a root-owned tmpfs crash-loops the service).
+q '.services.identity.tmpfs // [] | .[]' | gq -Fx '/run/identity:uid=1000,gid=1000,mode=0700' ||
+  fail "identity's /run/identity tmpfs is the host user's own"
+[[ -z "$(q '.services.identity.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
+  fail "identity must not get the Docker socket"
+q '.services.identity.depends_on | keys[]' | gq -x metadata-db || fail "identity waits for metadata-db"
+want_env identity CHELABASE_IDENTITY_SECRET_FILE "$K/identity/secret"
+want_env identity CHELABASE_IDENTITY_DB_PASSWORD_FILE "$K/identity/db.password"
+for c in AUTH ORCHESTRATOR WORKER; do
+  lc="$(tr '[:upper:]' '[:lower:]' <<<"$c")"
+  want_env identity "CHELABASE_IDENTITY_${c}_TOKEN_FILE" "$K/tokens/$lc-identity.token"
+done
+for s in auth orchestrator worker; do
+  want_env "$s" CHELABASE_IDENTITY_TOKEN_FILE "$K/tokens/$s-identity.token"
+  want_eff "$s" CHELABASE_IDENTITY_URL http://identity:8080
+done
+# Workbench mail goes to Mailpit, in plain SMTP.
+want_env identity CHELABASE_SMTP_HOST mailpit
+want_env identity CHELABASE_SMTP_TLS none
+# The gateway has no upstream for it.
+! q '.services.gateway.environment // {} | to_entries[] | .value' | gq -E '//identity(:|/|$)' ||
+  fail "the gateway must have no identity upstream"
+
+# The base file: the identity image, no host port, the internal network only.
+base="$(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-base-x \
+  -f "$root/infra/compose/docker-compose.yml" --env-file "$root/infra/compose/.env.example" \
+  config --no-env-resolution --format json)" || fail "base compose config failed"
+bq() { jq -r "$1" <<<"$base"; }
+[[ "$(bq '.services.identity.ports // [] | length')" == 0 ]] || fail "base: identity publishes no host port"
+[[ "$(bq '.services.identity.networks // {} | keys | join(" ")')" == default ]] || fail "base: identity is on the default network only"
+bq '.services.identity.image' | gq -E '/identity:' || fail "base: identity runs the identity image"
+[[ "$(bq '.services.identity.user')" == 10001:10001 ]] || fail "base: identity runs as the app user"
+[[ -n "$(bq '.services.identity.healthcheck.test // empty')" ]] || fail "base: identity has a healthcheck"
+for d in metadata-db init-secrets; do
+  bq '.services.identity.depends_on | keys[]' | gq -x "$d" || fail "base: identity waits for $d"
+done
+bq '.services["init-bootstrap"].depends_on | keys[]' | gq -x identity || fail "base: the bootstrap waits for identity"
+[[ "$(bq '.services.identity.read_only // false')" == true ]] || fail "base: identity's root filesystem is read-only"
+! bq '.services.gateway.environment // {} | to_entries[] | .value' | gq -E '//identity(:|/|$)' ||
+  fail "base: the gateway must have no identity upstream"
+published_base="$(bq '[.services | to_entries[] | select(.value.ports) | .key] | unique | join(" ")')"
+[[ "$published_base" == "gateway proxy" ]] || fail "base: only the gateway and the proxy publish ports, got: $published_base"
+
+# auth-replacement m5 (#118): the base identity service owns its /run/identity tmpfs.
+bq '.services.identity.tmpfs // [] | .[]' | grep -Fqx '/run/identity:uid=10001,gid=10001,mode=0700' ||
+  fail "base identity's /run/identity tmpfs is uid 10001's own"
+# m13 fix (#126): the dev member claims the stack's tenant with the setup code, and only the
+# orchestrator checks it. Without the code it answers every first sign-up `sign_up_closed`, so a
+# fresh workbench stack's bootstrap failed. It reads the stack's own code file, mounted read-only.
+code=/m/.chelabase/stacks/feat-x/setup/setup.code
+want_env orchestrator CHELABASE_SETUP_CODE_FILE "$code"
+[[ "$(q ".services.orchestrator.volumes[] | select(.target == \"$code\") | \"\(.source) \(.read_only // false)\"")" == "$code true" ]] ||
+  fail "the orchestrator mounts the stack's setup code read-only at $code"
+# The invariant behind it: an app's workbench `environment: !override` drops the base file's keys.
+# Every *_FILE key a base app service sets is set again in the workbench (its environment or
+# stack.env), or is named here with why the workbench doesn't need it.
+not_in_workbench=(
+  orchestrator:CHELABASE_METADATA_DATABASE_PASSWORD_FILE # stack.env's URL carries the password
+  worker:CHELABASE_METADATA_DATABASE_PASSWORD_FILE       # likewise
+  orchestrator:CHELABASE_PROXY_CA_FILE                   # a file name, defaulted by the service
+  identity:CHELABASE_SMTP_PASSWORD_FILE                  # Mailpit takes no SMTP login
+)
+for s in $(bq '.services | keys[]'); do
+  [[ "$(q ".services[\"$s\"].image // empty")" == chelabase-workbench:fixture000000 || $s == identity ]] || continue
+  for k in $(bq ".services[\"$s\"].environment // {} | keys[] | select(endswith(\"_FILE\"))"); do
+    [[ " ${not_in_workbench[*]} " == *" $s:$k "* ]] && continue
+    [[ -n "$(eff_env "$s" "$k")" ]] ||
+      fail "$s: the base sets $k, but the workbench drops it (set it in the overlay, or list it in not_in_workbench with why)"
+  done
+done
 echo "workbench-compose: ok"

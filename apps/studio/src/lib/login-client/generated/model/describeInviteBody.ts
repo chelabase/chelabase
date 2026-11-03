@@ -11,6 +11,6 @@
 export interface DescribeInviteBody {
   /** The invite token from the invite link. */
   t?: string;
-  /** The Zitadel user id from the invite link. */
+  /** The identity user id from the invite link. */
   user?: string;
 }

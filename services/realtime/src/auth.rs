@@ -1,13 +1,14 @@
 //! `auth` frames (spec §1, R9, S2, S14, W32): a Studio socket's first frame within 5 s, then one
-//! per oidc-client renewal. The token is verified as the gateway does (the same JWKS settings);
-//! its `sub` and `org_id` must be the ticket's (else 4003); a token whose `exp ≤ now` closes
-//! 4001, and the socket closes 4001 at `exp` exactly unless a renewal came (no leeway). A
-//! renewal that fails verification closes 4001 at once (W32). The token's contents never reach
-//! a log (R22).
+//! per token renewal. The member token is verified as the gateway does (auth's member key);
+//! its `sub` and tenant (its `tid`, #119) must be the ticket's (else
+//! 4003); a token whose `exp ≤ now` closes 4001, and the socket closes 4001 at `exp` exactly
+//! unless a renewal came (no leeway). A renewal that fails verification closes 4001 at once
+//! (W32). The token's contents never reach a log (R22).
 
 use async_trait::async_trait;
-use chelabase_auth::{AuthError, JwtVerifier, ZitadelAuthConfig};
+use chelabase_auth::member_token::{MemberTokenError, MemberTokenVerifier};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::ticket::TicketIdentity;
 
@@ -15,7 +16,13 @@ use crate::ticket::TicketIdentity;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberToken {
     pub sub: String,
-    pub org_id: String,
+    /// A member token's tenant (`tid`, #119).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
+    /// The identity session it was minted from (`sid`): a member's sockets from different
+    /// sessions never share a re-authorization answer.
+    #[serde(default)]
+    pub sid: String,
     /// Unix seconds.
     pub exp: u64,
     pub name: Option<String>,
@@ -27,10 +34,10 @@ pub enum TokenError {
     /// Expired past the verifier's leeway.
     #[error("the token expired")]
     Expired,
-    /// A bad signature, another issuer, no `sub` or org, not a JWT.
+    /// A bad signature, another issuer, no `sub` or tenant, not a JWT.
     #[error("the token is invalid")]
     Invalid,
-    /// The JWKS can't be fetched (or the verifier is misconfigured).
+    /// The verifier can't check it now.
     #[error("the token can't be checked now")]
     Unavailable,
 }
@@ -39,51 +46,49 @@ pub enum TokenError {
 pub trait TokenVerifier: Send + Sync + 'static {
     async fn verify(&self, token: &str) -> Result<MemberToken, TokenError>;
 
-    /// Whether tokens can be checked now (#22: the audiences may come late from the
-    /// bootstrap's files); the internal `/health` reports it.
+    /// Whether tokens can be checked now (the member verify key is configured); the internal
+    /// `/health` reports it.
     fn is_ready(&self) -> bool {
         true
     }
 }
 
-/// The production verifier: `chelabase_auth::JwtVerifier` with the gateway's settings.
-pub struct OidcVerifier {
-    inner: JwtVerifier,
+/// The production verifier: auth's member tokens (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119)
+/// with the auth host's issuer. Without the key every token is refused and it isn't ready.
+pub struct MemberVerifier {
+    member: Option<MemberTokenVerifier>,
 }
 
-impl OidcVerifier {
-    pub fn new(config: ZitadelAuthConfig) -> Self {
-        Self {
-            inner: JwtVerifier::new(config),
-        }
+impl MemberVerifier {
+    pub fn new(member: Option<MemberTokenVerifier>) -> Self {
+        Self { member }
     }
 }
 
 #[async_trait]
-impl TokenVerifier for OidcVerifier {
+impl TokenVerifier for MemberVerifier {
     async fn verify(&self, token: &str) -> Result<MemberToken, TokenError> {
-        match self.inner.verify(token).await {
+        let member = self.member.as_ref().ok_or(TokenError::Invalid)?;
+        match member.verify(token) {
             Ok(c) => Ok(MemberToken {
                 sub: c.sub,
-                org_id: c.org_id,
+                tenant_id: Some(c.tid),
+                sid: c.sid,
                 exp: c.exp,
-                name: c.name,
-                email: c.email,
+                name: Some(c.name).filter(|n| !n.is_empty()),
+                email: Some(c.email).filter(|e| !e.is_empty()),
             }),
-            Err(AuthError::Expired) => Err(TokenError::Expired),
-            Err(AuthError::Unauthorized | AuthError::InvalidToken(_)) => Err(TokenError::Invalid),
-            Err(AuthError::Jwks(_) | AuthError::Config(_) | AuthError::NotReady(_)) => {
-                Err(TokenError::Unavailable)
-            }
+            Err(MemberTokenError::Expired) => Err(TokenError::Expired),
+            Err(MemberTokenError::Invalid) => Err(TokenError::Invalid),
         }
     }
 
     fn is_ready(&self) -> bool {
-        self.inner.config().audiences.is_ready()
+        self.member.is_some()
     }
 }
 
-impl OidcVerifier {
+impl MemberVerifier {
     /// [`TokenVerifier::is_ready`], callable without the trait in scope.
     pub fn is_ready(&self) -> bool {
         TokenVerifier::is_ready(self)
@@ -94,7 +99,7 @@ impl OidcVerifier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthCheck {
     Ok,
-    /// Another `sub` or `org_id` than the ticket's: close 4003.
+    /// Another `sub` or tenant than the ticket's: close 4003.
     Mismatch,
     /// `exp ≤ now`: close 4001.
     Expired,
@@ -102,7 +107,7 @@ pub enum AuthCheck {
 
 /// R9/S14 on a verified token (`now` in unix seconds). A mismatch wins over expiry.
 pub fn check_auth_frame(ticket: &TicketIdentity, token: &MemberToken, now: u64) -> AuthCheck {
-    if token.sub != ticket.sub || token.org_id != ticket.org_id {
+    if token.sub != ticket.sub || token.tenant_id != ticket.tenant_id {
         AuthCheck::Mismatch
     } else if token.exp <= now {
         AuthCheck::Expired

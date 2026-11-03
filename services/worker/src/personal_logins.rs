@@ -280,7 +280,7 @@ mod tests {
         state.members.push(MemberRecord {
             id: member,
             tenant_id: db.tenant_id,
-            zitadel_user_id: format!("z-{member}"),
+            identity_user_id: format!("z-{member}"),
             email: None,
             display_name: "m".into(),
             tenant_admin: false,

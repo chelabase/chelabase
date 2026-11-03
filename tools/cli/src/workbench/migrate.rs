@@ -9,7 +9,6 @@ use std::path::{Component, Path, PathBuf};
 
 /// One move from the old layout to main's stack dir (paths relative to `<main>/.chelabase`).
 const MOVES: &[(&str, &str)] = &[
-    ("zitadel", "stacks/main/zitadel"),
     ("neon/proxy-ca.crt", "stacks/main/neon/proxy-ca.crt"),
 ];
 
@@ -158,13 +157,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let m = tmp.path();
         let base = m.join(".chelabase");
-        std::fs::create_dir_all(base.join("zitadel")).unwrap();
         std::fs::create_dir_all(base.join("neon")).unwrap();
         std::fs::create_dir_all(base.join("stacks/main/neon")).unwrap();
         std::fs::write(base.join("neon/proxy-ca.crt"), "old").unwrap();
         std::fs::write(base.join("stacks/main/neon/proxy-ca.crt"), "new").unwrap();
         let err = migrate_main_layout(m).unwrap_err().to_string();
         assert!(err.contains(".chelabase/neon/proxy-ca.crt"), "{err}");
-        assert!(base.join("zitadel").exists(), "the zitadel move waited too");
     }
 }

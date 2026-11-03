@@ -41,14 +41,16 @@ universe='[
   "K/realtime/pg.password", "K/realtime/ticket.key", "K/realtime/internal.token",
   "K/tokens/rest-internal.token", "K/tokens/data-keys.token", "K/tokens/app-auth.token",
   "K/tokens/app-sessions.token", "K/tokens/proxy-api.token", "K/tokens/storcon-hook.token",
+  "K/auth/member-jwt.key", "K/auth/member-jwt.pub", "K/identity/secret", "K/identity/db.password",
+  "K/tokens/auth-identity.token", "K/tokens/orchestrator-identity.token", "K/tokens/worker-identity.token",
+  "K/tokens/bootstrap-identity.token",
   "K/unlisted/a-future-key", "K/stacks/registry.json", "K/stacks/other/env/stack.env",
   "C/scripts/tests/workbench-compose.sh", "C/.chelabase/anything",
   "S/env/stack.env",
-  "S/zitadel/admin.pat", "S/zitadel/login-client.pat", "S/zitadel/demo-sa.json",
-  "S/zitadel/demo.env", "S/zitadel/actions.env", "S/studio.env",
+  "S/bootstrap/dev-member.json", "S/bootstrap/dev-token.json", "S/studio.env",
   "S/nats/auth.conf", "S/valkey/users.acl", "S/binaries.json", "S/runner/.curlrc",
   "S/neon/proxy-ca.crt", "S/logs/x", "S/test/x", "S/test/archive.tar.zst", "S/upgrade-e2e.env",
-  "S/unlisted/x"
+  "S/unlisted/x", "S/setup/setup.code"
 ]'
 
 # service -> { path: mode }; every other (service, path) must be none.
@@ -60,52 +62,50 @@ universe='[
 # RT1 T7 (S1): realtime sees the gateway's verify key (ticket requests), the platform CA's
 # certificate (T8's compute TLS), its NATS and Valkey passwords and its three realtime secrets.
 # The stack's state dir (least privilege): an app sees only the state files it reads itself, ro.
-# Its env files (stack.env, demo.env, actions.env, studio.env) are read by Compose on the host, at
-# create time, so they need no mount; nothing in an app writes under the state dir (logs, test
-# archives, the proxy CA copy, binaries.json and the runner's .curlrc are the host CLI's). The
-# Zitadel PATs are the only state files an app opens, once at startup
-# (CHELABASE_ZITADEL_ADMIN_PAT_FILE, CHELABASE_AUTH_TOKEN_FILE from demo.env); `up` creates the
-# apps that read them only after Zitadel has written them. CHELABASE_PROXY_CA_FILE is a path the
-# orchestrator hands to clients, never opens. Orchestrator and worker: admin.pat (Zitadel admin
-# API); auth: admin.pat (invites, app users) and login-client.pat (its own Zitadel client).
-# Gateway, rest and realtime open no state file. The runner (the test harness, which has the
-# Docker socket anyway) keeps the whole dir, rw: it runs nextest archives from test/, curl with
-# CURL_HOME=runner/, `docker compose` with stack.env and the env files to recreate apps
-# (roles_live), `dev token` (demo-sa.json, demo.env), reads proxy-ca.crt, studio.env and the PATs,
-# and writes upgrade-e2e.env at the dir's root.
+# Its env files (stack.env, studio.env) are read by Compose on the host, at create time, so they
+# need no mount; nothing in an app writes under the state dir (logs, test archives, the proxy CA
+# copy, binaries.json and the runner's .curlrc are the host CLI's), and no app opens a state file but
+# one: the orchestrator reads the stack's setup code (setup/setup.code, ro; #126).
+# CHELABASE_PROXY_CA_FILE is a path the orchestrator hands to clients, never opens. The runner
+# (the test harness, which has the Docker socket anyway) keeps the whole dir, rw: it runs nextest
+# archives from test/, curl with CURL_HOME=runner/, `docker compose` with stack.env and the env
+# files to recreate apps (roles_live), `dev token` (bootstrap/dev-member.json, and the session it
+# keeps in bootstrap/dev-token.json), reads proxy-ca.crt and studio.env, and writes
+# upgrade-e2e.env at the dir's root.
 expected='{
   "orchestrator": {
     "C/scripts/tests/workbench-compose.sh": "ro",
-    "S/zitadel/admin.pat": "ro",
     "K/secrets/secrets.key": "ro", "K/gateway/internal-verify.pem": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/orchestrator-tls/current/client.crt": "ro", "K/orchestrator-tls/current/client.key": "ro", "K/orchestrator-tls/current/ca.crt": "ro",
     "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/tokens/orchestrator-identity.token": "ro", "K/auth/member-jwt.pub": "ro",
+    "S/setup/setup.code": "ro"
   },
   "worker": {
     "C/scripts/tests/workbench-compose.sh": "ro",
-    "S/zitadel/admin.pat": "ro",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/compute-ca/ca.crt": "rw", "K/compute-ca/ca.key": "rw",
     "K/orchestrator-tls/current/client.crt": "rw", "K/orchestrator-tls/current/client.key": "rw", "K/orchestrator-tls/current/ca.crt": "rw",
     "K/realtime-tls/current/client.crt": "rw", "K/realtime-tls/current/client.key": "rw", "K/realtime-tls/current/ca.crt": "rw",
-    "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro"
+    "K/nats/worker.password": "ro", "K/valkey/control.password": "ro", "K/realtime/pg.password": "ro",
+    "K/tokens/worker-identity.token": "ro"
   },
   "gateway": {
     "C/scripts/tests/workbench-compose.sh": "ro",
-    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro",
+    "K/gateway/internal-signing.pem": "ro", "K/auth/app-jwt.pub": "ro", "K/auth/member-jwt.pub": "ro",
     "K/tokens/data-keys.token": "ro", "K/tokens/app-sessions.token": "ro"
   },
   "auth": {
     "C/scripts/tests/workbench-compose.sh": "ro",
-    "S/zitadel/admin.pat": "ro", "S/zitadel/login-client.pat": "ro",
     "K/auth/cookie.key": "ro", "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
+    "K/auth/member-jwt.key": "ro", "K/auth/member-jwt.pub": "ro",
     "K/gateway/internal-verify.pem": "ro",
     "K/compute-ca/ca.crt": "ro",
-    "K/tokens/app-auth.token": "ro"
+    "K/tokens/app-auth.token": "ro", "K/tokens/auth-identity.token": "ro"
   },
   "rest": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -119,7 +119,14 @@ expected='{
     "K/compute-ca/ca.crt": "ro",
     "K/realtime-tls/current/client.crt": "ro", "K/realtime-tls/current/client.key": "ro", "K/realtime-tls/current/ca.crt": "ro",
     "K/nats/realtime.password": "ro", "K/valkey/realtime.password": "ro",
-    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro"
+    "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
+    "K/auth/member-jwt.pub": "ro"
+  },
+  "identity": {
+    "C/scripts/tests/workbench-compose.sh": "ro",
+    "K/identity/secret": "ro", "K/identity/db.password": "ro",
+    "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro",
+    "K/tokens/worker-identity.token": "ro", "K/tokens/bootstrap-identity.token": "ro"
   },
   "studio": { "C/scripts/tests/workbench-compose.sh": "rw" },
   "docs": { "C/scripts/tests/workbench-compose.sh": "rw" },
@@ -127,11 +134,10 @@ expected='{
   "runner": {
     "C/scripts/tests/workbench-compose.sh": "rw",
     "S/env/stack.env": "rw",
-    "S/zitadel/admin.pat": "rw", "S/zitadel/login-client.pat": "rw", "S/zitadel/demo-sa.json": "rw",
-    "S/zitadel/demo.env": "rw", "S/zitadel/actions.env": "rw", "S/studio.env": "rw",
+    "S/bootstrap/dev-member.json": "rw", "S/bootstrap/dev-token.json": "rw", "S/studio.env": "rw",
     "S/nats/auth.conf": "rw", "S/valkey/users.acl": "rw", "S/binaries.json": "rw", "S/runner/.curlrc": "rw",
     "S/neon/proxy-ca.crt": "rw", "S/logs/x": "rw", "S/test/x": "rw", "S/test/archive.tar.zst": "rw",
-    "S/upgrade-e2e.env": "rw", "S/unlisted/x": "rw",
+    "S/upgrade-e2e.env": "rw", "S/unlisted/x": "rw", "S/setup/setup.code": "rw",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
@@ -146,7 +152,9 @@ expected='{
     "K/neon/storage-tokens/metrics.token": "ro",
     "K/realtime/pg.password": "ro", "K/realtime/ticket.key": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
-    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro"
+    "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
+    "K/auth/member-jwt.key": "ro", "K/auth/member-jwt.pub": "ro", "K/identity/secret": "ro", "K/identity/db.password": "ro",
+    "K/tokens/auth-identity.token": "ro", "K/tokens/orchestrator-identity.token": "ro", "K/tokens/worker-identity.token": "ro"
   }
 }'
 
@@ -176,17 +184,11 @@ expected_secret_binds='[
 # Every bind whose source is the stack's state dir or under it, for all services, as
 # service:S/<source>->target (":rw" when writable; a target in the state dir also as S/…): the
 # table above goes by target, so it can't see a state file mounted at another path. NATS and
-# Valkey read the auth files the workbench renders (hashes only); Zitadel writes its PATs into
-# zitadel/ (FirstInstance, on a fresh volume); the apps get their PATs at their own paths, ro;
-# the runner gets the whole dir.
+# Valkey read the auth files the workbench renders (hashes only); the runner gets the whole dir.
 expected_state_binds='[
   "nats:S/nats/auth.conf->/etc/nats/auth.conf",
   "valkey:S/valkey/users.acl->/etc/valkey/users.acl",
-  "zitadel:S/zitadel->/zitadel-bootstrap:rw",
-  "orchestrator:S/zitadel/admin.pat->S/zitadel/admin.pat",
-  "worker:S/zitadel/admin.pat->S/zitadel/admin.pat",
-  "auth:S/zitadel/admin.pat->S/zitadel/admin.pat",
-  "auth:S/zitadel/login-client.pat->S/zitadel/login-client.pat",
+  "orchestrator:S/setup/setup.code->S/setup/setup.code",
   "runner:S->S:rw"
 ]'
 
@@ -309,7 +311,7 @@ $tied"
   # The set of checkout-mounting services is the one the table knows.
   local mounting
   mounting="$(jq -r --arg c "$checkout" '[.services | to_entries[] | select(any(.value.volumes[]?; .target == $c)) | .key] | sort | join(" ")' <<<"$config")"
-  [[ "$mounting" == "auth docs gateway landing orchestrator realtime rest runner studio worker" ]] ||
+  [[ "$mounting" == "auth docs gateway identity landing orchestrator realtime rest runner studio worker" ]] ||
     fail "$label: checkout-mounting services changed (update the table); got: $mounting"
 }
 

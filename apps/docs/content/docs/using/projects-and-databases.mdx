@@ -16,7 +16,7 @@ A tenant's databases live in projects. Each project has a display `name` (1 to 6
 
 Another tenant's project answers 404.
 
-**Deleting a project** turns it `deleting`. Every database in it is deleted (computes, tenants, stored data), then the worker revokes the app sessions, deletes the project's Zitadel organization (when app users were on) and the project. A failure leaves the project `deleting` with `error` set, and the worker retries.
+**Deleting a project** turns it `deleting`. Every database in it is deleted (computes, tenants, stored data), then the worker revokes the app sessions, drops the project's app-user pool in the identity service (when app users were on) and deletes the project. A failure leaves the project `deleting` with `error` set, and the worker retries.
 
 Delete is refused with 409 while a database is still provisioning (`database_not_ready`), a branch is protected (`branch_protected`), or app users are being enabled or disabled (`conflict`). A wrong `confirm` is 422. A `deleting` project refuses every change with 409 `project_deleting`, and `POST /v1/databases` refuses it too.
 

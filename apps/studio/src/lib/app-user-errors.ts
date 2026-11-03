@@ -9,7 +9,8 @@ const TEXTS: Record<string, string> = {
   app_users_location_fixed: "The database, schema and table can't change once app users are enabled. Disable them first.",
   email_taken: "That email is already in use",
   weak_password: "That password is too weak. Use a longer one.",
-  unavailable: "User administration isn't configured on this Chelabase (the Zitadel admin credentials are missing)",
+  unavailable: "The project's users table can't be reached right now. Try again.",
+  identity_unavailable: "The identity service can't be reached right now. Try again.",
 };
 
 export function appUserErrorText(err: unknown): string {

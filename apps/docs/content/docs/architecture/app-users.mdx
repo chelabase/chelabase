@@ -1,14 +1,14 @@
 ---
 title: "App users"
-description: "How app users are stored, authenticated and kept in sync between Zitadel and your database."
+description: "How app users are stored, authenticated and kept in sync between the identity service and your database."
 ---
 
 Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. For how to enable and use app users, see the [app users guide](/docs/using/app-users). This page covers the moving parts.
 
 ## Who holds what
 
-- **Zitadel holds the identities**, one organization per project. It checks passwords and is the source of truth for who exists.
-- **Chelabase issues the tokens.** The `auth` service checks the password through a Zitadel session, then signs a short-lived EdDSA access token (`iss` is `chelabase-auth`, `aud` is `chelabase-project:<project id>`) and a rotating refresh token bound to that Zitadel session. The flows live under `/auth/v1/app/` and take a public key.
+- **The identity service holds the identities**, in one pool per project (`app-<project id>`, its own Postgres schema; see [Identity service](/docs/architecture/identity#pools)). It checks passwords and is the source of truth for who exists. The worker creates the pool when app users are enabled and drops it when the project is deleted.
+- **Chelabase issues the tokens.** The `auth` service checks the password against the project's pool, which opens an identity session (90 days), then signs a short-lived EdDSA access token (`iss` is `chelabase-auth`, `aud` is `chelabase-project:<project id>`) and a rotating refresh token bound to that identity session. The flows live under `/auth/v1/app/` and take a public key.
 - **Your database holds a users table** that you own, in one chosen auth database of the project: one row per user, on every branch of that database.
 - **The orchestrator keeps the sessions.** Sessions live in the metadata database, which stores only the SHA-256 of each refresh token. The orchestrator rotates refresh tokens, detects reuse and revokes sessions.
 
@@ -16,15 +16,16 @@ Apps sign their own end users up and in through `db.auth`, and the data API runs
 
 An app request carries `Authorization: Bearer <public key>` plus `Chelabase-User: <access token>`. The gateway verifies the token with the app-user public key and checks that its session is still live (cached 30 seconds, so a revocation lands within 30 seconds). It then mints the identity token for `rest` with the user's claims, and `rest` runs the request as `authenticated` with `request.jwt.claims` set. Policies read the claims through the `chelabase.claims()`, `chelabase.user_id()` and `chelabase.user_email()` helpers. See [Gateway](/docs/architecture/gateway) for the full check.
 
-The token key pair is made once by `chelabase dev bootstrap` (`.chelabase/auth/app-jwt.key` and `app-jwt.pub`, never overwritten): `auth` signs, the gateway verifies. A public JWKS endpoint (`GET /auth/v1/app/jwks`) lets your own servers verify tokens too.
+The token key pair is made once by `init-secrets` (`auth/app-jwt.key` and `app-jwt.pub` in the `secrets` volume; `.chelabase/auth/` on a workbench stack), never overwritten, and separate from the member-token pair: `auth` signs, the gateway verifies. A public JWKS endpoint (`GET /auth/v1/app/jwks`) lets your own servers verify tokens too.
 
-## Sync, webhooks and reconcile
+## Sync and reconcile
 
-Zitadel is the source of truth. Three paths copy users into the table on every live branch of the auth database:
+The identity pool is the source of truth. Two paths copy users into the table on every live branch of the auth database:
 
-- **Write-through** from Chelabase's own flows (sign-up, the platform admin).
-- **Webhooks.** `chelabase dev bootstrap` creates one instance-wide Zitadel Actions v2 target that points at the orchestrator's internal listener (`POST /internal/zitadel/events`), with an execution on user events, and writes its signing key where the orchestrator reads it: `bootstrap/actions-signing-key` in the `secrets` volume on a self-hosted Compose install (`chelabase-init bootstrap` makes it), or the stack's `zitadel/actions.env` (`.chelabase/stacks/<slug>/zitadel/actions.env`) on a workbench stack. The orchestrator checks the signature (401 for a bad one, 503 when no key is configured) and ignores events from other organizations. A user event publishes a sync job; a password change also revokes the user's sessions made before it. Compose relaxes Zitadel's `ZITADEL_HTTPCLIENT_DENYLIST` so Zitadel may call the orchestrator on the stack's private network (`orchestrator:8083`; self-hosted dev only).
-- **Reconcile.** Every `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the organization's users with each branch's rows and syncs every difference. The same pass reruns enables, disables and project deletes that have been stuck for 5 minutes, and purges sessions that were revoked or expired more than 7 days ago.
+- **Write-through.** Every change Chelabase makes to a user (sign-up, an email change, a ban, a delete, through the app flows or the platform admin) is made in the pool first, then publishes a sync job for that user. An email change, a password change or a deactivation also ends the user's identity sessions inline, so their refresh tokens stop working.
+- **Reconcile.** Every `CHELABASE_APP_USERS_RECONCILE_SECS` (default 300) per enabled project, and right after a branch of the auth database is created, the worker compares the pool's users with each branch's rows and syncs every difference. The same pass reruns enables, disables and project deletes that have been stuck for 5 minutes, and purges sessions that were revoked or expired more than 7 days ago.
+
+A deactivated user keeps their row, with `banned_at` set to when the sync first saw the ban.
 
 The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses inserts, deletes and changes to managed columns from any other role, so rows are Chelabase's to create and delete.
 
@@ -32,11 +33,10 @@ The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses 
 
 | Variable | Default | Read by |
 | --- | --- | --- |
-| `CHELABASE_ZITADEL_ADMIN_PAT_FILE` | self-hosted: `zitadel-pats/admin.pat` in the `secrets` volume; workbench: from `demo.env` (the stack's `zitadel/admin.pat`) | orchestrator, worker, auth (organization and user admin; without it app-user routes answer 503 and jobs wait) |
+| `CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE` | `http://identity:8080`; each caller's `tokens/<caller>-identity.token` | orchestrator, worker, auth (pool and user operations; when the identity service can't be reached, app-user routes answer 503 `identity_unavailable` and jobs wait) |
 | `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | self-hosted: `auth/app-jwt.key` / `.pub` in the `secrets` volume; workbench: the stack's `stack.env` (`.chelabase/auth/app-jwt.key` / `.pub`) | auth signs, the gateway verifies |
 | `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to session liveness |
-| `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY` | self-hosted: `bootstrap/actions-signing-key` in the `secrets` volume (`CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE`); workbench: the stack's `zitadel/actions.env` | orchestrator (webhook signatures) |
 | `CHELABASE_APP_ACCESS_TTL_SECS` | `900` (60 to 86400) | auth |
 | `CHELABASE_APP_REFRESH_TTL_SECS` | `2592000` (30 days; at most 90 days) | orchestrator |
 | `CHELABASE_APP_USERS_RECONCILE_SECS` | `300` (30 to 86400) | worker |
@@ -46,4 +46,4 @@ The default internal tokens are for local development only.
 
 ## Tests
 
-`just app-users-e2e` (runs on your checkout's stack) runs the whole story live: enabling app users, sign-up and sign-in, row-level security on the users table, branches receiving the rows, a webhook sync, refresh rotation and reuse detection, and project deletion. `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`) covers the bootstrap, the guard and the worker's enable, sync, resync and disable against a real compute and Zitadel.
+`just app-users-e2e` (runs on your checkout's stack) runs the whole story live: enabling app users, sign-up and sign-in, row-level security on the users table, branches receiving the rows, an email change reaching the row, refresh rotation and reuse detection, and project deletion dropping the pool. `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`) covers the bootstrap, the guard and the worker's enable, sync, resync and disable against a real compute and the identity service.

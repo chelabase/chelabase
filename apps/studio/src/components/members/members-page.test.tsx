@@ -19,7 +19,7 @@ const adminMe: Me = {
   member: { id: "ana", status: "active", tenant_admin: true },
   instance_admin: true, tenant_admins: [],
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
-  user: { sub: "u1", org_id: "org-1" },
+  user: { sub: "u1" },
   tenant: {
     id: "t1",
     slug: "demo",
@@ -155,7 +155,7 @@ describe("MembersPage", () => {
     const url = "http://studio.test/accept-invite?user=z1&code=c1&t=tok";
     const { f, queryClient } = setup({
       routes: {
-        "GET /v1/invites/delivery": ok({ email_available: false, reason: "no_email_provider" }),
+        "GET /v1/invites/delivery": ok({ email_available: false, reason: "email_not_configured" }),
         "POST /v1/invites": ok({ outcome: "invited", member: member("new", { status: "invited" }), invite_url: url }, 201),
       },
     });
@@ -233,7 +233,7 @@ describe("MembersPage", () => {
     await userEvent.click(await within(dialog).findByRole("radio", { name: /One-time link/ }));
     await userEvent.type(within(dialog).getByLabelText("Emails"), "old@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
-    expect(await within(dialog).findByText(/old@example.test already has a way to sign in/)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/old@example.test already has an account or a pending invite elsewhere/)).toBeInTheDocument();
     expect(within(dialog).getByRole("radio", { name: /^Email/ })).toBeChecked();
   });
 
@@ -565,8 +565,6 @@ describe("MembersPage", () => {
   it("each invite 409 code reads its own way", async () => {
     const cases: [object, RegExp][] = [
       [{ code: "signup_pending", message: "x", member_id: "ed" }, /signed up and is waiting for approval/],
-      [{ code: "email_ambiguous", message: "x" }, /More than one account in this organisation uses/],
-      [{ code: "email_in_use_elsewhere", message: "x" }, /Another account outside this organisation already uses/],
     ];
     for (const [error, text] of cases) {
       const r = setup({ routes: { "POST /v1/invites": ok({ error }, 409) } });
@@ -602,12 +600,13 @@ describe("MembersPage", () => {
     expect(bodies).toEqual([{ delivery: "email" }, { delivery: "link" }]);
   });
 
-  it("a removal whose identity step failed stays on screen with Retry", async () => {
+  // A metadata step answers `unavailable`, an identity step `identity_unavailable`: both are retryable.
+  it.each(["unavailable", "identity_unavailable"])("a removal answering 503 %s stays on screen with Retry", async (code) => {
     let attempts = 0;
     setup({
       routes: {
         "DELETE /v1/members/bo": () =>
-          ++attempts === 1 ? jsonResponse({ error: { code: "unavailable", message: "zitadel down" } }, 503) : new Response(null, { status: 204 }),
+          ++attempts === 1 ? jsonResponse({ error: { code, message: "down" } }, 503) : new Response(null, { status: 204 }),
       },
     });
     await userEvent.click(await screen.findByRole("button", { name: "More actions for Bo" }));

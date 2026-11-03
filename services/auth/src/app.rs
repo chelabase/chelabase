@@ -3,11 +3,14 @@
 use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
-use chelabase_zitadel::refusals;
-use chelabase_zitadel::rules::{normalize_email, strong_password};
+use chelabase_identity::{
+    CodeKind, CodeRequest, Delivery, Identity, IdentityError, Missing, NewUser, Pool, SignedIn,
+};
+use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
+use chelabase_identity::rules::{PASSWORD_MAX_BYTES, normalize_email, strong_password};
 use crate::app_users::internal::OpenInvite;
-use crate::zitadel::{NewUser, Session, UserState, ZError, ZUser, Zitadel};
-use axum::extract::{DefaultBodyLimit, State};
+use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, may_issue_code};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
@@ -20,7 +23,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -45,13 +48,14 @@ pub mod messages {
     pub const NO_SUCH_INVITE: &str = "No open invite matches this link";
     pub const BAD_NAME: &str = "Enter a first and a last name, up to 200 characters each";
     pub const BAD_DETAILS: &str = "Check the details you entered";
-    pub const MEMBER_SUSPENDED: &str =
-        "Your access is suspended. Once an administrator reinstates you, sign in with this password";
+    pub const SIGN_IN_AGAIN: &str = "Your session has ended; sign in again";
+    pub const NOT_FROM_STUDIO: &str = "This request must come from Studio";
+    pub const CHOOSE_TENANT: &str = "Choose a workspace to sign in to";
+    pub const MEMBER_SUSPENDED: &str = "Your access is suspended; ask an administrator to reinstate you";
 }
 use messages::*;
 
 pub struct AppState {
-    pub zitadel: Zitadel,
     pub config: Config,
     pub limiter: RateLimiter,
     /// Accept tickets already spent.
@@ -60,9 +64,13 @@ pub struct AppState {
     pub app: Option<crate::app_users::AppUsers>,
     /// Asks the orchestrator whether sign-up is open. `None` fails closed (sign-up answers 503).
     pub signup_gate: Option<crate::app_users::InternalClient>,
-    /// Zitadel with the admin token (from the admin PAT, independent of the app keys), which
-    /// accept-invite needs; `None` makes it answer 503 before spending a code.
-    pub admin: Option<Zitadel>,
+    /// The member-token signer (`CHELABASE_MEMBER_JWT_*`): `/auth/v1/token` mints with it.
+    pub member_tokens: crate::member_token::MemberTokens,
+    /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`): members
+    /// sign in, up and out against it.
+    pub identity: Identity,
+    /// What `/auth/v1/token` measures a session's age with.
+    pub clock: crate::session::Clock,
 }
 
 type S = State<Arc<AppState>>;
@@ -75,11 +83,11 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
 /// Studio's sign-in pages' routes.
 fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
-        .routes(routes!(auth_request))
         .routes(routes!(instance))
         .routes(routes!(studio_config))
         .routes(routes!(sign_in))
         .routes(routes!(sign_up))
+        .routes(routes!(token))
         .routes(routes!(accept_invite))
         .routes(routes!(describe_invite))
         .routes(routes!(verify_email))
@@ -95,7 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let (platform, _) = platform_router().split_for_parts();
     let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
     platform
-        // Readiness for compose `--wait` and k8s: not ready until the bootstrap's ids are there.
+        // Liveness and readiness for compose `--wait` and k8s.
         .route("/health", axum::routing::get(health))
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -134,102 +142,43 @@ async fn forwarded_for(
     next.run(req).await
 }
 
-/// What the sign-in pages do next, as `{"next": "done", "redirect": …}` or `{"next": "verify"}`.
-#[derive(Serialize, ToSchema)]
-#[serde(tag = "next", rename_all = "lowercase")]
-enum NextStep {
-    /// Signed in: send the browser to `redirect` (Zitadel's callback for the pending sign-in).
-    Done { redirect: String },
-    /// The email isn't verified: show the code step.
-    Verify,
-}
-
-fn next_step(step: &NextStep) -> Value {
-    serde_json::to_value(step).expect("NextStep serialises")
-}
-
-// Documentation only: the handler answers through `finish`, which serialises `NextStep::Done`
-// to the same JSON.
-/// The signed-in answer: `next` is always `done`.
-#[allow(dead_code)]
-#[derive(Serialize, ToSchema)]
-struct SignedIn {
-    next: DoneTag,
-    redirect: String,
-}
-
-#[allow(dead_code)]
-#[derive(Serialize, ToSchema)]
+/// Where a sign-in or sign-up goes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
-enum DoneTag {
-    Done,
+enum SignInStep {
+    /// Signed in, with the session cookie set: `POST /auth/v1/token` works.
+    Studio,
+    /// The email isn't verified: show the code step (the step cookie is set).
+    Verify,
+    /// The credentials are right, but an admin hasn't approved this person yet. No session.
+    Pending,
+}
+
+/// A sign-in's or sign-up's answer.
+#[derive(Serialize, ToSchema)]
+struct SignInAnswer {
+    next: SignInStep,
 }
 
 /// An empty JSON object.
 #[derive(Serialize, ToSchema)]
 struct EmptyResponse {}
 
-/// What the sign-in page needs to know about the pending sign-in.
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct AuthRequestInfo {
-    /// The visitor asked to create an account (`prompt=create`) and this instance allows it:
-    /// Studio goes to its sign-up page. `false` for a refused sign-up request too, which then
-    /// lands on the plain sign-in page.
-    sign_up: bool,
-    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a
-    /// setup code is configured): the sign-in page may offer "Create account". Always `false`
-    /// in platform mode.
-    sign_up_allowed: bool,
-}
-
-/// Studio's runtime config: the six public values it signs in with. Nothing else is here (no
-/// PAT, key or secret): it is public and cached.
+/// Studio's runtime config: the public values it starts with. Nothing else is here (no PAT, key
+/// or secret): it is public and cached.
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioConfig {
-    /// Zitadel's issuer URL (the OIDC authority).
-    issuer: String,
-    /// Studio's OIDC client id.
-    client_id: String,
-    /// The `chelabase` project id (the API audience Studio asks for).
-    project_id: String,
-    /// The platform org's id.
-    org_id: String,
     /// The public API base URL.
     api_url: String,
     /// Studio's public host.
     studio_host: String,
 }
 
-/// Every bootstrap output auth waits for, with why it isn't usable yet (`Ok` when it is).
-fn bootstrap_outputs(s: &AppState) -> Vec<Result<&str, chelabase_types::file_value::Unavailable>> {
-    std::iter::once(&s.config.org_id)
-        .chain(s.config.studio.client_id.as_ref())
-        .chain(s.config.studio.project_id.as_ref())
-        .map(|v| v.get())
-        .collect()
-}
-
-/// 200 once every bootstrap output auth reads is there, else 503 naming the variables that
-/// wait (never a value).
-async fn health(State(s): S) -> Response {
-    let waiting: Vec<String> = bootstrap_outputs(&s)
-        .into_iter()
-        .filter_map(|r| r.err())
-        .map(|e| {
-            not_ready(&e);
-            e.to_string()
-        })
-        .collect();
-    if waiting.is_empty() {
-        return reply(StatusCode::OK, json!({"status": "ok"}), Vec::new());
-    }
-    reply(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({"status": "waiting for the bootstrap", "waiting": waiting}),
-        Vec::new(),
-    )
+/// 200: auth needs nothing written after it starts (its keys and the identity client are read
+/// at startup).
+async fn health() -> Response {
+    reply(StatusCode::OK, json!({"status": "ok"}), Vec::new())
 }
 
 #[utoipa::path(
@@ -237,39 +186,14 @@ async fn health(State(s): S) -> Response {
     path = "/auth/v1/studio-config",
     operation_id = "getStudioConfig",
     tag = "login",
-    description = "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+    description = "Studio's runtime config: the API URL and Studio's host. Public; cacheable for 60 s.",
     responses(
         (status = 200, description = "The config (`Cache-Control: public, max-age=60`)", body = StudioConfig),
-        (status = 404, description = "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`", body = ErrorEnvelope),
-        (status = 503, description = "The bootstrap hasn't written the ids yet: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn studio_config(State(s): S) -> Response {
-    let no_store = |mut r: Response| {
-        r.headers_mut()
-            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-        r
-    };
     let studio = &s.config.studio;
-    let (Some(client_id), Some(project_id)) = (&studio.client_id, &studio.project_id) else {
-        return no_store(error(
-            StatusCode::NOT_FOUND,
-            ErrorCode::NotFound,
-            "Studio's runtime config isn't set up on this instance",
-        ));
-    };
-    let values = (s.config.org_id.get(), client_id.get(), project_id.get());
-    let (Ok(org_id), Ok(client_id), Ok(project_id)) = values else {
-        for e in [values.0.err(), values.1.err(), values.2.err()].into_iter().flatten() {
-            not_ready(&e);
-        }
-        return no_store(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
-    };
     let body = StudioConfig {
-        issuer: s.config.issuer.clone(),
-        client_id: client_id.to_string(),
-        project_id: project_id.to_string(),
-        org_id: org_id.to_string(),
         api_url: studio.api_url.clone(),
         studio_host: studio.studio_host.clone(),
     };
@@ -289,11 +213,15 @@ struct InstanceInfo {
     /// setup code that `chelabase-init secrets` printed. `false` once anyone is in, without a
     /// configured code (then no first sign-up is taken at all), and in platform mode.
     setup_required: bool,
+    /// Whether the sign-in page offers "Create account": sign-up is open, or the unclaimed
+    /// instance waits for its first account. `false` in platform mode.
+    sign_up_allowed: bool,
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
-/// Sign-up may wait up to a second for Zitadel to see the new user (`new_user_session`), so its
-/// answers are padded this much beyond sign-in's, or a new email would answer slower than a taken one.
+/// Sign-up and accept-invite do more than sign-in (the user, its row, its session), so their
+/// answers are padded this much beyond sign-in's, or a new email would answer slower than a
+/// taken one.
 pub(crate) const SIGN_UP_EXTRA: Duration = Duration::from_secs(1);
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -303,17 +231,6 @@ fn allowed(s: &AppState, checks: &[(String, u32, Duration)]) -> bool {
     checks
         .iter()
         .all(|(key, limit, window)| s.limiter.allow(key, *limit, *window))
-}
-
-/// Zitadel ids go into URL paths, so only their exact shapes are passed on:
-/// `V2_<digits>` for pending sign-ins, digits for users.
-fn is_auth_request_id(id: &str) -> bool {
-    id.strip_prefix("V2_")
-        .is_some_and(|n| !n.is_empty() && n.len() <= 32 && n.bytes().all(|b| b.is_ascii_digit()))
-}
-
-fn is_user_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
@@ -330,49 +247,6 @@ fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     ApiError::new(status.as_u16(), code, message).into_response()
 }
 
-/// The platform org's id, or the 503 `unavailable` every route that needs it answers while
-/// the bootstrap hasn't written it (m5: `CHELABASE_ZITADEL_ORG_ID_FILE` may appear after auth
-/// starts). Nothing runs against a missing org: `None` is answered with [`no_org`].
-fn org_id(s: &AppState) -> Option<&str> {
-    s.config.org_id.get().map_err(|e| not_ready(&e)).ok()
-}
-
-fn no_org() -> Response {
-    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
-}
-
-/// Logs why a bootstrap output isn't usable yet: the path, never a value.
-fn not_ready(e: &chelabase_types::file_value::Unavailable) {
-    match e {
-        chelabase_types::file_value::Unavailable::NotYet { .. } => {
-            info!("waiting for the bootstrap: {e}")
-        }
-        chelabase_types::file_value::Unavailable::Refused { .. } => warn!("{e}"),
-    }
-}
-
-fn unavailable(e: &ZError) -> Response {
-    warn!(error = %e, "zitadel call failed");
-    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
-}
-
-/// Zitadel's answers that a pending sign-in doesn't exist: reading it, and finishing it.
-const AUTH_REQUEST_GONE: [refusals::Refusal; 2] =
-    [refusals::AUTH_REQUEST_NOT_FOUND, refusals::FINISH_AUTH_REQUEST_NOT_FOUND];
-
-/// A pending sign-in that Zitadel no longer knows (its captured not-found) is gone; anything
-/// else, another refusal included, is unavailability.
-fn pending_sign_in_error(e: ZError) -> Response {
-    if e.is_any(&AUTH_REQUEST_GONE) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
-    unavailable(&e)
-}
-
-fn verify_template(s: &AppState) -> String {
-    format!("{}/verify?code={{{{.Code}}}}", s.config.studio_url)
-}
-
 fn login_cookie(s: &AppState, state: &LoginState) -> String {
     set_cookie(
         LOGIN_COOKIE,
@@ -382,106 +256,25 @@ fn login_cookie(s: &AppState, state: &LoginState) -> String {
     )
 }
 
-/// Finalize the pending sign-in: `done` with Zitadel's redirect, the session cookie set and
-/// the step cookie cleared.
-async fn finish(s: &AppState, auth_request: &str, session: Session) -> Response {
-    match s.zitadel.finish(auth_request, &session).await {
-        Ok(redirect) => signed_in(s, session, redirect),
-        Err(e) => pending_sign_in_error(e),
-    }
-}
-
-/// The `done` answer with the session cookie set and the step cookie cleared.
-fn signed_in(s: &AppState, session: Session, redirect: String) -> Response {
-    let kept = SessionState {
-        session_id: session.id,
-        session_token: session.token,
-        exp: now_secs() + SESSION_TTL_SECS,
-    };
-    let secure = s.config.secure_cookies;
-    reply(
-        StatusCode::OK,
-        next_step(&NextStep::Done { redirect }),
-        vec![
-            set_cookie(
-                SESSION_COOKIE,
-                &seal_session(&s.config.cookie_key, &kept),
-                SESSION_TTL_SECS,
-                secure,
-            ),
-            clear_cookie(LOGIN_COOKIE, secure),
-        ],
-    )
-}
-
-async fn verify_step(
-    s: &AppState,
-    auth_request: &str,
-    user_id: String,
-    session: Session,
-) -> Response {
+/// The code step: the identity session waits in the step cookie, and no session cookie is set.
+/// The identity session is kept, sealed in the 10-minute step cookie: a verified code finishes
+/// the sign-in with it, since nothing at that step can make a session without the password.
+/// An abandoned step leaves it to expire on its own.
+fn verify_step(s: &AppState, signed: SignedIn) -> Response {
     let state = LoginState {
-        auth_request: auth_request.to_string(),
-        user_id: Some(user_id),
-        session_id: Some(session.id),
-        session_token: Some(session.token),
+        auth_request: String::new(),
+        user_id: Some(signed.user.id),
+        session_id: Some(signed.session_id),
+        session_token: Some(signed.session_token),
         step: Step::Verify,
         decoy: false,
         exp: now_secs() + LOGIN_TTL_SECS,
     };
     reply(
         StatusCode::OK,
-        next_step(&NextStep::Verify),
+        json!(SignInAnswer { next: SignInStep::Verify }),
         vec![login_cookie(s, &state)],
     )
-}
-
-#[derive(Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct AuthRequestBody {
-    auth_request: String,
-}
-
-#[utoipa::path(
-    post,
-    path = "/auth/v1/auth-request",
-    operation_id = "getAuthRequest",
-    tag = "login",
-    description = "Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.",
-    request_body = AuthRequestBody,
-    responses(
-        (status = 200, description = "The pending sign-in is valid", body = AuthRequestInfo),
-        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
-        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
-        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
-        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
-        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
-    ),
-)]
-async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthRequestBody>) -> Response {
-    let ip = client_ip(&headers);
-    if !allowed(&s, &[(format!("auth-request:ip:{ip}"), 60, MINUTE)]) {
-        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
-    }
-    if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
-    match s.zitadel.auth_request(&b.auth_request).await {
-        Ok(asked) => {
-            // A fresh install waiting for its code takes a sign-up (with the code).
-            let sign_up_allowed = gate(&s, None)
-                .await
-                .is_ok_and(|a| a.allowed || a.setup_required);
-            reply(
-                StatusCode::OK,
-                json!(AuthRequestInfo { sign_up: asked && sign_up_allowed, sign_up_allowed }),
-                Vec::new(),
-            )
-        }
-        Err(e) => pending_sign_in_error(e),
-    }
 }
 
 #[utoipa::path(
@@ -489,7 +282,7 @@ async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthR
     path = "/auth/v1/instance",
     operation_id = "getInstance",
     tag = "login",
-    description = "Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.",
+    description = "Whether this instance is unclaimed, so the sign-up page asks for the setup code, and whether it takes sign-ups, so the sign-in page offers one. Sets no cookie.",
     responses(
         (status = 200, description = "The instance's sign-up state", body = InstanceInfo),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
@@ -502,12 +295,16 @@ async fn instance(State(s): S, headers: HeaderMap) -> Response {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     if ModePolicy::new(s.config.mode).sign_up() == SignUpRule::Refused {
-        return reply(StatusCode::OK, json!(InstanceInfo { setup_required: false }), Vec::new());
+        let closed = InstanceInfo { setup_required: false, sign_up_allowed: false };
+        return reply(StatusCode::OK, json!(closed), Vec::new());
     }
     match gate(&s, None).await {
         Ok(a) => reply(
             StatusCode::OK,
-            json!(InstanceInfo { setup_required: a.setup_required }),
+            json!(InstanceInfo {
+                setup_required: a.setup_required,
+                sign_up_allowed: a.allowed || a.setup_required,
+            }),
             Vec::new(),
         ),
         Err(refused) => refused.response(),
@@ -515,11 +312,18 @@ async fn instance(State(s): S, headers: HeaderMap) -> Response {
 }
 
 #[derive(Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 struct SignInBody {
-    auth_request: String,
     email: String,
     password: String,
+}
+
+/// The tenant asked for.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct TenantQuery {
+    /// The tenant's id. Needed to sign in to one of several; `/auth/v1/token` refuses any
+    /// but the session's. Never trusted: it is checked against the memberships.
+    tenant: Option<String>,
 }
 
 #[utoipa::path(
@@ -527,57 +331,54 @@ struct SignInBody {
     path = "/auth/v1/sign-in",
     operation_id = "signIn",
     tag = "login",
-    description = "Signs in with email and password. On success sets the HttpOnly session cookie, or, when the email still needs verifying, the HttpOnly step cookie that the code step reads.",
+    description = "Signs in with email and password. `studio` sets the HttpOnly session cookie, which seals the identity session and the tenant. `verify` sets the HttpOnly step cookie that the code step reads. `pending` sets no cookie: an admin hasn't approved this person yet. A wrong password, an unknown email and no active membership answer alike.",
+    params(TenantQuery),
     request_body = SignInBody,
     responses(
-        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
+        (status = 200, description = "`studio`, `verify` or `pending`", body = SignInAnswer),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 401, description = "Wrong email or password: `invalid_credentials`", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 401, description = "Wrong email or password, no active membership, or a `tenant` this person isn't a member of: `invalid_credentials`", body = ErrorEnvelope),
+        (status = 409, description = "The credentials are right and this person has several tenants: `tenant_required`, with their ids in `error.tenants`. Sign in again with `?tenant=`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
-async fn sign_in(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignInBody>) -> Response {
+async fn sign_in(
+    State(s): S,
+    Query(q): Query<TenantQuery>,
+    headers: HeaderMap,
+    ApiJson(b): ApiJson<SignInBody>,
+) -> Response {
     let start = Instant::now();
-    let answer = sign_in_inner(&s, &headers, b).await;
+    let answer = sign_in_inner(&s, q, &headers, b).await;
     pad(start, s.config.min_response).await;
     answer
 }
 
-async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Response {
+async fn sign_in_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap, b: SignInBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
     if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    // Per email, only failed password checks count: signing in as someone takes their password,
-    // so nobody can use up a known account's attempts. The attempt is reserved up front, so
+    // Per email, only refused sign-ins count: signing in as someone takes their password, so
+    // nobody can use up a known account's attempts. The attempt is reserved up front, so
     // concurrent requests can't all pass a check before any failure lands, and a client that
     // hangs up during the check still spends it. Only these outcomes give it back:
     //
     // | Outcome                                                        | Answer  | Email slot |
     // |----------------------------------------------------------------|---------|------------|
     // | the email's 5 a minute are used                                | 429     | none held  |
-    // | `authRequest` isn't an auth request id                         | 410     | refunded   |
-    // | no org yet (the bootstrap hasn't written it)                   | 503     | refunded   |
-    // | Zitadel refuses the auth request, or is unavailable            | 410/503 | refunded   |
-    // | the user lookup fails                                          | 503     | refunded   |
-    // | no user has this email                                         | 401     | counts     |
-    // | the password check is refused (any `Rejected`, see below)      | 401     | counts     |
-    // | the password check is unavailable (`Unavailable`)              | 503     | refunded   |
-    // | the password is right (refunded before anything else awaits)   | any     | refunded   |
+    // | wrong password, unknown email, banned, input identity refused  | 401     | counts     |
+    // | right password, but no tenant to land in                       | 401     | counts     |
+    // | identity or the orchestrator can't answer                      | 503     | refunded   |
+    // | right password, any other outcome                              | 200/409 | refunded   |
     // | the request is dropped undecided (the client hung up)          | none    | counts     |
     //
-    // A refused password check is any refusal of Zitadel's own: a wrong password
-    // (`refusals::PASSWORD_INVALID`), no such user (`SESSION_USER_NOT_FOUND`), a locked or
-    // inactive user (`SESSION_USER_LOCKED`, `SESSION_USER_NOT_ACTIVE`), or its request validation
-    // (`ZError::is_invalid_request`, e.g. a password over 200 characters: the caller's input).
-    // `Unavailable` is no answer, a 5xx, or a 4xx that isn't Zitadel's own error. An unknown
-    // email and a wrong password both count and answer the same 401, padded alike.
+    // "No tenant" counts so that it can't be told from a wrong password by when the 429 comes.
     let Some(slot) = Slot::reserve(
         &s.limiter,
         format!("sign-in:email:{}", email_tag(&email)),
@@ -588,56 +389,242 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     };
     // Counts: the slot is dropped without a refund.
     let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
-    if !is_auth_request_id(&b.auth_request) {
-        slot.refund();
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
-    let Some(org) = org_id(s) else {
-        slot.refund();
-        return no_org();
-    };
-    if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
-        slot.refund();
-        return pending_sign_in_error(e);
-    }
-    let user_id = match s.zitadel.find_user_by_email(org, &email).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return refused(),
-        Err(e) => {
-            slot.refund();
-            return unavailable(&e);
-        }
-    };
-    let session = match s.zitadel.create_session(&user_id, &b.password).await {
-        Ok(session) => {
-            slot.refund();
-            session
-        }
-        Err(ZError::Rejected { .. }) => {
+    let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
+        Ok(signed) => signed,
+        Err(
+            IdentityError::BadCredentials
+            | IdentityError::Banned
+            | IdentityError::SessionRevoked
+            | IdentityError::Invalid { .. },
+        ) => {
             info!(email = %email_tag(&email), "sign-in refused");
             return refused();
         }
-        Err(e @ ZError::Unavailable(_)) => {
+        Err(e) => {
             slot.refund();
-            return unavailable(&e);
+            return identity_unavailable(&e);
         }
     };
-    match s.zitadel.email_verified(&user_id).await {
-        Ok(true) => finish(s, &b.auth_request, session).await,
-        Ok(false) => {
-            if let Err(e) = s.zitadel.resend_code(&user_id, &verify_template(s)).await {
-                warn!(error = %e, "resending the verification code failed");
-            }
-            verify_step(s, &b.auth_request, user_id, session).await
+    match conclude(s, signed, q.tenant.as_deref()).await {
+        Concluded::Answer(answer) => {
+            slot.refund();
+            answer
         }
-        Err(e) => unavailable(&e),
+        Concluded::Refused => {
+            info!(email = %email_tag(&email), "sign-in refused: no tenant");
+            refused()
+        }
+    }
+}
+
+fn identity_unavailable(e: &IdentityError) -> Response {
+    warn!(error = %e, "identity call failed");
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+}
+
+/// What a right password led to.
+enum Concluded {
+    Answer(Response),
+    /// No tenant to land in: the caller gives its generic refusal. The session is gone.
+    Refused,
+}
+
+/// A session nobody will use.
+async fn drop_session(s: &AppState, session_id: &str) {
+    if let Err(e) = s.identity.revoke_session(&Pool::Members, session_id).await {
+        warn!(error = %e, "revoking an unused session failed; it expires on its own");
+    }
+}
+
+/// From a new identity session to the sign-in's answer. Only `studio` and `verify` keep the
+/// session; `pending` and `tenant_required` revoke it (a retry signs in again).
+async fn conclude(s: &AppState, signed: SignedIn, wanted: Option<&str>) -> Concluded {
+    if !signed.user.email_verified {
+        send_code(s, &signed.user.id, CodeKind::Verify).await;
+        return Concluded::Answer(verify_step(s, signed));
+    }
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("sign-in needs the orchestrator's internal client");
+        drop_session(s, &signed.session_id).await;
+        return Concluded::Answer(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+    };
+    let tenants = match orchestrator.member_tenants(&signed.user.id).await {
+        Ok(tenants) => tenants,
+        Err(e) => {
+            warn!(error = %e, "sign-in: reading the memberships failed");
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+        }
+    };
+    let tenant = match choose(&tenants, wanted) {
+        Choice::Tenant(tenant) => tenant,
+        Choice::Pending => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(reply(
+                StatusCode::OK,
+                json!(SignInAnswer { next: SignInStep::Pending }),
+                Vec::new(),
+            ));
+        }
+        Choice::Several(list) => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(
+                ApiError::new(StatusCode::CONFLICT.as_u16(), ErrorCode::TenantRequired, CHOOSE_TENANT)
+                    .with_extra("tenants", json!(list))
+                    .into_response(),
+            );
+        }
+        Choice::Nowhere => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Refused;
+        }
+    };
+    let kept = SessionState::Identity {
+        session_id: signed.session_id,
+        session_token: signed.session_token,
+        tenant,
+        exp: now_secs() + SESSION_TTL_SECS,
+    };
+    let secure = s.config.secure_cookies;
+    Concluded::Answer(reply(
+        StatusCode::OK,
+        json!(SignInAnswer { next: SignInStep::Studio }),
+        vec![
+            set_cookie(
+                SESSION_COOKIE,
+                &seal_session(&s.config.cookie_key, &kept),
+                SESSION_TTL_SECS,
+                secure,
+            ),
+            clear_cookie(LOGIN_COOKIE, secure),
+        ],
+    ))
+}
+
+/// Mails a code, within [`may_issue_code`] (5 an hour per user and kind, whichever flow asks).
+/// The answer never says whether one went out.
+async fn send_code(s: &AppState, user_id: &str, kind: CodeKind) {
+    if !may_issue_code(&s.limiter, kind, user_id) {
+        info!(kind = kind.as_str(), "a user's code limit is used up; nothing sent");
+        return;
+    }
+    // The page where the code is typed: never the code or an id in the link.
+    let page = match kind {
+        CodeKind::Reset => "password-reset",
+        _ => "verify",
+    };
+    let link = format!("{}/{page}", s.config.studio_url);
+    let mut request = CodeRequest::new(user_id, kind, Delivery::Email);
+    request.link = Some(&link);
+    if let Err(e) = s.identity.create_code(&Pool::Members, &request).await {
+        warn!(error = %e, "sending a code failed");
+    }
+}
+
+/// The answer to a call to `/auth/v1/token` that isn't Studio's: Studio sends both, and a form
+/// or another site can't. Neither says anything about the session.
+fn from_studio(s: &AppState, headers: &HeaderMap) -> bool {
+    let header_is = |name: &str, want: &str| headers.get(name).is_some_and(|v| v.as_bytes() == want.as_bytes());
+    header_is("x-chelabase-studio", "1") && header_is("origin", &s.config.studio_url)
+}
+
+/// A member's short-lived token.
+#[derive(Serialize, ToSchema)]
+struct MemberToken {
+    access_token: String,
+    /// Seconds until it expires.
+    expires_in: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/v1/token",
+    operation_id = "mintMemberToken",
+    tag = "login",
+    description = "Mints a member access token from the HttpOnly session cookie, after checking that the identity session is live and younger than 30 days and that the membership is active. Takes no body. Studio must send `Origin` and `X-Chelabase-Studio: 1`. Never cached.",
+    params(TenantQuery),
+    responses(
+        (status = 200, description = "The token, for the tenant the session is bound to", body = MemberToken),
+        (status = 401, description = "No live session, an older one, another tenant, or no active membership there: `unauthorized`", body = ErrorEnvelope),
+        (status = 403, description = "Not from Studio: `forbidden`", body = ErrorEnvelope),
+        (status = 429, description = "Over 120 a minute for this session: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn token(State(s): S, Query(q): Query<TenantQuery>, headers: HeaderMap) -> Response {
+    let mut answer = token_inner(&s, q, &headers).await;
+    answer
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    answer
+}
+
+async fn token_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap) -> Response {
+    if !from_studio(s, headers) {
+        return error(StatusCode::FORBIDDEN, ErrorCode::Forbidden, NOT_FROM_STUDIO);
+    }
+    let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, SIGN_IN_AGAIN);
+    let down = || error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+    let Some(SessionState::Identity { session_id, tenant, .. }) = read_cookie(headers, SESSION_COOKIE)
+        .and_then(|raw| open_session(&s.config.cookie_key, raw, now_secs()))
+    else {
+        return refused();
+    };
+    if !allowed(s, &[(format!("token:session:{session_id}"), 120, MINUTE)]) {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    }
+    // The session is sealed to its tenant: asking for another never moves it.
+    if q.tenant.as_deref().is_some_and(|t| t.parse() != Ok(tenant)) {
+        return refused();
+    }
+    // By id, never by token: identity's lookup by token slides the expiry.
+    let live = match s.identity.session_by_id(&Pool::Members, &session_id).await {
+        Ok(live) => live,
+        Err(IdentityError::NotFound(Missing::Session)) => return refused(),
+        Err(e) => {
+            warn!(error = %e, "identity call failed");
+            return down();
+        }
+    };
+    if s.clock.now() - live.session.created_at > ABSOLUTE_LIFETIME {
+        drop_session(s, &session_id).await;
+        return refused();
+    }
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("/auth/v1/token needs the orchestrator's internal client");
+        return down();
+    };
+    match orchestrator.member_tenants(&live.user.id).await {
+        Ok(tenants) if tenants.active.contains(&tenant) => {}
+        Ok(_) => return refused(),
+        Err(e) => {
+            warn!(error = %e, "/auth/v1/token: reading the memberships failed");
+            return down();
+        }
+    }
+    let minted = s.member_tokens.mint(&crate::member_token::MemberSubject {
+        user_id: &live.user.id,
+        tenant,
+        session_id: &session_id,
+        email: &live.user.email,
+        name: &live.user.name,
+    });
+    match minted {
+        Ok((access_token, _)) => reply(
+            StatusCode::OK,
+            json!(MemberToken { access_token, expires_in: s.member_tokens.ttl().as_secs() }),
+            Vec::new(),
+        ),
+        Err(e) => {
+            warn!(error = %e, "minting a member token failed");
+            down()
+        }
     }
 }
 
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SignUpBody {
-    auth_request: String,
     email: String,
     password: String,
     given_name: String,
@@ -653,19 +640,18 @@ struct SignUpBody {
     path = "/auth/v1/sign-up",
     operation_id = "signUp",
     tag = "login",
-    description = "Creates an account. Sets the HttpOnly session cookie when email verification is off, otherwise the HttpOnly step cookie that the code step reads.",
+    description = "Creates an account: the fresh-install admin with the setup code, otherwise a person waiting for an admin's approval. With email verification off it signs them in, so the answer is `studio` (the session cookie) or `pending` (no cookie). With it on, `verify` and the HttpOnly step cookie that the code step reads.",
     request_body = SignUpBody,
     responses(
-        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
-        (status = 400, description = "The body is malformed, a name is blank or over 200 characters, or Zitadel's validation refuses a field (`invalid_request`), or the password is too weak (`weak_password`)", body = ErrorEnvelope),
+        (status = 200, description = "`studio`, `verify` or `pending`", body = SignInAnswer),
+        (status = 400, description = "The body is malformed, a name is blank or over 200 characters, or the identity service refuses a field (`invalid_request`), or the password is too weak (`weak_password`)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), the unclaimed instance needs its setup code and it is missing or wrong (`setup_code_invalid`; no account is created), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
         (status = 409, description = "An account with this email exists (`email_taken`); only when email verification is off", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody>) -> Response {
@@ -690,83 +676,98 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
     if !usable_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
-    // Zitadel's own limit on a name (1–200 runes after trimming), checked here so a bad name
-    // never reaches it and is never answered as a password problem.
+    // A name is 1–200 runes after trimming, checked here so a bad name is never answered as a
+    // password problem.
     let usable_name = |n: &str| (1..=200).contains(&n.trim().chars().count());
     if !usable_name(&b.given_name) || !usable_name(&b.family_name) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_NAME);
-    }
-    let Some(org) = org_id(s) else {
-        return no_org();
-    };
-    if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
-        return pending_sign_in_error(e);
     }
     let nonce = match sign_up_gate(s, setup_code).await {
         Ok(nonce) => nonce,
         Err(refused) => return refused.response(),
     };
-    // A claim that fails after the account exists is undone by deleting it, which needs the
-    // admin client (the login client can't delete users): without it, no claim is attempted.
-    if nonce.is_some() && s.admin.is_none() {
-        warn!("a setup-code sign-up needs the admin Zitadel client (CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
-        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
-    }
-    // Zitadel checks usernames, not emails, for uniqueness: never make a second account
-    // for an email that already has one.
-    // Two accounts already sharing the email (made outside this check) count as taken too.
-    match s.zitadel.find_user_in_org(org, &email).await {
-        Ok(crate::zitadel::EmailMatch::None) => {}
-        Ok(_) => return taken(s, &email, b.auth_request),
-        Err(e) => return unavailable(&e),
-    }
-    let template = verify_template(s);
+    let name = format!("{} {}", b.given_name.trim(), b.family_name.trim());
     let new = NewUser {
-        org_id: org,
         email: &email,
-        given_name: b.given_name.trim(),
-        family_name: b.family_name.trim(),
         password: Some(&b.password),
-        user_id: None,
-        username: None,
-        send_code: true,
-        verified: s.config.skip_email_verification,
-        url_template: &template,
+        name: Some(&name),
+        email_verified: s.config.skip_email_verification,
     };
-    let user_id = match s.zitadel.create_user(&new).await {
-        Ok(id) => id,
-        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => return taken(s, &email, b.auth_request),
-        // Only Zitadel's policy, by its captured create-path ids, is the visitor's password (#79).
-        Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) => {
+    let user = match s.identity.create_user(&Pool::Members, &new).await {
+        Ok(user) => user,
+        Err(IdentityError::Conflict(_)) => {
+            if let Some(nonce) = &nonce
+                && let Some(healed) = heal_claim(s, &email, &b.password, nonce).await
+            {
+                return healed;
+            }
+            return taken(s, &email);
+        }
+        Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
-        // Its validation of a field (code 3, no id) is still the visitor's input, but no field
-        // in particular: the name and password checks above catch the known ones first.
-        Err(e) if e.is_invalid_request() => {
+        Err(IdentityError::Invalid { .. }) => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_DETAILS);
         }
-        // Any other refusal (a missing org: the instance is misconfigured) isn't the visitor's.
-        Err(e) => return unavailable(&e),
+        Err(e) => return identity_unavailable(&e),
     };
-    if let Some(nonce) = &nonce
-        && let Some(refused) = bind_claim(s, org, &user_id, nonce).await
-    {
+    if let Some(refused) = enroll(s, &user.id, nonce.as_ref()).await {
         return refused.response();
     }
-    let session = match new_user_session(s, &user_id, &b.password).await {
-        Ok(session) => session,
-        Err(e) => return unavailable(&e),
+    let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
+        Ok(signed) => signed,
+        Err(e) => return identity_unavailable(&e),
     };
-    if s.config.skip_email_verification {
-        return finish(s, &b.auth_request, session).await;
+    signed_up(s, signed).await
+}
+
+/// The answer to a sign-up whose account is enrolled, from its first session.
+async fn signed_up(s: &AppState, signed: SignedIn) -> Response {
+    match conclude(s, signed, None).await {
+        Concluded::Answer(answer) => answer,
+        // Enrolled a moment ago, and already out of the tenant.
+        Concluded::Refused => error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
     }
-    verify_step(s, &b.auth_request, user_id, session).await
+}
+
+/// A code-gated sign-up for an email that has an account: the claimant whose earlier attempt
+/// left the account behind (#121 audit S2: the bind or its row failed, and so did deleting
+/// the account). With that account's password, the claim is asked again for it, which writes
+/// the row that is missing, so the install isn't left without an admin. `None` for a wrong
+/// password (the caller answers as for any taken email); on a failed claim the account stays,
+/// because this sign-up didn't make it.
+async fn heal_claim(
+    s: &AppState,
+    email: &str,
+    password: &str,
+    nonce: &crate::app_users::internal::ClaimNonce,
+) -> Option<Response> {
+    let signed = match s.identity.sign_in(&Pool::Members, email, password).await {
+        Ok(signed) => signed,
+        Err(
+            IdentityError::BadCredentials
+            | IdentityError::Banned
+            | IdentityError::SessionRevoked
+            | IdentityError::Invalid { .. },
+        ) => return None,
+        Err(e) => return Some(identity_unavailable(&e)),
+    };
+    let claimed = match &s.signup_gate {
+        Some(gate) => gate.signup_claimed(&signed.user.id, nonce).await,
+        None => Err(crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into())),
+    };
+    match claimed {
+        Ok(bound) => info!(user_id = %signed.user.id, bound, "fresh-install claim, asked again for an existing account"),
+        Err(failed) => {
+            warn!(user_id = %signed.user.id, error = %failed, "asking the claim again failed");
+            drop_session(s, &signed.session_id).await;
+            return Some(refusal(failed).response());
+        }
+    }
+    Some(signed_up(s, signed).await)
 }
 
 /// Why the sign-up gate refused; [`Refusal::response`] is its answer.
@@ -812,11 +813,7 @@ async fn gate(
         warn!("no sign-up gate is configured");
         return Err(Refusal::Unavailable);
     };
-    let org = s.config.org_id.get().map_err(|e| {
-        not_ready(&e);
-        Refusal::Unavailable
-    })?;
-    gate.signup_check(org, setup_code).await.map_err(|e| {
+    gate.signup_check(setup_code).await.map_err(|e| {
         warn!(error = %e, "the sign-up gate failed");
         Refusal::Unavailable
     })
@@ -849,43 +846,62 @@ async fn sign_up_gate(
     })
 }
 
-/// Binds the fresh-install claim to the account just created. `None` when bound, or when the
-/// instance was claimed meanwhile (the account stays and waits as a newcomer). On any
-/// failure the account is deleted, so a retry with the same email can succeed, and the
-/// answer is `setup_code_invalid` (refused) or `unavailable`.
-async fn bind_claim(
+/// Gives the account just created its place: the fresh-install claim with a nonce, otherwise
+/// a `pending` row (a member token never makes one). `None` when that's done, the loser of the
+/// claim race included (they wait as pending). On any failure the account is deleted, so a
+/// retry with the same email can succeed, and the answer is why.
+///
+/// With email verification on, an open sign-up gets no row yet (#121 audit S1): a `pending`
+/// row for an address nobody proved would squat that email in the admins' request list.
+/// verify-email joins it once the code has marked the email verified ([`join_verified`]).
+async fn enroll(
     s: &AppState,
-    org: &str,
     user_id: &str,
-    nonce: &crate::app_users::internal::ClaimNonce,
+    nonce: Option<&crate::app_users::internal::ClaimNonce>,
 ) -> Option<Refusal> {
-    let failed = match &s.signup_gate {
-        Some(gate) => match gate.signup_claimed(org, user_id, nonce).await {
-            Ok(bound) => {
-                info!(user_id, bound, "fresh-install claim");
-                return None;
+    use crate::app_users::internal::InternalError;
+    let done = match (&s.signup_gate, nonce) {
+        (Some(gate), Some(nonce)) => gate.signup_claimed(user_id, nonce).await.map(|bound| {
+            info!(user_id, bound, "fresh-install claim");
+        }),
+        // The join waits for the verified email: see above.
+        (Some(_), None) if !s.config.skip_email_verification => {
+            info!(user_id, "open sign-up: the row waits for the verified email");
+            Ok(())
+        }
+        (Some(gate), None) => gate.signup_joined(user_id).await.and_then(|joined| {
+            if joined {
+                Ok(())
+            } else {
+                Err(InternalError::Refused { status: 403, code: "sign_up_closed".into() })
             }
-            Err(e) => e,
-        },
-        None => crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into()),
+        }),
+        (None, _) => Err(InternalError::Unavailable("no sign-up gate".into())),
     };
-    warn!(user_id, error = %failed, "binding the fresh-install claim failed; deleting the new account");
-    // `sign_up_inner` checked the admin client before creating the account.
-    if let Some(admin) = &s.admin
-        && let Err(e) = admin.delete_user(user_id).await
-    {
-        warn!(user_id, error = %e, "deleting the unclaimed account failed");
+    let Err(failed) = done else {
+        return None;
+    };
+    warn!(user_id, error = %failed, "enrolling the new account failed; deleting it");
+    if let Err(e) = s.identity.delete_user(&Pool::Members, user_id).await {
+        warn!(user_id, error = %e, "deleting the unenrolled account failed");
     }
-    Some(match failed {
-        crate::app_users::internal::InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
-        crate::app_users::internal::InternalError::Unavailable(_) => Refusal::Unavailable,
-    })
+    Some(refusal(failed))
+}
+
+/// Why the orchestrator refused to enroll an account.
+fn refusal(failed: crate::app_users::internal::InternalError) -> Refusal {
+    use crate::app_users::internal::InternalError;
+    match failed {
+        InternalError::Refused { code, .. } if code == "sign_up_closed" => Refusal::Closed,
+        InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
+        InternalError::Unavailable(_) => Refusal::Unavailable,
+    }
 }
 
 /// Both fields default to empty, so a missing one is a `not_found` like a wrong one.
 #[derive(Deserialize, ToSchema)]
 struct DescribeInviteBody {
-    /// The Zitadel user id from the invite link.
+    /// The identity user id from the invite link.
     #[serde(default)]
     user: String,
     /// The invite token from the invite link.
@@ -910,12 +926,23 @@ fn is_invite_token(t: &str) -> bool {
     t.len() == 43 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// An identity user id: a hyphenated lower-case UUID, as every id of the service's is. Ids go into
+/// identity's URL paths and limit keys, so only this exact shape is passed on.
+fn is_identity_id(id: &str) -> bool {
+    uuid::Uuid::parse_str(id).is_ok_and(|u| u.hyphenated().to_string() == id)
+}
+
+/// An invite or reset code: six digits.
+fn is_code(code: &str) -> bool {
+    code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit())
+}
+
 #[utoipa::path(
     post,
     path = "/auth/v1/invite",
     operation_id = "describeInvite",
     tag = "login",
-    description = "Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.",
+    description = "Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.",
     request_body = DescribeInviteBody,
     responses(
         (status = 200, description = "The invite is open and the token matches", body = InviteDescription),
@@ -943,7 +970,7 @@ async fn describe_invite_inner(s: &AppState, headers: &HeaderMap, q: DescribeInv
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
     let not_found = || error(StatusCode::NOT_FOUND, ErrorCode::NotFound, NO_SUCH_INVITE);
-    if !is_user_id(&q.user) || !is_invite_token(&q.t) {
+    if !is_identity_id(&q.user) || !is_invite_token(&q.t) {
         return not_found();
     }
     let Some(orchestrator) = &s.signup_gate else {
@@ -961,25 +988,52 @@ async fn describe_invite_inner(s: &AppState, headers: &HeaderMap, q: DescribeInv
     }
 }
 
+/// One of three shapes: `user` + `code` (a new person, or an account nobody proved: the code sets
+/// the first password), `user` + `acceptTicket` (a retry after the code was spent), or `email`
+/// (an existing account, from the code-less notice: `password` is its own). `t` is always the
+/// link's token.
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct AcceptInviteBody {
-    /// The Zitadel user id from the invite link.
-    user: String,
-    /// The invite code from the link. Send this or `acceptTicket`.
+    /// The invite link's token (`t`).
+    t: String,
+    /// The invitee's identity user id, from a code link (`?user=`).
+    #[serde(default)]
+    user: Option<String>,
+    /// The six-digit invite code from the invite email, or from the admin's link.
     #[serde(default)]
     code: Option<String>,
-    /// From an `invite_incomplete` error: retries the steps after the (spent) code.
+    /// From an `invite_incomplete` error: finishes the steps after the (spent) code. Send it in
+    /// place of `code`, with the same password.
     #[serde(default)]
     accept_ticket: Option<String>,
-    /// The link's `reset=1`: `code` is a password-reset code (a person who already had a way to
-    /// sign in, whom Zitadel gives no invite code). It sets the password itself.
+    /// An existing account's email (the notice's link carries only `t`).
     #[serde(default)]
-    reset: bool,
+    email: Option<String>,
+    /// The new password with `code` or `acceptTicket`; the account's own with `email`.
     password: String,
-    /// The pending sign-in to finish; without it the answer sends the browser to Studio.
-    #[serde(default)]
-    auth_request: Option<String>,
+}
+
+/// What proves the visitor may accept.
+enum Proof<'a> {
+    Code { user: &'a str, code: &'a str },
+    Ticket { user: &'a str, ticket: &'a str },
+    Account { email: String },
+}
+
+fn proof_of(b: &AcceptInviteBody) -> Option<Proof<'_>> {
+    if !is_invite_token(&b.t) {
+        return None;
+    }
+    let user = b.user.as_deref().filter(|u| is_identity_id(u));
+    match (user, b.code.as_deref().map(str::trim), b.accept_ticket.as_deref(), b.email.as_deref()) {
+        (Some(user), Some(code), None, None) if is_code(code) => Some(Proof::Code { user, code }),
+        (Some(user), None, Some(ticket), None) if b.user.is_some() => Some(Proof::Ticket { user, ticket }),
+        (None, None, None, Some(email)) if b.user.is_none() && !email.trim().is_empty() => {
+            Some(Proof::Account { email: normalize_email(email) })
+        }
+        _ => None,
+    }
 }
 
 #[utoipa::path(
@@ -987,18 +1041,19 @@ struct AcceptInviteBody {
     path = "/auth/v1/accept-invite",
     operation_id = "acceptInvite",
     tag = "login",
-    description = "Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.",
+    description = "Accepts a member invite and signs in (the HttpOnly session cookie). With `user` and `code` (the code from the invite email), the code sets the first password and verifies the email; an account someone else registered without proving the email has its old password replaced and every session ended. With `email` (an existing account, from the invite notice), the account's own password signs in and no password is set. The link's token `t` must match an open invite. A removed member's ban is lifted only then; any other ban is `member_suspended`. If a step after the code fails, the error is `invite_incomplete` with `error.accept_ticket`: send it back in place of `code`, with the same password, to finish. A weak password is refused before the code is used.",
     request_body = AcceptInviteBody,
     responses(
-        (status = 200, description = "Signed in: `next` is `done`, the session cookie is set", body = SignedIn),
-        (status = 400, description = "The body is malformed, the code or ticket is wrong, or the user is inactive with no open invite (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)", body = ErrorEnvelope),
+        (status = 200, description = "Signed in: `studio` with the session cookie set (or `pending`, with none)", body = SignInAnswer),
+        (status = 400, description = "The body is malformed, or the link, code or ticket is wrong, used or closed (`invalid_request`), or the password is too weak (`weak_password`; nothing was used)", body = ErrorEnvelope),
+        (status = 401, description = "With `email`: the email or password is wrong (`invalid_credentials`)", body = ErrorEnvelope),
+        (status = 403, description = "The account is banned outside Chelabase, or the member is suspended (`member_suspended`): no sign-in", body = ErrorEnvelope),
+        (status = 410, description = "The invite expired (`invite_expired`) or its account is gone (`invite_revoked`)", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
-        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 410, description = "The invite expired (`invite_expired`) or was revoked (`invite_revoked`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 403, description = "The member is suspended (`member_suspended`): the invite is accepted and the password set, but there is no sign-in until an admin reinstates them", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable (`unavailable`), or a step after the code check failed (`invite_incomplete`, with `accept_ticket`)", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable (`unavailable`), or a step after the code failed (`invite_incomplete`, with `accept_ticket`)", body = ErrorEnvelope),
     ),
 )]
 async fn accept_invite(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AcceptInviteBody>) -> Response {
@@ -1012,52 +1067,37 @@ async fn accept_invite(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Acce
     answer
 }
 
-/// Zitadel's password-policy refusals on `POST /v2/users/{id}/password` (a reset, a change or an
-/// admin set), by their captured ids: Zitadel localizes the message.
-pub(crate) const SET_PASSWORD_POLICY: [refusals::Refusal; 5] = [
-    refusals::PASSWORD_TOO_SHORT,
-    refusals::PASSWORD_NO_UPPER,
-    refusals::PASSWORD_NO_LOWER,
-    refusals::PASSWORD_NO_NUMBER,
-    refusals::PASSWORD_NO_SYMBOL,
-];
-
-/// The same checks on `POST /v2/users/new`, with that endpoint's ids.
-pub(crate) const CREATE_PASSWORD_POLICY: [refusals::Refusal; 5] = [
-    refusals::CREATE_USER_PASSWORD_TOO_SHORT,
-    refusals::CREATE_USER_PASSWORD_NO_UPPER,
-    refusals::CREATE_USER_PASSWORD_NO_LOWER,
-    refusals::CREATE_USER_PASSWORD_NO_NUMBER,
-    refusals::CREATE_USER_PASSWORD_NO_SYMBOL,
-];
-
-/// A password Zitadel can take: the policy's checks, and at most bcrypt's 72 bytes (counted in
-/// bytes, so 39 characters can be too many). A longer one passes Zitadel's validation and then
-/// fails with a 500 (`refusals::PASSWORD_MAX_BYTES`).
+/// A password identity can take: our complexity rule, and at most 72 bytes (counted in bytes, so
+/// 39 characters can be too many).
 pub(crate) fn usable_password(password: &str) -> bool {
-    password.len() <= refusals::PASSWORD_MAX_BYTES && strong_password(password)
+    password.len() <= PASSWORD_MAX_BYTES && strong_password(password)
 }
 
-/// Zitadel refused a new password on `POST /v2/users/{id}/password`: its policy, or its own
-/// validation of the field.
-fn set_password_refused(e: &ZError) -> bool {
-    e.is_any(&SET_PASSWORD_POLICY) || e.is_invalid_request()
+fn bad_invite() -> Response {
+    error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE)
 }
 
-/// What the orchestrator stores about the user's latest member invite. Unconfigured or failing
-/// is an error: callers fail closed.
-async fn open_invite(s: &AppState, user: &str) -> Result<OpenInvite, ()> {
-    let Some(orchestrator) = &s.signup_gate else {
-        warn!("accept-invite needs the orchestrator's internal client");
-        return Err(());
-    };
-    orchestrator.open_invite(user).await.map_err(|e| {
-        warn!(error = %e, "accept-invite: the open-invite check failed");
-    })
+fn suspended() -> Response {
+    error(StatusCode::FORBIDDEN, ErrorCode::MemberSuspended, MEMBER_SUSPENDED)
+}
+
+/// A link whose invite isn't open (any more): 410 `invite_expired` when the user's stored invite
+/// expired, else (none, a closed one, a wrong token, the check failing) 400.
+async fn closed_invite(orchestrator: &crate::app_users::InternalClient, user: &str) -> Response {
+    match orchestrator.open_invite(user).await {
+        Ok(OpenInvite { open: false, expires_at: Some(_) }) => {
+            error(StatusCode::GONE, ErrorCode::InviteExpired, INVITE_EXPIRED)
+        }
+        Ok(_) => bad_invite(),
+        Err(e) => {
+            warn!(error = %e, "accept-invite: the open-invite check failed");
+            bad_invite()
+        }
+    }
 }
 
 /// A step after the code was spent failed: tell the browser how to finish.
-fn incomplete(s: &AppState, user: &str, status: StatusCode, code: ErrorCode, message: &str) -> Response {
+fn incomplete(s: &AppState, user: &str) -> Response {
     let ticket = seal_ticket(
         &s.config.cookie_key,
         &AcceptTicket {
@@ -1066,14 +1106,9 @@ fn incomplete(s: &AppState, user: &str, status: StatusCode, code: ErrorCode, mes
             nonce: uuid::Uuid::new_v4().simple().to_string(),
         },
     );
-    ApiError::new(status.as_u16(), code, message)
+    ApiError::new(StatusCode::SERVICE_UNAVAILABLE.as_u16(), ErrorCode::InviteIncomplete, INVITE_INCOMPLETE)
         .with_extra("accept_ticket", json!(ticket))
         .into_response()
-}
-
-fn incomplete_unavailable(s: &AppState, user: &str, e: &ZError) -> Response {
-    warn!(error = %e, "accept-invite: a step after the code check failed");
-    incomplete(s, user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE)
 }
 
 async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteBody) -> Response {
@@ -1085,238 +1120,329 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     let Some(slot) = Slot::reserve(&s.limiter, format!("accept-invite:ip:{ip}"), 20, HOUR) else {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     };
-    let bad = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
-    let gone = |code, message| error(StatusCode::GONE, code, message);
-    let too_many = || error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
-    let weak = || error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
-    // Validate before any key is built from the input.
-    let code = b.code.as_deref().map(str::trim);
-    if !is_user_id(&b.user)
-        || code.is_some() == b.accept_ticket.is_some()
-        || code.is_some_and(|c| c.is_empty() || c.len() > 20)
-    {
-        return bad();
-    }
-    if b.auth_request.as_deref().is_some_and(|ar| !is_auth_request_id(ar)) {
-        return gone(ErrorCode::SignInExpired, GONE);
-    }
-    // Before the code is spent.
-    if !usable_password(&b.password) {
+    // Validated before any key is built or any service is asked.
+    let Some(proof) = proof_of(&b) else {
+        return bad_invite();
+    };
+    // Before the code is spent. An existing account's own password is whatever it is.
+    if !matches!(proof, Proof::Account { .. }) && !usable_password(&b.password) {
         slot.refund();
-        return weak();
+        return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
-    // Setting a password and marking the email verified need Zitadel's admin token; without it
-    // the code would be spent for nothing.
-    let Some(admin) = &s.admin else {
-        warn!("accept-invite needs CHELABASE_ZITADEL_ADMIN_PAT_FILE");
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("accept-invite needs the orchestrator's internal client");
         slot.refund();
         return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
     };
-    let Some(org) = org_id(s) else {
-        slot.refund();
-        return no_org();
+    let token_hash = hex::encode(Sha256::digest(b.t.as_bytes()));
+    let accepting = |user_id, may_unban, retry| Accepting {
+        orchestrator,
+        user_id,
+        token_hash: &token_hash,
+        password: &b.password,
+        may_unban,
+        retry,
     };
-    // Only failed code attempts (and a user of another organization) count against a user, so a
-    // typo'd password or a retry never locks the invitee out. Reserved up front like the
-    // address's slot, so a hang-up can't skip it; every other outcome hands it back.
-    let Some(user_slot) =
-        Slot::reserve(&s.limiter, format!("accept-invite:user:{}", b.user), 5, HOUR)
-    else {
-        slot.refund();
-        return too_many();
-    };
-    let user = match admin.get_user(&b.user).await {
-        Ok(Some(u)) => u,
-        Ok(None) => {
-            user_slot.refund();
-            return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
-        }
-        // A refusal is Zitadel's answer and counts against the address; only an outage is free.
-        Err(e @ ZError::Rejected { .. }) => {
-            user_slot.refund();
-            return unavailable(&e);
-        }
-        Err(e) => {
-            user_slot.refund();
-            slot.refund();
-            return unavailable(&e);
-        }
-    };
-    // An invite code for a user of another organization never signs into the platform.
-    if user.org_id != org {
-        warn!("accept-invite for a user outside the platform org");
-        return bad();
-    }
-    let mut password_set = false;
-    match (code, &b.accept_ticket) {
-        (Some(code), _) => {
-            // A reset code is checked by setting the password with it: nothing changes on a
-            // wrong one.
-            let checked = if b.reset {
-                admin.set_password(&b.user, code, &b.password).await
-            } else {
-                admin.verify_invite_code(&b.user, code).await
+    match proof {
+        Proof::Code { user, code } => {
+            let Some(user_slot) =
+                Slot::reserve(&s.limiter, format!("accept-invite:user:{user}"), 5, HOUR)
+            else {
+                slot.refund();
+                return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
             };
-            match checked {
-                Ok(()) => {
-                    user_slot.refund();
-                    password_set = b.reset;
-                }
-                // An arm that hands an attempt back matches one exact captured refusal. A wrong
-                // code is `INVITE_CODE_INVALID`, `PASSWORD_CODE_INVALID` or
-                // `PASSWORD_CODE_NOT_FOUND`, never one of them, so guessing stays counted. The
-                // user-gone arms hand back only the invitee's attempt: the address's counts.
-                Err(e) if !b.reset && e.is(refusals::INVITE_USER_NOT_FOUND) => {
-                    info!("accept-invite: the user is gone");
-                    user_slot.refund();
-                    return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
-                }
-                Err(e) if b.reset && e.is(refusals::SET_PASSWORD_USER_NOT_FOUND) => {
-                    info!("accept-invite: the user is gone");
-                    user_slot.refund();
-                    return gone(ErrorCode::InviteRevoked, INVITE_REVOKED);
-                }
-                // The policy refused the password: the code wasn't spent, so no ticket.
-                Err(e) if b.reset && e.is_any(&SET_PASSWORD_POLICY) => {
+            match check_code(s, orchestrator, user, &token_hash, code, &b.password).await {
+                Checked::Spent => user_slot.refund(),
+                Checked::Refused(answer) => return answer,
+                Checked::NotCounted(answer) => {
                     user_slot.refund();
                     slot.refund();
-                    return weak();
+                    return answer;
                 }
-                // Zitadel's validation of the field has no id to match exactly: it counts. The
-                // 72-byte cap above keeps the password out of reach of its 200-rune check, but a
-                // validation failure on another field of the request lands here too, so the arm
-                // stays.
-                Err(e) if b.reset && e.is_invalid_request() => return weak(),
-                // A wrong, an expired and a missing code get the same answer from Zitadel; the
-                // stored invite tells an expired one apart. Read only now, and counted either way.
-                Err(e) if !b.reset && e.is(refusals::INVITE_CODE_INVALID) => {
-                    return match open_invite(s, &b.user).await {
-                        Ok(OpenInvite { open: false, expires_at: Some(_) }) => {
-                            gone(ErrorCode::InviteExpired, INVITE_EXPIRED)
-                        }
-                        _ => bad(),
-                    };
-                }
-                Err(ZError::Rejected { status: status @ (400 | 412), message, .. }) => {
-                    warn!(status, %message, reset = b.reset, "accept-invite: the code was refused");
-                    return bad();
-                }
-                // Any other refusal is Zitadel answering about the code, not an outage: it counts
-                // against the address and the invitee (no refund matches a status class).
-                Err(e @ ZError::Rejected { .. }) => return unavailable(&e),
-                Err(e) => {
+                Checked::AddressCountsOnly(answer) => {
                     user_slot.refund();
-                    slot.refund();
-                    return unavailable(&e);
+                    return answer;
                 }
             }
+            // From here the code is spent, and no outcome counts against the address.
+            let answer = finish_accept(s, &accepting(user, true, Retry::Ticket), None).await;
+            slot.refund();
+            answer
         }
-        (None, Some(ticket)) => {
-            user_slot.refund();
-            // Claimed up front: a failed attempt hands back a fresh ticket, so this one is
-            // spent either way, and two concurrent uses can't both pass.
+        Proof::Ticket { user, ticket } => {
+            // Claimed up front: a failed attempt hands back a fresh ticket, so this one is spent
+            // either way, and two concurrent uses can't both pass. Per process: the barrier
+            // across replicas is the code itself, which identity uses once.
             match open_ticket(&s.config.cookie_key, ticket, now_secs()) {
-                Some(t)
-                    if t.user_id == b.user
-                        && s.used_tickets.claim(&t.nonce, t.exp, now_secs()) => {}
-                _ => return bad(),
+                Some(t) if t.user_id == user && s.used_tickets.claim(&t.nonce, t.exp, now_secs()) => {}
+                _ => return bad_invite(),
             }
+            let answer = finish_accept(s, &accepting(user, true, Retry::Ticket), None).await;
+            slot.refund();
+            answer
         }
-        (None, None) => {
-            user_slot.refund();
-            return bad();
+        Proof::Account { email } => {
+            // A password guess like a sign-in's, so it spends the same per-email budget.
+            let Some(email_slot) = Slot::reserve(
+                &s.limiter,
+                format!("sign-in:email:{}", email_tag(&email)),
+                5,
+                MINUTE,
+            ) else {
+                return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+            };
+            let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
+            // The password before anything about the invite is told. Identity checks it before
+            // the ban, so `Banned` means the password is right.
+            let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
+                Ok(signed) => Some(signed),
+                Err(IdentityError::Banned) => None,
+                Err(IdentityError::BadCredentials | IdentityError::SessionRevoked | IdentityError::Invalid { .. }) => {
+                    return refused();
+                }
+                Err(e) => {
+                    email_slot.refund();
+                    slot.refund();
+                    return identity_unavailable(&e);
+                }
+            };
+            email_slot.refund();
+            let (user_id, may_unban) = match &signed {
+                // The link's token must match this account's open invite: without it, the
+                // orchestrator's retry for an active member would sign anyone in with any `t`.
+                Some(signed) => match orchestrator.describe_invite(&signed.user.id, &token_hash).await {
+                    Ok(Some(_)) => (signed.user.id.clone(), false),
+                    Ok(None) => {
+                        drop_session(s, &signed.session_id).await;
+                        return bad_invite();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "accept-invite: the invite check failed");
+                        drop_session(s, &signed.session_id).await;
+                        slot.refund();
+                        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+                    }
+                },
+                // A banned account: our ban is lifted only for an open invite this link matches.
+                // Anything else answers as sign-in does for a banned account (a wrong password),
+                // so this is no oracle for a banned account's password.
+                None => {
+                    let user = match s.identity.find_user_by_email(&Pool::Members, &email).await {
+                        Ok(Some(user)) => user,
+                        Ok(None) => return refused(),
+                        Err(e) => {
+                            slot.refund();
+                            return identity_unavailable(&e);
+                        }
+                    };
+                    match s.identity.user_detail(&Pool::Members, &user.id).await {
+                        Ok(d) if d.ban_reason.as_deref() == Some(MEMBER_REMOVED_BAN_REASON) => {}
+                        Ok(_) | Err(IdentityError::NotFound(Missing::User)) => return refused(),
+                        Err(e) => {
+                            slot.refund();
+                            return identity_unavailable(&e);
+                        }
+                    }
+                    match orchestrator.describe_invite(&user.id, &token_hash).await {
+                        Ok(Some(_)) => {}
+                        Ok(None) => return refused(),
+                        Err(e) => {
+                            warn!(error = %e, "accept-invite: the invite check failed");
+                            slot.refund();
+                            return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+                        }
+                    }
+                    (user.id, true)
+                }
+            };
+            let answer = finish_accept(s, &accepting(&user_id, may_unban, Retry::Again), signed).await;
+            if answer.status() != StatusCode::BAD_REQUEST {
+                slot.refund();
+            }
+            answer
         }
     }
-    // From here the code is spent, and no outcome counts against the address.
-    let response = finish_accept(s, admin, b, user, password_set).await;
-    slot.refund();
-    response
 }
 
-/// The steps after a verified code: any failure hands back a ticket, and every step is safe to
-/// repeat.
-async fn finish_accept(
+/// How a code check ended, and what it counts against.
+enum Checked {
+    /// The code is used: the first password is set and the email verified.
+    Spent,
+    /// Counts against the address and the invitee (a wrong code, a closed link).
+    Refused(Response),
+    /// Counts against nothing (an outage, a weak password, a foreign ban).
+    NotCounted(Response),
+    /// Counts against the address only (the invitee is gone).
+    AddressCountsOnly(Response),
+}
+
+/// The link, then the account, then the code. Nothing changes unless the code is right; a weak
+/// password, a foreign ban and a closed link leave the code unused.
+async fn check_code(
     s: &AppState,
-    admin: &Zitadel,
-    b: AcceptInviteBody,
-    user: ZUser,
-    password_set: bool,
-) -> Response {
-    // I1: a deactivated user (a removed member invited again) comes back only now, with a
-    // verified code; the invite itself leaves them deactivated. #78: and only while Chelabase has
-    // an open invite for them. Anyone can have a reset code mailed, a deactivated user too, so a
-    // checked code alone never reactivates. A suspended member is locked, not inactive, and stays
-    // locked: Zitadel refuses their session below.
-    if user.state == UserState::Inactive {
-        match open_invite(s, &b.user).await {
-            Ok(OpenInvite { open: true, .. }) => {}
-            Ok(_) => {
-                info!("accept-invite: an inactive user with no open invite stays inactive");
-                return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_INVITE);
-            }
-            Err(()) => {
-                return incomplete(s, &b.user, StatusCode::SERVICE_UNAVAILABLE, ErrorCode::InviteIncomplete, INVITE_INCOMPLETE);
-            }
-        }
-        if let Err(e) = admin.reactivate_user_settled(&b.user).await {
-            return incomplete_unavailable(s, &b.user, &e);
+    orchestrator: &crate::app_users::InternalClient,
+    user: &str,
+    token_hash: &str,
+    code: &str,
+    password: &str,
+) -> Checked {
+    let down = || error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+    let revoked = || error(StatusCode::GONE, ErrorCode::InviteRevoked, INVITE_REVOKED);
+    match orchestrator.describe_invite(user, token_hash).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return Checked::Refused(closed_invite(orchestrator, user).await),
+        Err(e) => {
+            warn!(error = %e, "accept-invite: the invite check failed");
+            return Checked::NotCounted(down());
         }
     }
-    if !password_set {
-        match admin.set_password_admin(&b.user, &b.password).await {
-            Ok(()) => {}
-            Err(e) if set_password_refused(&e) => {
-                return incomplete(s, &b.user, StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
-            }
-            Err(e) => return incomplete_unavailable(s, &b.user, &e),
+    let detail = match s.identity.user_detail(&Pool::Members, user).await {
+        Ok(detail) => detail,
+        Err(IdentityError::NotFound(Missing::User)) => {
+            info!("accept-invite: the user is gone");
+            return Checked::AddressCountsOnly(revoked());
         }
-    }
-    if let Err(e) = admin.mark_email_verified(&b.user, &user.email).await {
-        return incomplete_unavailable(s, &b.user, &e);
-    }
-    let session = match new_user_session(s, &b.user, &b.password).await {
-        Ok(session) => session,
-        // A suspended member: locked until reinstated. The password is set and the email
-        // verified, so nothing is left to retry: no ticket, and the answer says why.
-        Err(e) if e.is_any(&[refusals::SESSION_USER_NOT_ACTIVE, refusals::SESSION_USER_LOCKED]) => {
-            info!("accept-invite: the user is locked; no session");
-            return error(StatusCode::FORBIDDEN, ErrorCode::MemberSuspended, MEMBER_SUSPENDED);
-        }
-        Err(e) => return incomplete_unavailable(s, &b.user, &e),
+        Err(e) => return Checked::NotCounted(identity_unavailable(&e)),
     };
-    match b.auth_request {
-        Some(ar) => match s.zitadel.finish(&ar, &session).await {
-            Ok(redirect) => signed_in(s, session, redirect),
-            // The account is complete; the pending sign-in just ended (Zitadel's captured
-            // not-found), so Studio's sign-in takes over. Another refusal is a step to retry.
-            Err(e) if e.is_any(&AUTH_REQUEST_GONE) => {
-                signed_in(s, session, s.config.studio_url.clone())
-            }
-            Err(e) => incomplete_unavailable(s, &b.user, &e),
+    // Only our own ban is ours to lift; any other stays, and the code stays unused.
+    if detail.user.banned && detail.ban_reason.as_deref() != Some(MEMBER_REMOVED_BAN_REASON) {
+        info!("accept-invite: the account is banned outside Chelabase");
+        return Checked::NotCounted(suspended());
+    }
+    match s
+        .identity
+        .verify_code(&Pool::Members, user, CodeKind::Invite, code, Some(password))
+        .await
+    {
+        Ok(_) => Checked::Spent,
+        Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => {
+            Checked::NotCounted(error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD))
+        }
+        // A wrong, used, replaced or locked code, or an account an invite can't set (an
+        // established one): counted.
+        Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. }) => Checked::Refused(bad_invite()),
+        Err(IdentityError::NotFound(Missing::User)) => Checked::AddressCountsOnly(revoked()),
+        Err(e @ IdentityError::Unavailable(_)) => Checked::NotCounted(identity_unavailable(&e)),
+        // Any other refusal is identity answering about the code, not an outage: it counts.
+        Err(e) => Checked::Refused(identity_unavailable(&e)),
+    }
+}
+
+/// What a failed step after the proof answers.
+#[derive(Clone, Copy)]
+enum Retry {
+    /// The code is spent: a ticket finishes the rest.
+    Ticket,
+    /// Nothing was spent: the same request again.
+    Again,
+}
+
+#[derive(Clone, Copy)]
+struct Accepting<'a> {
+    orchestrator: &'a crate::app_users::InternalClient,
+    user_id: &'a str,
+    token_hash: &'a str,
+    password: &'a str,
+    /// Our ban may be lifted: an open invite this link matches was confirmed.
+    may_unban: bool,
+    retry: Retry,
+}
+
+/// The steps after the proof, each safe to repeat: the member row (the orchestrator activates the
+/// invited row, closes the invite and clears the offboarded mark; an active row is a retry), then
+/// our ban lifted, then the session. The row comes before the unban, so an invite revoked or a
+/// member removed meanwhile lifts nothing. `signed` is the account's session when the proof made
+/// one; it is ended unless the answer keeps it.
+async fn finish_accept(s: &AppState, a: &Accepting<'_>, signed: Option<SignedIn>) -> Response {
+    let session = signed.as_ref().map(|s| s.session_id.clone());
+    let answer = finish_steps(s, a, signed).await;
+    if let Some(id) = session
+        && answer.status() != StatusCode::OK
+    {
+        drop_session(s, &id).await;
+    }
+    answer
+}
+
+async fn finish_steps(s: &AppState, a: &Accepting<'_>, signed: Option<SignedIn>) -> Response {
+    use crate::app_users::internal::InternalError;
+    let Accepting { orchestrator, user_id, token_hash, password, may_unban, retry } = *a;
+    let fail = |what: &str, e: &dyn std::fmt::Display| {
+        warn!(error = %e, "accept-invite: {what} failed");
+        match retry {
+            Retry::Ticket => incomplete(s, user_id),
+            Retry::Again => error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
+        }
+    };
+    let detail = match s.identity.user_detail(&Pool::Members, user_id).await {
+        Ok(detail) => detail,
+        Err(IdentityError::NotFound(Missing::User)) => {
+            return error(StatusCode::GONE, ErrorCode::InviteRevoked, INVITE_REVOKED);
+        }
+        Err(e) => return fail("reading the account", &e),
+    };
+    let ours = detail.ban_reason.as_deref() == Some(MEMBER_REMOVED_BAN_REASON);
+    if detail.user.banned && !(ours && may_unban) {
+        return if ours { bad_invite() } else { suspended() };
+    }
+    let tenant = match orchestrator
+        .accept_invite(user_id, token_hash, &detail.user.email, &detail.user.name)
+        .await
+    {
+        Ok(tenant) => tenant,
+        Err(InternalError::Refused { status: 403, code }) if code == "member_suspended" => return suspended(),
+        Err(InternalError::Refused { status: 410, .. }) => {
+            return error(StatusCode::GONE, ErrorCode::InviteExpired, INVITE_EXPIRED);
+        }
+        // No open invite matches the link, and the person isn't a member already.
+        Err(InternalError::Refused { .. }) => return bad_invite(),
+        Err(e) => return fail("accepting the invite", &e),
+    };
+    if detail.user.banned
+        && let Err(e) = s.identity.unban(&Pool::Members, user_id).await
+    {
+        return fail("lifting the removal's ban", &e);
+    }
+    let signed = match signed {
+        Some(signed) => signed,
+        None => match s.identity.sign_in(&Pool::Members, &detail.user.email, password).await {
+            Ok(signed) => signed,
+            // A ticket with another password than the code set: the ticket is spent.
+            Err(IdentityError::BadCredentials | IdentityError::Invalid { .. }) => return bad_invite(),
+            Err(IdentityError::Banned) => return suspended(),
+            Err(e) => return fail("signing in", &e),
         },
-        None => signed_in(s, session, s.config.studio_url.clone()),
+    };
+    let tenant = tenant.to_string();
+    match conclude(s, signed, Some(&tenant)).await {
+        Concluded::Answer(answer) if answer.status() == StatusCode::SERVICE_UNAVAILABLE => {
+            fail("reading the memberships", &"unavailable")
+        }
+        Concluded::Answer(answer) => answer,
+        Concluded::Refused => fail("choosing the tenant", &"no active membership"),
     }
 }
 
 /// A sign-up for a taken email. With verification on (platform), it's answered exactly like a
 /// new one, with a cookie that can't verify. With it off (self-hosted), a new sign-up has no
 /// code step to hide behind, so the user is told and Studio sends them to sign in.
-fn taken(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
+fn taken(s: &Arc<AppState>, email: &str) -> Response {
     if s.config.skip_email_verification {
         info!(email = %email_tag(email), "sign-up for a taken email");
         return error(StatusCode::CONFLICT, ErrorCode::EmailTaken, ACCOUNT_EXISTS);
     }
-    decoy(s, email, auth_request)
+    decoy(s, email)
 }
 
 /// Answer a sign-up for a taken email exactly like a new one, with a cookie that can't verify.
 /// The account's owner gets a password-reset email instead, so a real owner who forgot they
 /// signed up has a way back in.
-fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
+fn decoy(s: &Arc<AppState>, email: &str) -> Response {
     info!(email = %email_tag(email), "sign-up for a taken email (decoy)");
     spawn_reset_email(s, email.to_string());
     let decoy = LoginState {
-        auth_request,
+        // Only a limit key here ([`step_key`]): a decoy has no user.
+        auth_request: uuid::Uuid::new_v4().to_string(),
         user_id: None,
         session_id: None,
         session_token: None,
@@ -1326,27 +1452,13 @@ fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     };
     reply(
         StatusCode::OK,
-        next_step(&NextStep::Verify),
+        json!(SignInAnswer { next: SignInStep::Verify }),
         vec![login_cookie(s, &decoy)],
     )
 }
 
-/// Zitadel's session API sees a new user only once its projections catch up (a 404 until then).
-async fn new_user_session(s: &AppState, user_id: &str, password: &str) -> Result<Session, ZError> {
-    let mut attempt = 0;
-    loop {
-        match s.zitadel.create_session(user_id, password).await {
-            Err(e) if e.is(refusals::SESSION_USER_NOT_FOUND) && attempt < 10 => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            other => return other,
-        }
-    }
-}
-
-/// The rate-limit key for a pending code step: the user, or for a decoy its pending sign-in,
-/// so real and decoy cookies are limited alike.
+/// The rate-limit key for a pending code step: the user, or a decoy's own id, so real and decoy
+/// cookies are limited alike.
 fn step_key(state: &LoginState) -> String {
     state
         .user_id
@@ -1369,23 +1481,41 @@ struct CodeBody {
     path = "/auth/v1/verify-email",
     operation_id = "verifyEmail",
     tag = "login",
-    description = "Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.",
+    description = "Checks the emailed code. Reads the HttpOnly step cookie and clears it once the email is verified. An open sign-up joins its tenant now, as a person waiting for approval. The answer is a sign-in's: `studio` sets the HttpOnly session cookie, `pending` sets none. If sign-up closed since the account was made, the answer is `sign_up_closed` and the account is deleted. A retry after a failure past the code finishes with the same code.",
     request_body = CodeBody,
     responses(
-        (status = 200, description = "Email verified and signed in: `next` is `done`, the session cookie is set and the step cookie cleared", body = SignedIn),
+        (status = 200, description = "Email verified: `studio` (the session cookie is set) or `pending`; the step cookie is cleared", body = SignInAnswer),
         (status = 400, description = "The body is malformed (`invalid_request`) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
+        (status = 403, description = "Sign-up closed since the account was made: `sign_up_closed`; the account is deleted", body = ErrorEnvelope),
+        (status = 409, description = "The person has several tenants: `tenant_required`, with their ids in `error.tenants`; sign in with `?tenant=`", body = ErrorEnvelope),
+        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
-        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`; the step stays", body = ErrorEnvelope),
     ),
 )]
 async fn verify_email(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<CodeBody>) -> Response {
     let start = Instant::now();
     let answer = verify_email_inner(&s, &headers, b).await;
     pad(start, s.config.min_response).await;
+    answer
+}
+
+/// Adds the step cookie's clearing to an answer that doesn't already set it.
+fn step_ended(s: &AppState, mut answer: Response) -> Response {
+    let set = answer
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .any(|c| c.as_bytes().starts_with(format!("{LOGIN_COOKIE}=").as_bytes()));
+    if !set {
+        let clear = clear_cookie(LOGIN_COOKIE, s.config.secure_cookies);
+        answer
+            .headers_mut()
+            .append(header::SET_COOKIE, clear.parse().expect("cookie header"));
+    }
     answer
 }
 
@@ -1402,29 +1532,99 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
     let Some(state) = state else {
         return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
     };
+    let bad_code = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
     let (Some(user_id), Some(session_id), Some(session_token), false) = (
         state.user_id,
         state.session_id,
         state.session_token,
         state.decoy,
     ) else {
-        return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
+        return bad_code();
     };
-    match s.zitadel.verify_email(&user_id, b.code.trim()).await {
-        Ok(()) => {
-            finish(
-                s,
-                &state.auth_request,
-                Session {
-                    id: session_id,
-                    token: session_token,
-                },
-            )
-            .await
+    let user = match s
+        .identity
+        .verify_code(&Pool::Members, &user_id, CodeKind::Verify, b.code.trim(), None)
+        .await
+    {
+        Ok(user) => user,
+        // Refused, or spent by an earlier attempt whose later step failed: an email already
+        // verified carries on (the step cookie is the password's proof), so a retry finishes.
+        Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. } | IdentityError::NotFound(Missing::User)) => {
+            match s.identity.get_user(&Pool::Members, &user_id).await {
+                Ok(user) if user.email_verified => user,
+                Ok(_) | Err(IdentityError::NotFound(Missing::User)) => return bad_code(),
+                Err(e) => return identity_unavailable(&e),
+            }
         }
-        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE),
-        Err(e) => unavailable(&e),
+        Err(e) => return identity_unavailable(&e),
+    };
+    // On both arms, before anything changes: the step's session must still be live and the
+    // account's. A reset or an accepted invite ends every session of the account, and a step
+    // cookie from before it proves nothing any more, so it may not delete, join or sign in.
+    match s.identity.session_by_id(&Pool::Members, &session_id).await {
+        Ok(live) if live.user.id == user_id => {}
+        Ok(_) | Err(IdentityError::NotFound(Missing::Session | Missing::User)) => {
+            return step_ended(s, error(StatusCode::GONE, ErrorCode::SignInExpired, GONE));
+        }
+        Err(e) => return identity_unavailable(&e),
     }
+    match join_verified(s, &user.id).await {
+        Ok(true) => {}
+        Ok(false) => return step_ended(s, sign_up_closed_meanwhile(s, &user.id, &session_id).await),
+        Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
+    }
+    let signed = SignedIn { session_id, session_token, user };
+    match conclude(s, signed, None).await {
+        Concluded::Answer(answer) if answer.status().is_server_error() => answer,
+        Concluded::Answer(answer) => step_ended(s, answer),
+        // Joined a moment ago, and already out of the tenant.
+        Concluded::Refused => error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
+    }
+}
+
+/// #121: with verification on, an open sign-up's `pending` row waits for the verified email.
+/// `Ok(true)` once the person has a row to land in: an active or pending one already (the
+/// fresh-install admin, an approved member), or the join the gate takes now. `Ok(false)` when
+/// the gate refuses the join (sign-up closed meanwhile).
+async fn join_verified(s: &AppState, user_id: &str) -> Result<bool, ()> {
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("verify-email needs the orchestrator's internal client");
+        return Err(());
+    };
+    match orchestrator.member_tenants(user_id).await {
+        Ok(t) if !t.active.is_empty() || !t.pending.is_empty() => return Ok(true),
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = %e, "verify-email: reading the memberships failed");
+            return Err(());
+        }
+    }
+    orchestrator.signup_joined(user_id).await.map_err(|e| {
+        warn!(error = %e, "verify-email: joining the open sign-up failed");
+    })
+}
+
+/// Sign-up closed between the account and its code: the session ends and the account is
+/// deleted, as a refused sign-up's is, so a sign-up once it reopens starts afresh. An account an
+/// invite holds (or one the check can't clear) is kept: deleting it would break the invite.
+async fn sign_up_closed_meanwhile(s: &AppState, user_id: &str, session_id: &str) -> Response {
+    drop_session(s, session_id).await;
+    let invited = match &s.signup_gate {
+        Some(orchestrator) => orchestrator
+            .open_invite(user_id)
+            .await
+            .map(|i| i.expires_at.is_some())
+            .unwrap_or(true),
+        None => true,
+    };
+    if invited {
+        info!(user_id, "sign-up closed before the email was verified; the account stays for its invite");
+    } else if let Err(e) = s.identity.delete_user(&Pool::Members, user_id).await {
+        warn!(user_id, error = %e, "deleting the account of a closed sign-up failed");
+    } else {
+        info!(user_id, "sign-up closed before the email was verified; the account is deleted");
+    }
+    Refusal::Closed.response()
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -1435,7 +1635,7 @@ struct EmptyRequest {}
     path = "/auth/v1/resend-code",
     operation_id = "resendCode",
     tag = "login",
-    description = "Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent.",
+    description = "Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent; at most 5 codes go out per person an hour.",
     request_body = EmptyRequest,
     responses(
         (status = 200, description = "Done", body = EmptyResponse),
@@ -1462,10 +1662,8 @@ async fn resend_code_inner(s: &AppState, headers: &HeaderMap) -> Response {
     if !allowed(s, &checks) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    if let Some(user) = state.and_then(|st| st.user_id)
-        && let Err(e) = s.zitadel.resend_code(&user, &verify_template(s)).await
-    {
-        warn!(error = %e, "resending the verification code failed");
+    if let Some(user) = state.filter(|st| !st.decoy).and_then(|st| st.user_id) {
+        send_code(s, &user, CodeKind::Verify).await;
     }
     reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
@@ -1480,7 +1678,7 @@ struct EmailBody {
     path = "/auth/v1/password-reset",
     operation_id = "requestPasswordReset",
     tag = "login",
-    description = "Emails a password-reset link if the account exists. Always answers the same, whether or not it does.",
+    description = "Emails a password-reset code if the account exists, in the background. Always answers the same, in the same padded time, whether or not it does. At most 5 codes go out per person an hour.",
     request_body = EmailBody,
     responses(
         (status = 200, description = "Done", body = EmptyResponse),
@@ -1489,14 +1687,20 @@ struct EmailBody {
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "The instance isn't set up yet (its org id isn't written): `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<EmailBody>) -> Response {
+    let start = Instant::now();
+    let answer = password_reset_inner(&s, &headers, b);
+    pad(start, s.config.min_response).await;
+    answer
+}
+
+fn password_reset_inner(s: &Arc<AppState>, headers: &HeaderMap, b: EmailBody) -> Response {
     let email = normalize_email(&b.email);
-    let ip = client_ip(&headers);
+    let ip = client_ip(headers);
     if !allowed(
-        &s,
+        s,
         &[
             (format!("reset:ip:{ip}"), 20, HOUR),
             (format!("reset:email:{}", email_tag(&email)), 5, HOUR),
@@ -1504,35 +1708,19 @@ async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Ema
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    // Answered the same whether or not the account exists, but never "sent" when the org
-    // (and so the lookup) isn't there yet.
-    if org_id(&s).is_none() {
-        return no_org();
-    }
-    spawn_reset_email(&s, email);
+    // Answered the same whether or not the account exists.
+    spawn_reset_email(s, email);
     reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }
 
-/// Send a reset link to `email`'s account, if it has one, in the background, so the answer
-/// time doesn't reveal whether the user exists.
+/// Mails a reset code to `email`'s account, if it has one, in the background, so the answer time
+/// doesn't reveal whether it exists. The mail links to the reset page, which asks for the code:
+/// no id and no code is ever in the link.
 fn spawn_reset_email(s: &Arc<AppState>, email: String) {
     let s2 = s.clone();
     tokio::spawn(async move {
-        let template = format!(
-            "{}/password-reset?userId={{{{.UserID}}}}&code={{{{.Code}}}}",
-            s2.config.studio_url
-        );
-        // Every caller has the org already (it is cached once read).
-        let Ok(org) = s2.config.org_id.get() else {
-            warn!("password reset without the org id; nothing sent");
-            return;
-        };
-        match s2.zitadel.find_user_by_email(org, &email).await {
-            Ok(Some(user_id)) => {
-                if let Err(e) = s2.zitadel.send_password_reset(&user_id, &template).await {
-                    warn!(error = %e, "sending the password reset failed");
-                }
-            }
+        match s2.identity.find_user_by_email(&Pool::Members, &email).await {
+            Ok(Some(user)) => send_code(&s2, &user.id, CodeKind::Reset).await,
             Ok(None) => info!(email = %email_tag(&email), "password reset for an unknown email"),
             Err(e) => warn!(error = %e, "password reset lookup failed"),
         }
@@ -1540,9 +1728,9 @@ fn spawn_reset_email(s: &Arc<AppState>, email: String) {
 }
 
 #[derive(Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 struct ConfirmBody {
-    user_id: String,
+    email: String,
+    /// The six-digit code from the reset email.
     code: String,
     password: String,
 }
@@ -1552,16 +1740,16 @@ struct ConfirmBody {
     path = "/auth/v1/password-reset/confirm",
     operation_id = "confirmPasswordReset",
     tag = "login",
-    description = "Sets a new password with the code from the reset email.",
+    description = "Sets a new password with the code from the reset email, verifies the email and ends every session of the account. A wrong code and an unknown email answer alike. Sets no cookie: sign in with the new password.",
     request_body = ConfirmBody,
     responses(
         (status = 200, description = "Done", body = EmptyResponse),
-        (status = 400, description = "The body is malformed (`invalid_request`), the password is too weak (`weak_password`) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
+        (status = 400, description = "The body is malformed (`invalid_request`), the password is too weak (`weak_password`; the code is not used) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn password_reset_confirm(
@@ -1576,29 +1764,43 @@ async fn password_reset_confirm(
 }
 
 async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Response {
-    let user_id = b.user_id.trim();
-    let mut checks = vec![(format!("confirm:ip:{}", client_ip(headers)), 10, MINUTE)];
-    if is_user_id(user_id) {
-        checks.push((format!("confirm:user:{user_id}"), 10, HOUR));
-    }
-    if !allowed(s, &checks) {
+    let email = normalize_email(&b.email);
+    if !allowed(
+        s,
+        &[
+            (format!("confirm:ip:{}", client_ip(headers)), 10, MINUTE),
+            (format!("confirm:email:{}", email_tag(&email)), 10, HOUR),
+        ],
+    ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    // Checked before Zitadel sees the user id, so this answer can't tell ids apart.
+    let weak = || error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
+    let bad_code = || error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
+    // Checked before identity sees the email, so this answer can't tell accounts apart.
     if !usable_password(&b.password) {
-        return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
+        return weak();
     }
-    if !is_user_id(user_id) {
-        return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE);
+    let code = b.code.trim();
+    if !is_code(code) {
+        return bad_code();
     }
+    let user = match s.identity.find_user_by_email(&Pool::Members, &email).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return bad_code(),
+        Err(e) => return identity_unavailable(&e),
+    };
+    // Sets the password, verifies the email and ends every session of the user, in one step.
     match s
-        .zitadel
-        .set_password(user_id, b.code.trim(), &b.password)
+        .identity
+        .verify_code(&Pool::Members, &user.id, CodeKind::Reset, code, Some(&b.password))
         .await
     {
-        Ok(()) => reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new()),
-        Err(ZError::Rejected { .. }) => error(StatusCode::BAD_REQUEST, ErrorCode::InvalidCode, BAD_CODE),
-        Err(e) => unavailable(&e),
+        Ok(_) => reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new()),
+        Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => weak(),
+        Err(IdentityError::CodeInvalid | IdentityError::Invalid { .. } | IdentityError::NotFound(Missing::User)) => {
+            bad_code()
+        }
+        Err(e) => identity_unavailable(&e),
     }
 }
 
@@ -1607,7 +1809,7 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
     path = "/auth/v1/logout",
     operation_id = "logout",
     tag = "login",
-    description = "Ends the session and clears the HttpOnly session and step cookies.",
+    description = "Revokes the session and clears the HttpOnly session and step cookies. If the identity service can't be reached the cookies stay, so the client can try again.",
     request_body = EmptyRequest,
     responses(
         (status = 200, description = "Done", body = EmptyResponse),
@@ -1615,20 +1817,17 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service is unavailable: `unavailable`; the session is still live", body = ErrorEnvelope),
     ),
 )]
 async fn logout(State(s): S, headers: HeaderMap, ApiJson(_): ApiJson<EmptyRequest>) -> Response {
-    if let Some(kept) = read_cookie(&headers, SESSION_COOKIE)
+    if let Some(SessionState::Identity { session_id, .. }) = read_cookie(&headers, SESSION_COOKIE)
         .and_then(|raw| open_session(&s.config.cookie_key, raw, now_secs()))
-        && let Err(e) = s
-            .zitadel
-            .delete_session(&Session {
-                id: kept.session_id,
-                token: kept.session_token,
-            })
-            .await
     {
-        warn!(error = %e, "ending the Zitadel session failed");
+        match s.identity.revoke_session(&Pool::Members, &session_id).await {
+            Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
+            Err(e) => return identity_unavailable(&e),
+        }
     }
     let secure = s.config.secure_cookies;
     reply(

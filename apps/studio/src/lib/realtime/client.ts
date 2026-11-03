@@ -1,6 +1,6 @@
 import type {
   Key,
-  OidcEvents,
+  SessionEvents,
   PresenceState,
   ProjectHandlers,
   ProjectSubscription,
@@ -52,7 +52,7 @@ export interface WebSocketLike {
 export interface RealtimeClientOptions {
   /** `VITE_API_URL`. */
   apiUrl: string;
-  /** The current access token (the ticket request's bearer and the `auth` frame). */
+  /** The current member token (the ticket request's bearer and the `auth` frame). */
   token: string | undefined;
   fetch?: typeof fetch;
   WebSocket?: new (url: string, protocols?: string | string[]) => WebSocketLike;
@@ -390,7 +390,7 @@ export function createRealtimeClient(opts: RealtimeClientOptions): RealtimeClien
       };
     },
     setToken,
-    attachAuth(events: OidcEvents) {
+    attachAuth(events: SessionEvents) {
       const loaded = (user: { access_token: string }) => setToken(user.access_token);
       const out = () => close();
       events.addUserLoaded(loaded);

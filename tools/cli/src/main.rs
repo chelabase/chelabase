@@ -18,7 +18,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Local development setup: Zitadel, keys and env files
+    /// Local development setup: the stack's bootstrap and the dev member's token
     Dev {
         #[command(subcommand)]
         command: DevCommands,
@@ -263,13 +263,13 @@ enum GenCommands {
 #[derive(Subcommand, Debug)]
 enum DevCommands {
     /// The current stack's bootstrap, as `workbench up` runs it: `chelabase-init bootstrap
-    /// --demo` inside the stack, then the apps' env files (idempotent)
+    /// --demo` inside the stack (idempotent)
     Bootstrap {
-        /// Email of the Zitadel user to make the demo tenant's first admin (default: the dev user)
+        /// The dev member's email on a fresh stack (default: dev@chelabase.localhost)
         #[arg(long)]
         admin_email: Option<String>,
     },
-    /// Mint a short-lived JWT access token (stdout) via JWT profile
+    /// A short-lived member access token of the stack's dev member (stdout)
     Token,
 }
 

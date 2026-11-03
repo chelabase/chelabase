@@ -86,7 +86,7 @@ describe("InviteDialog: the last edges", () => {
       "POST /v1/invites": async (request) => {
         const body = await request.json();
         return body.email === "bad@x.test"
-          ? jsonResponse({ error: { code: "email_in_use_elsewhere", message: "x" } }, 409)
+          ? jsonResponse({ error: { code: "signup_pending", message: "x" } }, 409)
           : jsonResponse({ outcome: "invited", member: invited(body.email) }, 201);
       },
     });

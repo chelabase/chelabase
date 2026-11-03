@@ -147,21 +147,24 @@ fn target(role: Option<&str>) -> AuthTarget {
 fn answers_are_cached_per_member_and_target_for_one_cycle() {
     let mut cache = CycleCache::new();
     assert!(cache.is_empty());
-    cache.put("ana", &target(None), 7, allowed());
-    assert_eq!(cache.get("ana", &target(None), 7), Some(allowed()));
-    assert_eq!(cache.get("bob", &target(None), 7), None, "per member");
+    cache.put("ana", "s1", &target(None), 7, allowed());
+    assert_eq!(cache.get("ana", "s1", &target(None), 7), Some(allowed()));
+    assert_eq!(cache.get("bob", "s1", &target(None), 7), None, "per member");
+    // Review fix 1: another session of the member (one that may have logged out) asks itself.
+    assert_eq!(cache.get("ana", "s2", &target(None), 7), None, "per session");
     assert_eq!(
-        cache.get("ana", &target(Some("billing")), 7),
+        cache.get("ana", "s1", &target(Some("billing")), 7),
         None,
         "per target, role included"
     );
-    assert_eq!(cache.get("ana", &target(None), 8), None, "per cycle");
+    assert_eq!(cache.get("ana", "s1", &target(None), 8), None, "per cycle");
     cache.put(
         "ana",
+        "s1",
         &target(Some("billing")),
         8,
         AuthorizeOutcome::Forbidden,
     );
     assert_eq!(cache.len(), 1, "a new cycle drops the old answers");
-    assert_eq!(cache.get("ana", &target(None), 7), None);
+    assert_eq!(cache.get("ana", "s1", &target(None), 7), None);
 }

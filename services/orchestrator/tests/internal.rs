@@ -15,11 +15,11 @@ use chelabase_metadata::{
     PeekOutcome, ProjectStatus, RefreshNext, RefreshOutcome, RoleCopy, RoleLevel, RoleOrigin,
 };
 use chelabase_metadata::members::InviteDescription;
-use chelabase_metadata::personal_logins::LoginEndpoint;
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::MockZitadel;
+use chelabase_identity::Pool;
+use uuid::Uuid;
+use chelabase_identity::mock::FakeIdentity;
 use orchestrator::internal::app::AppJobPort;
 use chelabase_secrets::{Purpose, SecretKey, seal_credential};
 use chelabase_types::BranchId;
@@ -49,7 +49,6 @@ const REST_TOKEN: &str = "rest-token";
 const CONTROL_PLANE_URI: &str = "http://orchestrator:8083";
 const APP_AUTH_TOKEN: &str = "app-auth-token";
 const APP_SESSIONS_TOKEN: &str = "app-sessions-token";
-const SIGNING_KEY: &str = "actions-signing-key";
 const REFRESH_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 fn sha256_hex(s: &str) -> String {
@@ -58,8 +57,6 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
-/// Members hub T8: personal-login rows by (tenant, Zitadel user id).
-type LoginRows = HashMap<(TenantId, String), Vec<LoginEndpoint>>;
 
 /// An invite's stored expiry and whether the database clock calls it open.
 type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
@@ -86,24 +83,17 @@ struct FakeNeon {
     ddl_lock_timeout: Arc<Mutex<bool>>,
     /// App users (step 6b).
     app: Arc<Mutex<AppRows>>,
-    /// Zitadel org id -> (open sign-up, has members) for the sign-up gate.
-    signup: Arc<Mutex<HashMap<String, (bool, bool)>>>,
-    /// Selfhost-install m3: claim nonces and claims, by Zitadel org.
+    /// tenant -> (open sign-up, has members) for the sign-up gate.
+    signup: Arc<Mutex<HashMap<TenantId, (bool, bool)>>>,
+    /// Selfhost-install m3: claim nonces and claims, by tenant.
     setup: Arc<Mutex<FakeSetup>>,
-    /// Zitadel user id -> the user's open invite (a closed one is simply absent).
+    /// identity user id -> the user's open invite (a closed one is simply absent).
     invites: Arc<Mutex<HashMap<String, InviteDescription>>>,
-    /// Zitadel user id -> the stored expiry of the user's invite that isn't revoked or
+    /// identity user id -> the stored expiry of the user's invite that isn't revoked or
     /// accepted (expired or not), and whether the database clock calls it open.
     invite_expiries: Arc<Mutex<HashMap<String, InviteExpiry>>>,
-    /// RT1 T6: Zitadel org id -> the tenant bound to it.
-    tenants: Arc<Mutex<HashMap<String, TenantId>>>,
-    /// Members hub T8: each (tenant, Zitadel user id)'s personal-login rows, which
-    /// `revoke_logins_for_zitadel_user` answers (every row of the member, revoked ones
-    /// included; an unknown user has none); each revocation asked for, in order; and while
-    /// `fail_revocation` is set, the revocation write fails (a database error).
-    login_rows: Arc<Mutex<LoginRows>>,
-    revocations: Arc<Mutex<Vec<(TenantId, String)>>>,
-    fail_revocation: Arc<Mutex<bool>>,
+    /// #126: identity user id -> `(tenant, token hash)` of each accepted invite, newest first.
+    accepted: Arc<Mutex<HashMap<String, orchestrator::internal::AcceptedInvites>>>,
     /// Final round A: each offboarded mark cleared (D7), a clear that fails while
     /// `fail_clear` is set, and a tenant lookup that fails while `fail_tenant_lookup` is (T8-2).
     clears: Arc<Mutex<Vec<(TenantId, String)>>>,
@@ -115,24 +105,35 @@ struct FakeNeon {
 /// tested live, `members_live::setup_claim_*`).
 #[derive(Default)]
 struct FakeSetup {
-    /// nonce SHA-256 -> (org, still live)
-    nonces: HashMap<[u8; 32], (String, bool)>,
-    /// org -> the claim's Zitadel user
-    claims: HashMap<String, String>,
-    /// Zitadel users with a member row.
+    /// nonce SHA-256 -> (tenant, still live)
+    nonces: HashMap<[u8; 32], (TenantId, bool)>,
+    /// tenant -> the claim's identity user
+    claims: HashMap<TenantId, String>,
+    /// identity users with a member row.
     member_rows: std::collections::HashSet<String>,
     /// Every `replace_stale` `claim_setup` was called with.
     replace_asked: Vec<Option<String>>,
+    /// Every `admit_sign_up`: (tenant, user, email, name, admission).
+    admitted: Vec<(TenantId, String, String, String, chelabase_metadata::members::Admission)>,
+    /// identity user -> their tenants, as `member_tenants` answers.
+    tenants_of: HashMap<String, Vec<(TenantId, chelabase_metadata::members::MemberStatus)>>,
+    /// `admit_sign_up` fails with a database error.
+    admit_fails: bool,
+    /// identity user -> what `admit_sign_up` with `Closed` makes of their existing row (an
+    /// invited row with an open invite is activated; a suspended one stays).
+    rows: HashMap<String, chelabase_metadata::members::MemberStatus>,
 }
 
 impl FakeNeon {
+    /// The claim's user in the tenant labelled `org`.
     fn setup_claim_of(&self, org: &str) -> Option<String> {
-        self.setup.lock().unwrap().claims.get(org).cloned()
+        self.setup.lock().unwrap().claims.get(&tenant_of(org)).cloned()
     }
 
     fn live_nonces(&self, org: &str) -> Vec<[u8; 32]> {
+        let tenant = tenant_of(org);
         let st = self.setup.lock().unwrap();
-        st.nonces.iter().filter(|(_, (o, live))| o == org && *live).map(|(h, _)| *h).collect()
+        st.nonces.iter().filter(|(_, (t, live))| *t == tenant && *live).map(|(h, _)| *h).collect()
     }
 
     fn expire_nonces(&self) {
@@ -634,28 +635,16 @@ impl NeonMetadataPort for FakeNeon {
             .cloned())
     }
 
-    async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
-        self.check()?;
-        Ok(self
-            .app
-            .lock()
-            .unwrap()
-            .auths
-            .iter()
-            .find(|a| a.zitadel_org_id.as_deref() == Some(org_id))
-            .cloned())
-    }
-
     async fn signup_facts(
         &self,
-        zitadel_org_id: &str,
+        tenant: TenantId,
     ) -> Result<Option<orchestrator::internal::SignUpFacts>, MetadataError> {
         self.check()?;
         Ok(self
             .signup
             .lock()
             .unwrap()
-            .get(zitadel_org_id)
+            .get(&tenant)
             .map(|(open, has_members)| orchestrator::internal::SignUpFacts {
                 open: *open,
                 has_members: *has_members,
@@ -664,26 +653,26 @@ impl NeonMetadataPort for FakeNeon {
 
     async fn insert_setup_nonce(
         &self,
-        zitadel_org_id: &str,
+        tenant: TenantId,
         nonce_hash: [u8; 32],
         _ttl: std::time::Duration,
     ) -> Result<bool, MetadataError> {
         self.check()?;
-        if !self.signup.lock().unwrap().contains_key(zitadel_org_id) {
+        if !self.signup.lock().unwrap().contains_key(&tenant) {
             return Ok(false);
         }
-        self.setup.lock().unwrap().nonces.insert(nonce_hash, (zitadel_org_id.into(), true));
+        self.setup.lock().unwrap().nonces.insert(nonce_hash, (tenant, true));
         Ok(true)
     }
 
     async fn setup_claim(
         &self,
-        zitadel_org_id: &str,
+        tenant: TenantId,
     ) -> Result<Option<chelabase_metadata::members::SetupClaim>, MetadataError> {
         self.check()?;
         let st = self.setup.lock().unwrap();
-        Ok(st.claims.get(zitadel_org_id).map(|user| chelabase_metadata::members::SetupClaim {
-            zitadel_user_id: user.clone(),
+        Ok(st.claims.get(&tenant).map(|user| chelabase_metadata::members::SetupClaim {
+            identity_user_id: user.clone(),
             created_at: chrono::Utc::now(),
             has_member_row: st.member_rows.contains(user),
         }))
@@ -691,82 +680,100 @@ impl NeonMetadataPort for FakeNeon {
 
     async fn claim_setup(
         &self,
-        zitadel_org_id: &str,
+        tenant: TenantId,
         nonce_hash: [u8; 32],
-        zitadel_user_id: &str,
+        identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError> {
         use chelabase_metadata::members::SetupClaimOutcome::{AlreadyClaimed, Bound, Refused};
         self.check()?;
-        if !self.signup.lock().unwrap().contains_key(zitadel_org_id) {
+        if !self.signup.lock().unwrap().contains_key(&tenant) {
             return Ok(None);
         }
         let mut st = self.setup.lock().unwrap();
         st.replace_asked.push(replace_stale.map(str::to_string));
         match st.nonces.get(&nonce_hash) {
-            Some((org, true)) if org == zitadel_org_id => {}
+            Some((t, true)) if *t == tenant => {}
             _ => return Ok(Some(Refused)),
         }
         st.nonces.remove(&nonce_hash);
-        let outcome = match st.claims.get(zitadel_org_id).cloned() {
+        let outcome = match st.claims.get(&tenant).cloned() {
             None => Bound,
-            Some(u) if u == zitadel_user_id => Bound,
+            Some(u) if u == identity_user_id => Bound,
             Some(u) if replace_stale == Some(u.as_str()) && !st.member_rows.contains(&u) => Bound,
             Some(_) => AlreadyClaimed,
         };
         if outcome == Bound {
-            st.claims.insert(zitadel_org_id.into(), zitadel_user_id.into());
+            st.claims.insert(tenant, identity_user_id.into());
         }
         Ok(Some(outcome))
     }
 
-    async fn open_invite_for_user(&self, zitadel_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
+    async fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, chelabase_metadata::members::MemberStatus)>, MetadataError> {
         self.check()?;
-        Ok(self.invites.lock().unwrap().get(zitadel_user_id).cloned())
+        Ok(self.setup.lock().unwrap().tenants_of.get(identity_user_id).cloned().unwrap_or_default())
+    }
+
+    async fn admit_sign_up(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: chelabase_metadata::members::Admission,
+    ) -> Result<Option<chelabase_metadata::members::MemberStatus>, MetadataError> {
+        use chelabase_metadata::members::{Admission, MemberStatus};
+        self.check()?;
+        let mut st = self.setup.lock().unwrap();
+        if st.admit_fails {
+            return Err(MetadataError::Database(sqlx::Error::PoolTimedOut));
+        }
+        st.admitted.push((tenant, identity_user_id.into(), email.into(), name.into(), admission));
+        // The real rule: the claim's user becomes the active admin, whatever `admission` says.
+        if st.claims.get(&tenant).is_some_and(|u| u == identity_user_id) {
+            return Ok(Some(MemberStatus::Active));
+        }
+        Ok(match admission {
+            Admission::Active => Some(MemberStatus::Active),
+            Admission::Pending => Some(MemberStatus::Pending),
+            Admission::Closed => st.rows.get(identity_user_id).copied(),
+        })
+    }
+
+    async fn open_invite_for_user(&self, identity_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
+        self.check()?;
+        Ok(self.invites.lock().unwrap().get(identity_user_id).cloned())
     }
 
     async fn invite_expiry_for_user(
         &self,
-        zitadel_user_id: &str,
+        identity_user_id: &str,
     ) -> Result<Option<InviteExpiry>, MetadataError> {
         self.check()?;
-        Ok(self.invite_expiries.lock().unwrap().get(zitadel_user_id).copied())
+        Ok(self.invite_expiries.lock().unwrap().get(identity_user_id).copied())
     }
 
-    async fn tenant_by_org(&self, zitadel_org_id: &str) -> Result<Option<TenantId>, MetadataError> {
+    async fn accepted_invites_for_user(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, Option<Vec<u8>>)>, MetadataError> {
         self.check()?;
         if *self.fail_tenant_lookup.lock().unwrap() {
-            return Err(MetadataError::Config("the tenant lookup failed".into()));
+            return Err(MetadataError::Config("the accepted invites lookup failed".into()));
         }
-        Ok(self.tenants.lock().unwrap().get(zitadel_org_id).copied())
+        Ok(self.accepted.lock().unwrap().get(identity_user_id).cloned().unwrap_or_default())
     }
 
-    async fn clear_offboarded(&self, tenant: TenantId, zitadel_user_id: &str) -> Result<bool, MetadataError> {
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
         self.check()?;
         if *self.fail_clear.lock().unwrap() {
             return Err(MetadataError::Config("the clear failed".into()));
         }
-        self.clears.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
+        self.clears.lock().unwrap().push((tenant, identity_user_id.to_string()));
         Ok(true)
-    }
-
-    async fn revoke_logins_for_zitadel_user(
-        &self,
-        tenant: TenantId,
-        zitadel_user_id: &str,
-    ) -> Result<Vec<LoginEndpoint>, MetadataError> {
-        self.check()?;
-        if *self.fail_revocation.lock().unwrap() {
-            return Err(MetadataError::Config("the revocation write failed".into()));
-        }
-        self.revocations.lock().unwrap().push((tenant, zitadel_user_id.to_string()));
-        Ok(self
-            .login_rows
-            .lock()
-            .unwrap()
-            .get(&(tenant, zitadel_user_id.to_string()))
-            .cloned()
-            .unwrap_or_default())
     }
 
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
@@ -811,7 +818,7 @@ impl NeonMetadataPort for FakeNeon {
                 id: n.id,
                 project_id: n.project_id,
                 user_id: n.user_id,
-                zitadel_session_id: n.zitadel_session_id.into(),
+                identity_session_id: n.identity_session_id.into(),
                 created_at: now,
                 last_used_at: now,
                 expires_at: n.expires_at,
@@ -1171,24 +1178,6 @@ impl CachePort for FakeCache {
 }
 
 impl FakeCache {
-    /// Members hub T8 (S19): waits (up to 5 s, on the publish notifications, never a sleep)
-    /// until every (endpoint, role) of `want` was published; whether they all were.
-    async fn wait_for(&self, want: &[(String, String)]) -> bool {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let notified = self.published.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let sent = self.sent.lock().unwrap().clone();
-            if want.iter().all(|w| sent.contains(w)) {
-                return true;
-            }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                let sent = self.sent.lock().unwrap().clone();
-                return want.iter().all(|w| sent.contains(w));
-            }
-        }
-    }
 }
 
 async fn spawn_internal_with(
@@ -1224,8 +1213,7 @@ async fn spawn_internal_full(
 /// The app-user parts of the state a test chooses.
 struct AppSetup {
     key: SecretKey,
-    signing_key: Option<chelabase_types::file_value::FileValue>,
-    zitadel: Option<String>,
+    identity: Option<chelabase_identity::Identity>,
     jobs: FakeJobs,
     resync: FakeResync,
     mode: Mode,
@@ -1238,14 +1226,15 @@ struct AppSetup {
     attach_events: FakeAttachEvents,
     /// Selfhost-install m3: `InternalState.setup_code`.
     setup_code: Option<orchestrator::internal::SetupCode>,
+    /// #126: `InternalState.tenant`, the instance's tenant.
+    tenant: TenantId,
 }
 
 impl Default for AppSetup {
     fn default() -> Self {
         Self {
             key: SecretKey::generate(),
-            signing_key: Some(SIGNING_KEY.into()),
-            zitadel: None,
+            identity: None,
             jobs: FakeJobs::default(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
@@ -1254,8 +1243,16 @@ impl Default for AppSetup {
             realtime_logins: Default::default(),
             attach_events: FakeAttachEvents::default(),
             setup_code: None,
+            tenant: tenant_of(SETUP_ORG),
         }
     }
+}
+
+/// The tenant a test label names (a fixed id per label).
+fn tenant_of(label: &str) -> TenantId {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(label.as_bytes());
+    TenantId(Uuid::from_bytes(digest[..16].try_into().unwrap()))
 }
 
 /// How the fake's publish of a tenant-attached event ends.
@@ -1422,10 +1419,8 @@ async fn spawn_with_app(
         app_auth_token: APP_AUTH_TOKEN.into(),
         app_sessions_token: APP_SESSIONS_TOKEN.into(),
         app_refresh_ttl: REFRESH_TTL,
-        actions_signing_key: app.signing_key,
-        zitadel: app
-            .zitadel
-            .map(|base| Zitadel::new(&base, chelabase_zitadel::mock::ADMIN_TOKEN)),
+        tenant: app.tenant,
+        identity: app.identity,
         app_jobs: Arc::new(app.jobs),
         policy: chelabase_types::mode_policy::ModePolicy::new(app.mode),
         setup_code: app.setup_code,
@@ -3955,10 +3950,9 @@ async fn spec_route_sets_console_url() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// App users (step 6b): branch info, sessions, sync and the Zitadel Actions webhook.
+// App users (step 6b): branch info, sessions and sync.
 // ---------------------------------------------------------------------------------------------
 
-const ORG: &str = "o1";
 const SYNC_PW: &str = "sync-password";
 const MAIN_PG: &str = "127.0.0.1:55432";
 const CHILD_PG: &str = "127.0.0.1:55435";
@@ -4072,7 +4066,6 @@ fn app_world() -> AppWorld {
             project_id: project,
             status: AppUsersStatus::Enabled,
             error: None,
-            zitadel_org_id: Some(ORG.into()),
             database_id: auth_db,
             pg_database: "shop".into(),
             schema_name: "public".into(),
@@ -4122,13 +4115,10 @@ struct AppApp {
     app: Internal,
     neon: FakeNeon,
     jobs: FakeJobs,
-    /// RT1 T6: the realtime events the routes published.
-    rt_events: FakeRtEvents,
 }
 
-async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<&MockZitadel>) -> AppApp {
+async fn spawn_app(world: &AppWorld, identity: Option<chelabase_identity::Identity>) -> AppApp {
     let jobs = FakeJobs::default();
-    let rt_events = FakeRtEvents::default();
     let app = spawn_with_app(
         world.neon.clone(),
         world.locator.clone(),
@@ -4138,16 +4128,16 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
         "http://127.0.0.1:9",
         AppSetup {
             key: world.key.clone(),
-            signing_key: signing_key.map(Into::into),
-            zitadel: zitadel.map(|z| z.base.clone()),
+            identity,
             jobs: jobs.clone(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
-            rt_events: rt_events.clone(),
+            rt_events: FakeRtEvents::default(),
             control: FakeLocator::default(),
             realtime_logins: Default::default(),
             attach_events: FakeAttachEvents::default(),
             setup_code: None,
+            tenant: tenant_of(SETUP_ORG),
         },
     )
     .await;
@@ -4155,7 +4145,6 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
         app,
         neon: world.neon.clone(),
         jobs,
-        rt_events,
     }
 }
 
@@ -4170,47 +4159,10 @@ impl Internal {
         (status, resp.json().await.unwrap_or(Value::Null))
     }
 
-    /// The webhook: `signature` is the `zitadel-signature` header, if any.
-    async fn event(&self, body: &str, signature: Option<String>) -> u16 {
-        let mut req = self
-            .http
-            .post(format!("{}/internal/zitadel/events", self.base))
-            .header("content-type", "application/json")
-            .body(body.to_string());
-        if let Some(sig) = signature {
-            req = req.header("zitadel-signature", sig);
-        }
-        req.send().await.unwrap().status().as_u16()
-    }
 }
 
 fn error_code(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("")
-}
-
-/// `t=…,v1=…` for `body`, signed with `key` at `t`.
-fn sign(body: &str, key: &str, t: i64) -> String {
-    use hmac::{Hmac, KeyInit, Mac};
-    let mut mac = <Hmac<sha2::Sha256> as KeyInit>::new_from_slice(key.as_bytes()).unwrap();
-    mac.update(format!("{t}.{body}").as_bytes());
-    format!("t={t},v1={}", hex::encode(mac.finalize().into_bytes()))
-}
-
-fn signed(body: &str) -> Option<String> {
-    Some(sign(body, SIGNING_KEY, chrono::Utc::now().timestamp()))
-}
-
-fn user_event(event_type: &str, org: &str, user: &str, created_at: chrono::DateTime<chrono::Utc>) -> String {
-    json!({
-        "aggregateID": user,
-        "aggregateType": "user",
-        "resourceOwner": org,
-        "instanceID": "i1",
-        "event_type": event_type,
-        "created_at": created_at.to_rfc3339(),
-        "userID": user,
-    })
-    .to_string()
 }
 
 impl AppApp {
@@ -4220,7 +4172,7 @@ impl AppApp {
             .post_json(
                 "/internal/app/sessions",
                 Some(APP_AUTH_TOKEN),
-                json!({ "project_id": project, "user_id": user, "zitadel_session_id": zsid }),
+                json!({ "project_id": project, "user_id": user, "identity_session_id": zsid }),
             )
             .await;
         assert_eq!(status, 201, "{body}");
@@ -4281,21 +4233,63 @@ fn sha256(s: &str) -> [u8; 32] {
     Sha256::digest(s.as_bytes()).into()
 }
 
-/// A Zitadel mock holding session `id` of some user.
-async fn zitadel_with_sessions(ids: &[&str]) -> MockZitadel {
-    let z = MockZitadel::start().await;
-    {
-        let mut inner = z.inner.lock().unwrap();
-        for id in ids {
-            inner
-                .sessions
-                .insert((*id).into(), ("u1".into(), format!("tok-{id}")));
-        }
-    }
-    z
+/// #123: an identity fake whose app pool for `project` holds one session of one user per name;
+/// the app sessions the tests make name these as their `identity_session_id`.
+struct IdSessions {
+    fake: FakeIdentity,
+    pool: Pool,
+    ids: std::collections::HashMap<String, String>,
 }
 
-/// Waits up to 2 s for `check` (background work such as the webhook's Zitadel deletes).
+async fn identity_with_sessions(project: ProjectId, names: &[&str]) -> IdSessions {
+    let fake = FakeIdentity::start().await;
+    let pool = Pool::App(project.as_uuid());
+    let user = fake.with_user(&pool, "u1@example.com", "password-u1");
+    let ids = names
+        .iter()
+        .map(|n| ((*n).to_string(), fake.with_session(&pool, &user).0))
+        .collect();
+    IdSessions { fake, pool, ids }
+}
+
+impl IdSessions {
+    fn id(&self, name: &str) -> &str {
+        &self.ids[name]
+    }
+    fn client(&self) -> Option<chelabase_identity::Identity> {
+        Some(self.fake.client())
+    }
+    fn count(&self) -> usize {
+        self.fake.session_count(&self.pool)
+    }
+    /// The identity session revokes asked for, by name.
+    fn revoked(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .fake
+            .calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix(&format!("DELETE /internal/v1/pools/{}/sessions/", self.pool)))
+            .filter_map(|id| self.ids.iter().find(|(_, v)| v.as_str() == id).map(|(k, _)| k.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// An identity client whose service accepts connections and never answers.
+async fn hung_identity() -> chelabase_identity::Identity {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    chelabase_identity::Identity::new(&format!("http://{addr}"), "t")
+}
+
+/// Waits up to 2 s for `check` (background work).
 async fn eventually(check: impl Fn() -> bool) -> bool {
     for _ in 0..100 {
         if check() {
@@ -4315,7 +4309,7 @@ fn auth_routes(w: &AppWorld) -> Vec<(&'static str, String, Value)> {
         (
             "POST",
             "/internal/app/sessions".into(),
-            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs" }),
+            json!({ "project_id": w.project, "user_id": user, "identity_session_id": "zs" }),
         ),
         (
             "POST",
@@ -4367,7 +4361,7 @@ async fn call(app: &Internal, method: &str, path: &str, token: Option<&str>, bod
 #[tokio::test]
 async fn app_routes_need_the_app_bearer() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let sid = uuid::Uuid::new_v4();
     let mut routes = auth_routes(&w);
     routes.push(("GET", format!("/internal/app/sessions/{sid}"), Value::Null));
@@ -4388,7 +4382,7 @@ async fn app_routes_need_the_app_bearer() {
 #[tokio::test]
 async fn branch_info_for_auth_branch_targets_itself() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (status, body) = a
         .app
         .get(&format!("/internal/app/branches/{}", w.main), Some(APP_AUTH_TOKEN))
@@ -4399,7 +4393,6 @@ async fn branch_info_for_auth_branch_targets_itself() {
         json!({
             "project_id": w.project,
             "status": "enabled",
-            "zitadel_org_id": ORG,
             "email_verification": false,
             "on_delete": "delete",
             "auth_database_id": w.auth_db,
@@ -4432,7 +4425,7 @@ async fn branch_info_for_auth_branch_targets_itself() {
 #[tokio::test]
 async fn branch_info_for_other_database_targets_auth_main() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     // Another database of the project, and a backup branch of the auth database (R5).
     for branch in [w.other, w.backup] {
         let (status, body) = a
@@ -4464,7 +4457,7 @@ async fn branch_info_for_other_database_targets_auth_main() {
 #[tokio::test]
 async fn app_sync_is_null_rather_than_nameless_when_the_compute_has_no_address() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     w.locator.pg.lock().unwrap().remove("ep-main");
     let (status, body) = a
         .app
@@ -4500,7 +4493,7 @@ async fn connection_carries_the_name_of_the_endpoint_it_points_at() {
 #[tokio::test]
 async fn branch_info_without_app_users_404() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     for branch in [w.bare, w.gone, BranchId::new()] {
         let (status, body) = a
             .app
@@ -4523,7 +4516,7 @@ async fn branch_info_without_app_users_404() {
 #[tokio::test]
 async fn branch_info_sync_null_without_compute() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     // `child` runs but has no sync row yet.
     let (status, body) = a
         .app
@@ -4554,7 +4547,7 @@ async fn branch_info_sync_null_without_compute() {
 #[tokio::test]
 async fn create_session_returns_a_token_of_the_right_shape() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
     let before = chrono::Utc::now();
     let (status, body) = a
@@ -4562,7 +4555,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
         .post_json(
             "/internal/app/sessions",
             Some(APP_AUTH_TOKEN),
-            json!({ "project_id": w.project, "user_id": user, "zitadel_session_id": "zs1" }),
+            json!({ "project_id": w.project, "user_id": user, "identity_session_id": "zs1" }),
         )
         .await;
     assert_eq!(status, 201, "{body}");
@@ -4584,7 +4577,7 @@ async fn create_session_returns_a_token_of_the_right_shape() {
     assert_eq!(stored.hash, sha256(token), "the hash covers the whole token");
     assert_eq!(stored.s.user_id, user);
     assert_eq!(stored.s.project_id, w.project);
-    assert_eq!(stored.s.zitadel_session_id, "zs1");
+    assert_eq!(stored.s.identity_session_id, "zs1");
     // Two sessions never share a secret.
     let (_, other) = a.create_session(w.project, user, "zs2").await;
     assert_ne!(other.split_once('.').unwrap().1, secret);
@@ -4593,13 +4586,15 @@ async fn create_session_returns_a_token_of_the_right_shape() {
 #[tokio::test]
 async fn refresh_rotates() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
     let (sid, t0) = a.create_session(w.project, user, "zs1").await;
     let (status, body) = a.refresh(w.project, &t0).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["session_id"], json!(sid));
     assert_eq!(body["user_id"], json!(user));
+    // #123: auth checks the identity session behind it.
+    assert_eq!(body["identity_session_id"], "zs1");
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     assert_ne!(t1, t0);
     assert!(t1.starts_with(&format!("{sid}.")), "{t1}");
@@ -4615,7 +4610,7 @@ async fn refresh_rotates() {
 #[tokio::test]
 async fn refresh_grace_returns_the_same_token() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
@@ -4633,11 +4628,11 @@ async fn refresh_grace_returns_the_same_token() {
 
 // Review Focus 1.
 #[tokio::test]
-async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
+async fn refresh_reuse_revokes_and_ends_the_identity_session() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
@@ -4645,8 +4640,8 @@ async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
     assert_eq!(status, 401, "{body}");
     assert_eq!(error_code(&body), "refresh_token_reused");
     assert!(a.revoked(sid));
-    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
-    assert!(z.calls().contains(&"DELETE /v2/sessions/zs1".to_string()), "{:?}", z.calls());
+    assert!(eventually(|| z.count() == 0).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["zs1"]);
     // The current token is dead too.
     let (status, body) = a.refresh(w.project, &t1).await;
     assert_eq!(status, 401);
@@ -4656,7 +4651,7 @@ async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
 #[tokio::test]
 async fn refresh_other_project_is_invalid() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     let (status, body) = a.refresh(w.bare_project, &t0).await;
     assert_eq!(status, 401, "{body}");
@@ -4670,7 +4665,7 @@ async fn refresh_other_project_is_invalid() {
 #[tokio::test]
 async fn malformed_refresh_token_invalid() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     let unknown = format!("{}.{}", uuid::Uuid::new_v4(), t0.split_once('.').unwrap().1);
     for bad in [
@@ -4693,14 +4688,14 @@ async fn malformed_refresh_token_invalid() {
 #[tokio::test]
 async fn peek_answers_the_user_and_rotates_nothing() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
     let (sid, t0) = a.create_session(w.project, user, "zs1").await;
     let (status, body) = a.peek(w.project, &t0).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({ "session_id": sid, "user_id": user, "grace": false }),
+        json!({ "session_id": sid, "user_id": user, "identity_session_id": "zs1", "grace": false }),
         "no token in the answer"
     );
     let before = a.session(sid);
@@ -4713,7 +4708,10 @@ async fn peek_answers_the_user_and_rotates_nothing() {
     for (token, grace) in [(&t0, true), (&t1, false)] {
         let (status, body) = a.peek(w.project, token).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body, json!({ "session_id": sid, "user_id": user, "grace": grace }));
+        assert_eq!(
+            body,
+            json!({ "session_id": sid, "user_id": user, "identity_session_id": "zs1", "grace": grace })
+        );
     }
     let after = a.session(sid);
     assert_eq!((after.hash, after.prev, after.grace_until), (rotated.hash, rotated.prev, rotated.grace_until));
@@ -4721,13 +4719,13 @@ async fn peek_answers_the_user_and_rotates_nothing() {
 }
 
 // #59: an unknown, revoked or two-rotations-old token is `refresh_token_invalid`, the previous
-// token after the grace `refresh_token_reused`; peek revokes nothing and ends no Zitadel session.
+// token after the grace `refresh_token_reused`; peek revokes nothing and ends no identity session.
 #[tokio::test]
 async fn peek_gives_refresh_verdicts_without_revoking() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     let (_, body) = a.refresh(w.project, &t1).await;
@@ -4752,11 +4750,7 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
     let after = a.session(sid);
     assert_eq!((after.s, after.hash), (before.s, before.hash), "peek wrote nothing");
     assert!(!a.revoked(sid), "only refresh revokes on reuse");
-    assert!(
-        !z.calls().iter().any(|c| c.starts_with("DELETE /v2/sessions/")),
-        "peek ended no Zitadel session: {:?}",
-        z.calls()
-    );
+    assert!(z.revoked().is_empty(), "peek ended no identity session: {:?}", z.fake.calls());
     // The current token still works; the reuse still revokes when it reaches refresh.
     let (status, _) = a.peek(w.project, &t2).await;
     assert_eq!(status, 200);
@@ -4769,7 +4763,7 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
 #[tokio::test]
 async fn peek_other_project_is_invalid() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     let (status, body) = a.peek(w.bare_project, &t0).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_invalid"), "{body}");
@@ -4782,7 +4776,7 @@ async fn peek_other_project_is_invalid() {
 #[tokio::test]
 async fn peek_leaves_an_expired_session_to_refresh() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     a.edit_session(sid, |f| f.s.expires_at = chrono::Utc::now() - chrono::Duration::seconds(1));
     let (status, body) = a.peek(w.project, &t0).await;
@@ -4797,7 +4791,7 @@ async fn peek_leaves_an_expired_session_to_refresh() {
 #[tokio::test]
 async fn peek_metadata_fault_is_not_a_verdict() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     *w.neon.fail.lock().unwrap() = true;
     let (status, body) = a.peek(w.project, &t0).await;
@@ -4809,7 +4803,7 @@ async fn peek_metadata_fault_is_not_a_verdict() {
 #[tokio::test]
 async fn session_liveness() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
     let (sid, _) = a.create_session(w.project, user, "zs1").await;
     let path = format!("/internal/app/sessions/{sid}");
@@ -4838,13 +4832,13 @@ async fn session_liveness() {
 #[tokio::test]
 async fn revoke_user_sessions_keeps_one() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let z = identity_with_sessions(w.project, &["z1", "z2", "z3", "z4", "z5"]).await;
+    let a = spawn_app(&w, z.client()).await;
     let (u, v) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    let (s1, _) = a.create_session(w.project, u, "z1").await;
-    let (s2, _) = a.create_session(w.project, u, "z2").await;
-    let (s3, _) = a.create_session(w.project, u, "z3").await;
-    let (s4, _) = a.create_session(w.project, v, "z4").await;
+    let (s1, _) = a.create_session(w.project, u, z.id("z1")).await;
+    let (s2, _) = a.create_session(w.project, u, z.id("z2")).await;
+    let (s3, _) = a.create_session(w.project, u, z.id("z3")).await;
+    let (s4, _) = a.create_session(w.project, v, z.id("z4")).await;
     let (status, body) = a
         .app
         .post_json(
@@ -4856,11 +4850,8 @@ async fn revoke_user_sessions_keeps_one() {
     assert_eq!(status, 204, "{body}");
     assert!(a.revoked(s1) && a.revoked(s3));
     assert!(!a.revoked(s2) && !a.revoked(s4));
-    assert!(eventually(|| z.calls().iter().filter(|c| c.starts_with("DELETE")).count() == 2).await, "{:?}", z.calls());
-    let calls = z.calls();
-    assert!(calls.contains(&"DELETE /v2/sessions/z1".to_string()), "{calls:?}");
-    assert!(calls.contains(&"DELETE /v2/sessions/z3".to_string()), "{calls:?}");
-    assert!(!calls.iter().any(|c| c.ends_with("/z2") || c.ends_with("/z4")), "{calls:?}");
+    assert!(eventually(|| z.revoked().len() == 2).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["z1", "z3"]);
     // Another project's revoke leaves the user's sessions alone (I5).
     let (status, _) = a
         .app
@@ -4874,7 +4865,7 @@ async fn revoke_user_sessions_keeps_one() {
     assert!(!a.revoked(s2));
     // `created_before` limits it to older sessions.
     let cut = a.session(s2).s.created_at;
-    let (s5, _) = a.create_session(w.project, u, "z5").await;
+    let (s5, _) = a.create_session(w.project, u, z.id("z5")).await;
     a.edit_session(s5, |f| f.s.created_at = cut + chrono::Duration::seconds(5));
     let (status, _) = a
         .app
@@ -4888,15 +4879,13 @@ async fn revoke_user_sessions_keeps_one() {
     assert!(a.revoked(s2) && !a.revoked(s5));
 }
 
-/// T7: every revoke path answers without waiting for Zitadel to end the sessions (a slow
-/// or hung Zitadel would otherwise hold sign-out everywhere and change-password for up to
-/// 10 s per session).
+/// T7: every revoke path answers without waiting for identity to end the sessions (a slow
+/// or hung identity service would otherwise hold sign-out everywhere and change-password for
+/// up to 10 s per session).
 #[tokio::test]
-async fn revokes_answer_before_zitadel_ends_the_sessions() {
+async fn revokes_answer_before_identity_ends_the_sessions() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4", "z5"]).await;
-    z.set_session_delete_delay(std::time::Duration::from_millis(600));
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let a = spawn_app(&w, Some(hung_identity().await)).await;
     let u = uuid::Uuid::new_v4();
     let (s1, _) = a.create_session(w.project, u, "z1").await;
     let (s2, _) = a.create_session(w.project, u, "z2").await;
@@ -4946,25 +4935,16 @@ async fn revokes_answer_before_zitadel_ends_the_sessions() {
     let (status, body) = a.refresh(w.project, &t0).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"));
     assert!(start.elapsed() < fast, "refresh reuse waited {:?}", start.elapsed());
-
-    // They still end, in the background.
-    let mut done = false;
-    for _ in 0..200 {
-        if z.session_count() == 0 {
-            done = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(done, "{:?}", z.calls());
+    // That they still end, in the background, is `revoke_user_sessions_keeps_one` and the
+    // other revoke tests.
 }
 
 #[tokio::test]
 async fn revoke_by_token_ignores_a_wrong_token_or_project() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let revoke = |project: ProjectId, token: String| {
         let a = &a;
         async move {
@@ -4982,10 +4962,10 @@ async fn revoke_by_token_ignores_a_wrong_token_or_project() {
     assert_eq!(revoke(w.project, "garbage".into()).await, 204);
     assert_eq!(revoke(w.bare_project, t0.clone()).await, 204);
     assert!(!a.revoked(sid));
-    assert_eq!(z.session_count(), 1);
+    assert_eq!(z.count(), 1);
     assert_eq!(revoke(w.project, t0.clone()).await, 204);
     assert!(a.revoked(sid));
-    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
+    assert!(eventually(|| z.count() == 0).await, "{:?}", z.fake.calls());
     // Idempotent.
     assert_eq!(revoke(w.project, t0).await, 204);
 }
@@ -4994,9 +4974,9 @@ async fn revoke_by_token_ignores_a_wrong_token_or_project() {
 #[tokio::test]
 async fn revoke_other_project_session_is_a_no_op() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let path = format!("/internal/app/sessions/{sid}/revoke");
     let (status, _) = a
         .app
@@ -5004,18 +4984,14 @@ async fn revoke_other_project_session_is_a_no_op() {
         .await;
     assert_eq!(status, 204);
     assert!(!a.revoked(sid));
-    assert!(!z.calls().iter().any(|c| c.starts_with("DELETE")), "{:?}", z.calls());
+    assert!(z.revoked().is_empty(), "{:?}", z.fake.calls());
     let (status, _) = a
         .app
         .post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project }))
         .await;
     assert_eq!(status, 204);
     assert!(a.revoked(sid));
-    assert!(
-        eventually(|| z.calls().contains(&"DELETE /v2/sessions/zs1".to_string())).await,
-        "{:?}",
-        z.calls()
-    );
+    assert!(eventually(|| z.revoked() == ["zs1"]).await, "{:?}", z.fake.calls());
     // Idempotent, and an unknown session is fine too.
     let (status, _) = a
         .app
@@ -5033,11 +5009,38 @@ async fn revoke_other_project_session_is_a_no_op() {
     assert_eq!(status, 204);
 }
 
+// Review nit 8: app sign-out ends the identity session too, and each step is attempted on
+// every call: when ending the identity session failed, signing out again ends it (the app
+// session is already revoked by then), and a session of another project is never touched.
+#[tokio::test]
+async fn a_repeated_sign_out_ends_an_identity_session_the_first_one_missed() {
+    let w = app_world();
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, z.client()).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
+    let path = format!("/internal/app/sessions/{sid}/revoke");
+    z.fake.fail(&format!("DELETE /internal/v1/pools/{}/sessions/", z.pool), 503, "internal", 1);
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
+    assert_eq!(status, 204);
+    assert!(a.revoked(sid));
+    assert!(eventually(|| z.revoked() == ["zs1"]).await, "{:?}", z.fake.calls());
+    assert_eq!(z.count(), 1, "the first try failed");
+    // Another project's sign-out of this session id does nothing.
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.bare_project })).await;
+    assert_eq!(status, 204);
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
+    assert_eq!(status, 204);
+    assert!(eventually(|| z.count() == 0).await, "the retry didn't end it: {:?}", z.fake.calls());
+    // Idempotent once both are gone.
+    let (status, _) = a.app.post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project })).await;
+    assert_eq!(status, 204);
+}
+
 // P31.
 #[tokio::test]
 async fn gateway_bearer_reaches_only_session_liveness() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
     let path = format!("/internal/app/sessions/{sid}");
     assert_eq!(a.app.get(&path, Some(APP_SESSIONS_TOKEN)).await.0, 200);
@@ -5055,7 +5058,7 @@ async fn gateway_bearer_reaches_only_session_liveness() {
 #[tokio::test]
 async fn sync_publishes() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let user = uuid::Uuid::new_v4();
     let (status, body) = a
         .app
@@ -5099,123 +5102,41 @@ async fn sync_publishes() {
     );
 }
 
-// Review Focus 5.
-#[tokio::test]
-async fn webhook_rejects_bad_signature_and_ignores_other_orgs() {
-    let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
-    let user = uuid::Uuid::new_v4().to_string();
-    let body = user_event("user.human.added", ORG, &user, chrono::Utc::now());
-    let now = chrono::Utc::now().timestamp();
-    // No header, a bad header, the wrong key, an old timestamp, another body's signature.
-    assert_eq!(a.app.event(&body, None).await, 401);
-    assert_eq!(a.app.event(&body, Some("nonsense".into())).await, 401);
-    assert_eq!(a.app.event(&body, Some(sign(&body, "other-key", now))).await, 401);
-    assert_eq!(a.app.event(&body, Some(sign(&body, SIGNING_KEY, now - 600))).await, 401);
-    assert_eq!(a.app.event(&body, Some(sign("{}", SIGNING_KEY, now))).await, 401);
-    // Signed but ignored: another org, a non-user event, a non-uuid id, a body that isn't an event.
-    let other_org = user_event("user.human.added", "o2", &user, chrono::Utc::now());
-    let not_user = user_event("user.human.phone.changed", ORG, &user, chrono::Utc::now());
-    let not_uuid = user_event("user.human.added", ORG, "3001", chrono::Utc::now());
-    for ignored in [other_org, not_user, not_uuid, "not json".to_string(), "[]".to_string()] {
-        assert_eq!(a.app.event(&ignored, signed(&ignored)).await, 200, "{ignored}");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    assert!(a.published().is_empty(), "{:?}", a.published());
-}
-
-#[tokio::test]
-async fn webhook_publishes_sync_for_user_events() {
-    let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
-    let user = uuid::Uuid::new_v4();
-    let kinds = ["user.human.added", "user.human.email.verified", "user.removed", "user.locked"];
-    for kind in kinds {
-        let body = user_event(kind, ORG, &user.to_string(), chrono::Utc::now());
-        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{kind}");
-    }
-    assert!(eventually(|| a.published().len() == kinds.len()).await, "{:?}", a.published());
-    for job in a.published() {
-        assert_eq!(
-            job,
-            AppUsersSyncJob {
-                project_id: w.project,
-                user_id: user,
-                data: None,
-                origin_branch_id: None,
-            }
-        );
-    }
-}
-
-#[tokio::test]
-async fn webhook_password_changed_revokes_older_sessions_only() {
-    let w = app_world();
-    let z = zitadel_with_sessions(&["z-old", "z-new"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let user = uuid::Uuid::new_v4();
-    let (old, _) = a.create_session(w.project, user, "z-old").await;
-    let (new, _) = a.create_session(w.project, user, "z-new").await;
-    let changed = chrono::Utc::now();
-    a.edit_session(old, |f| f.s.created_at = changed - chrono::Duration::minutes(5));
-    a.edit_session(new, |f| f.s.created_at = changed + chrono::Duration::seconds(1));
-    let body = user_event("user.human.password.changed", ORG, &user.to_string(), changed);
-    assert_eq!(a.app.event(&body, signed(&body)).await, 200);
-    // Revoked before the answer.
-    assert!(a.revoked(old));
-    assert!(!a.revoked(new), "the session that changed the password stays");
-    assert!(
-        eventually(|| z.calls().contains(&"DELETE /v2/sessions/z-old".to_string())).await,
-        "{:?}",
-        z.calls()
-    );
-    assert!(!z.calls().iter().any(|c| c.ends_with("/z-new")));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(a.published().is_empty(), "no sync for a password change");
-}
-
-#[tokio::test]
-async fn webhook_503_without_signing_key() {
-    let w = app_world();
-    let a = spawn_app(&w, None, None).await;
-    let body = user_event("user.human.added", ORG, &uuid::Uuid::new_v4().to_string(), chrono::Utc::now());
-    assert_eq!(a.app.event(&body, signed(&body)).await, 503);
-    assert_eq!(a.app.event(&body, None).await, 503);
-}
-
 #[tokio::test]
 async fn signup_check_reasons() {
     let neon = FakeNeon::default();
     {
         let mut m = neon.signup.lock().unwrap();
-        m.insert("org-open".into(), (true, true));
-        m.insert("org-first".into(), (false, false));
-        m.insert("org-closed".into(), (false, true));
+        m.insert(tenant_of("org-open"), (true, true));
+        m.insert(tenant_of("org-first"), (false, false));
+        m.insert(tenant_of("org-closed"), (false, true));
     }
     let spawn = |neon: FakeNeon, mode| setup_app(neon, mode, Some(SETUP_CODE), None);
     let app = spawn(neon.clone(), Mode::SelfHosted).await;
     let ask = |org: &'static str| {
         let app = &app;
-        async move { app.post_json(CHECK, Some(APP_AUTH_TOKEN), json!({"org": org})).await }
+        async move { app.on(org).await.post_json(CHECK, Some(APP_AUTH_TOKEN), json!({})).await }
     };
     let no = |reason: &str, required: bool| json!({"allowed": false, "reason": reason, "setup_required": required});
     assert_eq!(ask("org-open").await, (200, json!({"allowed": true, "reason": "open", "setup_required": false})));
     assert_eq!(ask("org-first").await, (200, no("setup_code_invalid", true)));
     assert_eq!(ask("org-closed").await, (200, no("closed", false)));
     assert_eq!(ask("org-unknown").await, (200, no("closed", false)));
-    assert_eq!(app.post_json(CHECK, Some("wrong"), json!({"org": "org-open"})).await.0, 401);
-    assert_eq!(app.post_json(CHECK, None, json!({"org": "org-open"})).await.0, 401);
+    assert_eq!(app.on("org-open").await.post_json(CHECK, Some("wrong"), json!({})).await.0, 401);
+    assert_eq!(app.on("org-open").await.post_json(CHECK, None, json!({})).await.0, 401);
     // The old GET gate is gone (auth is its only caller).
-    assert_eq!(app.get("/internal/signup/allowed?org=org-open", Some(APP_AUTH_TOKEN)).await.0, 404);
+    assert_eq!(app.on("org-open").await.get("/internal/signup/allowed?org=org-open", Some(APP_AUTH_TOKEN)).await.0, 404);
     // Platform mode: sign-up and claims are refused whatever the code.
     let platform = spawn(neon.clone(), Mode::Platform).await;
     assert_eq!(
-        platform.post_json(CHECK, Some(APP_AUTH_TOKEN), json!({"org": "org-first", "setup_code": SETUP_CODE})).await,
+        platform.on("org-first").await.post_json(CHECK, Some(APP_AUTH_TOKEN), json!({"setup_code": SETUP_CODE})).await,
         (200, no("platform", false))
     );
     assert!(neon.live_nonces("org-first").is_empty());
     let claimed = platform
-        .post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"org": "org-first", "user_id": "1", "nonce": "ab".repeat(32)}))
+        .on("org-first")
+        .await
+        .post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"user_id": "1", "nonce": "ab".repeat(32)}))
         .await;
     assert_eq!((claimed.0, error_code(&claimed.1)), (403, "setup_code_invalid"));
 }
@@ -5225,34 +5146,70 @@ const CLAIMED: &str = "/internal/signup/claimed";
 const SETUP_CODE: &str = "ABCD-EFGH-JKMN-PQRS-TUVW";
 const SETUP_ORG: &str = "org-first";
 
-/// The internal listener with this setup code (`None`: no `CHELABASE_SETUP_CODE_FILE`) and,
-/// optionally, a Zitadel.
-async fn setup_app(neon: FakeNeon, mode: Mode, code: Option<&str>, zitadel: Option<&MockZitadel>) -> Internal {
-    spawn_with_app(
+/// The internal listeners of one fake with this setup code (`None`: no
+/// `CHELABASE_SETUP_CODE_FILE`) and, optionally, an identity service: one listener per tenant
+/// label ([`SetupApp::on`]), each serving the tenant its label names as the instance's.
+async fn setup_app(neon: FakeNeon, mode: Mode, code: Option<&str>, identity: Option<&FakeIdentity>) -> SetupApp {
+    SetupApp {
         neon,
-        FakeLocator::default(),
-        "http://127.0.0.1:9",
-        rules(Mode::SelfHosted, false),
-        FakeCache::default(),
-        "http://127.0.0.1:9",
-        AppSetup {
-            mode,
-            zitadel: zitadel.map(|z| z.base.clone()),
-            setup_code: code.map(|c| orchestrator::internal::SetupCode::parse(c).unwrap()),
-            ..AppSetup::default()
-        },
-    )
-    .await
+        mode,
+        code: code.map(str::to_string),
+        identity: identity.map(FakeIdentity::client),
+        apps: Default::default(),
+    }
 }
 
-/// A fake with one member-less tenant (org `SETUP_ORG`) and one with members (`org-members`).
+struct SetupApp {
+    neon: FakeNeon,
+    mode: Mode,
+    code: Option<String>,
+    identity: Option<chelabase_identity::Identity>,
+    apps: tokio::sync::Mutex<HashMap<String, Arc<Internal>>>,
+}
+
+impl SetupApp {
+    /// The listener whose instance tenant is the one `org` labels.
+    async fn on(&self, org: &str) -> Arc<Internal> {
+        let mut apps = self.apps.lock().await;
+        if let Some(app) = apps.get(org) {
+            return app.clone();
+        }
+        let app = Arc::new(
+            spawn_with_app(
+                self.neon.clone(),
+                FakeLocator::default(),
+                "http://127.0.0.1:9",
+                rules(Mode::SelfHosted, false),
+                FakeCache::default(),
+                "http://127.0.0.1:9",
+                AppSetup {
+                    mode: self.mode,
+                    identity: self.identity.clone(),
+                    setup_code: self.code.as_deref().map(|c| orchestrator::internal::SetupCode::parse(c).unwrap()),
+                    tenant: tenant_of(org),
+                    ..AppSetup::default()
+                },
+            )
+            .await,
+        );
+        apps.insert(org.to_string(), app.clone());
+        app
+    }
+
+    /// A request on the default tenant's listener (routes that don't depend on it).
+    async fn post_json(&self, path: &str, token: Option<&str>, body: Value) -> (u16, Value) {
+        self.on(SETUP_ORG).await.post_json(path, token, body).await
+    }
+}
+
+/// A fake with one member-less tenant (label `SETUP_ORG`) and one with members (`org-members`).
 fn fresh_install() -> FakeNeon {
     let neon = FakeNeon::default();
     {
         let mut m = neon.signup.lock().unwrap();
-        m.insert(SETUP_ORG.into(), (false, false));
-        m.insert("org-members".into(), (false, true));
-        m.insert("org-other".into(), (false, false));
+        m.insert(tenant_of(SETUP_ORG), (false, false));
+        m.insert(tenant_of("org-members"), (false, true));
+        m.insert(tenant_of("org-other"), (false, false));
     }
     neon
 }
@@ -5262,23 +5219,23 @@ fn nonce_sha(nonce: &str) -> [u8; 32] {
     Sha256::digest(hex::decode(nonce).unwrap()).into()
 }
 
-async fn check_with(app: &Internal, org: &str, code: Option<&str>) -> (u16, Value) {
-    let mut body = json!({"org": org});
+async fn check_with(app: &SetupApp, org: &str, code: Option<&str>) -> (u16, Value) {
+    let mut body = json!({});
     if let Some(code) = code {
         body["setup_code"] = json!(code);
     }
-    app.post_json(CHECK, Some(APP_AUTH_TOKEN), body).await
+    app.on(org).await.post_json(CHECK, Some(APP_AUTH_TOKEN), body).await
 }
 
 /// A nonce from a check with the right code.
-async fn right_code_nonce(app: &Internal, org: &str) -> String {
+async fn right_code_nonce(app: &SetupApp, org: &str) -> String {
     let (status, body) = check_with(app, org, Some(SETUP_CODE)).await;
     assert_eq!((status, &body["reason"]), (200, &json!("first_member")), "{body}");
     body["claim_nonce"].as_str().unwrap().to_string()
 }
 
-async fn claim(app: &Internal, org: &str, user: &str, nonce: &str) -> (u16, Value) {
-    app.post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"org": org, "user_id": user, "nonce": nonce}))
+async fn claim(app: &SetupApp, org: &str, user: &str, nonce: &str) -> (u16, Value) {
+    app.on(org).await.post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"user_id": user, "nonce": nonce}))
         .await
 }
 
@@ -5313,7 +5270,7 @@ async fn signup_claimed_tenant_ignores_code() {
     for code in [None, Some(SETUP_CODE), Some("wrong")] {
         assert_eq!(check_with(&app, "org-members", code).await, (200, closed.clone()), "{code:?}");
     }
-    neon.signup.lock().unwrap().insert("org-members".into(), (true, true));
+    neon.signup.lock().unwrap().insert(tenant_of("org-members"), (true, true));
     let open = json!({"allowed": true, "reason": "open", "setup_required": false});
     assert_eq!(check_with(&app, "org-members", Some(SETUP_CODE)).await, (200, open));
     assert!(neon.live_nonces("org-members").is_empty());
@@ -5323,8 +5280,8 @@ async fn signup_claimed_tenant_ignores_code() {
 #[tokio::test]
 async fn signup_no_code_file_closes_window() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let user = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let user = mock.with_user(&Pool::Members, "a@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, None, Some(&mock)).await;
     let closed = json!({"allowed": false, "reason": "closed", "setup_required": false});
     for code in [None, Some(SETUP_CODE)] {
@@ -5333,33 +5290,33 @@ async fn signup_no_code_file_closes_window() {
     assert!(neon.live_nonces(SETUP_ORG).is_empty());
     // Even a nonce that somehow exists binds nothing.
     let nonce = "cd".repeat(32);
-    neon.setup.lock().unwrap().nonces.insert(nonce_sha(&nonce), (SETUP_ORG.into(), true));
+    neon.setup.lock().unwrap().nonces.insert(nonce_sha(&nonce), (tenant_of(SETUP_ORG), true));
     let (status, body) = claim(&app, SETUP_ORG, &user, &nonce).await;
     assert_eq!((status, error_code(&body)), (403, "setup_code_invalid"));
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
 }
 
 // The nonce AC: the bearer alone binds nothing. No nonce, a malformed, unknown, reused,
-// expired or other org's one, or a user outside the org: 403, no claim written.
+// expired or other tenant's one, or an unknown user: 403, no claim written.
 #[tokio::test]
 async fn signup_claimed_without_code_or_nonce_refused() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
-    let outsider = mock.add_user_in("org-other", "o@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let unknown = Uuid::new_v4().to_string();
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let refused = |r: (u16, Value)| assert_eq!((r.0, error_code(&r.1)), (403, "setup_code_invalid"), "{r:?}");
-    refused(app.post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"org": SETUP_ORG, "user_id": a})).await);
+    refused(app.on(SETUP_ORG).await.post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"user_id": a})).await);
     refused(claim(&app, SETUP_ORG, &a, "").await);
     refused(claim(&app, SETUP_ORG, &a, "not-hex").await);
     refused(claim(&app, SETUP_ORG, &a, &"ab".repeat(32)).await);
     // Another org's nonce.
     let other = right_code_nonce(&app, "org-other").await;
     refused(claim(&app, SETUP_ORG, &a, &other).await);
-    // A user who isn't in the org: refused before the nonce is spent.
+    // A user identity doesn't have, or not a user id at all: refused before the nonce is spent.
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    refused(claim(&app, SETUP_ORG, &outsider, &n).await);
-    refused(claim(&app, SETUP_ORG, "999999", &n).await);
+    refused(claim(&app, SETUP_ORG, &unknown, &n).await);
+    refused(claim(&app, SETUP_ORG, "312345678901234567", &n).await);
     refused(claim(&app, SETUP_ORG, "../users", &n).await);
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
     // An expired one.
@@ -5368,8 +5325,8 @@ async fn signup_claimed_without_code_or_nonce_refused() {
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
     // The bearer is checked first.
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    assert_eq!(app.post_json(CLAIMED, Some("wrong"), json!({"org": SETUP_ORG, "user_id": a, "nonce": n})).await.0, 401);
-    assert_eq!(app.post_json(CLAIMED, None, json!({"org": SETUP_ORG, "user_id": a, "nonce": n})).await.0, 401);
+    assert_eq!(app.on(SETUP_ORG).await.post_json(CLAIMED, Some("wrong"), json!({"user_id": a, "nonce": n})).await.0, 401);
+    assert_eq!(app.on(SETUP_ORG).await.post_json(CLAIMED, None, json!({"user_id": a, "nonce": n})).await.0, 401);
     // The right nonce binds once; reusing it is refused.
     assert_eq!(claim(&app, SETUP_ORG, &a, &n).await, (200, json!({"bound": true})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(a.as_str()));
@@ -5381,31 +5338,31 @@ async fn signup_claimed_without_code_or_nonce_refused() {
 #[tokio::test]
 async fn signup_second_claim_is_not_bound() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
-    let b = mock.add_user_in(SETUP_ORG, "b@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let b = mock.with_user(&Pool::Members, "b@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let (na, nb) = (right_code_nonce(&app, SETUP_ORG).await, right_code_nonce(&app, SETUP_ORG).await);
     assert_eq!(claim(&app, SETUP_ORG, &a, &na).await, (200, json!({"bound": true})));
     assert_eq!(claim(&app, SETUP_ORG, &b, &nb).await, (200, json!({"bound": false})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(a.as_str()));
-    // A exists in Zitadel: never asked to be replaced.
+    // A exists in identity: never asked to be replaced.
     assert_eq!(neon.setup.lock().unwrap().replace_asked.last().cloned(), Some(None));
 }
 
-// AC 11: a claim whose user has no member row and is gone from Zitadel is replaced by a new
-// code-gated sign-up. A Zitadel failure on the way answers 503 and spends nothing.
+// AC 11: a claim whose user has no member row and is gone from identity is replaced by a new
+// code-gated sign-up. A identity failure on the way answers 503 and spends nothing.
 #[tokio::test]
 async fn signup_stale_claim_replaced() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let gone = mock.add_user_in(SETUP_ORG, "gone@x.com", "pw", true);
-    let new = mock.add_user_in(SETUP_ORG, "new@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let gone = mock.with_user(&Pool::Members, "gone@x.com", "password1");
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &gone, &n).await, (200, json!({"bound": true})));
-    mock.remove_user(&gone);
-    // Zitadel down: 503, the nonce stays live.
+    mock.client().delete_user(&Pool::Members, &gone).await.unwrap();
+    // Identity down: 503, the nonce stays live.
     let n = right_code_nonce(&app, SETUP_ORG).await;
     mock.set_down(true);
     let (status, body) = claim(&app, SETUP_ORG, &new, &n).await;
@@ -5415,24 +5372,136 @@ async fn signup_stale_claim_replaced() {
     assert_eq!(claim(&app, SETUP_ORG, &new, &n).await, (200, json!({"bound": true})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
     assert_eq!(neon.setup.lock().unwrap().replace_asked.last().cloned(), Some(Some(gone.clone())));
-    // A claim user with a member row is never replaced, even if Zitadel lost it.
+    // A claim user with a member row is never replaced, even if identity lost it.
     neon.setup.lock().unwrap().member_rows.insert(new.clone());
-    mock.remove_user(&new);
-    let third = mock.add_user_in(SETUP_ORG, "third@x.com", "pw", true);
+    mock.client().delete_user(&Pool::Members, &new).await.unwrap();
+    let third = mock.with_user(&Pool::Members, "third@x.com", "password1");
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &third, &n).await, (200, json!({"bound": false})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
 }
 
-// Without Zitadel the user can't be checked: no claim (503), fail closed.
+// Without identity the user can't be checked: no claim (503), fail closed.
 #[tokio::test]
-async fn signup_claimed_needs_zitadel() {
+async fn signup_claimed_needs_identity() {
     let neon = fresh_install();
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), None).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    let (status, body) = claim(&app, SETUP_ORG, "312345", &n).await;
+    let (status, body) = claim(&app, SETUP_ORG, &Uuid::new_v4().to_string(), &n).await;
     assert_eq!((status, error_code(&body)), (503, "unavailable"));
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
+}
+
+// A claim from before the identity service (a numeric id, no member row) can never sign in
+// again: it is stale.
+#[tokio::test]
+async fn signup_pre_identity_claim_is_stale() {
+    let neon = fresh_install();
+    neon.setup.lock().unwrap().claims.insert(tenant_of(SETUP_ORG), "312345678901234567".into());
+    let mock = FakeIdentity::start().await;
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    assert_eq!(claim(&app, SETUP_ORG, &new, &n).await, (200, json!({"bound": true})));
+    assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
+}
+
+// #121 AC 7: a member token never makes a row, so the bind itself makes the claimant the
+// admin, with identity's email and name.
+#[tokio::test]
+async fn signup_claim_admits_the_claimant() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    assert_eq!(claim(&app, SETUP_ORG, &a, &n).await, (200, json!({"bound": true})));
+    let admitted = neon.setup.lock().unwrap().admitted.clone();
+    assert_eq!(admitted, vec![(tenant_of(SETUP_ORG), a.clone(), "a@x.com".into(), String::new(), Admission::Closed)]);
+}
+
+// The loser of the claim race gets a `pending` row: the admin sees the request.
+#[tokio::test]
+async fn signup_race_loser_is_pending() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let b = mock.with_user(&Pool::Members, "b@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let (na, nb) = (right_code_nonce(&app, SETUP_ORG).await, right_code_nonce(&app, SETUP_ORG).await);
+    assert_eq!(claim(&app, SETUP_ORG, &a, &na).await.1, json!({"bound": true}));
+    assert_eq!(claim(&app, SETUP_ORG, &b, &nb).await.1, json!({"bound": false}));
+    let last = neon.setup.lock().unwrap().admitted.last().cloned().unwrap();
+    assert_eq!((last.1, last.4), (b, Admission::Pending));
+}
+
+// A row that can't be written is an error, so auth deletes the account and the claim goes stale.
+#[tokio::test]
+async fn signup_claim_admit_failure_is_an_error() {
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    neon.setup.lock().unwrap().admit_fails = true;
+    assert_eq!(claim(&app, SETUP_ORG, &a, &n).await.0, 500);
+}
+
+const JOINED: &str = "/internal/signup/joined";
+const ACTIVE: &str = "/internal/members/active";
+
+// Open sign-up: the `pending` row is written at sign-up. The route re-checks the gate; the
+// bearer alone admits nobody to a closed tenant.
+#[tokio::test]
+async fn signup_joined_writes_a_pending_row_only_when_open() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    neon.signup.lock().unwrap().insert(tenant_of("org-open"), (true, true));
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, None, Some(&mock)).await;
+    let join = |org: &'static str, user: String| {
+        let app = &app;
+        async move { app.on(org).await.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"user_id": user})).await }
+    };
+    assert_eq!(join("org-open", a.clone()).await, (200, json!({"joined": true})));
+    let admitted = neon.setup.lock().unwrap().admitted.clone();
+    assert_eq!(admitted, vec![(tenant_of("org-open"), a.clone(), "a@x.com".into(), String::new(), Admission::Pending)]);
+    // Closed, member-less (the claim's business), unknown tenant, unknown user: nothing written.
+    for (org, user) in [("org-members", a.clone()), (SETUP_ORG, a.clone()), ("org-nobody", a.clone()), ("org-open", Uuid::new_v4().to_string())] {
+        assert_eq!(join(org, user).await, (200, json!({"joined": false})), "{org}");
+    }
+    assert_eq!(neon.setup.lock().unwrap().admitted.len(), 1);
+    assert_eq!(app.on("org-open").await.post_json(JOINED, Some("wrong"), json!({"user_id": a})).await.0, 401);
+    let platform = setup_app(neon.clone(), Mode::Platform, None, Some(&mock)).await;
+    let r = platform.on("org-open").await.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"user_id": a})).await;
+    assert_eq!(r, (200, json!({"joined": false})));
+    mock.set_down(true);
+    let r = app.on("org-open").await.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"user_id": a})).await;
+    assert_eq!((r.0, error_code(&r.1)), (503, "unavailable"));
+}
+
+// What `auth` picks a tenant from, and re-reads before it mints.
+#[tokio::test]
+async fn members_active_lists_tenants_by_status() {
+    use chelabase_metadata::members::MemberStatus::{Active, Pending};
+    let (t1, t2, t3) = (TenantId(Uuid::from_u128(1)), TenantId(Uuid::from_u128(2)), TenantId(Uuid::from_u128(3)));
+    let neon = fresh_install();
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(t1, Active), (t2, Pending), (t3, Active)]);
+    let app = setup_app(neon.clone(), Mode::SelfHosted, None, None).await;
+    assert_eq!(
+        app.post_json(ACTIVE, Some(APP_AUTH_TOKEN), json!({"user_id": "u1"})).await,
+        (200, json!({"active": [t1.as_uuid(), t3.as_uuid()], "pending": [t2.as_uuid()]}))
+    );
+    assert_eq!(
+        app.post_json(ACTIVE, Some(APP_AUTH_TOKEN), json!({"user_id": "stranger"})).await,
+        (200, json!({"active": [], "pending": []}))
+    );
+    assert_eq!(app.post_json(ACTIVE, Some("wrong"), json!({"user_id": "u1"})).await.0, 401);
+    assert_eq!(app.post_json(ACTIVE, None, json!({"user_id": "u1"})).await.0, 401);
+    assert_eq!(app.post_json(ACTIVE, Some(REALTIME_TOKEN), json!({"user_id": "u1"})).await.0, 401);
 }
 
 /// Every log line written while `f` runs on this thread (the test's current-thread runtime
@@ -5468,13 +5537,13 @@ async fn signup_log_and_error_scrub() {
     let loaded = orchestrator::internal::load_setup_code(file.to_str()).unwrap();
     assert!(loaded.matches(SETUP_CODE));
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let wrong = "ZZZZ-YYYY-XXXX-WWWW-VVVV";
     let mut bodies = vec![check_with(&app, SETUP_ORG, Some(wrong)).await.1];
     let nonce = right_code_nonce(&app, SETUP_ORG).await;
-    bodies.push(claim(&app, SETUP_ORG, "999999", &nonce).await.1);
+    bodies.push(claim(&app, SETUP_ORG, "312345678901234567", &nonce).await.1);
     bodies.push(claim(&app, "org-other", &a, &nonce).await.1);
     bodies.push(claim(&app, SETUP_ORG, &a, &nonce).await.1);
     bodies.push(claim(&app, SETUP_ORG, &a, &nonce).await.1);
@@ -5491,12 +5560,13 @@ async fn signup_log_and_error_scrub() {
     }
 }
 
-// T12x: the invite description (R32). The auth service asks with the Zitadel user id and the
+// T12x: the invite description (R32). The auth service asks with the identity user id and the
 // SHA-256 of the link's token; only an open invite with that exact hash answers.
 fn invite_fixture(neon: &FakeNeon, hash: Option<[u8; 32]>) {
     neon.invites.lock().unwrap().insert(
         "u1".into(),
         InviteDescription {
+            tenant_id: TenantId(Uuid::from_u128(1)),
             token_hash: hash.map(|h| h.to_vec()),
             inviter_name: "Alice".into(),
             inviter_email: Some("alice@x.com".into()),
@@ -5740,7 +5810,7 @@ async fn realtime_token_reaches_connection_info_and_key_lookups() {
 #[tokio::test]
 async fn realtime_token_opens_nothing_else_here() {
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let app = &a.app;
     let gets = [
         format!("{ACCESS}?endpointish=ep-x&role=app&session_id=1"),
@@ -5755,7 +5825,7 @@ async fn realtime_token_opens_nothing_else_here() {
     }
     assert_eq!(app.post_json("/internal/invites/describe", Some(REALTIME_TOKEN), json!({})).await.0, 401);
     for path in ["/internal/signup/check", "/internal/signup/claimed"] {
-        assert_eq!(app.post_json(path, Some(REALTIME_TOKEN), json!({"org": "o1"})).await.0, 401, "POST {path}");
+        assert_eq!(app.post_json(path, Some(REALTIME_TOKEN), json!({})).await.0, 401, "POST {path}");
     }
     for (method, path, body) in auth_routes(&w) {
         assert_eq!(call(app, method, &path, Some(REALTIME_TOKEN), &body).await, 401, "{method} {path}");
@@ -5890,249 +5960,6 @@ async fn ddl_refused_failed_or_role_only_deltas_publish_no_pg_database_event() {
     assert_eq!(status, 503);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     assert!(events.project.lock().unwrap().is_empty(), "{:?}", events.project.lock().unwrap());
-}
-
-// W18: a member's Zitadel user removed, deactivated or locked changes what they may reach: an
-// access event for the tenant bound to that org, naming the member (`sub` = the user id).
-#[tokio::test]
-async fn webhook_member_user_events_publish_an_access_event() {
-    use chelabase_nats::rt::AccessEvent;
-    let w = app_world();
-    let tenant = TenantId::new();
-    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
-    // Zitadel ids are numeric strings, not uuids.
-    let kinds = ["user.removed", "user.deactivated", "user.locked"];
-    for kind in kinds {
-        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
-        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{kind}");
-    }
-    assert!(eventually(|| a.rt_events.access.lock().unwrap().len() == kinds.len()).await, "{:?}", a.rt_events.access.lock().unwrap());
-    for ev in a.rt_events.access.lock().unwrap().iter() {
-        assert_eq!(*ev, AccessEvent { tenant_id: tenant.as_uuid(), member_sub: Some("284617".into()) });
-    }
-    // A bad signature, an org no tenant has, and an app-users org publish no access event.
-    let body = user_event("user.removed", "tenant-org", "284617", chrono::Utc::now());
-    assert_eq!(a.app.event(&body, Some("nonsense".into())).await, 401);
-    for org in ["no-such-org", ORG] {
-        let body = user_event("user.removed", org, &uuid::Uuid::new_v4().to_string(), chrono::Utc::now());
-        assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{org}");
-    }
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert_eq!(a.rt_events.access.lock().unwrap().len(), kinds.len());
-}
-
-// ---- Members hub T8: the webhook revokes an offboarded member's personal logins (D4, P17) ----
-
-/// The webhook's app with tenant org `tenant-org` bound, its Zitadel user `284617` holding a
-/// personal login `zed` with rows on `ep-main` and `ep-child`; the cache, the resync port and
-/// the realtime events the app was given.
-struct Offboarding {
-    app: Internal,
-    neon: FakeNeon,
-    cache: FakeCache,
-    resync: FakeResync,
-    rt_events: FakeRtEvents,
-    tenant: TenantId,
-    main: BranchId,
-    child: BranchId,
-}
-
-impl Offboarding {
-    fn rows(&self) -> Vec<(String, String)> {
-        vec![("ep-main".into(), "zed".into()), ("ep-child".into(), "zed".into())]
-    }
-}
-
-async fn offboarding() -> Offboarding {
-    let w = app_world();
-    let tenant = TenantId::new();
-    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
-    let row = |branch: BranchId, endpoint: &str| LoginEndpoint {
-        branch_id: branch.as_uuid(),
-        endpoint_id: endpoint.into(),
-        role_name: "zed".into(),
-    };
-    w.neon
-        .login_rows
-        .lock()
-        .unwrap()
-        .insert((tenant, "284617".into()), vec![row(w.main, "ep-main"), row(w.child, "ep-child")]);
-    let (cache, resync, rt_events) = (FakeCache::default(), FakeResync::default(), FakeRtEvents::default());
-    let app = spawn_with_app(
-        w.neon.clone(),
-        w.locator.clone(),
-        "http://127.0.0.1:9",
-        rules(Mode::SelfHosted, false),
-        cache.clone(),
-        "http://127.0.0.1:9",
-        AppSetup {
-            key: w.key.clone(),
-            resync: resync.clone(),
-            rt_events: rt_events.clone(),
-            ..AppSetup::default()
-        },
-    )
-    .await;
-    Offboarding { app, neon: w.neon.clone(), cache, resync, rt_events, tenant, main: w.main, child: w.child }
-}
-
-// D4: `user.deactivated`, `user.locked` and `user.removed` for a tenant org revoke the member's
-// logins (the metadata write), tell the proxy cache about every row, ask each branch to
-// reconcile its member roles, then publish today's realtime access event (W18). An unknown user
-// revokes nothing; another org isn't a tenant's.
-#[tokio::test]
-async fn a_deactivated_zitadel_user_loses_their_logins_and_the_cache_is_cleared() {
-    for kind in ["user.deactivated", "user.locked", "user.removed"] {
-        let o = offboarding().await;
-        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
-        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}");
-        assert_eq!(
-            o.neon.revocations.lock().unwrap().clone(),
-            vec![(o.tenant, "284617".to_string())],
-            "{kind}: the member's logins are revoked"
-        );
-        assert!(
-            o.cache.wait_for(&o.rows()).await,
-            "{kind}: the proxy cache is told about every row: {:?}",
-            o.cache.sent.lock().unwrap()
-        );
-        let asked = o.resync.members_asked.lock().unwrap().clone();
-        for branch in [o.main, o.child] {
-            assert!(asked.contains(&branch), "{kind}: {branch} reconciles its member roles: {asked:?}");
-        }
-        assert!(
-            eventually(|| o.rt_events.access.lock().unwrap().len() == 1).await,
-            "{kind}: the realtime access event still goes out"
-        );
-    }
-
-    let o = offboarding().await;
-    let app_user = uuid::Uuid::new_v4().to_string();
-    for (org, user) in [("tenant-org", "999"), ("no-such-org", "284617"), (ORG, app_user.as_str())] {
-        let body = user_event("user.deactivated", org, user, chrono::Utc::now());
-        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{org} {user}");
-    }
-    assert_eq!(
-        o.neon.revocations.lock().unwrap().clone(),
-        vec![(o.tenant, "999".to_string())],
-        "only the tenant org's event asks for a revocation"
-    );
-    assert!(o.cache.sent.lock().unwrap().is_empty(), "an unknown user has no rows to clear");
-}
-
-// Selfhost-install m5 (AC 2): the orchestrator starts before the bootstrap has written the
-// Actions signing key. Until the file is there the webhook answers 503 (never an unchecked
-// pass, signed or not); once it appears, a signed `user.deactivated` is 200 and revokes the
-// member's logins, with no restart. A key file that's readable by others is refused (503).
-#[tokio::test]
-async fn webhook_picks_up_late_actions_key() {
-    use chelabase_types::file_value::{FileValue, Sensitivity};
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("actions-signing-key");
-    let w = app_world();
-    let tenant = TenantId::new();
-    w.neon.tenants.lock().unwrap().insert("tenant-org".into(), tenant);
-    let app = spawn_with_app(
-        w.neon.clone(),
-        w.locator.clone(),
-        "http://127.0.0.1:9",
-        rules(Mode::SelfHosted, false),
-        FakeCache::default(),
-        "http://127.0.0.1:9",
-        AppSetup {
-            key: w.key.clone(),
-            signing_key: Some(FileValue::file(
-                "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE",
-                &path,
-                Sensitivity::Secret,
-            )),
-            ..AppSetup::default()
-        },
-    )
-    .await;
-    let body = user_event("user.deactivated", "tenant-org", "284617", chrono::Utc::now());
-    assert_eq!(app.event(&body, signed(&body)).await, 503, "no key file yet");
-    assert_eq!(app.event(&body, None).await, 503, "unsigned, no key file yet");
-    std::fs::write(&path, "").unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(app.event(&body, signed(&body)).await, 503, "an empty key file");
-    std::fs::write(&path, format!("{SIGNING_KEY}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(app.event(&body, signed(&body)).await, 503, "a key file others can read");
-    assert!(w.neon.revocations.lock().unwrap().is_empty(), "nothing ran before the key");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert_eq!(app.event(&body, None).await, 401, "the key is there: unsigned is refused");
-    assert_eq!(app.event(&body, signed(&body)).await, 200);
-    assert_eq!(
-        w.neon.revocations.lock().unwrap().clone(),
-        vec![(tenant, "284617".to_string())],
-        "the member's logins are revoked"
-    );
-}
-
-// P17: a revocation write that fails answers 500, so Zitadel delivers the event again, and
-// nothing after it ran (no cache message, no realtime event); the redelivery completes it.
-#[tokio::test]
-async fn a_failed_revocation_is_500_so_zitadel_retries() {
-    let o = offboarding().await;
-    *o.neon.fail_revocation.lock().unwrap() = true;
-    let body = user_event("user.deactivated", "tenant-org", "284617", chrono::Utc::now());
-    assert_eq!(o.app.event(&body, signed(&body)).await, 500);
-    assert!(o.cache.sent.lock().unwrap().is_empty());
-    assert!(o.resync.members_asked.lock().unwrap().is_empty());
-    assert!(o.rt_events.access.lock().unwrap().is_empty(), "the revocation comes before the realtime event");
-
-    *o.neon.fail_revocation.lock().unwrap() = false;
-    assert_eq!(o.app.event(&body, signed(&body)).await, 200, "the redelivery");
-    assert!(o.cache.wait_for(&o.rows()).await, "{:?}", o.cache.sent.lock().unwrap());
-    assert!(eventually(|| !o.rt_events.access.lock().unwrap().is_empty()).await);
-    assert_eq!(o.rt_events.access.lock().unwrap().len(), 1, "the failed delivery published nothing");
-}
-
-// ---- Members hub step 1, final fix round, area A ----
-
-// T8-2 (P17): a tenant lookup that fails on an offboarding event is a 500, so Zitadel delivers
-// it again; never a 200 that skipped the revocation.
-#[tokio::test]
-async fn a_failed_tenant_lookup_on_offboarding_is_500() {
-    for kind in ["user.deactivated", "user.locked", "user.removed"] {
-        let o = offboarding().await;
-        *o.neon.fail_tenant_lookup.lock().unwrap() = true;
-        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
-        assert_eq!(o.app.event(&body, signed(&body)).await, 500, "{kind}");
-        *o.neon.fail_tenant_lookup.lock().unwrap() = false;
-        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}: the redelivery");
-        assert_eq!(o.neon.revocations.lock().unwrap().clone(), vec![(o.tenant, "284617".to_string())], "{kind}");
-    }
-}
-
-// D7: `user.reactivated` and `user.unlocked` for a tenant org clear the member's offboarded
-// mark (its logins stay revoked: nothing is revoked or published for them); a failed clear is
-// a 500 so Zitadel retries; an app-users org's reactivation still syncs the app user.
-#[tokio::test]
-async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
-    for kind in ["user.reactivated", "user.unlocked"] {
-        let o = offboarding().await;
-        let body = user_event(kind, "tenant-org", "284617", chrono::Utc::now());
-        assert_eq!(o.app.event(&body, signed(&body)).await, 200, "{kind}");
-        assert_eq!(
-            o.neon.clears.lock().unwrap().clone(),
-            vec![(o.tenant, "284617".to_string())],
-            "{kind}: the mark isn't cleared"
-        );
-        assert!(o.neon.revocations.lock().unwrap().is_empty(), "{kind}");
-
-        *o.neon.fail_clear.lock().unwrap() = true;
-        assert_eq!(o.app.event(&body, signed(&body)).await, 500, "{kind}: a failed clear");
-    }
-    let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
-    let user = uuid::Uuid::new_v4();
-    let body = user_event("user.reactivated", ORG, &user.to_string(), chrono::Utc::now());
-    assert_eq!(a.app.event(&body, signed(&body)).await, 200);
-    assert!(eventually(|| a.published().len() == 1).await, "{:?}", a.published());
 }
 
 // ---- Fork round 4, C4 (RT4-2, SP1, SP4, SP11, SP23) ----
@@ -6940,7 +6767,7 @@ async fn signup_routes_are_probed_by_the_network_e2e() {
         assert!(probed.contains(&route), "the e2e doesn't probe {route:?}: {probed:?}");
     }
     let w = app_world();
-    let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
+    let a = spawn_app(&w, None).await;
     let http = reqwest::Client::new();
     for (method, path) in &probes {
         let m = reqwest::Method::from_bytes(method.as_bytes()).unwrap();
@@ -6953,21 +6780,109 @@ async fn signup_routes_are_probed_by_the_network_e2e() {
     }
 }
 
-// N1 (m3 audit): Zitadel answering something that can't be read as the claim's user is not
+// N1 (m3 audit): identity answering something that can't be read as the claim's user is not
 // "gone": no replacement, 503, the nonce stays live and the claim unchanged.
 #[tokio::test]
-async fn signup_unreadable_zitadel_answer_keeps_the_claim() {
+async fn signup_unreadable_identity_answer_keeps_the_claim() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let first = mock.add_user_in(SETUP_ORG, "first@x.com", "pw", true);
-    let new = mock.add_user_in(SETUP_ORG, "new@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let first = mock.with_user(&Pool::Members, "first@x.com", "password1");
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &first, &n).await, (200, json!({"bound": true})));
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    mock.fail(&format!("GET /v2/users/{first}"), 200, "Odd.Answer", 1);
+    mock.fail(&format!("GET /internal/v1/pools/members/users/{first}"), 500, "odd_answer", 1);
     let (status, body) = claim(&app, SETUP_ORG, &new, &n).await;
     assert_eq!((status, error_code(&body)), (503, "unavailable"), "{body}");
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(first.as_str()));
     assert!(neon.live_nonces(SETUP_ORG).contains(&nonce_sha(&n)));
+}
+
+const ACCEPT: &str = "/internal/invites/accept";
+
+/// #124: accept-invite writes the member row itself (a member token makes none). Only the open
+/// invite whose stored hash the link's token matches activates it, in that invite's tenant
+/// (#126); a retry once it is active is answered the same, by the accepted invite with that
+/// hash; every success clears the offboarded mark.
+#[tokio::test]
+async fn accept_invite_activates_the_row_for_the_link_token_only() {
+    use chelabase_metadata::members::{Admission, MemberStatus};
+    let t1 = TenantId(Uuid::from_u128(1));
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    neon.setup.lock().unwrap().rows.insert("u1".into(), MemberStatus::Active);
+    let app = describe_app(neon.clone()).await;
+    let ask = |user: &str, hash: String| {
+        let body = json!({"user": user, "token_hash": hash, "email": "u1@x.com", "name": "U One"});
+        let app = &app;
+        async move { app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), body).await }
+    };
+    // Wrong token, wrong user, malformed: the same 404, nothing written.
+    let wrong = ask("u1", token_hash_hex("wrong")).await;
+    assert_eq!((wrong.0, error_code(&wrong.1)), (404, "not_found"));
+    assert_eq!(ask("u2", token_hash_hex("right")).await, wrong);
+    assert_eq!(ask("u1", "zz".into()).await, wrong);
+    assert_eq!(app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), json!({"user": 1})).await, wrong);
+    assert!(neon.setup.lock().unwrap().admitted.is_empty());
+    assert!(neon.clears.lock().unwrap().is_empty());
+    // The right token activates the row (`Closed`: nobody new is admitted) and clears the mark.
+    let ok = ask("u1", token_hash_hex("right")).await;
+    assert_eq!(ok, (200, json!({"tenant_id": t1.as_uuid()})));
+    assert_eq!(
+        neon.setup.lock().unwrap().admitted,
+        vec![(t1, "u1".into(), "u1@x.com".into(), "U One".into(), Admission::Closed)]
+    );
+    assert_eq!(*neon.clears.lock().unwrap(), vec![(t1, "u1".to_string())]);
+    // A retry once the invite is closed and the row active: the same answer, no new admit.
+    neon.invites.lock().unwrap().remove("u1");
+    neon.accepted.lock().unwrap().insert("u1".into(), vec![(t1, Some(token_hash("right").to_vec()))]);
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(t1, MemberStatus::Active)]);
+    assert_eq!(ask("u1", token_hash_hex("right")).await, ok);
+    assert_eq!(neon.setup.lock().unwrap().admitted.len(), 1);
+    // A retry with another hash, or one whose tenant the person isn't active in, is the 404.
+    assert_eq!(ask("u1", token_hash_hex("wrong")).await, wrong);
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(TenantId(Uuid::from_u128(2)), MemberStatus::Active)]);
+    assert_eq!(ask("u1", token_hash_hex("right")).await, wrong);
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(t1, MemberStatus::Active)]);
+    // The bearer is the app-auth one.
+    let body = json!({"user": "u1", "token_hash": token_hash_hex("right")});
+    assert_eq!(app.post_json(ACCEPT, Some("wrong"), body.clone()).await.0, 401);
+    assert_eq!(app.post_json(ACCEPT, Some(REALTIME_TOKEN), body.clone()).await.0, 401);
+    assert_eq!(app.post_json(ACCEPT, None, body).await.0, 401);
+}
+
+/// What the row is after the write decides the answer: suspended is 403 `member_suspended`, still
+/// invited (the invite expired before the write) 410 `invite_expired`; neither clears the mark.
+/// A failing write or clear is a 500, which auth answers with a retry ticket.
+#[tokio::test]
+async fn accept_invite_answers_the_rows_state() {
+    use chelabase_metadata::members::MemberStatus;
+    let neon = FakeNeon::default();
+    invite_fixture(&neon, Some(token_hash("right")));
+    let app = describe_app(neon.clone()).await;
+    let ask = || {
+        let body = json!({"user": "u1", "token_hash": token_hash_hex("right"), "email": "", "name": ""});
+        let app = &app;
+        async move { app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), body).await }
+    };
+    for (row, status, code) in [
+        (Some(MemberStatus::Suspended), 403, "member_suspended"),
+        (Some(MemberStatus::Invited), 410, "invite_expired"),
+        (None, 404, "not_found"),
+    ] {
+        match row {
+            Some(r) => neon.setup.lock().unwrap().rows.insert("u1".into(), r),
+            None => neon.setup.lock().unwrap().rows.remove("u1"),
+        };
+        let a = ask().await;
+        assert_eq!((a.0, error_code(&a.1)), (status, code), "{row:?}");
+    }
+    assert!(neon.clears.lock().unwrap().is_empty());
+    neon.setup.lock().unwrap().rows.insert("u1".into(), MemberStatus::Active);
+    *neon.fail_clear.lock().unwrap() = true;
+    assert_eq!(ask().await.0, 500);
+    *neon.fail_clear.lock().unwrap() = false;
+    neon.setup.lock().unwrap().admit_fails = true;
+    assert_eq!(ask().await.0, 500);
 }

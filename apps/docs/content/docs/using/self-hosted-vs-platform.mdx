@@ -8,8 +8,8 @@ description: Every rule that differs between self-hosted mode and platform mode,
 ## In practice
 
 - **Sign-up.** Self-hosted has no self-sign-up unless a tenant admin turns on open sign-up. People who sign up then wait as pending members for an admin to approve them. Platform mode refuses self-sign-up until it is designed. See [Members and invites](/docs/using/members-and-invites#how-people-join).
-- **Instance settings** (`/v1/instance/settings`, open sign-up) are for the active tenant admin when self-hosted; in platform mode they are for members of the operator organization (`CHELABASE_OPERATOR_ORG_ID`), and nobody passes while it is unset. The open sign-up switch exists only when self-hosted.
-- **Auto-created members.** Self-hosted: a person in the tenant's organization with no member row is admitted on their first request. The first one claims the admin (the fresh-install window: the sign-up needs the setup code that `init-secrets` printed, see [Install](/docs/self-hosting/install#read-the-setup-code); claim before exposing Studio; the loser of a simultaneous race is admitted as pending); others become pending while open sign-up is on and are refused while it is off. Platform: members are only made explicitly.
+- **Instance settings** (`/v1/instance/settings`, open sign-up) are for the active tenant admin when self-hosted; in platform mode they are for members of the operator tenant (`CHELABASE_OPERATOR_TENANT_ID`), and nobody passes while it is unset. The open sign-up switch exists only when self-hosted.
+- **How members are made.** Only explicitly, in both modes: by an accepted invite, an approved sign-up, or (self-hosted) the claim of a fresh install, whose first sign-up needs the setup code that `init-secrets` printed (see [Install](/docs/self-hosting/install#read-the-setup-code); claim before exposing Studio; the loser of a simultaneous race is admitted as pending). A signed-in account with no member row is refused.
 - **Safety defaults** (email verification, password strength, owner superuser, pre-hashed passwords, the CA file on reveal) are relaxed for local use in self-hosted mode and strict in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides email verification in either mode. Secure cookies follow the public scheme in both modes (Secure with `https`), and platform mode requires `https`.
 
 Correctness and safety checks are the same in both modes: the access rules in [Access per route](/docs/reference/access) apply identically.
@@ -22,7 +22,7 @@ This table is generated from `ModePolicy` and checked by a test (`just check`).
 
 | Rule | What it decides | Self-hosted | Platform |
 |---|---|---|---|
-| `instance_admin` | Who may use instance-level routes. | active tenant admin | member of the operator organisation |
+| `instance_admin` | Who may use instance-level routes. | active tenant admin | member of the operator tenant |
 | `sign_up` | Whether a visitor may create their own account. | gated by the tenant | refused |
 | `open_signup_switchable` | Whether the tenant may switch open sign-up on. | true | false |
 | `email_verification_default` | Whether sign-ups must verify their email by default. | false | true |
@@ -30,8 +30,6 @@ This table is generated from `ModePolicy` and checked by a test (`just check`).
 | `password_strength_forced` | Whether role passwords must pass the strength check. | false | true |
 | `prehashed_passwords_allowed` | Whether role passwords may be supplied pre-hashed. | true | false |
 | `ca_file_on_reveal` | Whether revealing connection details includes the dev CA path. | true | false |
-| `cli_manages_studio_login` | Whether the CLI manages Studio's login settings in Zitadel. | true | false |
-| `auto_create_members` | Whether a person in the tenant's org becomes a member on their first request. | true | false |
 | `default_internal_token_allowed` | Whether the services may start with the development internal bearer (a platform instance refuses to start with it). | true | false |
 
 {/* END GENERATED mode-table */}

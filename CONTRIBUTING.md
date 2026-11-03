@@ -14,7 +14,7 @@ apps/docs              the documentation site (content in apps/docs/content/docs
 apps/landing           the landing page
 services/              gateway, orchestrator, worker, rest, auth, realtime, init (chelabase-init)
 crates/                shared Rust libraries: auth, http, init, metadata, nats, neon, query,
-                       routes, schema, secrets, types, zitadel
+                       routes, schema, secrets, types, identity
 packages/              TypeScript packages: client, management-client, design (design system), neon-e2e
 openapi/               generated OpenAPI documents (management, login, data)
 infra/compose/         the self-hosted install (docker-compose.yml, .env.example,
@@ -93,7 +93,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just workbench up [--with docs,landing]` | Start this checkout's stack: the Compose services (metadata Postgres, NATS, Valkey, Zitadel, the Neon storage stack and proxy, Mailpit), the bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, realtime, Studio) in containers built from your host-built binaries. Waits in line when the stack cap is reached. Prints the URLs |
+| `just workbench up [--with docs,landing]` | Start this checkout's stack: the Compose services (metadata Postgres, NATS, Valkey, the identity service, the Neon storage stack and proxy, Mailpit), the bootstrap, then the apps (orchestrator, worker, gateway, rest, auth, realtime, Studio) in containers built from your host-built binaries. Waits in line when the stack cap is reached. Prints the URLs |
 | `just workbench restart [app…]` | Rebuild and recreate the named apps (all six Rust apps when none); `studio`, `docs` and `landing` can be named too |
 | `just workbench down [--stack <slug>]` | Stop the stack and remove its computes; volumes and state stay |
 | `just workbench purge [--stack <slug>] [--yes]` | `down`, then delete the volumes, state directory and registry entry. Main is purged only when named and confirmed: `just workbench purge --stack main --yes` |
@@ -104,9 +104,8 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 | `just workbench test [--stack <slug>] [selection…] [-- run-args…]` | Live Rust tests in the stack's runner container (see [Live Rust tests](#live-rust-tests)) |
 | `just workbench run [--stack <slug>] [--env K=V] <script> [args…]` | A repo script in the runner, on the stack's network (the e2e recipes use it) |
 | `just workbench env` | Print the path of this stack's `stack.env` |
-| `just zitadel-bootstrap [admin_email]` | Rerun this stack's bootstrap, as `workbench up` does (idempotent; workbench only) |
-| `just zitadel-reset` | Wipe only this stack's Zitadel volume so FirstInstance rewrites `admin.pat` |
-| `just auth-token` | Mint a short-lived demo JWT access token (stdout) |
+| `just stack-bootstrap [admin_email]` | Rerun this stack's bootstrap, as `workbench up` does (idempotent; workbench only) |
+| `just auth-token` | A short-lived member access token of the stack's dev member (stdout) |
 | `just create-db-demo [name]` | Authenticated `POST /v1/databases` through this stack's gateway, in the seed project; `name` defaults to `demo1` |
 | `just sweep-dbs` | Dev reset for this stack: remove its Neon computes, its storage-controller tenants and its metadata rows for databases, branches and endpoints |
 
@@ -114,7 +113,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too) |
+| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, the identity image's licences against `THIRD_PARTY_NOTICES.md`, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too) |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
 | `just deny` / `just deny-install` | RustSec advisories and yanked crates against `Cargo.lock`; install the pinned cargo-deny |
@@ -143,30 +142,18 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 ## Bootstrap admin and seed tenant
 
-The bootstrap is `chelabase-init bootstrap`. A self-hosted install runs it as the `init-bootstrap` one-shot, with no admin: the first sign-up with the setup code claims the instance. A workbench stack runs it with `--demo` instead (`just workbench up` does, and `just zitadel-bootstrap` reruns it), which adds the dev-only objects:
+The bootstrap is `chelabase-init bootstrap`. A self-hosted install runs it as the `init-bootstrap` one-shot, with no admin: the first sign-up with the setup code claims the instance. A workbench stack runs it with `--demo` instead (`just workbench up` does, and `just stack-bootstrap` reruns it), which also signs up the stack's **dev member** with the setup code: `dev@chelabase.localhost` (or the `admin_email` you pass), the seeded tenant's admin. Its password is random, made once and kept owner-only in the stack's state directory (`.chelabase/stacks/<slug>/bootstrap/dev-member.json`); never a fixed value. Sign in to Studio with it, or let `chelabase dev token` (`just auth-token`, `just create-db-demo`) sign it in and print a short-lived member token. Mail (invites, codes, resets) goes to Mailpit.
 
-- a tenant admin: Zitadel's first human user, `zitadel-admin@zitadel.<auth host name>` (on main, `zitadel-admin@zitadel.auth.chelabase.localhost`), or the user you pass as `admin_email` (it must exist in Zitadel). Sign in to Studio as that user;
-- the demo machine user and its key, behind `just auth-token` and `just create-db-demo`;
-- Mailpit as Zitadel's SMTP provider, when no SMTP is configured.
+The dev member can only claim a fresh tenant: on a stack whose tenant someone already claimed, the bootstrap stops with an error that says so. Start from a fresh stack with `just workbench purge` (for main, `just workbench purge --stack main --yes`), then `just workbench up`.
 
-Without `--demo`, every run deactivates Zitadel's human instance admins; with it, the first human user stays active.
-
-If bootstrap fails with a missing `admin.pat` (an old Zitadel volume from before FirstInstance):
-
-```bash
-just zitadel-reset && just zitadel-bootstrap
-```
-
-A Zitadel reset leaves no account but the bootstrap admin: sign in as that user and invite the rest.
-
-The metadata migrations seed one tenant and project, in every install, workbench or not. The bootstrap binds the tenant to its Zitadel org (`tenants.zitadel_org_id`). The fixed IDs are what `just create-db-demo` posts:
+The metadata migrations seed one tenant and project, in every install, workbench or not. Sign-up and the setup claim go to that tenant. The fixed IDs are what `just create-db-demo` posts:
 
 | Entity | Slug | UUID |
 | --- | --- | --- |
 | Tenant | `demo` | `00000000-0000-4000-8000-000000000001` |
 | Project | `default` | `00000000-0000-4000-8000-000000000002` |
 
-IAM artifacts are in the stack's state directory, `.chelabase/stacks/<slug>/` (gitignored; `<slug>` is `main` for the main checkout); the apps' env files are in its `zitadel/` (`demo.env`) after bootstrap. Zitadel PATs are opaque, so demo calls use JWT-profile access tokens from `chelabase dev token` (`just auth-token`).
+The stack's state directory is `.chelabase/stacks/<slug>/` (gitignored; `<slug>` is `main` for the main checkout); the dev member's file and the session `dev token` keeps are in its `bootstrap/`.
 
 ## Workbench URLs
 
@@ -176,14 +163,13 @@ Everything a browser or a script reaches goes through the stack's gateway, by ho
 | --- | --- |
 | http://studio.chelabase.localhost:8000 | Studio |
 | http://api.chelabase.localhost:8000 | The management API, the data API and the app-user sign-in routes |
-| http://auth.chelabase.localhost:8000 | Zitadel (console at `/ui/console`) |
 | http://docs.chelabase.localhost:8000 | The docs site (`just workbench up --with docs`) |
 | http://landing.chelabase.localhost:8000 | The landing page (`just workbench up --with landing`) |
 | http://mail.chelabase.localhost:8000 | Mailpit (workbench only) |
 
-`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and Zitadel sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack; the rules are on the docs page [Hosts](apps/docs/content/docs/self-hosting/hosts.mdx).
+`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack; the rules are on the docs page [Hosts](apps/docs/content/docs/self-hosting/hosts.mdx).
 
-`scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`, `CHELABASE_ZITADEL_TLS_MODE`). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
+`scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
 
 ## Ports
 
@@ -202,7 +188,7 @@ Configuration: [`infra/compose/.env.example`](infra/compose/.env.example) holds 
 
 ## Worktrees and their stacks
 
-Every checkout runs its own stack: its own Compose project, volumes, network, computes, Zitadel instance, state directory (`.chelabase/stacks/<slug>/`) and host names. Up to 4 stacks run at once by default (`CHELABASE_WORKBENCH_SLOTS` sets the cap); when the cap is reached, `just workbench up` waits in a FIFO queue (it gives up after 45 minutes; `CHELABASE_WORKBENCH_WAIT` changes that). The main checkout stays on `main`.
+Every checkout runs its own stack: its own Compose project, volumes, network, computes, identity data, state directory (`.chelabase/stacks/<slug>/`) and host names. Up to 4 stacks run at once by default (`CHELABASE_WORKBENCH_SLOTS` sets the cap); when the cap is reached, `just workbench up` waits in a FIFO queue (it gives up after 45 minutes; `CHELABASE_WORKBENCH_WAIT` changes that). The main checkout stays on `main`.
 
 ```bash
 just wt-add my-feature                # .worktrees/my-feature, branched from main
@@ -224,7 +210,7 @@ For a branch that exists only on origin, run `git fetch && git branch <branch> o
 Each worktree:
 
 - has its own `target/` directory, and compilation is shared machine-wide through sccache;
-- symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys; mounted read-only into every stack) and every stack's state;
+- symlinks `.chelabase` from the main checkout, which holds the machine's keys once (secrets key, gateway and cookie keys, compute-JWT keys, member-JWT keys, the identity service's secret, database password and caller tokens; mounted read-only into every stack) and every stack's state;
 - runs its own stack from its own binaries: run `just workbench …` from inside the worktree. Another checkout's stack is reached with `--stack <slug>` (`down`, `purge`, `test`, `run`); `status` lists them all.
 
 `just workbench down` when you're done frees the slot. Build artifacts pile up: `just sweep-builds` drops those older than 14 days from every `target/`.
@@ -248,10 +234,10 @@ These run against your checkout's own stack: each is `just workbench run scripts
 | `branch-e2e` | Branch at a time, reset to parent, restore with a backup, a point outside the history window, delete |
 | `storage-leak-e2e` | Deleting a database, a branch or a superseded timeline reclaims the safekeeper's WAL and S3 backup |
 | `compute-network-e2e` | What a compute can reach: no NATS, Valkey or databases; every listener on the compute network needs a credential or is public by design |
-| `auth-e2e` | Closed sign-up, a link invite and accepting it, sign-in, reset and logout through the gateway and auth |
+| `auth-e2e` | Closed sign-up, a link invite and accepting it, the session cookie and `/auth/v1/token`, sign-in, identical failures, reset with the mailed code, and logout ending the session |
 | `role-e2e` | Login roles: create a plain role, connect, back a secret key, refused delete, reset, revoke, delete |
-| `members-e2e` | An email invite (link from Mailpit) and a link invite, a grant, the SQL editor as a group role, revoke, open sign-up and approval |
-| `personal-logins-e2e` | Personal Postgres logins: connect through the proxy, a child branch, reset, revocation on grant loss, suspend, revoke-now, Zitadel offboarding, expiry |
+| `members-e2e` | An email invite (link and code from Mailpit) and a link invite, a grant, the SQL editor as a group role, revoke, removal and a re-invite accepted from the notice, open sign-up and approval |
+| `personal-logins-e2e` | Personal Postgres logins: connect through the proxy, a child branch, reset, revocation on grant loss, suspend, revoke-now, offboarding, expiry |
 | `teams-e2e` | A team-only member runs SQL as a Developer team role, a downgrade to Viewer refuses it, a Viewer team role reads through the data API, removal and delete |
 | `data-e2e` | Data API story (below) |
 | `console-e2e` | Data API across databases and Studio's console (below) |
@@ -278,7 +264,7 @@ These run against your checkout's own stack: each is `just workbench run scripts
 6. An owner password set in SQL answers 409 `owner_password_unknown`; after a reset the owner console works at once.
 7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `chelabase` schema; the database is deleted.
 
-`app-users-e2e`: a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `chelabase.user_id()` policy; a new branch gets the rows; an email changed in Zitadel reaches the row through the webhook; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its Zitadel org.
+`app-users-e2e`: a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `chelabase.user_id()` policy; a new branch gets the rows; an email changed through the platform API reaches the row; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its app-user pool.
 
 `sql-editor-e2e`: a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document.
 
@@ -288,8 +274,8 @@ These test the Compose install the way a self-hoster runs it. They need no workb
 
 | Recipe | What it runs |
 | --- | --- |
-| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim, a project and a database through the API and the proxy, the Zitadel webhook, no secret in `docker inspect`, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender) |
-| `selfhost-tls-e2e` | The install behind nginx terminating TLS with a throwaway CA and no port in the hosts: an https issuer, the claim and sign-in, the gateway and realtime verifying tokens, in-network calls to Zitadel, and `down -v` leaving nothing |
+| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim by the Acme example (`docker-compose.example.yml`) and a second seed run that skips, a project and a database through the API and the proxy, no secret in `docker inspect`, an invite mail through the identity service's SMTP, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender, refused by the identity service) |
+| `selfhost-tls-e2e` | The install behind nginx terminating TLS with a throwaway CA and no port in the hosts: the claim and sign-in with a Secure session cookie, a token whose issuer is the https auth host, the gateway and realtime verifying tokens, and `down -v` leaving nothing |
 
 Images:
 
@@ -309,7 +295,7 @@ just selfhost-tls-e2e
 Some Rust tests are `#[ignore]`d because they need the stack. Run them on your checkout's stack with `just workbench test -p <pkg> --test <file> -- --run-ignored only`: it makes sure the stack is up and current, archives the tests on the host and runs them in the runner container with the stack's environment (service names, the demo identity, the compute image). Arguments before `--` select what is archived; those after it go to nextest.
 
 - `rest_live` (`just workbench test -p rest --test rest_live -- --run-ignored only`): two databases with their own default schemas and caches, allow-lists (and stored lists following a SQL rename and drop), a disable with and without rest's invalidate call, and a child branch serving its parent's second database.
-- `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real Zitadel.
+- `app_users_live` (`just workbench test -p worker --test app_users_live -- --run-ignored only`): the bootstrap is idempotent; the guard and the protect triggers on a real compute; DDL elsewhere works even with the users table broken; the helpers and the built-in policies under the data API; a custom role's key reads with and without app users; the data API's rebootstrap keeps the objects and its remove drops the helpers (or is refused by a dependent policy); sign-up data and marked deletes; and the worker's enable, sync fan-out, branch hook, resync and disable with the real identity service.
 - `storcon_live` (`just workbench test -p chelabase-neon --test storcon_live -- --run-ignored only`): a round trip through the Rust storage-controller client. Other live files live in `services/worker/tests/` (`branch_live`, `neon_live`, `roles_live`).
 
 ## CI (GitHub Actions)
@@ -382,6 +368,6 @@ scripts/tests/compose-image-pins.sh digests.txt
 - After your PR merges, remove its worktree (`just wt-remove <branch>`) and delete the branch.
 - Before building on a branch, `git fetch` and check whether origin has newer commits. Never force-push; if a push is rejected, fetch and integrate first.
 - Never run `cargo fmt` on the workspace; rustfmt only the files you create.
-- Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key or the compute-JWT key pair.
-- Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies.
+- Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key, the compute-JWT key pair, the member-JWT pair (`auth/member-jwt.{key,pub}`), `identity/secret`, `identity/db.password` or the identity tokens (`tokens/{auth,orchestrator,worker,bootstrap}-identity.token`).
+- Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies. A change to `services/identity`'s production dependencies needs `bash scripts/tests/no-copyleft.sh --write`, which rewrites `THIRD_PARTY_NOTICES.md`; nothing under the GPL or the AGPL may ship there.
 - `tokio-postgres` is pinned to the `chelabase/rust-postgres` fork by `rev` in the workspace `Cargo.toml`; return to crates.io once the upstream change is released (https://github.com/rust-postgres/rust-postgres/pull/1391).

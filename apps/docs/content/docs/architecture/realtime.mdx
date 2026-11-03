@@ -52,7 +52,7 @@ Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`
 | `CHELABASE_REALTIME_PG_PASSWORD_FILE` | required | The password of `chelabase_realtime` |
 | `CHELABASE_COMPUTE_CA_FILE` | required | The platform CA certificate; every compute connection is TLS-verified against it |
 | `CHELABASE_INTERNAL_VERIFY_KEY` | required | The gateway's public key, to verify the identity on ticket requests |
-| `CHELABASE_AUTH_HOST`, `CHELABASE_ZITADEL_JWKS_URL`, `CHELABASE_ZITADEL_AUDIENCES` | the gateway's | How member tokens are verified |
+| `CHELABASE_AUTH_HOST`, `CHELABASE_MEMBER_JWT_PUBLIC_KEY` | the gateway's | How member tokens are verified (the issuer, and auth's member public key; unset, every token is refused) |
 | `CHELABASE_NATS_URL`, `_USER`, `_PASSWORD[_FILE]`, `_INBOX_PREFIX` | user `realtime`, inbox `_INBOX_realtime` | NATS login |
 | `CHELABASE_VALKEY_URL`, `_USER`, `_PASSWORD[_FILE]`, `CHELABASE_VALKEY_TLS` | `redis://127.0.0.1:6379`, none, none, `off` | Valkey login; `on` for `rediss://` |
 | `CHELABASE_REALTIME_MAX_SLOTS_PER_COMPUTE` | `10` | Replication slots realtime may hold on one compute |

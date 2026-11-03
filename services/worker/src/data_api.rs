@@ -104,6 +104,7 @@ DO $$ BEGIN
     DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
     DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
     DROP FUNCTION IF EXISTS chelabase.users_protect();
+    DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb);
     DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
     DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
     DROP FUNCTION IF EXISTS chelabase.app_users_rows();
@@ -2700,6 +2701,7 @@ DO $$ BEGIN
     DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_drop;
     DROP EVENT TRIGGER IF EXISTS chelabase_users_protect_ddl;
     DROP FUNCTION IF EXISTS chelabase.users_protect();
+    DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb);
     DROP FUNCTION IF EXISTS chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb);
     DROP FUNCTION IF EXISTS chelabase.app_users_gone(uuid, boolean);
     DROP FUNCTION IF EXISTS chelabase.app_users_rows();

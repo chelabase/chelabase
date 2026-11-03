@@ -91,7 +91,7 @@ impl TeamChange {
     }
 }
 
-/// What a committed team write reaches: each affected member as (id, Zitadel user), by id, and
+/// What a committed team write reaches: each affected member as (id, identity user), by id, and
 /// every project whose branches reconcile (the team's grant projects before and after), by id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamWrite {
@@ -638,7 +638,7 @@ impl MetadataClient {
             if skipped_admins.contains(&m.id) && !still_admin {
                 return Err(TeamWriteError::Changed);
             }
-            affected.push((m.id, m.zitadel_user_id));
+            affected.push((m.id, m.identity_user_id));
         }
         if observe(&mut tx, &plan, change).await? != expect {
             return Err(TeamWriteError::Changed);

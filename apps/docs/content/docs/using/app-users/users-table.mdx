@@ -9,11 +9,12 @@ Every app user has one row in the users table (`public.users` unless you chose a
 
 | Column | Type | Who owns it |
 |---|---|---|
-| `id` | `uuid`, primary key | Chelabase. It is the Zitadel user id. |
+| `id` | `uuid`, primary key | Chelabase. It is the identity user's id. |
 | `email` | `text` | Chelabase. |
 | `email_verified` | `boolean` | Chelabase. |
 | `created_at` | `timestamptz` | Chelabase. |
 | `deleted_at` | `timestamptz` | Chelabase. Set only when `on_delete` is `mark`. |
+| `banned_at` | `timestamptz` | Chelabase. Set while the user is deactivated, `NULL` otherwise. |
 
 Every other column is yours. Add columns, constraints, indexes and foreign keys with ordinary migrations.
 
@@ -58,7 +59,7 @@ GRANT INSERT (display_name) ON users TO authenticated;
 
 Any other key is 422 `unknown_column`. That includes managed columns, generated columns and `GENERATED ALWAYS` identity columns. `REVOKE INSERT (display_name) ON users FROM authenticated` takes a column out again.
 
-The values go through your column types and constraints. A failure is 422 `constraint_violation` with Postgres' message (and the constraint's name when it has one), and no Zitadel user is created.
+The values go through your column types and constraints. A failure is 422 `constraint_violation` with Postgres' message (and the constraint's name when it has one), and no identity user is created.
 
 The generated `db.ts` (Studio's **Download types**, `curl` of `/data/v1/types`; they produce the same module) marks the table, and the SDK types `signUp`'s `data` from its insertable columns.
 
@@ -74,7 +75,7 @@ or make the trigger function `SECURITY DEFINER`.
 
 ## `on_delete`
 
-When a user is deleted in Zitadel:
+When a user is deleted:
 
 - `delete` (default) deletes the row; your foreign keys cascade as you defined them;
 - `mark` sets `deleted_at` and keeps the row.

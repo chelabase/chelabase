@@ -687,30 +687,6 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
             .await
     }
 
-    async fn members_with_live_logins(&self) -> Result<Vec<(chelabase_types::TenantId, Uuid, String)>, MetadataError> {
-        self.inner.members_with_live_logins().await
-    }
-
-    async fn revoke_logins_for_zitadel_user(
-        &self,
-        tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
-    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        self.inner.revoke_logins_for_zitadel_user(tenant, zitadel_user_id).await
-    }
-
-    async fn offboarded_members(&self) -> Result<Vec<(chelabase_types::TenantId, Uuid, String)>, MetadataError> {
-        self.inner.offboarded_members().await
-    }
-
-    async fn clear_offboarded(
-        &self,
-        tenant: chelabase_types::TenantId,
-        zitadel_user_id: &str,
-    ) -> Result<bool, MetadataError> {
-        self.inner.clear_offboarded(tenant, zitadel_user_id).await
-    }
-
     async fn upsert_member_branch_role_if(
         &self,
         row: &chelabase_metadata::members::MemberBranchRole,
@@ -805,14 +781,6 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.app_auth_for_database(db).await
     }
 
-    async fn set_app_users_org(
-        &self,
-        project: ProjectId,
-        org_id: &str,
-    ) -> Result<(), MetadataError> {
-        self.inner.set_app_users_org(project, org_id).await
-    }
-
     async fn finish_enable_app_users(
         &self,
         project: ProjectId,
@@ -823,6 +791,18 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
 
     async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         self.inner.delete_project_auth(project).await
+    }
+
+    async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        self.inner.finish_disable_app_users(project).await
+    }
+
+    async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        self.inner.set_app_users_error(project, error).await
     }
 
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

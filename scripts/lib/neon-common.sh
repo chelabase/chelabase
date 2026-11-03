@@ -78,9 +78,10 @@ call() {
   printf '%s' "$out"
 }
 
-# api <method> <path> [json body]: a gateway call as the demo tenant's user (needs $GATEWAY, $tmp and
-# $CHELABASE_CLI). Prints the HTTP status; the body goes to $tmp/body. The token is minted per
-# request: it is short-lived.
+# api <method> <path> [json body]: a gateway call as the stack's dev member, the demo tenant's admin
+# (needs $GATEWAY, $tmp and $CHELABASE_CLI). Prints the HTTP status; the body goes to $tmp/body.
+# The token is asked for per request (`dev token` signs the dev member in once and reuses its
+# session): it is short-lived.
 api() {
   local token args
   token="$("$CHELABASE_CLI" dev token)" || die "chelabase dev token"

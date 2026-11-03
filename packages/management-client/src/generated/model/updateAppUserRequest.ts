@@ -13,13 +13,8 @@ export interface UpdateAppUserRequest {
   email?: string | null;
   /**
      * With `email`, whether the new address is verified (default true); alone, sets the flag
-     * on the current address (false sends the user a verification code).
+     * on the current address.
      * @nullable
      */
   email_verified?: boolean | null;
-  /**
-     * A new password; the user's sessions end.
-     * @nullable
-     */
-  password?: string | null;
 }

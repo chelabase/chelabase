@@ -6,6 +6,5 @@
  */
 
 export interface MeUser {
-  org_id: string;
   sub: string;
 }

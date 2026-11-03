@@ -82,7 +82,7 @@ pub(crate) enum PersonalLoginRevokeReason {
     Suspended,
     /// A tenant admin revoked the member's Postgres access.
     RevokedNow,
-    /// The member's Zitadel user was deactivated, locked or removed.
+    /// The member's identity user was banned or removed.
     IdentityOffboarded,
     /// The member was removed.
     MemberRemoved,
@@ -412,7 +412,7 @@ fn valid_until() -> DateTime<Utc> {
         (status = 200, description = "The logins the caller may see", body = PersonalLoginList),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel", body = ErrorEnvelope),
+        (status = 403, description = "`member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -497,7 +497,7 @@ where
         (status = 200, description = "The database's logins", body = PersonalLoginList),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only the project's Admins and tenant admins may (`required`); `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: only the project's Admins and tenant admins may (`required`); `member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) doesn't exist", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -546,7 +546,7 @@ where
         (status = 201, description = "The login and its password, once", body = PersonalLoginSecret),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your account was offboarded", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) doesn't exist", body = ErrorEnvelope),
         (status = 409, description = "`personal_login_exists`: you have a live login on this database (reset it, or delete it first); `role_exists`: a role on a branch of the database, or another login of it, has the name; `credentials_unavailable`: the main branch has no endpoint", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -667,7 +667,7 @@ where
         (status = 200, description = "The login and its new password, once", body = PersonalLoginSecret),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your identity was deactivated, locked or removed in Zitadel", body = ErrorEnvelope),
+        (status = 403, description = "`forbidden`: you're below Developer on the database (`required` is `developer`); `member_suspended`: you're suspended; `member_offboarded`: your account was offboarded", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) doesn't exist, or you have no login there that isn't revoked", body = ErrorEnvelope),
         (status = 409, description = "`credentials_unavailable`: the main branch has no endpoint", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -735,7 +735,7 @@ where
         (status = 204, description = "Deleted"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `member_suspended`: the caller is suspended; `member_offboarded`: the caller's identity was deactivated, locked or removed in Zitadel", body = ErrorEnvelope),
+        (status = 403, description = "`member_suspended`: the caller is suspended; `member_offboarded`: the caller's account was offboarded", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database (or another tenant's) doesn't exist, or there is no such login you may delete", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),

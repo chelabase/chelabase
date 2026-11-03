@@ -6,20 +6,12 @@
  */
 
 /**
- * Studio's runtime config: the six public values it signs in with. Nothing else is here (no
- * PAT, key or secret): it is public and cached.
+ * Studio's runtime config: the public values it starts with. Nothing else is here (no PAT, key
+ * or secret): it is public and cached.
  */
 export interface StudioConfig {
   /** The public API base URL. */
   apiUrl: string;
-  /** Studio's OIDC client id. */
-  clientId: string;
-  /** Zitadel's issuer URL (the OIDC authority). */
-  issuer: string;
-  /** The platform org's id. */
-  orgId: string;
-  /** The `chelabase` project id (the API audience Studio asks for). */
-  projectId: string;
   /** Studio's public host. */
   studioHost: string;
 }

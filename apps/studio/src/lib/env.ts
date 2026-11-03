@@ -5,44 +5,23 @@
  * values from the stack's `studio.env` instead ({@link readEnv}).
  */
 export interface StudioEnv {
-  issuer: string;
-  clientId: string;
-  projectId: string;
-  orgId: string;
   apiUrl: string;
-}
-
-const KEYS: Record<keyof StudioEnv, string> = {
-  issuer: "VITE_ZITADEL_ISSUER",
-  clientId: "VITE_ZITADEL_CLIENT_ID",
-  projectId: "VITE_ZITADEL_PROJECT_ID",
-  orgId: "VITE_ZITADEL_ORG_ID",
-  apiUrl: "VITE_API_URL",
-};
-
-export function readEnv(source: Record<string, string | undefined>): StudioEnv {
-  const value = (key: keyof StudioEnv) => source[KEYS[key]]?.trim() ?? "";
-  const missing = (Object.keys(KEYS) as (keyof StudioEnv)[])
-    .filter((key) => value(key) === "")
-    .map((key) => KEYS[key]);
-  if (missing.length > 0) {
-    throw new Error(
-      `Studio is missing ${missing.join(", ")}. Run \`just zitadel-bootstrap\` to write the stack's studio.env, then \`just workbench restart studio\`.`,
-    );
-  }
-  return {
-    issuer: value("issuer"),
-    clientId: value("clientId"),
-    projectId: value("projectId"),
-    orgId: value("orgId"),
-    apiUrl: value("apiUrl"),
-  };
+  studioHost: string;
 }
 
 /** Where auth serves Studio's runtime config, on Studio's own origin (the gateway routes it). */
 export const STUDIO_CONFIG_PATH = "/auth/v1/studio-config";
 
-const RUNTIME_KEYS: (keyof StudioEnv)[] = ["issuer", "clientId", "projectId", "orgId", "apiUrl"];
+/** The build values; only the API URL is needed. The host defaults to the page's own. */
+export function readEnv(source: Record<string, string | undefined>): StudioEnv {
+  const apiUrl = source.VITE_API_URL?.trim() ?? "";
+  if (apiUrl === "") {
+    throw new Error("Studio is missing VITE_API_URL. Set it in the stack's studio.env, then `just workbench restart studio`.");
+  }
+  return { apiUrl, studioHost: source.VITE_STUDIO_HOST?.trim() || window.location.host };
+}
+
+const RUNTIME_KEYS: (keyof StudioEnv)[] = ["apiUrl", "studioHost"];
 
 /** The runtime config's values; anything missing, blank or not a string is refused, by name. */
 export function readRuntimeConfig(body: unknown): StudioEnv {
@@ -55,13 +34,7 @@ export function readRuntimeConfig(body: unknown): StudioEnv {
   if (missing.length > 0) {
     throw new Error(`Studio's runtime config (${STUDIO_CONFIG_PATH}) is missing ${missing.join(", ")}.`);
   }
-  return {
-    issuer: value("issuer"),
-    clientId: value("clientId"),
-    projectId: value("projectId"),
-    orgId: value("orgId"),
-    apiUrl: value("apiUrl"),
-  };
+  return { apiUrl: value("apiUrl"), studioHost: value("studioHost") };
 }
 
 /**

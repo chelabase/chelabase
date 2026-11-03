@@ -37,8 +37,6 @@ import type {
   AppSignUpResult,
   AppUser,
   AppVerifyEmailBody,
-  AuthRequestBody,
-  AuthRequestInfo,
   CodeBody,
   ConfirmBody,
   DescribeInviteBody,
@@ -48,10 +46,12 @@ import type {
   ErrorEnvelope,
   InstanceInfo,
   InviteDescription,
-  NextStep,
+  MemberToken,
+  MintMemberTokenParams,
+  SignInAnswer,
   SignInBody,
+  SignInParams,
   SignUpBody,
-  SignedIn,
   StudioConfig
 } from './model';
 
@@ -87,9 +87,9 @@ export const getAcceptInviteUrl = () => {
 }
 
 /**
- * Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.
+ * Accepts a member invite and signs in (the HttpOnly session cookie). With `user` and `code` (the code from the invite email), the code sets the first password and verifies the email; an account someone else registered without proving the email has its old password replaced and every session ended. With `email` (an existing account, from the invite notice), the account's own password signs in and no password is set. The link's token `t` must match an open invite. A removed member's ban is lifted only then; any other ban is `member_suspended`. If a step after the code fails, the error is `invite_incomplete` with `error.accept_ticket`: send it back in place of `code`, with the same password, to finish. A weak password is refused before the code is used.
  */
-export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<SignedIn> => {
+export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -105,7 +105,7 @@ export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?:
     }
     return headers;
   };
-return customFetch<SignedIn>(getAcceptInviteUrl(),
+return customFetch<SignInAnswer>(getAcceptInviteUrl(),
   {
     ...options,
     method: 'POST',
@@ -1209,91 +1209,6 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
       return useMutation(getAppVerifyEmailMutationOptions(options), queryClient);
     }
 
-export const getGetAuthRequestUrl = () => {
-
-
-
-
-  return `/auth/v1/auth-request`
-}
-
-/**
- * Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.
- */
-export const getAuthRequest = async (authRequestBody: AuthRequestBody, options?: Parameters<typeof customFetch>[1]): Promise<AuthRequestInfo> => {
-
-    const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
-    if (!h) return {};
-    if (h instanceof Headers) return Object.fromEntries(h.entries());
-    if (Symbol.iterator in h) {
-      return Object.fromEntries(
-        Array.from(h as Iterable<Iterable<string>>, (entry) => Array.from(entry) as [string, string]),
-      );
-    }
-    const headers: Record<string, string | readonly string[]> = {};
-    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
-      if (value !== undefined) headers[name] = value;
-    }
-    return headers;
-  };
-return customFetch<AuthRequestInfo>(getGetAuthRequestUrl(),
-  {
-    ...options,
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...getHeaders(options?.headers) },
-    body: JSON.stringify(authRequestBody)
-  }
-);}
-
-
-
-
-
-export const getGetAuthRequestMutationKey = () => ['getAuthRequest'] as const;
-
-export const getGetAuthRequestMutationOptions = <TError = ErrorType<ErrorEnvelope>,
-    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof getAuthRequest>>, TError,GetAuthRequestMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
-): UseMutationOptions<Awaited<ReturnType<typeof getAuthRequest>>, TError,GetAuthRequestMutationVariables, TContext> => {
-
-const mutationKey = getGetAuthRequestMutationKey();
-const {mutation: mutationOptions, request: requestOptions} = options ?
-      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
-      options
-      : {...options, mutation: {...options.mutation, mutationKey}}
-      : {mutation: { mutationKey, }, request: undefined};
-
-
-
-
-      const mutationFn: MutationFunction<Awaited<ReturnType<typeof getAuthRequest>>, GetAuthRequestMutationVariables> = (props) => {
-          const {data} = props ?? {};
-
-          return  getAuthRequest(data,requestOptions)
-        }
-
-
-
-
-
-
-  return  { mutationFn, ...mutationOptions }}
-
-    export type GetAuthRequestMutationResult = NonNullable<Awaited<ReturnType<typeof getAuthRequest>>>
-    export type GetAuthRequestMutationBody = AuthRequestBody
-    export type GetAuthRequestMutationError = ErrorType<ErrorEnvelope>
-    export type GetAuthRequestMutationVariables = {data: AuthRequestBody}
-
-    export const useGetAuthRequest = <TError = ErrorType<ErrorEnvelope>,
-    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof getAuthRequest>>, TError,GetAuthRequestMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
- , queryClient?: QueryClient): UseMutationResult<
-        Awaited<ReturnType<typeof getAuthRequest>>,
-        TError,
-        GetAuthRequestMutationVariables,
-        TContext
-      > => {
-      return useMutation(getGetAuthRequestMutationOptions(options), queryClient);
-    }
-
 export const getGetInstanceUrl = () => {
 
 
@@ -1303,7 +1218,7 @@ export const getGetInstanceUrl = () => {
 }
 
 /**
- * Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.
+ * Whether this instance is unclaimed, so the sign-up page asks for the setup code, and whether it takes sign-ups, so the sign-in page offers one. Sets no cookie.
  */
 export const getInstance = async ( options?: Parameters<typeof customFetch>[1]): Promise<InstanceInfo> => {
 
@@ -1401,7 +1316,7 @@ export const getDescribeInviteUrl = () => {
 }
 
 /**
- * Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.
+ * Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.
  */
 export const describeInvite = async (describeInviteBody: DescribeInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<InviteDescription> => {
 
@@ -1486,7 +1401,7 @@ export const getLogoutUrl = () => {
 }
 
 /**
- * Ends the session and clears the HttpOnly session and step cookies.
+ * Revokes the session and clears the HttpOnly session and step cookies. If the identity service can't be reached the cookies stay, so the client can try again.
  */
 export const logout = async (emptyRequest: EmptyRequest, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1571,7 +1486,7 @@ export const getRequestPasswordResetUrl = () => {
 }
 
 /**
- * Emails a password-reset link if the account exists. Always answers the same, whether or not it does.
+ * Emails a password-reset code if the account exists, in the background. Always answers the same, in the same padded time, whether or not it does. At most 5 codes go out per person an hour.
  */
 export const requestPasswordReset = async (emailBody: EmailBody, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1656,7 +1571,7 @@ export const getConfirmPasswordResetUrl = () => {
 }
 
 /**
- * Sets a new password with the code from the reset email.
+ * Sets a new password with the code from the reset email, verifies the email and ends every session of the account. A wrong code and an unknown email answer alike. Sets no cookie: sign in with the new password.
  */
 export const confirmPasswordReset = async (confirmBody: ConfirmBody, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1741,7 +1656,7 @@ export const getResendCodeUrl = () => {
 }
 
 /**
- * Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent.
+ * Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent; at most 5 codes go out per person an hour.
  */
 export const resendCode = async (emptyRequest: EmptyRequest, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1817,18 +1732,26 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
       return useMutation(getResendCodeMutationOptions(options), queryClient);
     }
 
-export const getSignInUrl = () => {
+export const getSignInUrl = (params?: SignInParams,) => {
+  const normalizedParams = new URLSearchParams();
 
+  Object.entries(params || {}).forEach(([key, value]) => {
 
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
 
+  const stringifiedParams = normalizedParams.toString();
 
-  return `/auth/v1/sign-in`
+  return stringifiedParams.length > 0 ? `/auth/v1/sign-in?${stringifiedParams}` : `/auth/v1/sign-in`
 }
 
 /**
- * Signs in with email and password. On success sets the HttpOnly session cookie, or, when the email still needs verifying, the HttpOnly step cookie that the code step reads.
+ * Signs in with email and password. `studio` sets the HttpOnly session cookie, which seals the identity session and the tenant. `verify` sets the HttpOnly step cookie that the code step reads. `pending` sets no cookie: an admin hasn't approved this person yet. A wrong password, an unknown email and no active membership answer alike.
  */
-export const signIn = async (signInBody: SignInBody, options?: Parameters<typeof customFetch>[1]): Promise<NextStep> => {
+export const signIn = async (signInBody: SignInBody,
+    params?: SignInParams, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -1844,7 +1767,7 @@ export const signIn = async (signInBody: SignInBody, options?: Parameters<typeof
     }
     return headers;
   };
-return customFetch<NextStep>(getSignInUrl(),
+return customFetch<SignInAnswer>(getSignInUrl(params),
   {
     ...options,
     method: 'POST',
@@ -1874,9 +1797,9 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
 
 
       const mutationFn: MutationFunction<Awaited<ReturnType<typeof signIn>>, SignInMutationVariables> = (props) => {
-          const {data} = props ?? {};
+          const {data,params} = props ?? {};
 
-          return  signIn(data,requestOptions)
+          return  signIn(data,params,requestOptions)
         }
 
 
@@ -1889,7 +1812,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type SignInMutationResult = NonNullable<Awaited<ReturnType<typeof signIn>>>
     export type SignInMutationBody = SignInBody
     export type SignInMutationError = ErrorType<ErrorEnvelope>
-    export type SignInMutationVariables = {data: SignInBody}
+    export type SignInMutationVariables = {data: SignInBody;params?: SignInParams}
 
     export const useSignIn = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof signIn>>, TError,SignInMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -1911,9 +1834,9 @@ export const getSignUpUrl = () => {
 }
 
 /**
- * Creates an account. Sets the HttpOnly session cookie when email verification is off, otherwise the HttpOnly step cookie that the code step reads.
+ * Creates an account: the fresh-install admin with the setup code, otherwise a person waiting for an admin's approval. With email verification off it signs them in, so the answer is `studio` (the session cookie) or `pending` (no cookie). With it on, `verify` and the HttpOnly step cookie that the code step reads.
  */
-export const signUp = async (signUpBody: SignUpBody, options?: Parameters<typeof customFetch>[1]): Promise<NextStep> => {
+export const signUp = async (signUpBody: SignUpBody, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -1929,7 +1852,7 @@ export const signUp = async (signUpBody: SignUpBody, options?: Parameters<typeof
     }
     return headers;
   };
-return customFetch<NextStep>(getSignUpUrl(),
+return customFetch<SignInAnswer>(getSignUpUrl(),
   {
     ...options,
     method: 'POST',
@@ -1996,7 +1919,7 @@ export const getGetStudioConfigUrl = () => {
 }
 
 /**
- * Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.
+ * Studio's runtime config: the API URL and Studio's host. Public; cacheable for 60 s.
  */
 export const getStudioConfig = async ( options?: Parameters<typeof customFetch>[1]): Promise<StudioConfig> => {
 
@@ -2020,7 +1943,7 @@ export const getGetStudioConfigQueryKey = () => {
     }
 
 
-export const getGetStudioConfigQueryOptions = <TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+export const getGetStudioConfigQueryOptions = <TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
 ) => {
 
 const {query: queryOptions, request: requestOptions} = options ?? {};
@@ -2039,10 +1962,10 @@ const {query: queryOptions, request: requestOptions} = options ?? {};
 }
 
 export type GetStudioConfigQueryResult = NonNullable<Awaited<ReturnType<typeof getStudioConfig>>>
-export type GetStudioConfigQueryError = ErrorType<ErrorEnvelope>
+export type GetStudioConfigQueryError = ErrorType<unknown>
 
 
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
         DefinedInitialDataOptions<
           Awaited<ReturnType<typeof getStudioConfig>>,
@@ -2052,7 +1975,7 @@ export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioCo
       >, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
         UndefinedInitialDataOptions<
           Awaited<ReturnType<typeof getStudioConfig>>,
@@ -2062,12 +1985,12 @@ export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioCo
       >, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
@@ -2085,6 +2008,84 @@ export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioCo
 
 
 
+export const getMintMemberTokenUrl = (params?: MintMemberTokenParams,) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? 'null' : String(value))
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0 ? `/auth/v1/token?${stringifiedParams}` : `/auth/v1/token`
+}
+
+/**
+ * Mints a member access token from the HttpOnly session cookie, after checking that the identity session is live and younger than 30 days and that the membership is active. Takes no body. Studio must send `Origin` and `X-Chelabase-Studio: 1`. Never cached.
+ */
+export const mintMemberToken = async (params?: MintMemberTokenParams, options?: Parameters<typeof customFetch>[1]): Promise<MemberToken> => {
+
+  return customFetch<MemberToken>(getMintMemberTokenUrl(params),
+  {
+    ...options,
+    method: 'POST'
+
+
+  }
+);}
+
+
+
+
+
+export const getMintMemberTokenMutationKey = () => ['mintMemberToken'] as const;
+
+export const getMintMemberTokenMutationOptions = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof mintMemberToken>>, TError,MintMemberTokenMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+): UseMutationOptions<Awaited<ReturnType<typeof mintMemberToken>>, TError,MintMemberTokenMutationVariables, TContext> => {
+
+const mutationKey = getMintMemberTokenMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof mintMemberToken>>, MintMemberTokenMutationVariables> = (props) => {
+          const {params} = props ?? {};
+
+          return  mintMemberToken(params,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type MintMemberTokenMutationResult = NonNullable<Awaited<ReturnType<typeof mintMemberToken>>>
+
+    export type MintMemberTokenMutationError = ErrorType<ErrorEnvelope>
+    export type MintMemberTokenMutationVariables = {params?: MintMemberTokenParams}
+
+    export const useMintMemberToken = <TError = ErrorType<ErrorEnvelope>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof mintMemberToken>>, TError,MintMemberTokenMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof mintMemberToken>>,
+        TError,
+        MintMemberTokenMutationVariables,
+        TContext
+      > => {
+      return useMutation(getMintMemberTokenMutationOptions(options), queryClient);
+    }
+
 export const getVerifyEmailUrl = () => {
 
 
@@ -2094,9 +2095,9 @@ export const getVerifyEmailUrl = () => {
 }
 
 /**
- * Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.
+ * Checks the emailed code. Reads the HttpOnly step cookie and clears it once the email is verified. An open sign-up joins its tenant now, as a person waiting for approval. The answer is a sign-in's: `studio` sets the HttpOnly session cookie, `pending` sets none. If sign-up closed since the account was made, the answer is `sign_up_closed` and the account is deleted. A retry after a failure past the code finishes with the same code.
  */
-export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeof customFetch>[1]): Promise<SignedIn> => {
+export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -2112,7 +2113,7 @@ export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeo
     }
     return headers;
   };
-return customFetch<SignedIn>(getVerifyEmailUrl(),
+return customFetch<SignInAnswer>(getVerifyEmailUrl(),
   {
     ...options,
     method: 'POST',

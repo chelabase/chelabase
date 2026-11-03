@@ -16,7 +16,7 @@ chelabase-metadata = { workspace = true }
 chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true }
-chelabase-zitadel = { workspace = true }
+chelabase-identity = { workspace = true }
 getrandom = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
@@ -36,4 +36,5 @@ uuid = { workspace = true }
 test-support = []
 
 [dev-dependencies]
+axum = { workspace = true }
 tempfile = { workspace = true }

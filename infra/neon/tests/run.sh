@@ -78,12 +78,14 @@ check "build.sh with an unknown target exits 2" refuses 2 "$here/build.sh" bogus
 check "build.sh no longer builds vm-compute" refuses 2 "$here/build.sh" vm-compute
 
 # --- Compose ------------------------------------------------------------------------------
-# The base file, the workbench overlay and the self-hosted build overlay, one project (`chelabase`).
+# The base file, the workbench overlay, the self-hosted build overlay and the example's overlay,
+# one project (`chelabase`).
 compose_file="$root/infra/compose/docker-compose.yml"
 overlay_file="$root/infra/compose/docker-compose.workbench.yml"
 build_file="$root/infra/compose/docker-compose.build.yml"
-check "the base Compose file and its two overlays" \
-  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$build_file $overlay_file $compose_file "
+example_file="$root/infra/compose/docker-compose.example.yml"
+check "the base Compose file and its three overlays" \
+  test "$(find "$root/infra/compose" -name '*.yml' ! -name moon.yml | sort | tr '\n' ' ')" = "$build_file $example_file $overlay_file $compose_file "
 check "no hook-relay image or service left" \
   bash -c '! test -e "$1/infra/compose/hook-relay.Dockerfile" && ! grep -q "hook-relay" "$2"' _ "$root" "$compose_file"
 check "NEON_IMAGE defaults to a digest-pinned GHCR image" \
@@ -97,7 +99,7 @@ if command -v docker >/dev/null; then
   compose=(env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE docker compose -p chelabase-feat-x -f "$compose_file" -f "$overlay_file" --env-file "$fixture")
   services() { "${compose[@]}" "$@" config --services | sort | tr '\n' ' '; }
   check "the stack has every service (infra, app tier, no hook relay)" \
-    test "$(services)" = "auth create-bucket gateway mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage-broker storage-controller storcon-db studio valkey worker zitadel zitadel-db "
+    test "$(services)" = "auth create-bucket gateway identity mailpit metadata-db nats orchestrator pageserver proxy proxy-tls realtime register-safekeepers rest safekeeper1 safekeeper2 safekeeper3 seaweedfs storage-broker storage-controller storcon-db studio valkey worker "
   check "the project name comes from -p" \
     test "$("${compose[@]}" config --format json | jq -r '.name')" = "chelabase-feat-x"
   check "the compose file names no project" bash -c '! grep -qE "^name:" "$1"' _ "$compose_file"
@@ -109,13 +111,8 @@ if command -v docker >/dev/null; then
       | "\(.host_ip):\(.published)"] | sort | join(" ")')"
   check "neon publishes only the proxy's Postgres port, on loopback" \
     test "$published" = "127.0.0.1:4537 ::1:4537"
-  zitadel="$(jq -r '.services.zitadel' <<<"$neon_json")"
-  check "zitadel is v4.19.1, pinned by digest" \
-    grep -Eq '"ghcr\.io/zitadel/zitadel:v4\.19\.1@sha256:[0-9a-f]{64}"' <<<"$zitadel"
-  check "zitadel sends sign-ins to Studio's /login" \
-    test "$(jq -r '.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2' <<<"$zitadel")" = "http://studio.feat-x.chelabase.localhost:8137/login?authRequest="
-  check "zitadel writes the login-client token" \
-    test "$(jq -r '.environment.ZITADEL_FIRSTINSTANCE_LOGINCLIENTPATPATH' <<<"$zitadel")" = "/zitadel-bootstrap/login-client.pat"
+  check "no retired identity provider service" \
+    test "$(jq -r '[.services | keys[] | select(test("^zit" + "adel"))] | length' <<<"$neon_json")" = 0
   storcon="$(jq -r '.services["storage-controller"]' <<<"$neon_json")"
   # RT1 T1 (S27): the hook token is a generated secret; fork round 4 (F6): the controller reads
   # it from its mount itself (--control-plane-jwt-token-file), so it is in no argument and not

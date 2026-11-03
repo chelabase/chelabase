@@ -49,7 +49,7 @@ The worker has no public API. It listens to NATS in two ways.
 **Background loops** keep the system converging without being asked:
 
 - **Reconcile**, every 30 seconds, compares each branch's recorded status with its compute and fixes the difference: it recreates a compute that is missing or stopped (backing off when one keeps failing), finishes interrupted switches, and hands a merge whose worker went silent back to the queue.
-- Separate sweeps reconcile member roles and app users, revoke the logins of members who were deactivated or deleted in the identity provider, renew compute certificates and refresh storage tokens before they expire.
+- Separate sweeps reconcile member roles and app users, renew compute certificates and refresh storage tokens before they expire. Removing or suspending a member revokes their logins inline, with no sweep.
 
 The worker serves only `/health`, on `127.0.0.1:8082` by default.
 

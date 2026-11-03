@@ -22,7 +22,7 @@ chelabase-query = { workspace = true }
 chelabase-routes = { workspace = true }
 chelabase-schema = { workspace = true, features = ["openapi"] }
 chelabase-secrets = { workspace = true }
-chelabase-zitadel = { workspace = true }
+chelabase-identity = { workspace = true }
 async-nats = { workspace = true }
 chelabase-types = { workspace = true, features = ["axum", "openapi"] }
 axum = { workspace = true }
@@ -61,7 +61,7 @@ utoipa-axum = { workspace = true }
 # Live tests' own admin sessions.
 sqlx = { workspace = true }
 async-trait = { workspace = true }
-chelabase-zitadel = { workspace = true, features = ["mock"] }
+chelabase-identity = { workspace = true, features = ["mock"] }
 chelabase-auth = { workspace = true, features = ["test-support"] }
 hmac = { workspace = true }
 jsonwebtoken = { workspace = true }

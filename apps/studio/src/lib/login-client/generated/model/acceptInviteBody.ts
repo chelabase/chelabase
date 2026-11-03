@@ -5,28 +5,36 @@
  * OpenAPI spec version: 1
  */
 
+/**
+ * One of three shapes: `user` + `code` (a new person, or an account nobody proved: the code sets
+ * the first password), `user` + `acceptTicket` (a retry after the code was spent), or `email`
+ * (an existing account, from the code-less notice: `password` is its own). `t` is always the
+ * link's token.
+ */
 export interface AcceptInviteBody {
   /**
-     * From an `invite_incomplete` error: retries the steps after the (spent) code.
+     * From an `invite_incomplete` error: finishes the steps after the (spent) code. Send it in
+     * place of `code`, with the same password.
      * @nullable
      */
   acceptTicket?: string | null;
   /**
-     * The pending sign-in to finish; without it the answer sends the browser to Studio.
-     * @nullable
-     */
-  authRequest?: string | null;
-  /**
-     * The invite code from the link. Send this or `acceptTicket`.
+     * The six-digit invite code from the invite email, or from the admin's link.
      * @nullable
      */
   code?: string | null;
-  password: string;
   /**
-     * The link's `reset=1`: `code` is a password-reset code (a person who already had a way to
-     * sign in, whom Zitadel gives no invite code). It sets the password itself.
+     * An existing account's email (the notice's link carries only `t`).
+     * @nullable
      */
-  reset?: boolean;
-  /** The Zitadel user id from the invite link. */
-  user: string;
+  email?: string | null;
+  /** The new password with `code` or `acceptTicket`; the account's own with `email`. */
+  password: string;
+  /** The invite link's token (`t`). */
+  t: string;
+  /**
+     * The invitee's identity user id, from a code link (`?user=`).
+     * @nullable
+     */
+  user?: string | null;
 }

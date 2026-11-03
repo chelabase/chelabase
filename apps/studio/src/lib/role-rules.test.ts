@@ -63,7 +63,7 @@ function reference(rows: BranchRole[], granted: string[]): string[] {
 }
 
 const me = (roles: string[]): Me => ({
-  sub: "u", email: null, name: null, tenant_id: "t", instance_admin: false, tenant_admins: [], user: { sub: "u", org_id: "o" },
+  sub: "u", email: null, name: null, tenant_id: "t", instance_admin: false, tenant_admins: [], user: { sub: "u" },
   member: { id: "m", status: "active", tenant_admin: false },
   projects: [{ project_id: "p", platform_role: "developer", roles, databases: [] }],
   tenant: { id: "t", slug: "t", display_name: null, projects: [] },

@@ -3,7 +3,7 @@ title: Studio tour
 description: What each Studio screen does, from signing in to the Table editor and the SQL editor.
 ---
 
-Studio is Chelabase's web app. In a local stack it runs at `http://studio.chelabase.localhost:8000` (`just workbench up` starts it). Everything it does goes through the gateway on `:8000` with your Zitadel token, so anything you can click you can also do through the Management API (the reference is in Studio's **API** page and under Reference in these docs).
+Studio is Chelabase's web app. In a local stack it runs at `http://studio.chelabase.localhost:8000` (`just workbench up` starts it). Everything it does goes through the gateway on `:8000` with your member access token, so anything you can click you can also do through the Management API (the reference is in Studio's **API** page and under Reference in these docs).
 
 <Callout type="info">
 Open Studio at `studio.chelabase.localhost:8000`, not an IP address: the gateway routes by host name, and the sign-in redirect and the gateway's CORS origin are registered for that host.
@@ -11,12 +11,12 @@ Open Studio at `studio.chelabase.localhost:8000`, not an IP address: the gateway
 
 ## Signing in
 
-Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset` and `/logout`. Zitadel sends every sign-in there; the pages call the `auth` service through the gateway (`/auth/v1/*`), and the step state lives in encrypted HttpOnly cookies. The [Quickstart](/docs/using/quickstart) walks through signing in as the bootstrap admin.
+Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset`, `/pending` and `/logout`. They call the `auth` service through the gateway (`/auth/v1/*`); the session and the step state live in encrypted HttpOnly cookies, and Studio holds only a short-lived token in memory ([Identity service](/docs/architecture/identity)). The [Quickstart](/docs/using/quickstart) walks through signing in as the bootstrap admin.
 
-- Self-hosted mode (the default, `CHELABASE_MODE=self-hosted`) takes no self-sign-up unless a tenant admin switches it on (`PATCH /v1/instance/settings` with `open_signup`). The first admin is whoever claims the instance with the setup code ([Install](/docs/self-hosting/install#claim-the-instance)); an admin invites everyone else, by an email, or by a link to hand over when Zitadel has no email provider (`GET /v1/invites/delivery` says). The sign-in page offers **Create account** only while sign-up is open, and always says "No account? Ask your admin for an invite" otherwise. Platform mode takes no self-sign-up yet.
+- Self-hosted mode (the default, `CHELABASE_MODE=self-hosted`) takes no self-sign-up unless a tenant admin switches it on (`PATCH /v1/instance/settings` with `open_signup`). The first admin is whoever claims the instance with the setup code ([Install](/docs/self-hosting/install#claim-the-instance)); an admin invites everyone else, by an email, or by a link to hand over when no SMTP server is configured (`GET /v1/invites/delivery` says). The sign-in page offers **Create account** only while sign-up is open, and always says "No account? Ask your admin for an invite" otherwise. Platform mode takes no self-sign-up yet.
 - With sign-up open, a new person is a pending member who can do nothing until an admin approves them (`approveMember`, with their first grants) or declines them. Sign-ups are created with the email already verified in self-hosted mode; set `CHELABASE_REQUIRE_EMAIL_VERIFICATION=true` to require a code (codes and password-reset emails land in Mailpit at `http://mail.chelabase.localhost:8000`); `=false` turns it off in any mode.
 - A sign-up for an email that is taken says so and sends you to sign in.
-- Everyone who joins is in the same organization and tenant: a shared team workspace, by design for self-hosting. An admin can give the tenant a display name (`PATCH /v1/tenant`); the invite page and `GET /v1/me` use it, falling back to the slug.
+- Everyone who joins is in the same tenant: a shared team workspace, by design for self-hosting. An admin can give the tenant a display name (`PATCH /v1/tenant`); the invite page and `GET /v1/me` use it, falling back to the slug.
 
 ## Projects
 

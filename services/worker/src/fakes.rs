@@ -219,6 +219,11 @@ pub struct FakeState {
     /// A concurrent bootstrap that wins the next claim: `(pg_database, sealed)` is stored just
     /// before it.
     pub auth_sync_racer: Option<(String, String)>,
+    /// Applied once, just after the next `project_auth` read answers: the row moves to this
+    /// status, or goes (`None`), as a concurrent job would. `after_auth_read_skip` reads
+    /// answer unchanged first.
+    pub after_auth_read: Option<Option<AppUsersStatus>>,
+    pub after_auth_read_skip: usize,
     pub app_sessions: Vec<AppSession>,
     /// The schema merge base history, oldest first (E18); ids increase with each append.
     pub schema_bases: Vec<SchemaBase>,
@@ -251,9 +256,6 @@ pub struct FakeState {
     /// T6: every personal-login record (any database), as `personal_login_records` reads them
     /// (`qualifies` is whatever the test sets).
     pub personal_logins: Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>,
-    /// T7: each member's personal-row endpoints, as `revoke_logins_for_zitadel_user` returns
-    /// them (revoked logins' rows included, as the real read does).
-    pub login_endpoints: HashMap<uuid::Uuid, Vec<chelabase_metadata::personal_logins::LoginEndpoint>>,
     /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
     /// new branch and a restore's backup copy their source's.
     pub guard_exemptions: HashMap<BranchId, Vec<String>>,
@@ -686,7 +688,6 @@ impl FakeMetadata {
                 project_id: project,
                 status,
                 error: None,
-                zitadel_org_id: None,
                 database_id: db,
                 pg_database: "app".to_string(),
                 schema_name: "public".to_string(),
@@ -703,15 +704,15 @@ impl FakeMetadata {
         self.state().project_auth.get(&project).cloned()
     }
 
-    /// A live app session of `user`, with Zitadel session `zitadel_session_id`.
-    pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, zitadel_session_id: &str) -> uuid::Uuid {
+    /// A live app session of `user`, with identity session `identity_session_id`.
+    pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, identity_session_id: &str) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now();
         self.state().app_sessions.push(AppSession {
             id,
             project_id: project,
             user_id: user,
-            zitadel_session_id: zitadel_session_id.to_string(),
+            identity_session_id: identity_session_id.to_string(),
             created_at: now,
             last_used_at: now,
             expires_at: now + chrono::Duration::days(30),
@@ -2356,41 +2357,6 @@ impl WorkerMetadata for FakeMetadata {
         Ok(true)
     }
 
-    /// As the metadata's (D7): the marked members, by tenant then member.
-    async fn offboarded_members(
-        &self,
-    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
-        record(&self.journal, "metadata.offboarded_members".to_string());
-        let state = self.read("offboarded_members")?;
-        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
-            .members
-            .iter()
-            .filter(|m| m.offboarded)
-            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
-            .collect();
-        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
-        Ok(rows)
-    }
-
-    /// As the metadata's (D7): the tenant's member with this Zitadel user loses its mark; true
-    /// when it had one.
-    async fn clear_offboarded(
-        &self,
-        tenant: TenantId,
-        zitadel_user_id: &str,
-    ) -> Result<bool, MetadataError> {
-        let mut state = self.write("clear_offboarded")?;
-        let Some(m) = state
-            .members
-            .iter_mut()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id && m.offboarded)
-        else {
-            return Ok(false);
-        };
-        m.offboarded = false;
-        Ok(true)
-    }
-
     async fn member_acted_roles(
         &self,
         branch: uuid::Uuid,
@@ -2473,52 +2439,6 @@ impl WorkerMetadata for FakeMetadata {
             .insert(role_name.to_string(), FakeLogin::new(RoleOrigin::Personal, None, false));
         ep.set_verifier(role_name, verifier.as_deref());
         Ok(())
-    }
-
-    /// As the metadata's: one row per member holding a login that isn't revoked, by tenant
-    /// then member.
-    async fn members_with_live_logins(
-        &self,
-    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
-        record(&self.journal, "metadata.members_with_live_logins".to_string());
-        let state = self.read("members_with_live_logins")?;
-        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
-            .members
-            .iter()
-            .filter(|m| state.personal_logins.iter().any(|l| l.member_id == m.id && !l.revoked))
-            .map(|m| (m.tenant_id, m.id, m.zitadel_user_id.clone()))
-            .collect();
-        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
-        Ok(rows)
-    }
-
-    /// As the metadata's: the tenant's member with this Zitadel user has every login revoked
-    /// (`revoked`, no verifier) and the member's endpoints come back; an unknown user: empty.
-    async fn revoke_logins_for_zitadel_user(
-        &self,
-        tenant: TenantId,
-        zitadel_user_id: &str,
-    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        // `write` journals the call once (the tests count one entry per revocation).
-        let mut state = self.write("revoke_logins_for_zitadel_user")?;
-        let state = &mut *state;
-        let Some(member) = state
-            .members
-            .iter()
-            .find(|m| m.tenant_id == tenant && m.zitadel_user_id == zitadel_user_id)
-            .map(|m| m.id)
-        else {
-            return Ok(Vec::new());
-        };
-        for login in state.personal_logins.iter_mut().filter(|l| l.member_id == member) {
-            login.revoked = true;
-            login.scram_verifier = None;
-        }
-        // D7: the member is marked offboarded too.
-        if let Some(m) = state.members.iter_mut().find(|m| m.id == member) {
-            m.offboarded = true;
-        }
-        Ok(state.login_endpoints.get(&member).cloned().unwrap_or_default())
     }
 
     async fn delete_personal_role_row(
@@ -2791,7 +2711,24 @@ impl WorkerMetadata for FakeMetadata {
     }
 
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
-        Ok(self.read("project_auth")?.project_auth.get(&project).cloned())
+        let mut state = self.write("project_auth")?;
+        let found = state.project_auth.get(&project).cloned();
+        if state.after_auth_read.is_some() && state.after_auth_read_skip > 0 {
+            state.after_auth_read_skip -= 1;
+            return Ok(found);
+        }
+        match state.after_auth_read.take() {
+            Some(Some(status)) => {
+                if let Some(row) = state.project_auth.get_mut(&project) {
+                    row.status = status;
+                }
+            }
+            Some(None) => {
+                state.project_auth.remove(&project);
+            }
+            None => {}
+        }
+        Ok(found)
     }
 
     async fn app_auth_for_database(
@@ -2804,22 +2741,6 @@ impl WorkerMetadata for FakeMetadata {
             .values()
             .find(|a| a.database_id == db)
             .cloned())
-    }
-
-    async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
-        let mut state = self.write("set_app_users_org")?;
-        if state
-            .project_auth
-            .values()
-            .any(|a| a.project_id != project && a.zitadel_org_id.as_deref() == Some(org_id))
-        {
-            return Err(MetadataError::Conflict);
-        }
-        if let Some(a) = state.project_auth.get_mut(&project) {
-            a.zitadel_org_id = Some(org_id.to_string());
-            a.updated_at = Utc::now();
-        }
-        Ok(())
     }
 
     async fn finish_enable_app_users(
@@ -2849,6 +2770,36 @@ impl WorkerMetadata for FakeMetadata {
 
     async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         self.write("delete_project_auth")?.project_auth.remove(&project);
+        Ok(())
+    }
+
+    async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        let mut state = self.write("finish_disable_app_users")?;
+        let disabling = state
+            .project_auth
+            .get(&project)
+            .is_some_and(|a| a.status == AppUsersStatus::Disabling);
+        if disabling {
+            state.project_auth.remove(&project);
+        }
+        Ok(disabling)
+    }
+
+    async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_app_users_error")?;
+        if let Some(a) = state
+            .project_auth
+            .get_mut(&project)
+            .filter(|a| matches!(a.status, AppUsersStatus::Enabled | AppUsersStatus::Disabling))
+            .filter(|a| a.error.as_deref() != error)
+        {
+            a.error = error.map(str::to_string);
+            a.updated_at = Utc::now();
+        }
         Ok(())
     }
 
@@ -4104,11 +4055,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
         recreate_backoff: Mutex::default(),
-        zitadel: None,
+        identity: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),
-        identity_sweep_every: Duration::from_secs(600),
-        identity_sweep_warned: Default::default(),
         remove_orphans: true,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,

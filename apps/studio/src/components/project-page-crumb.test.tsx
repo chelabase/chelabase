@@ -7,7 +7,7 @@ import { ProjectPage } from "./project-page";
 const database = { database_id: "d1", name: "web1", postgres_database: "web1", status: "ready", host: null, port: null, branch_count: 0 };
 const me = {
   sub: "u1", email: "u@example.test", name: "U", tenant_id: "t1", member: { id: "m", status: "active", tenant_admin: true },
-  instance_admin: true, tenant_admins: [], user: { sub: "u1", org_id: "o" },
+  instance_admin: true, tenant_admins: [], user: { sub: "u1" },
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [{ id: "p1", slug: "x", name: "Acme / shop é", status: "active", databases: [database] }] },
 };

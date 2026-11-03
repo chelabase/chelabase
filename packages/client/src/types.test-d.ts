@@ -263,8 +263,8 @@ type AppDb = {
     public: {
       tables: {
         profiles: {
-          Row: { id: string; email: string; email_verified: boolean; created_at: string; deleted_at: string | null; nick: string; age: number | null };
-          Insert: { id?: string; email?: string; email_verified?: boolean; created_at?: string; deleted_at?: string | null; nick: string; age?: number | null };
+          Row: { id: string; email: string; email_verified: boolean; created_at: string; deleted_at: string | null; banned_at: string | null; nick: string; age: number | null };
+          Insert: { id?: string; email?: string; email_verified?: boolean; created_at?: string; deleted_at?: string | null; banned_at?: string | null; nick: string; age?: number | null };
           Update: { nick?: string };
         };
       };

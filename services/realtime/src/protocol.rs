@@ -20,7 +20,7 @@ pub const MAX_VIEW_KEYS: usize = 1000;
 
 /// Close codes (spec §2).
 pub mod close {
-    /// The OIDC token expired without a renewal, or no valid `auth` frame came first.
+    /// The member token expired without a renewal, or no valid `auth` frame came first.
     pub const TOKEN_EXPIRED: u16 = 4001;
     /// Access revoked, or a renewal for another person or org.
     pub const REVOKED: u16 = 4003;
@@ -37,7 +37,7 @@ pub mod close {
 /// A client → server frame.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClientFrame {
-    /// The member's OIDC access token: first frame of a Studio socket (R9), then each renewal.
+    /// The member token auth signed: first frame of a Studio socket (R9), then each renewal.
     Auth {
         token: String,
     },

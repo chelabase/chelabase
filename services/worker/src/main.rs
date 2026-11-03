@@ -118,14 +118,13 @@ async fn main() -> anyhow::Result<()> {
     tokio::spawn(serve_all_rows_check(worker.clone(), nats.clone()));
     tokio::spawn(serve_member_roles_enqueue(worker.clone(), nats.clone()));
     tokio::spawn(member_roles_sweep_loop(worker.clone()));
-    tokio::spawn(identity_sweep_loop(worker.clone()));
     tokio::spawn(cert_sweep_loop(worker.clone()));
     tokio::spawn(worker::token_refresh::storage_token_refresh_loop(worker.clone()));
     tokio::spawn(reconcile_loop(worker.clone(), js.clone()));
     tokio::spawn(serve_app_users_check(worker.clone(), nats.clone()));
     tokio::spawn(app_users_reconcile_loop(worker.clone()));
-    if worker.zitadel.is_none() {
-        warn!("Zitadel admin access isn't configured: app users and project delete jobs wait (CHELABASE_AUTH_HOST, CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
+    if worker.identity.is_none() {
+        warn!("the identity service isn't configured: app users and project delete jobs wait (CHELABASE_IDENTITY_URL, CHELABASE_IDENTITY_TOKEN_FILE)");
     }
 
     let project_delete_worker = worker.clone();
@@ -745,22 +744,6 @@ async fn member_roles_sweep_loop(worker: Arc<RealWorker>) {
         let (done, failed) = worker.sweep_member_roles_once().await;
         if failed > 0 {
             warn!(done, failed, "member-role sweep: some branches failed; the next sweep retries");
-        }
-    }
-}
-
-/// T7: every `CHELABASE_IDENTITY_SWEEP_SECS`, the Zitadel state of each member holding a live
-/// personal login is read and a deactivated, locked or deleted user's logins are revoked: the
-/// backstop for a missed Actions webhook.
-async fn identity_sweep_loop(worker: Arc<RealWorker>) {
-    let every = worker.identity_sweep_every;
-    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
-    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        ticks.tick().await;
-        let (checked, revoked) = worker.sweep_identities_once().await;
-        if revoked > 0 {
-            info!(checked, revoked, "identity sweep: offboarded members' logins revoked");
         }
     }
 }

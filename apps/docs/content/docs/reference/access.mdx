@@ -12,7 +12,7 @@ Every route is declared once, in `chelabase-routes`, with the credential it take
 | Public | No identity. Health, the API document, sign-in and accept-invite (the code is the credential). |
 | Data API key | A data API key, checked by the gateway. |
 | Signed in | Any verified identity (`/v1/me`). |
-| Instance admin | Self-hosted: an active tenant admin. Platform: a member of the operator organization. |
+| Instance admin | Self-hosted: an active tenant admin. Platform: an active member of the operator tenant (`CHELABASE_OPERATOR_TENANT_ID`). |
 | Tenant member | Any active member of the caller's tenant. |
 | Tenant admin | An active tenant admin. |
 | Project *role* | The caller's effective platform role on the project is at least *role* (Viewer, Developer, Admin). A tenant admin is Admin on every project. |
@@ -45,7 +45,7 @@ A member's effective access on a project combines their own grant with the grant
 
 ## Every route
 
-Sorted by path. Credentials: *Zitadel token* is a management token; the data API's keys are described under [Data API](/docs/using/data-api).
+Sorted by path. Credentials: *Member token* is a member access token from `POST /auth/v1/token` (Studio's sign-in); the data API's keys are described under [Data API](/docs/using/data-api).
 
 {/* BEGIN GENERATED access-table */}
 
@@ -64,7 +64,6 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/auth/v1/app/sign-up` | public data key | Data API key |
 | GET | `/auth/v1/app/user` | public data key | Data API key |
 | POST | `/auth/v1/app/verify-email` | public data key | Data API key |
-| POST | `/auth/v1/auth-request` | none | Public |
 | GET | `/auth/v1/instance` | none | Public |
 | POST | `/auth/v1/invite` | none | Public |
 | POST | `/auth/v1/logout` | none | Public |
@@ -74,137 +73,138 @@ Sorted by path. Credentials: *Zitadel token* is a management token; the data API
 | POST | `/auth/v1/sign-in` | none | Public |
 | POST | `/auth/v1/sign-up` | none | Public |
 | GET | `/auth/v1/studio-config` | none | Public |
+| POST | `/auth/v1/token` | none | Public |
 | POST | `/auth/v1/verify-email` | none | Public |
 | POST | `/data/v1/query` | any data key | Data API key |
 | GET | `/data/v1/schema` | secret data key | Data API key |
 | GET | `/data/v1/types` | secret data key | Data API key |
 | GET | `/health` | none | Public |
-| GET | `/v1/access-events` | Zitadel token | Tenant admin |
-| POST | `/v1/databases` | Zitadel token | Project Admin |
-| DELETE | `/v1/databases/\{id\}` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}` | Zitadel token | Project Viewer |
-| PATCH | `/v1/databases/\{id\}` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/branches` | Zitadel token | Project Developer |
-| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/connection` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/console/query` | Zitadel token | Act as: Viewer and the role in your set |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/console/schema` | Zitadel token | Act as: Viewer and the role in your set |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/schema` | Zitadel token | Project Viewer |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/types` | Zitadel token | Project Developer |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/databases` | Zitadel token | Project Viewer |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions` | Zitadel token | Project Developer |
-| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Zitadel token | Project Admin |
-| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Zitadel token | Project Developer |
-| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Zitadel token | Project Developer |
-| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Zitadel token | Project Developer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}/rotate` | Zitadel token | Project Developer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/merges` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/objects` | Zitadel token | Project Viewer |
-| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}` | Zitadel token | Project Admin |
-| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/privileges` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-password` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-to-parent` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/restore` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/review` | Zitadel token | Project Developer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/acknowledge` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/fix` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Zitadel token | Project Admin |
-| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |
-| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/delete-preview` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/reset-password` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/sessions` | Zitadel token | Project Admin |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/schema-changes` | Zitadel token | Act as, by branch: Developer unprotected, Admin protected, and the role in your set |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql` | Zitadel token | Act as: Developer and the role in your set |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/runs/\{run_id\}/cancel` | Zitadel token | Project Developer |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/schema` | Zitadel token | Act as: Developer and the role in your set |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/cell` | Zitadel token | Act as: Viewer and the role in your set |
-| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/rows/default` | Zitadel token | Act as: Developer and the role in your set |
-| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/types` | Zitadel token | Project Viewer |
-| GET | `/v1/databases/\{id\}/connection` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/merges` | Zitadel token | Project Viewer |
-| GET | `/v1/databases/\{id\}/merges/\{merge_id\}` | Zitadel token | Project Viewer |
-| PATCH | `/v1/databases/\{id\}/merges/\{merge_id\}` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/abandon` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/apply` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/cancel` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/finish` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| GET | `/v1/databases/\{id\}/merges/\{merge_id\}/plan.sql` | Zitadel token | Project Viewer |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/recompute` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/rehearse` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/retry` | Zitadel token | Branch: Developer unprotected, Admin protected |
-| PUT | `/v1/databases/\{id\}/personal-login` | Zitadel token | Project Developer |
-| POST | `/v1/databases/\{id\}/personal-login/reset-password` | Zitadel token | Project Developer |
-| GET | `/v1/databases/\{id\}/personal-logins` | Zitadel token | Project Admin |
-| DELETE | `/v1/databases/\{id\}/personal-logins/\{member_id\}` | Zitadel token | Tenant member |
-| POST | `/v1/databases/\{id\}/reset-password` | Zitadel token | Project Admin |
-| GET | `/v1/databases/\{id\}/sql-queries` | Zitadel token | Project Developer |
-| POST | `/v1/databases/\{id\}/sql-queries` | Zitadel token | Project Developer |
-| DELETE | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Zitadel token | Project Developer |
-| GET | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Zitadel token | Project Developer |
-| PATCH | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Zitadel token | Project Developer |
-| GET | `/v1/instance/settings` | Zitadel token | Instance admin |
-| PATCH | `/v1/instance/settings` | Zitadel token | Instance admin |
-| POST | `/v1/invites` | Zitadel token | Tenant admin |
-| GET | `/v1/invites/delivery` | Zitadel token | Tenant member |
-| DELETE | `/v1/invites/\{invite_id\}` | Zitadel token | Tenant admin |
-| POST | `/v1/invites/\{invite_id\}/resend` | Zitadel token | Tenant admin |
-| GET | `/v1/me` | Zitadel token | Signed in |
-| GET | `/v1/members` | Zitadel token | Tenant member |
-| DELETE | `/v1/members/\{member_id\}` | Zitadel token | Tenant admin |
-| PATCH | `/v1/members/\{member_id\}` | Zitadel token | Tenant admin |
-| POST | `/v1/members/\{member_id\}/approve` | Zitadel token | Tenant admin |
-| POST | `/v1/members/\{member_id\}/decline` | Zitadel token | Tenant admin |
-| GET | `/v1/members/\{member_id\}/personal-logins` | Zitadel token | Tenant member |
-| POST | `/v1/members/\{member_id\}/reinstate` | Zitadel token | Tenant admin |
-| POST | `/v1/members/\{member_id\}/revoke-postgres-access` | Zitadel token | Tenant admin |
-| POST | `/v1/members/\{member_id\}/suspend` | Zitadel token | Tenant admin |
-| GET | `/v1/members/\{member_id\}/teams` | Zitadel token | Tenant member |
+| GET | `/v1/access-events` | Member token | Tenant admin |
+| POST | `/v1/databases` | Member token | Project Admin |
+| DELETE | `/v1/databases/\{id\}` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}` | Member token | Project Viewer |
+| PATCH | `/v1/databases/\{id\}` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}` | Member token | Branch: Developer unprotected, Admin protected |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/connection` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/console/query` | Member token | Act as: Viewer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/console/schema` | Member token | Act as: Viewer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/schema` | Member token | Project Viewer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/data-api/types` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/databases` | Member token | Project Viewer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Member token | Project Admin |
+| PUT | `/v1/databases/\{id\}/branches/\{branch_id\}/guard-exemptions/\{role\}` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Member token | Project Developer |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/keys/\{key_id\}/rotate` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/merges` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/objects` | Member token | Project Viewer |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}` | Member token | Project Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/data-api` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/pg-databases/\{name\}/privileges` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-password` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/reset-to-parent` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/restore` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/review` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/acknowledge` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/review/fix` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles` | Member token | Project Admin |
+| DELETE | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Member token | Project Admin |
+| PATCH | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/delete-preview` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/reset-password` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/roles/\{role\}/sessions` | Member token | Project Admin |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/schema-changes` | Member token | Act as, by branch: Developer unprotected, Admin protected, and the role in your set |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql` | Member token | Act as: Developer and the role in your set |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/runs/\{run_id\}/cancel` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/sql/schema` | Member token | Act as: Developer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/cell` | Member token | Act as: Viewer and the role in your set |
+| POST | `/v1/databases/\{id\}/branches/\{branch_id\}/tables/\{schema\}/\{table\}/rows/default` | Member token | Act as: Developer and the role in your set |
+| GET | `/v1/databases/\{id\}/branches/\{branch_id\}/types` | Member token | Project Viewer |
+| GET | `/v1/databases/\{id\}/connection` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/merges` | Member token | Project Viewer |
+| GET | `/v1/databases/\{id\}/merges/\{merge_id\}` | Member token | Project Viewer |
+| PATCH | `/v1/databases/\{id\}/merges/\{merge_id\}` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/abandon` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/apply` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/cancel` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/finish` | Member token | Branch: Developer unprotected, Admin protected |
+| GET | `/v1/databases/\{id\}/merges/\{merge_id\}/plan.sql` | Member token | Project Viewer |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/recompute` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/rehearse` | Member token | Branch: Developer unprotected, Admin protected |
+| POST | `/v1/databases/\{id\}/merges/\{merge_id\}/retry` | Member token | Branch: Developer unprotected, Admin protected |
+| PUT | `/v1/databases/\{id\}/personal-login` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/personal-login/reset-password` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/personal-logins` | Member token | Project Admin |
+| DELETE | `/v1/databases/\{id\}/personal-logins/\{member_id\}` | Member token | Tenant member |
+| POST | `/v1/databases/\{id\}/reset-password` | Member token | Project Admin |
+| GET | `/v1/databases/\{id\}/sql-queries` | Member token | Project Developer |
+| POST | `/v1/databases/\{id\}/sql-queries` | Member token | Project Developer |
+| DELETE | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
+| GET | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
+| PATCH | `/v1/databases/\{id\}/sql-queries/\{query_id\}` | Member token | Project Developer |
+| GET | `/v1/instance/settings` | Member token | Instance admin |
+| PATCH | `/v1/instance/settings` | Member token | Instance admin |
+| POST | `/v1/invites` | Member token | Tenant admin |
+| GET | `/v1/invites/delivery` | Member token | Tenant member |
+| DELETE | `/v1/invites/\{invite_id\}` | Member token | Tenant admin |
+| POST | `/v1/invites/\{invite_id\}/resend` | Member token | Tenant admin |
+| GET | `/v1/me` | Member token | Signed in |
+| GET | `/v1/members` | Member token | Tenant member |
+| DELETE | `/v1/members/\{member_id\}` | Member token | Tenant admin |
+| PATCH | `/v1/members/\{member_id\}` | Member token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/approve` | Member token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/decline` | Member token | Tenant admin |
+| GET | `/v1/members/\{member_id\}/personal-logins` | Member token | Tenant member |
+| POST | `/v1/members/\{member_id\}/reinstate` | Member token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/revoke-postgres-access` | Member token | Tenant admin |
+| POST | `/v1/members/\{member_id\}/suspend` | Member token | Tenant admin |
+| GET | `/v1/members/\{member_id\}/teams` | Member token | Tenant member |
 | GET | `/v1/openapi.json` | none | Public |
-| GET | `/v1/projects` | Zitadel token | Tenant member |
-| POST | `/v1/projects` | Zitadel token | Tenant admin |
-| DELETE | `/v1/projects/\{id\}` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}` | Zitadel token | Project Viewer |
-| PATCH | `/v1/projects/\{id\}` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}/access-events` | Zitadel token | Project Admin |
-| DELETE | `/v1/projects/\{id\}/app-users` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}/app-users` | Zitadel token | Project Viewer |
-| PUT | `/v1/projects/\{id\}/app-users` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}/grants` | Zitadel token | Project Admin |
-| DELETE | `/v1/projects/\{id\}/grants/\{member_id\}` | Zitadel token | Project Admin |
-| PUT | `/v1/projects/\{id\}/grants/\{member_id\}` | Zitadel token | Project Admin |
-| DELETE | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Zitadel token | Project Admin |
-| PUT | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Zitadel token | Project Admin |
-| POST | `/v1/projects/\{id\}/invites` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}/team-grants` | Zitadel token | Project Admin |
-| GET | `/v1/projects/\{id\}/users` | Zitadel token | Project Viewer |
-| POST | `/v1/projects/\{id\}/users` | Zitadel token | Project Developer |
-| DELETE | `/v1/projects/\{id\}/users/\{user_id\}` | Zitadel token | Project Developer |
-| GET | `/v1/projects/\{id\}/users/\{user_id\}` | Zitadel token | Project Viewer |
-| PATCH | `/v1/projects/\{id\}/users/\{user_id\}` | Zitadel token | Project Developer |
-| POST | `/v1/projects/\{id\}/users/\{user_id\}/deactivate` | Zitadel token | Project Developer |
-| POST | `/v1/projects/\{id\}/users/\{user_id\}/reactivate` | Zitadel token | Project Developer |
-| DELETE | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Zitadel token | Project Developer |
-| GET | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Zitadel token | Project Viewer |
+| GET | `/v1/projects` | Member token | Tenant member |
+| POST | `/v1/projects` | Member token | Tenant admin |
+| DELETE | `/v1/projects/\{id\}` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}` | Member token | Project Viewer |
+| PATCH | `/v1/projects/\{id\}` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}/access-events` | Member token | Project Admin |
+| DELETE | `/v1/projects/\{id\}/app-users` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}/app-users` | Member token | Project Viewer |
+| PUT | `/v1/projects/\{id\}/app-users` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}/grants` | Member token | Project Admin |
+| DELETE | `/v1/projects/\{id\}/grants/\{member_id\}` | Member token | Project Admin |
+| PUT | `/v1/projects/\{id\}/grants/\{member_id\}` | Member token | Project Admin |
+| DELETE | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Member token | Project Admin |
+| PUT | `/v1/projects/\{id\}/grants/\{member_id\}/overrides` | Member token | Project Admin |
+| POST | `/v1/projects/\{id\}/invites` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}/team-grants` | Member token | Project Admin |
+| GET | `/v1/projects/\{id\}/users` | Member token | Project Viewer |
+| POST | `/v1/projects/\{id\}/users` | Member token | Project Developer |
+| DELETE | `/v1/projects/\{id\}/users/\{user_id\}` | Member token | Project Developer |
+| GET | `/v1/projects/\{id\}/users/\{user_id\}` | Member token | Project Viewer |
+| PATCH | `/v1/projects/\{id\}/users/\{user_id\}` | Member token | Project Developer |
+| POST | `/v1/projects/\{id\}/users/\{user_id\}/deactivate` | Member token | Project Developer |
+| POST | `/v1/projects/\{id\}/users/\{user_id\}/reactivate` | Member token | Project Developer |
+| DELETE | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Member token | Project Developer |
+| GET | `/v1/projects/\{id\}/users/\{user_id\}/sessions` | Member token | Project Viewer |
 | GET | `/v1/realtime/socket` | none | Public |
-| POST | `/v1/realtime/tickets` | Zitadel token | Signed in |
-| GET | `/v1/teams` | Zitadel token | Tenant member |
-| POST | `/v1/teams` | Zitadel token | Tenant admin |
-| DELETE | `/v1/teams/\{team_id\}` | Zitadel token | Tenant admin |
-| GET | `/v1/teams/\{team_id\}` | Zitadel token | Tenant member |
-| PATCH | `/v1/teams/\{team_id\}` | Zitadel token | Tenant admin |
-| DELETE | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Zitadel token | Tenant admin |
-| PUT | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Zitadel token | Tenant admin |
-| DELETE | `/v1/teams/\{team_id\}/members/\{member_id\}` | Zitadel token | Tenant admin |
-| PUT | `/v1/teams/\{team_id\}/members/\{member_id\}` | Zitadel token | Tenant admin |
-| PATCH | `/v1/tenant` | Zitadel token | Tenant admin |
+| POST | `/v1/realtime/tickets` | Member token | Signed in |
+| GET | `/v1/teams` | Member token | Tenant member |
+| POST | `/v1/teams` | Member token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}` | Member token | Tenant admin |
+| GET | `/v1/teams/\{team_id\}` | Member token | Tenant member |
+| PATCH | `/v1/teams/\{team_id\}` | Member token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Member token | Tenant admin |
+| PUT | `/v1/teams/\{team_id\}/grants/\{project_id\}` | Member token | Tenant admin |
+| DELETE | `/v1/teams/\{team_id\}/members/\{member_id\}` | Member token | Tenant admin |
+| PUT | `/v1/teams/\{team_id\}/members/\{member_id\}` | Member token | Tenant admin |
+| PATCH | `/v1/tenant` | Member token | Tenant admin |
 
 {/* END GENERATED access-table */}

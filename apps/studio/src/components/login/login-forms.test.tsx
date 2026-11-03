@@ -9,62 +9,118 @@ import { SignInForm } from "./sign-in-form";
 import { SignUpForm } from "./sign-up-form";
 import { VerifyEmailForm } from "./verify-email-form";
 
-const DONE = { next: "done", redirect: "http://studio.chelabase.localhost:8000/callback?code=c" };
+const STUDIO = { next: "studio" };
 const EXPIRED_BODY = { error: { code: "sign_in_expired", message: "This sign-in has expired, start again" } };
 
 /** Renders a login form against fake auth routes, with the login client pointed at them. */
 function renderLogin(ui: ReactElement, routes: Record<string, FakeHandler> = {}) {
-  const f = fakeFetch({ "POST /auth/v1/auth-request": () => jsonResponse({ signUp: false, signUpAllowed: false }), ...routes });
+  const f = fakeFetch(routes);
   configureLoginClient({ baseUrl: "http://studio.test", fetchImpl: f });
   return { ...renderWithQuery(ui, { fetch: f }), f };
 }
 
 const call = (f: { calls: Request[] }, path: string) => f.calls.find((r) => new URL(r.url).pathname === path);
+const nav = () => ({ toApp: vi.fn(), toVerify: vi.fn(), toPending: vi.fn(), toRegister: vi.fn() });
+
+async function submitSignIn(password = "x") {
+  await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
+  await userEvent.type(screen.getByLabelText("Password"), password);
+  await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+}
 
 describe("SignInForm", () => {
-  it("signs in and follows auth's redirect", async () => {
-    const go = vi.fn();
-    const { f } = renderLogin(<SignInForm authRequest="V2_1" go={go} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => jsonResponse(DONE),
-    });
+  it("signs in with the cookie session and opens the app", async () => {
+    const n = nav();
+    const { f } = renderLogin(<SignInForm {...n} />, { "POST /auth/v1/sign-in": () => jsonResponse({ next: "studio" }) });
     await userEvent.type(await screen.findByLabelText("Email"), "ada@example.com");
     await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
     await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/callback?code=c"));
-    expect(await call(f, "/auth/v1/sign-in")!.clone().json()).toEqual({ authRequest: "V2_1", email: "ada@example.com", password: "Secret-pass1" });
-    expect(call(f, "/auth/v1/sign-in")!.credentials).toBe("include");
+    await waitFor(() => expect(n.toApp).toHaveBeenCalled());
+    const req = call(f, "/auth/v1/sign-in")!;
+    expect(await req.clone().json()).toEqual({ email: "ada@example.com", password: "Secret-pass1" });
+    expect(req.credentials).toBe("include");
+    expect(new URL(req.url).search).toBe("");
+  });
+
+  it("goes_to_the_code_step_when_the_email_isnt_verified", async () => {
+    const n = nav();
+    renderLogin(<SignInForm {...n} />, { "POST /auth/v1/sign-in": () => jsonResponse({ next: "verify" }) });
+    await submitSignIn();
+    await waitFor(() => expect(n.toVerify).toHaveBeenCalled());
+    expect(n.toApp).not.toHaveBeenCalled();
+  });
+
+  it("pending_shows_the_waiting_screen", async () => {
+    const n = nav();
+    renderLogin(<SignInForm {...n} />, { "POST /auth/v1/sign-in": () => jsonResponse({ next: "pending" }) });
+    await submitSignIn();
+    await waitFor(() => expect(n.toPending).toHaveBeenCalled());
+    expect(n.toApp).not.toHaveBeenCalled();
+  });
+
+  it("tenant_required_lists_the_tenants_and_retries_with_the_chosen_one", async () => {
+    const n = nav();
+    const answers: Request[] = [];
+    const { f } = renderLogin(<SignInForm {...n} />, {
+      "POST /auth/v1/sign-in": (req) => {
+        answers.push(req);
+        return new URL(req.url).searchParams.get("tenant") === "t-beta"
+          ? jsonResponse({ next: "studio" })
+          : jsonResponse({ error: { code: "tenant_required", message: "Choose a tenant", tenants: ["t-alpha", "t-beta"] } }, 409);
+      },
+    });
+    await submitSignIn("Secret-pass1");
+    expect(await screen.findByText("Choose a workspace")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "t-beta" }));
+    await waitFor(() => expect(n.toApp).toHaveBeenCalled());
+    expect(answers.map((r) => new URL(r.url).searchParams.get("tenant"))).toEqual([null, "t-beta"]);
+    // The retry carries the same credentials; the chooser did not ask for them again.
+    expect(await answers[1]!.clone().json()).toEqual({ email: "a@b.c", password: "Secret-pass1" });
+    expect(f.calls.filter((r) => new URL(r.url).pathname === "/auth/v1/sign-in")).toHaveLength(2);
+  });
+
+  it("a_failed_retry_after_choosing_shows_the_error_and_the_chooser_stays", async () => {
+    renderLogin(<SignInForm {...nav()} />, {
+      "POST /auth/v1/sign-in": (req) =>
+        new URL(req.url).searchParams.has("tenant")
+          ? jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401)
+          : jsonResponse({ error: { code: "tenant_required", message: "Choose", tenants: ["t-alpha"] } }, 409),
+    });
+    await submitSignIn();
+    await userEvent.click(await screen.findByRole("button", { name: "t-alpha" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Email or password is incorrect");
+  });
+
+  it("tenant_required_without_a_list_shows_auths_message_and_no_chooser", async () => {
+    renderLogin(<SignInForm {...nav()} />, {
+      "POST /auth/v1/sign-in": () => jsonResponse({ error: { code: "tenant_required", message: "Choose a tenant" } }, 409),
+    });
+    await submitSignIn();
+    expect(await screen.findByRole("alert")).toHaveTextContent("Choose a tenant");
+    expect(screen.queryByText("Choose a workspace")).toBeNull();
   });
 
   it("shows auth's message on failure and stays put", async () => {
-    const go = vi.fn();
-    renderLogin(<SignInForm authRequest="V2_1" go={go} toVerify={vi.fn()} toRegister={vi.fn()} />, {
+    const n = nav();
+    renderLogin(<SignInForm {...n} />, {
       "POST /auth/v1/sign-in": () => jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401),
     });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await submitSignIn();
     expect(await screen.findByRole("alert")).toHaveTextContent("Email or password is incorrect");
     expect(screen.queryByRole("link", { name: "Start again" })).toBeNull();
-    expect(go).not.toHaveBeenCalled();
+    expect(n.toApp).not.toHaveBeenCalled();
   });
 
   it("shows the unavailable fallback when auth can't be reached", async () => {
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => { throw new TypeError("Failed to fetch"); },
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    renderLogin(<SignInForm {...nav()} />, { "POST /auth/v1/sign-in": () => { throw new TypeError("Failed to fetch"); } });
+    await submitSignIn();
     expect(await screen.findByRole("alert")).toHaveTextContent("Sign-in is unavailable, try again");
   });
 
   async function signInFailingWith(answer: FakeHandler) {
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": answer,
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    renderLogin(<SignInForm {...nav()} />, { "POST /auth/v1/sign-in": answer });
+    await submitSignIn();
     return screen.findByRole("alert");
   }
 
@@ -91,117 +147,41 @@ describe("SignInForm", () => {
   it("rate_limited_shows_auths_message", async () => {
     const alert = await signInFailingWith(() => jsonResponse({ error: { code: "rate_limited", message: "Too many attempts, wait a minute" } }, 429));
     expect(alert).toHaveTextContent("Too many attempts, wait a minute");
-    expect(screen.queryByRole("link", { name: "Start again" })).toBeNull();
   });
 
-  it("keeps auth's own message for invalid_credentials", async () => {
-    const alert = await signInFailingWith(() => jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401));
-    expect(alert).toHaveTextContent("Email or password is incorrect");
-  });
-
-  it("forwards to sign-up when the pending sign-in asked for it", async () => {
-    const toRegister = vi.fn();
-    const { f } = renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
-      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: true }),
-    });
-    await waitFor(() => expect(toRegister).toHaveBeenCalled());
-    expect(await call(f, "/auth/v1/auth-request")!.clone().json()).toEqual({ authRequest: "V2_1" });
-  });
-
-  it("closed_sign_up_offers_no_account_creation_only_the_invite_line", async () => {
-    const toRegister = vi.fn();
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />);
-    expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
-    expect(toRegister).not.toHaveBeenCalled();
-  });
-
-  it("sign_in_hides_create_account_when_closed", async () => {
-    // The pending sign-in asked for account creation (prompt=create), but sign-up is closed: stay on
-    // sign-in, offer no "Create account", and keep the generic error plus the invite line.
-    const toRegister = vi.fn();
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
-      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: false }),
-      "POST /auth/v1/sign-in": () =>
-        jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401),
-    });
-    expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText("Email"), "nobody@example.com");
-    await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Email or password is incorrect");
-    expect(screen.getByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
-    expect(toRegister).not.toHaveBeenCalled();
-  });
-
-  it("open_sign_up_offers_account_creation", async () => {
-    const toRegister = vi.fn();
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />, {
-      "POST /auth/v1/auth-request": () => jsonResponse({ signUp: false, signUpAllowed: true }),
+  it("offers account creation and the invite line while sign-up is open", async () => {
+    const n = nav();
+    renderLogin(<SignInForm {...n} />, {
+      "GET /auth/v1/instance": () => jsonResponse({ setupRequired: false, signUpAllowed: true }),
     });
     await userEvent.click(await screen.findByRole("button", { name: "Create account" }));
-    expect(toRegister).toHaveBeenCalledTimes(1);
-    expect(screen.queryByText("No account? Ask your admin for an invite.")).toBeNull();
+    expect(n.toRegister).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/ask your admin for an invite/i)).toBeInTheDocument();
   });
 
-  it("goes to the code step when the email isn't verified", async () => {
-    const toVerify = vi.fn();
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={toVerify} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => jsonResponse({ next: "verify" }),
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    await waitFor(() => expect(toVerify).toHaveBeenCalled());
+  it("hides account creation when sign-up is closed, or unknown", async () => {
+    for (const instance of [
+      () => jsonResponse({ setupRequired: false, signUpAllowed: false }),
+      () => jsonResponse({ error: { code: "unavailable", message: "down" } }, 503),
+    ]) {
+      const r = renderLogin(<SignInForm {...nav()} />, { "GET /auth/v1/instance": instance });
+      await waitFor(() => expect(r.f.calls.some((c) => new URL(c.url).pathname === "/auth/v1/instance")).toBe(true));
+      expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
+      r.unmount();
+    }
   });
 
-  it("offers to start again when the sign-in expired", async () => {
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/auth-request": () => jsonResponse(EXPIRED_BODY, 410),
-    });
-    expect(await screen.findByRole("alert")).toHaveTextContent("This sign-in has expired, start again");
-    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
-  });
-
-  it("sign_in_expired_shows_restart_by_code", async () => {
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => jsonResponse({ error: { code: "sign_in_expired", message: "Too late, begin anew" } }, 410),
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("Too late, begin anew");
-    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
-  });
-
-  it("doesn't offer a restart for the expired wording under another code", async () => {
-    renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => jsonResponse({ error: { code: "invalid_request", message: "This sign-in has expired, start again" } }, 400),
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "x");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(await screen.findByRole("alert")).toHaveTextContent("This sign-in has expired, start again");
-    expect(screen.queryByRole("link", { name: "Start again" })).toBeNull();
-  });
-
-  it("needs an authRequest", () => {
-    renderLogin(<SignInForm authRequest="" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />);
-    expect(screen.getByRole("alert")).toHaveTextContent("This sign-in has expired, start again");
-    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
+  it("shows_the_notice", () => {
+    renderLogin(<SignInForm {...nav()} notice="An account with this email already exists" />);
+    expect(screen.getByRole("status")).toHaveTextContent("An account with this email already exists");
   });
 
   it("password_never_cached", async () => {
-    const go = vi.fn();
-    const { queryClient } = renderLogin(<SignInForm authRequest="V2_1" go={go} toVerify={vi.fn()} toRegister={vi.fn()} />, {
-      "POST /auth/v1/sign-in": () => jsonResponse(DONE),
-    });
-    await userEvent.type(await screen.findByLabelText("Email"), "ada@example.com");
-    await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    await waitFor(() => expect(go).toHaveBeenCalled());
+    const n = nav();
+    const { queryClient } = renderLogin(<SignInForm {...n} />, { "POST /auth/v1/sign-in": () => jsonResponse({ next: "studio" }) });
+    await submitSignIn("Secret-pass1");
+    await waitFor(() => expect(n.toApp).toHaveBeenCalled());
     await waitFor(() => {
       const held = JSON.stringify(queryClient.getMutationCache().getAll().map((m) => m.state));
       expect(held).not.toContain("Secret-pass1");
@@ -210,12 +190,10 @@ describe("SignInForm", () => {
   });
 
   it("doesn't cache the password after a failed sign-in either", async () => {
-    const { queryClient } = renderLogin(<SignInForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toRegister={vi.fn()} />, {
+    const { queryClient } = renderLogin(<SignInForm {...nav()} />, {
       "POST /auth/v1/sign-in": () => jsonResponse({ error: { code: "invalid_credentials", message: "Email or password is incorrect" } }, 401),
     });
-    await userEvent.type(await screen.findByLabelText("Email"), "a@b.c");
-    await userEvent.type(screen.getByLabelText("Password"), "Secret-pass1");
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
+    await submitSignIn("Secret-pass1");
     expect(await screen.findByRole("alert")).toHaveTextContent("Email or password is incorrect");
     await waitFor(() => {
       expect(JSON.stringify(queryClient.getMutationCache().getAll().map((m) => m.state))).not.toContain("Secret-pass1");
@@ -234,30 +212,39 @@ async function fillSignUp(password = "Secret-pass1") {
 describe("SignUpForm", () => {
   it("creates the account and goes to the code step", async () => {
     const toVerify = vi.fn();
-    const { f, queryClient } = renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={toVerify} />, {
+    const { f, queryClient } = renderLogin(<SignUpForm toApp={vi.fn()} toVerify={toVerify} toPending={vi.fn()} />, {
       "POST /auth/v1/sign-up": () => jsonResponse({ next: "verify" }),
     });
     await fillSignUp();
     await waitFor(() => expect(toVerify).toHaveBeenCalled());
     expect(await call(f, "/auth/v1/sign-up")!.clone().json()).toEqual({
-      authRequest: "V2_1", email: "ada@example.com", password: "Secret-pass1", givenName: "Ada", familyName: "Lovelace",
+      email: "ada@example.com", password: "Secret-pass1", givenName: "Ada", familyName: "Lovelace",
     });
     await waitFor(() => {
       expect(JSON.stringify(queryClient.getMutationCache().getAll().map((m) => m.state))).not.toContain("Secret-pass1");
     });
   });
 
-  it("offers to start again when sign-up finds the sign-in expired", async () => {
-    renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} />, {
-      "POST /auth/v1/sign-up": () => jsonResponse(EXPIRED_BODY, 410),
+  it("an_open_sign_up_without_verification_opens_the_app", async () => {
+    const toApp = vi.fn();
+    renderLogin(<SignUpForm toApp={toApp} toVerify={vi.fn()} toPending={vi.fn()} />, {
+      "POST /auth/v1/sign-up": () => jsonResponse({ next: "studio" }),
     });
     await fillSignUp();
-    expect(await screen.findByRole("alert")).toHaveTextContent("This sign-in has expired, start again");
-    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
+    await waitFor(() => expect(toApp).toHaveBeenCalled());
+  });
+
+  it("a_sign_up_that_waits_for_an_admin_shows_the_waiting_screen", async () => {
+    const toPending = vi.fn();
+    renderLogin(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={toPending} />, {
+      "POST /auth/v1/sign-up": () => jsonResponse({ next: "pending" }),
+    });
+    await fillSignUp();
+    await waitFor(() => expect(toPending).toHaveBeenCalled());
   });
 
   it("shows a weak-password message without a restart link", async () => {
-    renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} />, {
+    renderLogin(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/sign-up": () => jsonResponse({ error: { code: "weak_password", message: "Password is too weak" } }, 400),
     });
     await fillSignUp("x");
@@ -267,19 +254,38 @@ describe("SignUpForm", () => {
 });
 
 describe("VerifyEmailForm", () => {
-  it("prefills the code from the email link, verifies and follows the redirect", async () => {
-    const go = vi.fn();
-    const { f } = renderLogin(<VerifyEmailForm initialCode="123456" go={go} toVerify={vi.fn()} />, {
-      "POST /auth/v1/verify-email": () => jsonResponse(DONE),
+  it("prefills the code from the email link, verifies and opens the app", async () => {
+    const toApp = vi.fn();
+    const { f } = renderLogin(<VerifyEmailForm initialCode="123456" toApp={toApp} toVerify={vi.fn()} toPending={vi.fn()} />, {
+      "POST /auth/v1/verify-email": () => jsonResponse(STUDIO),
     });
     expect(screen.getByLabelText("Code")).toHaveValue("123456");
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
-    await waitFor(() => expect(go).toHaveBeenCalledWith("http://studio.chelabase.localhost:8000/callback?code=c"));
+    await waitFor(() => expect(toApp).toHaveBeenCalled());
     expect(await call(f, "/auth/v1/verify-email")!.clone().json()).toEqual({ code: "123456" });
   });
 
+  it("a sign-up that waits for an admin goes to the waiting screen", async () => {
+    const toPending = vi.fn();
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={toPending} />, {
+      "POST /auth/v1/verify-email": () => jsonResponse({ next: "pending" }),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Verify" }));
+    await waitFor(() => expect(toPending).toHaveBeenCalled());
+  });
+
+  it("says sign-up closed meanwhile, with no restart link", async () => {
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
+      "POST /auth/v1/verify-email": () =>
+        jsonResponse({ error: { code: "sign_up_closed", message: "Sign-up is closed; ask an administrator for an invite" } }, 403),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign-up is closed; ask an administrator for an invite");
+    expect(screen.queryByRole("link", { name: "Start again" })).toBeNull();
+  });
+
   it("resends the code", async () => {
-    const { f } = renderLogin(<VerifyEmailForm go={vi.fn()} toVerify={vi.fn()} />, {
+    const { f } = renderLogin(<VerifyEmailForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/resend-code": () => jsonResponse({}),
     });
     await userEvent.click(screen.getByRole("button", { name: "Send a new code" }));
@@ -288,7 +294,7 @@ describe("VerifyEmailForm", () => {
   });
 
   it("says the same thing when resending fails", async () => {
-    renderLogin(<VerifyEmailForm go={vi.fn()} toVerify={vi.fn()} />, {
+    renderLogin(<VerifyEmailForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/resend-code": () => jsonResponse({ error: { code: "rate_limited", message: "Slow down" } }, 429),
     });
     await userEvent.click(screen.getByRole("button", { name: "Send a new code" }));
@@ -296,16 +302,16 @@ describe("VerifyEmailForm", () => {
   });
 
   it("sign_in_expired_on_verify_shows_restart", async () => {
-    renderLogin(<VerifyEmailForm initialCode="123456" go={vi.fn()} toVerify={vi.fn()} />, {
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/verify-email": () => jsonResponse({ error: { code: "sign_in_expired", message: "Too late, begin anew" } }, 410),
     });
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Too late, begin anew");
-    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
+    expect(screen.getByRole("link", { name: "Start again" })).toHaveAttribute("href", "/login");
   });
 
   it("shows auth's message for a bad code", async () => {
-    renderLogin(<VerifyEmailForm initialCode="000000" go={vi.fn()} toVerify={vi.fn()} />, {
+    renderLogin(<VerifyEmailForm initialCode="000000" toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/verify-email": () => jsonResponse({ error: { code: "invalid_code", message: "Code is invalid or expired" } }, 400),
     });
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
@@ -317,7 +323,7 @@ describe("VerifyEmailForm", () => {
 describe("taken email (self-hosted)", () => {
   it("sign-up sends the user to sign in with auth's message", async () => {
     const toLogin = vi.fn();
-    renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toLogin={toLogin} />, {
+    renderLogin(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} toLogin={toLogin} />, {
       "POST /auth/v1/sign-up": () => jsonResponse({ error: { code: "email_taken", message: "An account with this email already exists" } }, 409),
     });
     await fillSignUp("Secret-pass1!");
@@ -327,7 +333,7 @@ describe("taken email (self-hosted)", () => {
   it("email_taken_goes_to_sign_in", async () => {
     // Switches on the code, not the 409 status.
     const toLogin = vi.fn();
-    renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toLogin={toLogin} />, {
+    renderLogin(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} toLogin={toLogin} />, {
       "POST /auth/v1/sign-up": () => jsonResponse({ error: { code: "email_taken", message: "Already registered" } }, 400),
     });
     await fillSignUp();
@@ -336,7 +342,7 @@ describe("taken email (self-hosted)", () => {
 
   it("another 409 stays on sign-up with its message", async () => {
     const toLogin = vi.fn();
-    renderLogin(<SignUpForm authRequest="V2_1" go={vi.fn()} toVerify={vi.fn()} toLogin={toLogin} />, {
+    renderLogin(<SignUpForm toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} toLogin={toLogin} />, {
       "POST /auth/v1/sign-up": () => jsonResponse({ error: { code: "invalid_request", message: "Something clashed" } }, 409),
     });
     await fillSignUp();
@@ -344,24 +350,14 @@ describe("taken email (self-hosted)", () => {
     expect(toLogin).not.toHaveBeenCalled();
   });
 
-  it("the login page shows the notice and stays, even for a sign-up request", async () => {
-    const toRegister = vi.fn();
-    renderLogin(
-      <SignInForm authRequest="V2_1" notice="An account with this email already exists" go={vi.fn()} toVerify={vi.fn()} toRegister={toRegister} />,
-      { "POST /auth/v1/auth-request": () => jsonResponse({ signUp: true, signUpAllowed: true }) },
-    );
-    expect(screen.getByRole("status")).toHaveTextContent("An account with this email already exists");
-    await new Promise((r) => setTimeout(r, 20));
-    expect(toRegister).not.toHaveBeenCalled();
-  });
 });
 
 describe("VerifyEmailForm, expired", () => {
   it("offers to start again when the sign-in is over", async () => {
-    renderLogin(<VerifyEmailForm initialCode="123456" go={vi.fn()} toVerify={vi.fn()} />, {
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
       "POST /auth/v1/verify-email": () => jsonResponse(EXPIRED_BODY, 410),
     });
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
-    expect(await screen.findByRole("link", { name: "Start again" })).toHaveAttribute("href", "/");
+    expect(await screen.findByRole("link", { name: "Start again" })).toHaveAttribute("href", "/login");
   });
 });

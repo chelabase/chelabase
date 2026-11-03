@@ -11,5 +11,4 @@ export type AppUserState = typeof AppUserState[keyof typeof AppUserState];
 export const AppUserState = {
   active: 'active',
   inactive: 'inactive',
-  locked: 'locked',
 } as const;

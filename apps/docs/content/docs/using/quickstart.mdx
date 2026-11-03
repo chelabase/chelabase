@@ -12,7 +12,7 @@ This takes you from a running stack to a database your app reads and writes thro
 3. On `/app` you see your project, its databases, and a form to create one.
 
 <Callout type="info">
-Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when Zitadel has no email provider), and they join the same organization and tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use the Studio host you configured (`http://studio.chelabase.localhost:8000` by default): the sign-in redirect and the gateway's CORS settings are registered for that host. On a workbench stack, emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
+Self-sign-up is off by default: an admin invites everyone else (an email, or a link to hand over when no SMTP server is configured), and they join the same tenant, a shared team workspace. An admin can switch open sign-up on; people who then sign up wait for approval. Use the Studio host you configured (`http://studio.chelabase.localhost:8000` by default): the gateway's CORS settings and the sign-in session are set for that host. On a workbench stack, emails such as invites and password resets land in Mailpit at [http://mail.chelabase.localhost:8000](http://mail.chelabase.localhost:8000).
 </Callout>
 
 When sign-up is open, the sign-up's email verification follows `CHELABASE_REQUIRE_EMAIL_VERIFICATION` (`true` requires a code, which lands in Mailpit; `false` turns it off); without it the default follows the mode: off when self-hosted, required in platform mode. Invitees verify their email by accepting the invite.

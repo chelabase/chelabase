@@ -28,7 +28,20 @@ docker compose up -d --wait
 Two one-shot containers do the setup, and both must exit 0:
 
 - `init-secrets` makes every secret in the `secrets` volume (database passwords, tokens, keys), never overwriting one, and prints the setup code.
-- `init-bootstrap` configures Zitadel and the metadata database. It is safe to run again.
+- `init-bootstrap` sets up the identity service: its database role and the `members` pool where Studio's accounts live. It is safe to run again.
+
+## The services
+
+| Service | What it does |
+|---|---|
+| `gateway` | The only public entry: Studio, the APIs and the optional hosts, by host name |
+| `studio` | The web app |
+| `orchestrator`, `worker` | The Management API and the jobs that create, branch and delete databases |
+| `auth` | The login API: sign-in, sign-up, invites, password reset, and member and app-user tokens |
+| `identity` | Every account (Studio's members and each project's app users) and the emails with codes; internal only, see [Identity service](/docs/architecture/identity) |
+| `rest`, `realtime` | The data API and live rows |
+| `metadata-db`, `nats`, `valkey` | The control plane's database (the identity service's schemas live there too), jobs, and caches |
+| `storage-*`, `pageserver`, `safekeeper*`, `proxy`, `seaweedfs` | Neon's storage and the Postgres proxy |
 
 Running `docker compose up` again with nothing changed recreates nothing and prints no new code. `docker compose down` followed by `up` keeps the secrets.
 
@@ -64,12 +77,28 @@ After the claim, a second sign-up is refused with `sign_up_closed` unless you sw
 
 ## Choose your own secrets (optional)
 
-By default `init-secrets` generates every secret. To pick values yourself, uncomment the `CHELABASE_SEED_*` lines in `.env` and fill them in **before the first `docker compose up`**. The full list is the commented block at the end of `.env.example` (database passwords, the S3 keys, Zitadel's masterkey, the NATS and Valkey passwords, and the internal tokens).
+By default `init-secrets` generates every secret. To pick values yourself, uncomment the `CHELABASE_SEED_*` lines in `.env` and fill them in **before the first `docker compose up`**. The full list is the commented block at the end of `.env.example` (database passwords, the S3 keys, the NATS and Valkey passwords, and the internal tokens).
 
 - **First run only.** A seed is written as its secret file when that file does not exist yet. Once the file exists, a different value in `.env` makes `init-secrets` fail and name the key. Changing a secret later is not supported yet (rotation is [chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)). To keep a value you chose, leave the line as it is.
-- **Allowed values.** Printable ASCII with no spaces, quotes (`"` and `'`), backslash, backtick or `$`; at most 1024 characters. Passwords and tokens need at least 16 characters; Zitadel's masterkey must be exactly 32. Three third-party services receive a secret inside a quoted string in their own config, which is why the quote characters are excluded.
+- **Allowed values.** Printable ASCII with no spaces, quotes (`"` and `'`), backslash, backtick or `$`; at most 1024 characters. Passwords and tokens need at least 16 characters. Three third-party services receive a secret inside a quoted string in their own config, which is why the quote characters are excluded.
 - **Keep `.env` at mode 600** (`chmod 600 .env`) once it holds a seed or an SMTP setting. Don't commit it.
-- Seeds never reach a container's environment. They do not cover key pairs, certificates or signing keys; those are always generated.
+- Seeds never reach a container's environment. They do not cover key pairs, certificates or signing keys, the identity service's secret, database password and tokens, or the cookie key; those are always generated.
+
+### The secrets volume
+
+Everything `init-secrets` makes lives in the `secrets` volume, each file mounted only into the services that read it. The ones that sign or protect accounts:
+
+| File | Read by | What it is |
+|---|---|---|
+| `auth/member-jwt.key`, `auth/member-jwt.pub` | `auth` signs; the gateway, the orchestrator and realtime verify | The member access token pair (EdDSA) |
+| `auth/app-jwt.key`, `auth/app-jwt.pub` | `auth` signs; the gateway verifies | The app-user token pair |
+| `auth/cookie.key` | `auth` | Encrypts the sign-in session and step cookies |
+| `identity/secret` | `identity` | Keys the hashes of emailed codes |
+| `identity/db.password` | `identity`, `init-bootstrap` | The identity service's database password |
+| `tokens/auth-identity.token`, `tokens/orchestrator-identity.token`, `tokens/worker-identity.token`, `tokens/bootstrap-identity.token` | `identity` and each caller | One bearer per caller of the identity service |
+| `setup/setup.code` | `init-secrets`, the orchestrator | The setup code |
+
+None of them is ever rewritten once it exists.
 
 Never delete the `secrets` volume while the database volumes exist: the databases keep the old passwords, and new ones would not match.
 
@@ -84,7 +113,6 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_PUBLIC_PORT` | `8000` | The port in the hosts (80 for `http`, 443 for `https` when the hosts carry none) |
 | `CHELABASE_PUBLIC_SCHEME` | `http` | `http` or `https`: the scheme of every public URL |
 | `CHELABASE_PUBLIC_SECURE` | `false` | `true` when the scheme is `https` |
-| `CHELABASE_ZITADEL_TLS_MODE` | `disabled` | `disabled` for `http`, `external` for `https` |
 | `CHELABASE_HTTP_ADDR` | `127.0.0.1` | The host address the gateway is published on (`0.0.0.0` for every interface) |
 | `CHELABASE_HTTP_PORT` | `CHELABASE_PUBLIC_PORT` | The host port the gateway is published on |
 | `CHELABASE_PROXY_DOMAIN` | `localtest.me` | The domain of database hosts, `<endpoint>.<domain>` (see [Connect to databases](#connect-to-databases)) |
@@ -92,9 +120,11 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 | `CHELABASE_PROXY_PORT`, `CHELABASE_PROXY_HTTP_PORT` | `5432`, `4444` | The host ports of the proxy's Postgres and SQL-over-HTTP listeners |
 | `CHELABASE_IMAGE_REPO`, `CHELABASE_IMAGE_TAG` | `ghcr.io/chelabase`, a pinned `<commit>@sha256:<digest>` per image | Where the images come from. The compose file pins each release image by digest. Setting either variable replaces every pin: one tag for all images, with no digest check. For testing or images you built only (see [Upgrade](#upgrade)) |
 | `CHELABASE_CONTROL_SUBNET` | `10.214.0.0/22` | The control network; change it if it overlaps a network of the host |
-| `CHELABASE_SMTP_*` | unset | Zitadel's email (below) |
+| `CHELABASE_SMTP_*` | unset | The identity service's email (below) |
+| `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | How long a member access token lives, 60 to 900 seconds |
+| `CHELABASE_MEMBER_SESSION_CHECK_SECS` | `15` | How long the orchestrator reuses the identity service's answer that a member token's session is live, 0 to 30 seconds (0 asks every time). A token stops working at most this long after logout or a password reset |
 
-Compose cannot split a host into its name and port, so when you change the hosts, `.env` has to repeat what Compose can't derive: the three `*_HOST_NAME` values, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE` and `CHELABASE_ZITADEL_TLS_MODE`. `init-secrets` checks that they match the hosts and, if not, fails and names the exact line to fix. For example, `http` on port 9000:
+Compose cannot split a host into its name and port, so when you change the hosts, `.env` has to repeat what Compose can't derive: the three `*_HOST_NAME` values, `CHELABASE_PUBLIC_PORT` and `CHELABASE_PUBLIC_SECURE`. `init-secrets` checks that they match the hosts and, if not, fails and names the exact line to fix. For example, `http` on port 9000:
 
 ```bash
 CHELABASE_STUDIO_HOST=studio.chelabase.localhost:9000
@@ -106,7 +136,7 @@ CHELABASE_AUTH_HOST_NAME=auth.chelabase.localhost
 CHELABASE_PUBLIC_PORT=9000
 ```
 
-Change the hosts before the first `up`. Zitadel's issuer is derived from the auth host and the scheme and is signed into tokens.
+Change the hosts before the first `up`. The member tokens' issuer is derived from the auth host and the scheme and is signed into every token.
 
 For a real domain with TLS terminated by your proxy in front of the gateway, the hosts carry no port and the public port is 443:
 
@@ -120,28 +150,30 @@ CHELABASE_API_HOST_NAME=api.acme.com
 CHELABASE_AUTH_HOST_NAME=auth.acme.com
 CHELABASE_PUBLIC_PORT=443
 CHELABASE_PUBLIC_SECURE=true
-CHELABASE_ZITADEL_TLS_MODE=external
 CHELABASE_HTTP_ADDR=127.0.0.1
 CHELABASE_HTTP_PORT=8000
 ```
 
-Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network, they reach Zitadel directly (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
+Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
 
 Set `CHELABASE_GATEWAY_TRUSTED_PROXIES` to your proxy's address too, so per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
 
-### Email (SMTP)
+### Email
 
-Without SMTP, invites are handed over as links and Zitadel sends no mail. To send mail, set these lines in `.env`:
+The identity service sends the emails: invite codes, password-reset codes and, when it is on, sign-up verification codes. Without SMTP nothing is mailed: invites are handed over as links, which carry the code, and password reset is unavailable. To send mail, set these lines in `.env`:
 
 ```bash
 CHELABASE_SMTP_HOST=smtp.example.com
 CHELABASE_SMTP_PORT=587
+CHELABASE_SMTP_TLS=starttls
 CHELABASE_SMTP_FROM=chelabase@example.com
 CHELABASE_SMTP_USER=chelabase
 CHELABASE_SMTP_PASSWORD_PATH=/etc/chelabase/smtp.password
 ```
 
-The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into `init-bootstrap` only. `init-bootstrap` runs as uid 10001 (groups 10001 and 70), so the file must be owned by uid 10001 at mode 0600:
+`CHELABASE_SMTP_TLS` says how the connection is secured: `starttls` (the default; the server must offer STARTTLS), `tls` (implicit TLS, the default on port 465) or `none` (plain text, only for a relay on the same host or network). `CHELABASE_SMTP_PORT` defaults to 587. `CHELABASE_SMTP_USER` and the password go together: set both or neither.
+
+The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into the `identity` service only. The service runs as uid 10001 and treats the file as a secret: it must be a regular file (not a symlink) owned by uid 10001 at mode 0600. A file its group or others can read or write is refused.
 
 ```bash
 sudo install -d /etc/chelabase
@@ -149,7 +181,7 @@ sudo install -m 0600 -o 10001 /dev/null /etc/chelabase/smtp.password
 sudo sh -c 'cat > /etc/chelabase/smtp.password'   # paste the password, then Ctrl-D
 ```
 
-Mode 0640 with group 10001 or 70 works too (`sudo chgrp 10001 <file> && sudo chmod 640 <file>`), and keeps the file yours. A looser file (group-writable, readable by others, or a symlink), or one uid 10001 can't read (a root-owned 0600 file, say), makes `init-bootstrap` fail with an error naming the file. `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM` makes `init-bootstrap` exit 1 too, and `docker compose up --wait` fails. A changed SMTP setting or password is applied by the next `docker compose up`.
+A password file uid 10001 can't read, one with a looser mode than 0600, a symlink, `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM`, or an unknown `CHELABASE_SMTP_TLS` stops the identity service at start with an error naming the setting (`docker compose logs identity`), and `docker compose up --wait` fails. A changed `CHELABASE_SMTP_*` setting in `.env` is applied by the next `docker compose up -d --wait`. The password file is read only at start, so after changing it run `docker compose restart identity`.
 
 ## Connect to databases
 
@@ -176,14 +208,6 @@ psql "postgresql://postgres:…@ep-….localtest.me:5432/<db>?sslmode=verify-ful
 
 With `sslmode=verify-full` the client checks both the CA and the host name. The CA is a public certificate, not a secret; its key never leaves the volume.
 
-## Administering Zitadel
-
-<Callout type="warn">
-Every run of the bootstrap deactivates every active **human** member of Zitadel's instance (IAM) administrators, including one you added on purpose. The bootstrap runs on every `docker compose up` (`init-bootstrap`), so a human instance admin you grant in Zitadel's console is deactivated at the next `up`. Machine users are kept.
-</Callout>
-
-Chelabase manages Zitadel itself; you don't need to sign in to its console for normal use. If you have to administer Zitadel (at `CHELABASE_AUTH_HOST`), do it with a machine user, which the bootstrap leaves alone, not with a person.
-
 ## Build from source
 
 To run images built from your clone instead of the release images:
@@ -193,7 +217,7 @@ cd infra/compose
 docker compose -f docker-compose.yml -f docker-compose.build.yml up --build --wait
 ```
 
-This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio from its Dockerfile. The wiring, secrets and health checks are the same.
+This builds one all-in-one image, `chelabase/server:local`, that runs every Rust service and the one-shots, and builds Studio and the identity service from their Dockerfiles. The wiring, secrets and health checks are the same.
 
 ## Upgrade
 
@@ -206,7 +230,7 @@ docker compose pull
 docker compose up -d --wait
 ```
 
-`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. `up` recreates the containers, not the volumes: `init-secrets` creates only the secrets that are missing and never replaces one, the orchestrator applies any new metadata migrations when it starts, and `init-bootstrap` can safely run again. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
 
 `CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
 

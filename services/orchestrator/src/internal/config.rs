@@ -46,21 +46,9 @@ pub struct InternalConfig {
     pub app_sessions_token: String,
     /// `CHELABASE_APP_REFRESH_TTL_SECS`: how long a refresh keeps an app session alive.
     pub app_refresh_ttl: Duration,
-    /// `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY`, or the file `CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE`
-    /// names (the bootstrap's `actions-signing-key`, 0600), read when the webhook first needs
-    /// it: checks the Actions webhook's signature. Unset, or the file not written yet, the
-    /// webhook answers 503.
-    pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
     /// `CHELABASE_DEV_DEFAULTS=1` (the workbench only): a self-hosted instance may start with
     /// the development bearers ([`Self::check_mode`]).
     pub dev_defaults: chelabase_types::dev_defaults::DevDefaults,
-    /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT that deletes Zitadel sessions.
-    pub zitadel_admin_pat_file: Option<PathBuf>,
-    /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
-    pub zitadel_issuer: Option<String>,
-    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
-    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
-    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
 }
 
 /// Every bearer the internal listener checks, with its development default (public: a platform
@@ -88,7 +76,6 @@ impl InternalConfig {
                 .map_err(|e| anyhow!(e))?
                 .unwrap_or_else(|| default.to_string()))
         };
-        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
         Ok(Self {
             addr: or("CHELABASE_INTERNAL_ADDR", "127.0.0.1:8083")
                 .parse()
@@ -127,23 +114,8 @@ impl InternalConfig {
             app_auth_token: secret(DEV_BEARERS[5].0, DEV_BEARERS[5].1)?,
             app_sessions_token: secret(DEV_BEARERS[6].0, DEV_BEARERS[6].1)?,
             app_refresh_ttl: refresh_ttl(&or("CHELABASE_APP_REFRESH_TTL_SECS", "2592000"))?,
-            actions_signing_key: chelabase_types::file_value::FileValue::from_lookup(
-                &get,
-                "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY",
-                chelabase_types::file_value::Sensitivity::Secret,
-            )
-            .map_err(|e| anyhow!(e))?,
             dev_defaults: chelabase_types::dev_defaults::DevDefaults::from_lookup(&get)
                 .map_err(|e| anyhow!(e))?,
-            zitadel_admin_pat_file: get("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-                .filter(|v| !v.trim().is_empty())
-                .map(PathBuf::from),
-            zitadel_at: zitadel_issuer
-                .as_deref()
-                .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
-                .transpose()
-                .map_err(anyhow::Error::new)?,
-            zitadel_issuer,
         })
     }
 
@@ -173,36 +145,6 @@ impl InternalConfig {
             self.app_sessions_token.as_str(),
         ];
         std::array::from_fn(|i| (DEV_BEARERS[i].0, values[i]))
-    }
-
-    /// The Zitadel admin client (P2), or `None` (with a warning) when the PAT file or the
-    /// issuer is missing: then Zitadel sessions aren't deleted on revoke.
-    pub fn load_zitadel(&self) -> Option<chelabase_zitadel::client::Zitadel> {
-        let (Some(file), Some(issuer)) = (&self.zitadel_admin_pat_file, &self.zitadel_issuer)
-        else {
-            tracing::warn!(
-                "CHELABASE_ZITADEL_ADMIN_PAT_FILE or CHELABASE_AUTH_HOST is unset: \
-                 revoked app sessions keep their Zitadel sessions"
-            );
-            return None;
-        };
-        match std::fs::read_to_string(file) {
-            Ok(pat) if !pat.trim().is_empty() => {
-                let at = self.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
-                    base: issuer.clone(),
-                    host: None,
-                });
-                Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
-            }
-            Ok(_) => {
-                tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty");
-                None
-            }
-            Err(err) => {
-                tracing::warn!(file = %file.display(), "reading the Zitadel admin PAT: {err}");
-                None
-            }
-        }
     }
 
     /// What every compute's spec says about member logins: the configured CIDRs and the
@@ -298,14 +240,7 @@ impl std::fmt::Debug for InternalConfig {
             .field("app_auth_token", &"<redacted>")
             .field("app_sessions_token", &"<redacted>")
             .field("app_refresh_ttl", &self.app_refresh_ttl)
-            .field(
-                "actions_signing_key",
-                &self.actions_signing_key.as_ref().map(|k| k.var().to_string()),
-            )
             .field("dev_defaults", &self.dev_defaults)
-            .field("zitadel_admin_pat_file", &self.zitadel_admin_pat_file)
-            .field("zitadel_issuer", &self.zitadel_issuer)
-            .field("zitadel_at", &self.zitadel_at)
             .finish()
     }
 }
@@ -334,10 +269,67 @@ pub fn metadata_config(
     Ok(chelabase_metadata::MetadataConfig { database_url })
 }
 
+/// `CHELABASE_OPERATOR_TENANT_ID` (#119): the tenant whose members, signed in with a member
+/// token, are instance admins in platform mode. Unset or blank is `None`; anything but a
+/// tenant id refuses to start. The retired `CHELABASE_OPERATOR_ORG_ID` refuses to start too,
+/// naming its replacement (#126), so an upgrade never silently loses its operators.
+pub fn operator_tenant(get: impl Fn(&str) -> Option<String>) -> Result<Option<chelabase_types::TenantId>> {
+    const NAME: &str = "CHELABASE_OPERATOR_TENANT_ID";
+    const RETIRED: &str = "CHELABASE_OPERATOR_ORG_ID";
+    if get(RETIRED).is_some_and(|v| !v.trim().is_empty()) {
+        return Err(anyhow!(
+            "{RETIRED} is no longer read: set {NAME} to the operator tenant's id instead, and unset {RETIRED}"
+        ));
+    }
+    let Some(raw) = get(NAME).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let id: uuid::Uuid = raw.parse().map_err(|_| anyhow!("{NAME} is not a tenant id (a UUID)"))?;
+    if id.is_nil() {
+        return Err(anyhow!("{NAME} is the nil UUID"));
+    }
+    Ok(Some(chelabase_types::TenantId(id)))
+}
+
+/// The member-token verifier (#119): `CHELABASE_MEMBER_JWT_PUBLIC_KEY` with the auth host's
+/// issuer. `None` when the key is unset: every member token is then refused.
+pub fn member_tokens(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<chelabase_auth::member_token::MemberTokenVerifier>> {
+    chelabase_auth::member_token::MemberTokenVerifier::from_lookup(get).map_err(|e| anyhow!(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+
+    #[test]
+    fn operator_tenant_is_a_tenant_id_or_nothing() {
+        let with = |v: &'static str| move |n: &str| (n == "CHELABASE_OPERATOR_TENANT_ID").then(|| v.to_string());
+        assert_eq!(operator_tenant(|_| None).unwrap(), None);
+        assert_eq!(operator_tenant(with("  ")).unwrap(), None);
+        let id = uuid::Uuid::new_v4();
+        let raw: &'static str = Box::leak(id.to_string().into_boxed_str());
+        assert_eq!(operator_tenant(with(raw)).unwrap(), Some(chelabase_types::TenantId(id)));
+        for bad in ["ops-org", "00000000-0000-0000-0000-000000000000"] {
+            let err = operator_tenant(with(bad)).unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_OPERATOR_TENANT_ID"), "{err}");
+            assert!(!err.contains("ops-org"), "{err}");
+        }
+    }
+
+    // #126 AC 5: the retired org variable refuses to start, naming its replacement; blank is
+    // as good as unset.
+    #[test]
+    fn operator_org_id_refused() {
+        let with = |v: &'static str| move |n: &str| (n == "CHELABASE_OPERATOR_ORG_ID").then(|| v.to_string());
+        let err = operator_tenant(with("ops-org")).unwrap_err().to_string();
+        assert!(err.contains("CHELABASE_OPERATOR_ORG_ID"), "{err}");
+        assert!(err.contains("CHELABASE_OPERATOR_TENANT_ID"), "{err}");
+        assert!(!err.contains("ops-org"), "{err}");
+        assert_eq!(operator_tenant(with(" ")).unwrap(), None);
+    }
 
     // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
     // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to
@@ -591,9 +583,6 @@ mod tests {
         assert_eq!(c.app_auth_token, "chelabase-dev-app-auth");
         assert_eq!(c.app_sessions_token, "chelabase-dev-app-sessions");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(2_592_000));
-        assert!(c.actions_signing_key.is_none());
-        assert_eq!(c.zitadel_admin_pat_file, None);
-        assert_eq!(c.zitadel_issuer, None);
     }
 
     // M9: a platform instance refuses to start with a development bearer (every one of them:
@@ -629,62 +618,12 @@ mod tests {
             "CHELABASE_APP_AUTH_INTERNAL_TOKEN" => Some("auth-tok".into()),
             "CHELABASE_APP_SESSIONS_INTERNAL_TOKEN" => Some("gw-tok".into()),
             "CHELABASE_APP_REFRESH_TTL_SECS" => Some("3600".into()),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key".into()),
-            "CHELABASE_ZITADEL_ADMIN_PAT_FILE" => Some(".chelabase/stacks/main/zitadel/admin.pat".into()),
-            "CHELABASE_PUBLIC_SCHEME" => Some("http".into()),
-            "CHELABASE_AUTH_HOST" => Some("auth.chelabase.localhost:8000".into()),
             _ => None,
         })
         .unwrap();
         assert_eq!(c.app_auth_token, "auth-tok");
         assert_eq!(c.app_sessions_token, "gw-tok");
         assert_eq!(c.app_refresh_ttl, std::time::Duration::from_secs(3600));
-        assert_eq!(c.actions_signing_key.as_ref().map(|k| k.get().unwrap()), Some("sign-key"));
-        assert_eq!(
-            c.zitadel_admin_pat_file,
-            Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
-        );
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
-        let blank = InternalConfig::from_lookup(|name| {
-            (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY").then(|| "  ".to_string())
-        })
-        .unwrap();
-        assert!(blank.actions_signing_key.is_none());
-    }
-
-    // m5 (AC 3): the Actions signing key is the variable or the file it names, not both; the
-    // error names the variable and never the key.
-    #[test]
-    fn config_refuses_env_and_file_both() {
-        let err = InternalConfig::from_lookup(|name| match name {
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE" => Some("/out/actions-signing-key".into()),
-            _ => None,
-        })
-        .unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY ") && msg.contains("not both"), "{msg}");
-        assert!(!msg.contains("sign-key-secret"), "{msg}");
-    }
-
-    // m5: the key file is read when the webhook first needs it, not at startup: a missing file
-    // starts the orchestrator (its readiness doesn't wait for the key) and is "not yet".
-    #[test]
-    fn the_actions_key_file_is_read_late() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("actions-signing-key");
-        let p = path.to_str().unwrap().to_string();
-        let c = InternalConfig::from_lookup(move |name| {
-            (name == "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY_FILE").then(|| p.clone())
-        })
-        .unwrap();
-        let key = c.actions_signing_key.clone().expect("configured");
-        assert!(key.get().is_err(), "not written yet");
-        std::fs::write(&path, "late-key\n").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(key.get(), Ok("late-key"));
-        assert!(!format!("{c:?}").contains("late-key"));
     }
 
     // m5 (AC 4): self-hosted without CHELABASE_DEV_DEFAULTS=1 refuses every bearer that is
@@ -747,41 +686,10 @@ mod tests {
 
     #[test]
     fn debug_hides_the_app_auth_secrets() {
-        let c = InternalConfig::from_lookup(|name| match name {
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY" => Some("sign-key-secret".into()),
-            _ => None,
-        })
-        .unwrap();
+        let c = InternalConfig::from_lookup(|_| None).unwrap();
         let shown = format!("{c:?}");
         assert!(!shown.contains("chelabase-dev-app-auth"), "{shown}");
         assert!(!shown.contains("chelabase-dev-app-sessions"), "{shown}");
-        assert!(!shown.contains("sign-key-secret"), "{shown}");
-    }
-
-    #[test]
-    fn zitadel_needs_the_pat_file_and_the_issuer() {
-        let dir = tempfile::tempdir().unwrap();
-        let pat = dir.path().join("admin.pat");
-        std::fs::write(&pat, "the-pat\n").unwrap();
-        let base = InternalConfig::from_lookup(|_| None).unwrap();
-        assert!(base.load_zitadel().is_none());
-        let only_file = InternalConfig {
-            zitadel_admin_pat_file: Some(pat.clone()),
-            ..base.clone()
-        };
-        assert!(only_file.load_zitadel().is_none());
-        let missing_file = InternalConfig {
-            zitadel_admin_pat_file: Some(dir.path().join("nope.pat")),
-            zitadel_issuer: Some("http://127.0.0.1:9".into()),
-            ..base.clone()
-        };
-        assert!(missing_file.load_zitadel().is_none());
-        let both = InternalConfig {
-            zitadel_admin_pat_file: Some(pat),
-            zitadel_issuer: Some("http://127.0.0.1:9".into()),
-            ..base
-        };
-        assert!(both.load_zitadel().is_some());
     }
 
     // Review Focus 4: an orchestrator started before bootstrap says what to run.
@@ -794,7 +702,7 @@ mod tests {
         };
         let err = format!("{:#}", c.load_signer().err().expect("no keys"));
         assert!(err.contains("init-secrets"), "{err}");
-        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+        assert!(err.contains("just workbench up"), "{err}");
     }
 
     #[test]
@@ -809,7 +717,7 @@ mod tests {
         let err = format!("{:#}", c.load_signer().err().expect("corrupt keys"));
         assert!(err.contains("corrupt"), "{err}");
         assert!(err.contains("init-secrets"), "{err}");
-        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+        assert!(err.contains("just workbench up"), "{err}");
     }
 
     #[test]
@@ -825,50 +733,4 @@ mod tests {
         assert!(c.load_signer().is_ok());
     }
 
-    // #24: the session-deleting client goes in-network with the auth host as Host; the
-    // issuer stays the public one.
-    #[test]
-    fn zitadel_is_reached_at_the_in_network_url() {
-        let c = InternalConfig::from_lookup(|name| match name {
-            "CHELABASE_PUBLIC_SCHEME" => Some("https".into()),
-            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
-            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080".into()),
-            _ => None,
-        })
-        .unwrap();
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
-        assert_eq!(
-            c.zitadel_at,
-            Some(chelabase_types::entry::ZitadelAt {
-                base: "http://zitadel:8080".into(),
-                host: Some("auth.example.com".into()),
-            })
-        );
-        let err = InternalConfig::from_lookup(|name| match name {
-            "CHELABASE_AUTH_HOST" => Some("auth.example.com".into()),
-            "CHELABASE_ZITADEL_INTERNAL_URL" => Some("http://zitadel:8080/x".into()),
-            _ => None,
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
-    }
-
-    #[test]
-    fn the_zitadel_issuer_comes_from_the_auth_host() {
-        let c = InternalConfig::from_lookup(|name| match name {
-            "CHELABASE_PUBLIC_SCHEME" => Some("http".into()),
-            "CHELABASE_AUTH_HOST" => Some("auth.chelabase.localhost:8000".into()),
-            _ => None,
-        })
-        .unwrap();
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
-        assert_eq!(InternalConfig::from_lookup(|_| None).unwrap().zitadel_issuer, None);
-        let err = InternalConfig::from_lookup(|name| {
-            (name == "CHELABASE_ZITADEL_ISSUER").then(|| "http://old-issuer.example".to_string())
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("CHELABASE_AUTH_HOST"), "{err}");
-    }
 }

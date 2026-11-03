@@ -12,6 +12,8 @@
 //! | `gateway/internal-signing.pem`, `gateway/internal-verify.pem` | the gateway's internal-identity pair |
 //! | `auth/cookie.key` | auth's cookie key |
 //! | `auth/app-jwt.key`, `auth/app-jwt.pub` | the app-user JWT pair |
+//! | `auth/member-jwt.key`, `auth/member-jwt.pub` | the member JWT pair (auth signs; never the app-user pair) |
+//! | `identity/{secret,db.password}` | the identity service's Better Auth secret and its database password |
 //! | `neon/compute-jwt.pem`, `neon/compute-jwt.pub` | the compute-JWT pair |
 //! | `neon/compute-jwt.pub.pem` | derived: its public key as SPKI PEM |
 //! | `neon/storage-tokens/*.jwt` | derived: the scoped storage tokens |
@@ -20,7 +22,7 @@
 //! | `orchestrator-tls/`, `realtime-tls/` | client pairs (`current` -> `v<secs>/`), renewed when due |
 //! | `nats/*.password`, `valkey/*.password` | NATS and Valkey user passwords |
 //! | `realtime/{pg.password,ticket.key,internal.token}` | realtime's secrets |
-//! | `tokens/*.token` | the internal bearers |
+//! | `tokens/*.token` | the internal bearers (`*-identity.token`: each identity caller's own) |
 //!
 //! The install part holds what each install has on its own (in the workbench it goes under
 //! each stack's state dir; self-hosted, it is the same root):
@@ -29,11 +31,8 @@
 //! |---|---|
 //! | `nats/auth.conf`, `valkey/users.acl` | derived: the NATS users (bcrypt) and Valkey ACL (SHA-256) |
 //! | `db/metadata.password` | the metadata database's `chelabase` user |
-//! | `db/zitadel-user.password`, `db/zitadel-admin.password` | Zitadel's database user and admin (`postgres`) |
 //! | `db/storcon.password` | the storage controller database's `storcon` user |
 //! | `s3/access-key`, `s3/secret-key` | the object store's credentials |
-//! | `zitadel/masterkey` | Zitadel's masterkey (32 characters) |
-//! | `zitadel/steps.yaml` | Zitadel's `--steps` file: the FirstInstance human's random password, written nowhere else |
 //! | `setup/setup.code` | the one-time setup code (`XXXX-XXXX-XXXX-XXXX-XXXX`) |
 //!
 //! # Rules
@@ -84,6 +83,7 @@ pub enum Part {
 pub enum Pair {
     Internal,
     AppJwt,
+    MemberJwt,
     ComputeJwt,
     ComputeCa,
 }
@@ -95,6 +95,9 @@ pub enum Gen {
     SecretKey,
     /// 32 random bytes as 43 base64url characters.
     Text32,
+    /// [`Gen::Text32`], never seeded: its reader needs at least 32 bytes (a seed may hold 16) or
+    /// puts it in a URL (a seed may hold URL metacharacters).
+    Token32,
     /// 32 random bytes, raw.
     Raw32,
     /// One half of a pair (`private` true for the private key).
@@ -103,8 +106,6 @@ pub enum Gen {
     Password { dev: &'static str },
     /// `len` random letters and digits, or `dev` for a workbench stack.
     Alnum { len: usize, dev: &'static str },
-    /// Zitadel's steps file.
-    Steps,
     /// The setup code.
     SetupCode,
     /// Rendered from other entries.
@@ -135,8 +136,6 @@ pub struct Entry {
 pub const POSTGRES_GID: u32 = 70;
 /// `valkey/valkey:*-alpine` runs as 999:1000.
 pub const VALKEY_GID: u32 = 1000;
-/// `ghcr.io/zitadel/zitadel` runs as 1000:1000.
-pub const ZITADEL_GID: u32 = 1000;
 /// The Neon storage image's own user is 1000:1000.
 pub const NEON_GID: u32 = 1000;
 
@@ -157,7 +156,7 @@ const fn half(pair: Pair, private: bool) -> Gen {
 }
 
 /// The ownership map's defaults and every file this command makes. NATS runs as root, so its
-/// files need no group; the files of the postgres, Valkey, Zitadel and Neon images are 0640 with
+/// files need no group; the files of the postgres, Valkey and Neon images are 0640 with
 /// the image's group (the readers' containers join it, or `--owners` changes it).
 pub const LAYOUT: &[Entry] = &[
     e("secrets/secrets.key", M, Gen::SecretKey, P),
@@ -176,6 +175,10 @@ pub const LAYOUT: &[Entry] = &[
     e("auth/cookie.key", M, Gen::SecretKey, P),
     e("auth/app-jwt.key", M, half(Pair::AppJwt, true), P),
     e("auth/app-jwt.pub", M, half(Pair::AppJwt, false), PUB),
+    e("auth/member-jwt.key", M, half(Pair::MemberJwt, true), P),
+    e("auth/member-jwt.pub", M, half(Pair::MemberJwt, false), PUB),
+    e("identity/secret", M, Gen::Token32, P),
+    e("identity/db.password", M, Gen::Token32, P),
     e("neon/compute-jwt.pem", M, half(Pair::ComputeJwt, true), P),
     e(
         "neon/compute-jwt.pub",
@@ -209,6 +212,10 @@ pub const LAYOUT: &[Entry] = &[
     e("tokens/app-sessions.token", M, Gen::Text32, P),
     e("tokens/proxy-api.token", M, Gen::Text32, P),
     e("tokens/storcon-hook.token", M, Gen::Text32, P),
+    e("tokens/auth-identity.token", M, Gen::Token32, P),
+    e("tokens/orchestrator-identity.token", M, Gen::Token32, P),
+    e("tokens/worker-identity.token", M, Gen::Token32, P),
+    e("tokens/bootstrap-identity.token", M, Gen::Token32, P),
     e(
         "neon/compute-jwt.pub.pem",
         M,
@@ -259,18 +266,6 @@ pub const LAYOUT: &[Entry] = &[
         Spec::group(POSTGRES_GID),
     ),
     e(
-        "db/zitadel-user.password",
-        I,
-        Gen::Password { dev: "zitadel" },
-        Spec::group(ZITADEL_GID),
-    ),
-    e(
-        "db/zitadel-admin.password",
-        I,
-        Gen::Password { dev: "postgres" },
-        Spec::group(POSTGRES_GID),
-    ),
-    e(
         "db/storcon.password",
         I,
         Gen::Password { dev: "storcon" },
@@ -294,21 +289,6 @@ pub const LAYOUT: &[Entry] = &[
         },
         Spec::group(NEON_GID),
     ),
-    e(
-        "zitadel/masterkey",
-        I,
-        Gen::Alnum {
-            len: 32,
-            dev: "MasterkeyNeedsToHave32Characters",
-        },
-        Spec::group(ZITADEL_GID),
-    ),
-    e(
-        "zitadel/steps.yaml",
-        I,
-        Gen::Steps,
-        Spec::group(ZITADEL_GID),
-    ),
     e("setup/setup.code", I, Gen::SetupCode, P),
 ];
 
@@ -331,8 +311,8 @@ pub const LOCK_FILE: &str = ".chelabase-init.lock";
 /// How [`ensure_secrets`] runs.
 #[derive(Debug, Clone)]
 pub struct InitSecrets {
-    /// The workbench's fixed dev values for the database passwords, the S3 credentials and the
-    /// Zitadel masterkey (its stacks' volumes were made with them).
+    /// The workbench's fixed dev values for the database passwords and the S3 credentials (its
+    /// stacks' volumes were made with them).
     pub dev_fixed: bool,
     /// Where the install part goes; `None` is the root itself.
     pub install_dir: Option<PathBuf>,
@@ -484,9 +464,18 @@ fn check_content(entry: &Entry, bytes: &[u8]) -> std::result::Result<(), String>
             .map_err(|_| "not a base64 32-byte key".to_string()),
         Gen::SetupCode if is_setup_code(text()?.trim()) => Ok(()),
         Gen::SetupCode => Err("not a setup code (XXXX-XXXX-XXXX-XXXX-XXXX)".to_string()),
-        Gen::Text32 | Gen::Password { .. } | Gen::Alnum { .. } | Gen::Steps => blank(text()?),
+        Gen::Text32 | Gen::Password { .. } | Gen::Alnum { .. } => blank(text()?),
+        Gen::Token32 => {
+            let t = text()?;
+            blank(t)?;
+            if t.trim().len() < 32 {
+                Err("shorter than 32 characters".to_string())
+            } else {
+                Ok(())
+            }
+        }
         Gen::Pair {
-            pair: Pair::Internal | Pair::AppJwt,
+            pair: Pair::Internal | Pair::AppJwt | Pair::MemberJwt,
             private,
         } => {
             let ok = if private {
@@ -516,7 +505,7 @@ fn check_pair(pair: Pair, private: &[u8], public: &[u8]) -> std::result::Result<
         String::from_utf8_lossy(public),
     );
     let ok = match pair {
-        Pair::Internal | Pair::AppJwt => true,
+        Pair::Internal | Pair::AppJwt | Pair::MemberJwt => true,
         Pair::ComputeJwt => chelabase_neon::ComputeSigner::new(&k, &p).is_ok(),
         Pair::ComputeCa => chelabase_neon::compute_tls::ComputeCa::from_pem(&p, &k).is_ok(),
     };
@@ -542,20 +531,6 @@ fn new_setup_code() -> SetupCode {
     let raw = crate::random::from_alphabet(SETUP_ALPHABET, 20);
     let groups: Vec<&str> = (0..5).map(|i| &raw[i * 4..i * 4 + 4]).collect();
     SetupCode(groups.join("-"))
-}
-
-/// Zitadel's `--steps` file: the FirstInstance human's password, random, here only. (Its
-/// complexity policy wants a lower and upper case letter, a digit and a symbol.)
-fn render_steps() -> String {
-    let password = format!(
-        "{}-Aa1",
-        crate::random::from_alphabet(crate::random::ALPHANUMERIC, 40)
-    );
-    format!(
-        "# Generated by chelabase-init: Zitadel's FirstInstance setup (`--steps`). The first\n\
-         # human's password is random and stored nowhere else; the bootstrap deactivates the user.\n\
-         FirstInstance:\n  Org:\n    Human:\n      Password: \"{password}\"\n"
-    )
 }
 
 /// One `ensure_secrets` run.
@@ -857,6 +832,7 @@ impl Run<'_> {
         for pair in [
             Pair::Internal,
             Pair::AppJwt,
+            Pair::MemberJwt,
             Pair::ComputeJwt,
             Pair::ComputeCa,
         ] {
@@ -959,7 +935,7 @@ impl Run<'_> {
                 Gen::SecretKey => chelabase_secrets::SecretKey::generate()
                     .to_base64()
                     .into_bytes(),
-                Gen::Text32 => crate::random::text32().into_bytes(),
+                Gen::Text32 | Gen::Token32 => crate::random::text32().into_bytes(),
                 Gen::Raw32 => crate::random::bytes::<32>().to_vec(),
                 Gen::Password { dev: fixed } if dev => fixed.as_bytes().to_vec(),
                 Gen::Password { .. } => crate::random::text32().into_bytes(),
@@ -967,7 +943,6 @@ impl Run<'_> {
                 Gen::Alnum { len, .. } => {
                     crate::random::from_alphabet(crate::random::ALPHANUMERIC, len).into_bytes()
                 }
-                Gen::Steps => render_steps().into_bytes(),
                 // Written last, by `setup_code`.
                 Gen::SetupCode => continue,
                 Gen::Pair {
@@ -1001,7 +976,9 @@ impl Run<'_> {
     /// Both halves of a pair; if the public half can't be written, the private one goes again.
     fn create_pair(&mut self, pair: Pair) -> Result<()> {
         let (private, public) = match pair {
-            Pair::Internal | Pair::AppJwt => chelabase_auth::internal::generate_keypair_pem(),
+            Pair::Internal | Pair::AppJwt | Pair::MemberJwt => {
+                chelabase_auth::internal::generate_keypair_pem()
+            }
             Pair::ComputeJwt => {
                 let (pem, x) = chelabase_neon::jwt::generate_keypair();
                 (pem, format!("{x}\n"))
@@ -1211,9 +1188,14 @@ mod tests {
     }
 
     /// The workbench: the files the overlay's top-level `secrets:` block reads from
-    /// `${CHELABASE_KEYS_DIR}`; the others are Zitadel's PATs in the stack dir, which Zitadel
-    /// writes.
+    /// `${CHELABASE_KEYS_DIR}`, all of which chelabase-init makes. The one other file it may
+    /// read is the stack's setup code, which chelabase-init writes into the stack dir (#126).
     fn workbench_secret_files() -> Vec<String> {
+        const STACK_SETUP_CODE: &str = "setup/setup.code";
+        assert!(
+            LAYOUT.iter().any(|e| e.path == STACK_SETUP_CODE),
+            "{STACK_SETUP_CODE} is in chelabase-init's layout"
+        );
         let text = compose_file("docker-compose.workbench.yml");
         let block = text
             .split("\nsecrets:\n")
@@ -1231,17 +1213,15 @@ mod tests {
             let file = rest.split('"').next().unwrap();
             if let Some(p) = file.strip_prefix("${CHELABASE_KEYS_DIR}/") {
                 keys.push(p.to_string());
+            } else if file.strip_prefix("${CHELABASE_STACK_DIR}/") == Some(STACK_SETUP_CODE) {
+                // Not in the keys dir, so not checked against a keys-dir run below.
             } else {
                 others.push(file.to_string());
             }
         }
-        assert_eq!(
-            others,
-            [
-                "${CHELABASE_STACK_DIR}/zitadel/admin.pat",
-                "${CHELABASE_STACK_DIR}/zitadel/login-client.pat"
-            ],
-            "a workbench secret outside the keys dir that chelabase-init doesn't make"
+        assert!(
+            others.is_empty(),
+            "a workbench secret outside the keys dir that chelabase-init doesn't make: {others:?}"
         );
         assert!(keys.len() > 30, "{keys:?}");
         keys
@@ -1249,9 +1229,9 @@ mod tests {
 
     /// Self-hosted: every `subpath` the base compose file mounts from the `secrets` volume,
     /// which `chelabase-init secrets` fills. The others are in the dirs init-secrets' own script
-    /// makes after it (Zitadel's PATs, the bootstrap's outputs, Zitadel's rendered config).
+    /// makes after it (the bootstrap's outputs).
     fn selfhost_secret_paths() -> Vec<String> {
-        const SCRIPT_DIRS: [&str; 3] = ["zitadel-pats", "bootstrap", "zitadel-config"];
+        const SCRIPT_DIRS: [&str; 1] = ["bootstrap"];
         let text = compose_file("docker-compose.yml");
         let mut paths = Vec::new();
         let mut others = Vec::new();
@@ -1273,14 +1253,7 @@ mod tests {
         others.sort();
         assert_eq!(
             others,
-            [
-                "bootstrap",
-                "bootstrap/ids",
-                "zitadel-config/database.yaml",
-                "zitadel-pats",
-                "zitadel-pats/admin.pat",
-                "zitadel-pats/login-client.pat",
-            ],
+            ["bootstrap"],
             "a self-hosted mount outside chelabase-init's layout that init-secrets doesn't make"
         );
         let script = text.split("\n  init-secrets:\n").nth(1).unwrap();
@@ -1332,7 +1305,6 @@ mod tests {
         }
         for dir in [
             "db",
-            "zitadel",
             "setup",
             "s3",
             "secrets",
@@ -1357,8 +1329,6 @@ mod tests {
         }
         // The values have their formats.
         let read = |p: &str| std::fs::read_to_string(t.path().join(p)).unwrap();
-        assert_eq!(read("zitadel/masterkey").len(), 32);
-        assert!(read("zitadel/steps.yaml").contains("FirstInstance:"));
         assert!(
             chelabase_secrets::SecretKey::from_file(&t.path().join("secrets/secrets.key")).is_ok()
         );
@@ -1656,15 +1626,7 @@ mod tests {
         // Fixed dev values, owner-only files.
         let read = |p: PathBuf| std::fs::read_to_string(p).unwrap();
         assert_eq!(read(a.join("db/metadata.password")), "chelabase");
-        assert_eq!(
-            read(a.join("zitadel/masterkey")),
-            "MasterkeyNeedsToHave32Characters"
-        );
         assert_eq!(mode(&a.join("db/metadata.password")), 0o600);
-        assert_ne!(
-            read(a.join("zitadel/steps.yaml")),
-            read(b.join("zitadel/steps.yaml"))
-        );
         assert!(a.join("nats/auth.conf").is_file() && b.join("valkey/users.acl").is_file());
     }
 
@@ -1746,7 +1708,6 @@ mod tests {
             .unwrap();
             let id = chelabase_auth::internal::Identity {
                 sub: "u".into(),
-                org_id: "o".into(),
                 auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
                 request_id: "r".into(),
                 data: None,
@@ -1897,7 +1858,6 @@ mod tests {
             ("secrets/secrets.key", b"garbage"),
             ("auth/cookie.key", b"garbage"),
             ("realtime/ticket.key", b"short"),
-            ("zitadel/masterkey", b"\n"),
             ("neon/storage-tokens/metrics.token", b"\n"),
         ];
         for (file, bad) in cases {
@@ -2033,12 +1993,168 @@ mod tests {
             .into_keys()
             .map(|p| p.display().to_string())
             .collect();
+        // The identity files (m5, #118) came after the legacy generators were frozen as this
+        // baseline: only `ensure_secrets` makes them.
         let layout: std::collections::BTreeSet<String> = LAYOUT
             .iter()
             .filter(|e| e.part == Part::Machine || matches!(e.make, Gen::Derived(_)))
+            .filter(|e| {
+                e.make != Gen::Token32
+                    && !matches!(
+                        e.make,
+                        Gen::Pair {
+                            pair: Pair::MemberJwt,
+                            ..
+                        }
+                    )
+            })
             .map(|e| e.path.to_string())
             .collect();
         assert_eq!(made, layout);
+    }
+
+    // auth-replacement m5 (#118): the identity service's files.
+
+    /// The identity service's own files, its callers' bearers and the member-JWT pair.
+    const IDENTITY_FILES: [(&str, u32); 8] = [
+        ("identity/secret", 0o600),
+        ("identity/db.password", 0o600),
+        ("tokens/auth-identity.token", 0o600),
+        ("tokens/orchestrator-identity.token", 0o600),
+        ("tokens/worker-identity.token", 0o600),
+        // S1 (audit): the bootstrap's own, so the service tells it from the worker.
+        ("tokens/bootstrap-identity.token", 0o600),
+        ("auth/member-jwt.key", 0o600),
+        ("auth/member-jwt.pub", 0o644),
+    ];
+
+    #[test]
+    fn identity_entries_modes() {
+        let t = tmp();
+        let o = opts();
+        let report = ensure_secrets(t.path(), &o).unwrap();
+        let (uid, gid) = me();
+        for (file, want) in IDENTITY_FILES {
+            let entry = LAYOUT
+                .iter()
+                .find(|e| e.path == file)
+                .unwrap_or_else(|| panic!("{file} is not in the layout"));
+            assert_eq!(entry.part, Part::Machine, "{file}");
+            let p = t.path().join(file);
+            let meta = std::fs::symlink_metadata(&p).unwrap();
+            assert!(meta.is_file(), "{file}");
+            assert_eq!((meta.uid(), meta.gid(), mode(&p)), (uid, gid, want), "{file}");
+            assert!(report.created.contains(&p), "{file}");
+        }
+        // Owner-only directory: nothing below it is group-readable.
+        assert_eq!(mode(&t.path().join("identity")), 0o700);
+        // The service refuses a secret or a caller token under 32 bytes, and puts the database
+        // password into a URL: base64url only.
+        for file in &IDENTITY_FILES[..6] {
+            let v = std::fs::read_to_string(t.path().join(file.0)).unwrap();
+            assert!(v.len() >= 32, "{}", file.0);
+            assert!(
+                v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "{}",
+                file.0
+            );
+        }
+        // Each caller has its own token.
+        let tokens: std::collections::BTreeSet<String> = IDENTITY_FILES[2..6]
+            .iter()
+            .map(|(f, _)| std::fs::read_to_string(t.path().join(f)).unwrap())
+            .collect();
+        assert_eq!(tokens.len(), 4);
+        // The member pair is a usable Ed25519 pair, and not the app-user pair.
+        let signer = chelabase_auth::internal::InternalSigner::from_pem_file(
+            &t.path().join("auth/member-jwt.key"),
+        )
+        .unwrap();
+        let verifier = chelabase_auth::internal::InternalVerifier::from_pem_file(
+            &t.path().join("auth/member-jwt.pub"),
+        )
+        .unwrap();
+        let id = chelabase_auth::internal::Identity {
+            sub: "u".into(),
+            auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
+            request_id: "r".into(),
+            data: None,
+            email: None,
+            name: None,
+        };
+        verifier.verify(&signer.sign("a", &id).unwrap(), "a").unwrap();
+        assert_ne!(
+            std::fs::read(t.path().join("auth/member-jwt.key")).unwrap(),
+            std::fs::read(t.path().join("auth/app-jwt.key")).unwrap()
+        );
+        // None of them is seedable (a seed's rules allow 16 characters and URL metacharacters).
+        for (file, _) in IDENTITY_FILES {
+            assert!(
+                crate::seed::SEED_KEYS.iter().all(|k| k.path != file),
+                "{file}"
+            );
+        }
+        // A loose mode on one of them is refused, naming it, and nothing is written.
+        let p = t.path().join("identity/db.password");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = snapshot(t.path());
+        let err = format!("{:#}", ensure_secrets(t.path(), &o).unwrap_err());
+        assert!(err.contains(&p.display().to_string()), "{err}");
+        assert_eq!(snapshot(t.path()), before);
+    }
+
+    #[test]
+    fn never_overwrite_member_jwt() {
+        let t = tmp();
+        ensure_secrets(t.path(), &opts()).unwrap();
+        let before = snapshot(t.path());
+        // A rerun keeps every identity file byte for byte (and its mtime and mode).
+        let again = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(snapshot(t.path()), before);
+        for (file, _) in IDENTITY_FILES {
+            assert!(again.kept.contains(&t.path().join(file)), "{file}");
+        }
+        // One missing secret is made alone; the pair and the others stay.
+        std::fs::remove_file(t.path().join("identity/secret")).unwrap();
+        let r = ensure_secrets(t.path(), &opts()).unwrap();
+        assert_eq!(r.created, [t.path().join("identity/secret")]);
+        let after = snapshot(t.path());
+        for (file, _) in &IDENTITY_FILES[1..] {
+            assert_eq!(after[Path::new(file)], before[Path::new(file)], "{file}");
+        }
+        // Half the member pair is refused, not completed: a new private key would sign tokens
+        // the kept public key can't verify.
+        std::fs::remove_file(t.path().join("auth/member-jwt.pub")).unwrap();
+        let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
+        assert!(
+            err.contains("member-jwt.pub") && err.contains("delete both"),
+            "{err}"
+        );
+        assert!(!t.path().join("auth/member-jwt.pub").exists());
+        assert_eq!(
+            std::fs::read(t.path().join("auth/member-jwt.key")).unwrap(),
+            before[Path::new("auth/member-jwt.key")].0
+        );
+        // A key that doesn't parse is refused, and stays as it is.
+        let t = populated_with_two_missing();
+        for (file, bad) in [
+            ("auth/member-jwt.key", &b"garbage"[..]),
+            ("auth/member-jwt.pub", b"garbage"),
+            ("identity/secret", b"\n"),
+            ("tokens/worker-identity.token", b"  \n"),
+        ] {
+            let keep = std::fs::read(t.path().join(file)).unwrap();
+            std::fs::write(t.path().join(file), bad).unwrap();
+            let before = snapshot(t.path());
+            let err = format!("{:#}", ensure_secrets(t.path(), &opts()).unwrap_err());
+            assert!(
+                err.contains(&t.path().join(file).display().to_string()),
+                "{file}: {err}"
+            );
+            assert_eq!(snapshot(t.path()), before, "{file}");
+            std::fs::write(t.path().join(file), keep).unwrap();
+        }
     }
 
     // m12 (#23): seeds from the compose .env.
@@ -2123,7 +2239,7 @@ mod tests {
     fn seed_rerun_changes_nothing() {
         let t = tmp();
         let text = "CHELABASE_SEED_METADATA_DB_PASSWORD=Chosen-Metadata-0001\n\
-                    CHELABASE_SEED_ZITADEL_MASTERKEY=ABCDEFGHJKMNPQRSTUVWXYZ234567890\n\
+                    CHELABASE_SEED_S3_ACCESS_KEY=chosen-access-0001\n\
                     CHELABASE_SEED_NATS_RUNNER_PASSWORD=Chosen-Nats-Runner-0001\n";
         ensure_secrets(t.path(), &seeded(text)).unwrap();
         let before = snapshot(t.path());
@@ -2197,8 +2313,8 @@ mod tests {
             ),
             (short.into(), "CHELABASE_SEED_APP_AUTH_TOKEN"),
             (
-                format!("CHELABASE_SEED_ZITADEL_MASTERKEY={}\n", "K".repeat(31)),
-                "CHELABASE_SEED_ZITADEL_MASTERKEY",
+                "CHELABASE_SEED_S3_ACCESS_KEY=ab\n".into(),
+                "CHELABASE_SEED_S3_ACCESS_KEY",
             ),
             (
                 "CHELABASE_SEED_DATA_KEYS_TOKEN=\"line-one-0123456\nline-two\"\n".into(),
@@ -2291,10 +2407,7 @@ mod tests {
         // A distinct sentinel per key, each one a valid value for its rule.
         let sentinel = |k: &crate::seed::SeedKey, n: u32| -> String {
             let base = format!("Sntl9Q{n}x{}", k.path.replace(['/', '.', '-'], "x"));
-            match k.rule {
-                crate::seed::Rule::Masterkey => format!("{base:Q<32}")[..32].to_string(),
-                _ => format!("{base:Q<20}"),
-            }
+            format!("{base:Q<20}")
         };
         let all = |n: u32| -> (String, Vec<String>) {
             let mut text = String::from("# sentinels\n");
@@ -2315,10 +2428,7 @@ mod tests {
         let invalid = [
             "CHELABASE_SEED_NOT_A_KEY=Sntl9QUnknownKeyValue0001\n".to_string(),
             "CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QShort\n".to_string(),
-            format!(
-                "CHELABASE_SEED_ZITADEL_MASTERKEY={}\n",
-                &"Sntl9QMk".repeat(4)[..31]
-            ),
+            "CHELABASE_SEED_STORCON_DB_PASSWORD=Sntl9QShortStor\n".to_string(),
             "CHELABASE_SEED_APP_AUTH_TOKEN=\"Sntl9QMultiLine000001\nSntl9QSecondLine00001\"\n"
                 .into(),
             "CHELABASE_SEED_APP_AUTH_TOKEN=Sntl9QDuplicateOne0001\n\

@@ -1,0 +1,1582 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Chelabase identity (internal)",
+    "version": "0.1.0",
+    "description": "Internal identity service. Callers are auth, orchestrator, worker and bootstrap (chelabase-init's bootstrap), each with its own bearer token; each route is limited to the callers listed in x-callers, and on a pool route to the kinds of pool x-caller-pools lists for each (`members`, or `app` for any `app-<uuid>` pool); anything else answers 403. A pool is `members` or `app-<lowercase uuid>`."
+  },
+  "servers": [
+    {
+      "url": "http://identity:8080"
+    }
+  ],
+  "security": [
+    {
+      "caller": []
+    }
+  ],
+  "paths": {
+    "/internal/v1/pools/{pool}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "createPool",
+        "summary": "Create a pool's schema and run its migrations. Idempotent.",
+        "x-callers": [
+          "bootstrap",
+          "worker"
+        ],
+        "x-caller-pools": {
+          "bootstrap": [
+            "members"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
+        "responses": {
+          "201": {
+            "description": "The pool exists and is migrated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "pool"
+                  ],
+                  "properties": {
+                    "pool": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "dropPool",
+        "summary": "Drop a pool's schema with every user and session in it. Idempotent.",
+        "x-callers": [
+          "worker"
+        ],
+        "x-caller-pools": {
+          "worker": [
+            "app"
+          ]
+        },
+        "responses": {
+          "204": {
+            "description": "The pool is gone"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "description": "`members` is never dropped: 403 `forbidden` for every caller."
+      }
+    },
+    "/internal/v1/pools/{pool}/users": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "createUser",
+        "summary": "Create a user, with or without a password",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "maxLength": 320
+                  },
+                  "password": {
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 256
+                  },
+                  "email_verified": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "get": {
+        "operationId": "listUsers",
+        "summary": "List users, oldest first, one page at a time",
+        "description": "`search` narrows the list to users whose email contains it, ignoring case (`%` and `_` match themselves); `total` counts the matches. `email` instead finds the one user whose address is exactly it, ignoring case: one indexed read returning at most one user (`limit` and `offset` are echoed but not applied). `email` and `search` together are refused.",
+        "x-callers": [
+          "auth",
+          "orchestrator",
+          "worker"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 200,
+              "default": 50
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 320
+            }
+          },
+          {
+            "name": "email",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 320
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of users",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "users",
+                    "total",
+                    "limit",
+                    "offset"
+                  ],
+                  "properties": {
+                    "users": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/User"
+                      }
+                    },
+                    "total": {
+                      "type": "integer"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    },
+                    "offset": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "operationId": "getUser",
+        "summary": "Get a user",
+        "x-callers": [
+          "auth",
+          "orchestrator",
+          "worker"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
+        "responses": {
+          "200": {
+            "description": "The user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/UserDetail"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteUser",
+        "summary": "Delete a user with their sessions and accounts",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/email": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "put": {
+        "operationId": "setEmail",
+        "summary": "Set a user's email; email_verified is false unless given",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "maxLength": 320
+                  },
+                  "email_verified": {
+                    "type": "boolean",
+                    "default": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/password": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "put": {
+        "operationId": "setPassword",
+        "summary": "Set a user's password (creates the credential if missing)",
+        "x-callers": [
+          "auth"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "password"
+                ],
+                "properties": {
+                  "password": {
+                    "type": "string",
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/verify-email": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "markEmailVerified",
+        "summary": "Mark a user's email verified",
+        "x-callers": [
+          "auth"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
+        "responses": {
+          "200": {
+            "description": "The updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/ban": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "banUser",
+        "summary": "Ban a user and revoke every session at once",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "reason": {
+                    "type": "string",
+                    "maxLength": 512
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The banned user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/unban": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "unbanUser",
+        "summary": "Lift a ban",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
+        "responses": {
+          "200": {
+            "description": "The user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/sessions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "delete": {
+        "operationId": "revokeUserSessions",
+        "summary": "Revoke every session of a user",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/sessions": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "signIn",
+        "summary": "Password sign-in: creates a session",
+        "x-callers": [
+          "auth"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email",
+                  "password"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "maxLength": 320
+                  },
+                  "password": {
+                    "type": "string",
+                    "maxLength": 1024
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Signed in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "session_id",
+                    "session_token",
+                    "user"
+                  ],
+                  "properties": {
+                    "session_id": {
+                      "type": "string"
+                    },
+                    "session_token": {
+                      "type": "string"
+                    },
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "description": "`bad_credentials`, or `session_revoked` when a concurrent revoke deleted the new session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`banned`, or `forbidden` for a caller outside the allow-list",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/sessions/lookup": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "getSessionByToken",
+        "summary": "Resolve a session token (sent in the body, never the URL)",
+        "x-callers": [
+          "auth"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "token"
+                ],
+                "properties": {
+                  "token": {
+                    "type": "string",
+                    "maxLength": 512
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The live session and its user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "session",
+                    "user"
+                  ],
+                  "properties": {
+                    "session": {
+                      "$ref": "#/components/schemas/Session"
+                    },
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "description": "`session_not_found` or `pool_not_found`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/sessions/{id}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "get": {
+        "operationId": "getSessionById",
+        "summary": "Get a live session by id (never returns the token)",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members"
+          ]
+        },
+        "responses": {
+          "200": {
+            "description": "The live session and its user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "session",
+                    "user"
+                  ],
+                  "properties": {
+                    "session": {
+                      "$ref": "#/components/schemas/Session"
+                    },
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "revokeSession",
+        "summary": "Revoke one session by id",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "app"
+          ]
+        },
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/codes": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "createCode",
+        "summary": "Issue a six-digit email code for a user, replacing that user's earlier code of the same kind",
+        "description": "`delivery: email` sends it with the kind's template to the user's email and never returns it (409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses). `delivery: return` returns it and sends nothing (link delivery). The orchestrator may create only `invite` codes (403 otherwise). An `invite` code is refused with 409 `invite_refused` for an established account (a password and a verified email); a pre-registered account (no password, or an unverified email) may be invited. A code is bound to the user's email when issued: changing the email kills every outstanding code. TTL: `verify` and `reset` 15 minutes, `invite` 7 days. A code allows 5 wrong guesses; the next guess, right or wrong, is refused.",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "user_id",
+                  "kind",
+                  "delivery"
+                ],
+                "properties": {
+                  "user_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "kind": {
+                    "$ref": "#/components/schemas/CodeKind"
+                  },
+                  "delivery": {
+                    "type": "string",
+                    "enum": [
+                      "email",
+                      "return"
+                    ]
+                  },
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128,
+                    "description": "Shown in the email; single line. Default `Chelabase`."
+                  },
+                  "link": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri",
+                    "description": "Absolute http(s) URL where the code is entered, shown in the email. Never carries the code."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "kind",
+                    "delivery",
+                    "expires_at"
+                  ],
+                  "properties": {
+                    "kind": {
+                      "$ref": "#/components/schemas/CodeKind"
+                    },
+                    "delivery": {
+                      "type": "string",
+                      "enum": [
+                        "email",
+                        "return"
+                      ]
+                    },
+                    "expires_at": {
+                      "type": "string",
+                      "format": "date-time"
+                    },
+                    "code": {
+                      "type": "string",
+                      "pattern": "^[0-9]{6}$",
+                      "description": "Only with `delivery: return`."
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/codes/verify": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        }
+      ],
+      "post": {
+        "operationId": "verifyCode",
+        "summary": "Check and consume a code",
+        "description": "Counts one attempt and consumes the code in one step. Any wrong, expired, used, replaced or locked-out code, a code sent to an address the user no longer has, an unknown user, or an `invite` code for an account that has since been established (a password and a verified email), is 400 `invalid_code`; the last two cost no attempt. `verify` marks the email verified. `reset` and `invite` require `new_password`: they set it (400 `weak_password` before the code is spent if its length is out of range), mark the email verified and revoke all of the user's sessions. Kinds never stand in for each other.",
+        "x-callers": [
+          "auth"
+        ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "user_id",
+                  "kind",
+                  "code"
+                ],
+                "properties": {
+                  "user_id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{1,128}$"
+                  },
+                  "kind": {
+                    "$ref": "#/components/schemas/CodeKind"
+                  },
+                  "code": {
+                    "type": "string",
+                    "pattern": "^[0-9]{6}$"
+                  },
+                  "new_password": {
+                    "type": "string",
+                    "maxLength": 1024,
+                    "description": "Required for `reset` and `invite`; refused for `verify`."
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Consumed; the updated user",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "user"
+                  ],
+                  "properties": {
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/pools/{pool}/users/{id}/invite-notice": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "sendInviteNotice",
+        "summary": "Tell an existing account it was invited",
+        "description": "Mails the user a notice that links to the invite's ticket. It holds no code and sets nothing: the person accepts by signing in as themselves. Members pool only (400 `invalid_pool`). 409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses.",
+        "x-callers": [
+          "orchestrator"
+        ],
+        "x-caller-pools": {
+          "orchestrator": [
+            "members"
+          ]
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "link"
+                ],
+                "properties": {
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "link": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": "Absolute http(s) URL of the invite's ticket; refused with a `code` parameter"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Sent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "sent"
+                  ],
+                  "properties": {
+                    "sent": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
+    "/internal/v1/email/status": {
+      "get": {
+        "operationId": "emailStatus",
+        "summary": "Whether SMTP is configured and answers (connect, EHLO, TLS and auth as configured)",
+        "x-callers": [
+          "auth",
+          "orchestrator"
+        ],
+        "responses": {
+          "200": {
+            "description": "Status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "configured",
+                    "reachable"
+                  ],
+                  "properties": {
+                    "configured": {
+                      "type": "boolean"
+                    },
+                    "reachable": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "caller": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "The caller's token from tokens/{auth,orchestrator,worker}-identity.token"
+      }
+    },
+    "parameters": {
+      "Pool": {
+        "name": "pool",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^(members|app-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$"
+        }
+      },
+      "Id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,128}$"
+        }
+      }
+    },
+    "responses": {
+      "Error": {
+        "description": "An error",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "required": [
+          "error",
+          "message"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "enum": [
+              "unauthorized",
+              "forbidden",
+              "not_found",
+              "invalid_pool",
+              "invalid_request",
+              "body_too_large",
+              "pool_not_found",
+              "user_not_found",
+              "session_not_found",
+              "bad_credentials",
+              "banned",
+              "conflict",
+              "invalid_email",
+              "weak_password",
+              "bad_request",
+              "invalid_code",
+              "email_not_configured",
+              "invite_refused",
+              "email_send_failed",
+              "internal"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "User": {
+        "type": "object",
+        "required": [
+          "id",
+          "email",
+          "name",
+          "email_verified",
+          "banned",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "email": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "email_verified": {
+            "type": "boolean"
+          },
+          "banned": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "Session": {
+        "type": "object",
+        "required": [
+          "id",
+          "user_id",
+          "expires_at",
+          "created_at"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "user_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "CodeKind": {
+        "type": "string",
+        "enum": [
+          "verify",
+          "reset",
+          "invite"
+        ]
+      },
+      "UserDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/User"
+          },
+          {
+            "type": "object",
+            "required": [
+              "has_password",
+              "ban_reason"
+            ],
+            "properties": {
+              "has_password": {
+                "type": "boolean",
+                "description": "Whether the user can sign in with a password"
+              },
+              "ban_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the user is banned; null when they aren't"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

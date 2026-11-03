@@ -78,7 +78,7 @@ fn access_text(a: Access) -> String {
 fn auth_text(a: Auth) -> &'static str {
     match a {
         Auth::Public => "none",
-        Auth::Management => "Zitadel token",
+        Auth::Management => "Member token",
         Auth::DataKey => "any data key",
         Auth::SecretDataKey => "secret data key",
         Auth::PublicDataKey => "public data key",

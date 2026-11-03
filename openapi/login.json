@@ -13,7 +13,7 @@
         "tags": [
           "login"
         ],
-        "description": "Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.",
+        "description": "Accepts a member invite and signs in (the HttpOnly session cookie). With `user` and `code` (the code from the invite email), the code sets the first password and verifies the email; an account someone else registered without proving the email has its old password replaced and every session ended. With `email` (an existing account, from the invite notice), the account's own password signs in and no password is set. The link's token `t` must match an open invite. A removed member's ban is lifted only then; any other ban is `member_suspended`. If a step after the code fails, the error is `invite_incomplete` with `error.accept_ticket`: send it back in place of `code`, with the same password, to finish. A weak password is refused before the code is used.",
         "operationId": "acceptInvite",
         "requestBody": {
           "content": {
@@ -27,17 +27,27 @@
         },
         "responses": {
           "200": {
-            "description": "Signed in: `next` is `done`, the session cookie is set",
+            "description": "Signed in: `studio` with the session cookie set (or `pending`, with none)",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SignedIn"
+                  "$ref": "#/components/schemas/SignInAnswer"
                 }
               }
             }
           },
           "400": {
-            "description": "The body is malformed, the code or ticket is wrong, or the user is inactive with no open invite (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)",
+            "description": "The body is malformed, or the link, code or ticket is wrong, used or closed (`invalid_request`), or the password is too weak (`weak_password`; nothing was used)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "With `email`: the email or password is wrong (`invalid_credentials`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -47,7 +57,7 @@
             }
           },
           "403": {
-            "description": "The member is suspended (`member_suspended`): the invite is accepted and the password set, but there is no sign-in until an admin reinstates them",
+            "description": "The account is banned outside Chelabase, or the member is suspended (`member_suspended`): no sign-in",
             "content": {
               "application/json": {
                 "schema": {
@@ -57,7 +67,7 @@
             }
           },
           "410": {
-            "description": "The invite expired (`invite_expired`) or was revoked (`invite_revoked`)",
+            "description": "The invite expired (`invite_expired`) or its account is gone (`invite_revoked`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -107,7 +117,7 @@
             }
           },
           "503": {
-            "description": "Zitadel is unavailable (`unavailable`), or a step after the code check failed (`invite_incomplete`, with `accept_ticket`)",
+            "description": "The identity service or the orchestrator is unavailable (`unavailable`), or a step after the code failed (`invite_incomplete`, with `accept_ticket`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -211,7 +221,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -322,7 +332,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -561,7 +571,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -682,7 +692,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -907,7 +917,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1102,7 +1112,7 @@
             }
           },
           "503": {
-            "description": "Zitadel, the orchestrator or the database is unavailable: `unavailable`",
+            "description": "The identity service, the orchestrator or the database is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1153,7 +1163,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1257,108 +1267,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/auth/v1/auth-request": {
-      "post": {
-        "tags": [
-          "login"
-        ],
-        "description": "Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.",
-        "operationId": "getAuthRequest",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AuthRequestBody"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "The pending sign-in is valid",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AuthRequestInfo"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "The body is malformed: `invalid_request`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "410": {
-            "description": "This sign-in has expired or is unknown: `sign_in_expired`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "The body is over 8 KiB: `too_large`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "The body is not JSON (wrong content type): `invalid_request`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "The body is JSON but has the wrong fields: `invalid_request`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "429": {
-            "description": "Too many attempts: `rate_limited`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Zitadel is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1375,7 +1284,7 @@
         "tags": [
           "login"
         ],
-        "description": "Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.",
+        "description": "Whether this instance is unclaimed, so the sign-up page asks for the setup code, and whether it takes sign-ups, so the sign-in page offers one. Sets no cookie.",
         "operationId": "getInstance",
         "responses": {
           "200": {
@@ -1416,7 +1325,7 @@
         "tags": [
           "login"
         ],
-        "description": "Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.",
+        "description": "Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.",
         "operationId": "describeInvite",
         "requestBody": {
           "content": {
@@ -1507,7 +1416,7 @@
         "tags": [
           "login"
         ],
-        "description": "Ends the session and clears the HttpOnly session and step cookies.",
+        "description": "Revokes the session and clears the HttpOnly session and step cookies. If the identity service can't be reached the cookies stay, so the client can try again.",
         "operationId": "logout",
         "requestBody": {
           "content": {
@@ -1569,6 +1478,16 @@
                 }
               }
             }
+          },
+          "503": {
+            "description": "The identity service is unavailable: `unavailable`; the session is still live",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
           }
         }
       }
@@ -1578,7 +1497,7 @@
         "tags": [
           "login"
         ],
-        "description": "Emails a password-reset link if the account exists. Always answers the same, whether or not it does.",
+        "description": "Emails a password-reset code if the account exists, in the background. Always answers the same, in the same padded time, whether or not it does. At most 5 codes go out per person an hour.",
         "operationId": "requestPasswordReset",
         "requestBody": {
           "content": {
@@ -1650,16 +1569,6 @@
                 }
               }
             }
-          },
-          "503": {
-            "description": "The instance isn't set up yet (its org id isn't written): `unavailable`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
           }
         }
       }
@@ -1669,7 +1578,7 @@
         "tags": [
           "login"
         ],
-        "description": "Sets a new password with the code from the reset email.",
+        "description": "Sets a new password with the code from the reset email, verifies the email and ends every session of the account. A wrong code and an unknown email answer alike. Sets no cookie: sign in with the new password.",
         "operationId": "confirmPasswordReset",
         "requestBody": {
           "content": {
@@ -1693,7 +1602,7 @@
             }
           },
           "400": {
-            "description": "The body is malformed (`invalid_request`), the password is too weak (`weak_password`) or the code is wrong (`invalid_code`)",
+            "description": "The body is malformed (`invalid_request`), the password is too weak (`weak_password`; the code is not used) or the code is wrong (`invalid_code`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1743,7 +1652,7 @@
             }
           },
           "503": {
-            "description": "Zitadel is unavailable: `unavailable`",
+            "description": "The identity service is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1760,7 +1669,7 @@
         "tags": [
           "login"
         ],
-        "description": "Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent.",
+        "description": "Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent; at most 5 codes go out per person an hour.",
         "operationId": "resendCode",
         "requestBody": {
           "content": {
@@ -1841,8 +1750,19 @@
         "tags": [
           "login"
         ],
-        "description": "Signs in with email and password. On success sets the HttpOnly session cookie, or, when the email still needs verifying, the HttpOnly step cookie that the code step reads.",
+        "description": "Signs in with email and password. `studio` sets the HttpOnly session cookie, which seals the identity session and the tenant. `verify` sets the HttpOnly step cookie that the code step reads. `pending` sets no cookie: an admin hasn't approved this person yet. A wrong password, an unknown email and no active membership answer alike.",
         "operationId": "signIn",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "The tenant's id. Needed to sign in to one of several; `/auth/v1/token` refuses any\nbut the session's. Never trusted: it is checked against the memberships.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1855,11 +1775,11 @@
         },
         "responses": {
           "200": {
-            "description": "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)",
+            "description": "`studio`, `verify` or `pending`",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/NextStep"
+                  "$ref": "#/components/schemas/SignInAnswer"
                 }
               }
             }
@@ -1875,7 +1795,7 @@
             }
           },
           "401": {
-            "description": "Wrong email or password: `invalid_credentials`",
+            "description": "Wrong email or password, no active membership, or a `tenant` this person isn't a member of: `invalid_credentials`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1884,8 +1804,8 @@
               }
             }
           },
-          "410": {
-            "description": "This sign-in has expired or is unknown: `sign_in_expired`",
+          "409": {
+            "description": "The credentials are right and this person has several tenants: `tenant_required`, with their ids in `error.tenants`. Sign in again with `?tenant=`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1935,7 +1855,7 @@
             }
           },
           "503": {
-            "description": "Zitadel is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1952,7 +1872,7 @@
         "tags": [
           "login"
         ],
-        "description": "Creates an account. Sets the HttpOnly session cookie when email verification is off, otherwise the HttpOnly step cookie that the code step reads.",
+        "description": "Creates an account: the fresh-install admin with the setup code, otherwise a person waiting for an admin's approval. With email verification off it signs them in, so the answer is `studio` (the session cookie) or `pending` (no cookie). With it on, `verify` and the HttpOnly step cookie that the code step reads.",
         "operationId": "signUp",
         "requestBody": {
           "content": {
@@ -1966,17 +1886,17 @@
         },
         "responses": {
           "200": {
-            "description": "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)",
+            "description": "`studio`, `verify` or `pending`",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/NextStep"
+                  "$ref": "#/components/schemas/SignInAnswer"
                 }
               }
             }
           },
           "400": {
-            "description": "The body is malformed, a name is blank or over 200 characters, or Zitadel's validation refuses a field (`invalid_request`), or the password is too weak (`weak_password`)",
+            "description": "The body is malformed, a name is blank or over 200 characters, or the identity service refuses a field (`invalid_request`), or the password is too weak (`weak_password`)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2005,16 +1925,6 @@
               }
             }
           },
-          "410": {
-            "description": "This sign-in has expired or is unknown: `sign_in_expired`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
           "413": {
             "description": "The body is over 8 KiB: `too_large`",
             "content": {
@@ -2056,7 +1966,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the sign-up gate is unavailable: `unavailable`",
+            "description": "The identity service or the sign-up gate is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2073,7 +1983,7 @@
         "tags": [
           "login"
         ],
-        "description": "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+        "description": "Studio's runtime config: the API URL and Studio's host. Public; cacheable for 60 s.",
         "operationId": "getStudioConfig",
         "responses": {
           "200": {
@@ -2085,9 +1995,61 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/auth/v1/token": {
+      "post": {
+        "tags": [
+          "login"
+        ],
+        "description": "Mints a member access token from the HttpOnly session cookie, after checking that the identity session is live and younger than 30 days and that the membership is active. Takes no body. Studio must send `Origin` and `X-Chelabase-Studio: 1`. Never cached.",
+        "operationId": "mintMemberToken",
+        "parameters": [
+          {
+            "name": "tenant",
+            "in": "query",
+            "description": "The tenant's id. Needed to sign in to one of several; `/auth/v1/token` refuses any\nbut the session's. Never trusted: it is checked against the memberships.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The token, for the tenant the session is bound to",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MemberToken"
+                }
+              }
+            }
           },
-          "404": {
-            "description": "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`",
+          "401": {
+            "description": "No live session, an older one, another tenant, or no active membership there: `unauthorized`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not from Studio: `forbidden`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Over 120 a minute for this session: `rate_limited`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2097,7 +2059,7 @@
             }
           },
           "503": {
-            "description": "The bootstrap hasn't written the ids yet: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2114,7 +2076,7 @@
         "tags": [
           "login"
         ],
-        "description": "Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.",
+        "description": "Checks the emailed code. Reads the HttpOnly step cookie and clears it once the email is verified. An open sign-up joins its tenant now, as a person waiting for approval. The answer is a sign-in's: `studio` sets the HttpOnly session cookie, `pending` sets none. If sign-up closed since the account was made, the answer is `sign_up_closed` and the account is deleted. A retry after a failure past the code finishes with the same code.",
         "operationId": "verifyEmail",
         "requestBody": {
           "content": {
@@ -2128,17 +2090,37 @@
         },
         "responses": {
           "200": {
-            "description": "Email verified and signed in: `next` is `done`, the session cookie is set and the step cookie cleared",
+            "description": "Email verified: `studio` (the session cookie is set) or `pending`; the step cookie is cleared",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/SignedIn"
+                  "$ref": "#/components/schemas/SignInAnswer"
                 }
               }
             }
           },
           "400": {
             "description": "The body is malformed (`invalid_request`) or the code is wrong (`invalid_code`)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Sign-up closed since the account was made: `sign_up_closed`; the account is deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The person has several tenants: `tenant_required`, with their ids in `error.tenants`; sign in with `?tenant=`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2198,7 +2180,7 @@
             }
           },
           "503": {
-            "description": "Zitadel is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`; the step stays",
             "content": {
               "application/json": {
                 "schema": {
@@ -2215,8 +2197,9 @@
     "schemas": {
       "AcceptInviteBody": {
         "type": "object",
+        "description": "One of three shapes: `user` + `code` (a new person, or an account nobody proved: the code sets\nthe first password), `user` + `acceptTicket` (a retry after the code was spent), or `email`\n(an existing account, from the code-less notice: `password` is its own). `t` is always the\nlink's token.",
         "required": [
-          "user",
+          "t",
           "password"
         ],
         "properties": {
@@ -2225,32 +2208,36 @@
               "string",
               "null"
             ],
-            "description": "From an `invite_incomplete` error: retries the steps after the (spent) code."
-          },
-          "authRequest": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The pending sign-in to finish; without it the answer sends the browser to Studio."
+            "description": "From an `invite_incomplete` error: finishes the steps after the (spent) code. Send it in\nplace of `code`, with the same password."
           },
           "code": {
             "type": [
               "string",
               "null"
             ],
-            "description": "The invite code from the link. Send this or `acceptTicket`."
+            "description": "The six-digit invite code from the invite email, or from the admin's link."
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "An existing account's email (the notice's link carries only `t`)."
           },
           "password": {
-            "type": "string"
+            "type": "string",
+            "description": "The new password with `code` or `acceptTicket`; the account's own with `email`."
           },
-          "reset": {
-            "type": "boolean",
-            "description": "The link's `reset=1`: `code` is a password-reset code (a person who already had a way to\nsign in, whom Zitadel gives no invite code). It sets the password itself."
+          "t": {
+            "type": "string",
+            "description": "The invite link's token (`t`)."
           },
           "user": {
-            "type": "string",
-            "description": "The Zitadel user id from the invite link."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The invitee's identity user id, from a code link (`?user=`)."
           }
         }
       },
@@ -2508,35 +2495,6 @@
           }
         }
       },
-      "AuthRequestBody": {
-        "type": "object",
-        "required": [
-          "authRequest"
-        ],
-        "properties": {
-          "authRequest": {
-            "type": "string"
-          }
-        }
-      },
-      "AuthRequestInfo": {
-        "type": "object",
-        "description": "What the sign-in page needs to know about the pending sign-in.",
-        "required": [
-          "signUp",
-          "signUpAllowed"
-        ],
-        "properties": {
-          "signUp": {
-            "type": "boolean",
-            "description": "The visitor asked to create an account (`prompt=create`) and this instance allows it:\nStudio goes to its sign-up page. `false` for a refused sign-up request too, which then\nlands on the plain sign-in page."
-          },
-          "signUpAllowed": {
-            "type": "boolean",
-            "description": "This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a\nsetup code is configured): the sign-in page may offer \"Create account\". Always `false`\nin platform mode."
-          }
-        }
-      },
       "CodeBody": {
         "type": "object",
         "required": [
@@ -2551,18 +2509,19 @@
       "ConfirmBody": {
         "type": "object",
         "required": [
-          "userId",
+          "email",
           "code",
           "password"
         ],
         "properties": {
           "code": {
+            "type": "string",
+            "description": "The six-digit code from the reset email."
+          },
+          "email": {
             "type": "string"
           },
           "password": {
-            "type": "string"
-          },
-          "userId": {
             "type": "string"
           }
         }
@@ -2577,15 +2536,9 @@
           },
           "user": {
             "type": "string",
-            "description": "The Zitadel user id from the invite link."
+            "description": "The identity user id from the invite link."
           }
         }
-      },
-      "DoneTag": {
-        "type": "string",
-        "enum": [
-          "done"
-        ]
       },
       "EmailBody": {
         "type": "object",
@@ -2627,7 +2580,7 @@
         "enum": [
           "unauthorized",
           "forbidden",
-          "tenant_not_bound",
+          "tenant_required",
           "not_found",
           "method_not_allowed",
           "invalid_request",
@@ -2712,8 +2665,6 @@
           "member_role_reconcile_failed",
           "link_not_allowed",
           "signup_pending",
-          "email_ambiguous",
-          "email_in_use_elsewhere",
           "invite_closed",
           "permission_denied",
           "dependents_changed",
@@ -2730,7 +2681,8 @@
           "member_suspended",
           "member_offboarded",
           "invalid_successor",
-          "exposure_unconfirmed"
+          "exposure_unconfirmed",
+          "identity_unavailable"
         ]
       },
       "ErrorEnvelope": {
@@ -2749,12 +2701,17 @@
         "type": "object",
         "description": "What the sign-up page needs to know about this instance.",
         "required": [
-          "setupRequired"
+          "setupRequired",
+          "signUpAllowed"
         ],
         "properties": {
           "setupRequired": {
             "type": "boolean",
             "description": "The instance is unclaimed (its tenant has no member yet): the first sign-up needs the\nsetup code that `chelabase-init secrets` printed. `false` once anyone is in, without a\nconfigured code (then no first sign-up is taken at all), and in platform mode."
+          },
+          "signUpAllowed": {
+            "type": "boolean",
+            "description": "Whether the sign-in page offers \"Create account\": sign-up is open, or the unclaimed\ninstance waits for its first account. `false` in platform mode."
           }
         }
       },
@@ -2783,56 +2740,44 @@
           }
         }
       },
-      "NextStep": {
-        "oneOf": [
-          {
-            "type": "object",
-            "description": "Signed in: send the browser to `redirect` (Zitadel's callback for the pending sign-in).",
-            "required": [
-              "redirect",
-              "next"
-            ],
-            "properties": {
-              "next": {
-                "type": "string",
-                "enum": [
-                  "done"
-                ]
-              },
-              "redirect": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "The email isn't verified: show the code step.",
-            "required": [
-              "next"
-            ],
-            "properties": {
-              "next": {
-                "type": "string",
-                "enum": [
-                  "verify"
-                ]
-              }
-            }
-          }
+      "MemberToken": {
+        "type": "object",
+        "description": "A member's short-lived token.",
+        "required": [
+          "access_token",
+          "expires_in"
         ],
-        "description": "What the sign-in pages do next, as `{\"next\": \"done\", \"redirect\": …}` or `{\"next\": \"verify\"}`."
+        "properties": {
+          "access_token": {
+            "type": "string"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until it expires.",
+            "minimum": 0
+          }
+        }
+      },
+      "SignInAnswer": {
+        "type": "object",
+        "description": "A sign-in's or sign-up's answer.",
+        "required": [
+          "next"
+        ],
+        "properties": {
+          "next": {
+            "$ref": "#/components/schemas/SignInStep"
+          }
+        }
       },
       "SignInBody": {
         "type": "object",
         "required": [
-          "authRequest",
           "email",
           "password"
         ],
         "properties": {
-          "authRequest": {
-            "type": "string"
-          },
           "email": {
             "type": "string"
           },
@@ -2841,19 +2786,24 @@
           }
         }
       },
+      "SignInStep": {
+        "type": "string",
+        "description": "Where a sign-in or sign-up goes next.",
+        "enum": [
+          "studio",
+          "verify",
+          "pending"
+        ]
+      },
       "SignUpBody": {
         "type": "object",
         "required": [
-          "authRequest",
           "email",
           "password",
           "givenName",
           "familyName"
         ],
         "properties": {
-          "authRequest": {
-            "type": "string"
-          },
           "email": {
             "type": "string"
           },
@@ -2875,30 +2825,10 @@
           }
         }
       },
-      "SignedIn": {
-        "type": "object",
-        "description": "The signed-in answer: `next` is always `done`.",
-        "required": [
-          "next",
-          "redirect"
-        ],
-        "properties": {
-          "next": {
-            "$ref": "#/components/schemas/DoneTag"
-          },
-          "redirect": {
-            "type": "string"
-          }
-        }
-      },
       "StudioConfig": {
         "type": "object",
-        "description": "Studio's runtime config: the six public values it signs in with. Nothing else is here (no\nPAT, key or secret): it is public and cached.",
+        "description": "Studio's runtime config: the public values it starts with. Nothing else is here (no PAT, key\nor secret): it is public and cached.",
         "required": [
-          "issuer",
-          "clientId",
-          "projectId",
-          "orgId",
           "apiUrl",
           "studioHost"
         ],
@@ -2906,22 +2836,6 @@
           "apiUrl": {
             "type": "string",
             "description": "The public API base URL."
-          },
-          "clientId": {
-            "type": "string",
-            "description": "Studio's OIDC client id."
-          },
-          "issuer": {
-            "type": "string",
-            "description": "Zitadel's issuer URL (the OIDC authority)."
-          },
-          "orgId": {
-            "type": "string",
-            "description": "The platform org's id."
-          },
-          "projectId": {
-            "type": "string",
-            "description": "The `chelabase` project id (the API audience Studio asks for)."
           },
           "studioHost": {
             "type": "string",

@@ -58,8 +58,6 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
   const sessions = useListAppUserSessions(projectId, userId);
 
   const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [passwordChanged, setPasswordChanged] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [typed, setTyped] = useState("");
   useEffect(() => {
@@ -67,15 +65,6 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
   }, [user.data?.email]);
 
   const update = useUpdateAppUser({ mutation: { onSuccess: refresh } });
-  const setPw = useUpdateAppUser({
-    mutation: {
-      onSuccess: async () => {
-        setPasswordChanged(true);
-        await refresh();
-      },
-      onSettled: () => setPassword(""),
-    },
-  });
   const deactivate = useDeactivateAppUser({ mutation: { onSuccess: refresh } });
   const reactivate = useReactivateAppUser({ mutation: { onSuccess: refresh } });
   const revoke = useRevokeAppUserSessions({ mutation: { onSuccess: refresh } });
@@ -85,7 +74,7 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
         onClose();
         queryClient.removeQueries({ queryKey: getGetAppUserQueryKey(projectId, userId) });
         queryClient.removeQueries({ queryKey: getListAppUserSessionsQueryKey(projectId, userId) });
-        // Zitadel's list lags behind a delete: drop the user from every cached page now and only mark the lists stale
+        // The user list can lag behind a delete: drop the user from every cached page now and only mark the lists stale
         // (an immediate refetch could bring the deleted user back).
         queryClient.setQueriesData<AppUserPage>({ queryKey: ["/v1/projects/" + projectId + "/users"] }, (old) =>
           old && Array.isArray(old.users) ? { ...old, users: old.users.filter((x) => x.id !== userId) } : old,
@@ -102,14 +91,6 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
     event.preventDefault();
     if (u && email.trim() && email.trim() !== u.email && !update.isPending) update.mutate({ ...ids, data: { email: email.trim() } });
   }
-  function savePassword(event: FormEvent) {
-    event.preventDefault();
-    if (password && !setPw.isPending) {
-      setPasswordChanged(false);
-      setPw.mutate({ ...ids, data: { password } });
-    }
-  }
-
   return (
     <DialogPrimitive.Root open onOpenChange={(open) => !open && onClose()}>
       <DialogPrimitive.Portal>
@@ -133,7 +114,7 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
                     Save email
                   </Button>
                 </form>
-                {/* Zitadel can't take a verification back without a new address: once verified, it stays. */}
+                {/* A verification can't be taken back without a new address: once verified, it stays. */}
                 {u.email_verified ? (
                   <p className="flex items-center gap-1.5 text-sm">
                     <Check className="size-4 text-seafoam" aria-hidden="true" />
@@ -154,25 +135,6 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
                   </div>
                 )}
                 <Err error={update.error} />
-              </Section>
-              <Section title="Password">
-                <form onSubmit={savePassword} className="flex flex-wrap items-end gap-2">
-                  <label className="flex flex-col gap-1 text-sm">
-                    <span>New password</span>
-                    <input
-                      type="password"
-                      value={password}
-                      onChange={(e) => setPassword(e.target.value)}
-                      autoComplete="new-password"
-                      className={`${input} w-64`}
-                    />
-                  </label>
-                  <Button type="submit" disabled={!password || setPw.isPending}>
-                    Set password
-                  </Button>
-                </form>
-                {passwordChanged && <p className="text-sm text-muted-foreground">Password changed; the user's sessions ended</p>}
-                <Err error={setPw.error} />
               </Section>
               <Section title="Access">
                 {u.state === "inactive" ? (

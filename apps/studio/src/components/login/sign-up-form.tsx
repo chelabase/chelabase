@@ -3,10 +3,10 @@ import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { useGetInstance, useSignUp } from "@/lib/login-client/generated/endpoints";
 import {
-  EXPIRED_PROBLEM, Field, LoginLayout, Problem, SECRET, follow, problemOf, type FormProps, type LoginProblem,
+  Field, LoginLayout, Problem, SECRET, follow, problemOf, type FormProps, type LoginProblem,
 } from "./sign-in-form";
 
-export function SignUpForm({ authRequest = "", go, toVerify, toLogin }: FormProps) {
+export function SignUpForm({ toApp, toVerify, toPending, toLogin }: FormProps) {
   const [givenName, setGivenName] = useState("");
   const [familyName, setFamilyName] = useState("");
   const [email, setEmail] = useState("");
@@ -15,7 +15,7 @@ export function SignUpForm({ authRequest = "", go, toVerify, toLogin }: FormProp
   // Auth answered `setup_code_invalid`: ask for the code even if the instance check failed.
   const [codeAsked, setCodeAsked] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<LoginProblem | null>(authRequest ? null : EXPIRED_PROBLEM);
+  const [error, setError] = useState<LoginProblem | null>(null);
   const signUp = useSignUp(SECRET);
   const instance = useGetInstance({ query: { retry: false, staleTime: Infinity } });
   const showCode = instance.data?.setupRequired === true || codeAsked;
@@ -27,8 +27,8 @@ export function SignUpForm({ authRequest = "", go, toVerify, toLogin }: FormProp
     setError(null);
     try {
       const code = showCode ? setupCode.trim() : "";
-      const data = { authRequest, email, password, givenName, familyName, ...(code ? { setupCode: code } : {}) };
-      follow(await signUp.mutateAsync({ data }), go, toVerify);
+      const data = { email, password, givenName, familyName, ...(code ? { setupCode: code } : {}) };
+      follow(await signUp.mutateAsync({ data }), { toApp, toVerify, toPending });
     } catch (err) {
       if (err instanceof ApiError && err.code === "email_taken" && toLogin) {
         toLogin(err.message);
@@ -51,7 +51,7 @@ export function SignUpForm({ authRequest = "", go, toVerify, toLogin }: FormProp
         <Field label="Password" type="password" value={password} onChange={setPassword} autoComplete="new-password" />
         {showCode && <SetupCodeField value={setupCode} onChange={setSetupCode} />}
         {error && <Problem message={error.message} restart={error.restart} />}
-        <Button type="submit" disabled={busy || !authRequest} className="w-full">Create account</Button>
+        <Button type="submit" disabled={busy} className="w-full">Create account</Button>
       </form>
     </LoginLayout>
   );

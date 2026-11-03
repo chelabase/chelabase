@@ -10,6 +10,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chelabase_identity::{IdentityError, Missing, Pool};
 use chelabase_metadata::{
     AppUsersStatus, BeginEnable, BranchKind, BranchStatus, DatabaseOrigin, DatabaseStatus, MetadataError,
     NewProjectAuth, OnDelete, ProjectAuth, ProjectRecord,
@@ -46,7 +47,8 @@ where
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AppUsersSettings {
     pub status: AppUsersStatusView,
-    /// Why enabling failed; `null` otherwise.
+    /// Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool
+    /// gone from the identity service, a branch it couldn't upgrade); `null` otherwise.
     #[schema(required = true)]
     pub error: Option<String>,
     /// The Chelabase database whose Postgres database holds the users table.
@@ -56,9 +58,6 @@ pub struct AppUsersSettings {
     pub table: String,
     pub email_verification: bool,
     pub on_delete: OnDelete,
-    /// `null` until the worker has created the project's Zitadel org.
-    #[schema(required = true)]
-    pub zitadel_org_id: Option<String>,
 }
 
 impl From<ProjectAuth> for AppUsersSettings {
@@ -72,7 +71,6 @@ impl From<ProjectAuth> for AppUsersSettings {
             table: a.table_name,
             email_verification: a.email_verification,
             on_delete: a.on_delete,
-            zitadel_org_id: a.zitadel_org_id,
         }
     }
 }
@@ -94,7 +92,7 @@ pub struct PutAppUsersRequest {
     /// Default false.
     #[serde(default)]
     pub email_verification: Option<bool>,
-    /// What deleting a user in Zitadel does to its row: `delete` (default) or `mark`.
+    /// What deleting a user does to its row: `delete` (default) or `mark`.
     #[serde(default)]
     pub on_delete: Option<String>,
 }
@@ -181,7 +179,6 @@ fn schema_is_reserved(schema: &str) -> bool {
         (status = 200, description = "The settings and where enabling is", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users were never enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -395,7 +392,7 @@ where
     operation_id = "putAppUsers",
     tag = "app-users",
     summary = "Enable app users, or change their settings",
-    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's Zitadel org, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
+    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202), and so does pressing it on a disable on hold (`disabling` with an `error`: its pool still has users), which keeps the pool and its users. Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
     params(("id" = Uuid, Path, description = "Project id")),
     request_body = PutAppUsersRequest,
     responses(
@@ -403,9 +400,8 @@ where
         (status = 202, description = "Enabling started (or started again)", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project, database or Postgres database (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled", body = ErrorEnvelope),
+        (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled (and the disable isn't on hold)", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: a field is missing or invalid, the schema is reserved (`chelabase`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`", body = ErrorEnvelope),
@@ -529,17 +525,16 @@ where
     operation_id = "disableAppUsers",
     tag = "app-users",
     summary = "Disable app users",
-    description = "Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.",
+    description = "Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.",
     params(("id" = Uuid, Path, description = "Project id")),
     responses(
         (status = 202, description = "Disabling started", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_has_users`: users exist; `conflict`: app users are being enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the user service can't be reached", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service can't be reached", body = ErrorEnvelope),
     ),
 )]
 async fn disable_app_users<M, J>(
@@ -561,23 +556,24 @@ where
         Err(err) => return err.into_response(),
     };
     // A retry of a disable in progress skips the check: the users were checked when it began and
-    // the org may be gone already.
-    if auth.status != AppUsersStatus::Disabling
-        && let Some(org) = &auth.zitadel_org_id
-    {
-        let Some(zitadel) = &state.zitadel else {
-            return crate::app_user_admin::zitadel_unavailable().into_response();
+    // the pool may be gone already. The drop is irreversible, so a pool that can't be read
+    // refuses the disable.
+    if auth.status != AppUsersStatus::Disabling {
+        let Some(identity) = &state.identity_service else {
+            return crate::app_user_admin::identity_unavailable().into_response();
         };
-        match zitadel.org_has_users(org).await {
-            Ok(false) => {}
-            Ok(true) => {
+        match identity.list_users(&Pool::App(project.id.as_uuid()), 1, 0).await {
+            Ok(page) if page.total == 0 => {}
+            // A failed enable never got as far as the pool: nothing to lose.
+            Err(IdentityError::NotFound(Missing::Pool)) => {}
+            Ok(_) => {
                 return conflict(
                     ErrorCode::AppUsersHasUsers,
                     "the project still has users; delete them before disabling app users",
                 )
                 .into_response();
             }
-            Err(err) => return crate::app_user_admin::zitadel_failed("check the org's users", &err).into_response(),
+            Err(err) => return crate::app_user_admin::identity_failed("check the pool's users", &err).into_response(),
         }
     }
     if auth.status != AppUsersStatus::Disabling {

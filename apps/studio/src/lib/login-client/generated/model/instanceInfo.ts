@@ -15,4 +15,9 @@ export interface InstanceInfo {
      * configured code (then no first sign-up is taken at all), and in platform mode.
      */
   setupRequired: boolean;
+  /**
+     * Whether the sign-in page offers "Create account": sign-up is open, or the unclaimed
+     * instance waits for its first account. `false` in platform mode.
+     */
+  signUpAllowed: boolean;
 }

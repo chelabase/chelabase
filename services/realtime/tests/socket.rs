@@ -18,7 +18,7 @@ use serde_json::json;
 #[tokio::test]
 async fn a_ticket_is_201_no_store_and_expires_in_30() {
     let h = Harness::start().await;
-    let (status, headers, body) = h.post_ticket(h.rt(), Some(&h.identity("ana", ORG))).await;
+    let (status, headers, body) = h.post_ticket(h.rt(), Some(&h.identity("ana", TENANT))).await;
     assert_eq!(status, 201, "{body}");
     assert_eq!(
         headers.get("cache-control").and_then(|v| v.to_str().ok()),
@@ -45,7 +45,7 @@ async fn the_ticket_route_needs_the_gateways_identity_for_realtime() {
     // An identity for another service (here: a token signed by another key pair) is refused.
     let other = Harness::start().await;
     assert_eq!(
-        h.post_ticket(h.rt(), Some(&other.identity("ana", ORG)))
+        h.post_ticket(h.rt(), Some(&other.identity("ana", TENANT)))
             .await
             .0,
         401,
@@ -59,7 +59,7 @@ async fn valkey_down_means_503_for_tickets() {
     let h = Harness::start().await;
     h.store.fail(true);
     assert_eq!(
-        h.post_ticket(h.rt(), Some(&h.identity("ana", ORG))).await.0,
+        h.post_ticket(h.rt(), Some(&h.identity("ana", TENANT))).await.0,
         503
     );
 }
@@ -70,7 +70,7 @@ async fn tickets_are_rate_limited_per_member() {
     let h = Harness::start().await;
     // At once: each ticket also asks the orchestrator (T8-1), so a sequential burst can spread
     // over more seconds than the window under load.
-    let identity = h.identity("ana", ORG);
+    let identity = h.identity("ana", TENANT);
     let statuses: Vec<u16> = futures_util::future::join_all(
         (0..25).map(|_| h.post_ticket(h.rt(), Some(&identity))),
     )
@@ -84,7 +84,7 @@ async fn tickets_are_rate_limited_per_member() {
         "{statuses:?}"
     );
     assert_eq!(
-        h.post_ticket(h.rt(), Some(&h.identity("bob", ORG))).await.0,
+        h.post_ticket(h.rt(), Some(&h.identity("bob", TENANT))).await.0,
         201,
         "per member"
     );
@@ -182,8 +182,8 @@ async fn valkey_down_means_503_for_the_upgrade() {
     );
 }
 
-// #22: the internal health check is readiness too: 503 while the OIDC verifier can't check
-// tokens (its audiences aren't written yet), 200 once it can.
+// #22: the internal health check is readiness too: 503 while the member-token verifier can't
+// check tokens, 200 once it can.
 #[tokio::test]
 async fn health_waits_for_the_token_audiences() {
     let h = Harness::start().await;
@@ -237,16 +237,16 @@ async fn a_join_before_auth_closes_4001() {
 }
 
 #[tokio::test]
-async fn an_auth_frame_for_another_person_or_org_closes_4003() {
+async fn an_auth_frame_for_another_person_or_tenant_closes_4003() {
     let h = Harness::start().await;
     let mut ws = Harness::open(h.rt(), &h.ticket("ana").await).await;
     ws.send(json!({"type": "auth", "token": token("bob", 3600)}))
         .await;
     assert_eq!(ws.closed().await, close::REVOKED);
     let mut ws = Harness::open(h.rt(), &h.ticket("ana").await).await;
-    ws.send(json!({"type": "auth", "token": token_in("ana", "org-2", 3600)}))
+    ws.send(json!({"type": "auth", "token": token_in("ana", uuid::Uuid::from_u128(2), 3600)}))
         .await;
-    assert_eq!(ws.closed().await, close::REVOKED, "same sub, other org");
+    assert_eq!(ws.closed().await, close::REVOKED, "same sub, other tenant");
 }
 
 #[tokio::test]

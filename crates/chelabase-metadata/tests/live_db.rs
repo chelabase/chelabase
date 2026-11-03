@@ -506,7 +506,7 @@ impl KeyCheckScratch {
 async fn insert_grace_session(client: &MetadataClient, grace_secs: f64) -> uuid::Uuid {
     let session = uuid::Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO app_sessions (id, project_id, user_id, zitadel_session_id, refresh_hash,
+        "INSERT INTO app_sessions (id, project_id, user_id, identity_session_id, refresh_hash,
                                    grace_refresh_sealed, grace_until, expires_at)
          VALUES ($1, $2, gen_random_uuid(), 'key-check', decode('00', 'hex'), 'v1:x',
                  now() + make_interval(secs => $3), now() + interval '1 hour')",
@@ -570,7 +570,7 @@ impl SealedFixture {
             ("member_branch_roles", "password_enc") => {
                 let member = uuid::Uuid::new_v4();
                 sqlx::query(
-                    "INSERT INTO members (id, tenant_id, zitadel_user_id, status)
+                    "INSERT INTO members (id, tenant_id, identity_user_id, status)
                      VALUES ($1, $2, $3, 'active')",
                 )
                 .bind(member)
@@ -5537,7 +5537,7 @@ fn new_session<'a>(project: ProjectId, user: uuid::Uuid, refresh: u8) -> NewAppS
         id: uuid::Uuid::new_v4(),
         project_id: project,
         user_id: user,
-        zitadel_session_id: "zs-1",
+        identity_session_id: "zs-1",
         refresh_hash: hash(refresh),
         expires_at: chrono::Utc::now() + chrono::Duration::days(1),
     }
@@ -5735,6 +5735,33 @@ async fn finish_project_delete_cleans_up() {
     assert_eq!(again.slug, slug, "the slug is free again");
 }
 
+/// S1 (#120): the end of a disable takes only a `disabling` row, so a duplicate disable can't
+/// delete the row of an enable that started since. The project's own delete takes any row.
+#[tokio::test]
+#[ignore]
+async fn finish_disable_takes_only_a_disabling_row() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "disable").await;
+    let db = ready_database_in(&client, project).await;
+    let auth = new_auth(project, db);
+
+    client.begin_enable_app_users(&auth).await.unwrap();
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "enabling");
+    assert_eq!(auth_status(&client, project).await, Some(AppUsersStatus::Enabling));
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "enabled");
+
+    assert!(client.begin_disable_app_users(project).await.unwrap());
+    assert!(client.finish_disable_app_users(project).await.unwrap());
+    assert_eq!(auth_status(&client, project).await, None);
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "gone");
+
+    client.begin_enable_app_users(&auth).await.unwrap();
+    client.delete_project_auth(project).await.unwrap();
+    assert_eq!(auth_status(&client, project).await, None);
+}
+
 #[tokio::test]
 #[ignore]
 async fn enable_app_users_start_retry_exists() {
@@ -5761,8 +5788,6 @@ async fn enable_app_users_start_retry_exists() {
     let enabled = client.begin_enable_app_users(&changed).await.unwrap();
     let by_db = client.app_auth_for_database(db).await.unwrap();
     let listed = client.enabled_app_projects().await.unwrap();
-    client.set_app_users_org(project, "org-live-test").await.unwrap();
-    let by_org = client.project_auth_by_org("org-live-test").await.unwrap();
     let settings = client
         .update_app_users_settings(project, Some(false), None)
         .await
@@ -5779,8 +5804,38 @@ async fn enable_app_users_start_retry_exists() {
     assert!(matches!(enabled, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Enabled));
     assert_eq!(by_db.map(|a| a.project_id), Some(project));
     assert!(listed.iter().any(|a| a.project_id == project));
-    assert_eq!(by_org.map(|a| a.project_id), Some(project));
     assert!(!settings.email_verification && settings.on_delete == OnDelete::Mark);
+}
+
+/// Review S5 follow-up: a disable the worker put on hold (`disabling` with its error) goes back
+/// to `enabling` with the error cleared when enabled again at the same place; a disable under
+/// way (no error) or another place stays as it is.
+#[tokio::test]
+#[ignore]
+async fn enable_resumes_a_disable_on_hold() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "resume").await;
+    let db = ready_database_in(&client, project).await;
+    let auth = new_auth(project, db);
+    client.begin_enable_app_users(&auth).await.unwrap();
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    assert!(client.begin_disable_app_users(project).await.unwrap());
+    let under_way = client.begin_enable_app_users(&auth).await.unwrap();
+    client.set_app_users_error(project, Some("still holds 1 user(s)")).await.unwrap();
+    let on_hold = client.project_auth(project).await.unwrap().unwrap();
+    let elsewhere = client.begin_enable_app_users(&NewProjectAuth { table_name: "members", ..auth }).await.unwrap();
+    let resumed = client.begin_enable_app_users(&auth).await.unwrap();
+    let after = client.project_auth(project).await.unwrap().unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    assert!(matches!(under_way, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Disabling));
+    assert_eq!(
+        (on_hold.status, on_hold.error.as_deref()),
+        (AppUsersStatus::Disabling, Some("still holds 1 user(s)"))
+    );
+    assert!(matches!(elsewhere, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Disabling));
+    assert_eq!(resumed, BeginEnable::Retry);
+    assert_eq!((after.status, after.error), (AppUsersStatus::Enabling, None));
 }
 
 #[tokio::test]
@@ -8423,4 +8478,159 @@ async fn an_exemption_name_may_hold_any_character_but_nul() {
     cleanup(&client, id).await;
     assert!(added.unwrap());
     assert_eq!(listed.unwrap(), ["a\u{1}b"]);
+}
+
+// --- Identity ids -----------------------------------------------------------------------------
+
+#[tokio::test]
+#[ignore]
+async fn identity_id_columns_renamed() {
+    let client = client().await;
+    let pool = client.pool();
+    for (table, column) in [
+        ("members", "identity_user_id"),
+        ("invites", "identity_user_id"),
+        ("setup_claims", "identity_user_id"),
+        ("app_sessions", "identity_session_id"),
+    ] {
+        let found: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(found, 1, "{table}.{column} exists");
+    }
+    // Every user or session id column is one of the store-neutral names.
+    let old: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name ~ '_(user|session)_id$' \
+         AND column_name NOT IN ('identity_user_id', 'identity_session_id', 'replaced_user_id')",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(old.is_empty(), "no column keeps the old name: {old:?}");
+    let constraints: Vec<String> = sqlx::query_scalar(
+        "SELECT conname FROM pg_constraint WHERE conrelid IN ('public.members'::regclass, 'public.setup_claims'::regclass) \
+         AND conname LIKE '%identity_user_id%' ORDER BY conname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(constraints, ["members_tenant_id_identity_user_id_key", "setup_claims_identity_user_id_check"]);
+    let stale: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_constraint WHERE conname ~ '_(user|session)_id' \
+         AND conname !~ '(identity|replaced)_(user|session)_id'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(stale, 0, "no constraint keeps the old name");
+}
+
+// #126 AC 4: the strict migrator applies the drop, and neither org column (nor any other
+// `*_org_id` column) is left.
+#[tokio::test]
+#[ignore]
+async fn org_columns_dropped() {
+    let client = client().await;
+    let pool = client.pool();
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 20261104000001 AND success)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(applied, "the drop migration is applied");
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name ~ 'org_id$' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(left.is_empty(), "no org column is left: {left:?}");
+    // The tables themselves are intact.
+    for table in ["tenants", "project_auth"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{table} exists");
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn members_unique_identity_user_per_tenant() {
+    let client = client().await;
+    let pool = client.pool();
+    let user = format!("dup-{}", hex32());
+    let insert = "INSERT INTO members (id, tenant_id, identity_user_id, status) VALUES ($1, $2, $3, 'active')";
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    sqlx::query(insert).bind(first).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await.unwrap();
+    let dup = sqlx::query(insert).bind(second).bind(DEMO_TENANT_ID).bind(&user).execute(pool).await;
+    // Clean up both rows, so a duplicate that is wrongly accepted leaves nothing behind.
+    sqlx::query("DELETE FROM members WHERE id = ANY($1)").bind(vec![first, second]).execute(pool).await.unwrap();
+    let err = dup.expect_err("a second row for the same user in the tenant is refused");
+    let constraint = err.as_database_error().and_then(|e| e.constraint().map(str::to_string));
+    assert_eq!(constraint.as_deref(), Some("members_tenant_id_identity_user_id_key"));
+}
+
+#[tokio::test]
+#[ignore]
+async fn search_path_pinned_and_chelabase_schema_owned() {
+    let client = client().await;
+    for _ in 0..3 {
+        let path: String = sqlx::query_scalar("SHOW search_path").fetch_one(client.pool()).await.unwrap();
+        assert_eq!(path, "public");
+    }
+    let owner: Option<String> = sqlx::query_scalar(
+        "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'chelabase'",
+    )
+    .fetch_optional(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(owner.as_deref(), Some("chelabase"));
+}
+
+/// A connection that doesn't pin `search_path` (psql, scripts) still resolves to `public`,
+/// because the migration sets it on the database.
+#[tokio::test]
+#[ignore]
+async fn search_path_is_public_on_an_unpinned_connection() {
+    let _client = client().await;
+    let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+    });
+    let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(&database_url).await.unwrap();
+    let path: String = sqlx::query_scalar("SHOW search_path").fetch_one(&pool).await.unwrap();
+    assert_eq!(path, "public");
+}
+
+/// The metadata search_path migration refuses a `chelabase` schema that holds objects. Runs
+/// in a transaction that is rolled back, so the shared database is untouched.
+#[tokio::test]
+#[ignore]
+async fn search_path_migration_refuses_a_chelabase_schema_with_objects() {
+    use sqlx::Connection;
+    let _client = client().await;
+    let database_url = std::env::var("CHELABASE_METADATA_DATABASE_URL").unwrap_or_else(|_| {
+        "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata".to_string()
+    });
+    let mut conn = sqlx::PgConnection::connect(&database_url).await.unwrap();
+    let mut tx = conn.begin().await.unwrap();
+    sqlx::raw_sql("CREATE TABLE chelabase.guard_probe (id int)").execute(&mut *tx).await.unwrap();
+    let sql = include_str!("../migrations/20261103000002_metadata_search_path.sql");
+    let err = sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string())).execute(&mut *tx).await.expect_err("guard refuses");
+    assert!(err.to_string().contains("must contain no objects"), "{err}");
+    drop(tx); // rolls back
 }
