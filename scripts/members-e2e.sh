@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Live check of the Members step (invites, grants, act-as in the SQL editor, revoke, open
 # sign-up and approval), through the gateway and auth (needs the stack: just workbench up, with
-# Mailpit as Zitadel's SMTP provider):
-# 1. the bootstrap admin (the demo token's user, made a tenant admin by `dev bootstrap`) can
+# Mailpit as the identity service's SMTP server):
+# 1. the bootstrap admin (the stack's dev member, made a tenant admin by `dev bootstrap`) can
 #    invite by email;
 # 2. a project with a database, a group role `billing` owning schema `billing` with a table;
-# 3. `dev` is invited by email (the link is read from Mailpit's API) and accepts; a second
-#    person is invited by link (`delivery: "link"`, `invite_url`) and accepts;
+# 3. `dev` is invited by email (the link and the code are read from Mailpit's API) and accepts;
+#    a second person is invited by link (`delivery: "link"`, `invite_url`) and accepts;
 # 4. the admin grants `dev` Developer with `billing`;
 # 5. in the SQL editor `dev` acts as billing: INSERT into billing.t works, public and another
 #    schema are permission denied, the owner is 403 `forbidden`, and a script that does
@@ -14,11 +14,13 @@
 #    owned by the member's cb_m_* role;
 # 6. revoking the grant refuses the next request and ends an open SQL-editor session; removing
 #    the member answers 404 `not_found` to their old token (`/v1/me` says `removed`) and ends a
-#    running session; invited again, they stay out until they accept (I1);
-# 7. with open sign-up off the auth request says signUpAllowed:false and sign-up answers
-#    `sign_up_closed`; turned on, a third person signs up as `pending` (403 `pending_approval`),
-#    the admin approves them with a grant and they read the project; a fourth is declined and
-#    refused; the access log has the events; open sign-up goes off again.
+#    running session; invited again, they stay out until they accept (I1): the mail is a notice
+#    with no code, and they accept with their own password;
+# 7. with open sign-up off /auth/v1/instance says signUpAllowed:false and sign-up answers
+#    `sign_up_closed`; turned on, a third person signs up as `pending` (no session: sign-in
+#    answers `pending` too), the admin approves them with a grant and they sign in and read the
+#    project; a fourth is declined and can't sign in; the access log has the events; open
+#    sign-up goes off again.
 # Invites are also described (POST /auth/v1/invite), resent and revoked (step 3b).
 # Everything it makes is removed on exit, also on failure. KEEP=1 leaves the project.
 set -euo pipefail
@@ -33,8 +35,6 @@ GW="$GATEWAY"
 MAILPIT="${MAILPIT_URL:-$CHELABASE_ENTRY_MAIL_URL}"
 STUDIO="$CHELABASE_ENTRY_STUDIO_URL"
 tmp="$(mktemp -d)"
-JAR="$tmp/jar"
-STATUS_FILE="$tmp/ui-status"
 project_id=""
 slug=""
 db_id=""
@@ -69,19 +69,8 @@ cleanup() {
 trap cleanup EXIT
 
 [[ -x "${CHELABASE_CLI:-}" ]] || die "CHELABASE_CLI is unset or not executable (run through: just workbench run scripts/<name>.sh)"
-demo_env="${CHELABASE_ZITADEL_DIR:?run through just workbench run}/demo.env"
-[[ -f "$demo_env" ]] || die "$demo_env is missing (run just workbench up)"
-set -a
-# shellcheck disable=SC1091
-source "$demo_env"
-set +a
-# Studio's Zitadel app: VITE_ZITADEL_CLIENT_ID when set, else the one in the stack's studio.env.
-if [[ -z "${VITE_ZITADEL_CLIENT_ID:-}" && ! -f "$CHELABASE_STACK_DIR/studio.env" ]]; then
-  echo "[members-e2e] FAIL: $CHELABASE_STACK_DIR/studio.env is missing: run just workbench up" >&2
-  exit 1
-fi
-CLIENT="${VITE_ZITADEL_CLIENT_ID:-$(sed -n 's/^VITE_ZITADEL_CLIENT_ID=//p' "$CHELABASE_STACK_DIR/studio.env")}"
-ISS="$CHELABASE_ENTRY_AUTH_URL" # the issuer, derived from the entry
+# shellcheck source=lib/studio-auth.sh
+. scripts/lib/studio-auth.sh
 suffix="$(date +%s)-$RANDOM"
 DEV_EMAIL="members-dev-$suffix@example.com"
 LINK_EMAIL="members-link-$suffix@example.com"
@@ -97,105 +86,18 @@ ok() {
   [[ "$status" == "$3" ]] || die "$1 $2: $status (wanted $3) $(cat "$tmp/body")"
 }
 
-# --- Sign-in helpers (as scripts/auth-e2e.sh) ---------------------------------------------------
+# --- Sign-in: scripts/lib/studio-auth.sh (ui, login_token, accept_*, mail_*) ----------------------
 
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-VERIFIER="$(openssl rand -hex 32)"
-CHALLENGE="$(printf %s "$VERIFIER" | openssl dgst -sha256 -binary | b64url)"
+# signs_in_as <email> <password> → the sign-in answer's `next` (empty for an error answer)
+signs_in_as() { jq -r '.next // empty' <<<"$(sign_in "$1" "$2" "$(new_jar)")" 2>/dev/null || true; }
 
-# authorize [prompt] → the authRequest id from Zitadel's redirect to Studio's /login
-authorize() {
-  local scope="openid profile email urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:${CHELABASE_ZITADEL_PROJECT_ID}:aud"
-  local loc
-  loc="$(curl -sS -o /dev/null -w '%{redirect_url}' -G "$ISS/oauth/v2/authorize" \
-    --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$STUDIO/callback" \
-    --data-urlencode "response_type=code" --data-urlencode "scope=$scope" \
-    --data-urlencode "code_challenge=$CHALLENGE" --data-urlencode "code_challenge_method=S256" \
-    ${1:+--data-urlencode "prompt=$1"})"
-  [[ "$loc" == "$STUDIO/login?authRequest="* ]] || die "authorize redirected to: $loc"
-  echo "${loc#*authRequest=}"
+# sign_up_as <email> → the sign-up answer (its status via `status`)
+sign_up_as() {
+  ui sign-up "$(jq -nc --arg e "$1" --arg p "$PASSWORD" '{email: $e, password: $p, givenName: "Sign", familyName: "Up"}')" "$(new_jar)"
 }
 
-# ui <path> <json> → body; its status via `status` (a file: `$(ui …)` runs in a subshell)
-ui() {
-  local out
-  out="$(curl -sS -b "$JAR" -c "$JAR" -H "Origin: $STUDIO" -H 'Content-Type: application/json' \
-    -w '\n%{http_code}' -X POST "$GW/auth/v1/$1" -d "$2")"
-  printf '%s' "${out##*$'\n'}" >"$STATUS_FILE"
-  printf '%s' "${out%$'\n'*}"
-}
-status() { cat "$STATUS_FILE"; }
-
-# mail_link <to> <kind: accept-invite|verify|password-reset> [not this link] → the link in the
-# newest such email (waits while that is still the link given as the third argument)
-mail_link() {
-  local id found
-  for _ in $(seq 30); do
-    id="$(curl -sS -G "$MAILPIT/api/v1/search" --data-urlencode "query=to:$1" | jq -r '.messages[0].ID // empty')"
-    if [[ -n "$id" ]]; then
-      # The mail may carry the link HTML-escaped (&amp; between query parameters).
-      found="$(curl -sS "$MAILPIT/api/v1/message/$id" | jq -r '.Text' | grep -oE "$STUDIO/$2\?[^ \"<>]+" | head -n1 | sed 's/&amp;/\&/g')" || true
-      if [[ -n "$found" && "$found" != "${3:-}" ]]; then
-        echo "$found"
-        return 0
-      fi
-    fi
-    sleep 1
-  done
-  die "no $2 email for $1"
-}
-
-# exchange <callback url> → access token
-exchange() {
-  local code
-  code="$(sed -E 's/.*[?&]code=([^&]+).*/\1/' <<<"$1")"
-  curl -sS -X POST "$ISS/oauth/v2/token" -d grant_type=authorization_code -d "code=$code" \
-    -d "redirect_uri=$STUDIO/callback" -d "client_id=$CLIENT" -d "code_verifier=$VERIFIER" | jq -r .access_token
-}
-
-# accept_invite <invite link> <password> → access token (accepts the invite and finishes the sign-in)
-# The way Studio's /accept-invite does it for a link opened from an email, which carries no
-# pending sign-in: describe the invite with the link's token (a closed one stops here), start
-# Studio's own sign-in (Zitadel's redirect to /login hands back an authRequest; Studio's /login
-# sends it to the accept page), then accept with that authRequest, which ends signed in.
-accept_invite() {
-  local uid code t ar out redirect token reset
-  [[ "$1" != *"authRequest="* ]] || die "an invite link carries a pending sign-in: $1"
-  uid="$(sed -E 's/.*[?&]user=([^&]+).*/\1/' <<<"$1")"
-  code="$(sed -E 's/.*[&?]code=([^&]+).*/\1/' <<<"$1")"
-  t="$(sed -nE 's/.*[?&]t=([^&]+).*/\1/p' <<<"$1")"
-  if [[ -n "$t" ]]; then
-    ui invite "$(jq -nc --arg u "$uid" --arg t "$t" '{user: $u, t: $t}')" >/dev/null
-    [[ "$(status)" == 200 ]] || die "describe-invite for an open invite: $(status)"
-  fi
-  ar="$(authorize)"
-  # reset=1: a password-reset code (someone who already had a password, invited again)
-  reset=false
-  [[ "$1" == *"reset=1"* ]] && reset=true
-  out="$(ui accept-invite "{\"authRequest\":\"$ar\",\"user\":\"$uid\",\"code\":\"$code\",\"reset\":$reset,\"password\":\"$2\"}")"
-  [[ "$(status)" == 200 ]] || die "accept-invite: $(status) $out"
-  redirect="$(jq -r .redirect <<<"$out")"
-  [[ "$redirect" == "$STUDIO/callback?"* ]] || die "accept-invite didn't finish: $out"
-  token="$(exchange "$redirect")"
-  [[ -n "$token" && "$token" != null ]] || die "no access token after accept-invite"
-  echo "$token"
-}
-
-# login_token <email> <password> → a fresh access token (tokens are short-lived)
-login_token() {
-  local out token
-  out="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$1\",\"password\":\"$2\"}")"
-  # Sign-in allows 10 attempts a minute per address, and the e2e scripts before this one share
-  # it: wait the window out once.
-  if [[ "$(jq -r '.error.code // empty' <<<"$out" 2>/dev/null)" == rate_limited ]]; then
-    sleep 61
-    out="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$1\",\"password\":\"$2\"}")"
-  fi
-  [[ "$(jq -r .next <<<"$out")" == done ]] || die "sign-in as $1: $out"
-  token="$(exchange "$(jq -r .redirect <<<"$out")")"
-  [[ -n "$token" && "$token" != null ]] || die "no access token for $1"
-  echo "$token"
-}
+# instance → GET /auth/v1/instance
+instance() { curl -sS --max-time 30 "$GATEWAY/auth/v1/instance"; }
 
 # --- Calls as a person ---------------------------------------------------------------------------
 
@@ -241,11 +143,11 @@ denied() {
 
 ok GET /v1/me 200
 jq -e '.member.tenant_admin == true' "$tmp/body" >/dev/null ||
-  die "the demo token's user isn't a tenant admin: re-run just zitadel-bootstrap"
+  die "the dev member isn't a tenant admin: re-run just stack-bootstrap"
 ok GET /v1/invites/delivery 200
 jq -e '.email_available == true' "$tmp/body" >/dev/null ||
   die "invites can't be emailed: is Mailpit the active SMTP provider? $(cat "$tmp/body")"
-pass "the demo user is a tenant admin and invites can be emailed"
+pass "the dev member is a tenant admin and invites can be emailed"
 
 # --- 2. A project, a database, the group role billing ----------------------------------------------
 
@@ -298,20 +200,22 @@ jq -e '.outcome == "invited" and .member.status == "invited" and (.invite_url ==
   die "email invite: $(cat "$tmp/body")"
 dev_member="$(jq -r '.member.id' "$tmp/body")"
 member_ids+=("$dev_member")
-link="$(mail_link "$DEV_EMAIL" accept-invite)"
-DEV_TOKEN="$(accept_invite "$link" "$PASSWORD")"
+invite_mail="$(mail_id "$DEV_EMAIL")"
+link="$(mail_link "$invite_mail" accept-invite)"
+[[ "$link" == "$STUDIO/accept-invite?user="*"t="* && "$link" != *"code="* ]] || die "the invite mail's link: $link"
+DEV_TOKEN="$(accept_code "$link" "$(mail_code "$invite_mail")" "$PASSWORD")"
 s="$(uapi "$DEV_TOKEN" GET /v1/me)"
 [[ "$s" == 200 ]] || die "dev /v1/me: $s $(cat "$tmp/body")"
 jq -e --arg m "$dev_member" '.member.id == $m and .member.status == "active" and .member.tenant_admin == false' "$tmp/body" >/dev/null ||
   die "dev's membership after accepting: $(cat "$tmp/body")"
-pass "$DEV_EMAIL invited by email, the link read from Mailpit, accepted: an active member"
+pass "$DEV_EMAIL invited by email, the link and the code read from Mailpit, accepted: an active member"
 
 ok POST /v1/invites 201 "$(jq -nc --arg e "$LINK_EMAIL" '{email: $e, grants: [], delivery: "link"}')"
 url="$(jq -r '.invite_url // empty' "$tmp/body")"
 [[ "$url" == "$STUDIO/accept-invite?user="* ]] || die "no invite link: $(cat "$tmp/body")"
 link_member="$(jq -r '.member.id' "$tmp/body")"
 member_ids+=("$link_member")
-LINK_TOKEN="$(accept_invite "$url" "$PASSWORD")"
+LINK_TOKEN="$(accept_link "$url" "$PASSWORD")"
 s="$(uapi "$LINK_TOKEN" GET /v1/me)"
 [[ "$s" == 200 ]] || die "link invitee /v1/me: $s $(cat "$tmp/body")"
 jq -e --arg m "$link_member" '.member.id == $m and .member.status == "active"' "$tmp/body" >/dev/null ||
@@ -335,7 +239,7 @@ revoke_user="$(query_param "$revoke_url" user)"
 revoke_t="$(query_param "$revoke_url" t)"
 [[ -n "$revoke_user" && -n "$revoke_t" ]] || die "the invite link carries no user or t: $revoke_url"
 described="$(ui invite "$(jq -nc --arg u "$revoke_user" --arg t "$revoke_t" '{user: $u, t: $t}')")"
-# The inviter is the demo machine user (no name, no email): named "An admin", with a null email.
+# The inviter is the dev member: a name, and an email or null.
 [[ "$(status)" == 200 ]] && jq -e '(.tenant_name | type) == "string" and (.inviter_name | type) == "string"
     and .inviter_name != "" and ((.inviter_email | type) == "string" or .inviter_email == null)' <<<"$described" >/dev/null ||
   die "describe-invite (POST /auth/v1/invite): $(status) $described"
@@ -475,58 +379,51 @@ if grep -Eq '"outcome" *: *"ok"' "$tmp/long"; then
 fi
 pass "member removed: /v1/me says removed, the old token answers 404 not_found elsewhere, and the open SQL session ended ($ended s after)"
 
-# I1: invited again, the removed member stays out until they accept: their old password signs
-# nobody in (their Zitadel user stays deactivated), before and after the invite's expires_at,
-# and they stay `invited`. Zitadel makes no invite code for a user with a password, so the mail
-# is a password-reset one (`reset=1`); accepting sets the password with that code on the
-# deactivated user (real Zitadel allows it), then reactivates them, and they are active again.
+# I1: invited again, the removed member stays out until they accept: removal banned their
+# account, so their password signs nobody in, before and after the invite's expires_at, and they
+# stay `invited`. Their account has a password and a verified email, so the mail is a notice with
+# no code: they accept with their own password, which lifts the ban, and they are active again.
 ok POST /v1/invites 201 "$(jq -nc --arg e "$DEV_EMAIL" '{email: $e, grants: [], delivery: "email"}')"
 jq -e --arg m "$dev_member" '.outcome == "invited" and .member.id == $m and .member.status == "invited"' "$tmp/body" >/dev/null ||
   die "invite of the removed member: $(cat "$tmp/body")"
 reinvite="$(jq -r '.member.invite.id // empty' "$tmp/body")"
 [[ -n "$reinvite" ]] || die "the invite has no id: $(cat "$tmp/body")"
-# old_password_refused <when>: sign-in with dev's old password doesn't finish, and dev is invited.
-old_password_refused() {
-  local out
-  out="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$DEV_EMAIL\",\"password\":\"$PASSWORD\"}")"
-  if [[ "$(jq -r '.error.code // empty' <<<"$out" 2>/dev/null)" == rate_limited ]]; then
-    sleep 61 # a rate limit proves nothing: try again once the window is over
-    out="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$DEV_EMAIL\",\"password\":\"$PASSWORD\"}")"
-  fi
-  [[ "$(jq -r '.next // empty' <<<"$out" 2>/dev/null)" != done && "$(jq -r '.error.code // empty' <<<"$out" 2>/dev/null)" != rate_limited ]] ||
-    die "$1: the removed member signed in with the old password, or the check was rate limited: $(status) $out"
+# password_refused <when>: sign-in with dev's password doesn't finish, and dev is invited.
+password_refused() {
+  local next
+  next="$(signs_in_as "$DEV_EMAIL" "$PASSWORD")"
+  [[ "$(status)" == 401 && -z "$next" ]] || die "$1: the removed member's sign-in answered $(status) next=$next (wanted 401)"
   ok GET /v1/members 200
   jq -e --arg m "$dev_member" 'any(.[]; .id == $m and .status == "invited")' "$tmp/body" >/dev/null ||
     die "$1: dev isn't invited: $(jq -c --arg m "$dev_member" '[.[] | select(.id == $m)]' "$tmp/body")"
 }
-old_password_refused "before expires_at"
+password_refused "before expires_at"
 metadata_sql -c "UPDATE invites SET expires_at = now() - interval '1 minute' WHERE id = '$reinvite'" >/dev/null ||
   die "couldn't expire the invite"
-old_password_refused "after expires_at"
+password_refused "after expires_at"
 metadata_sql -c "UPDATE invites SET expires_at = now() + interval '1 day' WHERE id = '$reinvite'" >/dev/null ||
   die "couldn't restore the invite's expiry"
-relink="$(mail_link "$DEV_EMAIL" accept-invite "$link")"
-[[ "$relink" == *"reset=1"* ]] || die "the second invite isn't a password-reset link: $relink"
-NEW_PASSWORD="E2e-again-$(openssl rand -hex 4)A!"
-DEV_TOKEN="$(accept_invite "$relink" "$NEW_PASSWORD")"
+notice="$(mail_id "$DEV_EMAIL" "$invite_mail")"
+relink="$(mail_link "$notice" accept-invite)"
+[[ "$relink" == "$STUDIO/accept-invite?t="* && "$relink" != *"user="* && "$relink" != *"code="* ]] ||
+  die "the second invite isn't a code-less notice: $relink"
+if (mail_code "$notice") >/dev/null 2>&1; then die "the notice carries a code"; fi
+DEV_TOKEN="$(accept_notice "$relink" "$DEV_EMAIL" "$PASSWORD")"
 s="$(uapi "$DEV_TOKEN" GET /v1/me)"
 [[ "$s" == 200 ]] && jq -e --arg m "$dev_member" '.member.id == $m and .member.status == "active"' "$tmp/body" >/dev/null ||
   die "dev after accepting again: $s $(cat "$tmp/body")"
-out="$(ui sign-in "{\"authRequest\":\"$(authorize)\",\"email\":\"$DEV_EMAIL\",\"password\":\"$PASSWORD\"}")"
-[[ "$(jq -r '.next // empty' <<<"$out" 2>/dev/null)" != done ]] || die "the old password still signs in after accepting"
-pass "invited again: the old password signs nobody in before or after expires_at (still invited); the code verifies on the deactivated user and dev is active with the new password"
+[[ "$(signs_in_as "$DEV_EMAIL" "$PASSWORD")" == studio ]] || die "dev's own password doesn't sign in after accepting: $(status)"
+pass "invited again: the password signs nobody in before or after expires_at (still invited); the code-less notice, accepted with dev's own password, makes dev active"
 
 # --- 7. Sign-up -------------------------------------------------------------------------------------------------
 
 ok GET /v1/instance/settings 200
 jq -e '.open_signup == false and .open_signup_switchable == true' "$tmp/body" >/dev/null ||
   die "open sign-up should be off and switchable: $(cat "$tmp/body")"
-ar="$(authorize create)"
-[[ "$(ui auth-request "{\"authRequest\":\"$ar\"}")" == '{"signUp":false,"signUpAllowed":false}' ]] ||
-  die "closed sign-up was offered: $(status)"
-ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$SIGNUP_EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"Sign\",\"familyName\":\"Up\"}" >"$tmp/signup-body"
-[[ "$(status)" == 403 && "$(jq -r '.error.code' "$tmp/signup-body")" == sign_up_closed ]] ||
-  die "closed sign-up should be 403 sign_up_closed: $(status) $(cat "$tmp/signup-body")"
+[[ "$(instance)" == '{"setupRequired":false,"signUpAllowed":false}' ]] || die "closed sign-up was offered: $(instance)"
+out="$(sign_up_as "$SIGNUP_EMAIL")"
+[[ "$(status)" == 403 && "$(jq -r '.error.code' <<<"$out")" == sign_up_closed ]] ||
+  die "closed sign-up should be 403 sign_up_closed: $(status) $out"
 pass "open sign-up off: signUpAllowed false and sign-up answers sign_up_closed"
 
 signup_opened=1
@@ -534,36 +431,27 @@ ok PATCH /v1/instance/settings 200 '{"open_signup":true}'
 jq -e '.open_signup == true' "$tmp/body" >/dev/null || die "open sign-up didn't turn on: $(cat "$tmp/body")"
 allowed=""
 for _ in $(seq 20); do
-  ar="$(authorize create)"
-  if [[ "$(ui auth-request "{\"authRequest\":\"$ar\"}")" == '{"signUp":true,"signUpAllowed":true}' ]]; then
+  if [[ "$(instance)" == '{"setupRequired":false,"signUpAllowed":true}' ]]; then
     allowed=1
     break
   fi
   sleep 1
 done
-[[ -n "$allowed" ]] || die "sign-up still isn't offered 20 s after turning it on: $(status)"
-signed="$(ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$SIGNUP_EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"Sign\",\"familyName\":\"Up\"}")"
-[[ "$(status)" == 200 && "$(jq -r .next <<<"$signed")" == done ]] ||
-  die "sign-up: $(status) $signed (is email verification off?)"
-SIGNUP_TOKEN="$(exchange "$(jq -r .redirect <<<"$signed")")"
-[[ -n "$SIGNUP_TOKEN" && "$SIGNUP_TOKEN" != null ]] || die "no access token after sign-up"
-s="$(uapi "$SIGNUP_TOKEN" GET /v1/me)"
-[[ "$s" == 200 ]] || die "signed-up /v1/me: $s $(cat "$tmp/body")"
-jq -e '.member.status == "pending"' "$tmp/body" >/dev/null || die "the signed-up person isn't pending: $(cat "$tmp/body")"
-signup_member="$(jq -r '.member.id' "$tmp/body")"
-member_ids+=("$signup_member")
-s="$(uapi "$SIGNUP_TOKEN" GET "/v1/projects/$project_id")"
-[[ "$s" == 403 && "$(jq -r '.error.code' "$tmp/body")" == pending_approval ]] ||
-  die "a pending member's project read: $s $(cat "$tmp/body")"
+[[ -n "$allowed" ]] || die "sign-up still isn't offered 20 s after turning it on: $(instance)"
+out="$(sign_up_as "$SIGNUP_EMAIL")"
+[[ "$(status)" == 200 && "$(jq -r .next <<<"$out")" == pending ]] ||
+  die "sign-up: $(status) $out (wanted pending; is email verification off?)"
+[[ "$(signs_in_as "$SIGNUP_EMAIL" "$PASSWORD")" == pending ]] || die "a pending person's sign-in: $(status) (wanted pending)"
 ok GET /v1/members 200
-jq -e --arg m "$signup_member" --arg e "$SIGNUP_EMAIL" \
-  'any(.[]; .id == $m and .email == $e and .status == "pending")' "$tmp/body" >/dev/null ||
-  die "listMembers doesn't show the sign-up as pending: $(cat "$tmp/body")"
-pass "open sign-up on: a third person signed up, is pending (403 pending_approval) and listed as pending"
+signup_member="$(jq -r --arg e "$SIGNUP_EMAIL" '.[] | select(.email == $e and .status == "pending") | .id' "$tmp/body")"
+[[ -n "$signup_member" ]] || die "listMembers doesn't show the sign-up as pending: $(cat "$tmp/body")"
+member_ids+=("$signup_member")
+pass "open sign-up on: a third person signed up as pending (no session; sign-in answers pending) and is listed as pending"
 
 ok POST "/v1/members/$signup_member/approve" 200 \
   "$(jq -nc --arg p "$project_id" '{grants: [{project_id: $p, platform_role: "viewer"}]}')"
 jq -e '.status == "active"' "$tmp/body" >/dev/null || die "approve: $(cat "$tmp/body")"
+SIGNUP_TOKEN="$(login_token "$SIGNUP_EMAIL" "$PASSWORD")"
 read_ok=""
 for _ in $(seq 20); do
   s="$(uapi "$SIGNUP_TOKEN" GET "/v1/projects/$project_id")"
@@ -574,36 +462,23 @@ for _ in $(seq 20); do
   sleep 1
 done
 [[ -n "$read_ok" ]] || die "the approved member can't read the project: $s $(cat "$tmp/body")"
-pass "approved with a viewer grant: the member reads the project"
+pass "approved with a viewer grant: the member signs in and reads the project"
 
-# A second sign-up, declined: the next request with their token is refused.
-ar="$(authorize create)"
-signed="$(ui sign-up "{\"authRequest\":\"$ar\",\"email\":\"$DECLINE_EMAIL\",\"password\":\"$PASSWORD\",\"givenName\":\"De\",\"familyName\":\"Cline\"}")"
-[[ "$(status)" == 200 && "$(jq -r .next <<<"$signed")" == done ]] || die "second sign-up: $(status) $signed"
-DECLINE_TOKEN="$(exchange "$(jq -r .redirect <<<"$signed")")"
-[[ -n "$DECLINE_TOKEN" && "$DECLINE_TOKEN" != null ]] || die "no access token after the second sign-up"
-s="$(uapi "$DECLINE_TOKEN" GET /v1/me)"
-[[ "$s" == 200 ]] && jq -e '.member.status == "pending"' "$tmp/body" >/dev/null || die "second sign-up isn't pending: $s $(cat "$tmp/body")"
-decline_member="$(jq -r '.member.id' "$tmp/body")"
+# A second sign-up, declined: they can't sign in, also with the right password.
+out="$(sign_up_as "$DECLINE_EMAIL")"
+[[ "$(status)" == 200 && "$(jq -r .next <<<"$out")" == pending ]] || die "second sign-up: $(status) $out"
+ok GET /v1/members 200
+decline_member="$(jq -r --arg e "$DECLINE_EMAIL" '.[] | select(.email == $e and .status == "pending") | .id' "$tmp/body")"
+[[ -n "$decline_member" ]] || die "the second sign-up isn't pending: $(cat "$tmp/body")"
 member_ids+=("$decline_member")
 s="$(api POST "/v1/members/$decline_member/decline")"
 [[ "$s" == 204 ]] || die "decline: $s $(cat "$tmp/body")"
-refused=""
-for _ in $(seq 20); do # the declined user's token is refused at once (`/v1/me` says removed); Zitadel's step follows
-  s="$(uapi "$DECLINE_TOKEN" GET /v1/members)"
-  # 403 is what a pending member already gets: a declined one is 404 not_found (or 401 once
-  # Zitadel ended the session).
-  if [[ "$s" == 401 || "$s" == 404 ]]; then
-    refused=1
-    break
-  fi
-  sleep 1
-done
-[[ -n "$refused" ]] || die "a declined sign-up's next request was answered $s: $(cat "$tmp/body")"
-pass "declined a second sign-up: the next request is refused ($s)"
+next="$(signs_in_as "$DECLINE_EMAIL" "$PASSWORD")"
+[[ "$(status)" == 401 && -z "$next" ]] || die "a declined sign-up's sign-in answered $(status) next=$next (wanted 401)"
+pass "declined a second sign-up: their sign-in is refused (401)"
 
-# The access log: every change above is in it, with the people named (the actor is the demo
-# machine user, a member with no email: checked by its member id).
+# The access log: every change above is in it, with the people named (the actor, the dev
+# member, is checked by its member id).
 ok GET "/v1/access-events?limit=200" 200
 jq -e '(.events | type) == "array" and has("next_before")' "$tmp/body" >/dev/null || die "access-events shape: $(head -c 400 "$tmp/body")"
 jq -e --arg dev "$DEV_EMAIL" --arg su "$SIGNUP_EMAIL" '
@@ -625,9 +500,8 @@ pass "access-events: {events, next_before} with the invite, grant, sign-up and a
 ok PATCH /v1/instance/settings 200 '{"open_signup":false}'
 signup_opened=""
 jq -e '.open_signup == false' "$tmp/body" >/dev/null || die "open sign-up didn't turn off: $(cat "$tmp/body")"
-ar="$(authorize create)"
-[[ "$(ui auth-request "{\"authRequest\":\"$ar\"}")" == '{"signUp":false,"signUpAllowed":false}' ]] ||
-  die "sign-up is still offered after turning it off: $(status)"
+[[ "$(instance)" == '{"setupRequired":false,"signUpAllowed":false}' ]] ||
+  die "sign-up is still offered after turning it off: $(instance)"
 pass "open sign-up off again"
 
 echo "all passed ($((SECONDS - t0)) s)"

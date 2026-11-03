@@ -8,25 +8,18 @@
 #   2. render + up    the base file on local images, plus nginx terminating TLS in front of the
 #                     gateway (published on a free loopback port; curl and the socket client
 #                     reach the hosts through it with the CA, so every public URL is https)
-#   3. public entry   through TLS: the discovery issuer is https://auth.<domain>, Studio 200,
-#                     /_gateway/ready 200
-#   4. in-network     inside the gateway, realtime and orchestrator containers the public https
-#                     auth URL fails (plain HTTP on 443: the bug) and CHELABASE_ZITADEL_INTERNAL_URL
-#                     serves the keys (200) with the auth host as Host
-#   5. sign in        claim with the setup code, sign in as a Studio user: a token whose iss is
-#                     the public https issuer
-#   6. gateway        GET /v1/me with it is 200 (tenant admin); a garbage bearer is 401
-#   7. realtime       a ticket, a socket, the token in its auth frame, a project channel joined
+#   3. public entry   through TLS: Studio 200, /_gateway/ready 200, /auth/v1/instance asks for
+#                     the setup code
+#   4. sign in        claim with the setup code, sign in as Studio does: the session cookie is
+#                     Secure, and /auth/v1/token mints a token whose iss is https://auth.<domain>
+#   5. gateway        GET /v1/me with it is 200 (tenant admin); a garbage bearer is 401
+#   6. realtime       a ticket, a socket, the token in its auth frame, a project channel joined
 #                     (realtime and the orchestrator each verify the token)
-#   7b. database      on a domain of its own (CHELABASE_PROXY_DOMAIN=db.<domain>, as with wildcard
+#   7. database       on a domain of its own (CHELABASE_PROXY_DOMAIN=db.<domain>, as with wildcard
 #                     DNS): the connection details name <ep>.db.<domain> and the published proxy
 #                     port, and psql on the host (verify-full, the CA from `docker compose cp`, the
 #                     name pinned to loopback with hostaddr) creates and reads a row
-#   8. control        realtime and the orchestrator recreated without the in-network URL: the
-#                     socket closes 1013; then the gateway too: /v1/me is 503 (auth unavailable).
-#                     No token passes when the keys can't be fetched
-#   9. restored       recreated with it again: /v1/me is 200
-#  10. down -v        nothing is left behind (also on failure)
+#   8. down -v        nothing is left behind (also on failure)
 #
 # Images: the local release images (`just images`, or your own build): CHELABASE_IMAGE_REPO and
 # CHELABASE_IMAGE_TAG (default chelabase:latest); nothing is pulled for them, and the script never
@@ -53,9 +46,6 @@ step() { STEP="$*"; say "step: $STEP"; }
 
 compose() { # compose <args…>: the project's files and env
   local files=(-f "$dir/docker-compose.yml" -f "$tmp/override.yml")
-  # NOFIX=1: realtime and the orchestrator without the in-network URL; NOFIX=2: the gateway too.
-  [[ "${NOFIX:-0}" -lt 1 ]] || files+=(-f "$tmp/nofix.yml")
-  [[ "${NOFIX:-0}" -lt 2 ]] || files+=(-f "$tmp/nofix-gateway.yml")
   docker compose -p "$PROJECT" --project-directory "$dir" "${files[@]}" --env-file "$tmp/env" "$@"
 }
 
@@ -63,7 +53,7 @@ die() {
   echo "FAIL step '$STEP': $*" >&2
   if [[ -n "$PROJECT" ]]; then
     compose ps -a >&2 2>&1 || true
-    for svc in tls gateway realtime orchestrator auth; do
+    for svc in tls gateway realtime orchestrator auth identity; do
       echo "---- logs $svc (tail 12)" >&2
       { compose logs --no-color --tail 12 "$svc" 2>&1 | cut -c1-300 >&2; } || true
     done
@@ -81,9 +71,9 @@ remove_leftovers() {
 # The install docs' uninstall: stop the stack (so the worker starts no compute), remove the
 # computes by their label (they hold the stack's networks), then down -v.
 teardown() {
-  NOFIX=0 compose stop --timeout 20 >/dev/null 2>&1 || true
+  compose stop --timeout 20 >/dev/null 2>&1 || true
   remove_leftovers
-  NOFIX=0 compose down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
+  compose down -v --remove-orphans --timeout 20 >/dev/null 2>&1 || true
   remove_leftovers
 }
 
@@ -183,11 +173,11 @@ CHELABASE_API_HOST_NAME=$API_HOST
 CHELABASE_AUTH_HOST_NAME=$AUTH_HOST
 CHELABASE_PUBLIC_PORT=443
 CHELABASE_PUBLIC_SECURE=true
-CHELABASE_ZITADEL_TLS_MODE=external
 CHELABASE_HTTP_ADDR=127.0.0.1
 CHELABASE_HTTP_PORT=$HTTP_PORT
 CHELABASE_IMAGE_REPO=$REPO
 CHELABASE_IMAGE_TAG=$TAG
+CHELABASE_IDENTITY_IMAGE_TAG=$TAG
 CHELABASE_CONTROL_SUBNET=10.$n.0.0/22
 CHELABASE_CONTROL_COMPUTE_RANGE=10.$n.2.0/23
 CHELABASE_ORCHESTRATOR_CONTROL_IP=10.$n.0.10
@@ -240,24 +230,13 @@ services:
       gateway:
         condition: service_healthy
 EOF
-# The negative control: the verifying services without the in-network URL.
-cat >"$tmp/nofix.yml" <<'EOF'
-services:
-  realtime: {environment: {CHELABASE_ZITADEL_INTERNAL_URL: ""}}
-  orchestrator: {environment: {CHELABASE_ZITADEL_INTERNAL_URL: ""}}
-EOF
-cat >"$tmp/nofix-gateway.yml" <<'EOF'
-services:
-  gateway: {environment: {CHELABASE_ZITADEL_INTERNAL_URL: ""}}
-EOF
 say "project $PROJECT: https://$STUDIO_HOST through 127.0.0.1:$TLS_PORT (images $REPO/*:$TAG)"
-for svc in gateway orchestrator realtime auth init; do
+for svc in gateway orchestrator realtime auth identity init; do
   docker image inspect "$REPO/$svc:$TAG" >/dev/null 2>&1 ||
     die "no local image $REPO/$svc:$TAG: run \`just images\` (or set CHELABASE_IMAGE_REPO/CHELABASE_IMAGE_TAG)"
 done
 docker image inspect "$NGINX" >/dev/null 2>&1 || docker pull -q "$NGINX" >/dev/null || die "docker pull $NGINX"
 compose config --format json >"$tmp/config.json" 2>"$tmp/config.err" || die "docker compose config: $(cat "$tmp/config.err")"
-HELPER="$(jq -r '.services["metadata-db"].image' "$tmp/config.json")"
 if ! compose up -d --wait --wait-timeout 900 --pull never >"$tmp/up" 2>&1; then
   tail -n 40 "$tmp/up" >&2
   die "docker compose up --wait failed"
@@ -271,77 +250,43 @@ STUDIO="https://$STUDIO_HOST" API="https://$API_HOST" AUTH="https://$AUTH_HOST"
 # ---- 3. public entry -----------------------------------------------------------------------------
 
 step "the public entry answers over TLS"
-issuer="$("${CURL[@]}" "$AUTH/.well-known/openid-configuration" | jq -r .issuer)" || die "discovery"
-[[ "$issuer" == "$AUTH" ]] || die "the discovery issuer is '$issuer', not $AUTH"
 [[ "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$STUDIO/")" == 200 ]] || die "Studio is not 200 at $STUDIO/"
 [[ "$("${CURL[@]}" -o /dev/null -w '%{http_code}' "$API/_gateway/ready")" == 200 ]] || die "/_gateway/ready is not 200"
-pass "issuer $issuer, Studio 200, the gateway ready"
+[[ "$("${CURL[@]}" "$API/auth/v1/instance" | jq -r .setupRequired)" == true ]] || die "/auth/v1/instance doesn't ask for the setup code"
+pass "Studio 200, the gateway ready, the instance asks for the setup code"
 
-# ---- 4. in-network -------------------------------------------------------------------------------
+# ---- 4. sign in ----------------------------------------------------------------------------------
 
-step "inside the network the keys come from the in-network URL, not the public one"
-for svc in gateway realtime orchestrator; do
-  out="$(compose exec -T "$svc" sh -c '
-    printf "%s " "$CHELABASE_ZITADEL_INTERNAL_URL"
-    curl -sS -o /dev/null -w "%{http_code} " -H "Host: $1" "$CHELABASE_ZITADEL_INTERNAL_URL/oauth/v2/keys" || printf "fail "
-    curl -sS -o /dev/null --max-time 10 "https://$1/oauth/v2/keys" 2>/dev/null && echo public-ok || echo public-fails
-  ' sh "$AUTH_HOST" 2>&1)" || die "$svc: exec failed: $out"
-  [[ "$out" == "http://zitadel:8080 200 public-fails" ]] || die "$svc: '$out' (wanted the in-network URL, 200, the public URL failing)"
-done
-pass "gateway, realtime, orchestrator: in-network keys 200, the public https URL fails inside"
-
-# ---- 5. sign in ----------------------------------------------------------------------------------
-
-step "claim the instance and sign in as a Studio user, through TLS"
-vol_cat() {
-  docker run --rm --user 10001:10001 --network none -v "${PROJECT}_secrets:/s:ro" --entrypoint cat "$HELPER" "/s/$1"
-}
+step "claim the instance and sign in as Studio does, through TLS"
 compose logs --no-color init-secrets >"$tmp/init.log" 2>&1 || die "logs init-secrets"
 CODE="$(sed -nE 's/.*Setup code: ([A-Z0-9]{4}(-[A-Z0-9]{4}){4}).*/\1/p' "$tmp/init.log" | head -n1)"
 [[ -n "$CODE" ]] || die "no setup code in the init-secrets logs"
-PROJECT_ID="$(vol_cat bootstrap/ids/project-id | tr -d '\r\n')"
-CLIENT="$(vol_cat bootstrap/ids/studio-client-id | tr -d '\r\n')"
-[[ -n "$PROJECT_ID" && -n "$CLIENT" ]] || die "the bootstrap's ids are missing"
 PASSWORD="Selfhost-tls-$(openssl rand -hex 6)A!"
 EMAIL="admin-$(openssl rand -hex 3)@example.com"
-b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
-authorize() {
-  local verifier challenge loc
-  verifier="$(openssl rand -hex 32)"
-  challenge="$(printf %s "$verifier" | openssl dgst -sha256 -binary | b64url)"
-  echo "$verifier" >"$tmp/verifier"
-  loc="$("${CURL[@]}" -o /dev/null -w '%{redirect_url}' -G "$AUTH/oauth/v2/authorize" \
-    --data-urlencode "client_id=$CLIENT" --data-urlencode "redirect_uri=$STUDIO/callback" \
-    --data-urlencode "response_type=code" \
-    --data-urlencode "scope=openid profile email urn:zitadel:iam:user:resourceowner urn:zitadel:iam:org:project:id:${PROJECT_ID}:aud" \
-    --data-urlencode "code_challenge=$challenge" --data-urlencode "code_challenge_method=S256")" || die "authorize"
-  [[ "$loc" == "$STUDIO/login?authRequest="* ]] || die "authorize redirected to '$loc'"
-  echo "${loc#*authRequest=}"
-}
-ui() { # ui <path> <json>: Studio's login API; body to stdout, status in $tmp/ui-status
+ui() { # ui <path> <json>: Studio's login API; body to stdout, status in $tmp/ui-status, headers in $tmp/ui-headers
   local out
-  out="$("${CURL[@]}" -b "$tmp/jar" -c "$tmp/jar" -H "Origin: $STUDIO" -H 'Content-Type: application/json' \
-    -w '\n%{http_code}' -X POST "$API/auth/v1/$1" -d "$2")" || die "POST /auth/v1/$1"
+  out="$("${CURL[@]}" -D "$tmp/ui-headers" -b "$tmp/jar" -c "$tmp/jar" -H "Origin: $STUDIO" -H 'X-Chelabase-Studio: 1' \
+    -H 'Content-Type: application/json' -w '\n%{http_code}' -X POST "$API/auth/v1/$1" -d "$2")" || die "POST /auth/v1/$1"
   printf '%s' "${out##*$'\n'}" >"$tmp/ui-status"
   printf '%s' "${out%$'\n'*}"
 }
 : >"$tmp/jar"
-out="$(ui sign-up "$(jq -nc --arg ar "$(authorize)" --arg e "$EMAIL" --arg p "$PASSWORD" --arg c "$CODE" \
-  '{authRequest: $ar, email: $e, givenName: "Self", familyName: "Host", password: $p, setupCode: $c}')")"
+out="$(ui sign-up "$(jq -nc --arg e "$EMAIL" --arg p "$PASSWORD" --arg c "$CODE" \
+  '{email: $e, givenName: "Self", familyName: "Host", password: $p, setupCode: $c}')")"
 [[ "$(cat "$tmp/ui-status")" == 200 ]] || die "sign-up with the code: $(cat "$tmp/ui-status") $out"
-out="$(ui sign-in "$(jq -nc --arg ar "$(authorize)" --arg e "$EMAIL" --arg p "$PASSWORD" '{authRequest: $ar, email: $e, password: $p}')")"
-[[ "$(jq -r '.next // empty' <<<"$out")" == done ]] || die "sign-in: $(cat "$tmp/ui-status") $out"
-code="$(jq -r .redirect <<<"$out" | sed -E 's/.*[?&]code=([^&]+).*/\1/')"
-TOKEN="$("${CURL[@]}" -X POST "$AUTH/oauth/v2/token" -d grant_type=authorization_code -d "code=$code" \
-  -d "redirect_uri=$STUDIO/callback" -d "client_id=$CLIENT" -d "code_verifier=$(cat "$tmp/verifier")" | jq -r .access_token)"
-[[ -n "$TOKEN" && "$TOKEN" != null ]] || die "no access token"
+: >"$tmp/jar"
+out="$(ui sign-in "$(jq -nc --arg e "$EMAIL" --arg p "$PASSWORD" '{email: $e, password: $p}')")"
+[[ "$(jq -r '.next // empty' <<<"$out")" == studio ]] || die "sign-in: $(cat "$tmp/ui-status") $out"
+grep -qiE '^set-cookie: chelabase_session=[^;]+;.*; Secure' "$tmp/ui-headers" || die "the session cookie isn't Secure over https"
+TOKEN="$("${CURL[@]}" -b "$tmp/jar" -H "Origin: $STUDIO" -H 'X-Chelabase-Studio: 1' -X POST "$API/auth/v1/token" | jq -r '.access_token // empty')"
+[[ -n "$TOKEN" ]] || die "no access token from /auth/v1/token"
 payload="$(cut -d. -f2 <<<"$TOKEN" | tr '_-' '/+')"
 while ((${#payload} % 4)); do payload+="="; done
 iss="$(base64 -d <<<"$payload" 2>/dev/null | jq -r .iss)"
 [[ "$iss" == "$AUTH" ]] || die "the token's iss is '$iss', not $AUTH"
-pass "signed in; the token's iss is $iss"
+pass "signed in (a Secure session cookie); the token's iss is $iss"
 
-# ---- 6. gateway ----------------------------------------------------------------------------------
+# ---- 5. gateway ----------------------------------------------------------------------------------
 
 me() { "${CURL[@]}" -o "$tmp/body" -w '%{http_code}' "$API/v1/me" -H "Authorization: Bearer $1" || echo 000; }
 step "the gateway verifies the token"
@@ -353,7 +298,7 @@ status="$(me "x.y.z")"
 [[ "$status" == 401 ]] || die "a garbage bearer: $status (wanted 401) $(cat "$tmp/body")"
 pass "GET /v1/me 200 as tenant admin; a garbage bearer 401"
 
-# ---- 7. realtime ---------------------------------------------------------------------------------
+# ---- 6. realtime ---------------------------------------------------------------------------------
 
 # socket_join <ticket> <channel>: the socket's first frames; prints `joined`, `closed <code>` or
 # `timeout`. A minimal RFC 6455 client over TLS (Node's own WebSocket can't pin a proxy address).
@@ -422,7 +367,7 @@ got="$(socket_join "$(jq -r .ticket "$tmp/body")" "project:$project")"
 [[ "$got" == joined ]] || die "the socket with the token: $got (wanted joined)"
 pass "ticket 201; the socket's auth frame verified and project:$project joined"
 
-# ---- 7b. a database on the install's own proxy domain --------------------------------------------
+# ---- 7. a database on the install's own proxy domain --------------------------------------------
 
 api() { # api <method> <path> [json]: status to stdout, body in $tmp/body
   local args=(-o "$tmp/body" -w '%{http_code}' -X "$1" "$API$2" -H "Authorization: Bearer $TOKEN")
@@ -462,36 +407,7 @@ done
 [[ "$(psql_host -c 'create table t(v int); insert into t values (7); select v from t')" == 7 ]] || die "write and read through the proxy"
 pass "$pg_host:$PROXY_PORT from the host: verify-full against the install's CA, a row created and read"
 
-# ---- 8. negative control -------------------------------------------------------------------------
-
-step "without the in-network URL no token passes (the control)"
-# Realtime and the orchestrator first (the gateway still verifies, so a ticket is issued).
-NOFIX=1 compose up -d --wait --wait-timeout 300 --pull never realtime orchestrator >"$tmp/nofix.up" 2>&1 ||
-  { tail -n 20 "$tmp/nofix.up" >&2; die "recreating realtime and the orchestrator without the in-network URL failed"; }
-status="$(ticket)"
-[[ "$status" == 201 ]] || die "POST /v1/realtime/tickets (control): $status $(cat "$tmp/body")"
-got="$(socket_join "$(jq -r .ticket "$tmp/body")" "project:$project")"
-[[ "$got" == "closed 1013" ]] || die "the socket without the in-network URL: $got (wanted closed 1013)"
-# Then the gateway.
-NOFIX=2 compose up -d --wait --wait-timeout 300 --pull never gateway >"$tmp/nofix-gw.up" 2>&1 ||
-  { tail -n 20 "$tmp/nofix-gw.up" >&2; die "recreating the gateway without the in-network URL failed"; }
-status="$(me "$TOKEN")"
-[[ "$status" == 503 ]] || die "GET /v1/me without the in-network URL: $status (wanted 503) $(cat "$tmp/body")"
-jq -e '.error.code == "unavailable"' "$tmp/body" >/dev/null || die "/v1/me: $(cat "$tmp/body")"
-compose logs --no-color --since 5m gateway >"$tmp/nofix.log" 2>&1 || true
-grep -q "jwks fetch failed" "$tmp/nofix.log" || die "the gateway logged no failed key fetch"
-pass "the socket closed 1013 (realtime can't fetch keys); GET /v1/me 503 unavailable (the gateway can't)"
-
-# ---- 9. restored ---------------------------------------------------------------------------------
-
-step "with the in-network URL again, the token verifies"
-NOFIX=0 compose up -d --wait --wait-timeout 300 --pull never gateway realtime orchestrator >"$tmp/refix.up" 2>&1 ||
-  { tail -n 20 "$tmp/refix.up" >&2; die "recreating with the in-network URL failed"; }
-status="$(me "$TOKEN")"
-[[ "$status" == 200 ]] || die "GET /v1/me after restoring: $status $(cat "$tmp/body")"
-pass "GET /v1/me 200"
-
-# ---- 10. down -v ---------------------------------------------------------------------------------
+# ---- 8. down -v ---------------------------------------------------------------------------------
 
 step "down -v leaves nothing behind"
 [[ "${SELFHOST_TLS_E2E_KEEP:-}" == 1 ]] && exit 0
