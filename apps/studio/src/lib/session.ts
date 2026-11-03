@@ -1,6 +1,6 @@
 import { ApiError } from "@chelabase/management-client";
 import { mintMemberToken } from "./login-client/generated/endpoints";
-import type { OidcEvents } from "./realtime/types";
+import type { SessionEvents } from "./realtime/types";
 
 /** What `POST /auth/v1/token` answers. */
 export interface MintedToken {
@@ -159,7 +159,7 @@ export function createStudioSession(): Session {
  * The realtime client's view of the session, in the shape it already listens for: a renewed
  * token is `userLoaded`, sign-out is `userUnloaded` and `userSignedOut`.
  */
-export function realtimeAuthEvents(session: Session): OidcEvents {
+export function realtimeAuthEvents(session: Session): SessionEvents {
   type Out = () => void;
   const loaded = new Map<(user: { access_token: string }) => void, Out>();
   const unloaded = new Map<Out, Out>();
