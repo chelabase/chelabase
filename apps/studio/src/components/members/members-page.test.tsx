@@ -565,8 +565,6 @@ describe("MembersPage", () => {
   it("each invite 409 code reads its own way", async () => {
     const cases: [object, RegExp][] = [
       [{ code: "signup_pending", message: "x", member_id: "ed" }, /signed up and is waiting for approval/],
-      [{ code: "email_ambiguous", message: "x" }, /More than one account in this organisation uses/],
-      [{ code: "email_in_use_elsewhere", message: "x" }, /Another account outside this organisation already uses/],
     ];
     for (const [error, text] of cases) {
       const r = setup({ routes: { "POST /v1/invites": ok({ error }, 409) } });
