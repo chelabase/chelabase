@@ -93,6 +93,25 @@ describe("AppUsersCard", () => {
     });
   });
 
+  // A disable the worker put on hold (its pool still has users): the reason, and enabling again.
+  it("disable_on_hold_shows_error_and_enable_again", async () => {
+    const held = "the app-user pool app-p1 still holds 1 user(s); the pool is kept";
+    const { fetch } = setup(
+      {
+        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "disabling", error: held })),
+        "PUT /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "enabling" }), 202),
+      },
+      { ...project, app_users: "disabling" },
+    );
+    expect(await screen.findByText(held)).toBeInTheDocument();
+    expect(screen.getByText("Disabling app users is on hold")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Enable again" }));
+    await waitFor(() => expect(fetch.calls.some((c) => c.method === "PUT")).toBe(true));
+    expect(await fetch.calls.find((c) => c.method === "PUT")!.json()).toMatchObject({
+      database_id: "d1", pg_database: "postgres", schema: "public", table: "users", on_delete: "delete",
+    });
+  });
+
   it("enabled_settings_update_verification", async () => {
     const { fetch } = setup(
       {

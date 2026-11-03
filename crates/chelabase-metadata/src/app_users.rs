@@ -103,7 +103,8 @@ pub struct NewProjectAuth<'a> {
 pub enum BeginEnable {
     /// A new `enabling` row.
     Started,
-    /// A `failed` row with the same location went back to `enabling`.
+    /// A `failed` row, or a `disabling` one on hold, with the same location went back to
+    /// `enabling`.
     Retry,
     /// A row exists (any other state, or another location): nothing written.
     Exists(ProjectAuth),
@@ -295,9 +296,10 @@ impl MetadataClient {
 
     /// Starts enabling app users. Locks the project row (`FOR UPDATE`) and refuses with
     /// [`MetadataError::ProjectDeleting`] unless the project is `active`. A missing row is
-    /// inserted as `enabling`; a `failed` row with the same database, schema and table goes
-    /// back to `enabling` with its error cleared and the two settings updated; any other row is
-    /// returned untouched.
+    /// inserted as `enabling`; a `failed` row, or a `disabling` one the worker put on hold (its
+    /// pool still had users: the row holds the error), with the same database, schema and table
+    /// goes back to `enabling` with its error cleared and the two settings updated; any other
+    /// row is returned untouched.
     pub async fn begin_enable_app_users(
         &self,
         new: &NewProjectAuth<'_>,
@@ -345,7 +347,8 @@ impl MetadataClient {
                     && row.pg_database == new.pg_database
                     && row.schema_name == new.schema_name
                     && row.table_name == new.table_name;
-                if row.status == AppUsersStatus::Failed && same_place {
+                let on_hold = row.status == AppUsersStatus::Disabling && row.error.is_some();
+                if (row.status == AppUsersStatus::Failed || on_hold) && same_place {
                     sqlx::query(
                         "UPDATE project_auth
                          SET status = 'enabling', error = NULL, email_verification = $2,

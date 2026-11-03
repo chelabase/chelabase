@@ -392,7 +392,7 @@ where
     operation_id = "putAppUsers",
     tag = "app-users",
     summary = "Enable app users, or change their settings",
-    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
+    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202), and so does pressing it on a disable on hold (`disabling` with an `error`: its pool still has users), which keeps the pool and its users. Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
     params(("id" = Uuid, Path, description = "Project id")),
     request_body = PutAppUsersRequest,
     responses(
@@ -401,7 +401,7 @@ where
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project, database or Postgres database (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled", body = ErrorEnvelope),
+        (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled (and the disable isn't on hold)", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: a field is missing or invalid, the schema is reserved (`chelabase`, `information_schema`, `pg_*`, Neon's), or `on_delete` isn't `delete` or `mark`", body = ErrorEnvelope),

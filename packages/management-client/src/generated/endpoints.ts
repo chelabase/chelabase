@@ -9338,7 +9338,7 @@ export const getPutAppUsersUrl = (id: string,) => {
 }
 
 /**
- * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
+ * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202), and so does pressing it on a disable on hold (`disabling` with an `error`: its pool still has users), which keeps the pool and its users. Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
  * @summary Enable app users, or change their settings
  */
 export const putAppUsers = async (id: string,

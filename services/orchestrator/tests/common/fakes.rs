@@ -358,11 +358,6 @@ impl FakeMetadata {
         });
     }
 
-    /// Sets (or clears) when the tenant's admin was claimed.
-    fn set_setup_claim(&self, tenant: TenantId, user: &str) {
-        self.setup_claims.lock().unwrap().insert(tenant, user.into());
-    }
-
     fn set_admin_claim(&self, tenant: TenantId, at: Option<chrono::DateTime<chrono::Utc>>) {
         let mut claims = self.admin_claims.lock().unwrap();
         match at {
@@ -1444,7 +1439,8 @@ impl MetadataPort for FakeMetadata {
                 && existing.pg_database == new.pg_database
                 && existing.schema_name == new.schema_name
                 && existing.table_name == new.table_name;
-            if existing.status == AppUsersStatus::Failed && same {
+            let on_hold = existing.status == AppUsersStatus::Disabling && existing.error.is_some();
+            if (existing.status == AppUsersStatus::Failed || on_hold) && same {
                 existing.status = AppUsersStatus::Enabling;
                 existing.error = None;
                 existing.email_verification = new.email_verification;

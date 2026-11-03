@@ -567,6 +567,27 @@ async fn put_while_enabling_republishes() {
     );
 }
 
+// Review S5 follow-up: a disable the worker put on hold (its pool still has users, the reason
+// on the row) can be undone: enabling again goes back to `enabling` with the error cleared,
+// and the worker reinstalls on the kept pool. A disable still under way (no error) can't.
+#[tokio::test]
+async fn put_re_enables_a_disable_on_hold() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Disabling);
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!((status, code_of(&body)), (409, "conflict"), "under way: {body}");
+    assert!(au.jobs_published().is_empty());
+
+    au.metadata.project_auths.lock().unwrap().get_mut(&au.project.id).unwrap().error =
+        Some("the app-user pool still holds 1 user(s)".into());
+    let (status, body) = au.call(Method::PUT, "/app-users", Some(put_body(&au))).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body["status"], "enabling");
+    assert_eq!(body["error"], Value::Null);
+    assert_eq!(au.jobs_published(), vec![AppUsersJob::Enable { project_id: au.project.id }]);
+    assert_eq!(au.auth().status, AppUsersStatus::Enabling);
+}
+
 #[tokio::test]
 async fn delete_while_disabling_republishes() {
     let au = au_env(true).await;

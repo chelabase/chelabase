@@ -5807,6 +5807,37 @@ async fn enable_app_users_start_retry_exists() {
     assert!(!settings.email_verification && settings.on_delete == OnDelete::Mark);
 }
 
+/// Review S5 follow-up: a disable the worker put on hold (`disabling` with its error) goes back
+/// to `enabling` with the error cleared when enabled again at the same place; a disable under
+/// way (no error) or another place stays as it is.
+#[tokio::test]
+#[ignore]
+async fn enable_resumes_a_disable_on_hold() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "resume").await;
+    let db = ready_database_in(&client, project).await;
+    let auth = new_auth(project, db);
+    client.begin_enable_app_users(&auth).await.unwrap();
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    assert!(client.begin_disable_app_users(project).await.unwrap());
+    let under_way = client.begin_enable_app_users(&auth).await.unwrap();
+    client.set_app_users_error(project, Some("still holds 1 user(s)")).await.unwrap();
+    let on_hold = client.project_auth(project).await.unwrap().unwrap();
+    let elsewhere = client.begin_enable_app_users(&NewProjectAuth { table_name: "members", ..auth }).await.unwrap();
+    let resumed = client.begin_enable_app_users(&auth).await.unwrap();
+    let after = client.project_auth(project).await.unwrap().unwrap();
+    cleanup_project(&client, project, &[db]).await;
+    assert!(matches!(under_way, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Disabling));
+    assert_eq!(
+        (on_hold.status, on_hold.error.as_deref()),
+        (AppUsersStatus::Disabling, Some("still holds 1 user(s)"))
+    );
+    assert!(matches!(elsewhere, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Disabling));
+    assert_eq!(resumed, BeginEnable::Retry);
+    assert_eq!((after.status, after.error), (AppUsersStatus::Enabling, None));
+}
+
 #[tokio::test]
 #[ignore]
 async fn finish_enable_moves_only_enabling() {

@@ -85,6 +85,23 @@ export function AppUsersCard({ project, databases }: AppUsersCardProps) {
     },
   });
 
+  // Starts enabling again at the row's own place and settings (after `failed`, or on a disable
+  // on hold).
+  const enableAgain = (row: AppUsersSettings) =>
+    put.mutate({
+      id: project.id,
+      data: {
+        database_id: row.database_id,
+        pg_database: row.pg_database,
+        schema: row.schema,
+        table: row.table,
+        email_verification: row.email_verification,
+        on_delete: row.on_delete,
+      },
+    });
+  // A disable the worker put on hold: the pool still has users (the reason is on the row).
+  const onHold = status === "disabling" && settings.data?.status === "disabling" && !!settings.data.error;
+
   return (
     <section data-slot="app-users-card" className="space-y-3">
       <h2 className="text-lg font-semibold">App users</h2>
@@ -94,6 +111,16 @@ export function AppUsersCard({ project, databases }: AppUsersCardProps) {
           pending={put.isPending}
           onSubmit={(data) => put.mutate({ id: project.id, data })}
         />
+      ) : onHold && settings.data ? (
+        <div className="space-y-2 text-sm">
+          <p role="status" className="text-destructive">
+            Disabling app users is on hold
+          </p>
+          <p>{settings.data.error}</p>
+          <Button disabled={put.isPending} onClick={() => enableAgain(settings.data!)}>
+            Enable again
+          </Button>
+        </div>
       ) : status === "enabling" || status === "disabling" ? (
         <p className="text-sm text-muted-foreground">{status === "enabling" ? "Enabling…" : "Disabling…"}</p>
       ) : settings.data === undefined ? (
@@ -105,22 +132,7 @@ export function AppUsersCard({ project, databases }: AppUsersCardProps) {
           </p>
           {settings.data.error && <p>{settings.data.error}</p>}
           <div className="flex gap-2">
-            <Button
-              disabled={put.isPending || disable.isPending}
-              onClick={() =>
-                put.mutate({
-                  id: project.id,
-                  data: {
-                    database_id: settings.data.database_id,
-                    pg_database: settings.data.pg_database,
-                    schema: settings.data.schema,
-                    table: settings.data.table,
-                    email_verification: settings.data.email_verification,
-                    on_delete: settings.data.on_delete,
-                  },
-                })
-              }
-            >
+            <Button disabled={put.isPending || disable.isPending} onClick={() => enableAgain(settings.data!)}>
               Retry
             </Button>
             <Button variant="outline" disabled={put.isPending || disable.isPending} onClick={() => disable.mutate({ id: project.id })}>

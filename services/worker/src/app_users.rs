@@ -382,7 +382,7 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         match identity.list_users(&app_pool(project), 1, 0).await {
             Ok(page) if page.total > 0 => {
                 let error = format!(
-                    "the app-user pool {} still holds {} user(s), who signed up while app users were being disabled; the pool is kept and the disable finishes once it is empty",
+                    "the app-user pool {} still holds {} user(s), who signed up while app users were being disabled; the pool is kept. Enable app users again, delete those users, then disable",
                     app_pool(project),
                     page.total
                 );
@@ -1328,6 +1328,41 @@ pub(crate) mod tests {
         })
         .await
         .unwrap();
+        assert!(!s.pool_exists().await);
+        assert!(!s.w.metadata.state().project_auth.contains_key(&s.project));
+    }
+
+    // The recovery for a disable on hold: the admin enables again (the orchestrator moves the
+    // row back to `enabling` and clears the error), the enable reinstalls on the kept pool
+    // with its user, the admin deletes the user, and the next disable finishes.
+    #[tokio::test]
+    async fn a_disable_on_hold_re_enables_then_finishes() {
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        let late = s.add_user("late@example.com");
+        s.w.handle_app_users_job(&AppUsersJob::Disable { project_id: s.project }).await.unwrap();
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some(), "on hold");
+
+        // `PUT …/app-users` on the stuck row (begin_enable_app_users' Retry).
+        {
+            let mut state = s.w.metadata.state();
+            let row = state.project_auth.get_mut(&s.project).unwrap();
+            row.status = AppUsersStatus::Enabling;
+            row.error = None;
+        }
+        s.w.handle_app_users_job(&enable(&s)).await.unwrap();
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!((auth.status, auth.error.as_deref()), (AppUsersStatus::Enabled, None));
+        assert!(
+            !scripts(&s.w, &ep(&s.main), "app", BOOTSTRAP).is_empty(),
+            "the users machinery is back on the branch"
+        );
+        s.fake.client().get_user(&s.pool(), &late.to_string()).await.expect("the pool and its user were kept");
+
+        // The admin deletes the user, then disables again.
+        s.fake.client().delete_user(&s.pool(), &late.to_string()).await.unwrap();
+        s.w.metadata.state().project_auth.get_mut(&s.project).unwrap().status = AppUsersStatus::Disabling;
+        s.w.handle_app_users_job(&AppUsersJob::Disable { project_id: s.project }).await.unwrap();
         assert!(!s.pool_exists().await);
         assert!(!s.w.metadata.state().project_auth.contains_key(&s.project));
     }
