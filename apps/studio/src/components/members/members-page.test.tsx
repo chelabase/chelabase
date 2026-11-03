@@ -600,12 +600,13 @@ describe("MembersPage", () => {
     expect(bodies).toEqual([{ delivery: "email" }, { delivery: "link" }]);
   });
 
-  it("a removal whose identity step failed stays on screen with Retry", async () => {
+  // A metadata step answers `unavailable`, an identity step `identity_unavailable`: both are retryable.
+  it.each(["unavailable", "identity_unavailable"])("a removal answering 503 %s stays on screen with Retry", async (code) => {
     let attempts = 0;
     setup({
       routes: {
         "DELETE /v1/members/bo": () =>
-          ++attempts === 1 ? jsonResponse({ error: { code: "unavailable", message: "zitadel down" } }, 503) : new Response(null, { status: 204 }),
+          ++attempts === 1 ? jsonResponse({ error: { code, message: "down" } }, 503) : new Response(null, { status: 204 }),
       },
     });
     await userEvent.click(await screen.findByRole("button", { name: "More actions for Bo" }));

@@ -240,7 +240,7 @@ function PeopleRoster({ members, selfId, tenantAdmin, projects, onStatus: setSta
       await run();
       setUnfinished(null);
     } catch (err) {
-      if (err instanceof ApiError && err.code === "unavailable") {
+      if (err instanceof ApiError && (err.code === "unavailable" || err.code === "identity_unavailable")) {
         setUnfinished({ name, retry: () => removal(name, run) });
         return;
       }
