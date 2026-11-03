@@ -6277,7 +6277,8 @@ async fn a_failed_tenant_lookup_on_offboarding_is_500() {
 
 // D7: `user.reactivated` and `user.unlocked` for a tenant org clear the member's offboarded
 // mark (its logins stay revoked: nothing is revoked or published for them); a failed clear is
-// a 500 so Zitadel retries; an app-users org's reactivation still syncs the app user.
+// a 500 so Zitadel retries. An app-users org's reactivation does nothing (#123: app users live
+// in identity pools).
 #[tokio::test]
 async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
     for kind in ["user.reactivated", "user.unlocked"] {
@@ -6299,7 +6300,8 @@ async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
     let user = uuid::Uuid::new_v4();
     let body = user_event("user.reactivated", ORG, &user.to_string(), chrono::Utc::now());
     assert_eq!(a.app.event(&body, signed(&body)).await, 200);
-    assert!(eventually(|| a.published().len() == 1).await, "{:?}", a.published());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(a.published().is_empty(), "{:?}", a.published());
 }
 
 // ---- Fork round 4, C4 (RT4-2, SP1, SP4, SP11, SP23) ----

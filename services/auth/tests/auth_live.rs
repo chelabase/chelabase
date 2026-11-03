@@ -549,7 +549,8 @@ where
         let (status, body) = api(
             Method::PUT,
             &format!("/v1/projects/{project_id}/app-users"),
-            Some(json!({"database_id": db})),
+            // Sign-up signs in at once: the live tests read no mail.
+            Some(json!({"database_id": db, "email_verification": false})),
         )
         .await;
         if status != 202 {
@@ -591,43 +592,57 @@ where
     }
 }
 
-/// A password Zitadel's policy refuses is `weak_password` in app-user sign-up (by its `COMMA-`
-/// id) and reset (by its `DOMAIN-` id) (AC 3).
+/// An app-user call made as a signed-in user: the `Chelabase-User` header carries the access
+/// token, as the SDK sends it.
+async fn app_as(key: &str, access: &str, path: &str, body: Value) -> (u16, Value) {
+    send(
+        reqwest::Client::new()
+            .post(format!("{}/auth/v1/app/{path}", gateway()))
+            .bearer_auth(key)
+            .header("chelabase-user", access)
+            .json(&body),
+    )
+    .await
+}
+
+/// #123: app users live in the project's identity pool. Sign-up, sign-in and refresh run there
+/// (refresh checks the identity session behind the app session), and a password change on one
+/// device ends the other's session at its next refresh. Retires
+/// `zitadel_policy_refusals_are_weak_passwords_for_app_users`: identity has no Zitadel policy,
+/// and auth's own password rule answers first.
 #[tokio::test]
-#[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
-async fn zitadel_policy_refusals_are_weak_passwords_for_app_users() {
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn app_user_sessions_live_in_the_identity_pool() {
     with_app_users(|key| async move {
         let tag = &Uuid::new_v4().simple().to_string()[..8];
-        let (status, body) = app(
-            &key,
-            "sign-up",
-            json!({"email": format!("weak-{tag}@example.com"), "password": ZITADEL_WEAK}),
-        )
-        .await;
-        assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
         let email = format!("user-{tag}@example.com");
-        let (status, body) =
-            app(&key, "sign-up", json!({"email": email, "password": STRONG})).await;
-        assert_eq!(status, 201, "sign-up: {body}");
-        let user = body["user"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no user id: {body}"))
-            .to_string();
-        let code = admin().reset_code(&user).await;
-        let (status, body) = app(
+        let (status, one) = app(&key, "sign-up", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 201, "sign-up: {one}");
+        let one_access = one["access_token"].as_str().unwrap_or_else(|| panic!("no tokens: {one}"));
+        let (status, two) = app(&key, "sign-in", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 200, "sign-in: {two}");
+        let (status, two) = app(&key, "refresh", json!({"refresh_token": two["refresh_token"]})).await;
+        assert_eq!(status, 200, "refresh: {two}");
+        let (status, wrong) = app(&key, "sign-in", json!({"email": email, "password": "Wrong-pass-12!"})).await;
+        assert_eq!((status, code_of(&wrong)), (401, "invalid_credentials"), "{wrong}");
+        // Device one changes the password: device two's next refresh is refused.
+        let new_password = "Other-pass-34!";
+        let (status, changed) = app_as(
             &key,
-            "password-reset/confirm",
-            json!({"email": email, "code": code, "password": ZITADEL_WEAK}),
+            one_access,
+            "change-password",
+            json!({"current_password": STRONG, "password": new_password}),
         )
         .await;
-        assert_eq!((status, code_of(&body)), (422, "weak_password"), "{body}");
-        let (status, body) = app(
-            &key,
-            "password-reset/confirm",
-            json!({"email": email, "code": code, "password": "Other-pass-34!"}),
-        )
-        .await;
-        assert_eq!(status, 204, "the code wasn't spent: {body}");
+        assert_eq!(status, 200, "change-password: {changed}");
+        let (status, body) = app(&key, "refresh", json!({"refresh_token": two["refresh_token"]})).await;
+        assert_eq!(status, 401, "the other device's refresh: {body}");
+        let (status, body) = app(&key, "refresh", json!({"refresh_token": changed["refresh_token"]})).await;
+        assert_eq!(status, 200, "the new session's refresh: {body}");
+        let (status, _) = app(&key, "sign-in", json!({"email": email, "password": STRONG})).await;
+        assert_eq!(status, 401, "the old password");
+        let (status, body) = app(&key, "sign-in", json!({"email": email, "password": new_password})).await;
+        assert_eq!(status, 200, "the new password: {body}");
     })
     .await;
 }

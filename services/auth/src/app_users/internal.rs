@@ -52,6 +52,8 @@ pub struct RefreshRequest {
 pub struct Refreshed {
     pub session_id: Uuid,
     pub user_id: Uuid,
+    /// The identity session behind the app session (#123).
+    pub identity_session_id: String,
     pub refresh_token: String,
 }
 
@@ -60,6 +62,9 @@ pub struct Refreshed {
 pub struct Peeked {
     pub session_id: Uuid,
     pub user_id: Uuid,
+    /// The identity session behind the app session (#123). Required: an orchestrator that
+    /// doesn't name it is unreadable (503), never a session without one.
+    pub identity_session_id: String,
     /// The token is the previous one, inside its grace: reuse once the grace ends.
     pub grace: bool,
 }

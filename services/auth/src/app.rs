@@ -1116,15 +1116,6 @@ pub(crate) const SET_PASSWORD_POLICY: [refusals::Refusal; 5] = [
     refusals::PASSWORD_NO_SYMBOL,
 ];
 
-/// The same checks on `POST /v2/users/new`, with that endpoint's ids.
-pub(crate) const CREATE_PASSWORD_POLICY: [refusals::Refusal; 5] = [
-    refusals::CREATE_USER_PASSWORD_TOO_SHORT,
-    refusals::CREATE_USER_PASSWORD_NO_UPPER,
-    refusals::CREATE_USER_PASSWORD_NO_LOWER,
-    refusals::CREATE_USER_PASSWORD_NO_NUMBER,
-    refusals::CREATE_USER_PASSWORD_NO_SYMBOL,
-];
-
 /// A password Zitadel can take: the policy's checks, and at most bcrypt's 72 bytes (counted in
 /// bytes, so 39 characters can be too many). A longer one passes Zitadel's validation and then
 /// fails with a 500 (`refusals::PASSWORD_MAX_BYTES`).

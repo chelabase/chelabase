@@ -1,5 +1,6 @@
 //! App users' flows (`/auth/v1/app/*`): sign-up, sign-in and sessions for a project's end
-//! users, who live in the project's own Zitadel organization and get Chelabase-signed tokens.
+//! users, who live in the project's identity pool (`app-<project>`) and get Chelabase-signed
+//! tokens.
 
 pub mod flows;
 pub mod identity;
@@ -19,17 +20,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// Zitadel's `urlTemplate` for app users' emails: the code alone (R6, P13).
-pub const CODE_TEMPLATE: &str = "{{.Code}}";
 /// How long a branch's settings are reused.
 pub const BRANCH_CACHE_TTL: Duration = Duration::from_secs(30);
-/// How long a refresh waits for Zitadel's user answer before it answers 503 (#59 audit B1).
-/// A refresh checks the user between the orchestrator's peek and its rotation, and the
+/// How long a refresh waits for identity's session answer before it answers 503 (#59 audit
+/// B1). A refresh checks the session between the orchestrator's peek and its rotation, and the
 /// orchestrator keeps a replaced token answerable for only [`APP_REFRESH_GRACE`] (10 s): a
 /// request that peeked the current token just before a parallel one rotated it must still
 /// reach `refresh` inside that window. So the lookup takes at most 2/5 of the grace (4 s),
 /// leaving the rest (6 s) for the peek's reply, the `refresh` call and its row lock. Other
-/// Zitadel calls keep the client's own 10 s timeout.
+/// identity calls keep the client's own 10 s timeout.
 pub const REFRESH_USER_LOOKUP: Duration =
     Duration::from_millis(APP_REFRESH_GRACE.as_millis() as u64 * 2 / 5);
 const _: () = assert!(REFRESH_USER_LOOKUP.as_millis() * 2 <= APP_REFRESH_GRACE.as_millis());
@@ -39,7 +38,7 @@ pub struct AppUsers {
     pub internal: InternalClient,
     pub signer: AppTokenSigner,
     pub users_db: Arc<dyn UsersDb>,
-    /// Admin token client, only for deleting a user after a failed sign-up commit (P32).
+    /// Unused since #123 (app users moved to identity pools); removed with Zitadel (m13).
     pub zitadel_admin: Zitadel,
     pub access_ttl: Duration,
     pub branches: moka::future::Cache<Uuid, Arc<AppBranchInfo>>,
