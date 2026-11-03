@@ -10317,7 +10317,17 @@
             }
           },
           "401": {
-            "description": "`unauthorized`: no credential, or a bad token or internal identity",
+            "description": "`unauthorized`: no credential, a bad token or internal identity, or a member token whose tenant no longer exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`no_access_yet` (self-hosted) or `not_available_in_platform_mode` (platform): a member token whose subject has no member row in the tenant it names",
             "content": {
               "application/json": {
                 "schema": {
