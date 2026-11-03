@@ -13,7 +13,8 @@
 //!   never makes a row, so this is where it is made. The bearer alone binds nothing: a claim
 //!   needs a nonce, which only the code gets.
 //! - `POST /internal/signup/joined {org, user_id}`: the same for an open sign-up, whose row is
-//!   `pending` until an admin approves it. It asks the gate's question again.
+//!   `pending` until an admin approves it. It asks the gate's question again, and writes no row
+//!   for a user whose email isn't verified.
 //! - `POST /internal/members/active {user_id}`: the tenants a person is an active or pending
 //!   member of. `auth` chooses a sign-in's tenant from it and re-reads it before minting.
 //!
@@ -237,6 +238,13 @@ async fn identity_user(identity: &Identity, id: &str) -> Result<Option<User>, Id
     }
 }
 
+/// The identity user an open sign-up may write a row for: `None` for a definite not-found and
+/// for an unverified email. A `pending` row shows in the admins' request list and takes its
+/// address from other rows (`release_email`), so it waits until the address is proven.
+async fn joinable_user(identity: &Identity, id: &str) -> Result<Option<User>, IdentityError> {
+    Ok(identity_user(identity, id).await?.filter(|user| user.email_verified))
+}
+
 /// The nonce's SHA-256, for a nonce of exactly the shape `check` hands out (64 hex digits).
 fn nonce_hash(nonce: &str) -> Option<[u8; 32]> {
     let bytes: [u8; 32] = hex::decode(nonce).ok()?.try_into().ok()?;
@@ -352,7 +360,9 @@ pub(super) struct JoinedBody {
 /// Writes the `pending` row of a user who signed up while the tenant is open: 200
 /// `{"joined": true}`. 200 `{"joined": false}` (nothing written) in platform mode, for a tenant
 /// that isn't open now or has no member yet (the setup claim's business), for an unknown org
-/// or user. 503 when identity can't be asked. `auth` deletes the account unless `joined`.
+/// or user, and for a user whose email isn't verified. 503 when identity can't be asked.
+/// `auth` deletes the account unless `joined`. With verification on, `auth` asks only once the
+/// email is verified (m11's verify-email).
 pub(super) async fn joined<M, L>(
     State(state): State<Arc<InternalState<M, L>>>,
     Json(b): Json<JoinedBody>,
@@ -376,7 +386,7 @@ where
     let Some(identity) = &state.identity else {
         return unavailable("no identity client to check the user");
     };
-    let user = match identity_user(identity, &b.user_id).await {
+    let user = match joinable_user(identity, &b.user_id).await {
         Ok(Some(user)) => user,
         Ok(None) => return no(),
         Err(e) => return unavailable(&format!("identity lookup failed: {e}")),
@@ -479,6 +489,24 @@ mod tests {
         let good = dir.path().join("setup.code");
         std::fs::write(&good, format!("{CODE}\n")).unwrap();
         assert!(load_setup_code(good.to_str()).unwrap().matches(CODE));
+    }
+
+    // #121 audit S1: an address nobody proved gets no `pending` row, so it can't squat an
+    // email in the admin's request list.
+    #[tokio::test]
+    async fn only_a_verified_user_may_join() {
+        use chelabase_identity::mock::FakeIdentity;
+        let mock = FakeIdentity::start().await;
+        let verified = mock.with_user(&Pool::Members, "a@x.com", "password1");
+        let unverified = mock.with_unverified_user(&Pool::Members, "b@x.com", "password1");
+        let identity = mock.client();
+        let joinable = joinable_user(&identity, &verified).await.unwrap();
+        assert_eq!(joinable.map(|u| u.id), Some(verified));
+        assert!(joinable_user(&identity, &unverified).await.unwrap().is_none(), "unverified");
+        let unknown = uuid::Uuid::new_v4().to_string();
+        assert!(joinable_user(&identity, &unknown).await.unwrap().is_none(), "unknown");
+        mock.set_down(true);
+        assert!(joinable_user(&identity, &unknown).await.is_err(), "unreadable is not a no");
     }
 
     #[test]
