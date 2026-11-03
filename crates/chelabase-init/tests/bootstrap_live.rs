@@ -584,14 +584,21 @@ async fn pool_schema_function_name_rule() {
     .await;
 }
 
-// AC 1: the stack's own members pool, through the bootstrap's identity step, twice: the schema
-// exists, is the identity role's, and the second run changes nothing. Needs the stack's identity
-// service and the runner's identity secrets.
+// AC 1: the stack's own members pool and the bootstrap's identity step, run again. The
+// bootstrap's own run on `up` (with tokens/bootstrap-identity.token, which the runner never
+// gets: it is mounted in the bootstrap and identity only) made the members pool; this checks
+// what it made, reruns the step's roles part, and proves the pool route the step calls is
+// idempotent on a scratch app pool, with the worker's token (identity lets the worker create
+// app pools only, so that token is refused on `members`). Needs the stack's identity service
+// and the runner's identity secrets.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres and identity service"]
 async fn members_pool_idempotent() {
-    use chelabase_init::bootstrap::identity::{IdentityConfig, run};
+    use chelabase_init::bootstrap::identity::{
+        IdentityConfig, MEMBERS_POOL, create_pool, ensure_roles,
+    };
     use chelabase_init::bootstrap::retry::{Backoff, Waiter};
+    use chelabase_init::roles::IdentityRoles;
     let keys = std::env::var("CHELABASE_KEYS_DIR").expect("CHELABASE_KEYS_DIR (the runner's)");
     let read = |f: &str| {
         std::fs::read_to_string(format!("{keys}/{f}"))
@@ -599,40 +606,88 @@ async fn members_pool_idempotent() {
     };
     let base = std::env::var("CHELABASE_IDENTITY_URL")
         .unwrap_or_else(|_| "http://identity:8080".into());
-    // The worker's token: the pool route takes it too, and the runner never gets the
-    // bootstrap's own (tokens/bootstrap-identity.token, mounted in the bootstrap and identity
-    // only). The bootstrap's own run on `up` uses that one.
-    let cfg = IdentityConfig::new(
-        &base,
-        &read("tokens/worker-identity.token"),
-        &read("identity/db.password"),
-    );
+    let worker_token = read("tokens/worker-identity.token");
+    let db_password = read("identity/db.password");
+    let cfg = IdentityConfig::new(&base, &worker_token, &db_password);
     let w = || Waiter::new(std::time::Duration::from_secs(120), Backoff::default());
-    let state = || async {
+    let state = |schema: String| async move {
         let mut su = PgConnection::connect(&url()).await.unwrap();
         let row: (i64, String, Vec<String>, String) = sqlx::query_as(
             "SELECT n.oid::bigint, pg_get_userbyid(n.nspowner)::text,
                     (SELECT coalesce(array_agg(c.oid::text || ':' || c.relname ORDER BY c.oid), '{}')
                        FROM pg_class c WHERE c.relnamespace = n.oid),
                     (SELECT rolpassword FROM pg_authid WHERE rolname = 'chelabase_identity')
-               FROM pg_namespace n WHERE n.nspname = 'identity_members'",
+               FROM pg_namespace n WHERE n.nspname = $1",
         )
+        .bind(&schema)
         .fetch_one(&mut su)
         .await
-        .expect("identity_members exists");
+        .unwrap_or_else(|e| panic!("{schema} exists: {e}"));
         su.close().await.unwrap();
         row
     };
-    run(&w(), &url(), &cfg).await.unwrap();
-    let first = state().await;
-    assert_eq!(first.1, "chelabase_identity");
+    let better_auth = |tables: &[String]| {
+        tables.iter().any(|t| t.ends_with(":user"))
+            && tables.iter().any(|t| t.ends_with(":session"))
+    };
+
+    // What the bootstrap's own run made.
+    let members = state("identity_members".into()).await;
+    assert_eq!(members.1, "chelabase_identity");
     assert!(
-        first.2.iter().any(|t| t.ends_with(":user")) && first.2.iter().any(|t| t.ends_with(":session")),
+        better_auth(&members.2),
         "Better Auth's tables: {:?}",
-        first.2
+        members.2
     );
-    run(&w(), &url(), &cfg).await.unwrap();
-    assert_eq!(state().await, first, "a second run changes nothing");
+
+    // The step's roles part again changes nothing (the verifier included).
+    ensure_roles(&w(), &url(), &IdentityRoles::default(), &db_password)
+        .await
+        .unwrap();
+    assert_eq!(
+        state("identity_members".into()).await,
+        members,
+        "a rerun changes nothing"
+    );
+
+    // The pool route the step calls: the worker's token is refused on `members`...
+    let http = chelabase_http::client_builder().build().unwrap();
+    let refused = create_pool(&http, &cfg, MEMBERS_POOL).await;
+    let msg = format!(
+        "{:#}",
+        refused.expect_err("the worker may not create members")
+    );
+    assert!(msg.contains("403"), "{msg}");
+    assert_eq!(state("identity_members".into()).await, members);
+
+    // ...and the route is idempotent: a second create of the same pool changes nothing.
+    let id = uuid::Uuid::new_v4();
+    let pool = format!("app-{id}");
+    let schema = format!("identity_app_{}", id.simple());
+    w().until("the scratch app pool", || create_pool(&http, &cfg, &pool))
+        .await
+        .unwrap();
+    let first = state(schema.clone()).await;
+    assert_eq!(first.1, "chelabase_identity");
+    assert!(better_auth(&first.2), "Better Auth's tables: {:?}", first.2);
+    w().until("the scratch app pool, again", || {
+        create_pool(&http, &cfg, &pool)
+    })
+    .await
+    .unwrap();
+    let second = state(schema.clone()).await;
+    let dropped = http
+        .delete(format!(
+            "{}/internal/v1/pools/{pool}",
+            base.trim_end_matches('/')
+        ))
+        .bearer_auth(worker_token.trim())
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(second, first, "a second create changes nothing");
+    assert!(dropped.is_success(), "dropping the scratch pool: {dropped}");
 }
 
 // N3 (audit): the database name is quoted as an identifier, so a name with a `"` works.

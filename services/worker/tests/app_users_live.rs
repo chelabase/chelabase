@@ -1128,7 +1128,8 @@ async fn pool_exists(identity: &Identity, pool: &Pool) -> bool {
 
 /// AC 1, 3 and 6 live: enable creates the pool (again: a no-op), a ban revokes the user's app
 /// sessions through the sync, the reconcile makes every branch's table match the pool, and
-/// disable drops the pool.
+/// disable keeps a pool that still holds users (the row stays `disabling`), then drops it once
+/// they are deleted.
 #[tokio::test]
 #[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env"]
 async fn app_users_live() {
@@ -1268,13 +1269,27 @@ async fn app_users_live() {
         assert_ne!(pw_main, pw_dev2);
         assert_ne!(pw_dev, pw_dev2);
 
-        // Disable: the table stays as an ordinary one (RLS on, no policies), the role and the
-        // pool go.
+        // Disable while the pool still holds both users (the orchestrator refuses that, so here
+        // they stand for sign-ups that raced the disable): the pool is kept and the row stays
+        // `disabling` with the reason.
         assert!(fx.metadata.begin_disable_app_users(fx.project).await.unwrap());
-        fx.worker
-            .handle_app_users_job(&AppUsersJob::Disable { project_id: fx.project })
-            .await
-            .expect("disable");
+        let disable = AppUsersJob::Disable { project_id: fx.project };
+        fx.worker.handle_app_users_job(&disable).await.expect("disable on hold");
+        let held = fx.metadata.project_auth(fx.project).await.unwrap().expect("the row stays");
+        assert_eq!(held.status, AppUsersStatus::Disabling);
+        assert!(
+            held.error.as_deref().is_some_and(|e| e.contains("still holds 2 user(s)")),
+            "{:?}",
+            held.error
+        );
+        assert!(pool_exists(&identity, &pool).await, "the pool is kept");
+
+        // With the users deleted, the disable finishes: the table stays as an ordinary one
+        // (RLS on, no policies), the role and the pool go.
+        for id in [user, second] {
+            admin.delete_user(&pool, &id.to_string()).await.expect("delete the user");
+        }
+        fx.worker.handle_app_users_job(&disable).await.expect("disable");
         assert!(fx.metadata.project_auth(fx.project).await.unwrap().is_none());
         for ep in [&fx.ep, &dev_ep, &dev2_ep] {
             assert_eq!(
