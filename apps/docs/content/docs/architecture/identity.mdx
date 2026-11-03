@@ -12,7 +12,7 @@ Accounts live in **pools**, one Postgres schema each, in the metadata server's d
 | Pool | Schema | Holds | Made by |
 | --- | --- | --- | --- |
 | `members` | `identity_members` | Studio's members, in every tenant | `init-bootstrap`, on install |
-| `app-<project id>` | `identity_app_<hex>` | One project's app users | The worker, when app users are enabled; dropped when the project is deleted |
+| `app-<project id>` | `identity_app_<hex>` | One project's app users | The worker, when app users are enabled; dropped when app users are disabled or the project is deleted |
 
 A pool has Better Auth's own tables (users, accounts, sessions) plus a table of emailed codes. A user, a session or a code is never valid in another pool: every query is schema-qualified, the connections run with `search_path = pg_catalog` so an unqualified name fails instead of reaching another pool, and a code is bound to its pool's schema.
 
@@ -30,9 +30,11 @@ Members and app users never share a pool, a signing key or a token audience.
 Email verification, password reset and invites use six-digit codes:
 
 - one live code per user and kind (`verify`, `reset`, `invite`); a new one replaces the old;
-- verification and reset codes last 15 minutes, invite codes 7 days; each takes at most 5 wrong guesses;
+- verification and reset codes last 15 minutes, invite codes 7 days, though the invite itself expires after 72 hours, which is the limit an invitee meets; each takes at most 5 wrong guesses;
 - a code is stored only as an HMAC-SHA256 under `identity/secret`, bound to the pool, the user, the kind and the user's current email, so changing the email kills every outstanding code;
-- `auth` issues at most 5 codes an hour per person and kind.
+- `auth` issues at most 5 verification or reset codes an hour per person and kind. Invite codes come from the orchestrator and are limited there instead, to 5 invite sends (first invites and resends together) an hour per person.
+
+These limits, like `auth`'s other sign-in limits, are kept in each process's memory: they apply per replica, not across replicas, and start again when the service restarts.
 
 With SMTP configured (`CHELABASE_SMTP_*`, see [Install](/docs/self-hosting/install#email)), the identity service mails the code. Without it, nothing is mailed: an admin invites by link instead, and the link carries the code.
 
@@ -46,12 +48,12 @@ A member token is an EdDSA JWT signed with `auth/member-jwt.key`. Its audience i
 
 ## Revocation
 
-Access is checked on every request, so taking it away needs no token to expire:
+The membership is checked on every request, so removing or suspending someone takes effect on their next request, with no token to wait out. The sign-in session behind a member token is checked too, through a short cache, so logout and a password reset cut off a token minted before them within seconds:
 
-- **Removing or declining a member** ends their identity sessions at once and, unless they still belong to another tenant, bans the account. Their personal Postgres logins are revoked and any open SQL-editor session or realtime socket ends. A token they already hold gets 404 `not_found` (`GET /v1/me` says `removed`).
-- **Suspending** a member refuses every request with 403 `member_suspended` and revokes their logins; reinstating lets them back in.
-- **A password reset** ends every session of the account.
-- **Logout** revokes the session and clears the cookie.
+- **Removing or declining a member** revokes their personal Postgres logins and ends any open SQL-editor session or realtime socket. A token they already hold gets 404 `not_found` (`GET /v1/me` says `removed`). Their identity sessions end at once unless they are still active in another tenant: then the sessions are kept, which is safe because the session cookie is sealed to the tenant it signed in to. The account is banned only when the person has no other membership that isn't removed (invited, pending, active or suspended).
+- **Suspending** a member refuses every request with 403 `member_suspended` and revokes their logins, and ends their identity sessions unless they are active in another tenant; reinstating lets them back in. A suspended member who tries to sign in gets the generic sign-in failure (401 `invalid_credentials`, the same answer as a wrong password), not a message saying they are suspended. That is deliberate: sign-in never reveals whether an account exists or what state it is in. A password reset doesn't change this.
+- **A password reset** ends every session of the account; member tokens minted from those sessions stop working within seconds.
+- **Logout** revokes the session and clears the cookie; member tokens minted from it stop working within seconds.
 - **An invite accepted again** by a removed member lifts the ban only then, with their own password.
 
 `/auth/v1/token` refuses a session that has ended or a membership that is no longer active, so Studio signs the person out at its next refresh.
