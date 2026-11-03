@@ -10,6 +10,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use chelabase_identity::{IdentityError, Missing, Pool};
 use chelabase_metadata::{
     AppUsersStatus, BeginEnable, BranchKind, BranchStatus, DatabaseOrigin, DatabaseStatus, MetadataError,
     NewProjectAuth, OnDelete, ProjectAuth, ProjectRecord,
@@ -529,7 +530,7 @@ where
     operation_id = "disableAppUsers",
     tag = "app-users",
     summary = "Disable app users",
-    description = "Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.",
+    description = "Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.",
     params(("id" = Uuid, Path, description = "Project id")),
     responses(
         (status = 202, description = "Disabling started", body = AppUsersSettings),
@@ -539,7 +540,7 @@ where
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_has_users`: users exist; `conflict`: app users are being enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: the user service can't be reached", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service can't be reached", body = ErrorEnvelope),
     ),
 )]
 async fn disable_app_users<M, J>(
@@ -561,23 +562,24 @@ where
         Err(err) => return err.into_response(),
     };
     // A retry of a disable in progress skips the check: the users were checked when it began and
-    // the org may be gone already.
-    if auth.status != AppUsersStatus::Disabling
-        && let Some(org) = &auth.zitadel_org_id
-    {
-        let Some(zitadel) = &state.zitadel else {
-            return crate::app_user_admin::zitadel_unavailable().into_response();
+    // the pool may be gone already. The drop is irreversible, so a pool that can't be read
+    // refuses the disable.
+    if auth.status != AppUsersStatus::Disabling {
+        let Some(identity) = &state.identity_service else {
+            return crate::app_user_admin::identity_unavailable().into_response();
         };
-        match zitadel.org_has_users(org).await {
-            Ok(false) => {}
-            Ok(true) => {
+        match identity.list_users(&Pool::App(project.id.as_uuid()), 1, 0).await {
+            Ok(page) if page.total == 0 => {}
+            // A failed enable never got as far as the pool: nothing to lose.
+            Err(IdentityError::NotFound(Missing::Pool)) => {}
+            Ok(_) => {
                 return conflict(
                     ErrorCode::AppUsersHasUsers,
                     "the project still has users; delete them before disabling app users",
                 )
                 .into_response();
             }
-            Err(err) => return crate::app_user_admin::zitadel_failed("check the org's users", &err).into_response(),
+            Err(err) => return crate::app_user_admin::identity_failed("check the pool's users", &err).into_response(),
         }
     }
     if auth.status != AppUsersStatus::Disabling {

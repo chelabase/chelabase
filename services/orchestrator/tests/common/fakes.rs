@@ -2843,7 +2843,7 @@ async fn spawn_app_core(
     oidc: chelabase_auth::ZitadelAuthConfig,
     identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
-    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None)
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None, identity_service)
         .await
 }
 
@@ -2867,6 +2867,7 @@ async fn spawn_app_member_tokens(
         unused_oidc(),
         None,
         Some(members),
+        None,
     )
     .await
 }
@@ -2887,6 +2888,7 @@ async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: O
         unused_oidc(),
         tenant,
         None,
+        None,
     )
     .await
 }
@@ -2905,6 +2907,7 @@ async fn spawn_app_core_with(
     oidc: chelabase_auth::ZitadelAuthConfig,
     operator_tenant: Option<TenantId>,
     member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
+    identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
     let rt_events = FakeRtEvents::default();
     // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in

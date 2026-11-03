@@ -2730,7 +2730,8 @@
           "member_suspended",
           "member_offboarded",
           "invalid_successor",
-          "exposure_unconfirmed"
+          "exposure_unconfirmed",
+          "identity_unavailable"
         ]
       },
       "ErrorEnvelope": {

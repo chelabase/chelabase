@@ -12307,7 +12307,7 @@
           "app-users"
         ],
         "summary": "Disable app users",
-        "description": "Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.",
+        "description": "Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.",
         "operationId": "disableAppUsers",
         "parameters": [
           {
@@ -12393,7 +12393,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13370,7 +13370,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13391,7 +13391,7 @@
           "app-users"
         ],
         "summary": "Create a user",
-        "description": "Writes the user's row to the users table first (the table's own constraints can refuse it), then creates the Zitadel user, then commits. Columns of your own get their defaults.",
+        "description": "Creates the identity user, then writes the user's row to the users table and commits. When the table refuses the row (its own constraints) the identity user is deleted again. Columns of your own get their defaults.",
         "operationId": "createAppUser",
         "parameters": [
           {
@@ -13517,7 +13517,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service or the users table can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached; `unavailable`: the users table can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13635,7 +13635,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13656,7 +13656,7 @@
           "app-users"
         ],
         "summary": "Delete a user",
-        "description": "Deletes the Zitadel user and ends their sessions; the users table's row follows the project's `on_delete` setting.",
+        "description": "Ends the user's sessions and deletes the identity user; the users table's row follows the project's `on_delete` setting. The sessions are revoked first, so a `503` still ended them.",
         "operationId": "deleteAppUser",
         "parameters": [
           {
@@ -13745,7 +13745,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13765,8 +13765,8 @@
         "tags": [
           "app-users"
         ],
-        "summary": "Change a user's email or password",
-        "description": "A new password ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. The users table follows through the sync job.",
+        "summary": "Change a user's email",
+        "description": "A new email ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.",
         "operationId": "updateAppUser",
         "parameters": [
           {
@@ -13852,7 +13852,7 @@
             }
           },
           "409": {
-            "description": "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email; `conflict`: the user service refused the change in the user's current state",
+            "description": "`project_deleting`; `app_users_disabled`: app users aren't enabled; `email_taken`: another user has this email",
             "content": {
               "application/json": {
                 "schema": {
@@ -13882,7 +13882,7 @@
             }
           },
           "422": {
-            "description": "`invalid_request`: nothing to change, the email or password is invalid, or `email_verified: false` without a new email for a verified address; `weak_password`: the password doesn't meet the policy",
+            "description": "`invalid_request`: nothing to change, the email is invalid, an unknown field such as `password`, or `email_verified: false` without a new email for a verified address",
             "content": {
               "application/json": {
                 "schema": {
@@ -13902,7 +13902,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -13925,7 +13925,7 @@
           "app-users"
         ],
         "summary": "Deactivate a user",
-        "description": "The user can't sign in, and their sessions end.",
+        "description": "Bans the user: they can't sign in, and their sessions end. The sessions are revoked first, so a `503` still ended them.",
         "operationId": "deactivateAppUser",
         "parameters": [
           {
@@ -14021,7 +14021,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14139,7 +14139,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14260,7 +14260,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -14369,7 +14369,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: the user service can't be reached",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -15787,8 +15787,7 @@
         "type": "string",
         "enum": [
           "active",
-          "inactive",
-          "locked"
+          "inactive"
         ]
       },
       "AppUsersSettings": {
@@ -18056,7 +18055,8 @@
           "member_suspended",
           "member_offboarded",
           "invalid_successor",
-          "exposure_unconfirmed"
+          "exposure_unconfirmed",
+          "identity_unavailable"
         ]
       },
       "ErrorEnvelope": {
@@ -22873,14 +22873,7 @@
               "boolean",
               "null"
             ],
-            "description": "With `email`, whether the new address is verified (default true); alone, sets the flag\non the current address (false sends the user a verification code)."
-          },
-          "password": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A new password; the user's sessions end."
+            "description": "With `email`, whether the new address is verified (default true); alone, sets the flag\non the current address."
           }
         },
         "additionalProperties": false

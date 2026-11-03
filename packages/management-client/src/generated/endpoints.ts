@@ -9428,7 +9428,7 @@ export const getDisableAppUsersUrl = (id: string,) => {
 }
 
 /**
- * Refused while the project's org has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), deletes the Zitadel org and the settings. Pressing it again while `disabling` starts the work again.
+ * Refused while the project's pool has any user. Otherwise 202: the worker removes the guard machinery (the table stays as an ordinary table), drops the pool and deletes the settings. Pressing it again while `disabling` starts the work again.
  * @summary Disable app users
  */
 export const disableAppUsers = async (id: string, options?: Parameters<typeof customFetch>[1]): Promise<AppUsersSettings> => {
@@ -10260,7 +10260,7 @@ export const getCreateAppUserUrl = (id: string,) => {
 }
 
 /**
- * Writes the user's row to the users table first (the table's own constraints can refuse it), then creates the Zitadel user, then commits. Columns of your own get their defaults.
+ * Creates the identity user, then writes the user's row to the users table and commits. When the table refuses the row (its own constraints) the identity user is deleted again. Columns of your own get their defaults.
  * @summary Create a user
  */
 export const createAppUser = async (id: string,
@@ -10460,7 +10460,7 @@ export const getDeleteAppUserUrl = (id: string,
 }
 
 /**
- * Deletes the Zitadel user and ends their sessions; the users table's row follows the project's `on_delete` setting.
+ * Ends the user's sessions and deletes the identity user; the users table's row follows the project's `on_delete` setting. The sessions are revoked first, so a `503` still ended them.
  * @summary Delete a user
  */
 export const deleteAppUser = async (id: string,
@@ -10537,8 +10537,8 @@ export const getUpdateAppUserUrl = (id: string,
 }
 
 /**
- * A new password ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. The users table follows through the sync job.
- * @summary Change a user's email or password
+ * A new email ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.
+ * @summary Change a user's email
  */
 export const updateAppUser = async (id: string,
     userId: string,
@@ -10606,7 +10606,7 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
     export type UpdateAppUserMutationVariables = {id: string;userId: string;data: UpdateAppUserRequest}
 
     /**
- * @summary Change a user's email or password
+ * @summary Change a user's email
  */
 export const useUpdateAppUser = <TError = ErrorType<ErrorEnvelope>,
     TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof updateAppUser>>, TError,UpdateAppUserMutationVariables, TContext>, request?: SecondParameter<typeof customFetch>}
@@ -10629,7 +10629,7 @@ export const getDeactivateAppUserUrl = (id: string,
 }
 
 /**
- * The user can't sign in, and their sessions end.
+ * Bans the user: they can't sign in, and their sessions end. The sessions are revoked first, so a `503` still ended them.
  * @summary Deactivate a user
  */
 export const deactivateAppUser = async (id: string,
