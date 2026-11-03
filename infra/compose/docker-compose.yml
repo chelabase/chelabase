@@ -776,7 +776,7 @@ services:
   # health route before that, and its first database call waits for the bootstrap). The service
   # takes its database URL only from a file: the entrypoint writes it from the password file
   # (base64url, checked) into a private tmpfs. Outgoing mail: .env's CHELABASE_SMTP_* (the
-  # password from the host file CHELABASE_SMTP_PASSWORD_PATH, as for the bootstrap).
+  # password from the host file CHELABASE_SMTP_PASSWORD_PATH: uid 10001, mode 0600).
   # The image isn't published or pinned yet: that happens from `main` once the auth-replacement
   # epic merges, when the release scripts learn to publish and pin it like the others.
   # Until then the default tag `unpublished` doesn't exist: build it from the clone with
