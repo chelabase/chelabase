@@ -47,7 +47,8 @@ where
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AppUsersSettings {
     pub status: AppUsersStatusView,
-    /// Why enabling failed; `null` otherwise.
+    /// Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool
+    /// gone from the identity service, a branch it couldn't upgrade); `null` otherwise.
     #[schema(required = true)]
     pub error: Option<String>,
     /// The Chelabase database whose Postgres database holds the users table.

@@ -15827,7 +15827,7 @@
               "string",
               "null"
             ],
-            "description": "Why enabling failed; `null` otherwise."
+            "description": "Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool\ngone from the identity service, a branch it couldn't upgrade); `null` otherwise."
           },
           "on_delete": {
             "$ref": "#/components/schemas/OnDelete"

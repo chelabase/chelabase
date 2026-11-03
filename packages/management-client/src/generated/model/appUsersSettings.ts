@@ -16,7 +16,8 @@ export interface AppUsersSettings {
   database_id: DatabaseId;
   email_verification: boolean;
   /**
-     * Why enabling failed; `null` otherwise.
+     * Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool
+     * gone from the identity service, a branch it couldn't upgrade); `null` otherwise.
      * @nullable
      */
   error: string | null;
