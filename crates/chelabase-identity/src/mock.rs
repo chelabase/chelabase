@@ -350,6 +350,40 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             };
             let limit = num("limit", 50, 1, 200)?;
             let offset = num("offset", 0, 0, 1_000_000_000)?;
+            let decode = |v: &str| {
+                urlencoding::decode(v).map_or_else(|_| v.to_string(), |d| d.into_owned())
+            };
+            // Exactly this address, ignoring case: at most one user.
+            if let Some(email) = q.get("email").map(|v| decode(v)) {
+                if email.chars().count() > 320 {
+                    return Err(refuse(
+                        400,
+                        "invalid_request",
+                        "email must be at most 320 characters",
+                    ));
+                }
+                if q.contains_key("search") {
+                    return Err(refuse(
+                        400,
+                        "invalid_request",
+                        "give email or search, not both",
+                    ));
+                }
+                let email = email.to_lowercase();
+                let users: Vec<Value> = p
+                    .users
+                    .iter()
+                    .filter(|u| !email.is_empty() && u.email == email)
+                    .map(user_out)
+                    .collect();
+                let total = users.len();
+                return Ok((
+                    200,
+                    Some(
+                        json!({ "users": users, "total": total, "limit": limit, "offset": offset }),
+                    ),
+                ));
+            }
             // Part of the email, ignoring case (emails are stored lowercase).
             let search = q
                 .get("search")

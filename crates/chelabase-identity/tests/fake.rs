@@ -526,3 +526,29 @@ async fn session_lifetime_per_pool() {
     f.advance(day(60));
     assert!(id.session_by_id(&app, &app_session).await.is_err(), "past 90 days");
 }
+
+/// `find_user_by_email` is one exact lookup: the user with that address (any case), or `None`
+/// when only longer addresses contain it. One `GET …/users` call either way.
+#[tokio::test]
+async fn find_user_by_email_is_one_exact_lookup() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let pool = Pool::App(uuid::Uuid::new_v4());
+    id.create_pool(&pool).await.unwrap();
+    let a = f.with_user(&pool, "exact@x.io", PW);
+    for i in 0..250 {
+        f.with_user(&pool, &format!("u{i}exact@x.io"), PW);
+    }
+    let list = format!("GET /internal/v1/pools/{pool}/users");
+    let lists = || f.calls().iter().filter(|c| c.starts_with(&list)).count();
+
+    let before = lists();
+    let got = id.find_user_by_email(&pool, "EXACT@x.io").await.unwrap();
+    assert_eq!(got.map(|u| u.id), Some(a));
+    assert_eq!(lists() - before, 1);
+
+    let before = lists();
+    assert!(id.find_user_by_email(&pool, "xact@x.io").await.unwrap().is_none());
+    assert!(id.find_user_by_email(&pool, "%@x.io").await.unwrap().is_none());
+    assert_eq!(lists() - before, 2);
+}

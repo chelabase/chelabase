@@ -165,7 +165,7 @@
       "get": {
         "operationId": "listUsers",
         "summary": "List users, oldest first, one page at a time",
-        "description": "`search` narrows the list to users whose email contains it, ignoring case (`%` and `_` match themselves); `total` counts the matches.",
+        "description": "`search` narrows the list to users whose email contains it, ignoring case (`%` and `_` match themselves); `total` counts the matches. `email` instead finds the one user whose address is exactly it, ignoring case: one indexed read returning at most one user (`limit` and `offset` are echoed but not applied). `email` and `search` together are refused.",
         "x-callers": [
           "auth",
           "orchestrator",
@@ -193,6 +193,14 @@
           },
           {
             "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 320
+            }
+          },
+          {
+            "name": "email",
             "in": "query",
             "schema": {
               "type": "string",

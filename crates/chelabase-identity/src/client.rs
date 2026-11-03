@@ -206,6 +206,20 @@ impl Identity {
         self.users_page(pool, Some(search), limit, offset).await
     }
 
+    /// The user whose email is exactly `email`, ignoring case, or `None`. One indexed read on
+    /// identity's unique email column, however many other addresses contain it. `email` is at
+    /// most 320 characters.
+    pub async fn find_user_by_email(
+        &self,
+        pool: &Pool,
+        email: &str,
+    ) -> Result<Option<User>, IdentityError> {
+        let page = self
+            .list_call(pool, vec![("email", email.to_string())])
+            .await?;
+        Ok(page.users.into_iter().next())
+    }
+
     async fn users_page(
         &self,
         pool: &Pool,
@@ -217,6 +231,14 @@ impl Identity {
         if let Some(search) = search.filter(|s| !s.is_empty()) {
             query.push(("search", search.to_string()));
         }
+        self.list_call(pool, query).await
+    }
+
+    async fn list_call(
+        &self,
+        pool: &Pool,
+        query: Vec<(&str, String)>,
+    ) -> Result<UserPage, IdentityError> {
         self.call(&ops::LIST_USERS, Some(pool), None, &query, None)
             .await
     }

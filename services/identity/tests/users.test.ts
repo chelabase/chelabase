@@ -137,4 +137,25 @@ describeDb("users", () => {
     expect(await ids("find%me")).toEqual([]);
     expect((await call(h, "GET", `${base()}/users?search=${"x".repeat(321)}`)).status).toBe(400);
   });
+
+  // `email` is an exact match on the (lowercase, unique) address: at most one user, one read,
+  // however many other addresses contain it.
+  it("list_email_matches_exactly_one_user", async () => {
+    const a = await createUser("Exact@Lookup.io");
+    await createUser("anexact@lookup.io");
+    await createUser("exact@lookup.io.evil");
+    const find = async (q: string, as: "auth" | "orchestrator" = "auth") => {
+      const r = await call(h, "GET", `${base()}/users?email=${encodeURIComponent(q)}`, { as });
+      expect(r.status, q).toBe(200);
+      expect(r.body.total, q).toBe(r.body.users.length);
+      return (r.body.users as { id: string }[]).map((u) => u.id);
+    };
+    expect(await find("exact@lookup.io")).toEqual([a.id]);
+    expect(await find("EXACT@lookup.IO", "orchestrator")).toEqual([a.id]);
+    expect(await find("xact@lookup.io")).toEqual([]);
+    expect(await find("%@lookup.io")).toEqual([]);
+    expect(await find("")).toEqual([]);
+    expect((await call(h, "GET", `${base()}/users?email=${"x".repeat(321)}`)).status).toBe(400);
+    expect((await call(h, "GET", `${base()}/users?email=a%40b.io&search=a`)).status).toBe(400);
+  });
 });

@@ -529,8 +529,6 @@ async fn app_jwks(State(s): S) -> Response {
 
 const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(3600);
-/// A page of the identity user search (its maximum).
-const SEARCH_PAGE: u32 = 200;
 
 mod text {
     pub const BAD_CREDENTIALS: &str = "Email or password is incorrect";
@@ -671,25 +669,18 @@ async fn branch_info(app: &AppUsers, caller: &AppCaller) -> Flow<Arc<AppBranchIn
     Ok(info)
 }
 
-/// The pool's user with exactly this (normalized) email. Identity searches by substring, so
-/// every page is read until an exact match. A search identity refuses (an address no account
-/// could have) is no one; a user whose id isn't a uuid is no one either.
+/// The pool's user with exactly this (normalized) email: one exact identity lookup. An address
+/// that fails the shape check is no one, and identity is not asked, so every route answers it
+/// as it answers an unknown email. A lookup identity refuses is no one too, and so is a user
+/// whose id isn't a uuid.
 async fn find_user(s: &AppState, info: &AppBranchInfo, email: &str) -> Flow<Option<(Uuid, User)>> {
-    let pool = pool(info);
-    let mut offset = 0u32;
-    loop {
-        let page = match s.identity.search_users(&pool, email, SEARCH_PAGE, offset).await {
-            Ok(page) => page,
-            Err(IdentityError::Invalid { .. }) => return Ok(None),
-            Err(e) => return Err(identity_down(&e)),
-        };
-        if let Some(u) = page.users.iter().find(|u| normalize_email(&u.email) == email) {
-            return Ok(Uuid::parse_str(&u.id).ok().map(|id| (id, u.clone())));
-        }
-        offset += page.users.len() as u32;
-        if page.users.is_empty() || u64::from(offset) >= page.total {
-            return Ok(None);
-        }
+    if !valid_email(email) {
+        return Ok(None);
+    }
+    match s.identity.find_user_by_email(&pool(info), email).await {
+        Ok(Some(u)) => Ok(Uuid::parse_str(&u.id).ok().map(|id| (id, u))),
+        Ok(None) | Err(IdentityError::Invalid { .. }) => Ok(None),
+        Err(e) => Err(identity_down(&e)),
     }
 }
 

@@ -3117,3 +3117,41 @@ async fn identity_password_refusals_are_weak_passwords() {
     assert!(h.password_is("bob@example.com", PW).await);
     assert!(!h.internal.session(h.session_id(&s)).unwrap().revoked, "nothing was revoked");
 }
+
+// B1 of the m10 audit: an email lookup on a public route is one exact identity call, never a
+// substring search paged to the end. 650 users contain `a@example.com`; none is it. A blank
+// address is refused by the shape check before identity is asked at all.
+#[tokio::test]
+async fn lookup_of_an_unknown_email_is_one_identity_call() {
+    let h = harness().await;
+    for i in 0..650 {
+        h.add_user(&format!("u{i}a@example.com"), true).await;
+    }
+    let list = format!("GET {}/users", h.pool_path());
+    let mut worst = Vec::new();
+    for (path, email) in [
+        ("password-reset", "a@example.com"),
+        ("resend-code", "a@example.com"),
+        ("verify-email", "a@example.com"),
+        ("password-reset/confirm", "a@example.com"),
+        ("password-reset", ""),
+        ("resend-code", ""),
+        ("verify-email", ""),
+        ("password-reset/confirm", ""),
+    ] {
+        let before = h.proxy.calls().len();
+        let body = match path {
+            "verify-email" => json!({"email": email, "code": "123456"}),
+            "password-reset/confirm" => json!({"email": email, "code": "123456", "password": NEW_PW}),
+            _ => json!({"email": email}),
+        };
+        h.post(path, body, None).await;
+        let calls = &h.proxy.calls()[before..];
+        let lists = calls.iter().filter(|c| **c == list).count();
+        worst.push((path, email, lists, calls.len()));
+    }
+    assert!(
+        worst.iter().all(|&(_, email, lists, total)| lists <= 1 && total == usize::from(!email.is_empty())),
+        "(route, email, user-list reads, identity calls) per request: {worst:?}"
+    );
+}

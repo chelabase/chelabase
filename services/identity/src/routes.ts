@@ -300,7 +300,9 @@ const ROUTES: readonly Route[] = [
   },
   {
     // Mirrors `listUsers` (/admin/list-users), oldest first so pages are stable. `search`
-    // narrows to emails containing it, ignoring case; `total` counts the matches.
+    // narrows to emails containing it, ignoring case; `total` counts the matches. `email`
+    // instead finds the one user with exactly that address (emails are stored lowercase and
+    // unique): one indexed read, at most one user, no paging.
     id: "users.list",
     method: "GET",
     rest: ["users"],
@@ -310,6 +312,21 @@ const ROUTES: readonly Route[] = [
       const search = query.get("search") ?? "";
       if (search.length > MAX_EMAIL) {
         throw new HttpError(400, "invalid_request", `search must be at most ${MAX_EMAIL} characters`);
+      }
+      const email = query.get("email");
+      if (email !== null) {
+        if (email.length > MAX_EMAIL) {
+          throw new HttpError(400, "invalid_request", `email must be at most ${MAX_EMAIL} characters`);
+        }
+        if (query.has("search")) throw new HttpError(400, "invalid_request", "give email or search, not both");
+        if (email === "") return { status: 200, body: { users: [], total: 0, limit, offset } };
+        return registry.use(pool, async (auth) => {
+          const ctx = await context(auth);
+          // Better Auth's own exact lookup: `email = lower($1)`.
+          const found = await ctx.internalAdapter.findUserByEmail(email);
+          const users = found ? [userOut(found.user as BaUser)] : [];
+          return { status: 200, body: { users, total: users.length, limit, offset } };
+        });
       }
       // Part of the email, ignoring case. The adapter builds `LIKE '%…%'` without escaping, so
       // LIKE's own wildcards (and its escape character) are escaped here to match literally.
