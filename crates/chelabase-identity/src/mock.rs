@@ -26,7 +26,14 @@ use std::time::Duration;
 /// The bearer the fake's [`FakeIdentity::client`] sends. Any non-empty bearer is accepted.
 pub const TOKEN: &str = "test-identity-token";
 
-const SESSION_TTL_DAYS: i64 = 7;
+/// Session lifetime, as the service sets it per pool: 30 days for members, 90 for app users.
+fn session_ttl(pool: &str) -> ChronoDuration {
+    if pool == "members" {
+        ChronoDuration::days(30)
+    } else {
+        ChronoDuration::days(90)
+    }
+}
 const MIN_PASSWORD: usize = 8;
 const MAX_PASSWORD: usize = 128;
 
@@ -67,6 +74,8 @@ pub struct SentCode {
     pub email: String,
     pub kind: CodeKind,
     pub code: String,
+    /// The `link` the mail carried, if any.
+    pub link: Option<String>,
 }
 
 /// What a test may read of a fake user.
@@ -451,7 +460,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 token: format!("tok-{}", tick()),
                 user_id: u.id.clone(),
                 created: now,
-                expires: now + ChronoDuration::days(SESSION_TTL_DAYS),
+                expires: now + session_ttl(&name),
             };
             let out = json!({ "session_id": s.id, "session_token": s.token, "user": user_out(&u) });
             p.sessions.push(s);
@@ -631,13 +640,14 @@ impl FakeIdentity {
         self.with(|i| {
             let now = i.now();
             let (id, token) = (i.uuid(), i.id("tok-"));
-            let p = i.pools.get_mut(&pool.to_string()).expect("the pool exists");
+            let name = pool.to_string();
+            let p = i.pools.get_mut(&name).expect("the pool exists");
             p.sessions.push(FSession {
                 id: id.clone(),
                 token: token.clone(),
                 user_id: user_id.to_string(),
                 created: now,
-                expires: now + ChronoDuration::days(SESSION_TTL_DAYS),
+                expires: now + session_ttl(&name),
             });
             (id, token)
         })

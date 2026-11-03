@@ -506,3 +506,23 @@ async fn user_detail_tells_password_and_ban_reason() {
     id.unban(&Pool::Members, &with).await.unwrap();
     assert_eq!(id.user_detail(&Pool::Members, &with).await.unwrap().ban_reason, None);
 }
+
+// As the service: members' sessions last 30 days, app users' 90.
+#[tokio::test]
+async fn session_lifetime_per_pool() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let app = app_pool();
+    let day = |n: u64| Duration::from_secs(n * 24 * 3600);
+    f.with_user(&Pool::Members, "m@x.io", "password-m-1");
+    let a = f.with_user(&app, "a@x.io", "password-a-1");
+    let member = id.sign_in(&Pool::Members, "m@x.io", "password-m-1").await.unwrap();
+    let (app_session, _) = f.with_session(&app, &a);
+    f.advance(day(29));
+    assert!(id.session_by_id(&Pool::Members, &member.session_id).await.is_ok());
+    f.advance(day(2));
+    assert!(id.session_by_id(&Pool::Members, &member.session_id).await.is_err(), "past 30 days");
+    assert!(id.session_by_id(&app, &app_session).await.is_ok());
+    f.advance(day(60));
+    assert!(id.session_by_id(&app, &app_session).await.is_err(), "past 90 days");
+}
