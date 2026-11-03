@@ -80,7 +80,7 @@ impl Deps {
         if members.is_none() {
             tracing::warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: every member token is refused");
         }
-                let nats = chelabase_nats::connect(&config.nats)
+        let nats = chelabase_nats::connect(&config.nats)
             .await
             .with_context(|| format!("NATS at {}", config.nats.url))?;
         let valkey = Arc::new(
