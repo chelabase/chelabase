@@ -6,6 +6,7 @@
     "gateway",
     "orchestrator",
     "studio",
+    "identity",
     "data-api",
     "app-users",
     "sql-editor",

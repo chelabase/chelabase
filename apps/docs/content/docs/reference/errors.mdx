@@ -25,7 +25,6 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 415 | `invalid_request` | The request isn't `Content-Type: application/json`. |
 | 422 | `invalid_request` | The body is JSON but has the wrong fields, a field is missing or out of range, or a name is invalid. |
 | 401 | `unauthorized` | No credential, or a bad token or key. |
-| 403 | `tenant_not_bound` | The caller's organization isn't bound to a Chelabase tenant. |
 | 409 | `tenant_required` | Sign-in (`/auth/v1/sign-in`) for a member of several tenants with no `?tenant=`. Sent only after correct credentials; `error.tenants` lists the choices. |
 | 403 | `forbidden` | The `tenant_id` in the body isn't the caller's tenant. |
 | 404 | `not_found` | The resource doesn't exist, or belongs to another tenant (both answer the same). The gateway also answers `not_found` for an unknown host or route. |
@@ -34,7 +33,7 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 429 | `rate_limited` | Too many attempts on a login endpoint. |
 | 500 | `internal` | Unexpected; details are only in the server logs. |
 | 502 | `unavailable` | A service behind the API answered something unexpected, or failed. |
-| 503 | `unavailable` | A service behind the API (the compute, the user service, the identity provider) can't be reached right now. |
+| 503 | `unavailable` | A service behind the API (the compute, the user service, the identity service) can't be reached right now. |
 | 504 | `timeout` | A service didn't answer in time. The gateway also answers `timeout` with 408 when a request times out. |
 
 ### Members, access and invites
@@ -47,7 +46,7 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 403 | `no_access_yet` | The caller is a member with no grants anywhere. A tenant admin must grant them a project. |
 | 403 | `pending_approval` | The caller signed up and waits for a tenant admin to approve them. |
 | 403 | `member_suspended` | A tenant admin suspended the caller's membership. Every route refuses them except `GET /v1/me`; a tenant admin can reinstate them. |
-| 403 | `member_offboarded` | The caller's Zitadel user was deactivated, locked or removed. Every route refuses them except `GET /v1/me`, until Zitadel shows the user active again (reactivated or unlocked). |
+| 403 | `member_offboarded` | The caller was offboarded: removed or declined, which ends their sessions and bans their account. Every route refuses them except `GET /v1/me`, until they accept a new invite. |
 | 409 | `personal_login_exists` | The caller already has a live personal login on this database. Reset its password, or delete it and create a new one to change the name. |
 | 403 | `not_available_in_platform_mode` | The feature (or self-sign-up) isn't designed for platform mode yet. |
 | 403 | `sign_up_closed` | Open sign-up is off and the tenant already has members. |
@@ -55,8 +54,6 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 409 | `last_tenant_admin` | The change would leave the tenant without an active tenant admin (demoting or removing the last one). |
 | 409 | `link_not_allowed` | A link invite (`delivery: "link"`) for someone who already has a way to sign in (a password, passkey, OTP or identity-provider link). Send it by email instead; `error.email_available` says whether email delivery works now. |
 | 409 | `signup_pending` | The person signed up and waits for approval. Approve or decline the sign-up instead of inviting them; `error.member_id` names the member. |
-| 409 | `email_ambiguous` | More than one user of the organisation has this email. Resolve it in the identity provider first. |
-| 409 | `email_in_use_elsewhere` | A user outside the tenant's organisation already has this email. Use another email, or fix the account in the identity provider. |
 | 409 | `invite_closed` | The invite was revoked, accepted or replaced since. Reload the list. |
 | 410 | `invite_expired` | The invite's code has expired. Ask for a new invite. |
 | 410 | `invite_revoked` | The invite was revoked. |

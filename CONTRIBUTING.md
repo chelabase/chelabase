@@ -113,7 +113,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too) |
+| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, the identity image's licences against `THIRD_PARTY_NOTICES.md`, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too) |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
 | `just deny` / `just deny-install` | RustSec advisories and yanked crates against `Cargo.lock`; install the pinned cargo-deny |
@@ -234,9 +234,9 @@ These run against your checkout's own stack: each is `just workbench run scripts
 | `branch-e2e` | Branch at a time, reset to parent, restore with a backup, a point outside the history window, delete |
 | `storage-leak-e2e` | Deleting a database, a branch or a superseded timeline reclaims the safekeeper's WAL and S3 backup |
 | `compute-network-e2e` | What a compute can reach: no NATS, Valkey or databases; every listener on the compute network needs a credential or is public by design |
-| `auth-e2e` | Closed sign-up, a link invite and accepting it, sign-in, reset and logout through the gateway and auth |
+| `auth-e2e` | Closed sign-up, a link invite and accepting it, the session cookie and `/auth/v1/token`, sign-in, identical failures, reset with the mailed code, and logout ending the session |
 | `role-e2e` | Login roles: create a plain role, connect, back a secret key, refused delete, reset, revoke, delete |
-| `members-e2e` | An email invite (link from Mailpit) and a link invite, a grant, the SQL editor as a group role, revoke, open sign-up and approval |
+| `members-e2e` | An email invite (link and code from Mailpit) and a link invite, a grant, the SQL editor as a group role, revoke, removal and a re-invite accepted from the notice, open sign-up and approval |
 | `personal-logins-e2e` | Personal Postgres logins: connect through the proxy, a child branch, reset, revocation on grant loss, suspend, revoke-now, offboarding, expiry |
 | `teams-e2e` | A team-only member runs SQL as a Developer team role, a downgrade to Viewer refuses it, a Viewer team role reads through the data API, removal and delete |
 | `data-e2e` | Data API story (below) |
@@ -264,7 +264,7 @@ These run against your checkout's own stack: each is `just workbench run scripts
 6. An owner password set in SQL answers 409 `owner_password_unknown`; after a reset the owner console works at once.
 7. Main can't be switched off; disabling `analytics` answers 409 `data_api_disabled` in the console and 404 to the key at once; `?remove=true` drops the `chelabase` schema; the database is deleted.
 
-`app-users-e2e`: a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `chelabase.user_id()` policy; a new branch gets the rows; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its app-user pool.
+`app-users-e2e`: a project and a database with app users enabled; an SDK sign-up refused by a `NOT NULL` column (422 `constraint_violation`), then accepted with `data` once the column is granted; each user reads only their own row (and the public key alone nothing), on the users table and on a table with a `chelabase.user_id()` policy; a new branch gets the rows; an email changed through the platform API reaches the row; refresh rotation, the grace answer and `refresh_token_reused` after 11 s, then `user_session_revoked` for the session's access token; a user deleted through the API loses their row on both branches; deleting the project deletes its database and its app-user pool.
 
 `sql-editor-e2e`: a script as owner and as `anon` under RLS, a notice, an error with its position, a cancel, closing the stream through the gateway (the run's slot is freed), a 75 s `pg_sleep` through the gateway (heartbeats), the guard (`DROP` needs `confirm`; a protected branch holds writes), saved queries (including a stale version) and the schema document.
 
@@ -274,8 +274,8 @@ These test the Compose install the way a self-hoster runs it. They need no workb
 
 | Recipe | What it runs |
 | --- | --- |
-| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim, a project and a database through the API and the proxy, no secret in `docker inspect`, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender) |
-| `selfhost-tls-e2e` | The install behind nginx terminating TLS with a throwaway CA and no port in the hosts: an https issuer, the claim and sign-in, the gateway and realtime verifying tokens, and `down -v` leaving nothing |
+| `selfhost-e2e` | A fresh `up --wait`, every service healthy, the setup code in the logs, sign-up refused without the code, the claim by the Acme example (`docker-compose.example.yml`) and a second seed run that skips, a project and a database through the API and the proxy, no secret in `docker inspect`, an invite mail through the identity service's SMTP, each service reading its own secrets, a rerun that changes nothing, the documented uninstall leaving nothing behind, and a failing install (SMTP host with no sender, refused by the identity service) |
+| `selfhost-tls-e2e` | The install behind nginx terminating TLS with a throwaway CA and no port in the hosts: the claim and sign-in with a Secure session cookie, a token whose issuer is the https auth host, the gateway and realtime verifying tokens, and `down -v` leaving nothing |
 
 Images:
 
@@ -369,5 +369,5 @@ scripts/tests/compose-image-pins.sh digests.txt
 - Before building on a branch, `git fetch` and check whether origin has newer commits. Never force-push; if a push is rejected, fetch and integrate first.
 - Never run `cargo fmt` on the workspace; rustfmt only the files you create.
 - Never overwrite `.chelabase/secrets/secrets.key`, the gateway key pair, the cookie key, the compute-JWT key pair, the member-JWT pair (`auth/member-jwt.{key,pub}`), `identity/secret`, `identity/db.password` or the identity tokens (`tokens/{auth,orchestrator,worker,bootstrap}-identity.token`).
-- Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies.
+- Before adding a dependency, check the registry for the latest release rather than trusting an older pin. Prefer the security-stronger option when two are equivalent (aws-lc-rs over ring). pnpm's minimum release age applies. A change to `services/identity`'s production dependencies needs `bash scripts/tests/no-copyleft.sh --write`, which rewrites `THIRD_PARTY_NOTICES.md`; nothing under the GPL or the AGPL may ship there.
 - `tokio-postgres` is pinned to the `chelabase/rust-postgres` fork by `rev` in the workspace `Cargo.toml`; return to crates.io once the upstream change is released (https://github.com/rust-postgres/rust-postgres/pull/1391).

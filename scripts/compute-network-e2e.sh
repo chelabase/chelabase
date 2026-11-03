@@ -3,7 +3,7 @@
 # like a compute (the stack's `compute` and `control` networks only). Runs in the stack's runner
 # (`just compute-network-e2e`).
 #
-# 1. Reachability: a compute can't reach NATS, Valkey, any database, Zitadel, Mailpit, SeaweedFS,
+# 1. Reachability: a compute can't reach NATS, Valkey, any database, the identity service, Mailpit, SeaweedFS,
 #    the storage controller, the gateway or Studio, by name or by their default-network address;
 #    it reaches what it needs (pageserver, safekeeper, the orchestrator's hooks listener).
 # 2. Port audit (S27): every TCP listener of every container on the compute network (read from
@@ -54,7 +54,7 @@ default_ip() {
 }
 
 # --- 1. reachability ---------------------------------------------------------------------------
-for target in nats:4222 nats:8222 valkey:6379 metadata-db:5432 zitadel-db:5432 storcon-db:5432 zitadel:8080 \
+for target in nats:4222 nats:8222 valkey:6379 metadata-db:5432 storcon-db:5432 identity:8080 \
   mailpit:8025 mailpit:1025 seaweedfs:8333 storage-controller:1234 storage-broker:50051 "gateway:$gateway_port" studio:3000; do
   host="${target%%:*}" port="${target#*:}"
   if tcp_open "$host" "$port"; then fail "a compute reaches $target"; else ok "no route to $target"; fi
@@ -152,16 +152,13 @@ audit() { # audit <service> <port>: the check for one listener; returns 1 when i
       refused GET "http://rest:8086/internal/types/$uuid?role=authenticated" "rest's internal types route"
       refused POST "http://rest:8086/internal/console/$uuid/query" "rest's internal console route" -d '{}' ;;
     # Studio's sign-in backend: public by design (it is what the gateway serves to anyone), but
-    # ruling (e): a compute can't pick its rate-limit key through X-Forwarded-For. 61 lookups of
-    # an unknown sign-in (60 a minute per address, answered 410 without Zitadel), each claiming a
-    # new address: the limit still applies to the compute's own address. The body's field is
-    # `authRequest` (camelCase): with any other field the JSON extractor answers 422 before the
-    # handler's rate limit runs, so nothing is ever limited (RT1 final fix round, test bug).
+    # ruling (e): a compute can't pick its rate-limit key through X-Forwarded-For. 61 reads of
+    # the instance info (60 a minute per address), each claiming a new address: the limit still
+    # applies to the compute's own address.
     auth:8084)
       local i got limited=""
       for i in $(seq 61); do
-        got="$(status POST http://auth:8084/auth/v1/auth-request -H 'Content-Type: application/json' \
-          -H "X-Forwarded-For: 198.51.100.$i" -d '{"authRequest":"not-a-request"}')"
+        got="$(status GET http://auth:8084/auth/v1/instance -H "X-Forwarded-For: 198.51.100.$i")"
         [[ "$got" == 429 ]] && { limited=1; break; }
       done
       [[ -n "$limited" ]] && ok "auth:8084 is public by design and ignores a compute's X-Forwarded-For" ||
