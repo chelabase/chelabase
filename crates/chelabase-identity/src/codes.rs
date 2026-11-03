@@ -146,6 +146,23 @@ impl Identity {
         Ok(out.user)
     }
 
+    /// Tells an existing account it was invited: a mail with `link` (the invite's ticket) and no
+    /// code, so it can set nothing. Members pool only; a `link` holding a `code` is refused.
+    pub async fn send_invite_notice(
+        &self,
+        pool: &Pool,
+        user_id: &str,
+        project_name: Option<&str>,
+        link: &str,
+    ) -> Result<(), IdentityError> {
+        let mut body = json!({ "link": link });
+        if let Some(name) = project_name {
+            body["project_name"] = Value::String(name.to_string());
+        }
+        self.call_empty(&ops::SEND_INVITE_NOTICE, Some(pool), Some(user_id), Some(body))
+            .await
+    }
+
     /// Whether the service can send email (replaces Zitadel's `email_provider_active`).
     pub async fn email_status(&self) -> Result<EmailStatus, IdentityError> {
         self.call(&ops::EMAIL_STATUS, None, None, &[], None).await

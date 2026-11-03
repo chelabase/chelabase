@@ -16,7 +16,7 @@
 //! - `delivery: email` is 409 `email_not_configured` without SMTP (checked before the user).
 //!   The fake does not model caller tokens, so the orchestrator's invite-only rule is not here.
 
-use super::{Inner, Reply, SentCode, check_password, refuse, str_field, user_idx, user_out};
+use super::{Inner, Reply, SentCode, SentNotice, check_password, refuse, str_field, user_idx, user_out};
 use crate::codes::CodeKind;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{Value, json};
@@ -68,8 +68,27 @@ pub(super) fn route(
     match (method, tail) {
         ("POST", ["codes"]) => Some(create(i, pool, body)),
         ("POST", ["codes", "verify"]) => Some(verify(i, pool, body)),
+        ("POST", ["users", id, "invite-notice"]) => Some(notice(i, pool, id, body)),
         _ => None,
     }
+}
+
+/// As the service's `invite.notice`: members pool only, a link without a code, SMTP, the user.
+fn notice(i: &mut Inner, pool: &str, id: &str, body: &Value) -> Reply {
+    if pool != "members" {
+        return Err(refuse(400, "invalid_pool", "invite notices are for the members pool"));
+    }
+    let link = str_field(body, "link")?.to_string();
+    if link.split(['?', '&']).any(|part| part.starts_with("code=")) {
+        return Err(refuse(400, "invalid_request", "link must not carry a code"));
+    }
+    if !i.email_configured {
+        return Err(refuse(409, "email_not_configured", "no SMTP is configured"));
+    }
+    let p = super::pool_mut(i, pool)?;
+    let email = p.users[user_idx(p, id)?].email.clone();
+    i.notices.push(SentNotice { user_id: id.to_string(), email, link });
+    Ok((202, Some(json!({ "sent": true }))))
 }
 
 fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
@@ -123,6 +142,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
             email,
             kind,
             code,
+            link: body.get("link").and_then(Value::as_str).map(str::to_string),
         });
     }
     Ok((201, Some(out)))

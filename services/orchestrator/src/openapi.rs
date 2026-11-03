@@ -968,18 +968,6 @@ impl members::MembersPort for Doc {
     ) -> Result<(chelabase_metadata::members::MemberListing, Uuid), DocWriteError> {
         match *self {}
     }
-    async fn add_existing_user(
-        &self,
-        actor: Uuid,
-        tenant: TenantId,
-        identity_user_id: &str,
-        email: &str,
-        name: &str,
-        grants: &[(Uuid, chelabase_metadata::members::GrantRow)],
-        teams: &[chelabase_metadata::members::TeamSeen],
-    ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
-        match *self {}
-    }
     async fn resend_invite(
         &self,
         actor: Uuid,
@@ -1011,6 +999,16 @@ impl members::MembersPort for Doc {
         match *self {}
     }
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, DocWriteError> {
+        match *self {}
+    }
+    async fn revoke_logins_for_identity_user(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        match *self {}
+    }
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
         match *self {}
     }
     async fn set_tenant_display_name(

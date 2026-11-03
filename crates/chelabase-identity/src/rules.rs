@@ -1,5 +1,9 @@
 //! Input rules shared by every caller of the identity service.
 
+/// The ban reason of a person removed from their last tenant. Only this ban is ours to lift
+/// (reinstate here, accept-invite in `services/auth`); any other reason is left in place.
+pub const MEMBER_REMOVED_BAN_REASON: &str = "chelabase:removed-from-last-tenant";
+
 /// The complexity rule checked before a password reaches the service, so the answer never
 /// depends on whether an account exists.
 pub fn strong_password(password: &str) -> bool {

@@ -1,15 +1,16 @@
-// Email templates: one plain-text and one HTML file per code kind under `templates/`. The
+// Email templates: one plain-text and one HTML file per mail under `templates/`. The
 // text file's first line is `Subject: …`. Placeholders are `{{project}}`, `{{code}}`,
 // `{{expires}}` and `{{link}}`; without a link, every line holding `{{link}}` is dropped.
 import { readFileSync } from "node:fs";
 
-export const TEMPLATE_KINDS = ["verify", "reset", "invite"] as const;
+export const TEMPLATE_KINDS = ["verify", "reset", "invite", "invite_notice"] as const;
 export type TemplateKind = (typeof TEMPLATE_KINDS)[number];
 
 export interface TemplateValues {
   project: string;
-  code: string;
-  expires: string;
+  /** Left out of `invite_notice`, which holds neither. */
+  code?: string;
+  expires?: string;
   link?: string;
 }
 
@@ -46,7 +47,7 @@ const escapeHtml = (s: string) =>
 
 function fill(template: string, values: TemplateValues, escape: (s: string) => string): string {
   const lines = values.link === undefined ? template.split("\n").filter((l) => !l.includes("{{link}}")) : template.split("\n");
-  const map: Record<string, string> = { project: values.project, code: values.code, expires: values.expires, link: values.link ?? "" };
+  const map: Record<string, string> = { project: values.project, code: values.code ?? "", expires: values.expires ?? "", link: values.link ?? "" };
   return lines.join("\n").replace(/\{\{(project|code|expires|link)\}\}/g, (_, key: string) => escape(map[key]!));
 }
 

@@ -220,8 +220,10 @@ pub struct FakeState {
     /// before it.
     pub auth_sync_racer: Option<(String, String)>,
     /// Applied once, just after the next `project_auth` read answers: the row moves to this
-    /// status, or goes (`None`), as a concurrent job would.
+    /// status, or goes (`None`), as a concurrent job would. `after_auth_read_skip` reads
+    /// answer unchanged first.
     pub after_auth_read: Option<Option<AppUsersStatus>>,
+    pub after_auth_read_skip: usize,
     pub app_sessions: Vec<AppSession>,
     /// The schema merge base history, oldest first (E18); ids increase with each append.
     pub schema_bases: Vec<SchemaBase>,
@@ -2796,6 +2798,10 @@ impl WorkerMetadata for FakeMetadata {
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         let mut state = self.write("project_auth")?;
         let found = state.project_auth.get(&project).cloned();
+        if state.after_auth_read.is_some() && state.after_auth_read_skip > 0 {
+            state.after_auth_read_skip -= 1;
+            return Ok(found);
+        }
         match state.after_auth_read.take() {
             Some(Some(status)) => {
                 if let Some(row) = state.project_auth.get_mut(&project) {
@@ -2878,6 +2884,24 @@ impl WorkerMetadata for FakeMetadata {
             state.project_auth.remove(&project);
         }
         Ok(disabling)
+    }
+
+    async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        let mut state = self.write("set_app_users_error")?;
+        if let Some(a) = state
+            .project_auth
+            .get_mut(&project)
+            .filter(|a| a.status == AppUsersStatus::Enabled)
+            .filter(|a| a.error.as_deref() != error)
+        {
+            a.error = error.map(str::to_string);
+            a.updated_at = Utc::now();
+        }
+        Ok(())
     }
 
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

@@ -246,7 +246,7 @@ async fn member_tenants_lists_active_and_pending() {
     join(b, &who, Admission::Pending).await;
     join(c, "admin-c", Admission::Active).await;
     let gone = join(c, &who, Admission::Active).await;
-    sqlx::query("UPDATE members SET status = 'suspended' WHERE id = $1").bind(gone.id).execute(s.client.pool()).await.unwrap();
+    sqlx::query("UPDATE members SET status = 'suspended', suspended_at = now() WHERE id = $1").bind(gone.id).execute(s.client.pool()).await.unwrap();
     let mut want = vec![(a, MemberStatus::Active), (b, MemberStatus::Pending)];
     want.sort_by_key(|(t, _)| t.as_uuid());
     assert_eq!(s.client.member_tenants(&who).await.unwrap(), want);

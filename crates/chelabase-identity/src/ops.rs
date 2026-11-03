@@ -39,5 +39,6 @@ ops! {
     // m2 (#115), see codes.rs.
     CREATE_CODE = "createCode", "POST", "/internal/v1/pools/{pool}/codes";
     VERIFY_CODE = "verifyCode", "POST", "/internal/v1/pools/{pool}/codes/verify";
+    SEND_INVITE_NOTICE = "sendInviteNotice", "POST", "/internal/v1/pools/{pool}/users/{id}/invite-notice";
     EMAIL_STATUS = "emailStatus", "GET", "/internal/v1/email/status";
 }

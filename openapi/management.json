@@ -9843,7 +9843,7 @@
           "members"
         ],
         "summary": "Invite a person",
-        "description": "Matches the email to a person: an existing member just gets the grants, all or none (200); an active user of the organisation who has a password and was never a member becomes an active member (201, `added`, no mail); anyone else, a removed member or a deactivated or passwordless user of the organisation included, gets a Zitadel invite mail with a link to Studio's `/accept-invite` and is `invited` until they accept (201); one who already has a way to sign in (a removed member invited again) gets Zitadel's password-reset mail with the same link marked `reset=1`, since Zitadel makes no invite code for them. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only when the invite makes the Zitadel user, or the user has never had a way to sign in (password, passkey, OTP, U2F, IdP link); else 409 `link_not_allowed`, send by email) nothing is mailed (no email provider needed): the response carries the link as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
+        "description": "Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only for a new person, or an account with no password and an unverified email; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
         "operationId": "createInvite",
         "requestBody": {
           "content": {
@@ -9917,7 +9917,7 @@
             }
           },
           "409": {
-            "description": "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: a grant's project is being deleted",
+            "description": "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: a grant's project is being deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -9956,6 +9956,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -9967,7 +9977,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -9990,7 +10000,7 @@
           "members"
         ],
         "summary": "Can invites be emailed?",
-        "description": "Asks Zitadel whether an email provider is active. Without one, invite by link (`delivery: \"link\"`). A Zitadel that can't be asked is not an error: the answer is `email_available: false` with the reason.",
+        "description": "Asks the identity service whether SMTP is configured. Without it, invite by link (`delivery: \"link\"`). An identity service that can't be asked is not an error: the answer is `email_available: false` with the reason.",
         "operationId": "getInviteDelivery",
         "responses": {
           "200": {
@@ -10057,7 +10067,7 @@
           "members"
         ],
         "summary": "Revoke an invite",
-        "description": "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.",
+        "description": "The member becomes `removed` and its grants go; then the invitee's account is deleted when it never set a password; an account with a password, or one that is still a member of another tenant, is left as it is. Revoking an invite whose member is still removed retries that step.",
         "operationId": "revokeInvite",
         "parameters": [
           {
@@ -10136,7 +10146,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel isn't configured (nothing changed), or can't be reached after the revoke (revoke again to retry)",
+            "description": "`identity_unavailable`: revoked in Chelabase, but the identity service couldn't be reached for the account (revoke again to finish)",
             "content": {
               "application/json": {
                 "schema": {
@@ -10159,7 +10169,7 @@
           "members"
         ],
         "summary": "Send an invite again",
-        "description": "Zitadel mails a new code (the old one stops working), or with `delivery: \"link\"` (only for an invitee with no way to sign in yet; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. The body may be left out (then `email`).",
+        "description": "A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: \"link\"` (only for an invitee with no password and an unverified email; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).",
         "operationId": "resendInvite",
         "parameters": [
           {
@@ -10241,7 +10251,7 @@
             }
           },
           "409": {
-            "description": "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee who can sign in",
+            "description": "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee with an account; `conflict`: email delivery with no SMTP configured",
             "content": {
               "application/json": {
                 "schema": {
@@ -10270,6 +10280,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -10281,7 +10301,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -10430,7 +10450,7 @@
           "members"
         ],
         "summary": "Remove a member",
-        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+        "description": "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When this was their last membership in any tenant, their account's sessions end and it is banned; while they are a member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Removing a removed member again redoes every step after the removal.",
         "operationId": "removeMember",
         "parameters": [
           {
@@ -10509,7 +10529,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: removed in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); remove again to retry",
+            "description": "`identity_unavailable`: removed in Chelabase (refused at once), but the identity service couldn't end the sessions or ban the account; remove again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -10808,7 +10828,7 @@
           "members"
         ],
         "summary": "Decline a sign-up",
-        "description": "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+        "description": "The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked and, when this was their last membership in any tenant, their account's sessions end and it is banned. A still-valid token is refused at once. Declining a removed member again redoes those steps.",
         "operationId": "declineMember",
         "parameters": [
           {
@@ -10887,7 +10907,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: declined in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); decline again to retry",
+            "description": "`identity_unavailable`: declined in Chelabase, but the identity service couldn't end the sessions or ban the account; decline again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -10999,7 +11019,7 @@
           "members"
         ],
         "summary": "Reinstate a suspended member",
-        "description": "The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.",
+        "description": "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted (a ban for any other reason stays), and their offboarded mark is cleared. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
         "operationId": "reinstateMember",
         "parameters": [
           {
@@ -11085,7 +11105,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: reinstated in Chelabase, but Zitadel couldn't unlock the user (or isn't configured); reinstate again to retry",
+            "description": "`identity_unavailable`: reinstated in Chelabase, but the identity service couldn't lift the ban; reinstate again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -11197,7 +11217,7 @@
           "members"
         ],
         "summary": "Suspend a member",
-        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+        "description": "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are a member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.",
         "operationId": "suspendMember",
         "parameters": [
           {
@@ -11283,7 +11303,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry",
+            "description": "`identity_unavailable`: suspended in Chelabase (refused at once), but the identity service couldn't end the sessions; suspend again to finish",
             "content": {
               "application/json": {
                 "schema": {
@@ -13101,7 +13121,7 @@
             }
           },
           "409": {
-            "description": "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: the project is being deleted",
+            "description": "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: the project is being deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -13140,6 +13160,16 @@
               }
             }
           },
+          "429": {
+            "description": "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          },
           "500": {
             "description": "`internal`: unexpected; details only in the logs",
             "content": {
@@ -13151,7 +13181,7 @@
             }
           },
           "503": {
-            "description": "`unavailable`: Zitadel can't be reached or isn't configured",
+            "description": "`identity_unavailable`: the identity service can't be reached",
             "content": {
               "application/json": {
                 "schema": {
@@ -15827,7 +15857,7 @@
               "string",
               "null"
             ],
-            "description": "Why enabling failed; `null` otherwise."
+            "description": "Why enabling failed, or, on an enabled project, the last problem reconcile found (a pool\ngone from the identity service, a branch it couldn't upgrade); `null` otherwise."
           },
           "on_delete": {
             "$ref": "#/components/schemas/OnDelete"
@@ -17850,9 +17880,8 @@
         "type": "string",
         "description": "Why invites can't be emailed.",
         "enum": [
-          "no_email_provider",
-          "zitadel_unavailable",
-          "zitadel_not_configured"
+          "email_not_configured",
+          "identity_unavailable"
         ]
       },
       "Dependent": {
@@ -18553,7 +18582,7 @@
         "properties": {
           "email_available": {
             "type": "boolean",
-            "description": "Whether Zitadel has an active email provider, so `email` delivery works."
+            "description": "Whether an SMTP server is configured, so `email` delivery works."
           },
           "reason": {
             "oneOf": [
@@ -18596,7 +18625,6 @@
         "description": "What an invite did.",
         "enum": [
           "invited",
-          "added",
           "existing_member"
         ]
       },
@@ -18863,7 +18891,7 @@
       },
       "Member": {
         "type": "object",
-        "description": "A member of the tenant: a person in its Zitadel organisation.",
+        "description": "A member of the tenant: a person of the members pool.",
         "required": [
           "id",
           "email",

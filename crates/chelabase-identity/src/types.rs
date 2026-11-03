@@ -31,6 +31,17 @@ pub struct User {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A user as the single-user read shows them.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UserDetail {
+    #[serde(flatten)]
+    pub user: User,
+    /// Whether they can sign in with a password.
+    pub has_password: bool,
+    /// Why they are banned; `None` when they aren't.
+    pub ban_reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct NewUser<'a> {
     pub email: &'a str,

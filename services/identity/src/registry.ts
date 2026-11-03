@@ -86,8 +86,10 @@ export class PoolRegistry {
     });
   }
 
-  /** Evicts the pool's instance and drops its schema through m5's function. Idempotent. */
+  /** Evicts the pool's instance and drops its schema through m5's function. Idempotent. Never `members`. */
   async dropPool(ref: PoolRef): Promise<void> {
+    // Defence in depth behind the route's refusal.
+    if (ref.name === "members") throw new Error("the members pool is never dropped");
     await this.locked(ref.schema, async () => {
       this.cache.delete(ref.schema);
       await this.db.query("SELECT identity_admin.drop_pool_schema($1)", [ref.schema]);

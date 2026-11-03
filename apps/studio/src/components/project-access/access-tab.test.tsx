@@ -234,7 +234,7 @@ describe("AccessTab", () => {
     const url = "http://studio.test/accept-invite#abc";
     const { queryClient } = setup({
       routes: {
-        "GET /v1/invites/delivery": ok({ email_available: false, reason: "no_email_provider" }),
+        "GET /v1/invites/delivery": ok({ email_available: false, reason: "email_not_configured" }),
         "POST /v1/projects/p1/invites": ok({ outcome: "invited", member: member("new", { status: "invited" }), invite_url: url }),
       },
     });

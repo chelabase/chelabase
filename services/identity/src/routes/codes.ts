@@ -9,6 +9,7 @@ import { HttpError } from "../http.ts";
 import {
   checkPasswordLength,
   context,
+  hasPassword,
   ID_PATTERN,
   isUuid,
   requireUser,
@@ -87,9 +88,7 @@ function invalidCode(): HttpError {
  * account; resetting one is the reset code's job.
  */
 async function inviteAllowed(ctx: Context, user: BaUser): Promise<boolean> {
-  if (!user.emailVerified) return true;
-  const account = (await ctx.internalAdapter.findCredentialAccount(user.id)) as { password?: string | null } | null;
-  return !account?.password;
+  return !user.emailVerified || !(await hasPassword(ctx, user));
 }
 
 /**
@@ -182,6 +181,35 @@ export function codeRoutes(): Route[] {
       },
     },
   ];
+}
+
+/**
+ * The mail an existing account gets when it is invited: it says so and links to the invite's
+ * ticket. It sets nothing and carries no code, so the person joins by signing in as themselves.
+ * Members pool only: app users have no invites. The link is the caller's, so a link that holds
+ * a `code` is refused here rather than mailed.
+ */
+export function inviteNoticeRoute(): Route {
+  return {
+    id: "invite.notice",
+    method: "POST",
+    rest: ["users", ":id", "invite-notice"],
+    async handle({ mailer, registry, pool, id, body }) {
+      if (pool.name !== "members") throw new HttpError(400, "invalid_pool", "invite notices are for the members pool");
+      const project = optText(body, "project_name", MAX_PROJECT) ?? DEFAULT_PROJECT;
+      const link = optLink(body);
+      if (link === undefined) throw new HttpError(400, "invalid_request", "link is required");
+      if (new URL(link).searchParams.has("code")) throw new HttpError(400, "invalid_request", "link must not carry a code");
+      if (!mailer.configured) {
+        throw new HttpError(409, "email_not_configured", "no SMTP server is configured");
+      }
+      return registry.use(pool, async (auth) => {
+        const user = await requireUser(await context(auth), id);
+        await mailer.send(user.email, render("invite_notice", { project, link }));
+        return { status: 202, body: { sent: true } };
+      });
+    },
+  };
 }
 
 export function emailStatusRoute(): GlobalRoute {

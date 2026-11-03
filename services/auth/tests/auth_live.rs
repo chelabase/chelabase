@@ -194,6 +194,21 @@ impl Admin {
 }
 
 /// One statement against the metadata database, as the e2e scripts' `metadata_sql` runs it.
+/// [`metadata_sql`] that reports a failure instead of panicking, for cleanups.
+async fn try_metadata_sql(sql: &str) -> Result<String, String> {
+    let out = tokio::process::Command::new("psql")
+        .arg(need("CHELABASE_METADATA_DATABASE_URL"))
+        .args(["-v", "ON_ERROR_STOP=1", "-qtA", "-c", sql])
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("{sql}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("{sql}: {}", String::from_utf8_lossy(&out.stderr)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 async fn metadata_sql(sql: &str) -> String {
     let out = tokio::process::Command::new("psql")
         .arg(need("CHELABASE_METADATA_DATABASE_URL"))
@@ -299,18 +314,58 @@ async fn session_call(path: &str, cookie: Option<&str>, body: Option<Value>) -> 
     (status, body, set)
 }
 
+/// Every person `member_sign_in_live` signs up, this run's and any an earlier run left behind.
+const LIVE_MEMBERS: &str = "auth-live-member-%@example.com";
+
+/// Undoes what `member_sign_in_live` changes, whatever state a run stopped in, and never panics
+/// midway: the demo tenant's open sign-up goes back first, then each member is removed through the
+/// API as an admin would (`access_events` is append-only and names the row, so it is never
+/// deleted), then their identity users go. Returns what failed.
+async fn member_sign_in_cleanup(was_open: bool) -> Vec<String> {
+    let mut failed = Vec::new();
+    if let Err(e) = try_metadata_sql(&format!("UPDATE tenants SET open_signup = {was_open} WHERE id = '{DEMO_TENANT_ID}'")).await {
+        failed.push(e);
+    }
+    let ids = try_metadata_sql(&format!(
+        "SELECT id FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email LIKE '{LIVE_MEMBERS}' AND status <> 'removed'"
+    ))
+    .await;
+    match ids {
+        Ok(ids) => {
+            for id in ids.lines().filter(|l| !l.is_empty()) {
+                let path = format!("/v1/members/{id}");
+                match tokio::spawn(async move { api(Method::DELETE, &path, None).await }).await {
+                    // 503: removed here, only identity's follow-up steps failed.
+                    Ok((204 | 503, _)) => {}
+                    Ok((status, body)) => failed.push(format!("removing member {id}: {status} {body}")),
+                    Err(e) => failed.push(format!("removing member {id}: {e}")),
+                }
+            }
+        }
+        Err(e) => failed.push(e),
+    }
+    if let Err(e) = try_metadata_sql(&format!(r#"DELETE FROM identity_members."user" WHERE email LIKE '{LIVE_MEMBERS}'"#)).await {
+        failed.push(e);
+    }
+    failed
+}
+
 /// #121 AC 1 against the stack: an open sign-up waits as pending, and once active the member signs
 /// in, gets a token the gateway and orchestrator accept, and loses it at logout. Open sign-up is
-/// switched on for the demo tenant meanwhile; the row and the user go afterwards, pass or fail.
+/// switched on for the demo tenant meanwhile; [`member_sign_in_cleanup`] runs afterwards, pass or
+/// fail.
 #[tokio::test]
 #[ignore = "needs the workbench stack and the metadata database"]
 async fn member_sign_in_live() {
     let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
-    let was_open = metadata_sql(&format!("SELECT open_signup FROM tenants WHERE id = '{DEMO_TENANT_ID}'")).await;
-    metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
+    let was_open = metadata_sql(&format!("SELECT open_signup FROM tenants WHERE id = '{DEMO_TENANT_ID}'")).await == "t";
+    // Leftovers of an earlier run first: their pending rows and users would get in the way.
+    let stale = member_sign_in_cleanup(was_open).await;
+    assert!(stale.is_empty(), "cleaning up an earlier run: {stale:?}");
     let run = email.clone();
     let outcome = tokio::spawn(async move {
         let email = run;
+        metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
         let creds = json!({"email": email, "password": STRONG});
         let mut sign_up = creds.clone();
         sign_up["givenName"] = json!("Live");
@@ -337,9 +392,9 @@ async fn member_sign_in_live() {
         assert_eq!(me["member"]["status"], "active");
 
         // Suspended: `/token` stops at once, whatever the session.
-        metadata_sql(&format!("UPDATE members SET status = 'suspended' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        metadata_sql(&format!("UPDATE members SET status = 'suspended', suspended_at = now() WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
         assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "suspended");
-        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        metadata_sql(&format!("UPDATE members SET status = 'active', suspended_at = NULL WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
         assert_eq!(session_call("token", Some(&cookie), None).await.0, 200);
 
         // Without Studio's header, and after logout with the same bytes.
@@ -352,12 +407,11 @@ async fn member_sign_in_live() {
         assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
     })
     .await;
-    metadata_sql(&format!("UPDATE tenants SET open_signup = {was_open} WHERE id = '{DEMO_TENANT_ID}'")).await;
-    let _ = metadata_sql(&format!("DELETE FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
-    let _ = metadata_sql(&format!(r#"DELETE FROM identity_members."user" WHERE email = '{email}'"#)).await;
+    let failed = member_sign_in_cleanup(was_open).await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
+    assert!(failed.is_empty(), "cleanup: {failed:?}");
 }
 
 fn accept(user: &str, code: &str, password: &str) -> Value {
