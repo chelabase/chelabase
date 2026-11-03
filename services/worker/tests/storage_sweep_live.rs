@@ -13,9 +13,9 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chelabase_metadata::{
     BranchKind, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient,
@@ -29,7 +29,9 @@ use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use worker::config::RealWorker;
-use worker::storage_sweep::{SweepBranch, SweepDatabase, SweepSource, sweep_database};
+use worker::storage_sweep::{
+    BranchRead, ReadError, SweepBranch, SweepDatabase, SweepSource, sweep_database,
+};
 
 mod common;
 use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
@@ -323,8 +325,18 @@ impl SweepSource for NoWindow<'_> {
         db: DatabaseId,
         b: &SweepBranch,
         expire: bool,
-    ) -> Result<(HashSet<Uuid>, u64), String> {
-        self.0.references(db, b, expire).await
+        open: &[String],
+    ) -> Result<BranchRead, ReadError> {
+        self.0.references(db, b, expire, open).await
+    }
+
+    async fn branch_point(
+        &self,
+        db: DatabaseId,
+        timeline: &str,
+        recorded: &BTreeSet<String>,
+    ) -> Result<Option<SystemTime>, String> {
+        self.0.branch_point(db, timeline, recorded).await
     }
 }
 
