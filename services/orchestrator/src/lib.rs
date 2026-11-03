@@ -2099,11 +2099,17 @@ fn in_operator_org<M, J>(state: &AppState<M, J>, org_id: &str) -> bool {
     state.operator_org.as_deref().is_some_and(|org| !org.is_empty() && org == org_id)
 }
 
-/// Whether the caller is in the operator's tenant (member token) or org (Zitadel token): each
-/// path reads only its own setting.
-fn caller_is_operator<M, J>(state: &AppState<M, J>, caller: &Caller) -> bool {
+/// Whether `member`, the row a member token's `tid` led to, makes its caller an operator:
+/// `tenant` is the operator tenant and the membership is active. `tid` alone is never enough.
+fn is_operator_member<M, J>(state: &AppState<M, J>, tenant: TenantId, member: Option<&MemberRecord>) -> bool {
+    state.operator_tenant == Some(tenant) && member.is_some_and(MemberRecord::in_good_standing)
+}
+
+/// Whether the caller is in the operator's tenant (member token, with `member`, its row there)
+/// or org (Zitadel token): each path reads only its own setting.
+fn caller_is_operator<M, J>(state: &AppState<M, J>, caller: &Caller, member: Option<&MemberRecord>) -> bool {
     match caller.tenant_id {
-        Some(tenant) => state.operator_tenant == Some(tenant),
+        Some(tenant) => is_operator_member(state, tenant, member),
         None => in_operator_org(state, &caller.org_id),
     }
 }
@@ -2152,7 +2158,12 @@ where
     ) -> Result<Self, Self::Rejection> {
         use chelabase_types::access::{decide, Access, CallerFacts};
         let caller = Caller::from_request_parts(parts, state).await?;
-        let operator = caller_is_operator(state, &caller);
+        // A member token's row comes first: the operator check needs it.
+        let token_member = match caller.tenant_id {
+            Some(tenant) => Some(resolve_member(state, tenant, &caller).await?),
+            None => None,
+        };
+        let operator = caller_is_operator(state, &caller, token_member.as_ref().and_then(Option::as_ref));
         if state.policy.instance_admin(false, operator) {
             return Ok(InstancePrincipal {
                 sub: caller.sub,
@@ -2163,7 +2174,10 @@ where
             });
         }
         let tenant_id = caller_tenant(state, &caller).await?.ok_or_else(tenant_not_bound)?;
-        let member = resolve_member(state, tenant_id, &caller).await?;
+        let member = match token_member {
+            Some(member) => member,
+            None => resolve_member(state, tenant_id, &caller).await?,
+        };
         let facts = CallerFacts { member: access::member_facts(member.as_ref()), in_operator_org: operator };
         decide(&state.policy, &facts, None, None, None, None, Access::Instance).map_err(access::deny_to_api)?;
         Ok(InstancePrincipal {
@@ -2208,7 +2222,7 @@ where
 
         let member = resolve_member(state, tenant_id, &caller).await?;
         Ok(AuthPrincipal {
-            in_operator_org: caller_is_operator(state, &caller),
+            in_operator_org: caller_is_operator(state, &caller, member.as_ref()),
             sub: caller.sub,
             org_id: caller.org_id,
             tenant_id,
@@ -2256,8 +2270,8 @@ pub(crate) async fn read_only_member_principal<M: MetadataPort, J>(
         org_id: String::new(),
         tenant_id,
         request_id: Uuid::new_v4().to_string(),
+        in_operator_org: is_operator_member(state, tenant_id, member.as_ref()),
         member,
-        in_operator_org: state.operator_tenant == Some(tenant_id),
     }))
 }
 
@@ -2724,7 +2738,7 @@ where
     // D7: an offboarded member is told who they are, with nothing to use.
     let active = member.as_ref().filter(|m| m.in_good_standing());
     let tenant_admin = active.is_some_and(|m| m.tenant_admin);
-    let instance_admin = state.policy.instance_admin(tenant_admin, caller_is_operator(state, &caller));
+    let instance_admin = state.policy.instance_admin(tenant_admin, caller_is_operator(state, &caller, member.as_ref()));
 
     // The projects the caller may use: all of them for a tenant admin, else their grants.
     let projects = match (tenant_id, active) {

@@ -17554,3 +17554,26 @@ async fn realtime_routes_take_member_tokens() {
     let (_, body) = ask(json!({ "sub": "rita", "org_id": "org-1" })).await;
     assert_eq!(body["allowed"], json!(true), "{body}");
 }
+
+// `tid` is never trusted alone: naming the operator tenant makes no one an operator without an
+// active membership there, on the instance check and on `/v1/me` alike.
+#[tokio::test]
+async fn operator_tenant_needs_an_active_membership() {
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    metadata.add_member(ops, "sus", MemberStatus::Suspended, false);
+    metadata.add_member(ops, "off", MemberStatus::Active, false);
+    metadata.set_member(ops, "off", |m| m.offboarded = true);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let before = metadata.members.lock().unwrap().len();
+    assert_eq!(send_member(&app, "op", ops.as_uuid(), Method::GET, INSTANCE_PROBE).await.status(), 200);
+    for sub in ["stranger", "sus", "off"] {
+        let resp = send_member(&app, sub, ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
+        assert_eq!(resp.status(), 403, "{sub}");
+        let me: Value = send_member(&app, sub, ops.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+        assert_eq!(me["instance_admin"], json!(false), "{sub}: {me}");
+    }
+    assert_eq!(metadata.members.lock().unwrap().len(), before, "nothing is admitted");
+}
