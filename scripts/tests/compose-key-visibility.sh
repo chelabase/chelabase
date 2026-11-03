@@ -50,7 +50,7 @@ universe='[
   "S/bootstrap/dev-member.json", "S/bootstrap/dev-token.json", "S/studio.env",
   "S/nats/auth.conf", "S/valkey/users.acl", "S/binaries.json", "S/runner/.curlrc",
   "S/neon/proxy-ca.crt", "S/logs/x", "S/test/x", "S/test/archive.tar.zst", "S/upgrade-e2e.env",
-  "S/unlisted/x"
+  "S/unlisted/x", "S/setup/setup.code"
 ]'
 
 # service -> { path: mode }; every other (service, path) must be none.
@@ -64,7 +64,8 @@ universe='[
 # The stack's state dir (least privilege): an app sees only the state files it reads itself, ro.
 # Its env files (stack.env, studio.env) are read by Compose on the host, at create time, so they
 # need no mount; nothing in an app writes under the state dir (logs, test archives, the proxy CA
-# copy, binaries.json and the runner's .curlrc are the host CLI's), and no app opens a state file.
+# copy, binaries.json and the runner's .curlrc are the host CLI's), and no app opens a state file but
+# one: the orchestrator reads the stack's setup code (setup/setup.code, ro; #126).
 # CHELABASE_PROXY_CA_FILE is a path the orchestrator hands to clients, never opens. The runner
 # (the test harness, which has the Docker socket anyway) keeps the whole dir, rw: it runs nextest
 # archives from test/, curl with CURL_HOME=runner/, `docker compose` with stack.env and the env
@@ -80,7 +81,8 @@ expected='{
     "K/nats/orchestrator.password": "ro", "K/valkey/control.password": "ro", "K/realtime/internal.token": "ro",
     "K/tokens/rest-internal.token": "ro", "K/tokens/data-keys.token": "ro", "K/tokens/app-auth.token": "ro",
     "K/tokens/app-sessions.token": "ro", "K/tokens/proxy-api.token": "ro", "K/tokens/storcon-hook.token": "ro",
-    "K/tokens/orchestrator-identity.token": "ro", "K/auth/member-jwt.pub": "ro"
+    "K/tokens/orchestrator-identity.token": "ro", "K/auth/member-jwt.pub": "ro",
+    "S/setup/setup.code": "ro"
   },
   "worker": {
     "C/scripts/tests/workbench-compose.sh": "ro",
@@ -135,7 +137,7 @@ expected='{
     "S/bootstrap/dev-member.json": "rw", "S/bootstrap/dev-token.json": "rw", "S/studio.env": "rw",
     "S/nats/auth.conf": "rw", "S/valkey/users.acl": "rw", "S/binaries.json": "rw", "S/runner/.curlrc": "rw",
     "S/neon/proxy-ca.crt": "rw", "S/logs/x": "rw", "S/test/x": "rw", "S/test/archive.tar.zst": "rw",
-    "S/upgrade-e2e.env": "rw", "S/unlisted/x": "rw",
+    "S/upgrade-e2e.env": "rw", "S/unlisted/x": "rw", "S/setup/setup.code": "rw",
     "K/secrets/secrets.key": "ro",
     "K/neon/compute-jwt.pem": "ro", "K/neon/compute-jwt.pub": "ro",
     "K/auth/app-jwt.key": "ro", "K/auth/app-jwt.pub": "ro",
@@ -186,6 +188,7 @@ expected_secret_binds='[
 expected_state_binds='[
   "nats:S/nats/auth.conf->/etc/nats/auth.conf",
   "valkey:S/valkey/users.acl->/etc/valkey/users.acl",
+  "orchestrator:S/setup/setup.code->S/setup/setup.code",
   "runner:S->S:rw"
 ]'
 
