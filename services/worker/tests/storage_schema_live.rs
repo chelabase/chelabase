@@ -3254,3 +3254,211 @@ async fn storage_write_once_live() {
     }))
     .await;
 }
+
+// --- m7 fix round (the audit's findings) -----------------------------------------------------
+
+/// A call to the in-process storage service with a streamed body, bounded by `within`:
+/// `Some((status, body))`, or `None` when it was still waiting at the end.
+async fn streamed(base: &str, token: &str, method: &str, path: &str, body: reqwest::Body, within: Duration) -> Option<(u16, Value)> {
+    let res = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{base}{path}"))
+        .header(chelabase_auth::internal::IDENTITY_HEADER, token)
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send();
+    match tokio::time::timeout(within, res).await {
+        Ok(Ok(res)) => {
+            let status = res.status().as_u16();
+            Some((status, res.json().await.unwrap_or_default()))
+        }
+        Ok(Err(e)) => Some((0, json!(e.to_string()))),
+        Err(_) => None,
+    }
+}
+
+/// B1 (in-process: the stack's service predates the fix): HTML after 600 spaces, or after a
+/// UTF-8 BOM and whitespace, declared as `image/png` into an `image/*` bucket is 415 as a
+/// single upload and as part 1 alike; nothing is stored.
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_multipart_padded_html_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name, allowed_mime_types) VALUES ('images', ARRAY['image/*']); COMMIT;").await;
+        let (base, token) = in_process_storage(Arc::new(FailingStore::default()), fx.main).await;
+        let html: &[u8] = b"<!DOCTYPE html><html><script>alert(1)</script></html>";
+        let mut spaces = vec![b' '; 600];
+        spaces.extend_from_slice(html);
+        let mut bom = b"\xef\xbb\xbf".to_vec();
+        bom.extend(std::iter::repeat_n(b' ', 600));
+        bom.extend_from_slice(html);
+        let png = [("content-type", "image/png")];
+        for (i, padded) in [spaces, bom].into_iter().enumerate() {
+            let (status, b) = raw(&base, &token, "POST", &format!("/storage/v1/object/images/pad{i}.png"), padded.clone(), &png).await;
+            assert_eq!(status, 415, "case {i}, single: {}", json_of(&b));
+            let (status, b) = raw(&base, &token, "POST", &format!("/storage/v1/upload/images/part{i}.png"), vec![], &png).await;
+            assert_eq!(status, 200, "{}", json_of(&b));
+            let id = json_of(&b)["id"].as_str().unwrap().to_string();
+            let (status, b) = raw(&base, &token, "PUT", &format!("/storage/v1/upload/session/{id}/1"), padded, &[]).await;
+            assert_eq!(status, 415, "case {i}, part 1: {}", json_of(&b));
+        }
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+    }))
+    .await;
+}
+
+/// S2 (in-process): a body that stops sending, a part's or a single upload's, fails with 408
+/// `request_timeout` within the idle period and frees its share of the upload memory; nothing
+/// is stored. A slow body whose chunks each come within the period, though it takes several
+/// periods in all, is stored whole.
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_multipart_stalled_body_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let cap = storage::limits::InFlight::new(150 * MIB).with_body_idle(Duration::from_secs(1));
+        let (base, token) = in_process_storage_with(Arc::new(FailingStore::default()), fx.main, cap.clone()).await;
+        let stalling = || {
+            let first = futures_util::stream::once(async { Ok::<_, std::io::Error>(bytes::Bytes::from(vec![1u8; 64 * 1024])) });
+            reqwest::Body::wrap_stream(first.chain(futures_util::stream::pending()))
+        };
+        let (status, b) = raw(&base, &token, "POST", "/storage/v1/upload/files/stall.bin", vec![], &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let id = json_of(&b)["id"].as_str().unwrap().to_string();
+        let within = Duration::from_secs(20);
+        for path in [format!("/storage/v1/upload/session/{id}/1"), "/storage/v1/object/files/stall.bin".to_owned()] {
+            let started = Instant::now();
+            let got = streamed(&base, &token, if path.contains("/session/") { "PUT" } else { "POST" }, &path, stalling(), within).await;
+            let (status, b) = got.unwrap_or_else(|| panic!("{path}: still waiting after {within:?}"));
+            assert_eq!((status, b["error"]["code"].clone()), (408, json!("request_timeout")), "{path}: {b}");
+            assert!(started.elapsed() < Duration::from_secs(10), "{path}: {:?}", started.elapsed());
+            assert_eq!(cap.available(), 150 * MIB, "{path}: the reservation is still held");
+        }
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        // Slow but live: 8 chunks 400 ms apart (3.2 s in all, the period 1 s).
+        let (status, b) = streamed(&base, &token, "PUT", &format!("/storage/v1/upload/session/{id}/1"), paced_body(512 * 1024, 3, Duration::from_millis(400), None), within).await.unwrap();
+        assert_eq!((status, b["size"].clone()), (200, json!(512 * 1024)), "{b}");
+        assert_eq!(raw(&base, &token, "DELETE", &format!("/storage/v1/upload/session/{id}"), vec![], &[]).await.0, 204);
+    }))
+    .await;
+}
+
+/// N2 (in-process): a version-6 `storage.upload_sessions` made before the sessions were bound
+/// to the data key (no `key_id`) is healed by the bootstrap: the column is added, `NOT NULL`,
+/// and a session opens.
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_multipart_keyless_sessions_healed_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let column = "SELECT count(*) || ' ' || coalesce(bool_and(attnotnull)::text, '-') FROM pg_attribute WHERE attrelid = 'storage.upload_sessions'::regclass AND attname = 'key_id' AND NOT attisdropped";
+        assert_eq!(fx.value(column).await, "1 true");
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_admin; ALTER TABLE storage.upload_sessions DROP COLUMN key_id; COMMENT ON SCHEMA storage IS 'chelabase storage schema 6'; COMMIT;").await;
+        assert_eq!(fx.value(column).await, "0 -");
+        bootstrap(fx).await;
+        assert_eq!(fx.value("SELECT obj_description('storage'::regnamespace, 'pg_namespace')").await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_eq!(fx.value(column).await, "1 true");
+        let (base, token) = in_process_storage(Arc::new(FailingStore::default()), fx.main).await;
+        let (status, b) = raw(&base, &token, "POST", "/storage/v1/upload/files/healed.bin", vec![], &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+    }))
+    .await;
+}
+
+/// S1 (decided): `storage.upload_sessions` is nothing to the API's roles; the database owner
+/// (trusted, with `pg_read_all_data` / `pg_write_all_data`) reads and deletes any caller's
+/// sessions but never forges or rewrites one, nor does storage rebind one. Deleting a session
+/// only cancels its upload (404 after), never a stored object. Pinned, so a change is deliberate.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_multipart_sessions_access_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        assert_eq!(object("POST", "/storage/v1/object/files/kept.txt", &secret, Some(b"kept".to_vec().into()), &[("content-type", "text/plain")]).await.0, 200);
+        let (status, b) = open_upload(&secret, "files", "s.bin", "application/octet-stream", &[]).await;
+        assert_eq!(status, 200, "{b}");
+        let id = b["id"].as_str().unwrap().to_string();
+        for role in ["anon", "authenticated", "authenticator"] {
+            for st in ["SELECT 1 FROM storage.upload_sessions", "DELETE FROM storage.upload_sessions", "UPDATE storage.upload_sessions SET parts = '{}'", "SELECT storage.record_part(gen_random_uuid(), 1, 1, 'x')"] {
+                assert_eq!(fx.code(role, st).await, "42501", "{role}: {st}");
+            }
+        }
+        let forge = format!("INSERT INTO storage.upload_sessions SELECT gen_random_uuid(), bucket_id, name, version_id, upload_id, content_type, upsert, datoid, caller_role, owner, key_id, parts, timeline_id, expires_at FROM storage.upload_sessions WHERE id = '{id}'");
+        let got = [
+            fx.code(OWNER, "SELECT count(*) FROM storage.upload_sessions").await,
+            fx.code(OWNER, &forge).await,
+            fx.code(OWNER, &format!("UPDATE storage.upload_sessions SET parts = '{{}}' WHERE id = '{id}'")).await,
+            fx.code("chelabase_storage", &format!("UPDATE storage.upload_sessions SET caller_role = 'anon' WHERE id = '{id}'")).await,
+            fx.code(OWNER, &format!("DELETE FROM storage.upload_sessions WHERE id = '{id}'")).await,
+        ];
+        assert_eq!(got, ["ok", "CB004", "CB004", "22023", "ok"], "[select, forge, rewrite, rebind, delete]");
+        fx.as_role_commit(OWNER, &format!("DELETE FROM storage.upload_sessions WHERE id = '{id}'")).await;
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_sessions").await, "0");
+        assert_eq!(put_part(&secret, &id, 1, b"late".to_vec(), &[]).await.0, 404);
+        let (status, _, kept) = object("GET", "/storage/v1/object/files/kept.txt", &secret, None, &[]).await;
+        assert_eq!((status, &kept[..]), (200, &b"kept"[..]));
+    }))
+    .await;
+}
+
+/// The audit's: two completions of one session at once: exactly one wins, the other is 409,
+/// the object is whole and no session is left. Repeated to give the race a chance.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_multipart_concurrent_complete_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'")]).await;
+        for round in 0..4 {
+            let name = format!("race{round}.bin");
+            let up = if round % 2 == 1 { vec![("x-upsert", "true")] } else { vec![] };
+            let (s, b) = open_upload(&secret, "files", &name, "application/octet-stream", &up).await;
+            assert_eq!(s, 200, "{b}");
+            let id = b["id"].as_str().unwrap().to_string();
+            assert_eq!(put_part(&secret, &id, 1, part_bytes(1), &[]).await.0, 200);
+            assert_eq!(put_part(&secret, &id, 2, b"tail".to_vec(), &[]).await.0, 200);
+            let (a, c) = tokio::join!(session_call(&secret, "POST", &id, "/complete", &[]), session_call(&secret, "POST", &id, "/complete", &[]));
+            // The loser is 409 when it got past the lookup, 404 when the winner had already
+            // deleted the session.
+            let mut st = [(a.0, a.1["error"]["code"].clone()), (c.0, c.1["error"]["code"].clone())];
+            st.sort_by_key(|x| x.0);
+            assert_eq!(st[0].0, 200, "round {round}: {} / {}", a.1, c.1);
+            assert!(matches!(&st[1], (409, v) if v == "conflict") || matches!(&st[1], (404, v) if v == "upload_not_found"), "round {round}: {} / {}", a.1, c.1);
+            let (s, _, got) = object("GET", &format!("/storage/v1/object/files/{name}"), &secret, None, &[]).await;
+            let mut want = part_bytes(1);
+            want.extend_from_slice(b"tail");
+            assert!(s == 200 && got[..] == want[..], "round {round}: {s}, {} bytes", got.len());
+        }
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_sessions").await, "0");
+    }))
+    .await;
+}
+
+/// The audit's, AC 2 on counted bytes: a chunked single upload (no `Content-Length`) over the
+/// limit is 413, and parts sent in parallel that each fit but together don't make a 413
+/// completion; no row, no blob.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_multipart_counted_limits_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
+        let store = object_store().await;
+        fx.admin("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name, file_size_limit) VALUES ('mib', 1048576), ('eight', 8388608); COMMIT;").await;
+        let chunks: Vec<Result<bytes::Bytes, std::io::Error>> = (0..8).map(|_| Ok(bytes::Bytes::from(vec![7u8; 256 << 10]))).collect();
+        let (s, _, b) = object("POST", "/storage/v1/object/mib/chunked.bin", &secret, Some(reqwest::Body::wrap_stream(futures_util::stream::iter(chunks))), &[]).await;
+        assert_eq!(s, 413, "{}", json_of(&b));
+        let (_, b) = open_upload(&secret, "eight", "par.bin", "application/octet-stream", &[]).await;
+        let id = b["id"].as_str().unwrap().to_string();
+        let (p1, p2) = tokio::join!(put_part(&secret, &id, 1, part_bytes(1), &[]), put_part(&secret, &id, 2, part_bytes(2), &[]));
+        let (s, b) = session_call(&secret, "POST", &id, "/complete", &[]).await;
+        assert_eq!((s, b["error"]["code"].clone()), (413, json!("too_large")), "parts {} {}: {b}", p1.0, p2.0);
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects").await, "0");
+        assert!(fx.blobs(&store).await.is_empty(), "{:?}", fx.blobs(&store).await);
+    }))
+    .await;
+}

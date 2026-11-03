@@ -46,7 +46,10 @@
 //!   alone, like the tickets: `guard_sessions` lets only [`STORAGE_ROLE`] write them, stamps
 //!   the timeline, caps them at 24 hours and lets an update change only the parts (and bring
 //!   the expiry closer). A session vouches for nothing: completing one mints a ticket and
-//!   writes the row as the caller, so row level security decides again.
+//!   writes the row as the caller, so row level security decides again. The database owner
+//!   is trusted here: with `pg_read_all_data` and `pg_write_all_data` it reads every caller's
+//!   sessions and may delete them (decided in the m7 audit, S1). Deleting a session only
+//!   cancels its upload (its parts are the sweeper's); it never changes a stored object.
 //! - A write-once bucket (`storage.buckets.write_once`, m7) is enforced here, so no role is
 //!   exempt, the owner and storage's own included: `guard_buckets` never lets `write_once`
 //!   go back to false and keeps the name of a write-once bucket holding objects (its public
@@ -313,6 +316,13 @@ CREATE TABLE IF NOT EXISTS storage.upload_sessions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE storage.upload_sessions OWNER TO chelabase_admin;
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_attribute WHERE attrelid OPERATOR(pg_catalog.=) 'storage.upload_sessions'::pg_catalog.regclass
+      AND attname OPERATOR(pg_catalog.=) 'key_id' AND NOT attisdropped) THEN
+    DELETE FROM storage.upload_sessions;
+  END IF;
+END $$;
+ALTER TABLE storage.upload_sessions ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;
 ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS write_once boolean NOT NULL DEFAULT false;
 ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
 DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
@@ -2092,6 +2102,9 @@ mod tests {
         }
         for part in [
             "ALTER TABLE storage.upload_sessions OWNER TO chelabase_admin;",
+            // N2: a version-6 table from before the key binding gains the column; its
+            // sessions (unbound, so unusable) go.
+            "AND attname OPERATOR(pg_catalog.=) 'key_id' AND NOT attisdropped) THEN\n    DELETE FROM storage.upload_sessions;\n  END IF;\nEND $$;\nALTER TABLE storage.upload_sessions ADD COLUMN IF NOT EXISTS key_id uuid NOT NULL;",
             "ALTER TABLE storage.upload_sessions DISABLE ROW LEVEL SECURITY;",
             "ALTER TABLE storage.upload_sessions ENABLE TRIGGER ALL;",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.upload_sessions TO chelabase_storage;",
