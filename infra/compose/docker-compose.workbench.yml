@@ -828,6 +828,7 @@ services:
       # chelabase-identity's live tests call as auth, and as the worker for pool routes.
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/auth-identity.token
       - CHELABASE_IDENTITY_WORKER_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/worker-identity.token
+      - CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
     group_add: ["${CHELABASE_DOCKER_GID}"]
     # The static address is in the member-login rule's address list. On the compute network:
     # live tests dial computes like the services do.
