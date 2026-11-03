@@ -26,7 +26,7 @@ These come from the management API, the login API (the dashboard sign-in and app
 | 422 | `invalid_request` | The body is JSON but has the wrong fields, a field is missing or out of range, or a name is invalid. |
 | 401 | `unauthorized` | No credential, or a bad token or key. |
 | 403 | `tenant_not_bound` | The caller's organization isn't bound to a Chelabase tenant. |
-| 409 | `tenant_required` | Sign-in or `/auth/v1/token` for a member of several tenants with no `?tenant=`. Sent only after correct credentials; `error.tenants` lists the choices. |
+| 409 | `tenant_required` | Sign-in (`/auth/v1/sign-in`) for a member of several tenants with no `?tenant=`. Sent only after correct credentials; `error.tenants` lists the choices. |
 | 403 | `forbidden` | The `tenant_id` in the body isn't the caller's tenant. |
 | 404 | `not_found` | The resource doesn't exist, or belongs to another tenant (both answer the same). The gateway also answers `not_found` for an unknown host or route. |
 | 405 | `method_not_allowed` | The gateway has no handler for this method on this path; the `Allow` header lists the methods it has. |
