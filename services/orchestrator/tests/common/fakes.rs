@@ -620,6 +620,13 @@ impl MetadataPort for FakeMetadata {
         Ok(self.tenants_by_org.lock().unwrap().get(zitadel_org_id).copied())
     }
 
+    /// #119: a tenant exists once it is bound to an org, has members or has an overview.
+    async fn tenant_exists(&self, tenant: TenantId) -> Result<bool, MetadataError> {
+        Ok(self.tenants_by_org.lock().unwrap().values().any(|t| *t == tenant)
+            || self.members.lock().unwrap().iter().any(|m| m.tenant_id == tenant)
+            || self.overviews.lock().unwrap().contains_key(&tenant))
+    }
+
     async fn insert_database_pending(
         &self,
         _database_id: DatabaseId,
@@ -2836,6 +2843,69 @@ async fn spawn_app_core(
     oidc: chelabase_auth::ZitadelAuthConfig,
     identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None)
+        .await
+}
+
+/// #119: an app whose realtime routes also take member tokens checked by `members`.
+#[allow(dead_code)]
+async fn spawn_app_member_tokens(
+    metadata: FakeMetadata,
+    mode: Mode,
+    members: chelabase_auth::member_token::MemberTokenVerifier,
+) -> TestApp {
+    spawn_app_core_with(
+        metadata,
+        FakeJobs::default(),
+        "http://127.0.0.1:9",
+        mode,
+        10,
+        None,
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        None,
+        None,
+        unused_oidc(),
+        None,
+        Some(members),
+    )
+    .await
+}
+
+/// #119: an app whose platform operator tenant (`CHELABASE_OPERATOR_TENANT_ID`) is `tenant`.
+#[allow(dead_code)]
+async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: Option<TenantId>) -> TestApp {
+    spawn_app_core_with(
+        metadata,
+        FakeJobs::default(),
+        "http://127.0.0.1:9",
+        mode,
+        10,
+        None,
+        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
+        None,
+        None,
+        unused_oidc(),
+        tenant,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn spawn_app_core_with(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    cap: u32,
+    zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    operator_org: Option<&str>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
+    oidc: chelabase_auth::ZitadelAuthConfig,
+    operator_tenant: Option<TenantId>,
+    member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
+) -> TestApp {
     let rt_events = FakeRtEvents::default();
     // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in
     // `main.rs`).
@@ -2857,6 +2927,7 @@ async fn spawn_app_core(
         },
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
         operator_org: operator_org.map(str::to_string),
+        operator_tenant,
         proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
@@ -2871,6 +2942,7 @@ async fn spawn_app_core(
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: REALTIME_TOKEN.into(),
             verifier: chelabase_auth::JwtVerifier::new(oidc),
+            member: member_tokens,
         },
         rt_events: Arc::new(rt_events.clone()),
         proxy_cache: Arc::new(cache.clone()),

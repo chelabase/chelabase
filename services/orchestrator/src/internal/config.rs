@@ -334,10 +334,48 @@ pub fn metadata_config(
     Ok(chelabase_metadata::MetadataConfig { database_url })
 }
 
+/// `CHELABASE_OPERATOR_TENANT_ID` (#119): the tenant whose members, signed in with a member
+/// token, are instance admins in platform mode. Unset or blank is `None`; anything but a
+/// tenant id refuses to start. `CHELABASE_OPERATOR_ORG_ID` stays for Zitadel tokens until m13.
+pub fn operator_tenant(get: impl Fn(&str) -> Option<String>) -> Result<Option<chelabase_types::TenantId>> {
+    const NAME: &str = "CHELABASE_OPERATOR_TENANT_ID";
+    let Some(raw) = get(NAME).map(|v| v.trim().to_string()).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    let id: uuid::Uuid = raw.parse().map_err(|_| anyhow!("{NAME} is not a tenant id (a UUID)"))?;
+    if id.is_nil() {
+        return Err(anyhow!("{NAME} is the nil UUID"));
+    }
+    Ok(Some(chelabase_types::TenantId(id)))
+}
+
+/// The member-token verifier (#119): `CHELABASE_MEMBER_JWT_PUBLIC_KEY` with the auth host's
+/// issuer. `None` when the key is unset: every member token is then refused.
+pub fn member_tokens(
+    get: impl Fn(&str) -> Option<String>,
+) -> Result<Option<chelabase_auth::member_token::MemberTokenVerifier>> {
+    chelabase_auth::member_token::MemberTokenVerifier::from_lookup(get).map_err(|e| anyhow!(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chelabase_neon::jwt::{PRIVATE_KEY_FILE, PUBLIC_KEY_FILE};
+
+    #[test]
+    fn operator_tenant_is_a_tenant_id_or_nothing() {
+        let with = |v: &'static str| move |n: &str| (n == "CHELABASE_OPERATOR_TENANT_ID").then(|| v.to_string());
+        assert_eq!(operator_tenant(|_| None).unwrap(), None);
+        assert_eq!(operator_tenant(with("  ")).unwrap(), None);
+        let id = uuid::Uuid::new_v4();
+        let raw: &'static str = Box::leak(id.to_string().into_boxed_str());
+        assert_eq!(operator_tenant(with(raw)).unwrap(), Some(chelabase_types::TenantId(id)));
+        for bad in ["ops-org", "00000000-0000-0000-0000-000000000000"] {
+            let err = operator_tenant(with(bad)).unwrap_err().to_string();
+            assert!(err.contains("CHELABASE_OPERATOR_TENANT_ID"), "{err}");
+            assert!(!err.contains("ops-org"), "{err}");
+        }
+    }
 
     // m5 fix round: no fixed development credential outside the workbench. An unset (or blank)
     // CHELABASE_METADATA_DATABASE_URL is a startup error naming it, never a fallback to

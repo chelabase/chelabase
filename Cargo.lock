@@ -299,6 +299,7 @@ dependencies = [
  "axum",
  "chelabase-auth",
  "chelabase-http",
+ "chelabase-identity",
  "chelabase-query",
  "chelabase-routes",
  "chelabase-secrets",

@@ -124,6 +124,17 @@ pub(crate) fn proxy_host(endpoint_id: &str, domain: &str) -> String {
 /// in-memory fake instead of a real Postgres-backed `MetadataClient`. The member API's reads
 /// and writes are [`members::MembersPort`].
 pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
+    /// Whether the tenant exists (#119: a member token's `tid` names one that may be gone).
+    fn tenant_exists(&self, tenant: TenantId) -> impl Future<Output = Result<bool, MetadataError>> + Send {
+        async move {
+            match self.open_signup(tenant).await {
+                Ok(_) => Ok(true),
+                Err(MetadataError::TenantNotFound(_)) => Ok(false),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
     fn get_tenant_by_zitadel_org_id(
         &self,
         zitadel_org_id: &str,
@@ -1785,6 +1796,9 @@ pub struct AppState<M, J> {
     /// `CHELABASE_OPERATOR_ORG_ID`: in platform mode, members of this Zitadel org are instance
     /// admins. `None` (unset or blank) means nobody is.
     pub operator_org: Option<String>,
+    /// `CHELABASE_OPERATOR_TENANT_ID` (#119): in platform mode, members of this tenant who come
+    /// with a member token are instance admins. `None` means nobody is that way.
+    pub operator_tenant: Option<TenantId>,
     /// Where the dev proxy's CA certificate is (`CHELABASE_PROXY_CA_FILE`); self-hosted only.
     pub proxy_ca_file: String,
     /// `CHELABASE_BRANCH_DATA_API_DATABASE_CAP`: databases a branch serves, main included.
@@ -1880,6 +1894,9 @@ impl RestInternal {
 struct Caller {
     sub: String,
     org_id: String,
+    /// A member token's tenant (`tid`, #119); then `org_id` is empty. `None` on the Zitadel
+    /// path, which finds the tenant by org.
+    tenant_id: Option<TenantId>,
     request_id: String,
     /// The token's email and name claims, when it carries them.
     email: Option<String>,
@@ -1913,6 +1930,7 @@ where
         Ok(Caller {
             sub: claims.sub,
             org_id: claims.org_id,
+            tenant_id: claims.tenant_id.map(TenantId),
             request_id: claims.rid,
             email: claims.email,
             name: claims.name,
@@ -1956,6 +1974,20 @@ async fn resolve_member<M: MetadataPort, J>(
         error!("resolve member: {err}");
         ApiError::internal()
     };
+    // #119: a member token's tenant only names where to look. The membership must already be
+    // there: no admission, no first-member admin claim, no invite activation, no claim refresh.
+    // A tenant that is gone is 401 (the token is stale); no row is `None` (403 downstream).
+    if caller.tenant_id.is_some() {
+        let member = state
+            .metadata
+            .member_by_identity_user(tenant, &caller.sub)
+            .await
+            .map_err(failed)?;
+        if member.is_none() && !state.metadata.tenant_exists(tenant).await.map_err(failed)? {
+            return Err(tenant_unknown());
+        }
+        return Ok(member);
+    }
     let auto_create = state.policy.auto_create_members();
     // Both claims at hand: `admit_member` reads, refreshes or makes the row in one go.
     if auto_create && let (Some(email), Some(name)) = (&caller.email, &caller.name) {
@@ -2071,6 +2103,38 @@ fn in_operator_org<M, J>(state: &AppState<M, J>, org_id: &str) -> bool {
     state.operator_org.as_deref().is_some_and(|org| !org.is_empty() && org == org_id)
 }
 
+/// Whether `member`, the row a member token's `tid` led to, makes its caller an operator:
+/// `tenant` is the operator tenant and the membership is active. `tid` alone is never enough.
+fn is_operator_member<M, J>(state: &AppState<M, J>, tenant: TenantId, member: Option<&MemberRecord>) -> bool {
+    state.operator_tenant == Some(tenant) && member.is_some_and(MemberRecord::in_good_standing)
+}
+
+/// Whether the caller is in the operator's tenant (member token, with `member`, its row there)
+/// or org (Zitadel token): each path reads only its own setting.
+fn caller_is_operator<M, J>(state: &AppState<M, J>, caller: &Caller, member: Option<&MemberRecord>) -> bool {
+    match caller.tenant_id {
+        Some(tenant) => is_operator_member(state, tenant, member),
+        None => in_operator_org(state, &caller.org_id),
+    }
+}
+
+/// The caller's tenant: a member token's `tid` (whose membership [`resolve_member`] then
+/// requires), else the tenant bound to the Zitadel org.
+async fn caller_tenant<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    caller: &Caller,
+) -> Result<Option<TenantId>, ApiError> {
+    match caller.tenant_id {
+        Some(tenant) => Ok(Some(tenant)),
+        None => lookup_tenant(state, &caller.org_id).await.map_err(|_| ApiError::internal()),
+    }
+}
+
+/// #119: a member token's tenant no longer exists.
+fn tenant_unknown() -> ApiError {
+    ApiError::unauthorized("the token's tenant no longer exists; sign in again")
+}
+
 /// A caller allowed on an `Instance` route. Checked before the tenant binding (ruling R19): in
 /// platform mode a member of the operator org passes whether or not the org is a tenant's.
 /// Anyone else needs a bound org (else `tenant_not_bound`) and, self-hosted, to be an active
@@ -2098,7 +2162,12 @@ where
     ) -> Result<Self, Self::Rejection> {
         use chelabase_types::access::{decide, Access, CallerFacts};
         let caller = Caller::from_request_parts(parts, state).await?;
-        let operator = in_operator_org(state, &caller.org_id);
+        // A member token's row comes first: the operator check needs it.
+        let token_member = match caller.tenant_id {
+            Some(tenant) => Some(resolve_member(state, tenant, &caller).await?),
+            None => None,
+        };
+        let operator = caller_is_operator(state, &caller, token_member.as_ref().and_then(Option::as_ref));
         if state.policy.instance_admin(false, operator) {
             return Ok(InstancePrincipal {
                 sub: caller.sub,
@@ -2108,11 +2177,11 @@ where
                 member: None,
             });
         }
-        let tenant_id = lookup_tenant(state, &caller.org_id)
-            .await
-            .map_err(|_| ApiError::internal())?
-            .ok_or_else(tenant_not_bound)?;
-        let member = resolve_member(state, tenant_id, &caller).await?;
+        let tenant_id = caller_tenant(state, &caller).await?.ok_or_else(tenant_not_bound)?;
+        let member = match token_member {
+            Some(member) => member,
+            None => resolve_member(state, tenant_id, &caller).await?,
+        };
         let facts = CallerFacts { member: access::member_facts(member.as_ref()), in_operator_org: operator };
         decide(&state.policy, &facts, None, None, None, None, Access::Instance).map_err(access::deny_to_api)?;
         Ok(InstancePrincipal {
@@ -2145,9 +2214,8 @@ where
         state: &Arc<AppState<M, J>>,
     ) -> Result<Self, Self::Rejection> {
         let caller = Caller::from_request_parts(parts, state).await?;
-        let tenant_id = lookup_tenant(state, &caller.org_id)
-            .await
-            .map_err(|_| ApiError::internal())?
+        let tenant_id = caller_tenant(state, &caller)
+            .await?
             .ok_or_else(|| {
                 ApiError::new(
                     403,
@@ -2158,7 +2226,7 @@ where
 
         let member = resolve_member(state, tenant_id, &caller).await?;
         Ok(AuthPrincipal {
-            in_operator_org: in_operator_org(state, &caller.org_id),
+            in_operator_org: caller_is_operator(state, &caller, member.as_ref()),
             sub: caller.sub,
             org_id: caller.org_id,
             tenant_id,
@@ -2187,6 +2255,27 @@ pub(crate) async fn read_only_principal<M: MetadataPort, J>(
         request_id: Uuid::new_v4().to_string(),
         member,
         in_operator_org: in_operator_org(state, &claims.org_id),
+    }))
+}
+
+/// #119: [`read_only_principal`] for a verified member token: the tenant its `tid` names, when
+/// it exists (`None` otherwise), and the member row as it is.
+pub(crate) async fn read_only_member_principal<M: MetadataPort, J>(
+    state: &AppState<M, J>,
+    claims: &chelabase_auth::member_token::MemberClaims,
+) -> Result<Option<AuthPrincipal>, MetadataError> {
+    let tenant_id = TenantId(claims.tid);
+    let member = state.metadata.member_by_identity_user(tenant_id, &claims.sub).await?;
+    if member.is_none() && !state.metadata.tenant_exists(tenant_id).await? {
+        return Ok(None);
+    }
+    Ok(Some(AuthPrincipal {
+        sub: claims.sub.clone(),
+        org_id: String::new(),
+        tenant_id,
+        request_id: Uuid::new_v4().to_string(),
+        in_operator_org: is_operator_member(state, tenant_id, member.as_ref()),
+        member,
     }))
 }
 
@@ -2645,7 +2734,7 @@ where
         error!("{what}: {err}");
         ApiError::internal()
     };
-    let tenant_id = lookup_tenant(state, &caller.org_id).await.map_err(|_| ApiError::internal())?;
+    let tenant_id = caller_tenant(state, &caller).await?;
     let member = match tenant_id {
         Some(tenant) => resolve_member(state, tenant, &caller).await?,
         None => None,
@@ -2653,7 +2742,7 @@ where
     // D7: an offboarded member is told who they are, with nothing to use.
     let active = member.as_ref().filter(|m| m.in_good_standing());
     let tenant_admin = active.is_some_and(|m| m.tenant_admin);
-    let instance_admin = state.policy.instance_admin(tenant_admin, in_operator_org(state, &caller.org_id));
+    let instance_admin = state.policy.instance_admin(tenant_admin, caller_is_operator(state, &caller, member.as_ref()));
 
     // The projects the caller may use: all of them for a tenant admin, else their grants.
     let projects = match (tenant_id, active) {

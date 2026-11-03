@@ -81,6 +81,11 @@ pub struct InternalClaims {
     pub exp: u64,
     pub sub: String,
     pub org_id: String,
+    /// The member's tenant, from a member token's `tid` (#119); then `org_id` is empty.
+    /// `None` for a Zitadel token, a data key, and tokens minted before it existed. Until m13
+    /// removes `org_id`, a consumer that binds a member to a tenant reads this first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<Uuid>,
     pub auth: AuthMethod,
     /// Gateway request id, for following one request across services.
     pub rid: String,
@@ -124,7 +129,34 @@ impl InternalSigner {
         identity: &Identity,
         issued_at: u64,
     ) -> Result<String, AuthError> {
+        self.sign_claims(audience, identity, None, issued_at)
+    }
+
+    /// Sign for a member whose token named `tenant` (`tid`, #119). `identity.org_id` must be
+    /// empty: a token never carries both a tenant and a Zitadel org.
+    pub fn sign_for_tenant(
+        &self,
+        audience: &str,
+        identity: &Identity,
+        tenant: Uuid,
+    ) -> Result<String, AuthError> {
+        if !identity.org_id.is_empty() || tenant.is_nil() {
+            return Err(AuthError::Config(
+                "a member identity names a tenant and no Zitadel org".into(),
+            ));
+        }
+        self.sign_claims(audience, identity, Some(tenant), now_secs())
+    }
+
+    fn sign_claims(
+        &self,
+        audience: &str,
+        identity: &Identity,
+        tenant_id: Option<Uuid>,
+        issued_at: u64,
+    ) -> Result<String, AuthError> {
         let claims = InternalClaims {
+            tenant_id,
             iss: INTERNAL_ISSUER.to_string(),
             aud: audience.to_string(),
             iat: issued_at,
@@ -174,9 +206,14 @@ impl InternalVerifier {
         validation.set_audience(&[audience]);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.leeway = LEEWAY_SECS;
-        decode::<InternalClaims>(token, &self.key, &validation)
+        let claims = decode::<InternalClaims>(token, &self.key, &validation)
             .map(|data| data.claims)
-            .map_err(|e| AuthError::InvalidToken(e.to_string()))
+            .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
+        // #119: a member names a tenant or a Zitadel org, never both, never a nil tenant.
+        if claims.tenant_id.is_some_and(|t| t.is_nil() || !claims.org_id.is_empty()) {
+            return Err(AuthError::InvalidToken("an identity names both a tenant and an org".into()));
+        }
+        Ok(claims)
     }
 }
 

@@ -33,6 +33,12 @@ async fn main() -> anyhow::Result<()> {
     let identity = InternalVerifier::from_env().expect("internal identity verify key");
     let entry = chelabase_types::entry::Entry::from_env().map_err(anyhow::Error::new)?;
     let internal_config = InternalConfig::from_env()?;
+    // #119: member tokens signed by auth, and the platform operator's tenant for them.
+    let member_tokens = orchestrator::internal::config::member_tokens(|name| std::env::var(name).ok())?;
+    if member_tokens.is_none() {
+        warn!("CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set: realtime refuses every member token");
+    }
+    let operator_tenant = orchestrator::internal::config::operator_tenant(|name| std::env::var(name).ok())?;
     // Unset is a startup error (P13); empty means no address rule.
     let member_logins = internal_config.member_logins()?;
     let realtime_logins = internal_config.realtime_logins()?;
@@ -151,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
             token: internal_config.realtime_token.clone(),
             // The gateway's settings (issuer, JWKS URL), the same env names.
             verifier: chelabase_auth::JwtVerifier::from_env()?,
+            member: member_tokens.clone(),
         },
         rt_events,
         proxy_cache,
@@ -164,6 +171,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty()),
+        operator_tenant,
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
         locator: Arc::new(DockerLocator::connect(

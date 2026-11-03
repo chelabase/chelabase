@@ -128,6 +128,7 @@ fn the_ticket_key_comes_from_its_file() {
     let id = realtime::ticket::TicketIdentity {
         sub: "s".into(),
         org_id: "o".into(),
+        tenant_id: None,
         auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
         email: None,
         name: None,

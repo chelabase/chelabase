@@ -220,6 +220,8 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         signup_gate: None,
         used_tickets: Default::default(),
         admin: None,
+        member_tokens: None,
+        identity: None,
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

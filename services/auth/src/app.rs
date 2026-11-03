@@ -63,6 +63,12 @@ pub struct AppState {
     /// Zitadel with the admin token (from the admin PAT, independent of the app keys), which
     /// accept-invite needs; `None` makes it answer 503 before spending a code.
     pub admin: Option<Zitadel>,
+    /// #119: the member-token signer (`CHELABASE_MEMBER_JWT_*`); `None` signs none. m8's
+    /// `/auth/v1/token` mints with it.
+    pub member_tokens: Option<crate::member_token::MemberTokens>,
+    /// #119: the identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`);
+    /// later milestones move sign-in and sessions onto it.
+    pub identity: Option<chelabase_identity::Identity>,
 }
 
 type S = State<Arc<AppState>>;

@@ -130,6 +130,9 @@ pub struct Config {
     /// replication session logs in with, and the `ca.crt` it verifies the compute against; the
     /// worker writes and renews it.
     pub realtime_tls_dir: PathBuf,
+    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (#119): auth's member-token public key, checked against
+    /// the same issuer as the OIDC settings. `None`: every member token is refused.
+    pub member_jwt_public_key: Option<PathBuf>,
 }
 
 fn default_addr() -> SocketAddr {
@@ -187,6 +190,7 @@ impl Config {
             max_slots_per_compute: 10,
             compute_ca: None,
             realtime_tls_dir: PathBuf::new(),
+            member_jwt_public_key: None,
         }
     }
 
@@ -285,6 +289,9 @@ impl Config {
             max_slots_per_compute,
             compute_ca: get("CHELABASE_COMPUTE_CA_FILE").map(PathBuf::from),
             realtime_tls_dir: PathBuf::from(realtime_tls_dir),
+            member_jwt_public_key: get("CHELABASE_MEMBER_JWT_PUBLIC_KEY")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| PathBuf::from(v.trim())),
         })
     }
 }
