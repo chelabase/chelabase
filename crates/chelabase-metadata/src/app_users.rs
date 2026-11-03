@@ -482,6 +482,26 @@ impl MetadataClient {
         Ok(deleted == 1)
     }
 
+    /// Records (`Some`) or clears (`None`) the worker's last reconcile error on an `enabled`
+    /// row: a pool gone from the identity service, a branch it can't upgrade. Only an
+    /// `enabled` row: an enable's own outcome ends `enabling`, and a `failed` row keeps the
+    /// enable's error. A row already holding the value is left alone.
+    pub async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        sqlx::query(
+            "UPDATE project_auth SET error = $2, updated_at = now()
+             WHERE project_id = $1 AND status = 'enabled' AND error IS DISTINCT FROM $2",
+        )
+        .bind(project.as_uuid())
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
         sqlx::query(
             "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
