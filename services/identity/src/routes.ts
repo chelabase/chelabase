@@ -274,6 +274,8 @@ const ROUTES: readonly Route[] = [
     method: "DELETE",
     rest: [],
     async handle({ registry, pool }) {
+      // The members pool holds every member's account: no caller may drop it.
+      if (pool.name === "members") throw new HttpError(403, "forbidden", "the members pool is never dropped");
       await registry.dropPool(pool);
       return { status: 204 };
     },

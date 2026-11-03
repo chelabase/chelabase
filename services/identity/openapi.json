@@ -78,7 +78,8 @@
           "403": {
             "$ref": "#/components/responses/Error"
           }
-        }
+        },
+        "description": "`members` is never dropped: 403 `forbidden` for every caller."
       }
     },
     "/internal/v1/pools/{pool}/users": {
