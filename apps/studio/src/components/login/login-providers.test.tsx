@@ -7,7 +7,7 @@ import { useResendCode } from "@/lib/login-client/generated/endpoints";
 import { fakeFetch, jsonResponse } from "@/test/fake-fetch";
 import { LoginProviders } from "./login-providers";
 
-const env = { issuer: "i", clientId: "c", projectId: "p", orgId: "o", apiUrl: "http://gateway.test" };
+const env = { apiUrl: "http://gateway.test", studioHost: "studio.test" };
 
 function Probe() {
   const resend = useResendCode();

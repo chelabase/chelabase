@@ -1,10 +1,10 @@
-import { configureManagementClient } from "@chelabase/management-client";
-import { QueryClientProvider } from "@tanstack/react-query";
-import { Outlet, createFileRoute } from "@tanstack/react-router";
-import { useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { useAuth, type AuthContextProps } from "react-oidc-context";
+import { ApiError, configureManagementClient, useGetMe } from "@chelabase/management-client";
+import { QueryClientProvider, type QueryClient } from "@tanstack/react-query";
+import { Outlet, createFileRoute, useNavigate } from "@tanstack/react-router";
+import { useEffect, useMemo, useState } from "react";
 import { SignedInApp } from "@/components/app-shell/signed-in-app";
 import { SignInError } from "@/components/sign-in-error";
+import { Button } from "@/components/ui/button";
 import { AccessTokenContext } from "@/lib/access-token";
 import { useRegisterDevtoolsQueryClient } from "@/lib/devtools-query-client";
 import { AppSessionContext, type AppSession } from "@/lib/app-session";
@@ -12,31 +12,32 @@ import { createStudioQueryClient } from "@/lib/query";
 import { signOut } from "@/lib/sign-out";
 import { useStudioEnv } from "@/lib/env-context";
 import { useLoginClient } from "@/lib/login-client/use-login-client";
-import { createReauthGuard, restartSignInOnce, type ReauthGuard } from "@/lib/reauth";
+import { createReauthGuard, recoverFromRejectedToken, type ReauthGuard } from "@/lib/reauth";
 import { createRealtimeClient } from "@/lib/realtime/client";
 import { RealtimeContext } from "@/lib/realtime/context";
 import type { RealtimeClient } from "@/lib/realtime/types";
+import { realtimeAuthEvents, type Session } from "@/lib/session";
+import { useSession, useSessionSnapshot } from "@/lib/session-context";
 
 export const Route = createFileRoute("/app")({ component: AppPage });
 
 /**
  * The tab's realtime client while signed in. It opens its socket only when a page first joins a
- * channel; every renewed token goes out as an `auth` frame (`userLoaded`), and signing out closes
- * it for good (W32).
+ * channel; every renewed token goes out as an `auth` frame, and signing out closes it for good (W32).
  */
-function useRealtimeClient(apiUrl: string, authRef: RefObject<AuthContextProps>, signedIn: boolean, token: string | undefined): RealtimeClient | null {
+function useRealtimeClient(apiUrl: string, session: Session, signedIn: boolean, token: string | undefined): RealtimeClient | null {
   const [client, setClient] = useState<RealtimeClient | null>(null);
   useEffect(() => {
     if (!signedIn) return;
-    const c = createRealtimeClient({ apiUrl, token: authRef.current.user?.access_token });
-    const detach = c.attachAuth(authRef.current.events);
+    const c = createRealtimeClient({ apiUrl, token: session.token() });
+    const detach = c.attachAuth(realtimeAuthEvents(session));
     setClient(c);
     return () => {
       detach();
       c.close();
       setClient(null);
     };
-  }, [apiUrl, authRef, signedIn]);
+  }, [apiUrl, session, signedIn]);
   // A token stored before the listener was attached (the events cover every later renewal).
   useEffect(() => {
     if (client && token) client.setToken(token);
@@ -45,71 +46,126 @@ function useRealtimeClient(apiUrl: string, authRef: RefObject<AuthContextProps>,
 }
 
 /**
- * Points the management client at this Studio's API with the signed-in user's token.
- * Runs during render (not in an effect) so it's in place before the dashboard's
- * first query: children's effects run before ours. Re-runs only when the URL changes.
+ * Points the management client at this Studio's API with the session's token. Runs during render
+ * (not in an effect) so it's in place before the dashboard's first query: children's effects run
+ * before ours. A 401 mints a fresh token once and runs the queries again; if `/token` refuses,
+ * the session is over and `/login` follows (the session's status change takes the user there).
  */
-function useConfigureManagementClient(apiUrl: string, authRef: RefObject<AuthContextProps>, guard: ReauthGuard): void {
+function useConfigureManagementClient(apiUrl: string, session: Session, guard: ReauthGuard, queryClient: QueryClient): void {
   useMemo(() => {
     configureManagementClient({
       baseUrl: apiUrl,
-      getToken: () => authRef.current.user?.access_token,
-      // Restart sign-in once; if a fresh token is refused too, let the
-      // dashboard show the gateway's error instead of looping through Zitadel.
-      onUnauthorized: restartSignInOnce(guard, () => void authRef.current.signinRedirect()),
+      getToken: () => session.token(),
+      onUnauthorized: recoverFromRejectedToken(guard, {
+        refresh: () => session.refresh(),
+        refreshed: () => void queryClient.invalidateQueries(),
+        toLogin: () => session.clear(),
+      }),
     });
-  }, [apiUrl, authRef, guard]);
+  }, [apiUrl, session, guard, queryClient]);
 }
 
 function AppPage() {
-  const auth = useAuth();
   const env = useStudioEnv();
-  // A ref keeps the clients stable while tokens refresh underneath them.
-  const authRef = useRef(auth);
-  authRef.current = auth;
+  const session = useSession();
+  const { status, token } = useSessionSnapshot();
+  const navigate = useNavigate();
   const [queryClient] = useState(createStudioQueryClient);
   useRegisterDevtoolsQueryClient(queryClient);
   // Sign-out ends auth's session through the login client.
   useLoginClient();
   const [guard] = useState(() => createReauthGuard(window.sessionStorage));
 
-  useConfigureManagementClient(env.apiUrl, authRef, guard);
-  const realtime = useRealtimeClient(env.apiUrl, authRef, auth.isAuthenticated, auth.user?.access_token);
+  useConfigureManagementClient(env.apiUrl, session, guard, queryClient);
 
-  const name = auth.user?.profile.name;
-  const email = auth.user?.profile.email;
-  const session = useMemo<AppSession>(
+  // Arriving without a token (a reload, or straight from sign-in): mint one from the cookie.
+  const [checked, setChecked] = useState(status === "signed-in");
+  const [startError, setStartError] = useState<string | null>(null);
+  useEffect(() => {
+    if (checked) return;
+    session.start().then(
+      () => setChecked(true),
+      (err: unknown) => {
+        setStartError(err instanceof Error ? err.message : "Couldn't reach Chelabase");
+        setChecked(true);
+      },
+    );
+  }, [checked, session]);
+  // No session (never had one, it ended, or `/token` refused a refresh): sign in again.
+  useEffect(() => {
+    if (checked && status === "signed-out") void navigate({ to: "/login", search: { notice: "" }, replace: true });
+  }, [checked, status, navigate]);
+
+  const realtime = useRealtimeClient(env.apiUrl, session, status === "signed-in", token);
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
+  const appSession = useMemo<AppSession>(
     () => ({
       apiUrl: env.apiUrl,
-      profile: { name, email },
       onLoaded: () => guard.reset(),
       // The header clears the query cache before this runs.
-      onSignOut: () => void signOut(() => authRef.current.signoutRedirect()),
+      onSignOut: () => {
+        setSignOutError(null);
+        signOut(session, {
+          disconnect: () => realtime?.close(),
+          leave: () => {
+            queryClient.clear();
+            void navigate({ to: "/login", search: { notice: "" }, replace: true });
+          },
+        }).catch(() =>
+          setSignOutError("Couldn't sign you out: Chelabase didn't answer, so your session is still active. Try again."),
+        );
+      },
+      profile: {},
     }),
-    [env.apiUrl, name, email, guard],
+    [env.apiUrl, guard, session, realtime, queryClient, navigate],
   );
 
-  const needsSignIn = !auth.isLoading && !auth.isAuthenticated && !auth.activeNavigator && !auth.error;
-  useEffect(() => {
-    if (needsSignIn) void auth.signinRedirect();
-  }, [needsSignIn, auth]);
-
-  if (auth.error && !auth.isAuthenticated) return <SignInError message={auth.error.message} />;
-  if (!auth.isAuthenticated) {
-    return <main className="p-8 text-muted-foreground">Redirecting to sign in…</main>;
-  }
+  if (startError && status !== "signed-in") return <SignInError message={startError} />;
+  if (status !== "signed-in") return <main className="p-8 text-muted-foreground">Signing you in…</main>;
   return (
     <QueryClientProvider client={queryClient}>
       {/* The token value (not a getter) so pages re-render when it refreshes. */}
-      <AccessTokenContext.Provider value={auth.user?.access_token}>
+      <AccessTokenContext.Provider value={token}>
         <RealtimeContext.Provider value={realtime}>
-          <AppSessionContext.Provider value={session}>
-            <SignedInApp profile={session.profile} onSignOut={session.onSignOut}>
-              <Outlet />
-            </SignedInApp>
+          <AppSessionContext.Provider value={appSession}>
+            {signOutError && (
+              <p role="alert" className="bg-background p-3 text-center text-sm text-destructive">
+                {signOutError}
+              </p>
+            )}
+            <SignedInLayout app={appSession} />
           </AppSessionContext.Provider>
         </RealtimeContext.Provider>
       </AccessTokenContext.Provider>
     </QueryClientProvider>
+  );
+}
+
+/** The shell, once `/v1/me` has said who this is (it also gives the profile menu its name and email). */
+function SignedInLayout({ app }: { app: AppSession }) {
+  const me = useGetMe();
+  const profile = useMemo(() => ({ name: me.data?.name ?? undefined, email: me.data?.email ?? undefined }), [me.data?.name, me.data?.email]);
+  // A valid token whose subject has no row in the tenant: nothing in Studio would work for them.
+  if (me.data === undefined && me.error instanceof ApiError && me.error.status === 403) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-background p-8 text-foreground">
+        <div className="w-full max-w-sm space-y-4">
+          <h1 className="text-2xl font-semibold tracking-tight">No access to this workspace</h1>
+          <p className="text-sm">Your account isn't a member of this workspace. Ask a tenant admin to invite you.</p>
+          <Button variant="outline" onClick={app.onSignOut}>
+            Sign out
+          </Button>
+        </div>
+      </main>
+    );
+  }
+  const withProfile = useMemo(() => ({ ...app, profile }), [app, profile]);
+  return (
+    <AppSessionContext.Provider value={withProfile}>
+      <SignedInApp profile={profile} onSignOut={app.onSignOut}>
+        <Outlet />
+      </SignedInApp>
+    </AppSessionContext.Provider>
   );
 }

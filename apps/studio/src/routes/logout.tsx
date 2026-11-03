@@ -16,7 +16,7 @@ function LogoutPage() {
   useLoginClient();
   useEffect(() => {
     const target = safeRedirect(post_logout_redirect, window.location.origin);
-    // Leave even if auth is unreachable: the Zitadel tokens are already ended.
+    // Leave even if auth is unreachable; an outage keeps the cookie, so the next visit is still signed in.
     void logout({}).catch(() => undefined).finally(() => window.location.replace(target));
   }, [post_logout_redirect]);
   return <main className="p-8 text-muted-foreground">Signing you out…</main>;

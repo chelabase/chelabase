@@ -3,20 +3,16 @@ import { ApiError } from "@chelabase/management-client";
 import { Button } from "@/components/ui/button";
 import { describeInvite, useAcceptInvite } from "@/lib/login-client/generated/endpoints";
 import type { InviteDescription } from "@/lib/login-client/generated/model";
-import { savePendingInvite, takePendingInvite } from "@/lib/pending-invite";
 import { LoginLayout, Problem, SECRET, messageOf } from "./sign-in-form";
 
 export interface AcceptInviteFormProps {
-  /** The Zitadel user id, the invite code and the Chelabase invite token, from the link. */
+  /** The user id, the invite code and the Chelabase invite token, from the link. */
   user: string;
   code: string;
   t: string;
   /** The link's `reset=1`: the code is a password-reset code (a removed member invited again). */
   reset?: boolean;
-  /** The pending sign-in this page finishes; "" for a link opened from an email. */
-  authRequest: string;
-  /** Starts Studio's sign-in (OIDC with PKCE); Zitadel comes back through `/login` with one. */
-  startSignIn: () => void;
+  /** Leaves for `url` once the account is set up and the cookie session is set. */
   go: (url: string) => void;
 }
 
@@ -60,21 +56,13 @@ export function AcceptInviteForm({
   code: linkCode,
   t: linkToken,
   reset: linkReset = false,
-  authRequest: linkAuthRequest,
-  startSignIn,
   go,
 }: AcceptInviteFormProps) {
   // M8: the link's code and token are read once into state, and the address bar keeps only
   // `?user=` at once (on mount, not at the first submit), so they stay out of the history, a
-  // bookmark or a shared screen. Back from the sign-in this page started, they come from this
-  // tab's pending invite instead. The router then re-renders with the shorter address: the page
+  // bookmark or a shared screen. The router then re-renders with the shorter address: the page
   // keeps what it read.
-  const [{ code, t, reset, authRequest }] = useState(() => {
-    const fromLink = { code: linkCode, t: linkToken, reset: linkReset, authRequest: linkAuthRequest };
-    if (linkCode !== "" || linkAuthRequest === "") return fromLink;
-    const pending = takePendingInvite(user);
-    return pending ? { code: pending.code, t: pending.t, reset: pending.reset, authRequest: linkAuthRequest } : fromLink;
-  });
+  const [{ code, t, reset }] = useState(() => ({ code: linkCode, t: linkToken, reset: linkReset }));
   useEffect(() => {
     const here = new URL(window.location.href);
     const only = new URLSearchParams(user ? { user } : {});
@@ -108,14 +96,6 @@ export function AcceptInviteForm({
       live = false;
     };
   }, [complete, user, t]);
-  // A link from an email has no pending sign-in: keep the link for this tab and start one.
-  const started = useRef(false);
-  useEffect(() => {
-    if (!complete || authRequest !== "" || !looked || ending || started.current) return;
-    started.current = true;
-    savePendingInvite({ user, code, t, reset });
-    startSignIn();
-  }, [complete, authRequest, looked, ending, user, code, t, reset, startSignIn]);
   const accept = useAcceptInvite(SECRET);
   const [password, setPassword] = useState("");
   const [ticket, setTicket] = useState<string | null>(null);
@@ -139,7 +119,6 @@ export function AcceptInviteForm({
       const done = await accept.mutateAsync({
         data: {
           ...(usedTicket ? { user, acceptTicket: usedTicket, password } : reset ? { user, code, reset: true, password } : { user, code, password }),
-          ...(authRequest ? { authRequest } : {}),
         },
       });
       // Stay busy until the browser leaves.
@@ -203,8 +182,8 @@ export function AcceptInviteForm({
     );
   }
 
-  // The sign-in this page starts is on its way (or the lookup still runs).
-  if (authRequest === "") {
+  // The inviter lookup still runs.
+  if (!looked) {
     return (
       <LoginLayout title="Join Chelabase" titleRef={title}>
         <p className="text-sm text-chalk-dim">Opening your invite…</p>

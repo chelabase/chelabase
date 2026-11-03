@@ -1,68 +1,17 @@
-import { render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import { SignIn, type SignInProps } from "./sign-in";
-
-function fakeAuth(over: Partial<SignInProps["auth"]> = {}): SignInProps["auth"] {
-  return { isLoading: false, error: undefined, signinRedirect: vi.fn().mockResolvedValue(undefined), ...over };
-}
-
-const authError = (message: string): NonNullable<SignInProps["auth"]["error"]> =>
-  Object.assign(new Error(message), { source: "unknown" as const });
+import { screen } from "@testing-library/react";
+import { describe, expect, it } from "vitest";
+import { renderWithRouter } from "@/test/render-router";
+import { SignIn } from "./sign-in";
 
 describe("SignIn", () => {
-  it("signup_redirects_to_create_once", () => {
-    const auth = fakeAuth();
-    render(<SignIn auth={auth} signup />);
-    expect(auth.signinRedirect).toHaveBeenCalledTimes(1);
-    // "replace": Back from Zitadel must not land on a page that redirects again
-    expect(auth.signinRedirect).toHaveBeenCalledWith({ prompt: "create", redirectMethod: "replace" });
+  it("offers sign-in once the session check is over", async () => {
+    renderWithRouter(<SignIn checking={false} />);
+    expect(await screen.findByRole("link", { name: "Sign in" })).toHaveAttribute("href", expect.stringMatching(/^\/login/));
   });
 
-  it("redirects_once_under_rerender", () => {
-    const auth = fakeAuth();
-    const { rerender } = render(<SignIn auth={auth} signup />);
-    rerender(<SignIn auth={fakeAuth({ signinRedirect: auth.signinRedirect })} signup />);
-    rerender(<SignIn auth={fakeAuth({ signinRedirect: auth.signinRedirect })} signup />);
-    expect(auth.signinRedirect).toHaveBeenCalledTimes(1);
-  });
-
-  it("no_redirect_while_loading", () => {
-    const signinRedirect = vi.fn().mockResolvedValue(undefined);
-    const { rerender } = render(<SignIn auth={fakeAuth({ isLoading: true, signinRedirect })} signup />);
-    expect(signinRedirect).not.toHaveBeenCalled();
-    rerender(<SignIn auth={fakeAuth({ isLoading: false, signinRedirect })} signup />);
-    expect(signinRedirect).toHaveBeenCalledTimes(1);
-  });
-
-  it("no_redirect_without_signup", () => {
-    const auth = fakeAuth();
-    render(<SignIn auth={auth} signup={false} />);
-    expect(auth.signinRedirect).not.toHaveBeenCalled();
-  });
-
-  it("no_second_redirect_after_an_error", () => {
-    const signinRedirect = vi.fn().mockResolvedValue(undefined);
-    render(<SignIn auth={fakeAuth({ error: authError("zitadel down"), signinRedirect })} signup />);
-    expect(signinRedirect).not.toHaveBeenCalled();
-    expect(screen.getByRole("alert")).toHaveTextContent("Sign-in failed: zitadel down");
-  });
-
-  it("no_redirect_when_an_error_arrives_after_the_redirect", () => {
-    const signinRedirect = vi.fn().mockResolvedValue(undefined);
-    const { rerender } = render(<SignIn auth={fakeAuth({ signinRedirect })} signup />);
-    rerender(<SignIn auth={fakeAuth({ error: authError("boom"), signinRedirect })} signup />);
-    expect(signinRedirect).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole("alert")).toBeInTheDocument();
-  });
-
-  it("sign_in_button_signs_in_and_account_creation_waits_for_the_login_page", async () => {
-    // Whether sign-up is open is only known once Zitadel hands over a pending sign-in, so the
-    // landing page offers just "Sign in"; the login page offers "Create account" when allowed.
-    const auth = fakeAuth();
-    render(<SignIn auth={auth} signup={false} />);
-    await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
-    expect(auth.signinRedirect).toHaveBeenCalledExactlyOnceWith();
-    expect(screen.queryByRole("button", { name: /create account/i })).toBeNull();
+  it("says_it_is_checking_and_offers_nothing_yet", async () => {
+    renderWithRouter(<SignIn checking />);
+    expect(await screen.findByRole("status")).toHaveTextContent("Checking your session");
+    expect(screen.queryByRole("link", { name: "Sign in" })).toBeNull();
   });
 });

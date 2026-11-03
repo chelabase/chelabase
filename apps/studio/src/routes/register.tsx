@@ -2,20 +2,17 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { LoginProviders } from "@/components/login/login-providers";
 import { SignUpForm } from "@/components/login/sign-up-form";
 
-export const Route = createFileRoute("/register")({
-  validateSearch: (search: Record<string, unknown>) => ({ authRequest: typeof search.authRequest === "string" ? search.authRequest : "" }),
-  component: RegisterPage,
-});
+export const Route = createFileRoute("/register")({ component: RegisterPage });
 
 function RegisterPage() {
-  const { authRequest } = Route.useSearch();
   const navigate = useNavigate();
   return (
     <LoginProviders>
-      <SignUpForm authRequest={authRequest}
-        go={(url) => window.location.assign(url)}
+      <SignUpForm
+        toApp={() => void navigate({ to: "/app", replace: true })}
         toVerify={() => void navigate({ to: "/verify", search: { code: "" } })}
-        toLogin={(notice) => void navigate({ to: "/login", search: { authRequest, notice }, replace: true })} />
+        toPending={() => void navigate({ to: "/pending", replace: true })}
+        toLogin={(notice) => void navigate({ to: "/login", search: { notice }, replace: true })} />
     </LoginProviders>
   );
 }

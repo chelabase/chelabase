@@ -2,37 +2,34 @@ import { describe, expect, it, vi } from "vitest";
 import { loadEnv, readEnv } from "./env";
 
 const full = {
-  VITE_ZITADEL_ISSUER: "http://auth.chelabase.localhost:8000",
-  VITE_ZITADEL_CLIENT_ID: "client-1",
-  VITE_ZITADEL_PROJECT_ID: "project-1",
-  VITE_ZITADEL_ORG_ID: "org-1",
   VITE_API_URL: "http://api.chelabase.localhost:8000",
+  VITE_STUDIO_HOST: "studio.chelabase.localhost:8000",
 };
 
 describe("readEnv", () => {
   it("maps every VITE_ setting", () => {
     expect(readEnv(full)).toEqual({
-      issuer: "http://auth.chelabase.localhost:8000",
-      clientId: "client-1",
-      projectId: "project-1",
-      orgId: "org-1",
       apiUrl: "http://api.chelabase.localhost:8000",
+      studioHost: "studio.chelabase.localhost:8000",
     });
   });
 
-  it("names every missing setting and how to fix it", () => {
-    expect(() => readEnv({ ...full, VITE_ZITADEL_CLIENT_ID: "", VITE_API_URL: undefined })).toThrow(
-      /VITE_ZITADEL_CLIENT_ID, VITE_API_URL.*just zitadel-bootstrap/,
-    );
+  it("needs only the API URL; the host is the page's own", () => {
+    expect(readEnv({ VITE_API_URL: "http://api.test" })).toEqual({ apiUrl: "http://api.test", studioHost: window.location.host });
+  });
+
+  it("names the missing API URL", () => {
+    expect(() => readEnv({ VITE_API_URL: undefined })).toThrow(/VITE_API_URL/);
+    expect(() => readEnv({ VITE_API_URL: "  " })).not.toThrow(/zitadel/i);
+  });
+
+  it("carries no identity-provider settings", () => {
+    expect(Object.keys(readEnv(full)).sort()).toEqual(["apiUrl", "studioHost"]);
   });
 });
 
 describe("loadEnv", () => {
   const runtime = {
-    issuer: "https://auth.example.com",
-    clientId: "client-rt",
-    projectId: "project-rt",
-    orgId: "org-rt",
     apiUrl: "https://api.example.com",
     studioHost: "studio.example.com",
   };
@@ -53,11 +50,8 @@ describe("loadEnv", () => {
 
   it("uses the runtime config over the VITE_ build values", async () => {
     expect(await loadEnv(full, answer(200, runtime))).toEqual({
-      issuer: "https://auth.example.com",
-      clientId: "client-rt",
-      projectId: "project-rt",
-      orgId: "org-rt",
       apiUrl: "https://api.example.com",
+      studioHost: "studio.example.com",
     });
   });
 
@@ -67,7 +61,7 @@ describe("loadEnv", () => {
   });
 
   it("still names the missing VITE_ settings when a 404 has nothing to fall back on", async () => {
-    await expect(loadEnv({}, answer(404, ""))).rejects.toThrow(/VITE_ZITADEL_ISSUER/);
+    await expect(loadEnv({}, answer(404, ""))).rejects.toThrow(/VITE_API_URL/);
   });
 
   it("says the instance is still setting up while auth answers 503, without falling back", async () => {
@@ -77,8 +71,8 @@ describe("loadEnv", () => {
   });
 
   it("refuses a config with a missing value or a non-JSON page", async () => {
-    await expect(loadEnv(full, answer(200, { ...runtime, clientId: "" }))).rejects.toThrow(/clientId/);
-    await expect(loadEnv(full, answer(200, { ...runtime, orgId: 7 }))).rejects.toThrow(/orgId/);
+    await expect(loadEnv(full, answer(200, { ...runtime, apiUrl: "" }))).rejects.toThrow(/apiUrl/);
+    await expect(loadEnv(full, answer(200, { ...runtime, studioHost: 7 }))).rejects.toThrow(/studioHost/);
     await expect(loadEnv(full, answer(200, "<!doctype html>", "text/html"))).rejects.toThrow(/studio-config/);
   });
 

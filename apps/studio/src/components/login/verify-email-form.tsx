@@ -3,7 +3,7 @@ import { Button } from "@/components/ui/button";
 import { useResendCode, useVerifyEmail } from "@/lib/login-client/generated/endpoints";
 import { Field, LoginLayout, Problem, follow, problemOf, type FormProps, type LoginProblem } from "./sign-in-form";
 
-export function VerifyEmailForm({ initialCode = "", go, toVerify }: FormProps) {
+export function VerifyEmailForm({ initialCode = "", toApp, toVerify, toPending }: FormProps) {
   const [code, setCode] = useState(initialCode);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<LoginProblem | null>(null);
@@ -17,7 +17,7 @@ export function VerifyEmailForm({ initialCode = "", go, toVerify }: FormProps) {
     setBusy(true);
     setError(null);
     try {
-      follow(await verifyEmail.mutateAsync({ data: { code: code.trim() } }), go, toVerify);
+      follow(await verifyEmail.mutateAsync({ data: { code: code.trim() } }), { toApp, toVerify, toPending });
     } catch (err) {
       setError(problemOf(err));
       setBusy(false);
