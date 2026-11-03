@@ -57,7 +57,6 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
-/// Members hub T8: personal-login rows by (tenant, identity user id).
 
 /// An invite's stored expiry and whether the database clock calls it open.
 type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
@@ -94,7 +93,7 @@ struct FakeNeon {
     /// accepted (expired or not), and whether the database clock calls it open.
     invite_expiries: Arc<Mutex<HashMap<String, InviteExpiry>>>,
     /// #126: identity user id -> `(tenant, token hash)` of each accepted invite, newest first.
-    accepted: Arc<Mutex<HashMap<String, Vec<(TenantId, Option<Vec<u8>>)>>>>,
+    accepted: Arc<Mutex<HashMap<String, orchestrator::internal::AcceptedInvites>>>,
     /// Final round A: each offboarded mark cleared (D7), a clear that fails while
     /// `fail_clear` is set, and a tenant lookup that fails while `fail_tenant_lookup` is (T8-2).
     clears: Arc<Mutex<Vec<(TenantId, String)>>>,
