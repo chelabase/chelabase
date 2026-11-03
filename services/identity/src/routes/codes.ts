@@ -10,6 +10,7 @@ import {
   checkPasswordLength,
   context,
   ID_PATTERN,
+  isUuid,
   requireUser,
   userOut,
   type BaUser,
@@ -163,7 +164,7 @@ export function codeRoutes(): Route[] {
           // The user first: the code is bound to their current email. An unknown user, or an
           // invite for an established account, is refused like a wrong code, before the guess
           // is counted, so neither costs an attempt nor tells the cases apart.
-          const holder = (await ctx.internalAdapter.findUserById(id)) as BaUser | null;
+          const holder = isUuid(id) ? ((await ctx.internalAdapter.findUserById(id)) as BaUser | null) : null;
           if (!holder || (kind === "invite" && !(await inviteAllowed(ctx, holder)))) throw invalidCode();
           if (!(await auth.codes.consume(id, holder.email, kind, code))) throw invalidCode();
           // The row cascades with its user, so the user existed when the code was consumed; a

@@ -94,6 +94,17 @@ impl Inner {
         self.next += 1;
         format!("{prefix}{}", self.next)
     }
+    /// A user or session id: a UUID, as the service's are (deterministic here).
+    pub fn uuid(&mut self) -> String {
+        self.next += 1;
+        uuid_of(self.next)
+    }
+}
+
+fn uuid_of(n: u64) -> String {
+    uuid::Uuid::from_u128(u128::from(n))
+        .hyphenated()
+        .to_string()
 }
 
 #[derive(Clone)]
@@ -253,9 +264,9 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
     }
     let mut next = i.next;
     let p = pool_mut(i, &name)?;
-    let mut fresh = |prefix: &str| {
+    let mut tick = || {
         next += 1;
-        format!("{prefix}{next}")
+        next
     };
     let reply = match (method, tail) {
         ("POST", ["users"]) => {
@@ -269,7 +280,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 return Err(refuse(409, "conflict", "a user with this email exists"));
             }
             let u = FUser {
-                id: fresh("user-"),
+                id: uuid_of(tick()),
                 email,
                 password: password.map(str::to_string),
                 name: body
@@ -307,17 +318,34 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             };
             let limit = num("limit", 50, 1, 200)?;
             let offset = num("offset", 0, 0, 1_000_000_000)?;
-            let users: Vec<Value> = p
+            // Part of the email, ignoring case (emails are stored lowercase).
+            let search = q
+                .get("search")
+                .map(|v| urlencoding::decode(v).map_or_else(|_| v.to_string(), |d| d.into_owned()))
+                .unwrap_or_default()
+                .to_lowercase();
+            if search.chars().count() > 320 {
+                return Err(refuse(
+                    400,
+                    "invalid_request",
+                    "search must be at most 320 characters",
+                ));
+            }
+            let matching: Vec<&FUser> = p
                 .users
+                .iter()
+                .filter(|u| u.email.contains(&search))
+                .collect();
+            let users: Vec<Value> = matching
                 .iter()
                 .skip(offset)
                 .take(limit)
-                .map(user_out)
+                .map(|u| user_out(u))
                 .collect();
             (
                 200,
                 Some(
-                    json!({ "users": users, "total": p.users.len(), "limit": limit, "offset": offset }),
+                    json!({ "users": users, "total": matching.len(), "limit": limit, "offset": offset }),
                 ),
             )
         }
@@ -388,8 +416,8 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 return Err(refuse(403, "banned", "user is banned"));
             }
             let s = FSession {
-                id: fresh("sess-"),
-                token: format!("tok-{}", fresh("")),
+                id: uuid_of(tick()),
+                token: format!("tok-{}", tick()),
                 user_id: u.id.clone(),
                 created: now,
                 expires: now + ChronoDuration::days(SESSION_TTL_DAYS),
@@ -544,7 +572,7 @@ impl FakeIdentity {
     fn add_user(&self, pool: &Pool, email: &str, password: Option<&str>, verified: bool) -> String {
         self.with(|i| {
             let now = i.now();
-            let id = i.id("user-");
+            let id = i.uuid();
             let p = i.pools.entry(pool.to_string()).or_default();
             p.users.push(FUser {
                 id: id.clone(),
@@ -564,7 +592,7 @@ impl FakeIdentity {
     pub fn with_session(&self, pool: &Pool, user_id: &str) -> (String, String) {
         self.with(|i| {
             let now = i.now();
-            let (id, token) = (i.id("sess-"), i.id("tok-"));
+            let (id, token) = (i.uuid(), i.id("tok-"));
             let p = i.pools.get_mut(&pool.to_string()).expect("the pool exists");
             p.sessions.push(FSession {
                 id: id.clone(),

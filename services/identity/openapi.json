@@ -164,6 +164,7 @@
       "get": {
         "operationId": "listUsers",
         "summary": "List users, oldest first, one page at a time",
+        "description": "`search` narrows the list to users whose email contains it, ignoring case (`%` and `_` match themselves); `total` counts the matches.",
         "x-callers": [
           "auth",
           "orchestrator",
@@ -187,6 +188,14 @@
               "type": "integer",
               "minimum": 0,
               "default": 0
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "maxLength": 320
             }
           }
         ],
@@ -1231,7 +1240,8 @@
         ],
         "properties": {
           "id": {
-            "type": "string"
+            "type": "string",
+            "format": "uuid"
           },
           "email": {
             "type": "string"
@@ -1265,10 +1275,12 @@
         ],
         "properties": {
           "id": {
-            "type": "string"
+            "type": "string",
+            "format": "uuid"
           },
           "user_id": {
-            "type": "string"
+            "type": "string",
+            "format": "uuid"
           },
           "expires_at": {
             "type": "string",

@@ -118,4 +118,5 @@ export const ErrorCode = {
   member_offboarded: 'member_offboarded',
   invalid_successor: 'invalid_successor',
   exposure_unconfirmed: 'exposure_unconfirmed',
+  identity_unavailable: 'identity_unavailable',
 } as const;

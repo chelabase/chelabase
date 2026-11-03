@@ -1,18 +1,20 @@
 //! App users against real computes (roadmap step 6b): the users bootstrap, its guard and protect
 //! triggers, the claim helpers under the data API, the data API's remove and rebootstrap paths
-//! with the app-users objects, and the worker's enable, sync, branch and disable jobs with the
-//! real Zitadel.
+//! with the app-users objects, and the worker's enable, sync, reconcile, branch and disable
+//! jobs with the real identity service.
 //!
 //! Same setup as `roles_live` (the workbench stack, so the gateway, rest and the
 //! orchestrator serve the data API, plus `psql` in the runner and the proxy's CA), with
-//! `demo.env` sourced for the Zitadel admin PAT and the app JWT key pair:
+//! `demo.env` sourced for the app JWT key pair. The worker calls the identity service with its
+//! own token (`CHELABASE_IDENTITY_WORKER_TOKEN_FILE`); the test makes and bans users with
+//! auth's (`CHELABASE_IDENTITY_TOKEN_FILE`), as the admin API and sign-up would:
 //!
 //! ```text
 //! just workbench test -p worker --test app_users_live -- --run-ignored only
 //! ```
 //!
 //! Each test provisions its own database in its own project and deletes both afterwards, pass
-//! or fail (with the project's Zitadel org and users, when the test made them).
+//! or fail (with the project's identity pool and its users, when the test made them).
 
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
@@ -23,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chelabase_auth::app_token::{APP_ISSUER, AppClaims, AppTokenSigner, app_audience};
+use chelabase_identity::{Identity, IdentityError, Missing, NewUser, Pool};
 use chelabase_metadata::{
     AppUsersStatus, BeginEnable, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus,
     MetadataClient, NewAppSession, NewBranch, NewProjectAuth, OnDelete,
@@ -31,7 +34,6 @@ use chelabase_nats::{AppUsersJob, AppUsersSyncJob, BranchJob};
 use chelabase_neon::{ComputeBackend, ComputeLocator, DockerLocator};
 use chelabase_secrets::{Purpose, open_credential, open_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
-use chelabase_zitadel::client::NewUser;
 use serde_json::{Value, json};
 use uuid::Uuid;
 use worker::app_users_sql::{USERS_SYNC_ROLE, gone_call_sql, upsert_call_sql, users_bootstrap_sql};
@@ -64,7 +66,9 @@ where
     F: FnOnce(Arc<Fx>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    let (worker, metadata, _config) = setup().await;
+    let (mut worker, metadata, _config) = setup().await;
+    // The runner's CHELABASE_IDENTITY_TOKEN_FILE is auth's; the worker calls with its own.
+    worker.identity = Some(worker_identity());
     let id = DatabaseId::new();
     let name = format!("au-{}", &id.to_string()[..8]);
     let project = metadata
@@ -114,9 +118,9 @@ where
 
     // A panic inside the task is caught here, so the cleanup below always runs.
     let outcome = tokio::spawn(body(fx.clone())).await;
-    if let Some(zitadel) = &fx.worker.zitadel {
-        // Only the org this project made (its id is the project's): never another org.
-        let _ = zitadel.delete_org(&fx.project.to_string()).await;
+    if let Some(identity) = &fx.worker.identity {
+        // Only this project's pool (named by its id): never another one.
+        let _ = identity.drop_pool(&fx.pool()).await;
     }
     let _ = fx.metadata.finish_project_delete(fx.project).await;
     cleanup(&fx.worker, &fx.metadata, fx.id).await;
@@ -125,7 +129,21 @@ where
     }
 }
 
+/// The worker's identity client: `CHELABASE_IDENTITY_URL` with the worker's token.
+fn worker_identity() -> Identity {
+    let url = std::env::var("CHELABASE_IDENTITY_URL").expect("CHELABASE_IDENTITY_URL");
+    let token = std::env::var("CHELABASE_IDENTITY_WORKER_TOKEN_FILE")
+        .expect("CHELABASE_IDENTITY_WORKER_TOKEN_FILE");
+    Identity::from_token_file(&url, std::path::Path::new(&token))
+        .expect("the worker's identity token")
+}
+
 impl Fx {
+    /// The project's app-user pool.
+    fn pool(&self) -> Pool {
+        Pool::App(self.project.as_uuid())
+    }
+
     /// SQL as cloud_admin on `ep`'s compute, in `database` (forwarding off: `admin_sql`).
     async fn sql_in(&self, ep: &str, database: &str, sql: &str) -> String {
         self.worker
@@ -208,7 +226,8 @@ impl Fx {
     /// Postgres (as `auth` connects).
     async fn sync_login(&self, ep: &str, sql: &str) -> Result<String, String> {
         let locator = DockerLocator::connect(
-            &std::env::var("CHELABASE_COMPUTE_NETWORK").unwrap_or_else(|_| "chelabase_compute".into()),
+            &std::env::var("CHELABASE_COMPUTE_NETWORK")
+                .unwrap_or_else(|_| "chelabase_compute".into()),
             &std::env::var("CHELABASE_STACK").unwrap_or_else(|_| "main".into()),
         )
         .expect("the Docker client");
@@ -444,7 +463,9 @@ fn chelabase_cli() -> std::path::PathBuf {
 async fn api(method: &str, path: &str, body: Option<Value>) -> (u16, Value) {
     let token = tokio::process::Command::new(chelabase_cli())
         .args(["dev", "token"])
-        .current_dir(std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into))
+        .current_dir(
+            std::env::var("CHELABASE_CHECKOUT").map_or_else(|_| workspace_root(), Into::into),
+        )
         .output()
         .await
         .expect("chelabase dev token");
@@ -898,8 +919,10 @@ async fn data_api_rebootstrap_keeps_app_users_objects() {
             .await;
         assert!(reply.ok, "{reply:?}");
         assert_eq!(
-            fx.value("SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase_quarantine%'")
-                .await,
+            fx.value(
+                "SELECT count(*) FROM pg_namespace WHERE nspname LIKE 'chelabase_quarantine%'"
+            )
+            .await,
             "0",
             "the data API bootstrap quarantined the chelabase schema"
         );
@@ -973,30 +996,28 @@ async fn remove_data_api_drops_the_helpers() {
     .await;
 }
 
-// --- The worker's jobs with the real Zitadel ------------------------------------------------
+// --- The worker's jobs with the real identity service ---------------------------------------
 
-/// The org's live count in Zitadel (v2 search by id; 0 once deleted).
-async fn org_count(org: &str) -> usize {
-    let issuer = std::env::var("CHELABASE_ZITADEL_ISSUER").expect("CHELABASE_ZITADEL_ISSUER");
-    let pat = std::fs::read_to_string(env_path("CHELABASE_ZITADEL_ADMIN_PAT_FILE")).unwrap();
-    let res: Value = reqwest::Client::new()
-        .post(format!("{issuer}/v2/organizations/_search"))
-        .bearer_auth(pat.trim())
-        .json(&json!({"queries": [{"idQuery": {"id": org}}]}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    res["result"].as_array().map_or(0, Vec::len)
+/// Whether the pool exists, asked as the worker.
+async fn pool_exists(identity: &Identity, pool: &Pool) -> bool {
+    match identity.list_users(pool, 1, 0).await {
+        Ok(_) => true,
+        Err(IdentityError::NotFound(Missing::Pool)) => false,
+        Err(e) => panic!("listing {pool}: {e}"),
+    }
 }
 
+/// AC 1, 3 and 6 live: enable creates the pool (again: a no-op), a ban revokes the user's app
+/// sessions through the sync, the reconcile makes every branch's table match the pool, and
+/// disable drops the pool.
 #[tokio::test]
-#[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack, CHELABASE_COMPUTE_IMAGE and demo.env"]
 async fn app_users_live() {
     live(|fx| async move {
-        let zitadel = fx.worker.zitadel.as_ref().expect("Zitadel admin access (source demo.env)");
+        let identity = fx.worker.identity.clone().expect("the worker's identity client");
+        // Users are made and banned as auth (the admin API and sign-up do it in production).
+        let admin = Identity::from_env().expect("the identity service (CHELABASE_IDENTITY_URL)");
+        let pool = fx.pool();
         let (dev, dev_ep) = fx.child("dev").await;
         let auth = NewProjectAuth {
             project_id: fx.project,
@@ -1014,9 +1035,7 @@ async fn app_users_live() {
             .expect("enable");
         let row = fx.metadata.project_auth(fx.project).await.unwrap().unwrap();
         assert_eq!(row.status, AppUsersStatus::Enabled, "{:?}", row.error);
-        let org = fx.project.to_string();
-        assert_eq!(row.zitadel_org_id.as_deref(), Some(org.as_str()));
-        assert_eq!(org_count(&org).await, 1);
+        assert!(pool_exists(&identity, &pool).await, "the pool exists");
         for ep in [&fx.ep, &dev_ep] {
             assert_eq!(
                 first_line(&fx.sql_in(ep, &fx.database, SNAPSHOT_TRIGGERS).await),
@@ -1033,40 +1052,83 @@ async fn app_users_live() {
             "resync recorded {USERS_SYNC_ROLE}: {copies:?}"
         );
 
-        // A user in the org: the sync fans out to both branches.
-        let user = Uuid::new_v4();
-        let uid = user.to_string();
-        let email = format!("live-{}@example.com", &uid[..8]);
-        zitadel
-            .create_user(&NewUser {
-                org_id: &org,
-                email: &email,
-                given_name: "live",
-                family_name: "-",
-                password: Some("Live-Passw0rd!"),
-                user_id: Some(&uid),
-                username: Some(&uid),
-                send_code: false,
-                verified: true,
-                url_template: "",
-            })
+        // A user in the pool: the sync fans out to both branches.
+        let email = format!("live-{}@example.com", &Uuid::new_v4().to_string()[..8]);
+        let created = admin
+            .create_user(
+                &pool,
+                &NewUser { email: &email, password: Some("Live-Passw0rd!"), name: None, email_verified: true },
+            )
             .await
-            .expect("create the Zitadel user");
-        fx.worker
-            .handle_app_users_sync(&AppUsersSyncJob {
-                project_id: fx.project,
-                user_id: user,
-                data: None,
-                origin_branch_id: None,
-            })
-            .await
-            .expect("sync");
+            .expect("create the user");
+        let user: Uuid = created.id.parse().expect("identity user ids are uuids");
+        let job = |user_id| AppUsersSyncJob {
+            project_id: fx.project,
+            user_id,
+            data: None,
+            origin_branch_id: None,
+        };
+        fx.worker.handle_app_users_sync(&job(user)).await.expect("sync");
         let has_row = format!("SELECT count(*) FROM public.users WHERE id = '{user}'");
         for ep in [&fx.ep, &dev_ep] {
             assert_eq!(first_line(&fx.sql_in(ep, &fx.database, &has_row).await), "1", "{ep}");
         }
 
-        // A new branch gets the row (its create hook) and a fresh sync password.
+        // AC 1: enabling again (the create the enable runs) is a no-op: the user stays.
+        identity.create_pool(&pool).await.expect("create the pool again");
+        identity.get_user(&pool, &created.id).await.expect("the user survives a second create");
+
+        // AC 3: a ban, then the sync: the user's app sessions are revoked.
+        let session = Uuid::new_v4();
+        fx.metadata
+            .insert_app_session(&NewAppSession {
+                id: session,
+                project_id: fx.project,
+                user_id: user,
+                identity_session_id: "app-users-live",
+                refresh_hash: rand_hash(),
+                expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            })
+            .await
+            .expect("insert the app session");
+        admin.ban(&pool, &created.id, None).await.expect("ban the user");
+        fx.worker.handle_app_users_sync(&job(user)).await.expect("sync after the ban");
+        assert!(
+            fx.metadata.list_user_sessions(fx.project, user).await.unwrap().is_empty(),
+            "the banned user's app sessions are revoked"
+        );
+        admin.unban(&pool, &created.id).await.expect("unban the user");
+
+        // AC 6: a stale row, a missing row and a ghost row; the reconcile makes both branches
+        // match the pool.
+        let email2 = format!("live2-{}@example.com", &Uuid::new_v4().to_string()[..8]);
+        let second: Uuid = admin
+            .create_user(&pool, &NewUser { email: &email2, password: None, name: None, email_verified: false })
+            .await
+            .expect("create a second user")
+            .id
+            .parse()
+            .unwrap();
+        let ghost = Uuid::new_v4();
+        for ep in [&fx.ep, &dev_ep] {
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(user, "stale@example.com", false, chrono::Utc::now(), None))
+                .await;
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(ghost, "ghost@example.com", true, chrono::Utc::now(), None))
+                .await;
+        }
+        fx.worker.reconcile_app_users(fx.project).await.expect("reconcile");
+        // uuid order is byte order in Postgres and in `Uuid`'s `Ord`.
+        let table = "SELECT string_agg(id || ' ' || email || ' ' || email_verified, ',' ORDER BY id) FROM public.users";
+        let want = {
+            let mut rows = [(user, format!("{user} {email} true")), (second, format!("{second} {email2} false"))];
+            rows.sort();
+            rows.map(|(_, r)| r).join(",")
+        };
+        for ep in [&fx.ep, &dev_ep] {
+            assert_eq!(first_line(&fx.sql_in(ep, &fx.database, table).await), want, "{ep}");
+        }
+
+        // A new branch gets the rows (its create hook) and a fresh sync password.
         let (dev2, dev2_ep) = fx.child("dev2").await;
         assert_eq!(first_line(&fx.sql_in(&dev2_ep, &fx.database, &has_row).await), "1");
         let password = |branch: BranchId| {
@@ -1082,8 +1144,7 @@ async fn app_users_live() {
         assert_ne!(pw_dev, pw_dev2);
 
         // Disable: the table stays as an ordinary one (RLS on, no policies), the role and the
-        // org go.
-        zitadel.delete_user(&uid).await.expect("delete the user");
+        // pool go.
         assert!(fx.metadata.begin_disable_app_users(fx.project).await.unwrap());
         fx.worker
             .handle_app_users_job(&AppUsersJob::Disable { project_id: fx.project })
@@ -1111,7 +1172,7 @@ async fn app_users_live() {
         }
         // An ordinary table now: the owner drops it.
         fx.owner_ok("DROP TABLE users").await;
-        assert_eq!(org_count(&org).await, 0, "the org is gone");
+        assert!(!pool_exists(&identity, &pool).await, "the pool is gone");
     })
     .await;
 }

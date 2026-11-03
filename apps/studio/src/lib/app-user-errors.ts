@@ -10,6 +10,7 @@ const TEXTS: Record<string, string> = {
   email_taken: "That email is already in use",
   weak_password: "That password is too weak. Use a longer one.",
   unavailable: "User administration isn't configured on this Chelabase (the Zitadel admin credentials are missing)",
+  identity_unavailable: "The identity service can't be reached right now. Try again.",
 };
 
 export function appUserErrorText(err: unknown): string {

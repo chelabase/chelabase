@@ -1810,6 +1810,10 @@ pub struct AppState<M, J> {
     /// Zitadel's admin API (admin PAT); `None` when `CHELABASE_ZITADEL_ADMIN_PAT_FILE` or
     /// `CHELABASE_AUTH_HOST` isn't set.
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`): app
+    /// users' admin actions on the project's pool. `None` when either is unset or the token
+    /// can't be read; those routes then answer 503 `identity_unavailable`.
+    pub identity_service: Option<chelabase_identity::Identity>,
     /// The one write path to a project's users table.
     pub users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
     /// Studio's SQL editor: runs in flight and the data-role grant cache.

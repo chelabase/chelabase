@@ -156,11 +156,13 @@ pub enum ErrorCode {
     /// 409: a role delete would expose objects (definer routines, non-invoker views granted to
     /// others) to its successor and wasn't confirmed with the preview's current token.
     ExposureUnconfirmed,
+    /// 503: the identity service (app users' pools) can't be reached or refused Chelabase's call.
+    IdentityUnavailable,
 }
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 106] = [
+    pub const ALL: [ErrorCode; 107] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
@@ -267,6 +269,7 @@ impl ErrorCode {
         Self::MemberOffboarded,
         Self::InvalidSuccessor,
         Self::ExposureUnconfirmed,
+        Self::IdentityUnavailable,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -377,6 +380,7 @@ impl ErrorCode {
             Self::MemberOffboarded => "member_offboarded",
             Self::InvalidSuccessor => "invalid_successor",
             Self::ExposureUnconfirmed => "exposure_unconfirmed",
+            Self::IdentityUnavailable => "identity_unavailable",
         }
     }
 }
@@ -479,7 +483,7 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 106] = [
+    const ALL: [(ErrorCode, &str); 107] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
@@ -591,6 +595,7 @@ mod tests {
         (ErrorCode::InvalidSuccessor, "invalid_successor"),
         // T10 fix: 409, a role delete's exposures weren't confirmed with the preview's token.
         (ErrorCode::ExposureUnconfirmed, "exposure_unconfirmed"),
+        (ErrorCode::IdentityUnavailable, "identity_unavailable"),
     ];
 
     #[test]

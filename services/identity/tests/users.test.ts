@@ -103,4 +103,38 @@ describeDb("users", () => {
     expect((await lookup(session.body.session_token)).status).toBe(404);
     expect((await call(h, "DELETE", `${base()}/users/${user.id}`)).status).toBe(404);
   });
+
+  // The platform keys app users by UUID (users tables, app_sessions, the sync job).
+  it("user_and_session_ids_are_uuids", async () => {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const user = await createUser("uuid@x.io", "password-uuid-1");
+    expect(user.id).toMatch(uuid);
+    const s = await signIn("uuid@x.io", "password-uuid-1");
+    expect(s.body.session_id).toMatch(uuid);
+    // An id that isn't a UUID is not found, never a database error.
+    expect((await call(h, "GET", `${base()}/users/abcDEF123`)).body.error).toBe("user_not_found");
+    expect((await call(h, "POST", `${base()}/users/abcDEF123/ban`)).body.error).toBe("user_not_found");
+    expect((await call(h, "DELETE", `${base()}/users/abcDEF123/sessions`)).body.error).toBe("user_not_found");
+    expect((await call(h, "GET", `${base()}/sessions/abcDEF123`)).body.error).toBe("session_not_found");
+    expect((await call(h, "DELETE", `${base()}/sessions/abcDEF123`)).body.error).toBe("session_not_found");
+  });
+
+  // `search` matches part of the email, ignoring case; LIKE wildcards are literal.
+  it("list_search_matches_part_of_the_email", async () => {
+    const a = await createUser("Find.Me+one@search.io");
+    const b = await createUser("find_me2@search.io");
+    await createUser("other@search.io");
+    const ids = async (q: string) => {
+      const r = await call(h, "GET", `${base()}/users?search=${encodeURIComponent(q)}&limit=200`, { as: "orchestrator" });
+      expect(r.status, q).toBe(200);
+      expect(r.body.total, q).toBe(r.body.users.length);
+      return (r.body.users as { id: string }[]).map((u) => u.id).sort();
+    };
+    expect(await ids("FIND")).toEqual([a.id, b.id].sort());
+    expect(await ids("me+ONE@")).toEqual([a.id]);
+    expect(await ids("_")).toEqual([b.id]);
+    expect(await ids("%")).toEqual([]);
+    expect(await ids("find%me")).toEqual([]);
+    expect((await call(h, "GET", `${base()}/users?search=${"x".repeat(321)}`)).status).toBe(400);
+  });
 });

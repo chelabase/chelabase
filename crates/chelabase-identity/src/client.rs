@@ -186,7 +186,32 @@ impl Identity {
         limit: u32,
         offset: u32,
     ) -> Result<UserPage, IdentityError> {
-        let query = [("limit", limit.to_string()), ("offset", offset.to_string())];
+        self.users_page(pool, None, limit, offset).await
+    }
+
+    /// The users whose email contains `search`, ignoring case (`%` and `_` match themselves),
+    /// oldest first. `total` counts the matches. `search` is at most 320 characters.
+    pub async fn search_users(
+        &self,
+        pool: &Pool,
+        search: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<UserPage, IdentityError> {
+        self.users_page(pool, Some(search), limit, offset).await
+    }
+
+    async fn users_page(
+        &self,
+        pool: &Pool,
+        search: Option<&str>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<UserPage, IdentityError> {
+        let mut query = vec![("limit", limit.to_string()), ("offset", offset.to_string())];
+        if let Some(search) = search.filter(|s| !s.is_empty()) {
+            query.push(("search", search.to_string()));
+        }
         self.call(&ops::LIST_USERS, Some(pool), None, &query, None)
             .await
     }

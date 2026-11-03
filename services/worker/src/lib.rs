@@ -119,6 +119,10 @@ pub struct Worker<M, S, C, N, P> {
     /// org create/delete, user reads and session deletes. `None` when either is unset; app
     /// users jobs that need it then fail and are retried (P2).
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`):
+    /// app-user pool create/drop and user reads. `None` when either is unset; app users and
+    /// project delete jobs then fail and are retried.
+    pub identity: Option<chelabase_identity::Identity>,
     /// How often every enabled project's users are reconciled (`CHELABASE_APP_USERS_RECONCILE_SECS`).
     pub app_users_reconcile_every: Duration,
     /// How often the member-role sweep runs (`CHELABASE_MEMBER_ROLES_SWEEP_SECS`).

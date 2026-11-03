@@ -2774,8 +2774,34 @@ async fn spawn_app_with_compute_tls(
     operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
 ) -> TestApp {
-    spawn_app_core(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, unused_oidc())
+    spawn_app_core(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, unused_oidc(), None)
         .await
+}
+
+/// An app whose app-user admin routes call `identity_service` (the fake's client, or `None`),
+/// with the users-table writer and the compute client pair given.
+#[allow(dead_code)]
+async fn spawn_app_identity(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    identity_service: Option<chelabase_identity::Identity>,
+    users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
+    compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
+) -> TestApp {
+    spawn_app_core(
+        metadata,
+        jobs,
+        "http://127.0.0.1:9",
+        Mode::SelfHosted,
+        10,
+        None,
+        users_db,
+        None,
+        compute_tls,
+        unused_oidc(),
+        identity_service,
+    )
+    .await
 }
 
 /// RT1 T6: an app whose realtime routes verify members' tokens against `oidc` (a mock JWKS).
@@ -2798,6 +2824,7 @@ async fn spawn_app_oidc(
         None,
         None,
         oidc,
+        None,
     )
     .await
 }
@@ -2814,8 +2841,9 @@ async fn spawn_app_core(
     operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
     oidc: chelabase_auth::ZitadelAuthConfig,
+    identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
-    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None)
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None, identity_service)
         .await
 }
 
@@ -2839,6 +2867,7 @@ async fn spawn_app_member_tokens(
         unused_oidc(),
         None,
         Some(members),
+        None,
     )
     .await
 }
@@ -2859,6 +2888,7 @@ async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: O
         unused_oidc(),
         tenant,
         None,
+        None,
     )
     .await
 }
@@ -2877,6 +2907,7 @@ async fn spawn_app_core_with(
     oidc: chelabase_auth::ZitadelAuthConfig,
     operator_tenant: Option<TenantId>,
     member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
+    identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
     let rt_events = FakeRtEvents::default();
     // Members hub T8: the app's `proxy_cache` (P4; the same `Arc` as the internal state's in
@@ -2905,6 +2936,7 @@ async fn spawn_app_core_with(
         locator: Arc::new(locator.clone()),
         console: Console::default(),
         zitadel,
+        identity_service,
         users_db,
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes: orchestrator::DEFAULT_TABLE_API_DRY_RUN_MAX_BYTES,
