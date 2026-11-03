@@ -436,6 +436,8 @@ services:
       - CHELABASE_STORCON_HOOK_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token
       - CHELABASE_IDENTITY_URL=http://identity:8080
       - CHELABASE_IDENTITY_TOKEN_FILE=${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token
+      # #126: the setup code the dev member's claim (and a first sign-up) needs; the stack's own.
+      - CHELABASE_SETUP_CODE_FILE=${CHELABASE_STACK_DIR}/setup/setup.code
       # Connection strings name the proxy's published port on the host.
       - CHELABASE_PROXY_PG_PORT=${CHELABASE_PROXY_PORT}
       # Bare names: taken from the caller's env, unset when it has none. The runner's live tests
@@ -468,6 +470,7 @@ services:
       - {source: token-app-auth, target: "${CHELABASE_KEYS_DIR}/tokens/app-auth.token"}
       - {source: token-app-sessions, target: "${CHELABASE_KEYS_DIR}/tokens/app-sessions.token"}
       - {source: token-proxy-api, target: "${CHELABASE_KEYS_DIR}/tokens/proxy-api.token"}
+      - {source: stack-setup-code, target: "${CHELABASE_STACK_DIR}/setup/setup.code"}
       - {source: token-storcon-hook, target: "${CHELABASE_KEYS_DIR}/tokens/storcon-hook.token"}
       - {source: token-orchestrator-identity, target: "${CHELABASE_KEYS_DIR}/tokens/orchestrator-identity.token"}
       - {source: member-jwt-public, target: "${CHELABASE_KEYS_DIR}/auth/member-jwt.pub"}
@@ -832,6 +835,8 @@ volumes:
 # `environment:`, never through stack.env.
 secrets:
   secrets-key: {file: "${CHELABASE_KEYS_DIR}/secrets/secrets.key"}
+  # The stack's setup code (`chelabase workbench up` writes it): the orchestrator's, read-only.
+  stack-setup-code: {file: "${CHELABASE_STACK_DIR}/setup/setup.code"}
   internal-signing: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-signing.pem"}
   internal-verify: {file: "${CHELABASE_KEYS_DIR}/gateway/internal-verify.pem"}
   cookie: {file: "${CHELABASE_KEYS_DIR}/auth/cookie.key"}

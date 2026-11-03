@@ -85,8 +85,10 @@ done
 [[ "$(q '.services.runner.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
   fail "runner mounts the state dir read-write at its own path"
 
+# The one exception: the orchestrator reads the stack's setup code (#126), checked below.
 for s in orchestrator worker gateway auth rest realtime studio; do
-  [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\")) | .source")" ]] ||
+  [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\"))
+    | select(\"$s:\" + .source != \"orchestrator:/m/.chelabase/stacks/feat-x/setup/setup.code\") | .source")" ]] ||
     fail "$s mounts nothing from the state dir (it opens no state file)"
 done
 for s in mailpit identity orchestrator worker gateway auth rest; do
@@ -427,4 +429,28 @@ published_base="$(bq '[.services | to_entries[] | select(.value.ports) | .key] |
 # auth-replacement m5 (#118): the base identity service owns its /run/identity tmpfs.
 bq '.services.identity.tmpfs // [] | .[]' | grep -Fqx '/run/identity:uid=10001,gid=10001,mode=0700' ||
   fail "base identity's /run/identity tmpfs is uid 10001's own"
+# m13 fix (#126): the dev member claims the stack's tenant with the setup code, and only the
+# orchestrator checks it. Without the code it answers every first sign-up `sign_up_closed`, so a
+# fresh workbench stack's bootstrap failed. It reads the stack's own code file, mounted read-only.
+code=/m/.chelabase/stacks/feat-x/setup/setup.code
+want_env orchestrator CHELABASE_SETUP_CODE_FILE "$code"
+[[ "$(q ".services.orchestrator.volumes[] | select(.target == \"$code\") | \"\(.source) \(.read_only // false)\"")" == "$code true" ]] ||
+  fail "the orchestrator mounts the stack's setup code read-only at $code"
+# The invariant behind it: an app's workbench `environment: !override` drops the base file's keys.
+# Every *_FILE key a base app service sets is set again in the workbench (its environment or
+# stack.env), or is named here with why the workbench doesn't need it.
+not_in_workbench=(
+  orchestrator:CHELABASE_METADATA_DATABASE_PASSWORD_FILE # stack.env's URL carries the password
+  worker:CHELABASE_METADATA_DATABASE_PASSWORD_FILE       # likewise
+  orchestrator:CHELABASE_PROXY_CA_FILE                   # a file name, defaulted by the service
+  identity:CHELABASE_SMTP_PASSWORD_FILE                  # Mailpit takes no SMTP login
+)
+for s in $(bq '.services | keys[]'); do
+  [[ "$(q ".services[\"$s\"].image // empty")" == chelabase-workbench:fixture000000 || $s == identity ]] || continue
+  for k in $(bq ".services[\"$s\"].environment // {} | keys[] | select(endswith(\"_FILE\"))"); do
+    [[ " ${not_in_workbench[*]} " == *" $s:$k "* ]] && continue
+    [[ -n "$(eff_env "$s" "$k")" ]] ||
+      fail "$s: the base sets $k, but the workbench drops it (set it in the overlay, or list it in not_in_workbench with why)"
+  done
+done
 echo "workbench-compose: ok"

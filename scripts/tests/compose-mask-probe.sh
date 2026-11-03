@@ -26,7 +26,7 @@ keys="$main/.chelabase"
 checkout="$main/.worktrees/x"
 state="$keys/stacks/x"
 mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrator-tls/v1,nats,valkey,realtime,tokens,identity} \
-  "$state"/{env,nats,valkey,bootstrap,neon,logs,test,runner} "$keys/stacks/other" "$checkout"
+  "$state"/{env,nats,valkey,bootstrap,neon,logs,test,runner,setup} "$keys/stacks/other" "$checkout"
 # RT1 T1: the service secrets (S1, S27) and the storage auth files exist too; the orchestrator
 # reads its own NATS and Valkey passwords, realtime's internal token and the internal bearers.
 for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verify.pem auth/cookie.key \
@@ -46,8 +46,9 @@ for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verif
   echo "content of $f" >"$keys/$f"
 done
 ln -s v1 "$keys/orchestrator-tls/current"
-# The stack's state dir lies under the masked keys dir too; the orchestrator sees none of it.
-for f in env/stack.env bootstrap/dev-member.json bootstrap/dev-token.json studio.env nats/auth.conf valkey/users.acl binaries.json neon/proxy-ca.crt \
+# The stack's state dir lies under the masked keys dir too; the orchestrator sees only its setup
+# code (#126: the dev member's claim needs it).
+for f in setup/setup.code env/stack.env bootstrap/dev-member.json bootstrap/dev-token.json studio.env nats/auth.conf valkey/users.acl binaries.json neon/proxy-ca.crt \
   runner/.curlrc logs/x test/archive.tar.zst; do
   echo "content of $f" >"$state/$f"
 done
@@ -73,14 +74,15 @@ readable=(secrets/secrets.key gateway/internal-verify.pem neon/compute-jwt.pem n
   orchestrator-tls/current/client.crt orchestrator-tls/current/client.key orchestrator-tls/current/ca.crt
   nats/orchestrator.password valkey/control.password realtime/internal.token
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token
-  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub)
+  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub
+  stacks/x/setup/setup.code)
 expected="$(printf '%s\n' "$keys/secrets/secrets.key" "$keys/gateway/internal-verify.pem" \
   "$keys/neon/compute-jwt.pem" "$keys/neon/compute-jwt.pub" "$keys/orchestrator-tls/current" \
   "$keys/orchestrator-tls/v1/client.crt" "$keys/orchestrator-tls/v1/client.key" "$keys/orchestrator-tls/v1/ca.crt" \
   "$keys/nats/orchestrator.password" "$keys/valkey/control.password" "$keys/realtime/internal.token" \
   "$keys/tokens/rest-internal.token" "$keys/tokens/data-keys.token" "$keys/tokens/app-auth.token" \
   "$keys/tokens/app-sessions.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
-  "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" | sort)"
+  "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" "$state/setup/setup.code" | sort)"
 
 script='set -e
 for f in "$@"; do cat "$f" >/dev/null || { echo "UNREADABLE $f"; exit 3; }; done
