@@ -1,5 +1,5 @@
 //! RT1 T7 coder's edge tests, beyond the RED set: name and id spellings at the join, the 64 KB
-//! boundary, JWKS down at the first frame and at a renewal, the S16 reprobe on
+//! boundary, the verifier down at the first frame and at a renewal, the S16 reprobe on
 //! re-authorization, a degraded channel recovering, `changed` batches re-checking every
 //! selected member, access events that don't match their subject, project channel edges.
 
@@ -150,7 +150,7 @@ async fn open_sockets_stay_up_while_valkey_is_down() {
     );
 }
 
-// --- JWKS down ----------------------------------------------------------------------------------
+// --- verifier down ------------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_first_token_that_cant_be_checked_closes_try_again_later() {

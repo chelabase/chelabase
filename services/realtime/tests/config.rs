@@ -14,7 +14,7 @@ struct Env {
 }
 
 impl Env {
-    /// The minimum: the ticket key file, the internal token file and the OIDC host.
+    /// The minimum: the ticket key file, the internal token file and the auth host.
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         let mut env = Env {

@@ -291,7 +291,7 @@ async fn live_pair() -> (Live, Live) {
         let identity = Arc::new(InternalVerifier::from_pem(verify_pem.as_bytes()).unwrap());
         let deps = Deps::connect(&config, identity)
             .await
-            .expect("NATS, Valkey and OIDC with the runner's credentials");
+            .expect("NATS, Valkey and the member-token key with the runner's credentials");
         out.push(Live {
             rt: build_with(config, deps).await.expect("realtime starts"),
             signer: signer.clone(),
@@ -712,7 +712,7 @@ async fn live_with(tune: impl FnOnce(&mut Config)) -> Live {
     let identity = Arc::new(InternalVerifier::from_pem(verify_pem.as_bytes()).unwrap());
     let deps = Deps::connect(&config, identity)
         .await
-        .expect("NATS, Valkey, OIDC and the replication source with the runner's credentials");
+        .expect("NATS, Valkey, the member-token key and the replication source with the runner's credentials");
     Live {
         rt: build_with(config, deps).await.expect("realtime starts"),
         signer,

@@ -1,5 +1,5 @@
 //! The socket tests' harness: realtime in-process (`app::build_with`) on ephemeral loopback
-//! ports with the in-memory store and bus, the fake change source, the fake OIDC verifier, a
+//! ports with the in-memory store and bus, the fake change source, the fake member-token verifier, a
 //! gateway identity signer of the test's own and a fake orchestrator serving T6's
 //! `/internal/realtime/{authorize,projects}` answers. Several instances share the store, the bus
 //! and the orchestrator, as instances share Valkey, NATS and the orchestrator.

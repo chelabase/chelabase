@@ -77,7 +77,7 @@ const SINK_QUEUE: usize = 256;
 const PROJECT_REFRESH_GAP: Duration = Duration::from_millis(250);
 /// RFC 6455 "policy violation": the client stopped reading.
 const CLOSE_TOO_SLOW: u16 = 1008;
-/// RFC 6455 "try again later": the token can't be checked now (JWKS down) or Valkey is down.
+/// RFC 6455 "try again later": the token can't be checked now (no member-token key) or Valkey is down.
 const CLOSE_TRY_LATER: u16 = 1013;
 
 fn unix_ms() -> u64 {
@@ -836,7 +836,7 @@ impl Session {
         let member = match verified {
             Ok(m) => m,
             Err(TokenError::Unavailable) => {
-                tracing::warn!("a socket's token can't be checked now (JWKS)");
+                tracing::warn!("a socket's token can't be checked now (the member-token verifier)");
                 self.close(CLOSE_TRY_LATER, "the token can't be checked now")
                     .await;
                 return Flow::Stop;
@@ -877,7 +877,7 @@ impl Session {
             Ok(m) => m,
             Err(TokenError::Unavailable) => {
                 // Not a failed renewal: the token in hand stands until its own exp.
-                tracing::warn!("a renewal can't be checked now (JWKS): the current token stands");
+                tracing::warn!("a renewal can't be checked now (the member-token verifier): the current token stands");
                 return Flow::Go;
             }
             Err(_) => {

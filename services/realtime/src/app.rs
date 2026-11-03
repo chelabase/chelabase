@@ -1,7 +1,7 @@
 //! The service: its dependencies, its two listeners and its handle.
 //!
 //! - [`build`]: production dependencies from the [`Config`] (the gateway's verify key file,
-//!   OIDC, NATS, Valkey; T8's change source), then [`build_with`].
+//!   auth's member-token key, NATS, Valkey; T8's change source), then [`build_with`].
 //! - [`Deps::connect`]: the same dependencies with a given identity verifier (the live tests
 //!   sign their own identities: the runner has no gateway key).
 //! - [`build_with`]: binds `config.addr` and `config.internal_addr` (port 0 for an ephemeral

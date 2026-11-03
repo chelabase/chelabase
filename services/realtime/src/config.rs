@@ -130,8 +130,8 @@ pub struct Config {
     /// replication session logs in with, and the `ca.crt` it verifies the compute against; the
     /// worker writes and renews it.
     pub realtime_tls_dir: PathBuf,
-    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (#119): auth's member-token public key, checked against
-    /// the same issuer as the OIDC settings. `None`: every member token is refused.
+    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (#119): auth's member-token public key; tokens must name
+    /// the auth host's issuer. `None`: every member token is refused.
     pub member_jwt_public_key: Option<PathBuf>,
 }
 
@@ -159,7 +159,7 @@ fn read_secret_text(var: &str, path: &str) -> anyhow::Result<String> {
 }
 
 impl Config {
-    /// The defaults of the table above with this key and token (no OIDC settings, anonymous
+    /// The defaults of the table above with this key and token (no member-token key, anonymous
     /// NATS and Valkey); tests set the rest.
     pub fn with_defaults(ticket_key: TicketKey, internal_token: &str) -> Self {
         Self {
