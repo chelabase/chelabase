@@ -34,8 +34,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Some(ProjectStatus::Deleting) => {}
             Some(ProjectStatus::Deleted) | None => {
                 // A redelivery of a finished delete, or one that finished before the drop
-                // moved ahead of the rows: only the pool may be left.
-                return drop_pool(self.identity()?, project).await;
+                // moved ahead of the rows: only the pool may be left. Without an identity
+                // client there is nothing to retry for: acked, so the job doesn't sit in the
+                // queue for ever.
+                return match self.identity.as_ref() {
+                    Some(identity) => drop_pool(identity, project).await,
+                    None => {
+                        warn!(%project, "project already deleted and no identity service is configured; a pool left behind isn't dropped");
+                        Ok(())
+                    }
+                };
             }
             Some(status) => {
                 info!(%project, status = status.as_str(), "project not deleting; dropping the delete job");
@@ -291,6 +299,35 @@ mod tests {
         s.w.handle_project_delete(s.project).await.unwrap();
         assert!(s.pool_exists().await);
         assert!(s.pool_calls().iter().all(|c| !c.starts_with("DELETE")));
+    }
+
+    /// Re-audit nit: a redelivered delete for a project already `deleted` (or gone) with no
+    /// identity client configured is acked with a warning, not redelivered for ever; one for
+    /// a project still `deleting` is retried as before.
+    #[tokio::test]
+    async fn a_delete_of_a_deleted_project_without_identity_acks() {
+        let mut s = setup(AppUsersStatus::Enabled).await;
+        s.w.identity = None;
+        s.w.metadata
+            .state()
+            .projects
+            .get_mut(&s.project)
+            .unwrap()
+            .status = ProjectStatus::Deleted;
+        s.w.handle_project_delete(s.project).await.unwrap();
+        s.w.metadata.state().projects.remove(&s.project);
+        s.w.handle_project_delete(s.project).await.unwrap();
+
+        let s = setup(AppUsersStatus::Enabled).await;
+        set_deleting(&s);
+        databases_gone(&s);
+        let mut s = s;
+        s.w.identity = None;
+        s.w.handle_project_delete(s.project).await.unwrap_err();
+        assert_eq!(
+            s.w.metadata.state().projects[&s.project].status,
+            ProjectStatus::Deleting
+        );
     }
 
     /// B4: the periodic pass has no message to redeliver: the project stays `deleting` until

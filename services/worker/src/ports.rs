@@ -614,6 +614,12 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         &self,
         project: ProjectId,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// Records or clears reconcile's last error on an `enabled` row only.
+    fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> impl Future<Output = Result<(), MetadataError>> + Send;
     fn enabled_app_projects(
         &self,
     ) -> impl Future<Output = Result<Vec<ProjectAuth>, MetadataError>> + Send;
@@ -1376,6 +1382,14 @@ impl WorkerMetadata for MetadataClient {
 
     async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
         MetadataClient::finish_disable_app_users(self, project).await
+    }
+
+    async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        MetadataClient::set_app_users_error(self, project, error).await
     }
 
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

@@ -17,7 +17,7 @@ use chelabase_secrets::{open_role_password, seal_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::app_users_sql::{
@@ -375,12 +375,36 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return Ok(());
         }
         drop_pool(identity, project).await?;
-        self.metadata
+        let finished = self
+            .metadata
             .finish_disable_app_users(project)
             .await
             .map_err(|e| e.to_string())?;
-        info!(%project, "app users disabled");
+        if finished {
+            info!(%project, "app users disabled");
+        } else {
+            // The residual window: a finished copy plus a new enable took the row between the
+            // re-read and the drop, so the drop may have hit the enable's pool. Reconcile
+            // records a pool gone from an `enabled` row (`pool_gone`).
+            warn!(%project, "the app users row changed under the disable after its re-read; its pool drop may have hit a newer enable's pool");
+        }
         Ok(())
+    }
+
+    /// An `enabled` project whose pool is gone from the identity service (the disable/enable
+    /// window above, or a pool dropped by hand): no retry can bring it back, so the job is
+    /// acked with the error on the row, where `GET …/app-users` and Studio show it, and in
+    /// the log. A pool back in place clears it on the next reconcile pass.
+    async fn pool_gone(&self, project: ProjectId) -> Result<(), String> {
+        let error = format!(
+            "the app-user pool {} is gone from the identity service; its users can't sign in or be synced",
+            app_pool(project)
+        );
+        error!(%project, "{error}");
+        self.metadata
+            .set_app_users_error(project, Some(&error))
+            .await
+            .map_err(|e| e.to_string())
     }
 
     /// Applies one user's state in the pool to the users table on every live branch of the
@@ -415,10 +439,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             Err(IdentityError::NotFound(Missing::User)) => None,
             // Before the enable made the pool there is nothing to sync yet; once enabled a
             // missing pool is trouble, never "every user is gone".
-            Err(IdentityError::NotFound(Missing::Pool))
-                if auth.status == AppUsersStatus::Enabling =>
-            {
-                return Ok(());
+            Err(IdentityError::NotFound(Missing::Pool)) => {
+                return if auth.status == AppUsersStatus::Enabling {
+                    Ok(())
+                } else {
+                    self.pool_gone(job.project_id).await
+                };
             }
             Err(e) => return Err(format!("reading user {user_id}: {e}")),
         };
@@ -506,6 +532,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     ///
     /// Every banned user's app sessions are revoked on every pass, matching row or not: a
     /// sign-in that raced the ban leaves a session no row difference shows.
+    ///
+    /// What a pass can't put right is on the row's `error` (`GET …/app-users`, Studio): a
+    /// pool gone from the identity service ([`Worker::pool_gone`]), or the first branch it
+    /// couldn't upgrade (a `banned_at` column of another type, say). A pass that upgrades
+    /// every branch clears it.
     pub async fn reconcile_app_users(&self, project: ProjectId) -> Result<(), String> {
         let auth = self
             .metadata
@@ -522,10 +553,13 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         loop {
             let page = match identity.list_users(&pool, PAGE, offset).await {
                 Ok(page) => page,
-                Err(IdentityError::NotFound(Missing::Pool))
-                    if auth.status == AppUsersStatus::Enabling =>
-                {
-                    return Ok(());
+                // Before the enable made the pool there is nothing to reconcile yet.
+                Err(IdentityError::NotFound(Missing::Pool)) => {
+                    return if auth.status == AppUsersStatus::Enabling {
+                        Ok(())
+                    } else {
+                        self.pool_gone(project).await
+                    };
                 }
                 Err(e) => return Err(format!("listing the pool's users: {e}")),
             };
@@ -550,9 +584,17 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let mut seen = HashSet::new();
         let mut stale = Vec::new();
         let mut gone: Vec<(Uuid, HashSet<BranchId>)> = Vec::new();
+        // The first branch the pass couldn't upgrade, for the row.
+        let mut not_upgraded: Option<String> = None;
         for (branch, ep) in self.live_branches(auth.database_id).await? {
             if let Err(e) = self.upgrade_users_on(&branch, &ep, &auth).await {
                 warn!(branch = %branch.id, %project, "upgrading the users machinery; skipped: {e:#}");
+                not_upgraded.get_or_insert_with(|| {
+                    format!(
+                        "upgrading the users machinery on branch {}: {e:#}",
+                        branch.name
+                    )
+                });
                 continue;
             }
             let rows = self
@@ -595,6 +637,12 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     None => gone.push((id, HashSet::from([branch.id]))),
                 }
             }
+        }
+        if not_upgraded.is_some() || auth.error.is_some() {
+            self.metadata
+                .set_app_users_error(project, not_upgraded.as_deref())
+                .await
+                .map_err(|e| format!("recording the reconcile outcome: {e}"))?;
         }
         let job = |user_id| AppUsersSyncJob {
             project_id: project,
@@ -868,6 +916,54 @@ pub(crate) mod tests {
 
     fn count(journal: &Journal, entry: &str) -> usize {
         entries(journal).iter().filter(|e| *e == entry).count()
+    }
+
+    /// Everything logged on this thread while the guard lives, as plain text (no colours).
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Logs {
+            self.clone()
+        }
+    }
+
+    impl std::fmt::Display for Logs {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&String::from_utf8_lossy(&self.0.lock().unwrap()))
+        }
+    }
+
+    impl Logs {
+        /// `#[tokio::test]` runs on one thread, so a thread-local default sees the whole test.
+        fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
+            let logs = Logs::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::TRACE)
+                .finish();
+            (logs, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The lines at `level` containing every one of `needles`.
+        fn lines_with(&self, level: &str, needles: &[&str]) -> usize {
+            self.to_string()
+                .lines()
+                .filter(|l| l.contains(level) && needles.iter().all(|n| l.contains(n)))
+                .count()
+        }
     }
 
     fn enable(s: &Setup) -> AppUsersJob {
@@ -1291,6 +1387,121 @@ pub(crate) mod tests {
         assert!(s.pool_exists().await, "the new enable's pool was dropped");
     }
 
+    /// Re-audit S1: the residual window is between the re-read and the drop. A copy overtaken
+    /// there drops the new enable's pool and `finish_disable_app_users` finds no `disabling`
+    /// row; the disable says so at warn, naming the project, instead of "app users disabled".
+    #[tokio::test]
+    async fn a_disable_overtaken_after_its_reread_warns() {
+        let (logs, _guard) = Logs::capture();
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        // The first read and the re-read both see `disabling`; the row changes just after.
+        {
+            let mut state = s.w.metadata.state();
+            state.after_auth_read = Some(Some(AppUsersStatus::Enabling));
+            state.after_auth_read_skip = 1;
+        }
+
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            s.w.metadata.auth(s.project).map(|a| a.status),
+            Some(AppUsersStatus::Enabling),
+            "the enable's row is left alone"
+        );
+        assert!(
+            !s.pool_exists().await,
+            "the window: the enable's pool is dropped"
+        );
+        assert_eq!(
+            logs.lines_with(
+                "WARN",
+                &[&s.project.to_string(), "changed under the disable"]
+            ),
+            1,
+            "{logs}"
+        );
+        assert_eq!(logs.lines_with("INFO", &["app users disabled"]), 0, "{logs}");
+    }
+
+    /// Re-audit S2 (the auditor's `adv_enabled_without_a_pool_is_silent_and_permanent`,
+    /// inverted): an `enabled` project whose pool is gone has the error recorded on its row,
+    /// at error level in the log, and its jobs acked rather than redelivered for ever. A pool
+    /// back in place clears it on the next pass.
+    #[tokio::test]
+    async fn an_enabled_project_whose_pool_is_gone_records_the_error() {
+        let (logs, _guard) = Logs::capture();
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+
+        s.w.app_users_reconcile_once().await;
+        s.w.app_users_reconcile_once().await;
+
+        assert!(!s.pool_exists().await);
+        let auth = s.w.metadata.auth(s.project).unwrap();
+        assert_eq!(auth.status, AppUsersStatus::Enabled);
+        let error = auth.error.expect("the gone pool is on the row");
+        assert!(error.contains(&s.pool().to_string()), "{error}");
+        assert_eq!(
+            logs.lines_with("ERROR", &[&s.project.to_string(), &s.pool().to_string()]),
+            2,
+            "{logs}"
+        );
+        // The jobs are acked: nothing a redelivery could do.
+        s.w.handle_app_users_job(&AppUsersJob::Reconcile {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+        s.w.handle_app_users_sync(&sync_job(&s, Uuid::new_v4()))
+            .await
+            .unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, Some(error));
+
+        // The pool back (an operator's repair): the next pass clears the error.
+        s.with_pool();
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, None);
+    }
+
+    /// Re-audit S2: a branch reconcile can't upgrade (a `banned_at` collision, say) is on the
+    /// row, naming the branch, until a pass upgrades it.
+    #[tokio::test]
+    async fn a_branch_reconcile_cannot_upgrade_is_on_the_row() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        s.w.computes.answer("chelabase.app_users_rows()", "[]");
+        s.w.computes.answer_at(&ep(&s.dev), "to_regprocedure", "t\n");
+        *s.w.computes.fail_sql_containing.lock().unwrap() = Some((
+            BOOTSTRAP.into(),
+            "column \"banned_at\" of relation \"users\" already exists".into(),
+        ));
+
+        s.w.reconcile_app_users(s.project).await.unwrap();
+
+        let error =
+            s.w.metadata
+                .auth(s.project)
+                .unwrap()
+                .error
+                .expect("the skipped branch is on the row");
+        assert!(
+            error.contains("dev") && error.contains("upgrading") && error.contains("banned_at"),
+            "{error}"
+        );
+
+        // The upgrade goes through: cleared.
+        *s.w.computes.fail_sql_containing.lock().unwrap() = None;
+        s.w.reconcile_app_users(s.project).await.unwrap();
+        assert_eq!(s.w.metadata.auth(s.project).unwrap().error, None);
+        // The failed script isn't on the fake's log; the one that went through is.
+        assert_eq!(scripts(&s.w, &ep(&s.dev), "app", BOOTSTRAP).len(), 1);
+    }
+
     /// S2: an enable whose row went while it made the pool (the project's delete ran) drops
     /// what it made, so no pool outlives the project.
     #[tokio::test]
@@ -1491,14 +1702,17 @@ pub(crate) mod tests {
             .unwrap();
         assert!(s.w.computes.sql.lock().unwrap().is_empty());
 
+        // Enabled without a pool: acked with the error on the row; no session is revoked and
+        // no row is touched (the user isn't "gone", the pool is).
         let s = setup(AppUsersStatus::Enabled).await;
         let user = Uuid::new_v4();
         s.w.metadata.add_session(s.project, user, "s1");
         s.w.handle_app_users_sync(&sync_job(&s, user))
             .await
-            .unwrap_err();
+            .unwrap();
         assert!(s.w.computes.sql.lock().unwrap().is_empty());
         assert_eq!(count(&s.journal, "metadata.revoke_user_sessions"), 0);
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some());
     }
 
     #[tokio::test]
@@ -1708,14 +1922,16 @@ pub(crate) mod tests {
             assert!(ran.contains(&gone_call_sql(ghost, false)));
         }
 
-        // A pool that is gone while the project is enabled is an error, not an empty listing.
+        // A pool that is gone while the project is enabled is an error on the row, not an
+        // empty listing: no row is touched.
         let s = setup(AppUsersStatus::Enabled).await;
         s.w.computes.answer(
             "chelabase.app_users_rows()",
             &json!([{"id": Uuid::new_v4(), "email": "a@x.io", "email_verified": true, "deleted_at": null}]).to_string(),
         );
-        s.w.reconcile_app_users(s.project).await.unwrap_err();
+        s.w.reconcile_app_users(s.project).await.unwrap();
         assert!(scripts(&s.w, &ep(&s.main), "app", "BEGIN;").is_empty());
+        assert!(s.w.metadata.auth(s.project).unwrap().error.is_some());
     }
 
     /// N4: a listing that would delete most rows (an empty pool) deletes nothing; stale rows

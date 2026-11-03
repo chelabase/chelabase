@@ -829,6 +829,14 @@ impl<M: WorkerMetadata> WorkerMetadata for PublishingMetadata<M> {
         self.inner.finish_disable_app_users(project).await
     }
 
+    async fn set_app_users_error(
+        &self,
+        project: ProjectId,
+        error: Option<&str>,
+    ) -> Result<(), MetadataError> {
+        self.inner.set_app_users_error(project, error).await
+    }
+
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
         self.inner.enabled_app_projects().await
     }
