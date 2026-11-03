@@ -995,7 +995,11 @@ impl members::MembersPort for Doc {
     ) -> Result<chelabase_metadata::members::MemberListing, DocWriteError> {
         match *self {}
     }
-    async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
+    async fn other_memberships(
+        &self,
+        identity_user_id: &str,
+        except: Option<Uuid>,
+    ) -> Result<chelabase_metadata::members::OtherMemberships, MetadataError> {
         match *self {}
     }
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, DocWriteError> {

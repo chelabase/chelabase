@@ -10,7 +10,7 @@
 
 use chelabase_metadata::members::{
     AccessAction, AccessEvent, AccessWriteError, Admission, GrantRow, MemberBranchRole,
-    MemberStatus, NewInvite, Observed, OverrideRow, TeamSeen,
+    MemberStatus, NewInvite, Observed, OtherMemberships, OverrideRow, TeamSeen,
 };
 use chelabase_metadata::personal_logins::{
     AccessEventInput, GrantVia, LoginEndpoint, LoginStatus, LoginWriteError, MemberProjectRole,
@@ -696,11 +696,11 @@ async fn invited_becomes_active_on_ensure() {
     s.finish().await;
 }
 
-// One Zitadel user in two tenants: each membership sees the other until it is removed; the
-// user's last membership has no other.
+// One identity user in two tenants: each membership sees the other until it is removed (`live`),
+// and an active one only while it is active (`active`); the user's last membership has no other.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn other_membership_is_any_tenants_non_removed_row() {
+async fn other_memberships_are_any_tenants_non_removed_rows() {
     let s = Scratch::new().await;
     let (t1, t2) = (s.tenant().await, s.tenant().await);
     let mut admins = Vec::new();
@@ -720,21 +720,29 @@ async fn other_membership_is_any_tenants_non_removed_row() {
         admins.push(admin.id);
         zs.push(z.id);
     }
-    // Someone else's row (another Zitadel user) never counts.
+    let both = OtherMemberships { active: true, live: true };
+    let none = OtherMemberships::default();
+    // Someone else's row (another identity user) never counts.
     s.client
         .ensure_member_first_comer_for_tests(t1, "y", "", "Y", Admission::Active)
         .await
         .unwrap();
-    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
-    assert!(s.client.has_other_membership(zs[1]).await.unwrap());
-    assert!(!s.client.has_other_membership(admins[0]).await.unwrap());
-    assert!(!s.client.has_other_membership(Uuid::new_v4()).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", Some(zs[0])).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("z", Some(zs[1])).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("z", None).await.unwrap(), both);
+    assert_eq!(s.client.other_memberships("nobody", None).await.unwrap(), none);
+    // A suspended row is live but not active.
+    s.client.suspend_member(admins[1], zs[1]).await.unwrap();
+    assert_eq!(
+        s.client.other_memberships("z", Some(zs[0])).await.unwrap(),
+        OtherMemberships { active: false, live: true }
+    );
     s.client.remove_member(admins[0], zs[0]).await.unwrap();
     // The removed row no longer counts for the other; the removed one still sees the other.
-    assert!(!s.client.has_other_membership(zs[1]).await.unwrap());
-    assert!(s.client.has_other_membership(zs[0]).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", Some(zs[1])).await.unwrap(), none);
+    assert!(s.client.other_memberships("z", Some(zs[0])).await.unwrap().live);
     s.client.remove_member(admins[1], zs[1]).await.unwrap();
-    assert!(!s.client.has_other_membership(zs[0]).await.unwrap());
+    assert_eq!(s.client.other_memberships("z", None).await.unwrap(), none);
     s.finish().await;
 }
 

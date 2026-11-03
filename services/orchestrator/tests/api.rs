@@ -16188,7 +16188,8 @@ async fn remove_partial_failure_is_finished_by_a_retry() {
     }
 }
 
-// A failed login write is a 500 with the member already out, and the retry does what it skipped.
+// A failed login write is a retryable 503 with the member already out, and the retry does what
+// it skipped.
 #[tokio::test]
 async fn remove_login_step_failure_is_finished_by_a_retry() {
     let t = mw(Mode::SelfHosted).await;
@@ -16196,7 +16197,8 @@ async fn remove_login_step_failure_is_finished_by_a_retry() {
     t.identity.with_session(&Pool::Members, &sub);
     *t.w.metadata.fail_offboard.lock().unwrap() = true;
     let path = format!("/v1/members/{member}");
-    error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 500).await;
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
     assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Removed);
     *t.w.metadata.fail_offboard.lock().unwrap() = false;
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
@@ -16465,6 +16467,123 @@ async fn invite_create_conflict_is_retryable() {
     // The user was not really made by the forced fault, so the re-read finds nobody: a retryable 503.
     let err = error_of(err, 503).await;
     assert_eq!(code_of(&err), "identity_unavailable");
+}
+
+// #122 N4: the create lost to a concurrent invite that made the same user: the search runs once
+// more and this invite goes to that user.
+#[tokio::test]
+async fn invite_create_lost_to_a_concurrent_invite_uses_that_user() {
+    let t = mw(Mode::SelfHosted).await;
+    t.identity.fail_after("POST /internal/v1/pools/members/users", 409, "conflict", 1);
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "race@x.io", "developer", &["app"]))).await).await;
+    assert_eq!(body["outcome"], "invited");
+    let sub = sub_of(&t, "race@x.io");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Invited);
+    assert!(t.identity.user(&Pool::Members, &sub).is_some(), "not this call's user: never deleted");
+}
+
+// #122 B1: a failed offboard write doesn't skip the identity half of a removal: the sessions end
+// and the account is banned in the same request, the answer is a retryable 503, and a retry
+// finishes the write.
+#[tokio::test]
+async fn adv_remove_offboard_failure_still_ends_identity_access() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "adv5@x.com");
+    t.identity.with_session(&Pool::Members, &sub);
+    *t.w.metadata.fail_offboard.lock().unwrap() = true;
+    let _ = t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await;
+    assert_eq!(t.identity.session_count(&Pool::Members), 0, "sessions left alive after the 500");
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned, "not banned after the 500");
+}
+
+// #122 B1, decline: the same.
+#[tokio::test]
+async fn decline_offboard_failure_still_ends_identity_access() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_unverified_user(&Pool::Members, "pia@x.com", "Secret-pass1");
+    let pia = t.w.metadata.add_member(t.w.tenant, &sub, MemberStatus::Pending, false);
+    t.identity.with_session(&Pool::Members, &sub);
+    *t.w.metadata.fail_offboard.lock().unwrap() = true;
+    let path = format!("/v1/members/{pia}/decline");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable", "{err}");
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+    assert!(t.identity.user(&Pool::Members, &sub).unwrap().banned);
+    *t.w.metadata.fail_offboard.lock().unwrap() = false;
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 204);
+    assert!(t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded);
+}
+
+// #122 S1 (decided): removal from the last *active* tenant always ends the sessions; the account
+// is banned only when no other non-removed row exists, so an open invite, a pending sign-up or a
+// suspension elsewhere keeps it usable for that acceptance, approval or reinstatement.
+#[tokio::test]
+async fn adv_remove_ends_sessions_while_only_an_inactive_row_remains() {
+    for other in [MemberStatus::Invited, MemberStatus::Pending, MemberStatus::Suspended] {
+        let t = mw(Mode::SelfHosted).await;
+        let (member, sub) = identity_member(&t, "adv1@x.com");
+        second_tenant(&t, &sub, other);
+        t.identity.with_session(&Pool::Members, &sub);
+        assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{member}"), None).await.status(), 204, "{other:?}");
+        assert_eq!(t.identity.session_count(&Pool::Members), 0, "{other:?}: no other active tenant");
+        let user = t.identity.user(&Pool::Members, &sub).unwrap();
+        assert!(!user.banned, "{other:?}: another row lives: {user:?}");
+    }
+}
+
+// #122 S1, suspend: the sessions end when no other tenant holds them as an active member.
+#[tokio::test]
+async fn suspend_ends_sessions_when_the_only_other_row_is_an_open_invite() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "two@x.com");
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    t.identity.with_session(&Pool::Members, &sub);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    assert_eq!(t.identity.session_count(&Pool::Members), 0);
+    assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
+}
+
+// #122 S2: an account banned for a reason that isn't ours keeps the offboarded mark on reinstate,
+// so the row doesn't become usable while the identity service still bans the person.
+#[tokio::test]
+async fn adv_reinstate_with_a_foreign_ban_keeps_the_offboarded_mark() {
+    let t = mw(Mode::SelfHosted).await;
+    let (member, sub) = identity_member(&t, "sue@x.com");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
+    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == member).unwrap().offboarded = true;
+    t.identity.client().ban(&Pool::Members, &sub, Some("abuse")).await.unwrap();
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/reinstate"), None).await.status(), 200);
+    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
+    assert_eq!(stored.status, MemberStatus::Active);
+    assert!(stored.offboarded, "the mark stays while the foreign ban does");
+    assert_eq!(t.identity.user(&Pool::Members, &sub).unwrap().ban_reason.as_deref(), Some("abuse"));
+}
+
+// #122 S3: an invite that fails before its member row is written deletes the user it made only
+// when no other tenant's row references it by then.
+#[tokio::test]
+async fn invite_failing_before_its_row_keeps_a_user_another_tenant_reached() {
+    for shared in [true, false] {
+        let t = mw(Mode::SelfHosted).await;
+        let team = t.w.metadata.seed_team(t.w.tenant, "Racy");
+        t.w.metadata.seed_team_grant(team, t.w.project, PlatformRole::Viewer, &[]);
+        let project = t.w.project;
+        // The team changes before each write, so the store gives up after its retries.
+        t.w.metadata.race_teams_once(move |md| md.seed_team_grant(team, project, PlatformRole::Developer, &[]));
+        let identity = t.identity.clone();
+        t.w.metadata.race_teams_once(move |md| {
+            md.seed_team_grant(team, project, PlatformRole::Viewer, &[]);
+            if shared {
+                // Another tenant's invite reaches the new user meanwhile.
+                let sub = identity.user_by_email(&Pool::Members, "new@x.com").expect("made by this call");
+                md.add_member(TenantId::new(), &sub, MemberStatus::Invited, false);
+            }
+        });
+        let body = json!({ "email": "new@x.com", "grants": [], "team_ids": [team] });
+        error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 409).await;
+        let left = t.identity.user_by_email(&Pool::Members, "new@x.com");
+        assert_eq!(left.is_some(), shared, "shared: {shared}");
+    }
 }
 
 // A removed member keeps the mark in metadata; a new invite clears it, or they could never use

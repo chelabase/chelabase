@@ -21,7 +21,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chelabase_metadata::members::{
     AccessEvent as EventRecord, AccessWriteError, GrantRow, InviteState, MemberListing, MemberRecord,
-    MemberStatus, NewInvite, Observed, OpenInvite,
+    MemberStatus, NewInvite, Observed, OpenInvite, OtherMemberships,
     OverrideRow, ProjectAccess, TeamSeen,
 };
 use chelabase_metadata::personal_logins::{
@@ -355,12 +355,13 @@ pub trait MembersPort: Send + Sync + 'static {
         teams: &[TeamSeen],
     ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
 
-    /// Whether the member's identity user has another non-removed member row, in any tenant: a
-    /// removal, a decline or a revoke then leaves the account alone.
-    fn has_other_membership(
+    /// The identity user's member rows in every tenant but the `except` row: whether one is
+    /// active (its sessions stay) and whether one isn't removed (the account stays unbanned).
+    fn other_memberships(
         &self,
-        member: Uuid,
-    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+        identity_user_id: &str,
+        except: Option<Uuid>,
+    ) -> impl Future<Output = Result<OtherMemberships, MetadataError>> + Send;
 
     /// Declines a pending member: removed. Returns its identity user.
     fn decline_member(
@@ -651,8 +652,8 @@ impl MembersPort for MetadataClient {
         MetadataClient::approve_member(self, actor, member, grants, teams).await
     }
 
-    async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
-        MetadataClient::has_other_membership(self, member).await
+    async fn other_memberships(&self, identity_user_id: &str, except: Option<Uuid>) -> Result<OtherMemberships, MetadataError> {
+        MetadataClient::other_memberships(self, identity_user_id, except).await
     }
 
     async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, AccessWriteError> {
@@ -1205,6 +1206,13 @@ pub(crate) fn unprocessable(message: impl Into<String>) -> ApiError {
 pub(crate) fn internal(what: &str, err: impl std::fmt::Display) -> ApiError {
     error!("{what}: {err}");
     ApiError::internal()
+}
+
+/// A metadata step after the write that failed: 503 `unavailable`, because the same request
+/// again redoes every step after the write and so finishes it.
+fn retry_later(what: &str, step: &str, err: impl std::fmt::Display) -> ApiError {
+    error!("{what}: {step}: {err}");
+    ApiError::new(503, ErrorCode::Unavailable, format!("{what}: a step after the change failed; send the same request again to finish"))
 }
 
 /// A refused write's answer; `not_found` is the message for `NotFound`.
@@ -2288,8 +2296,9 @@ where
 /// Invite step 2 (R29): an `invited` member and its invite, for `existing` (a members-pool user
 /// who isn't a live member here) or a new passwordless user, then the invite is sent (mailed, or
 /// with `Delivery::Link` handed back inside the link, R35). Each step undoes the earlier ones when
-/// it fails: the invite is revoked, and a user this call made is deleted, unless another tenant
-/// holds it by then. A user that existed before is never deleted.
+/// it fails: the invite is revoked, and a user this call made is deleted, unless a member row of
+/// any tenant that isn't removed references it by then. A user that existed before is never
+/// deleted, nor one a concurrent invite made first.
 #[allow(clippy::too_many_arguments)]
 async fn invite_with_code<M, J>(
     state: &AppState<M, J>,
@@ -2314,50 +2323,58 @@ where
     // T9-I1: what the caller sees is read before anything is made (a failed read here leaves
     // nothing behind).
     let visible = visible_projects(state, principal).await?;
-    let created = existing.is_none();
-    let (user, send) = match existing {
-        Some(user) => {
-            let detail = identity
-                .user_detail(&Pool::Members, &user.id)
-                .await
-                .map_err(|err| identity_failed("invite: read user", &err))?;
-            let send = invite_send(identity, Some(&detail), delivery).await?;
-            take_invite_send(&user.id)?;
-            (user.id, send)
-        }
+    // An existing user: what may be sent to them, within their hourly budget.
+    let existing_send = async |user: &User| -> Result<InviteSend, ApiError> {
+        let detail = identity
+            .user_detail(&Pool::Members, &user.id)
+            .await
+            .map_err(|err| identity_failed("invite: read user", &err))?;
+        let send = invite_send(identity, Some(&detail), delivery).await?;
+        take_invite_send(&user.id)?;
+        Ok(send)
+    };
+    let (user, send, created) = match existing {
+        Some(user) => (user.id.clone(), existing_send(&user).await?, false),
         None => {
             let new = NewUser { email, ..NewUser::default() };
             match identity.create_user(&Pool::Members, &new).await {
                 // A new user's first send always fits; it starts the person's count.
                 Ok(user) => {
                     let _ = take_invite_send(&user.id);
-                    (user.id, invite_send(identity, None, delivery).await?)
+                    (user.id, invite_send(identity, None, delivery).await?, true)
                 }
-                // Made by another invite since the search: inviting again finds it.
+                // Made by a concurrent invite since the search: read once more and invite that
+                // user as an existing one (never this call's to delete). Another invite of this
+                // tenant that won is the store's 409 `conflict`.
                 Err(IdentityError::Conflict(_)) => {
                     warn!(request_id = %principal.request_id, "invite: the user was made by another call meanwhile");
-                    return Err(identity_unavailable());
+                    let found = find_identity_user(identity, email)
+                        .await
+                        .map_err(|err| identity_failed("invite: find user again", &err))?;
+                    let Some(user) = found else {
+                        return Err(identity_unavailable());
+                    };
+                    (user.id.clone(), existing_send(&user).await?, false)
                 }
                 Err(err) => return Err(identity_failed("invite: create user", &err)),
             }
         }
     };
-    // Undoes what this call did to the identity user: one it made is deleted, unless another
-    // tenant's invite holds it by now (`member`: this call's member row, once there is one).
-    let undo = |why: &'static str, member: Option<Uuid>| {
+    // Undoes what this call did to the identity user: one it made is deleted, unless a member
+    // row that isn't removed references it by now, in any tenant (another tenant's invite that
+    // reached it meanwhile, or this call's own row when its revoke failed).
+    let undo = |why: &'static str| {
         let user = user.clone();
         async move {
             if !created {
                 return;
             }
-            if let Some(member) = member {
-                match state.metadata.has_other_membership(member).await {
-                    Ok(false) => {}
-                    Ok(true) => return,
-                    Err(err) => {
-                        error!(user_id = %user, "invite: keeping the new user after {why} failed: other memberships unreadable: {err}");
-                        return;
-                    }
+            match state.metadata.other_memberships(&user, None).await {
+                Ok(OtherMemberships { live: false, .. }) => {}
+                Ok(_) => return,
+                Err(err) => {
+                    error!(user_id = %user, "invite: keeping the new user after {why} failed: other memberships unreadable: {err}");
+                    return;
                 }
             }
             if let Err(err) = identity.delete_user(&Pool::Members, &user).await {
@@ -2391,18 +2408,18 @@ where
                 let again = match teams_seen(state, principal.tenant_id, teams).await {
                     Ok(again) => again,
                     Err(err) => {
-                        undo("a team gone", None).await;
+                        undo("a team gone").await;
                         return Err(err);
                     }
                 };
                 if let Err(err) = check_invite(state, None, checked, &again).await {
-                    undo("a refused team", None).await;
+                    undo("a refused team").await;
                     return Err(err);
                 }
                 seen = again;
             }
             Err(err) => {
-                undo("a refused member", None).await;
+                undo("a refused member").await;
                 return Err(write_failed("invite: store", err, "project not found"));
             }
         }
@@ -2424,7 +2441,7 @@ where
             if let Err(failed) = state.metadata.revoke_undelivered_invite(actor, invite).await {
                 error!(%invite, "invite: revoking after a failed send failed: {failed}");
             }
-            undo("a failed send", Some(listing.id)).await;
+            undo("a failed send").await;
             return Err(err);
         }
     };
@@ -2840,7 +2857,7 @@ where
     operation_id = "removeMember",
     tag = "members",
     summary = "Remove a member",
-    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When this was their last membership in any tenant, their account's sessions end and it is banned; while they are a member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Removing a removed member again redoes every step after the removal.",
+    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end, and when no other tenant holds them at all (an open invite, a pending sign-up or a suspension counts) the account is banned too. While they are an active member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Every step runs even when one fails; removing a removed member again redoes every step after the removal.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Removed"),
@@ -2850,7 +2867,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`last_tenant_admin`: the tenant would have no active tenant admin", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`identity_unavailable`: removed in Chelabase (refused at once), but the identity service couldn't end the sessions or ban the account; remove again to finish", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: removed in Chelabase (refused at once), but the identity service couldn't end the sessions or ban the account; `unavailable`: removed, but revoking the personal logins or reading their other memberships failed. Either way, remove again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn remove_member<M, J>(
@@ -2888,10 +2905,12 @@ where
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
+    let ended = end_identity_access(&state, id, &m.identity_user_id, true, "remove member").await;
+    // The first failure is the answer, after every step ran; each is a retryable 503.
     if let Err(err) = offboarded {
-        return internal("remove member: revoke personal logins", err).into_response();
+        return retry_later("remove member", "revoke personal logins", err).into_response();
     }
-    tri!(end_identity_access(&state, id, &m.identity_user_id, true, "remove member").await);
+    tri!(ended);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2977,7 +2996,7 @@ where
     operation_id = "declineMember",
     tag = "members",
     summary = "Decline a sign-up",
-    description = "The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked and, when this was their last membership in any tenant, their account's sessions end and it is banned. A still-valid token is refused at once. Declining a removed member again redoes those steps.",
+    description = "The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked, their account's sessions end when they are an active member of no other tenant, and the account is banned when no other tenant holds them at all. A still-valid token is refused at once. Every step runs even when one fails; declining a removed member again redoes those steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Declined"),
@@ -2987,7 +3006,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the member isn't waiting for approval", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`identity_unavailable`: declined in Chelabase, but the identity service couldn't end the sessions or ban the account; decline again to finish", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: declined in Chelabase, but the identity service couldn't end the sessions or ban the account; `unavailable`: declined, but revoking the personal logins or reading their other memberships failed. Either way, decline again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn decline_member<M, J>(
@@ -3024,10 +3043,11 @@ where
     // As a removal, on every call.
     let offboarded = state.metadata.revoke_logins_for_identity_user(principal.tenant_id, &m.identity_user_id).await;
     access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
+    let ended = end_identity_access(&state, id, &m.identity_user_id, true, "decline member").await;
     if let Err(err) = offboarded {
-        return internal("decline member: revoke personal logins", err).into_response();
+        return retry_later("decline member", "revoke personal logins", err).into_response();
     }
-    tri!(end_identity_access(&state, id, &m.identity_user_id, true, "decline member").await);
+    tri!(ended);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -3043,12 +3063,15 @@ pub(crate) struct RevokeResult {
 }
 
 /// The identity half of ending a member's access, after the Chelabase half (suspend, remove,
-/// decline). While the person is a member of another tenant nothing is touched: their sessions
-/// carry the tenant they were made for, and `/auth/v1/token` checks that membership on every
-/// call. Otherwise every session ends, and with `ban` the account is banned with
-/// [`MEMBER_REMOVED_BAN_REASON`] (an existing ban keeps its own reason). Both steps are tried,
-/// a gone user counts as done, and any failure is 503 `identity_unavailable`: the member is
-/// already refused by the orchestrator, and the same call again finishes it.
+/// decline). While the person is an active member of another tenant nothing is touched: their
+/// sessions carry the tenant they were made for, and `/auth/v1/token` checks that membership on
+/// every call. Otherwise every session ends. With `ban`, the account is also banned with
+/// [`MEMBER_REMOVED_BAN_REASON`] (an existing ban keeps its own reason), but only when no other
+/// row of theirs isn't removed: an open invite, a pending sign-up or a suspension elsewhere still
+/// needs the account for its acceptance, approval or reinstatement (`/auth/v1/token` refuses a
+/// tenant without an active membership meanwhile). Both steps are tried, a gone user counts as
+/// done, and any failure is 503 `identity_unavailable`: the member is already refused by the
+/// orchestrator, and the same call again finishes it.
 async fn end_identity_access<M, J>(
     state: &AppState<M, J>,
     member: Uuid,
@@ -3059,20 +3082,20 @@ async fn end_identity_access<M, J>(
 where
     M: MetadataPort,
 {
-    let shared = state
+    let others = state
         .metadata
-        .has_other_membership(member)
+        .other_memberships(user, Some(member))
         .await
-        .map_err(|err| internal(&format!("{what}: other memberships"), err))?;
+        .map_err(|err| retry_later(what, "other memberships", err))?;
     let identity = identity_client(state)?;
-    if shared {
+    if others.active {
         return Ok(());
     }
     let gone = |result: Result<(), IdentityError>| match result {
         Err(IdentityError::NotFound(Missing::User)) => Ok(()),
         other => other,
     };
-    let banned = if ban {
+    let banned = if ban && !others.live {
         match identity.get_user(&Pool::Members, user).await {
             Ok(u) if u.banned => Ok(()),
             Ok(_) => gone(identity.ban(&Pool::Members, user, Some(MEMBER_REMOVED_BAN_REASON)).await.map(drop)),
@@ -3095,7 +3118,7 @@ where
     operation_id = "suspendMember",
     tag = "members",
     summary = "Suspend a member",
-    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are a member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.",
+    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The suspended member", body = Member),
@@ -3105,7 +3128,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: yourself, or a member who isn't active (invited, pending or removed); `last_tenant_admin`: the tenant would have no active tenant admin", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`identity_unavailable`: suspended in Chelabase (refused at once), but the identity service couldn't end the sessions; suspend again to finish", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: suspended in Chelabase (refused at once), but the identity service couldn't end the sessions; `unavailable`: suspended, but their other memberships couldn't be read. Either way, suspend again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn suspend_member<M, J>(
@@ -3141,6 +3164,10 @@ where
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
+    // N1: suspend doesn't set the offboarded mark (`revoke_logins_for_identity_user`), unlike
+    // remove and decline. The access check reads the mark before the status, so a marked member
+    // would be refused `member_offboarded` instead of `member_suspended`, and reinstate would
+    // have a mark to clear. The logins are revoked by `suspend_member` itself.
     tri!(end_identity_access(&state, id, &m.identity_user_id, false, "suspend member").await);
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
     Json(tri!(member_view(&state, &principal, m).await)).into_response()
@@ -3152,7 +3179,7 @@ where
     operation_id = "reinstateMember",
     tag = "members",
     summary = "Reinstate a suspended member",
-    description = "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted (a ban for any other reason stays), and their offboarded mark is cleared. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
+    description = "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. A ban for any other reason stays, and so does the mark, so they stay refused (`member_offboarded`) until that ban is lifted and they are reinstated again. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The reinstated member", body = Member),
@@ -3194,20 +3221,24 @@ where
     }
     // Then, on every call: the account's ban is lifted when it is ours (another reason is left in
     // place), and the offboarded mark goes. Realtime re-checks once more after the clear.
+    // A ban for any other reason stays, and so does the mark: the row isn't made usable while
+    // the account is banned. Each step depends on the one before, so a failure ends the call.
     let identity = tri!(identity_client(&state));
-    match identity.user_detail(&Pool::Members, &m.identity_user_id).await {
+    let clear = match identity.user_detail(&Pool::Members, &m.identity_user_id).await {
         Ok(d) if d.user.banned && d.ban_reason.as_deref() == Some(MEMBER_REMOVED_BAN_REASON) => {
             if let Err(err) = identity.unban(&Pool::Members, &m.identity_user_id).await {
                 return identity_failed("reinstate member: unban", &err).into_response();
             }
+            true
         }
         Ok(d) if d.user.banned => {
-            warn!(member_id = %id, reason = ?d.ban_reason, "reinstate member: the account is banned for another reason; left banned");
+            warn!(member_id = %id, reason = ?d.ban_reason, "reinstate member: the account is banned for another reason; left banned, the offboarded mark kept");
+            false
         }
-        Ok(_) | Err(IdentityError::NotFound(Missing::User)) => {}
+        Ok(_) | Err(IdentityError::NotFound(Missing::User)) => true,
         Err(err) => return identity_failed("reinstate member: read user", &err).into_response(),
-    }
-    if let Err(err) = state.metadata.clear_offboarded(principal.tenant_id, &m.identity_user_id).await {
+    };
+    if clear && let Err(err) = state.metadata.clear_offboarded(principal.tenant_id, &m.identity_user_id).await {
         return internal("reinstate member: clear the offboarded mark", err).into_response();
     }
     access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
@@ -3330,7 +3361,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: a grant's project doesn't exist in the tenant", body = ErrorEnvelope),
-        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -3382,7 +3413,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -3579,8 +3610,9 @@ where
     let shared = tri!(
         state
             .metadata
-            .has_other_membership(m.id)
+            .other_memberships(&user, Some(m.id))
             .await
+            .map(|others| others.live)
             .map_err(|err| internal("revoke invite: other memberships", err))
     );
     let identity = tri!(identity_client(&state));

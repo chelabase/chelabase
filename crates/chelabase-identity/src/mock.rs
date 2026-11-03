@@ -101,6 +101,8 @@ struct Fault {
     status: u16,
     error: String,
     remaining: u32,
+    /// The call takes effect first, and then answers the fault.
+    after: bool,
 }
 
 pub(crate) struct Inner {
@@ -523,7 +525,17 @@ async fn handle(State(inner): State<Arc<Mutex<Inner>>>, req: Request) -> Respons
             .find(|f| f.remaining > 0 && call.contains(&f.pattern))
         {
             f.remaining -= 1;
-            Err((f.status, "forced", f.error.clone()))
+            let (status, error, after) = (f.status, f.error.clone(), f.after);
+            if after {
+                let _ = route(
+                    &mut i,
+                    parts.method.as_str(),
+                    &path,
+                    parts.uri.query().unwrap_or(""),
+                    &json_body,
+                );
+            }
+            Err((status, "forced", error))
         } else if !bearer {
             Err(refuse(
                 401,
@@ -686,12 +698,23 @@ impl FakeIdentity {
     /// The next `times` calls whose `"METHOD path"` contains `pattern` answer `status` with this
     /// error code.
     pub fn fail(&self, pattern: &str, status: u16, error: &str, times: u32) {
+        self.push_fault(pattern, status, error, times, false);
+    }
+
+    /// As [`fail`](Self::fail), but each call takes effect before it answers the error: a
+    /// request another caller won (a user made by a concurrent create answers `409`).
+    pub fn fail_after(&self, pattern: &str, status: u16, error: &str, times: u32) {
+        self.push_fault(pattern, status, error, times, true);
+    }
+
+    fn push_fault(&self, pattern: &str, status: u16, error: &str, times: u32, after: bool) {
         self.with(|i| {
             i.faults.push(Fault {
                 pattern: pattern.into(),
                 status,
                 error: error.into(),
                 remaining: times,
+                after,
             })
         });
     }

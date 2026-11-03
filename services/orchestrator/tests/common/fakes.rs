@@ -4291,12 +4291,16 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         })
     }
 
-    async fn has_other_membership(&self, member: uuid::Uuid) -> Result<bool, MetadataError> {
+    async fn other_memberships(&self, identity_user_id: &str, except: Option<uuid::Uuid>) -> Result<chelabase_metadata::members::OtherMemberships, MetadataError> {
         let members = self.members.lock().unwrap();
-        let Some(user) = members.iter().find(|m| m.id == member).map(|m| m.identity_user_id.clone()) else {
-            return Ok(false);
-        };
-        Ok(members.iter().any(|m| m.id != member && m.identity_user_id == user && m.status != MemberStatus::Removed))
+        let others: Vec<_> = members
+            .iter()
+            .filter(|m| Some(m.id) != except && m.identity_user_id == identity_user_id && m.status != MemberStatus::Removed)
+            .collect();
+        Ok(chelabase_metadata::members::OtherMemberships {
+            active: others.iter().any(|m| m.status == MemberStatus::Active),
+            live: !others.is_empty(),
+        })
     }
 
     async fn decline_member(&self, actor: uuid::Uuid, member: uuid::Uuid) -> FakeWrite<String> {
