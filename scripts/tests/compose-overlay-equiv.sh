@@ -26,7 +26,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 env_file="$root/scripts/tests/fixtures/workbench-stack.env"
 # The last intended change of the workbench shape: auth-replacement m5 (the identity service).
-rev=c90f396b
+rev=7b9a251f
 while (($#)); do
   case "$1" in
     --env-file) env_file="$2"; shift 2 ;;
