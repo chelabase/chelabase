@@ -451,7 +451,15 @@ where
 {
     match state.metadata.revoke_app_session(id, body.project_id).await {
         Ok(Some(session)) => end_identity_sessions_later(&state, vec![session]),
-        Ok(None) => {}
+        // Already revoked (a repeated sign-out): its identity session is ended again, so a
+        // retry finishes what a failed first try left (one already gone is fine).
+        Ok(None) => match state.metadata.app_session(id).await {
+            Ok(Some(session)) if session.project_id == body.project_id && session.revoked_at.is_some() => {
+                end_identity_sessions_later(&state, vec![session]);
+            }
+            Ok(_) => {}
+            Err(e) => return internal("revoking an app session", e),
+        },
         Err(e) => return internal("revoking an app session", e),
     }
     StatusCode::NO_CONTENT.into_response()
