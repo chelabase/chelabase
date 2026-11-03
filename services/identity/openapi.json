@@ -3,7 +3,7 @@
   "info": {
     "title": "Chelabase identity (internal)",
     "version": "0.1.0",
-    "description": "Internal identity service. Callers are auth, orchestrator, worker and bootstrap (chelabase-init's bootstrap), each with its own bearer token; each route is limited to the callers listed in x-callers. A pool is `members` or `app-<lowercase uuid>`."
+    "description": "Internal identity service. Callers are auth, orchestrator, worker and bootstrap (chelabase-init's bootstrap), each with its own bearer token; each route is limited to the callers listed in x-callers, and on a pool route to the kinds of pool x-caller-pools lists for each (`members`, or `app` for any `app-<uuid>` pool); anything else answers 403. A pool is `members` or `app-<lowercase uuid>`."
   },
   "servers": [
     {
@@ -29,6 +29,14 @@
           "bootstrap",
           "worker"
         ],
+        "x-caller-pools": {
+          "bootstrap": [
+            "members"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
         "responses": {
           "201": {
             "description": "The pool exists and is migrated",
@@ -65,6 +73,11 @@
         "x-callers": [
           "worker"
         ],
+        "x-caller-pools": {
+          "worker": [
+            "app"
+          ]
+        },
         "responses": {
           "204": {
             "description": "The pool is gone"
@@ -95,6 +108,16 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -171,6 +194,19 @@
           "orchestrator",
           "worker"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
         "parameters": [
           {
             "name": "limit",
@@ -274,6 +310,19 @@
           "orchestrator",
           "worker"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ],
+          "worker": [
+            "app"
+          ]
+        },
         "responses": {
           "200": {
             "description": "The user",
@@ -314,6 +363,16 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
         "responses": {
           "204": {
             "description": "Deleted"
@@ -349,6 +408,15 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -424,6 +492,12 @@
         "x-callers": [
           "auth"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -492,6 +566,12 @@
         "x-callers": [
           "auth"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
         "responses": {
           "200": {
             "description": "The updated user",
@@ -542,6 +622,16 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": false,
           "content": {
@@ -608,6 +698,16 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
         "responses": {
           "200": {
             "description": "The user",
@@ -658,6 +758,16 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members",
+            "app"
+          ]
+        },
         "responses": {
           "204": {
             "description": "Revoked"
@@ -689,6 +799,12 @@
         "x-callers": [
           "auth"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -781,6 +897,12 @@
         "x-callers": [
           "auth"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -858,8 +980,18 @@
         "operationId": "getSessionById",
         "summary": "Get a live session by id (never returns the token)",
         "x-callers": [
-          "auth"
+          "auth",
+          "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members"
+          ]
+        },
         "responses": {
           "200": {
             "description": "The live session and its user",
@@ -904,6 +1036,15 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "app"
+          ]
+        },
         "responses": {
           "204": {
             "description": "Revoked"
@@ -937,6 +1078,15 @@
           "auth",
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ],
+          "orchestrator": [
+            "members"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -1050,6 +1200,12 @@
         "x-callers": [
           "auth"
         ],
+        "x-caller-pools": {
+          "auth": [
+            "members",
+            "app"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
@@ -1133,6 +1289,11 @@
         "x-callers": [
           "orchestrator"
         ],
+        "x-caller-pools": {
+          "orchestrator": [
+            "members"
+          ]
+        },
         "requestBody": {
           "required": true,
           "content": {
