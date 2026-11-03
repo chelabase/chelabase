@@ -220,6 +220,32 @@ async fn audit_a_store_clock_jump_does_not_collapse_the_mark_wait() {
     assert_eq!(pass(&src, &store).await.deleted, 1);
 }
 
+/// Audit S1: a store clock far from the databases', with no earlier pass to compare with.
+#[tokio::test]
+async fn sweep_refuses_a_store_clock_far_from_the_databases() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let orphan = blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(10_000));
+    src.st().clock = Some(at(10_000 - 3601));
+    let r = sweep_database(&src, &store, src.db, GRACE, false)
+        .await
+        .unwrap();
+    assert!(
+        r.refused && r.blocked.as_deref().is_some_and(|w| w.contains("apart")),
+        "{r:?}"
+    );
+    assert_eq!(r.marked, 0);
+    // Without any clock, the pass is refused too.
+    src.st().clock = None;
+    let r = sweep_database(&src, &store, src.db, GRACE, false)
+        .await
+        .unwrap();
+    assert!(r.refused, "{r:?}");
+    assert!(exists(&store, &orphan).await);
+}
+
 /// Audit S1: both clocks near each other now, but the store's ran far ahead of the databases'
 /// since the last pass.
 #[tokio::test]
@@ -334,6 +360,13 @@ struct LeakyStore(MemoryStore);
 
 #[async_trait::async_trait]
 impl ObjectStore for LeakyStore {
+    // Honest, so a pass gets as far as the purge's own listing.
+    async fn list_dated(
+        &self,
+        p: &str,
+    ) -> Result<Vec<chelabase_storage::DatedObject>, chelabase_storage::StorageError> {
+        self.0.list_dated(p).await
+    }
     async fn multipart_part_copy(
         &self,
         k: &str,
@@ -432,11 +465,10 @@ async fn sweep_purge_stays_inside_its_prefix() {
         .await
         .unwrap();
     src.st().status = DatabaseStatus::Deleted;
-    assert!(
-        sweep_database(&src, &store, src.db, GRACE, false)
-            .await
-            .is_err()
-    );
+    let refused = sweep_database(&src, &store, src.db, GRACE, false)
+        .await
+        .unwrap_err();
+    assert!(refused.contains("refusing to delete"), "{refused}");
     assert!(exists(&store.0, &theirs).await);
 }
 
@@ -1113,6 +1145,23 @@ mod worker_reads {
         assert!(store.list(&format!("{db}/")).await.unwrap().is_empty());
         w.queue_storage_sweeps().await.unwrap();
         assert_eq!(w.sweep_requests.sent(), [db, db]);
+    }
+
+    /// Audit S6: a tenant without `pitr_interval` keeps Neon's default, longer than the
+    /// database's own window may be.
+    #[tokio::test]
+    async fn sweep_takes_neons_default_for_an_unset_history() {
+        let (w, _journal) = worker();
+        let db = ready_database(&w).await;
+        w.metadata
+            .state()
+            .databases
+            .get_mut(&db)
+            .unwrap()
+            .history_window = Duration::from_secs(3600);
+        w.storage.pitr.lock().unwrap().clear();
+        let d = w.database(db).await.unwrap().unwrap();
+        assert_eq!(d.retention, crate::storage_sweep::NEON_DEFAULT_PITR);
     }
 
     /// Audit S2: a failing job is retried a few times, then dropped and counted.
