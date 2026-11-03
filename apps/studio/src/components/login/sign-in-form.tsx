@@ -1,7 +1,7 @@
 import { ApiError } from "@chelabase/management-client";
 import { useState, type FormEvent, type ReactNode, type Ref } from "react";
 import { Button } from "@/components/ui/button";
-import { useSignIn } from "@/lib/login-client/generated/endpoints";
+import { useGetInstance, useSignIn } from "@/lib/login-client/generated/endpoints";
 import type { SignInAnswer } from "@/lib/login-client/generated/model";
 
 const UNAVAILABLE = "Sign-in is unavailable, try again";
@@ -44,11 +44,10 @@ export function problemOf(err: unknown): LoginProblem {
   return { message: messageOf(err), restart: err instanceof ApiError && err.code === "sign_in_expired" };
 }
 
-/** Where an answer sends the person. `done` (verify-email, accept-invite) is a signed-in session. */
-export function follow(answer: SignInAnswer | { next: "done" }, to: Pick<FormProps, "toApp" | "toVerify" | "toPending">) {
+/** Where a sign-in's answer (sign-in, sign-up, verify-email, accept-invite) sends the person. */
+export function follow(answer: SignInAnswer, to: Pick<FormProps, "toApp" | "toVerify" | "toPending">) {
   switch (answer.next) {
     case "studio":
-    case "done":
       return to.toApp();
     case "verify":
       return to.toVerify();
@@ -108,6 +107,10 @@ export function SignInForm({ toApp, toVerify, toPending, toRegister, notice }: F
   // Several tenants have this person: the ids to choose from, until one is picked.
   const [tenants, setTenants] = useState<string[] | null>(null);
   const signIn = useSignIn(SECRET);
+  // "Create account" only while the instance takes sign-ups; unknown (still loading, or the
+  // check failed) offers the invite line alone.
+  const instance = useGetInstance({ query: { retry: false, staleTime: Infinity } });
+  const offerSignUp = toRegister !== undefined && instance.data?.signUpAllowed === true;
 
   async function attempt(tenant?: string) {
     if (busy) return;
@@ -162,7 +165,7 @@ export function SignInForm({ toApp, toVerify, toPending, toRegister, notice }: F
         <a href="/password-reset" className="underline">Forgot your password?</a>
       </p>
       <p className="text-sm text-muted-foreground">
-        {toRegister ? (
+        {offerSignUp ? (
           <>No account? <button type="button" onClick={toRegister} className="underline">Create account</button> or ask your admin for an invite.</>
         ) : (
           "No account? Ask your admin for an invite."
