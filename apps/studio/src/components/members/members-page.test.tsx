@@ -155,7 +155,7 @@ describe("MembersPage", () => {
     const url = "http://studio.test/accept-invite?user=z1&code=c1&t=tok";
     const { f, queryClient } = setup({
       routes: {
-        "GET /v1/invites/delivery": ok({ email_available: false, reason: "no_email_provider" }),
+        "GET /v1/invites/delivery": ok({ email_available: false, reason: "email_not_configured" }),
         "POST /v1/invites": ok({ outcome: "invited", member: member("new", { status: "invited" }), invite_url: url }, 201),
       },
     });

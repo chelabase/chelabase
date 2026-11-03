@@ -6,28 +6,19 @@
 
 include!("common/fakes.rs");
 
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
 
 /// org-1's tenant with project Billing (database web1, owner `postgres`, main and `dev`) and
-/// Zitadel's mock behind the orchestrator (the member routes need it).
-async fn zworld() -> (MemberWorld, MockZitadel) {
+/// the identity fake behind the orchestrator (the member routes need it).
+async fn zworld() -> (MemberWorld, FakeIdentity) {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let mock = MockZitadel::start().await;
-    mock.add_org("org-1");
-    let app = spawn_app_custom(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-    )
+    let mock = FakeIdentity::start().await;
+    mock.with_pool(&Pool::Members);
+    let app = spawn_app_identity(metadata.clone(), jobs.clone(), Some(mock.client()), Arc::new(chelabase_query::app_users::PgUsersDb::new()), None)
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
     let mut db = sample_database(tenant);
@@ -180,8 +171,8 @@ fn assert_suspension_null(m: &Value) {
 #[tokio::test]
 async fn the_roster_carries_the_suspension_of_a_suspended_member_and_null_otherwise() {
     let (w, mock) = zworld().await;
-    let ann_sub = mock.add_user_in("org-1", "ann@x.com", "Secret-pass1", true);
-    let bob_sub = mock.add_user_in("org-1", "bob@x.com", "Secret-pass1", true);
+    let ann_sub = mock.with_user(&Pool::Members, "ann@x.com", "Secret-pass1");
+    let bob_sub = mock.with_user(&Pool::Members, "bob@x.com", "Secret-pass1");
     let ann = w.metadata.add_granted(w.tenant, &ann_sub, w.project, PlatformRole::Developer, &[]);
     let bob = w.metadata.add_granted(w.tenant, &bob_sub, w.project, PlatformRole::Viewer, &[]);
     let send = |method: Method, path: String| {
@@ -220,8 +211,8 @@ async fn the_roster_carries_the_suspension_of_a_suspended_member_and_null_otherw
 #[tokio::test]
 async fn every_single_member_response_carries_the_suspension_fields() {
     let (w, mock) = zworld().await;
-    let ann_sub = mock.add_user_in("org-1", "ann@x.com", "Secret-pass1", true);
-    let pat_sub = mock.add_user_in("org-1", "pat@x.com", "Secret-pass1", true);
+    let ann_sub = mock.with_user(&Pool::Members, "ann@x.com", "Secret-pass1");
+    let pat_sub = mock.with_user(&Pool::Members, "pat@x.com", "Secret-pass1");
     let ann = w.metadata.add_granted(w.tenant, &ann_sub, w.project, PlatformRole::Developer, &[]);
     let pat = w.metadata.add_member(w.tenant, &pat_sub, MemberStatus::Pending, false);
     let admin_send = |method: Method, path: String, body: Option<Value>| {

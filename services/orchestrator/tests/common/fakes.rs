@@ -83,6 +83,8 @@ struct FakeMetadata {
     /// Calls to `project_auth` and to `project_auth_statuses`.
     /// `revoke_user_sessions` fails while set.
     fail_revoke: Arc<Mutex<bool>>,
+    /// Makes the offboarding write of a removal fail.
+    fail_offboard: Arc<Mutex<bool>>,
     project_auth_reads: Arc<AtomicUsize>,
     project_auth_batch_reads: Arc<AtomicUsize>,
     /// Saved queries with their (database, user).
@@ -3791,6 +3793,32 @@ impl orchestrator::members::MembersPort for FakeMetadata {
         Ok(out)
     }
 
+    async fn revoke_logins_for_identity_user(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
+        if *self.fail_offboard.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
+        let Some(member) = self.member(tenant, identity_user_id).map(|m| m.id) else {
+            return Ok(Vec::new());
+        };
+        // As the store: the mark first, then every live login, by the offboarding reason.
+        self.members.lock().unwrap().iter_mut().filter(|m| m.id == member).for_each(|m| m.offboarded = true);
+        self.revoke_member_logins(member, chelabase_metadata::personal_logins::RevokeReason::IdentityOffboarded);
+        orchestrator::members::MembersPort::member_login_endpoints(self, member).await
+    }
+
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
+        let mut members = self.members.lock().unwrap();
+        let Some(m) = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id && m.offboarded) else {
+            return Ok(false);
+        };
+        m.offboarded = false;
+        Ok(true)
+    }
+
     async fn member_login_endpoints(&self, member: uuid::Uuid) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
         let mut out: Vec<_> = self
             .personal_logins
@@ -4163,7 +4191,9 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             tenant_admin: false,
             status: MemberStatus::Invited,
             accepted_at: None,
-            offboarded: false, suspended_at: None, suspended_by: None,
+            // As the store: only `clear_offboarded` takes the mark away.
+            offboarded: existing.as_ref().is_some_and(|m| m.offboarded),
+            suspended_at: None, suspended_by: None,
         };
         {
             let mut members = self.members.lock().unwrap();
@@ -4188,54 +4218,6 @@ impl orchestrator::members::MembersPort for FakeMetadata {
             member: record,
         };
         Ok((listing, invite))
-    }
-
-    async fn add_existing_user(
-        &self,
-        actor: uuid::Uuid,
-        tenant: TenantId,
-        identity_user_id: &str,
-        email: &str,
-        name: &str,
-        grants: &[(uuid::Uuid, GrantRow)],
-        teams: &[chelabase_metadata::members::TeamSeen],
-    ) -> FakeWrite<chelabase_metadata::members::MemberListing> {
-        use chelabase_metadata::members::AccessWriteError;
-        // P25: the teams must still be what the check read, or nothing is written.
-        self.teams_seen_hold(tenant, teams)?;
-        let email = Some(email.trim().to_lowercase()).filter(|e| !e.is_empty());
-        // R29: any row with the user, a removed one included, comes back only by invite code.
-        if self.member(tenant, identity_user_id).is_some() {
-            return Err(AccessWriteError::Conflict("already a member, or removed".into()));
-        }
-        let id = uuid::Uuid::new_v4();
-        self.insert_member_grants(tenant, id, grants)?;
-        let record = MemberRecord {
-            id,
-            tenant_id: tenant,
-            identity_user_id: identity_user_id.into(),
-            email: email.clone(),
-            display_name: name.into(),
-            tenant_admin: false,
-            status: MemberStatus::Active,
-            accepted_at: Some(chrono::Utc::now()),
-            offboarded: false, suspended_at: None, suspended_by: None,
-        };
-        {
-            let mut members = self.members.lock().unwrap();
-            for m in members.iter_mut().filter(|m| m.tenant_id == tenant && m.id != id && m.email == email) {
-                m.email = None;
-            }
-            members.retain(|m| m.id != id);
-            members.push(record.clone());
-        }
-        self.log(Change::new(tenant, Some(actor), "member_added", Some(id)).scope(single_project(grants), None).after(json!({ "email": email, "grants": grants_json(grants) })));
-        self.add_team_memberships(actor, tenant, id, teams);
-        Ok(chelabase_metadata::members::MemberListing {
-            created_at: self.created_at(record.id),
-            has_access: !grants.is_empty() || teams.iter().any(|t| !t.grants.is_empty()),
-            member: record,
-        })
     }
 
     async fn resend_invite(&self, actor: uuid::Uuid, invite: uuid::Uuid, expires_at: chrono::DateTime<chrono::Utc>, token_hash: [u8; 32]) -> FakeWrite<()> {

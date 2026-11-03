@@ -7,7 +7,7 @@
 import type { DeliveryReason } from './deliveryReason.ts';
 
 export interface InviteDelivery {
-  /** Whether Zitadel has an active email provider, so `email` delivery works. */
+  /** Whether an SMTP server is configured, so `email` delivery works. */
   email_available: boolean;
   reason: DeliveryReason | null;
 }

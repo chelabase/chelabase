@@ -26,7 +26,7 @@ export interface InviteDialogProps {
 }
 
 /** A lookup that failed counts as "no email": the link always works. */
-const UNKNOWN: InviteDelivery = { email_available: false, reason: "zitadel_unavailable" };
+const UNKNOWN: InviteDelivery = { email_available: false, reason: "identity_unavailable" };
 
 /** Most addresses one batch may carry (R8). */
 export const MAX_INVITES = 50;
@@ -158,7 +158,7 @@ function InviteForm({
   const [failure, setFailure] = useState<InviteFailure>({});
   const [results, setResults] = useState<Sent[] | null>(null);
 
-  // Email by default when Zitadel can send it, else the link.
+  // Email by default when the instance can send it, else the link.
   useEffect(() => {
     if (info) setHow(info.email_available ? "email" : "link");
   }, [info]);
@@ -236,11 +236,9 @@ function InviteForm({
       onDone(
         again
           ? `Invited ${address} again. The link in their email works for 72 hours; the previous one no longer works.`
-          : result.outcome === "added"
-            ? `${address} already had an account here and was added as a member. No email was sent.`
-            : result.outcome === "existing_member"
-              ? `${address} is already a member. Their access to the chosen projects is set.`
-              : `Invited ${address}. The link in their email works for 72 hours.`,
+          : result.outcome === "existing_member"
+            ? `${address} is already a member. Their access to the chosen projects is set.`
+            : `Invited ${address}. The link in their email works for 72 hours.`,
       );
     } catch (err) {
       const f = inviteFailure(err, address, rows, projects);

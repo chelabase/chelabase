@@ -181,7 +181,7 @@ describe("Invite actions on an invited member's page (Part 3 header)", () => {
   });
 
   it("without_email_delivery_there_is_no_resend_but_the_link_and_revoke_remain", async () => {
-    mountInvited({ [DELIVERY]: ok({ email_available: false, reason: "no_email_provider" }) });
+    mountInvited({ [DELIVERY]: ok({ email_available: false, reason: "email_not_configured" }) });
     expect(await screen.findByRole("button", { name: "New invite link" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Revoke invite" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Resend invite" })).toBeNull();

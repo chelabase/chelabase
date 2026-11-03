@@ -18,8 +18,8 @@ include!("common/fakes.rs");
 
 use chelabase_auth::test_support::{BrokenJwks, MockJwks};
 use chelabase_nats::rt::{AccessEvent, ProjectEvent};
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
 
 const AUTHORIZE: &str = "/internal/realtime/authorize";
 const PROJECTS: &str = "/internal/realtime/projects";
@@ -1105,25 +1105,16 @@ async fn a_reset_publishes_the_branch_status() {
 
 // --- Events: access (P10, W18, S28) ---------------------------------------------------------
 
-/// [`rt`] with Zitadel's mock behind the orchestrator (the member API's removals and invites).
-async fn rt_z() -> (Rt, MockZitadel) {
+/// [`rt`] with the identity fake behind the orchestrator (the member API's removals and invites).
+async fn rt_z() -> (Rt, FakeIdentity) {
     let jwks = MockJwks::start().await;
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let mock = MockZitadel::start().await;
-    mock.add_org("org-1");
-    let app = spawn_app_custom(
-        metadata.clone(),
-        jobs.clone(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-    )
+    let mock = FakeIdentity::start().await;
+    mock.with_pool(&Pool::Members);
+    let app = spawn_app_identity(metadata.clone(), jobs.clone(), Some(mock.client()), Arc::new(chelabase_query::app_users::PgUsersDb::new()), None)
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
     let mut db = sample_database(tenant);
@@ -1265,7 +1256,7 @@ async fn the_tenant_admin_flag_publishes_an_access_event() {
 #[tokio::test]
 async fn removing_approving_and_declining_members_publish_access_events() {
     let (t, z) = rt_z().await;
-    let gil_sub = z.add_user_in("org-1", "gil@x.com", "Secret-pass1", true);
+    let gil_sub = z.with_user(&Pool::Members, "gil@x.com", "Secret-pass1");
     let gil = t.metadata.add_granted(
         t.tenant,
         &gil_sub,
@@ -1311,7 +1302,7 @@ async fn removing_approving_and_declining_members_publish_access_events() {
     );
 
     t.events().clear();
-    let zid = z.add_user_in("org-1", "kim@example.test", "", false);
+    let zid = z.with_invited_user(&Pool::Members, "kim@example.test");
     let kim = t
         .metadata
         .add_member(t.tenant, &zid, MemberStatus::Pending, false);

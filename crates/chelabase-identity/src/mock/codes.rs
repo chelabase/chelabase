@@ -142,6 +142,7 @@ fn create(i: &mut Inner, pool: &str, body: &Value) -> Reply {
             email,
             kind,
             code,
+            link: body.get("link").and_then(Value::as_str).map(str::to_string),
         });
     }
     Ok((201, Some(out)))
