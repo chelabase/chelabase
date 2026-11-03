@@ -31,8 +31,9 @@ use uuid::Uuid;
 use crate::error::Failure;
 
 /// The oldest `storage` schema this service works with (`chelabase storage schema <n>`): the
-/// one with upload tickets bound to their role and owner.
-pub const MIN_SCHEMA_VERSION: u32 = 4;
+/// one with `storage.buckets.write_once` (m7), which the bucket routes write. An older one
+/// (reconcile brings it up within a pass) answers 503 rather than failing on the column.
+pub const MIN_SCHEMA_VERSION: u32 = 7;
 
 /// How long a database's schema check is trusted.
 pub const SCHEMA_CHECK_TTL: Duration = Duration::from_secs(30);
@@ -306,17 +307,19 @@ mod tests {
     #[test]
     fn only_chelabase_s_current_schema_is_served() {
         let admin = Some("chelabase_admin");
-        assert!(schema_acceptable(admin, Some("chelabase storage schema 4")));
+        assert!(schema_acceptable(admin, Some("chelabase storage schema 7")));
         assert!(schema_acceptable(
             admin,
             Some("chelabase storage schema 12")
         ));
         for (owner, stamp) in [
-            (Some("postgres"), Some("chelabase storage schema 4")),
+            (Some("postgres"), Some("chelabase storage schema 7")),
             (Some("app_owner"), Some("chelabase storage schema 99")),
+            // Before `write_once` (m7): the bucket routes would fail on the column.
+            (admin, Some("chelabase storage schema 6")),
             (admin, Some("chelabase storage schema 3")),
             (admin, Some("chelabase storage schema ")),
-            (admin, Some("chelabase storage schema 4 ")),
+            (admin, Some("chelabase storage schema 7 ")),
             (admin, Some("chelabase storage schema 1234567890")),
             (admin, Some("my storage")),
             (admin, None),

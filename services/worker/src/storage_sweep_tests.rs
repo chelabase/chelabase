@@ -671,6 +671,53 @@ async fn sweep_keeps_a_blob_any_branch_references() {
     assert!(!exists(&store, &k2).await);
 }
 
+/// m7 (write-once): an object in a write-once bucket is never updated or deleted (the
+/// database refuses it), so its row, and with it its version, stays on every read for ever:
+/// the sweep sees the version referenced on every pass and never marks or deletes its blob,
+/// however many grace periods and history windows go by, while an unreferenced blob next to
+/// it is marked and deleted on time. The sweep needs no notion of the bucket for that: its
+/// reads delete only dead tickets and expired sessions, never a row of `storage.objects` or
+/// `storage.buckets`, and the guards fire on no SELECT.
+#[tokio::test]
+async fn sweep_never_touches_a_write_once_objects_blob() {
+    let store = MemoryStore::default();
+    let frozen = Uuid::new_v4();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![frozen])]);
+    store.set_now(at(0));
+    let kept = blob(&store, src.db, frozen).await;
+    let stray = blob(&store, src.db, Uuid::new_v4()).await;
+    let window = (GRACE + RETENTION).as_secs();
+    let mut deleted = 0;
+    for step in 1..=40 {
+        store.set_now(at(step * window));
+        let r = pass(&src, &store).await;
+        assert_eq!((r.referenced, r.blocked.clone()), (1, None), "{r:?}");
+        deleted += r.deleted;
+    }
+    assert_eq!(deleted, 1, "the stray blob went");
+    assert!(exists(&store, &kept).await);
+    assert!(!exists(&store, &stray).await);
+    assert!(
+        store
+            .list(&format!("_sweep/{}/marks/", src.db))
+            .await
+            .unwrap()
+            .is_empty(),
+        "no mark on a referenced blob"
+    );
+    for expire in [false, true] {
+        let sql = references_sql(expire, &["u-1".to_string()]);
+        for line in sql.lines() {
+            let writes = line.contains("DELETE") || line.contains("UPDATE") || line.contains("INSERT");
+            assert!(
+                !writes || line.contains("DELETE FROM storage.upload_tickets") || line.contains("DELETE FROM storage.upload_sessions"),
+                "a sweep read writes elsewhere: {line}"
+            );
+            assert!(!(writes && (line.contains("storage.objects") || line.contains("storage.buckets"))), "{line}");
+        }
+    }
+}
+
 /// One branch that can't be read: nothing in the database is deleted, and the pass says why.
 #[tokio::test]
 async fn sweep_fails_closed_on_an_unreadable_branch() {

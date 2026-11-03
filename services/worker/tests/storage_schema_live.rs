@@ -1491,10 +1491,22 @@ async fn object(
     body: Option<reqwest::Body>,
     headers: &[(&str, &str)],
 ) -> (u16, reqwest::header::HeaderMap, bytes::Bytes) {
+    object_within(method, path, key, body, headers, Duration::from_secs(600)).await
+}
+
+/// [`object`] with its own client timeout (the GiB upload outlives the usual 600 s).
+async fn object_within(
+    method: &str,
+    path: &str,
+    key: &str,
+    body: Option<reqwest::Body>,
+    headers: &[(&str, &str)],
+    timeout: Duration,
+) -> (u16, reqwest::header::HeaderMap, bytes::Bytes) {
     let mut req = reqwest::Client::new()
         .request(method.parse().unwrap(), format!("{}{path}", gateway()))
         .bearer_auth(key)
-        .timeout(Duration::from_secs(600));
+        .timeout(timeout);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
@@ -2056,10 +2068,10 @@ async fn storage_api_gib_upload_live() {
         let fx = &*fx;
         let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'")]).await;
         let total = 1usize << 30;
-        // 64 KiB every 62.5 ms: 1 MiB/s.
+        // 64 KiB every 62.5 ms: 1 MiB/s, so about 18 minutes (the client waits up to 30).
         let body = Some(paced_body(total, 6, Duration::from_micros(62_500), None));
         let started = Instant::now();
-        let (status, _, b) = object("POST", "/storage/v1/object/files/gib.bin", &secret, body, &[]).await;
+        let (status, _, b) = object_within("POST", "/storage/v1/object/files/gib.bin", &secret, body, &[], Duration::from_secs(1800)).await;
         assert_eq!((status, json_of(&b)["size"].clone()), (200, json!(total)), "{}", json_of(&b));
         println!("1 GiB at 1 MiB/s took {:?}", started.elapsed());
     }))
@@ -2387,6 +2399,13 @@ impl chelabase_storage::ObjectStore for FailingStore {
     }
     async fn list(&self, prefix: &str) -> Result<Vec<chelabase_storage::ObjectMeta>, chelabase_storage::StorageError> {
         self.inner.list(prefix).await
+    }
+    // The sweep's reads (m8), so a sweep can run over this store.
+    async fn list_dated(&self, prefix: &str) -> Result<Vec<chelabase_storage::DatedObject>, chelabase_storage::StorageError> {
+        self.inner.list_dated(prefix).await
+    }
+    async fn list_uploads(&self, prefix: &str) -> Result<Vec<chelabase_storage::OpenUpload>, chelabase_storage::StorageError> {
+        self.inner.list_uploads(prefix).await
     }
     async fn multipart_create(&self, key: &str, content_type: Option<&str>) -> Result<String, chelabase_storage::StorageError> {
         self.inner.multipart_create(key, content_type).await
@@ -2911,7 +2930,9 @@ async fn storage_multipart_lost_permission_live() {
 async fn storage_multipart_other_callers_session_live() {
     with_fx(|fx| Box::pin(async move {
         let fx = &*fx;
-        let secret = objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
+        // Each caller its own rows: a user's, or (no user: `owner` and `chelabase.user_id()`
+        // both NULL) a secret key's.
+        let secret = objects_fixture(fx, &[("SELECT", "'owner IS NOT DISTINCT FROM chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner IS NOT DISTINCT FROM chelabase.user_id()'")]).await;
         let public = fx.public_key().await;
         let (alice, bob) = (fx.user_token(Uuid::new_v4()).await, fx.user_token(Uuid::new_v4()).await);
         let as_alice = [("chelabase-user", alice.as_str())];
@@ -3023,4 +3044,213 @@ async fn storage_multipart_memory_cap_live() {
 async fn storage_multipart_part_copy_live() {
     let prefix = format!("conformance-m7-{}", Uuid::new_v4());
     chelabase_storage::conformance::run(&object_store().await, &prefix).await;
+}
+
+// --- m7: write-once buckets (decided 2026-11-02) ---------------------------------------------
+
+/// A call to the in-process storage service: `(status, body)`.
+async fn raw(base: &str, token: &str, method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]) -> (u16, bytes::Bytes) {
+    let mut req = reqwest::Client::new()
+        .request(method.parse().unwrap(), format!("{base}{path}"))
+        .header(chelabase_auth::internal::IDENTITY_HEADER, token)
+        .body(body);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let res = req.send().await.unwrap();
+    let status = res.status().as_u16();
+    (status, res.bytes().await.unwrap_or_default())
+}
+
+/// A write-once bucket, enforced by the database for every role, through this branch's storage
+/// service in this process (the stack's runs the epic's earlier build): `write_once` is set on
+/// create or update and never turned off; an object there is uploaded once and never
+/// overwritten (an upsert is 409 `write_once`), moved, renamed or deleted; a multipart
+/// completion onto a name taken meanwhile is refused; the bucket, holding objects, is neither
+/// deleted nor renamed, though its other settings still change; empty, it still is. The
+/// owner, storage's own role and the superuser are refused in SQL alike (`CB005`), and an
+/// ordinary bucket's objects stay deletable. A copy into a new name is an upload. The objects
+/// stay referenced, so a sweep keeps their blobs. The schema is stamped 7 and healthy; a
+/// version-6 shape is migrated by the bootstrap (the column and the guards added, stamp 7).
+#[tokio::test]
+#[ignore = "needs the workbench stack"]
+async fn storage_write_once_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        const TEXT: (&str, &str) = ("content-type", "text/plain");
+        let stamp = "SELECT obj_description('storage'::regnamespace, 'pg_namespace')";
+        let check = || async { last_line(&fx.admin(&schema_check_sql("public", Some(&fx.verifier().await))).await) };
+        assert_eq!(fx.value(stamp).await, storage_schema::STORAGE_SCHEMA_STAMP);
+        assert_eq!(check().await, "t");
+        // Every policy open for `authenticated`: only write-once stands in the way.
+        objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'"), ("DELETE", "'true'", "NULL")]).await;
+        for (command, using, check_expr) in [("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'"), ("DELETE", "'true'", "NULL")] {
+            fx.owner(&format!(
+                "SELECT storage.create_policy('b_{}', 'buckets', '{command}', ARRAY['authenticated']::name[], {using}, {check_expr})",
+                command.to_lowercase()
+            ))
+            .await
+            .unwrap();
+        }
+        let store = Arc::new(FailingStore::default());
+        let (base, token) = in_process_storage(store.clone(), fx.main).await;
+        let call = async |method: &str, path: &str, body: Vec<u8>, headers: &[(&str, &str)]| {
+            let (status, b) = raw(&base, &token, method, path, body, headers).await;
+            (status, json_of(&b))
+        };
+        let code = |b: &Value| b["error"]["code"].clone();
+        let body = |v: Value| v.to_string().into_bytes();
+        let bucket = |name: &str| format!("/storage/v1/bucket/{name}");
+        let up = |name: &str| format!("/storage/v1/object/frozen/{name}");
+
+        // Set on create, listed, never turned off; turned on later on an ordinary bucket.
+        let (status, b) = call("POST", "/storage/v1/bucket", body(json!({ "name": "frozen", "write_once": true })), &[JSON]).await;
+        assert_eq!((status, b["write_once"].clone()), (201, json!(true)), "{b}");
+        let (status, list) = call("GET", "/storage/v1/bucket", vec![], &[]).await;
+        assert_eq!(status, 200, "{list}");
+        let flag = |name: &str| list.as_array().unwrap().iter().find(|x| x["name"] == name).unwrap()["write_once"].clone();
+        assert_eq!((flag("frozen"), flag("files")), (json!(true), json!(false)), "{list}");
+        let (status, b) = call("PATCH", &bucket("frozen"), body(json!({ "write_once": false })), &[JSON]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        assert_eq!(call("PATCH", &bucket("other"), body(json!({ "write_once": true })), &[JSON]).await.0, 204);
+        let (status, b) = call("PATCH", &bucket("other"), body(json!({ "write_once": false })), &[JSON]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        assert_eq!(fx.value("SELECT write_once FROM storage.buckets WHERE name = 'other'").await, "t");
+        // Empty, a write-once bucket is still renamed and deleted.
+        assert_eq!(call("PATCH", &bucket("other"), body(json!({ "name": "thawed" })), &[JSON]).await.0, 204);
+        assert_eq!(call("DELETE", &bucket("thawed"), vec![], &[]).await.0, 204);
+        // The first object and a rename race: while a rename of an empty write-once bucket is
+        // uncommitted, an upload into it waits (`name` is unique, so the rename holds the row
+        // `FOR UPDATE` against the foreign key check's `FOR KEY SHARE`), then lands in the
+        // renamed bucket; the bucket is never renamed past an object it holds.
+        assert_eq!(call("POST", "/storage/v1/bucket", body(json!({ "name": "racing", "write_once": true })), &[JSON]).await.0, 201);
+        let mut renamer = session(fx, "chelabase_storage", &fx.storage_password().await).await;
+        send(&mut renamer, "BEGIN; UPDATE storage.buckets SET name = 'raced' WHERE name = 'racing'; SELECT 'held';").await;
+        assert_eq!(read_line(&mut renamer).await, "held");
+        let mut first = tokio::spawn({
+            let (base, token) = (base.clone(), token.clone());
+            async move { raw(&base, &token, "POST", "/storage/v1/object/racing/first.txt", b"first".to_vec(), &[TEXT]).await }
+        });
+        assert!(tokio::time::timeout(Duration::from_secs(2), &mut first).await.is_err(), "the first object went in under an uncommitted rename");
+        send(&mut renamer, "COMMIT; SELECT 'renamed';").await;
+        assert_eq!(read_line(&mut renamer).await, "renamed");
+        let (status, b) = first.await.unwrap();
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = 'raced'").await, "1");
+        drop(renamer);
+
+        // Uploaded once: a second upload is the usual conflict, an upsert (either spelling, and
+        // the PUT route) the write-once refusal; the object is unchanged.
+        let (status, b) = call("POST", &up("a.txt"), b"one".to_vec(), &[TEXT]).await;
+        assert_eq!(status, 200, "{b}");
+        let version = fx.value("SELECT version_id FROM storage.objects WHERE name = 'a.txt'").await;
+        let (status, b) = call("POST", &up("a.txt"), b"two".to_vec(), &[TEXT]).await;
+        assert_eq!((status, code(&b)), (409, json!("conflict")), "{b}");
+        let (status, b) = call("POST", &format!("{}?upsert=true", up("a.txt")), b"two".to_vec(), &[TEXT]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        let (status, b) = call("POST", &up("a.txt"), b"two".to_vec(), &[TEXT, ("x-upsert", "true")]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        let (status, b) = call("PUT", &up("a.txt"), b"two".to_vec(), &[TEXT, ("x-upsert", "true")]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        // Never moved, renamed or deleted, one at a time or in a batch.
+        for to in [json!({ "bucket": "frozen", "from": "a.txt", "to": "b.txt" }), json!({ "bucket": "frozen", "from": "a.txt", "to": "a.txt", "to_bucket": "files" })] {
+            let (status, b) = call("POST", "/storage/v1/object/move", body(to.clone()), &[JSON]).await;
+            assert_eq!((status, code(&b)), (409, json!("write_once")), "{to}: {b}");
+        }
+        let (status, b) = call("DELETE", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        let (status, b) = call("DELETE", "/storage/v1/object/frozen", body(json!({ "names": ["a.txt"] })), &[JSON]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        let (status, got) = raw(&base, &token, "GET", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]));
+        assert_eq!(fx.value("SELECT version_id FROM storage.objects WHERE name = 'a.txt'").await, version);
+        assert_eq!(fx.value("SELECT count(*) FROM storage.upload_tickets").await, "0", "a refused move left a ticket");
+
+        // A copy in is an upload (a new name); onto an existing name, the usual conflict; a
+        // copy out is free.
+        assert_eq!(call("POST", "/storage/v1/object/files/src.txt", b"src".to_vec(), &[TEXT]).await.0, 200);
+        let (status, b) = call("POST", "/storage/v1/object/copy", body(json!({ "bucket": "files", "from": "src.txt", "to": "c.txt", "to_bucket": "frozen" })), &[JSON]).await;
+        assert_eq!(status, 200, "{b}");
+        let (status, b) = call("POST", "/storage/v1/object/copy", body(json!({ "bucket": "files", "from": "src.txt", "to": "a.txt", "to_bucket": "frozen" })), &[JSON]).await;
+        assert_eq!((status, code(&b)), (409, json!("conflict")), "{b}");
+        let (status, b) = call("POST", "/storage/v1/object/copy", body(json!({ "bucket": "frozen", "from": "a.txt", "to": "out.txt", "to_bucket": "files" })), &[JSON]).await;
+        assert_eq!(status, 200, "{b}");
+
+        // Multipart: an upsert onto an existing name is refused as it opens; a completion onto a
+        // name taken meanwhile is refused, without upsert (the usual conflict) or with it.
+        let (status, b) = call("POST", "/storage/v1/upload/frozen/a.txt?upsert=true", vec![], &[TEXT]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        for (name, upsert, expected) in [("m.bin", "", "conflict"), ("n.bin", "?upsert=true", "write_once")] {
+            let (status, b) = call("POST", &format!("/storage/v1/upload/frozen/{name}{upsert}"), vec![], &[TEXT]).await;
+            assert_eq!(status, 200, "{b}");
+            let id = b["id"].as_str().unwrap().to_string();
+            assert_eq!(call("PUT", &format!("/storage/v1/upload/session/{id}/1"), b"part".to_vec(), &[]).await.0, 200);
+            assert_eq!(call("POST", &up(name), b"first".to_vec(), &[TEXT]).await.0, 200);
+            let (status, b) = call("POST", &format!("/storage/v1/upload/session/{id}/complete"), vec![], &[]).await;
+            assert_eq!((status, code(&b)), (409, json!(expected)), "{name}: {b}");
+            // The session is this caller's to abort.
+            assert_eq!(call("DELETE", &format!("/storage/v1/upload/session/{id}"), vec![], &[]).await.0, 204);
+            let (status, got) = raw(&base, &token, "GET", &up(name), vec![], &[]).await;
+            assert_eq!((status, &got[..]), (200, &b"first"[..]), "{name}");
+        }
+
+        // The bucket holding objects: neither deleted nor renamed; its other settings still change.
+        let (status, b) = call("DELETE", &bucket("frozen"), vec![], &[]).await;
+        assert_eq!((status, code(&b)), (409, json!("bucket_not_empty")), "{b}");
+        let (status, b) = call("PATCH", &bucket("frozen"), body(json!({ "name": "thawed" })), &[JSON]).await;
+        assert_eq!((status, code(&b)), (409, json!("write_once")), "{b}");
+        assert_eq!(call("PATCH", &bucket("frozen"), body(json!({ "public": true, "file_size_limit": 10 })), &[JSON]).await.0, 204);
+        assert_eq!(fx.value("SELECT name || ' ' || public || ' ' || file_size_limit || ' ' || write_once FROM storage.buckets WHERE name = 'frozen'").await, "frozen true 10 true");
+
+        // In SQL, no role is exempt: the owner (BYPASSRLS, pg_write_all_data), storage's own
+        // role (BYPASSRLS) and the superuser; an ordinary bucket's object is still deleted.
+        for statement in [
+            "DELETE FROM storage.objects WHERE name = 'a.txt'",
+            "UPDATE storage.objects SET name = 'z.txt' WHERE name = 'a.txt'",
+            "UPDATE storage.objects SET metadata = '{\"k\": 1}' WHERE name = 'a.txt'",
+            "UPDATE storage.buckets SET write_once = false WHERE name = 'frozen'",
+            "UPDATE storage.buckets SET name = 'thawed' WHERE name = 'frozen'",
+        ] {
+            for role in [OWNER, "chelabase_storage"] {
+                assert_eq!(fx.code(role, statement).await, "CB005", "{role}: {statement}");
+            }
+            assert!(fx.admin_on(&fx.ep, statement).await.is_err(), "the superuser: {statement}");
+        }
+        assert_eq!(fx.code("chelabase_storage", "DELETE FROM storage.objects WHERE name = 'src.txt'").await, "ok");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = 'frozen'").await, "4");
+
+        // A sweep keeps every blob a row references (all of them: a write-once row is never
+        // gone), and is really sweeping: an unreferenced blob beside them is marked, then waits.
+        let total: usize = fx.value("SELECT count(*) FROM storage.objects").await.parse().unwrap();
+        let stray = format!("{}{}", fx.prefix().await, Uuid::new_v4());
+        chelabase_storage::ObjectStore::put(&*store, &stray, bytes::Bytes::from_static(b"stray"), chelabase_storage::PutOptions::default()).await.unwrap();
+        for pass in 0..2 {
+            let r = worker::storage_sweep::sweep_database(&fx.worker, &*store, fx.id, Duration::ZERO, false).await.unwrap();
+            assert_eq!((r.blocked.clone(), r.blobs, r.referenced, r.deleted), (None, total + 1, total, 0), "pass {pass}: {r:?}");
+            assert_eq!((r.marked, r.waiting), if pass == 0 { (1, 0) } else { (0, 1) }, "pass {pass}: {r:?}");
+        }
+        let (status, got) = raw(&base, &token, "GET", &up("a.txt"), vec![], &[]).await;
+        assert_eq!((status, &got[..]), (200, &b"one"[..]));
+
+        // Migration: a version-6 shape (no column, no guards, stamped 6) is brought to 7 by
+        // the bootstrap; the objects and the bucket's other settings are untouched.
+        fx.admin(
+            "BEGIN; SET LOCAL ROLE chelabase_admin;
+             DROP TRIGGER guard_buckets ON storage.buckets; DROP TRIGGER freeze_objects ON storage.objects;
+             ALTER TABLE storage.buckets DROP COLUMN write_once;
+             COMMENT ON SCHEMA storage IS 'chelabase storage schema 6'; COMMIT;
+             DROP FUNCTION storage.guard_buckets(); DROP FUNCTION storage.freeze_objects();",
+        )
+        .await;
+        assert_eq!(check().await, "f");
+        assert_eq!(fx.code(OWNER, "DELETE FROM storage.objects WHERE name = 'c.txt'").await, "ok", "version 6 has no guard");
+        bootstrap(fx).await;
+        assert_eq!(fx.value(stamp).await, "chelabase storage schema 7");
+        assert_eq!(check().await, "t");
+        assert_eq!(fx.value("SELECT name || ' ' || public || ' ' || file_size_limit || ' ' || write_once FROM storage.buckets WHERE name = 'frozen'").await, "frozen true 10 false", "a migrated bucket starts ordinary");
+        fx.owner("UPDATE storage.buckets SET write_once = true WHERE name = 'frozen'").await.unwrap();
+        assert_eq!(fx.code(OWNER, "DELETE FROM storage.objects WHERE name = 'a.txt'").await, "CB005");
+        assert_eq!(fx.value("SELECT count(*) FROM storage.objects o JOIN storage.buckets b ON b.id = o.bucket_id WHERE b.name = 'frozen'").await, "4");
+    }))
+    .await;
 }

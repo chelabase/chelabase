@@ -47,6 +47,15 @@
 //!   the timeline, caps them at 24 hours and lets an update change only the parts (and bring
 //!   the expiry closer). A session vouches for nothing: completing one mints a ticket and
 //!   writes the row as the caller, so row level security decides again.
+//! - A write-once bucket (`storage.buckets.write_once`, m7) is enforced here, so no role is
+//!   exempt, the owner and storage's own included: `guard_buckets` never lets `write_once`
+//!   go back to false and keeps the name of a write-once bucket holding objects (its public
+//!   URLs stay); `freeze_objects` refuses every update or delete of an object in one (an
+//!   upsert's overwrite, a move, a rename, a metadata change). Both raise [`WRITE_ONCE`] and
+//!   run `SECURITY DEFINER` as the superuser that installs them (as the data API's own
+//!   helpers do): their one read of the other table must get past forced row level security
+//!   whoever the caller is. Nothing may execute them; a trigger needs no grant to fire. The
+//!   objects' foreign key already keeps any bucket holding objects from being deleted.
 //! - A branch copies unconsumed tickets but never its parent's timeline (`neon.timeline_id`
 //!   is a postmaster setting, fixed per compute), so they can't be used there.
 //! - Owner-level roles (the database owner is a Neon privileged role: `BYPASSRLS`, a member of
@@ -86,10 +95,10 @@ pub const MANAGED_COLUMNS: [&str; 4] = ["bucket_id", "version_id", "size", "etag
 /// [`STORAGE_SCHEMA_STAMP`]) whenever the script changes what it installs, so reconcile
 /// reinstalls. A schema stamped with a higher version is a newer worker's: this one leaves it
 /// alone (mixed versions during a deploy never downgrade it).
-pub const STORAGE_SCHEMA_VERSION: u32 = 6;
+pub const STORAGE_SCHEMA_VERSION: u32 = 7;
 
 /// The schema's comment: `chelabase storage schema <STORAGE_SCHEMA_VERSION>`.
-pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 6";
+pub const STORAGE_SCHEMA_STAMP: &str = "chelabase storage schema 7";
 
 /// The stamp's form, as a POSIX regex whose one group is the version ([`stamp_version`]).
 pub const STAMP_PATTERN: &str = "^chelabase storage schema ([0-9]{1,9})$";
@@ -106,6 +115,11 @@ pub const TICKET_MISSING: &str = "CB003";
 
 /// The SQLSTATE `guard_tickets` raises when anyone but [`STORAGE_ROLE`] writes a ticket.
 pub const TICKET_FORGED: &str = "CB004";
+
+/// The SQLSTATE `freeze_objects` and `guard_buckets` raise (m7): an object in a write-once
+/// bucket updated or deleted, `write_once` turned off, or a write-once bucket holding objects
+/// renamed. The storage service answers 409 `write_once`.
+pub const WRITE_ONCE: &str = "CB005";
 
 /// `chelabase_storage`'s connection limit. Each storage service process holds at most a
 /// branch's `storage_max_connections` (1 to 20) to it; during a rolling deploy two replicas
@@ -252,6 +266,7 @@ CREATE TABLE IF NOT EXISTS storage.buckets (
   public boolean NOT NULL DEFAULT false,
   file_size_limit bigint CHECK (file_size_limit > 0),
   allowed_mime_types text[],
+  write_once boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TABLE IF NOT EXISTS storage.objects (
@@ -298,6 +313,7 @@ CREATE TABLE IF NOT EXISTS storage.upload_sessions (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE storage.upload_sessions OWNER TO chelabase_admin;
+ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS write_once boolean NOT NULL DEFAULT false;
 ALTER TABLE storage.upload_tickets ADD COLUMN IF NOT EXISTS caller_role name NOT NULL DEFAULT '', ADD COLUMN IF NOT EXISTS owner uuid;
 DELETE FROM storage.upload_tickets WHERE caller_role OPERATOR(pg_catalog.=) '';
 ALTER TABLE storage.upload_tickets OWNER TO chelabase_admin;
@@ -335,6 +351,7 @@ DO $$ DECLARE d record; k record; BEGIN
 END $$;
 ALTER TABLE storage.buckets ALTER COLUMN id SET DEFAULT gen_random_uuid();
 ALTER TABLE storage.buckets ALTER COLUMN public SET DEFAULT false;
+ALTER TABLE storage.buckets ALTER COLUMN write_once SET DEFAULT false;
 ALTER TABLE storage.buckets ALTER COLUMN created_at SET DEFAULT now();
 ALTER TABLE storage.objects ALTER COLUMN id SET DEFAULT gen_random_uuid();
 ALTER TABLE storage.objects ALTER COLUMN metadata SET DEFAULT '{{}}';
@@ -366,7 +383,7 @@ ALTER TABLE storage.upload_sessions NO FORCE ROW LEVEL SECURITY;
 ALTER TABLE storage.upload_sessions DISABLE ROW LEVEL SECURITY;
 REVOKE ALL ON storage.buckets, storage.objects, storage.upload_tickets, storage.upload_sessions FROM PUBLIC, anon, authenticated, authenticator, chelabase_storage, {owner};
 GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;
-GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types), UPDATE (name, public, file_size_limit, allowed_mime_types), DELETE ON storage.buckets TO authenticated;
+GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types, write_once), UPDATE (name, public, file_size_limit, allowed_mime_types, write_once), DELETE ON storage.buckets TO authenticated;
 GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;
 GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;
 GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;
@@ -415,6 +432,22 @@ REVOKE ALL ON FUNCTION storage.touch_objects() FROM PUBLIC;
 CREATE OR REPLACE TRIGGER touch_objects BEFORE UPDATE ON storage.objects
   FOR EACH ROW EXECUTE FUNCTION storage.touch_objects();
 ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER touch_objects;
+CREATE OR REPLACE FUNCTION storage.guard_buckets() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
+$f${GUARD_BUCKETS_BODY}$f$;
+ALTER FUNCTION storage.guard_buckets() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.guard_buckets() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER guard_buckets BEFORE UPDATE ON storage.buckets
+  FOR EACH ROW EXECUTE FUNCTION storage.guard_buckets();
+ALTER TABLE storage.buckets ENABLE ALWAYS TRIGGER guard_buckets;
+CREATE OR REPLACE FUNCTION storage.freeze_objects() RETURNS trigger
+  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS
+$f${FREEZE_OBJECTS_BODY}$f$;
+ALTER FUNCTION storage.freeze_objects() OWNER TO CURRENT_USER;
+REVOKE ALL ON FUNCTION storage.freeze_objects() FROM PUBLIC;
+CREATE OR REPLACE TRIGGER freeze_objects BEFORE UPDATE OR DELETE ON storage.objects
+  FOR EACH ROW EXECUTE FUNCTION storage.freeze_objects();
+ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER freeze_objects;
 DO $$ BEGIN
   IF pg_catalog.to_regtype('storage.object_ref') IS NULL THEN
     CREATE TYPE storage.object_ref AS (bucket_id uuid, name text);
@@ -557,10 +590,12 @@ pub fn storage_check_sql(owner_role: &str, verifier: Option<&str>) -> String {
                  OR (p.proname OPERATOR(pg_catalog.=) 'touch_objects' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${TOUCH_OBJECTS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'guard_sessions' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_SESSIONS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'record_part' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${RECORD_PART_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'guard_buckets' AND p.prosecdef AND EXISTS (SELECT FROM pg_catalog.pg_roles s WHERE s.oid OPERATOR(pg_catalog.=) p.proowner AND s.rolsuper) AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_BUCKETS_BODY}$b$) \
+                 OR (p.proname OPERATOR(pg_catalog.=) 'freeze_objects' AND p.prosecdef AND EXISTS (SELECT FROM pg_catalog.pg_roles s WHERE s.oid OPERATOR(pg_catalog.=) p.proowner AND s.rolsuper) AND p.prosrc OPERATOR(pg_catalog.=) $b${FREEZE_OBJECTS_BODY}$b$) \
                  OR (p.proname OPERATOR(pg_catalog.=) 'consume_ticket' AND p.prosecdef AND p.proowner OPERATOR(pg_catalog.=) r.oid \
-                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 6 \
+                   AND p.prosrc OPERATOR(pg_catalog.=) $b${CONSUME_TICKET_BODY}$b$))) OPERATOR(pg_catalog.=) 8 \
              AND (SELECT pg_catalog.count(*) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) t.tgrelid \
-               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 4 \
+               WHERE c.relnamespace OPERATOR(pg_catalog.=) n.oid AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 6 \
              AND (SELECT pg_catalog.array_agg(v ORDER BY v) FROM (SELECT {default_entry} AS v FROM pg_catalog.pg_attrdef x \
                JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) x.adrelid \
                JOIN pg_catalog.pg_attribute a ON a.attrelid OPERATOR(pg_catalog.=) x.adrelid AND a.attnum OPERATOR(pg_catalog.=) x.adnum \
@@ -594,7 +629,7 @@ pub fn foreign_objects_sql() -> String {
   WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND p.oid::pg_catalog.regprocedure::pg_catalog.text OPERATOR(pg_catalog.<>) ALL (ARRAY[\
 'storage.foldername(text)', 'storage.filename(text)', 'storage.extension(text)', 'storage.object_ref(uuid,text)', \
 'storage.create_policy(name,name,text,name[],text,text,boolean)', 'storage.drop_policy(name,name)', 'storage.protect_objects()', 'storage.guard_tickets()', 'storage.touch_objects()', 'storage.guard_sessions()', 'storage.record_part(uuid,integer,bigint,text)', \
-'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)']) \
+'storage.guard_buckets()', 'storage.freeze_objects()', 'storage.consume_ticket(uuid,uuid,text,bigint,text,uuid,name)']) \
 UNION ALL SELECT pg_catalog.format('DROP %s IF EXISTS %s CASCADE', CASE c.relkind WHEN 'i' THEN 'INDEX' WHEN 'I' THEN 'INDEX' WHEN 'S' THEN 'SEQUENCE' \
     WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'c' THEN 'TYPE' WHEN 'f' THEN 'FOREIGN TABLE' ELSE 'TABLE' END, c.oid::pg_catalog.regclass) \
   FROM pg_catalog.pg_class c WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} \
@@ -615,7 +650,9 @@ UNION ALL SELECT pg_catalog.format('DROP TRIGGER IF EXISTS %I ON %s CASCADE', t.
     AND NOT ((t.tgname OPERATOR(pg_catalog.=) 'protect_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
       OR (t.tgname OPERATOR(pg_catalog.=) 'touch_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects') \
       OR (t.tgname OPERATOR(pg_catalog.=) 'guard_tickets' AND c.relname OPERATOR(pg_catalog.=) 'upload_tickets') \
-      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_sessions' AND c.relname OPERATOR(pg_catalog.=) 'upload_sessions')) \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_sessions' AND c.relname OPERATOR(pg_catalog.=) 'upload_sessions') \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'guard_buckets' AND c.relname OPERATOR(pg_catalog.=) 'buckets') \
+      OR (t.tgname OPERATOR(pg_catalog.=) 'freeze_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects')) \
 UNION ALL SELECT pg_catalog.format('DROP RULE IF EXISTS %I ON %s CASCADE', w.rulename, w.ev_class::pg_catalog.regclass) FROM pg_catalog.pg_rewrite w \
   JOIN pg_catalog.pg_class c ON c.oid OPERATOR(pg_catalog.=) w.ev_class WHERE c.relnamespace OPERATOR(pg_catalog.=) {ns} AND c.relkind OPERATOR(pg_catalog.=) 'r' \
 UNION ALL SELECT pg_catalog.format('DROP POLICY IF EXISTS %I ON storage.upload_tickets', y.polname) FROM pg_catalog.pg_policy y \
@@ -641,7 +678,7 @@ fn acl_entries_sql() -> String {
   UNION ALL SELECT 'ON ROUTINE ' OPERATOR(pg_catalog.||) p.oid::pg_catalog.regprocedure::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, \
       CASE WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['create_policy', 'drop_policy']::pg_catalog.name[]) THEN ARRAY['{{owner}}'] \
         WHEN p.proname OPERATOR(pg_catalog.=) 'record_part' THEN ARRAY['chelabase_storage'] \
-        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
+        WHEN p.proname OPERATOR(pg_catalog.=) ANY (ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions', 'guard_buckets', 'freeze_objects']::pg_catalog.name[]) THEN ARRAY[]::pg_catalog.text[] ELSE ARRAY['public'] END \
     FROM pg_catalog.pg_proc p, pg_catalog.aclexplode(p.proacl) a WHERE p.pronamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) p.proowner \
   UNION ALL SELECT 'ON TYPE ' OPERATOR(pg_catalog.||) t.oid::pg_catalog.regtype::pg_catalog.text, a.grantor, a.grantee, a.is_grantable, ARRAY['public'] \
     FROM pg_catalog.pg_type t, pg_catalog.aclexplode(t.typacl) a WHERE t.typnamespace OPERATOR(pg_catalog.=) {ns} AND a.grantee OPERATOR(pg_catalog.<>) t.typowner"
@@ -728,6 +765,38 @@ UPDATE storage.upload_sessions SET parts = parts || jsonb_build_object(p_part::t
   RETURNING true
 ";
 
+/// `guard_buckets`'s body (m7, `SECURITY DEFINER` as the superuser: the objects read is past
+/// row level security): `write_once` never goes back to false, and a write-once bucket
+/// holding objects keeps its name.
+pub const GUARD_BUCKETS_BODY: &str = "
+BEGIN
+  IF OLD.write_once AND NOT NEW.write_once THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB005', MESSAGE = 'storage.buckets: write_once is never turned off';
+  END IF;
+  IF OLD.write_once AND NEW.name <> OLD.name AND EXISTS (SELECT FROM storage.objects o WHERE o.bucket_id = OLD.id) THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB005', MESSAGE = 'storage.buckets: a write-once bucket holding objects keeps its name';
+  END IF;
+  RETURN NEW;
+END
+";
+
+/// `freeze_objects`'s body (m7, `SECURITY DEFINER` as the superuser: the buckets read is past
+/// row level security): no update or delete of an object in a write-once bucket, whoever asks.
+/// (A rename racing a write-once bucket's first object needs nothing here: `name` is unique,
+/// so a rename locks the bucket's row `FOR UPDATE`, which the objects' foreign key check's
+/// `FOR KEY SHARE` waits for, or holds off, so `guard_buckets` sees the object.)
+pub const FREEZE_OBJECTS_BODY: &str = "
+BEGIN
+  IF EXISTS (SELECT FROM storage.buckets b WHERE b.id = OLD.bucket_id AND b.write_once) THEN
+    RAISE EXCEPTION USING ERRCODE = 'CB005', MESSAGE = 'storage.objects: the bucket is write-once; its objects are never overwritten, moved, renamed or deleted';
+  END IF;
+  IF TG_OP = 'DELETE' THEN
+    RETURN OLD;
+  END IF;
+  RETURN NEW;
+END
+";
+
 /// `touch_objects`'s body: every update of an object (an upsert's overwrite included) stamps
 /// `updated_at`, which callers can't write themselves.
 pub const TOUCH_OBJECTS_BODY: &str = "
@@ -760,10 +829,11 @@ END
 const STORAGE_ROLE_OID: &str = "(SELECT oid FROM pg_catalog.pg_roles WHERE rolname OPERATOR(pg_catalog.=) 'chelabase_storage')";
 
 /// The install's column defaults, as `table.column=pg_get_expr`.
-pub const EXPECTED_DEFAULTS: [&str; 9] = [
+pub const EXPECTED_DEFAULTS: [&str; 10] = [
     "buckets.created_at=now()",
     "buckets.id=gen_random_uuid()",
     "buckets.public=false",
+    "buckets.write_once=false",
     "objects.created_at=now()",
     "objects.id=gen_random_uuid()",
     "objects.metadata='{}'::jsonb",
@@ -1146,7 +1216,7 @@ mod tests {
             grants,
             [
                 "GRANT SELECT ON storage.buckets, storage.objects TO anon, authenticated;",
-                "GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types), UPDATE (name, public, file_size_limit, allowed_mime_types), DELETE ON storage.buckets TO authenticated;",
+                "GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types, write_once), UPDATE (name, public, file_size_limit, allowed_mime_types, write_once), DELETE ON storage.buckets TO authenticated;",
                 "GRANT INSERT (id, bucket_id, name, owner, metadata, size, content_type, etag, version_id), UPDATE (bucket_id, name, owner, metadata, size, content_type, etag, version_id), DELETE ON storage.objects TO authenticated;",
                 "GRANT SELECT, INSERT, UPDATE, DELETE ON storage.buckets, storage.objects TO chelabase_storage;",
                 "GRANT SELECT, INSERT, DELETE ON storage.upload_tickets TO chelabase_storage;",
@@ -1745,6 +1815,8 @@ mod tests {
             &format!("$b${PROTECT_OBJECTS_BODY}$b$"),
             &format!("$b${GUARD_TICKETS_BODY}$b$"),
             &format!("$b${CONSUME_TICKET_BODY}$b$"),
+            &format!("$b${GUARD_BUCKETS_BODY}$b$"),
+            &format!("$b${FREEZE_OBJECTS_BODY}$b$"),
             &expected_list(&EXPECTED_DEFAULTS),
             &expected_list(&EXPECTED_CONSTRAINTS),
         ] {
@@ -1754,7 +1826,7 @@ mod tests {
             sql().contains(&format!("$f${PROTECT_OBJECTS_BODY}$f$"))
                 && sql().contains(&format!("$f${CONSUME_TICKET_BODY}$f$"))
         );
-        assert_eq!(EXPECTED_DEFAULTS.len(), 9);
+        assert_eq!(EXPECTED_DEFAULTS.len(), 10);
         assert!(EXPECTED_CONSTRAINTS.contains(&"objects.objects_bucket_id_fkey"));
     }
 
@@ -1995,7 +2067,7 @@ mod tests {
     /// with the tickets when the role was tampered with.
     #[test]
     fn storage_schema_upload_sessions_are_storages_alone() {
-        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (6, "chelabase storage schema 6"));
+        const { assert!(STORAGE_SCHEMA_VERSION >= 6) };
         let sql = sql();
         let table = between(&sql, "CREATE TABLE IF NOT EXISTS storage.upload_sessions (", ");");
         for column in [
@@ -2047,7 +2119,7 @@ mod tests {
         // Checked and healed like the tickets.
         let check = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'guard_sessions' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${GUARD_SESSIONS_BODY}$b$)")), "{check}");
-        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 4"), "four triggers: {check}");
+        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 6"), "six triggers: {check}");
         let foreign = foreign_objects_sql();
         for part in [
             "'storage.guard_sessions()'",
@@ -2060,7 +2132,7 @@ mod tests {
         }
         let acl = acl_entries_sql();
         assert!(acl.contains("c.relname OPERATOR(pg_catalog.=) ANY (ARRAY['upload_tickets', 'upload_sessions']::pg_catalog.name[]) THEN ARRAY['chelabase_storage']"), "{acl}");
-        assert!(acl.contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions']"), "{acl}");
+        assert!(acl.contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions', 'guard_buckets', 'freeze_objects']"), "{acl}");
         assert!(EXPECTED_DEFAULTS.contains(&"upload_sessions.created_at=now()"));
         assert!(EXPECTED_CONSTRAINTS.contains(&"upload_sessions.upload_sessions_pkey"));
     }
@@ -2089,9 +2161,85 @@ mod tests {
         }
         let check = storage_check_sql("postgres", Some(VERIFIER));
         assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) 'record_part' AND NOT p.prosecdef AND p.prosrc OPERATOR(pg_catalog.=) $b${RECORD_PART_BODY}$b$)")), "{check}");
-        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 6"), "six checked functions: {check}");
+        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 8"), "eight checked functions: {check}");
         assert!(foreign_objects_sql().contains("'storage.record_part(uuid,integer,bigint,text)'"));
         assert!(acl_entries_sql().contains("WHEN p.proname OPERATOR(pg_catalog.=) 'record_part' THEN ARRAY['chelabase_storage']"));
     }
 
+    /// m7 (decided 2026-11-02): `write_once` on a bucket, version 7, enforced by the database
+    /// for every role. The column (callers may set it; a version-6 schema gains it, its default
+    /// healed with the others); `guard_buckets` (never turned off; a write-once bucket holding
+    /// objects keeps its name) and `freeze_objects` (no update or delete of an object in a
+    /// write-once bucket), both raising [`WRITE_ONCE`], `SECURITY DEFINER` as the superuser
+    /// (their reads of the other table are past forced row level security, whoever the caller
+    /// is), executable by nobody and firing always; checked and healed like the others.
+    #[test]
+    fn storage_schema_write_once_is_enforced_by_the_database() {
+        assert_eq!((STORAGE_SCHEMA_VERSION, STORAGE_SCHEMA_STAMP), (7, "chelabase storage schema 7"));
+        assert_eq!(stamp_version(STORAGE_SCHEMA_STAMP), Some(7));
+        let sql = sql();
+        let buckets = between(&sql, "CREATE TABLE IF NOT EXISTS storage.buckets (", ");");
+        assert!(buckets.contains("write_once boolean NOT NULL DEFAULT false"), "{buckets}");
+        for part in [
+            "ALTER TABLE storage.buckets ADD COLUMN IF NOT EXISTS write_once boolean NOT NULL DEFAULT false;",
+            "ALTER TABLE storage.buckets ALTER COLUMN write_once SET DEFAULT false;",
+            "GRANT INSERT (id, name, public, file_size_limit, allowed_mime_types, write_once), UPDATE (name, public, file_size_limit, allowed_mime_types, write_once), DELETE ON storage.buckets TO authenticated;",
+            "CREATE OR REPLACE FUNCTION storage.guard_buckets() RETURNS trigger\n  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS",
+            "ALTER FUNCTION storage.guard_buckets() OWNER TO CURRENT_USER;",
+            "REVOKE ALL ON FUNCTION storage.guard_buckets() FROM PUBLIC;",
+            "CREATE OR REPLACE TRIGGER guard_buckets BEFORE UPDATE ON storage.buckets\n  FOR EACH ROW EXECUTE FUNCTION storage.guard_buckets();",
+            "ALTER TABLE storage.buckets ENABLE ALWAYS TRIGGER guard_buckets;",
+            "CREATE OR REPLACE FUNCTION storage.freeze_objects() RETURNS trigger\n  LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS",
+            "ALTER FUNCTION storage.freeze_objects() OWNER TO CURRENT_USER;",
+            "REVOKE ALL ON FUNCTION storage.freeze_objects() FROM PUBLIC;",
+            "CREATE OR REPLACE TRIGGER freeze_objects BEFORE UPDATE OR DELETE ON storage.objects\n  FOR EACH ROW EXECUTE FUNCTION storage.freeze_objects();",
+            "ALTER TABLE storage.objects ENABLE ALWAYS TRIGGER freeze_objects;",
+        ] {
+            assert!(sql.contains(part), "{part}: {sql}");
+        }
+        // Nothing grants EXECUTE on either (a trigger needs none to fire).
+        for name in ["guard_buckets", "freeze_objects"] {
+            assert!(!sql.contains(&format!("GRANT EXECUTE ON FUNCTION storage.{name}()")), "{sql}");
+        }
+        let guard = between(&sql, "CREATE OR REPLACE FUNCTION storage.guard_buckets()", "$f$;");
+        for part in [
+            "IF OLD.write_once AND NOT NEW.write_once THEN",
+            "IF OLD.write_once AND NEW.name <> OLD.name AND EXISTS (SELECT FROM storage.objects o WHERE o.bucket_id = OLD.id) THEN",
+            "RETURN NEW;",
+        ] {
+            assert!(guard.contains(part), "{part}: {guard}");
+        }
+        assert_eq!(guard.matches("RAISE EXCEPTION USING ERRCODE = 'CB005'").count(), 2, "{guard}");
+        let freeze = between(&sql, "CREATE OR REPLACE FUNCTION storage.freeze_objects()", "$f$;");
+        for part in [
+            "IF EXISTS (SELECT FROM storage.buckets b WHERE b.id = OLD.bucket_id AND b.write_once) THEN",
+            "RAISE EXCEPTION USING ERRCODE = 'CB005'",
+            "IF TG_OP = 'DELETE' THEN\n    RETURN OLD;",
+            "RETURN NEW;",
+        ] {
+            assert!(freeze.contains(part), "{part}: {freeze}");
+        }
+        // Checked: both bodies, SECURITY DEFINER and a superuser's; both triggers counted.
+        let check = storage_check_sql("postgres", Some(VERIFIER));
+        for name in ["guard_buckets", "freeze_objects"] {
+            assert!(check.contains(&format!("(p.proname OPERATOR(pg_catalog.=) '{name}' AND p.prosecdef AND EXISTS (SELECT FROM pg_catalog.pg_roles s WHERE s.oid OPERATOR(pg_catalog.=) p.proowner AND s.rolsuper) AND p.prosrc OPERATOR(pg_catalog.=) $b$")), "{name}: {check}");
+        }
+        assert!(check.contains("$b$))) OPERATOR(pg_catalog.=) 8"), "eight checked functions: {check}");
+        assert!(check.contains("AND NOT t.tgisinternal) OPERATOR(pg_catalog.=) 6"), "six triggers: {check}");
+        // Healed: the install's own are kept and anything else dropped; no ACL entry on either.
+        let foreign = foreign_objects_sql();
+        for part in [
+            "'storage.guard_buckets()'",
+            "'storage.freeze_objects()'",
+            "(t.tgname OPERATOR(pg_catalog.=) 'guard_buckets' AND c.relname OPERATOR(pg_catalog.=) 'buckets')",
+            "(t.tgname OPERATOR(pg_catalog.=) 'freeze_objects' AND c.relname OPERATOR(pg_catalog.=) 'objects')",
+        ] {
+            assert!(foreign.contains(part), "{part}: {foreign}");
+        }
+        assert!(acl_entries_sql().contains("ARRAY['protect_objects', 'guard_tickets', 'touch_objects', 'guard_sessions', 'guard_buckets', 'freeze_objects']"), "{}", acl_entries_sql());
+        assert!(EXPECTED_DEFAULTS.contains(&"buckets.write_once=false"));
+        let mut sorted = EXPECTED_DEFAULTS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, EXPECTED_DEFAULTS, "the check compares the sorted list");
+    }
 }

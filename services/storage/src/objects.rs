@@ -24,6 +24,11 @@
 //! A refused or failed write deletes the blob and withdraws the ticket
 //! ([`crate::names::keep_if_written`]); a write whose outcome is unknown (no answer from
 //! Postgres) keeps the blob for m8's sweeper, which deletes only unreferenced blobs.
+//!
+//! A write-once bucket (m7) is the database's to enforce (`freeze_objects`, [`WRITE_ONCE`]):
+//! an upsert's overwrite, a move, a rename or a delete there fails in the statement, as the
+//! pre-check's rolled-back write does, and is answered 409 `write_once`. Nothing here reads
+//! the flag, so no route can forget it.
 
 use std::sync::Arc;
 
@@ -100,8 +105,15 @@ pub fn outcome_unknown(f: &Failure) -> bool {
 /// The trigger's code for a row its ticket doesn't vouch for.
 const TICKET_MISSING: &str = "CB003";
 
+/// The schema's code for a write-once refusal (m7): an object in a write-once bucket
+/// overwritten (an upsert), moved, renamed or deleted; `write_once` turned off; a write-once
+/// bucket holding objects renamed. The database raises it for every role, so the service
+/// never checks the flag itself: 409 `write_once`, with the database's message.
+pub const WRITE_ONCE: &str = "CB005";
+
 /// A database error as this module reads it: the trigger's [`TICKET_MISSING`] keeps its
-/// SQLSTATE (a 409 until a step reads it), everything else maps as the data API does.
+/// SQLSTATE (a 409 until a step reads it), [`WRITE_ONCE`] is 409 `write_once`, everything
+/// else maps as the data API does.
 pub fn db_failure(code: &str, message: &str, request_id: &str) -> QueryFailure {
     struct Db<'a>(&'a str, &'a str);
     impl chelabase_query::error::DbFields for Db<'_> {
@@ -121,19 +133,21 @@ pub fn db_failure(code: &str, message: &str, request_id: &str) -> QueryFailure {
             None
         }
     }
-    if code == TICKET_MISSING {
-        let mut f = QueryFailure::new(StatusCode::CONFLICT, "conflict", message);
+    if code == TICKET_MISSING || code == WRITE_ONCE {
+        let kind = if code == WRITE_ONCE { "write_once" } else { "conflict" };
+        let mut f = QueryFailure::new(StatusCode::CONFLICT, kind, message);
         f.sqlstate = Some(code.to_owned());
         return f;
     }
     QueryFailure::from_db(&Db(code, message), request_id)
 }
 
-/// [`crate::buckets::pg`], keeping `CB003` ([`db_failure`]).
+/// A caller statement's failure, keeping the schema's own codes ([`db_failure`]): `CB003`
+/// and `CB005`. The bucket routes use it too.
 pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
     move |e| match e.as_db_error() {
-        Some(db) if db.code().code() == TICKET_MISSING => {
-            db_failure(TICKET_MISSING, db.message(), request_id)
+        Some(db) if matches!(db.code().code(), TICKET_MISSING | WRITE_ONCE) => {
+            db_failure(db.code().code(), db.message(), request_id)
         }
         _ => QueryFailure::from_pg(&e, request_id),
     }
@@ -575,7 +589,7 @@ pub(crate) async fn upload_as<S: ConnSource, M: ConnSource>(
         (status = 200, description = "Stored: `bucket`, `name`, `version_id`, `size`, `etag`", body = Value),
         (status = 400, description = "`invalid_request`", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
-        (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first", body = StorageErrorEnvelope),
+        (status = 409, description = "`conflict`: the name is taken (no upsert), or another upload changed it first; `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`: over the bucket's file size limit", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`: the declared type, or the type the first bytes are recognised as, isn't on the bucket's `allowed_mime_types`", body = StorageErrorEnvelope),
         (status = 502, description = "`storage_error`: the object store failed", body = StorageErrorEnvelope),
@@ -871,7 +885,7 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
     summary = "Delete an object",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     security(("bearer" = [])),
-    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Deleted"), (status = 404, description = "`object_not_found`: missing, or hidden", body = StorageErrorEnvelope), (status = 409, description = "`write_once`: the bucket is write-once", body = StorageErrorEnvelope)),
 )]
 pub async fn delete<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -904,7 +918,7 @@ pub struct DeleteObjects {
     params(("bucket" = String, Path), ObjectParams),
     request_body = DeleteObjects,
     security(("bearer" = [])),
-    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value)),
+    responses((status = 200, description = "`deleted`: the names deleted (those missing or hidden are left out)", body = Value), (status = 409, description = "`write_once`: the bucket is write-once; nothing is deleted", body = StorageErrorEnvelope)),
 )]
 pub async fn delete_many<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1016,7 +1030,7 @@ pub async fn copy<S: ConnSource, M: ConnSource>(
     params(ObjectParams),
     request_body = Relocate,
     security(("bearer" = [])),
-    responses((status = 204, description = "Moved"), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "The destination exists", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing changes", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
+    responses((status = 204, description = "Moved"), (status = 404, description = "The source is missing or hidden", body = StorageErrorEnvelope), (status = 409, description = "`conflict`: the destination exists; `write_once`: the source's bucket is write-once", body = StorageErrorEnvelope), (status = 413, description = "`too_large`: over the destination bucket's limit; nothing changes", body = StorageErrorEnvelope), (status = 415, description = "`mime_not_allowed`: a type the destination bucket doesn't allow", body = StorageErrorEnvelope)),
 )]
 pub async fn r#move<S: ConnSource, M: ConnSource>(
     State(state): State<Arc<AppState<S, M>>>,
@@ -1272,6 +1286,23 @@ mod tests {
             (rls.status, rls.sqlstate.as_deref()),
             (StatusCode::FORBIDDEN, Some("42501"))
         );
+    }
+
+    /// m7 (write-once): the triggers' `CB005` (an object in a write-once bucket updated, moved or
+    /// deleted; `write_once` turned off; a write-once bucket holding objects renamed) is 409
+    /// `write_once` with the database's own message, through every mapping: the pre-check's
+    /// refusal, the final write's and a plain statement's.
+    #[test]
+    fn a_write_once_refusal_is_409_write_once() {
+        let message = "storage.objects: the bucket is write-once";
+        let f = db_failure("CB005", message, "r");
+        assert_eq!(
+            (f.status, f.code, f.message.as_str(), f.sqlstate.as_deref()),
+            (StatusCode::CONFLICT, "write_once", message, Some("CB005"))
+        );
+        assert_eq!(final_failure(Failure(f.clone())).0.code, "write_once");
+        assert_eq!(Failure(f.clone()).refusal().0.code, "write_once");
+        assert!(!outcome_unknown(&Failure(f)));
     }
 
     /// SF2: a final write that failed without an answer from Postgres (the connection lost, the
