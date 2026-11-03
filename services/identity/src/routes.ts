@@ -12,7 +12,7 @@ import type { Mailer } from "./email/mailer.ts";
 import { HttpError, type Json } from "./http.ts";
 import { parsePoolName, type PoolRef } from "./pool-name.ts";
 import type { PoolRegistry } from "./registry.ts";
-import { codeRoutes, emailStatusRoute } from "./routes/codes.ts";
+import { codeRoutes, emailStatusRoute, inviteNoticeRoute } from "./routes/codes.ts";
 
 export type RouteId =
   | "pools.create"
@@ -33,6 +33,7 @@ export type RouteId =
   | "sessions.revoke_all"
   | "codes.create"
   | "codes.verify"
+  | "invite.notice"
   | "email.status";
 
 /** What each caller may do. Anything not listed answers 403. */
@@ -59,7 +60,8 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
   ]),
   // App-user admin in the management API: no sign-in and no session tokens. It may set an
   // initial password when it creates a user, but never changes one afterwards. It may create
-  // invite codes (only that kind; see routes/codes.ts) but never check one.
+  // invite codes (only that kind; see routes/codes.ts) but never check one, and it alone sends
+  // the code-less invite notice to an existing account.
   orchestrator: new Set<RouteId>([
     "users.create",
     "users.list",
@@ -71,6 +73,7 @@ export const ALLOW: Record<Caller, ReadonlySet<RouteId>> = {
     "sessions.revoke",
     "sessions.revoke_all",
     "codes.create",
+    "invite.notice",
     "email.status",
   ]),
   // Pool lifecycle and the users sync.
@@ -161,6 +164,7 @@ export interface BaUser {
   name: string;
   emailVerified: boolean;
   banned?: boolean | null;
+  banReason?: string | null;
   createdAt: Date | string;
   updatedAt: Date | string;
 }
@@ -185,6 +189,12 @@ export function userOut(u: BaUser): Json {
     created_at: iso(u.createdAt),
     updated_at: iso(u.updatedAt),
   };
+}
+
+/** Whether the user can sign in with a password. */
+export async function hasPassword(ctx: Context, user: BaUser): Promise<boolean> {
+  const account = (await ctx.internalAdapter.findCredentialAccount(user.id)) as { password?: string | null } | null;
+  return Boolean(account?.password);
 }
 
 /** Never includes the token. */
@@ -318,14 +328,17 @@ const ROUTES: readonly Route[] = [
     },
   },
   {
-    // Mirrors `getUser` (/admin/get-user).
+    // Mirrors `getUser` (/admin/get-user), plus what only a single read tells: `has_password`
+    // needs an account lookup per user, so the list leaves both out.
     id: "users.get",
     method: "GET",
     rest: ["users", ":id"],
     async handle({ registry, pool, id }) {
       return registry.use(pool, async (auth) => {
-        const user = await requireUser(await context(auth), id);
-        return { status: 200, body: { user: userOut(user) } };
+        const ctx = await context(auth);
+        const user = await requireUser(ctx, id);
+        const out = { ...(userOut(user) as Record<string, Json>), has_password: await hasPassword(ctx, user), ban_reason: user.banReason ?? null };
+        return { status: 200, body: { user: out } };
       });
     },
   },
@@ -532,6 +545,7 @@ const ROUTES: readonly Route[] = [
     },
   },
   ...codeRoutes(),
+  inviteNoticeRoute(),
 ];
 
 const GLOBAL_ROUTES: readonly GlobalRoute[] = [emailStatusRoute()];

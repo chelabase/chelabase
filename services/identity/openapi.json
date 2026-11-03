@@ -277,7 +277,7 @@
                   ],
                   "properties": {
                     "user": {
-                      "$ref": "#/components/schemas/User"
+                      "$ref": "#/components/schemas/UserDetail"
                     }
                   }
                 }
@@ -1108,6 +1108,86 @@
         }
       }
     },
+    "/internal/v1/pools/{pool}/users/{id}/invite-notice": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/Pool"
+        },
+        {
+          "$ref": "#/components/parameters/Id"
+        }
+      ],
+      "post": {
+        "operationId": "sendInviteNotice",
+        "summary": "Tell an existing account it was invited",
+        "description": "Mails the user a notice that links to the invite's ticket. It holds no code and sets nothing: the person accepts by signing in as themselves. Members pool only (400 `invalid_pool`). 409 `email_not_configured` without SMTP; 502 `email_send_failed` when the SMTP server refuses.",
+        "x-callers": [
+          "orchestrator"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "link"
+                ],
+                "properties": {
+                  "project_name": {
+                    "type": "string",
+                    "maxLength": 128
+                  },
+                  "link": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "description": "Absolute http(s) URL of the invite's ticket; refused with a `code` parameter"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Sent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "sent"
+                  ],
+                  "properties": {
+                    "sent": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "502": {
+            "$ref": "#/components/responses/Error"
+          }
+        }
+      }
+    },
     "/internal/v1/email/status": {
       "get": {
         "operationId": "emailStatus",
@@ -1298,6 +1378,33 @@
           "verify",
           "reset",
           "invite"
+        ]
+      },
+      "UserDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/User"
+          },
+          {
+            "type": "object",
+            "required": [
+              "has_password",
+              "ban_reason"
+            ],
+            "properties": {
+              "has_password": {
+                "type": "boolean",
+                "description": "Whether the user can sign in with a password"
+              },
+              "ban_reason": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Why the user is banned; null when they aren't"
+              }
+            }
+          }
         ]
       }
     }
