@@ -85,6 +85,8 @@ struct FakeMetadata {
     fail_revoke: Arc<Mutex<bool>>,
     /// Makes the offboarding write of a removal fail.
     fail_offboard: Arc<Mutex<bool>>,
+    /// Makes `other_memberships` fail.
+    fail_other_memberships: Arc<Mutex<bool>>,
     project_auth_reads: Arc<AtomicUsize>,
     project_auth_batch_reads: Arc<AtomicUsize>,
     /// Saved queries with their (database, user).
@@ -4292,6 +4294,9 @@ impl orchestrator::members::MembersPort for FakeMetadata {
     }
 
     async fn other_memberships(&self, identity_user_id: &str, except: Option<uuid::Uuid>) -> Result<chelabase_metadata::members::OtherMemberships, MetadataError> {
+        if *self.fail_other_memberships.lock().unwrap() {
+            return Err(MetadataError::Conflict);
+        }
         let members = self.members.lock().unwrap();
         let others: Vec<_> = members
             .iter()

@@ -16089,7 +16089,9 @@ async fn invite_undo_keeps_a_user_shared_since() {
     let sub = t.identity.with_invited_user(&Pool::Members, "both@x.com");
     second_tenant(&t, &sub, MemberStatus::Invited);
     t.identity.fail(CODES_ROUTE, 503, "internal", 1);
-    error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "both@x.com"))).await, 503).await;
+    // By email: a link for someone another tenant holds is refused before anything is sent.
+    let body = invite_body(&t.w, "both@x.com", "developer", &["app"]);
+    error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(body)).await, 503).await;
     assert!(t.identity.user(&Pool::Members, &sub).is_some());
 }
 
@@ -16281,18 +16283,6 @@ async fn reinstate_restores() {
     // Realtime re-checks once the member is really clear: the last event comes after the clear.
     let events = t.w.app.rt_events.access();
     assert_eq!(events.len(), before + 2, "{events:?}");
-}
-
-#[tokio::test]
-async fn reinstate_leaves_a_foreign_ban() {
-    let t = mw(Mode::SelfHosted).await;
-    let (member, sub) = identity_member(&t, "sue@x.com");
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
-    t.identity.client().ban(&Pool::Members, &sub, Some("abuse")).await.unwrap();
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/reinstate"), None).await.status(), 200);
-    let user = t.identity.user(&Pool::Members, &sub).unwrap();
-    assert!(user.banned, "{user:?}");
-    assert_eq!(user.ban_reason.as_deref(), Some("abuse"));
 }
 
 #[tokio::test]
@@ -16543,20 +16533,101 @@ async fn suspend_ends_sessions_when_the_only_other_row_is_an_open_invite() {
     assert!(!t.identity.user(&Pool::Members, &sub).unwrap().banned);
 }
 
-// #122 S2: an account banned for a reason that isn't ours keeps the offboarded mark on reinstate,
-// so the row doesn't become usable while the identity service still bans the person.
+// #122 re-audit B1: an account banned for a reason that isn't ours can't be reinstated. The
+// answer is 409 and nothing is written: the member stays suspended and refused, and the ban stays.
 #[tokio::test]
-async fn adv_reinstate_with_a_foreign_ban_keeps_the_offboarded_mark() {
+async fn reinstate_under_a_foreign_ban_is_refused() {
     let t = mw(Mode::SelfHosted).await;
-    let (member, sub) = identity_member(&t, "sue@x.com");
+    let (member, sub) = identity_member(&t, "sue2@x.com");
     assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/suspend"), None).await.status(), 200);
-    t.w.metadata.members.lock().unwrap().iter_mut().find(|m| m.id == member).unwrap().offboarded = true;
+    assert!(!t.w.metadata.member(t.w.tenant, &sub).unwrap().offboarded, "suspend sets no mark");
     t.identity.client().ban(&Pool::Members, &sub, Some("abuse")).await.unwrap();
-    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/reinstate"), None).await.status(), 200);
-    let stored = t.w.metadata.member(t.w.tenant, &sub).unwrap();
-    assert_eq!(stored.status, MemberStatus::Active);
-    assert!(stored.offboarded, "the mark stays while the foreign ban does");
-    assert_eq!(t.identity.user(&Pool::Members, &sub).unwrap().ban_reason.as_deref(), Some("abuse"));
+    let before = t.w.app.rt_events.access().len();
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{member}/reinstate"), None).await, 409).await;
+    assert_eq!(code_of(&err), "conflict");
+    assert_eq!(t.w.metadata.member(t.w.tenant, &sub).unwrap().status, MemberStatus::Suspended);
+    assert_eq!(t.w.app.rt_events.access().len(), before, "nothing changed");
+    let err = error_of(t.send(&sub, Method::GET, "/v1/members", None).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+    let user = t.identity.user(&Pool::Members, &sub).unwrap();
+    assert!(user.banned, "{user:?}");
+    assert_eq!(user.ban_reason.as_deref(), Some("abuse"));
+}
+
+// #122 re-audit S1: a link hands the admin a password-setting code, so it is refused for a person
+// another tenant still holds (an open invite there included). By email the code reaches only
+// the mailbox owner, so that stays allowed; a resend by link is refused the same way.
+#[tokio::test]
+async fn link_invite_refused_for_another_tenants_invitee() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "theirs@x.com");
+    second_tenant(&t, &sub, MemberStatus::Invited);
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "theirs@x.com"))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert!(t.w.metadata.member(t.w.tenant, &sub).is_none(), "no member row");
+    assert!(!t.identity.calls().iter().any(|c| c.contains(CODES_ROUTE)), "no code is created");
+
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "theirs@x.com", "developer", &["app"]))).await).await;
+    assert_eq!(t.identity.codes_sent().len(), 1, "email delivery stays allowed");
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}/resend");
+    let err = error_of(t.send(DEFAULT_SUB, Method::POST, &path, Some(json!({ "delivery": "link" }))).await, 409).await;
+    assert_eq!(code_of(&err), "link_not_allowed");
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &path, None).await.status(), 200, "by email it is resent");
+}
+
+// A link for someone whose only other row is removed is still a new person's link.
+#[tokio::test]
+async fn link_invite_allowed_when_the_other_tenant_removed_them() {
+    let t = mw(Mode::SelfHosted).await;
+    let sub = t.identity.with_invited_user(&Pool::Members, "gone@x.com");
+    second_tenant(&t, &sub, MemberStatus::Removed);
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_link_body(&t, "gone@x.com"))).await).await;
+    assert!(body["invite_url"].is_string(), "{body}");
+}
+
+// The m10 follow-up: finding the invitee is one exact identity lookup, never a substring search
+// paged to the end. 650 users contain `a@x.com`; none is it.
+#[tokio::test]
+async fn invite_lookup_is_one_identity_call() {
+    let t = mw(Mode::SelfHosted).await;
+    for i in 0..650 {
+        t.identity.with_invited_user(&Pool::Members, &format!("u{i}a@x.com"));
+    }
+    let list = "GET /internal/v1/pools/members/users";
+    let before = t.identity.calls().len();
+    created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "a@x.com", "developer", &["app"]))).await).await;
+    let lists = t.identity.calls()[before..].iter().filter(|c| c.as_str() == list).count();
+    assert_eq!(lists, 1, "user-list reads for one invite");
+}
+
+// #122 re-audit N1: other memberships unreadable after the revoke is the retryable 503, and the
+// same revoke again finishes it.
+#[tokio::test]
+async fn revoke_invite_other_memberships_failure_is_retryable() {
+    let t = mw(Mode::SelfHosted).await;
+    let body = created(t.send(DEFAULT_SUB, Method::POST, "/v1/invites", Some(invite_body(&t.w, "new@x.io", "developer", &["app"]))).await).await;
+    let invite = body["member"]["invite"]["id"].as_str().unwrap().to_string();
+    let path = format!("/v1/invites/{invite}");
+    *t.w.metadata.fail_other_memberships.lock().unwrap() = true;
+    let err = error_of(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await, 503).await;
+    assert_eq!(code_of(&err), "unavailable");
+    *t.w.metadata.fail_other_memberships.lock().unwrap() = false;
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &path, None).await.status(), 204);
+    assert_eq!(t.identity.user_by_email(&Pool::Members, "new@x.io"), None);
+}
+
+// #122 re-audit N2: with no identity client, ending access for someone active in another tenant
+// has nothing to do there, so it is no 503.
+#[tokio::test]
+async fn no_identity_client_is_no_503_while_active_elsewhere() {
+    let t = mw_without_identity().await;
+    let bob = t.w.metadata.add_granted(t.w.tenant, "bob", t.w.project, PlatformRole::Developer, &["app"]);
+    let ann = t.w.metadata.add_granted(t.w.tenant, "ann", t.w.project, PlatformRole::Developer, &["app"]);
+    second_tenant(&t, "bob", MemberStatus::Active);
+    second_tenant(&t, "ann", MemberStatus::Active);
+    assert_eq!(t.send(DEFAULT_SUB, Method::POST, &format!("/v1/members/{bob}/suspend"), None).await.status(), 200);
+    assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/members/{ann}"), None).await.status(), 204);
 }
 
 // #122 S3: an invite that fails before its member row is written deletes the user it made only
