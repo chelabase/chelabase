@@ -1,9 +1,9 @@
 //! `auth` frames (spec §1, R9, S2, S14, W32): a Studio socket's first frame within 5 s, then one
 //! per oidc-client renewal. The token is verified as the gateway does (the same JWKS settings);
-//! its `sub`, `org_id` and tenant (a member token's `tid`, #119) must be the ticket's (else 4003); a token whose `exp ≤ now` closes
-//! 4001, and the socket closes 4001 at `exp` exactly unless a renewal came (no leeway). A
-//! renewal that fails verification closes 4001 at once (W32). The token's contents never reach
-//! a log (R22).
+//! its `sub`, `org_id` and tenant (a member token's `tid`, #119) must be the ticket's (else
+//! 4003); a token whose `exp ≤ now` closes 4001, and the socket closes 4001 at `exp` exactly
+//! unless a renewal came (no leeway). A renewal that fails verification closes 4001 at once
+//! (W32). The token's contents never reach a log (R22).
 
 use async_trait::async_trait;
 use chelabase_auth::member_token::{MemberTokenError, MemberTokenVerifier, member_shaped};

@@ -1938,17 +1938,22 @@ where
     }
 }
 
-/// Caller whose org is bound to a Chelabase tenant (soft-bind), with their member row.
+/// Caller with a Chelabase tenant, with their member row there: the tenant a member token's
+/// `tid` names, or the one a Zitadel token's org is bound to (soft-bind).
 #[derive(Debug, Clone)]
 pub struct AuthPrincipal {
     pub sub: String,
+    /// The Zitadel org; empty for a member token.
     pub org_id: String,
     pub tenant_id: TenantId,
     pub request_id: String,
-    /// The caller's member row in the tenant: `None` only in platform mode, which makes no
-    /// members on its own. [`access::authorize`] checks its status on every request.
+    /// The caller's member row in the tenant: `None` for anyone [`resolve_member`] finds no row
+    /// for and doesn't admit, which includes every member token without one.
+    /// [`access::authorize`] checks its status on every request.
     pub member: Option<MemberRecord>,
-    /// Whether the caller's org is `CHELABASE_OPERATOR_ORG_ID` (platform instance routes).
+    /// Whether the caller is an operator (platform instance routes): a Zitadel token's org is
+    /// `CHELABASE_OPERATOR_ORG_ID`, or a member token's subject is an active member of
+    /// `CHELABASE_OPERATOR_TENANT_ID`.
     pub in_operator_org: bool,
 }
 
@@ -2260,7 +2265,8 @@ pub(crate) async fn read_only_principal<M: MetadataPort, J>(
 
 /// #119: [`read_only_principal`] for a verified member token: the tenant its `tid` names, when
 /// it exists (`None` otherwise), and the member row as it is.
-pub(crate) async fn read_only_member_principal<M: MetadataPort, J>(
+#[doc(hidden)] // `pub` for the realtime principal's test: no route shows its operator flag.
+pub async fn read_only_member_principal<M: MetadataPort, J>(
     state: &AppState<M, J>,
     claims: &chelabase_auth::member_token::MemberClaims,
 ) -> Result<Option<AuthPrincipal>, MetadataError> {
@@ -2709,7 +2715,8 @@ async fn health() -> impl IntoResponse {
     summary = "The caller, their capabilities and their tenant",
     responses(
         (status = 200, description = "The signed-in user, their membership and what they may use, and, once their org is bound, the tenant with the projects and databases they may use", body = MeResponse),
-        (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
+        (status = 401, description = "`unauthorized`: no credential, a bad token or internal identity, or a member token whose tenant no longer exists", body = ErrorEnvelope),
+        (status = 403, description = "`no_access_yet` (self-hosted) or `not_available_in_platform_mode` (platform): a member token whose subject has no member row in the tenant it names", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
 )]
@@ -2729,7 +2736,8 @@ where
     M: MetadataPort,
     J: JobPort,
 {
-    use chelabase_types::access::{GrantSources, PlatformRole, RoleSet};
+    use chelabase_types::access::{Deny, GrantSources, PlatformRole, RoleSet};
+    use chelabase_types::mode::Mode;
     let failed = |what: &str, err: MetadataError| {
         error!("{what}: {err}");
         ApiError::internal()
@@ -2739,6 +2747,13 @@ where
         Some(tenant) => resolve_member(state, tenant, &caller).await?,
         None => None,
     };
+    // #119: `tid` alone vouches for nothing, so a stranger to that tenant learns nothing of it.
+    if caller.tenant_id.is_some() && member.is_none() {
+        return Err(access::deny_to_api(match state.policy.mode() {
+            Mode::SelfHosted => Deny::NoAccessYet,
+            Mode::Platform => Deny::NotAvailableInPlatformMode,
+        }));
+    }
     // D7: an offboarded member is told who they are, with nothing to use.
     let active = member.as_ref().filter(|m| m.in_good_standing());
     let tenant_admin = active.is_some_and(|m| m.tenant_admin);

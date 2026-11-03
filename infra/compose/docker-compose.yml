@@ -1210,6 +1210,7 @@ services:
       # .env's tunables (blank = the service's default).
       CHELABASE_REQUIRE_EMAIL_VERIFICATION: ${CHELABASE_REQUIRE_EMAIL_VERIFICATION:-}
       CHELABASE_APP_ACCESS_TTL_SECS: ${CHELABASE_APP_ACCESS_TTL_SECS:-}
+      CHELABASE_MEMBER_ACCESS_TTL_SECS: ${CHELABASE_MEMBER_ACCESS_TTL_SECS:-}
       # auth-replacement m5: its identity bearer (member and app-user flows).
       CHELABASE_IDENTITY_URL: http://identity:8080
       CHELABASE_IDENTITY_TOKEN_FILE: /run/chelabase/secrets/tokens/auth-identity.token

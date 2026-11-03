@@ -16238,6 +16238,12 @@ async fn member_token_wrong_tenant_403_no_jit() {
     let other = TenantId::new();
     w.metadata.bind_org("org-2", other);
     w.metadata.add_member(other, "mallory", MemberStatus::Active, true);
+    w.metadata.set_overview(TenantOverview {
+        id: w.tenant,
+        slug: "victim-corp".into(),
+        display_name: Some("Victim Corp".into()),
+        projects: vec![],
+    });
     let before = (w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len());
     let path = format!("/v1/databases/{}", w.db);
     for sub in ["mallory", "newcomer"] {
@@ -16245,8 +16251,10 @@ async fn member_token_wrong_tenant_403_no_jit() {
         assert_eq!(code_of(&err), "no_access_yet", "{sub}");
         let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/members").await, 403).await;
         assert_eq!(code_of(&err), "no_access_yet", "{sub}");
-        let me: Value = send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
-        assert!(me["member"].is_null(), "{sub}: {me}");
+        // `/v1/me` too: `tid` alone never reveals the tenant.
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/me").await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        assert!(!err.to_string().contains("victim-corp"), "{sub}: {err}");
         assert!(w.metadata.member(w.tenant, sub).is_none(), "{sub}: no member row");
     }
     assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
@@ -16423,8 +16431,56 @@ async fn operator_tenant_needs_an_active_membership() {
     for sub in ["stranger", "sus", "off"] {
         let resp = send_member(&app, sub, ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
         assert_eq!(resp.status(), 403, "{sub}");
+    }
+    // A member not in good standing is still told where they stand; a stranger is told nothing.
+    for sub in ["sus", "off"] {
         let me: Value = send_member(&app, sub, ops.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
         assert_eq!(me["instance_admin"], json!(false), "{sub}: {me}");
     }
+    let err = error_of(send_member(&app, "stranger", ops.as_uuid(), Method::GET, "/v1/me").await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
     assert_eq!(metadata.members.lock().unwrap().len(), before, "nothing is admitted");
+}
+
+// The realtime routes read the same rule: their principal for a member token naming the operator
+// tenant is an operator only with an active membership there, and is never made one by `tid`.
+#[tokio::test]
+async fn realtime_principal_operator_needs_an_active_membership() {
+    use chelabase_auth::member_token::{MemberClaims, MEMBER_AUDIENCE};
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    metadata.add_member(ops, "sus", MemberStatus::Suspended, false);
+    metadata.add_member(ops, "off", MemberStatus::Active, false);
+    metadata.set_member(ops, "off", |m| m.offboarded = true);
+    let other = TenantId::new();
+    metadata.bind_org("org-1", other);
+    metadata.add_member(other, "op", MemberStatus::Active, false);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let before = metadata.members.lock().unwrap().len();
+    let principal = |sub: &'static str, tenant: TenantId| {
+        let app = &app;
+        async move {
+            let claims = MemberClaims {
+                iss: "http://auth.test".into(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: sub.into(),
+                tid: tenant.as_uuid(),
+                sid: "s".into(),
+                email: String::new(),
+                name: String::new(),
+                iat: 0,
+                exp: 0,
+            };
+            orchestrator::read_only_member_principal(&app.state, &claims).await.unwrap().unwrap()
+        }
+    };
+    assert!(principal("op", ops).await.in_operator_org, "an active member of the operator tenant");
+    assert!(!principal("op", other).await.in_operator_org, "the same person in another tenant");
+    for sub in ["stranger", "sus", "off"] {
+        assert!(!principal(sub, ops).await.in_operator_org, "{sub}");
+    }
+    assert!(principal("stranger", ops).await.member.is_none(), "read, never made");
+    assert_eq!(metadata.members.lock().unwrap().len(), before);
 }

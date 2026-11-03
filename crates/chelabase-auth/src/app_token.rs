@@ -56,7 +56,7 @@ pub fn kid_for(raw_public: &[u8; 32]) -> String {
 /// The raw 32-byte key out of an Ed25519 SPKI PEM (44 bytes of DER; the key is the last 32).
 pub(crate) fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
     let text = std::str::from_utf8(public_pem)
-        .map_err(|e| AuthError::Config(format!("app public key: {e}")))?;
+        .map_err(|e| AuthError::Config(format!("Ed25519 public key: {e}")))?;
     let body: String = text
         .lines()
         .map(str::trim)
@@ -64,10 +64,10 @@ pub(crate) fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
         .collect();
     let der = STANDARD
         .decode(body)
-        .map_err(|e| AuthError::Config(format!("app public key: {e}")))?;
+        .map_err(|e| AuthError::Config(format!("Ed25519 public key: {e}")))?;
     if der.len() != 44 {
         return Err(AuthError::Config(format!(
-            "app public key: expected a 44-byte Ed25519 SPKI, got {} bytes",
+            "Ed25519 public key: expected a 44-byte SPKI, got {} bytes",
             der.len()
         )));
     }
