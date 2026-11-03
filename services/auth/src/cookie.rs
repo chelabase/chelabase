@@ -1,10 +1,11 @@
 //! The encrypted cookies: step state between requests (`chelabase_login`) and the finished
-//! sign-in's Zitadel session, kept only to end it at logout (`chelabase_session`).
+//! sign-in's session (`chelabase_session`).
 
 use chelabase_secrets::{SecretKey, open, seal};
 use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 pub const LOGIN_COOKIE: &str = "chelabase_login";
 pub const SESSION_COOKIE: &str = "chelabase_session";
@@ -32,11 +33,32 @@ pub struct LoginState {
     pub exp: u64,
 }
 
+/// What `chelabase_session` seals.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionState {
-    pub session_id: String,
-    pub session_token: String,
-    pub exp: u64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionState {
+    /// An identity session, bound to the tenant chosen at sign-in: `/auth/v1/token` mints from it.
+    Identity {
+        session_id: String,
+        session_token: String,
+        tenant: Uuid,
+        exp: u64,
+    },
+    /// A Zitadel session from accept-invite, kept only to end it at logout. Mints nothing. #124
+    /// (m11) moves accept-invite to identity and deletes this variant.
+    Zitadel {
+        session_id: String,
+        session_token: String,
+        exp: u64,
+    },
+}
+
+impl SessionState {
+    fn exp(&self) -> u64 {
+        match self {
+            Self::Identity { exp, .. } | Self::Zitadel { exp, .. } => *exp,
+        }
+    }
 }
 
 pub fn now_secs() -> u64 {
@@ -70,7 +92,7 @@ pub fn seal_session(key: &SecretKey, state: &SessionState) -> String {
 
 pub fn open_session(key: &SecretKey, sealed: &str, now: u64) -> Option<SessionState> {
     let state: SessionState = serde_json::from_str(&open(key, SESSION_AAD, sealed).ok()?).ok()?;
-    (state.exp >= now).then_some(state)
+    (state.exp() >= now).then_some(state)
 }
 
 const TICKET_AAD: &str = "chelabase:auth:accept-ticket";
@@ -162,7 +184,7 @@ mod tests {
         // A session cookie can't be replayed as a login cookie.
         let session = seal_session(
             &key,
-            &SessionState {
+            &SessionState::Zitadel {
                 session_id: "s".into(),
                 session_token: "t".into(),
                 exp: now_secs() + 60,

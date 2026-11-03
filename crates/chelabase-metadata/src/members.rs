@@ -1612,6 +1612,29 @@ impl MetadataClient {
         .transpose()?)
     }
 
+    /// The tenants this identity user is an active or pending member of, by tenant id. What
+    /// `auth` picks a sign-in's tenant from, and what `/auth/v1/token` re-reads before it mints.
+    pub async fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, MemberStatus)>, MetadataError> {
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+            "SELECT tenant_id, status FROM members
+              WHERE identity_user_id = $1 AND status IN ('active', 'pending')
+              ORDER BY tenant_id",
+        )
+        .bind(identity_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(tenant, status)| {
+                let status = if status == "active" { MemberStatus::Active } else { MemberStatus::Pending };
+                (TenantId(tenant), status)
+            })
+            .collect())
+    }
+
     /// Whether `member`'s Zitadel user has another member row, in any tenant, that isn't
     /// removed: a removal then leaves the user active (only its sessions end). An unknown
     /// `member` is `false`.

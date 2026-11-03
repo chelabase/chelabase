@@ -17963,6 +17963,7 @@
           "unauthorized",
           "forbidden",
           "tenant_not_bound",
+          "tenant_required",
           "not_found",
           "method_not_allowed",
           "invalid_request",

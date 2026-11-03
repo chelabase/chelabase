@@ -1117,14 +1117,15 @@ pub mod auth {
         }
     }
 
-    pub const AUTH_REQUEST: Endpoint = post("auth.auth_request", "/auth/v1/auth-request");
     /// Whether the instance is unclaimed (the sign-up page asks for the setup code).
     pub const INSTANCE: Endpoint = Endpoint { method: Method::Get, ..post("auth.instance", "/auth/v1/instance") };
-    /// Studio's runtime config (its Zitadel ids and public URLs), read before it mounts.
+    /// Studio's runtime config (its public URLs), read before it mounts.
     pub const STUDIO_CONFIG: Endpoint =
         Endpoint { method: Method::Get, ..post("auth.studio_config", "/auth/v1/studio-config") };
     pub const SIGN_IN: Endpoint = post("auth.sign_in", "/auth/v1/sign-in");
     pub const SIGN_UP: Endpoint = post("auth.sign_up", "/auth/v1/sign-up");
+    /// A member access token from the session cookie. Public here: auth checks the cookie.
+    pub const TOKEN: Endpoint = post("auth.token", "/auth/v1/token");
     pub const ACCEPT_INVITE: Endpoint = post("auth.accept_invite", "/auth/v1/accept-invite");
     /// Who invited the visitor and to what, for the accept page (`{user, t}` in the body, never a URL). Public: the link's
     /// token is the credential.
@@ -1358,7 +1359,7 @@ pub const ENDPOINTS: &[Endpoint] = &[
     rest::QUERY,
     rest::SCHEMA,
     rest::TYPES,
-    auth::AUTH_REQUEST,
+    auth::TOKEN,
     auth::INSTANCE,
     auth::STUDIO_CONFIG,
     auth::SIGN_IN,
@@ -2131,7 +2132,7 @@ mod tests {
             ("rest.schema", Access::DataKey),
             ("rest.types", Access::DataKey),
             // Studio sign-in.
-            ("auth.auth_request", Access::Public),
+            ("auth.token", Access::Public),
             ("auth.instance", Access::Public),
             ("auth.studio_config", Access::Public),
             ("auth.sign_in", Access::Public),

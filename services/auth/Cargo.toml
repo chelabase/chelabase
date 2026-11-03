@@ -44,6 +44,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 chelabase-auth = { workspace = true, features = ["keygen"] }
+chelabase-identity = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
 chelabase-zitadel = { workspace = true, features = ["mock"] }

@@ -19,6 +19,9 @@ use chelabase_metadata::personal_logins::LoginEndpoint;
 use chelabase_nats::{AppUsersSyncJob, JobEnvelope};
 use chelabase_types::{DatabaseId, ProjectId, TenantId};
 use chelabase_zitadel::client::Zitadel;
+use chelabase_identity::Pool;
+use uuid::Uuid;
+use chelabase_identity::mock::FakeIdentity;
 use chelabase_zitadel::mock::MockZitadel;
 use orchestrator::internal::app::AppJobPort;
 use chelabase_secrets::{Purpose, SecretKey, seal_credential};
@@ -123,6 +126,12 @@ struct FakeSetup {
     member_rows: std::collections::HashSet<String>,
     /// Every `replace_stale` `claim_setup` was called with.
     replace_asked: Vec<Option<String>>,
+    /// Every `admit_sign_up`: (org, user, email, name, admission).
+    admitted: Vec<(String, String, String, String, chelabase_metadata::members::Admission)>,
+    /// identity user -> their tenants, as `member_tenants` answers.
+    tenants_of: HashMap<String, Vec<(TenantId, chelabase_metadata::members::MemberStatus)>>,
+    /// `admit_sign_up` fails with a database error.
+    admit_fails: bool,
 }
 
 impl FakeNeon {
@@ -720,6 +729,40 @@ impl NeonMetadataPort for FakeNeon {
         Ok(Some(outcome))
     }
 
+    async fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, chelabase_metadata::members::MemberStatus)>, MetadataError> {
+        self.check()?;
+        Ok(self.setup.lock().unwrap().tenants_of.get(identity_user_id).cloned().unwrap_or_default())
+    }
+
+    async fn admit_sign_up(
+        &self,
+        org: &str,
+        identity_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: chelabase_metadata::members::Admission,
+    ) -> Result<Option<chelabase_metadata::members::MemberStatus>, MetadataError> {
+        use chelabase_metadata::members::{Admission, MemberStatus};
+        self.check()?;
+        let mut st = self.setup.lock().unwrap();
+        if st.admit_fails {
+            return Err(MetadataError::Database(sqlx::Error::PoolTimedOut));
+        }
+        st.admitted.push((org.into(), identity_user_id.into(), email.into(), name.into(), admission));
+        // The real rule: the claim's user becomes the active admin, whatever `admission` says.
+        if st.claims.get(org).is_some_and(|u| u == identity_user_id) {
+            return Ok(Some(MemberStatus::Active));
+        }
+        Ok(match admission {
+            Admission::Active => Some(MemberStatus::Active),
+            Admission::Pending => Some(MemberStatus::Pending),
+            Admission::Closed => None,
+        })
+    }
+
     async fn open_invite_for_user(&self, identity_user_id: &str) -> Result<Option<InviteDescription>, MetadataError> {
         self.check()?;
         Ok(self.invites.lock().unwrap().get(identity_user_id).cloned())
@@ -1226,6 +1269,7 @@ struct AppSetup {
     key: SecretKey,
     signing_key: Option<chelabase_types::file_value::FileValue>,
     zitadel: Option<String>,
+    identity: Option<chelabase_identity::Identity>,
     jobs: FakeJobs,
     resync: FakeResync,
     mode: Mode,
@@ -1246,6 +1290,7 @@ impl Default for AppSetup {
             key: SecretKey::generate(),
             signing_key: Some(SIGNING_KEY.into()),
             zitadel: None,
+            identity: None,
             jobs: FakeJobs::default(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
@@ -1426,6 +1471,7 @@ async fn spawn_with_app(
         zitadel: app
             .zitadel
             .map(|base| Zitadel::new(&base, chelabase_zitadel::mock::ADMIN_TOKEN)),
+        identity: app.identity,
         app_jobs: Arc::new(app.jobs),
         policy: chelabase_types::mode_policy::ModePolicy::new(app.mode),
         setup_code: app.setup_code,
@@ -4140,6 +4186,7 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
             key: world.key.clone(),
             signing_key: signing_key.map(Into::into),
             zitadel: zitadel.map(|z| z.base.clone()),
+            identity: None,
             jobs: jobs.clone(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
@@ -5226,8 +5273,8 @@ const SETUP_CODE: &str = "ABCD-EFGH-JKMN-PQRS-TUVW";
 const SETUP_ORG: &str = "org-first";
 
 /// The internal listener with this setup code (`None`: no `CHELABASE_SETUP_CODE_FILE`) and,
-/// optionally, a Zitadel.
-async fn setup_app(neon: FakeNeon, mode: Mode, code: Option<&str>, zitadel: Option<&MockZitadel>) -> Internal {
+/// optionally, an identity service.
+async fn setup_app(neon: FakeNeon, mode: Mode, code: Option<&str>, identity: Option<&FakeIdentity>) -> Internal {
     spawn_with_app(
         neon,
         FakeLocator::default(),
@@ -5237,7 +5284,7 @@ async fn setup_app(neon: FakeNeon, mode: Mode, code: Option<&str>, zitadel: Opti
         "http://127.0.0.1:9",
         AppSetup {
             mode,
-            zitadel: zitadel.map(|z| z.base.clone()),
+            identity: identity.map(FakeIdentity::client),
             setup_code: code.map(|c| orchestrator::internal::SetupCode::parse(c).unwrap()),
             ..AppSetup::default()
         },
@@ -5323,8 +5370,8 @@ async fn signup_claimed_tenant_ignores_code() {
 #[tokio::test]
 async fn signup_no_code_file_closes_window() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let user = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let user = mock.with_user(&Pool::Members, "a@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, None, Some(&mock)).await;
     let closed = json!({"allowed": false, "reason": "closed", "setup_required": false});
     for code in [None, Some(SETUP_CODE)] {
@@ -5344,9 +5391,9 @@ async fn signup_no_code_file_closes_window() {
 #[tokio::test]
 async fn signup_claimed_without_code_or_nonce_refused() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
-    let outsider = mock.add_user_in("org-other", "o@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let unknown = Uuid::new_v4().to_string();
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let refused = |r: (u16, Value)| assert_eq!((r.0, error_code(&r.1)), (403, "setup_code_invalid"), "{r:?}");
     refused(app.post_json(CLAIMED, Some(APP_AUTH_TOKEN), json!({"org": SETUP_ORG, "user_id": a})).await);
@@ -5356,10 +5403,10 @@ async fn signup_claimed_without_code_or_nonce_refused() {
     // Another org's nonce.
     let other = right_code_nonce(&app, "org-other").await;
     refused(claim(&app, SETUP_ORG, &a, &other).await);
-    // A user who isn't in the org: refused before the nonce is spent.
+    // A user identity doesn't have, or not a user id at all: refused before the nonce is spent.
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    refused(claim(&app, SETUP_ORG, &outsider, &n).await);
-    refused(claim(&app, SETUP_ORG, "999999", &n).await);
+    refused(claim(&app, SETUP_ORG, &unknown, &n).await);
+    refused(claim(&app, SETUP_ORG, "312345678901234567", &n).await);
     refused(claim(&app, SETUP_ORG, "../users", &n).await);
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
     // An expired one.
@@ -5381,31 +5428,31 @@ async fn signup_claimed_without_code_or_nonce_refused() {
 #[tokio::test]
 async fn signup_second_claim_is_not_bound() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
-    let b = mock.add_user_in(SETUP_ORG, "b@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let b = mock.with_user(&Pool::Members, "b@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let (na, nb) = (right_code_nonce(&app, SETUP_ORG).await, right_code_nonce(&app, SETUP_ORG).await);
     assert_eq!(claim(&app, SETUP_ORG, &a, &na).await, (200, json!({"bound": true})));
     assert_eq!(claim(&app, SETUP_ORG, &b, &nb).await, (200, json!({"bound": false})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(a.as_str()));
-    // A exists in Zitadel: never asked to be replaced.
+    // A exists in identity: never asked to be replaced.
     assert_eq!(neon.setup.lock().unwrap().replace_asked.last().cloned(), Some(None));
 }
 
-// AC 11: a claim whose user has no member row and is gone from Zitadel is replaced by a new
-// code-gated sign-up. A Zitadel failure on the way answers 503 and spends nothing.
+// AC 11: a claim whose user has no member row and is gone from identity is replaced by a new
+// code-gated sign-up. A identity failure on the way answers 503 and spends nothing.
 #[tokio::test]
 async fn signup_stale_claim_replaced() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let gone = mock.add_user_in(SETUP_ORG, "gone@x.com", "pw", true);
-    let new = mock.add_user_in(SETUP_ORG, "new@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let gone = mock.with_user(&Pool::Members, "gone@x.com", "password1");
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &gone, &n).await, (200, json!({"bound": true})));
-    mock.remove_user(&gone);
-    // Zitadel down: 503, the nonce stays live.
+    mock.client().delete_user(&Pool::Members, &gone).await.unwrap();
+    // Identity down: 503, the nonce stays live.
     let n = right_code_nonce(&app, SETUP_ORG).await;
     mock.set_down(true);
     let (status, body) = claim(&app, SETUP_ORG, &new, &n).await;
@@ -5415,24 +5462,135 @@ async fn signup_stale_claim_replaced() {
     assert_eq!(claim(&app, SETUP_ORG, &new, &n).await, (200, json!({"bound": true})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
     assert_eq!(neon.setup.lock().unwrap().replace_asked.last().cloned(), Some(Some(gone.clone())));
-    // A claim user with a member row is never replaced, even if Zitadel lost it.
+    // A claim user with a member row is never replaced, even if identity lost it.
     neon.setup.lock().unwrap().member_rows.insert(new.clone());
-    mock.remove_user(&new);
-    let third = mock.add_user_in(SETUP_ORG, "third@x.com", "pw", true);
+    mock.client().delete_user(&Pool::Members, &new).await.unwrap();
+    let third = mock.with_user(&Pool::Members, "third@x.com", "password1");
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &third, &n).await, (200, json!({"bound": false})));
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
 }
 
-// Without Zitadel the user can't be checked: no claim (503), fail closed.
+// Without identity the user can't be checked: no claim (503), fail closed.
 #[tokio::test]
-async fn signup_claimed_needs_zitadel() {
+async fn signup_claimed_needs_identity() {
     let neon = fresh_install();
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), None).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    let (status, body) = claim(&app, SETUP_ORG, "312345", &n).await;
+    let (status, body) = claim(&app, SETUP_ORG, &Uuid::new_v4().to_string(), &n).await;
     assert_eq!((status, error_code(&body)), (503, "unavailable"));
     assert_eq!(neon.setup_claim_of(SETUP_ORG), None);
+}
+
+// A claim from the Zitadel era (a numeric id, no member row) can never sign in again: it is stale.
+#[tokio::test]
+async fn signup_zitadel_era_claim_is_stale() {
+    let neon = fresh_install();
+    neon.setup.lock().unwrap().claims.insert(SETUP_ORG.into(), "312345678901234567".into());
+    let mock = FakeIdentity::start().await;
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    assert_eq!(claim(&app, SETUP_ORG, &new, &n).await, (200, json!({"bound": true})));
+    assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(new.as_str()));
+}
+
+// #121 AC 7: a member token never makes a row, so the bind itself makes the claimant the
+// admin, with identity's email and name.
+#[tokio::test]
+async fn signup_claim_admits_the_claimant() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    assert_eq!(claim(&app, SETUP_ORG, &a, &n).await, (200, json!({"bound": true})));
+    let admitted = neon.setup.lock().unwrap().admitted.clone();
+    assert_eq!(admitted, vec![(SETUP_ORG.into(), a.clone(), "a@x.com".into(), String::new(), Admission::Closed)]);
+}
+
+// The loser of the claim race gets a `pending` row: the admin sees the request.
+#[tokio::test]
+async fn signup_race_loser_is_pending() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let b = mock.with_user(&Pool::Members, "b@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let (na, nb) = (right_code_nonce(&app, SETUP_ORG).await, right_code_nonce(&app, SETUP_ORG).await);
+    assert_eq!(claim(&app, SETUP_ORG, &a, &na).await.1, json!({"bound": true}));
+    assert_eq!(claim(&app, SETUP_ORG, &b, &nb).await.1, json!({"bound": false}));
+    let last = neon.setup.lock().unwrap().admitted.last().cloned().unwrap();
+    assert_eq!((last.1, last.4), (b, Admission::Pending));
+}
+
+// A row that can't be written is an error, so auth deletes the account and the claim goes stale.
+#[tokio::test]
+async fn signup_claim_admit_failure_is_an_error() {
+    let neon = fresh_install();
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
+    let n = right_code_nonce(&app, SETUP_ORG).await;
+    neon.setup.lock().unwrap().admit_fails = true;
+    assert_eq!(claim(&app, SETUP_ORG, &a, &n).await.0, 500);
+}
+
+const JOINED: &str = "/internal/signup/joined";
+const ACTIVE: &str = "/internal/members/active";
+
+// Open sign-up: the `pending` row is written at sign-up. The route re-checks the gate; the
+// bearer alone admits nobody to a closed tenant.
+#[tokio::test]
+async fn signup_joined_writes_a_pending_row_only_when_open() {
+    use chelabase_metadata::members::Admission;
+    let neon = fresh_install();
+    neon.signup.lock().unwrap().insert("org-open".into(), (true, true));
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
+    let app = setup_app(neon.clone(), Mode::SelfHosted, None, Some(&mock)).await;
+    let join = |org: &'static str, user: String| {
+        let app = &app;
+        async move { app.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"org": org, "user_id": user})).await }
+    };
+    assert_eq!(join("org-open", a.clone()).await, (200, json!({"joined": true})));
+    let admitted = neon.setup.lock().unwrap().admitted.clone();
+    assert_eq!(admitted, vec![("org-open".into(), a.clone(), "a@x.com".into(), String::new(), Admission::Pending)]);
+    // Closed, member-less (the claim's business), unknown org, unknown user: nothing written.
+    for (org, user) in [("org-members", a.clone()), (SETUP_ORG, a.clone()), ("org-nobody", a.clone()), ("org-open", Uuid::new_v4().to_string())] {
+        assert_eq!(join(org, user).await, (200, json!({"joined": false})), "{org}");
+    }
+    assert_eq!(neon.setup.lock().unwrap().admitted.len(), 1);
+    assert_eq!(app.post_json(JOINED, Some("wrong"), json!({"org": "org-open", "user_id": a})).await.0, 401);
+    let platform = setup_app(neon.clone(), Mode::Platform, None, Some(&mock)).await;
+    let r = platform.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"org": "org-open", "user_id": a})).await;
+    assert_eq!(r, (200, json!({"joined": false})));
+    mock.set_down(true);
+    let r = app.post_json(JOINED, Some(APP_AUTH_TOKEN), json!({"org": "org-open", "user_id": a})).await;
+    assert_eq!((r.0, error_code(&r.1)), (503, "unavailable"));
+}
+
+// What `auth` picks a tenant from, and re-reads before it mints.
+#[tokio::test]
+async fn members_active_lists_tenants_by_status() {
+    use chelabase_metadata::members::MemberStatus::{Active, Pending};
+    let (t1, t2, t3) = (TenantId(Uuid::from_u128(1)), TenantId(Uuid::from_u128(2)), TenantId(Uuid::from_u128(3)));
+    let neon = fresh_install();
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(t1, Active), (t2, Pending), (t3, Active)]);
+    let app = setup_app(neon.clone(), Mode::SelfHosted, None, None).await;
+    assert_eq!(
+        app.post_json(ACTIVE, Some(APP_AUTH_TOKEN), json!({"user_id": "u1"})).await,
+        (200, json!({"active": [t1.as_uuid(), t3.as_uuid()], "pending": [t2.as_uuid()]}))
+    );
+    assert_eq!(
+        app.post_json(ACTIVE, Some(APP_AUTH_TOKEN), json!({"user_id": "stranger"})).await,
+        (200, json!({"active": [], "pending": []}))
+    );
+    assert_eq!(app.post_json(ACTIVE, Some("wrong"), json!({"user_id": "u1"})).await.0, 401);
+    assert_eq!(app.post_json(ACTIVE, None, json!({"user_id": "u1"})).await.0, 401);
+    assert_eq!(app.post_json(ACTIVE, Some(REALTIME_TOKEN), json!({"user_id": "u1"})).await.0, 401);
 }
 
 /// Every log line written while `f` runs on this thread (the test's current-thread runtime
@@ -5468,13 +5626,13 @@ async fn signup_log_and_error_scrub() {
     let loaded = orchestrator::internal::load_setup_code(file.to_str()).unwrap();
     assert!(loaded.matches(SETUP_CODE));
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let a = mock.add_user_in(SETUP_ORG, "a@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let a = mock.with_user(&Pool::Members, "a@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let wrong = "ZZZZ-YYYY-XXXX-WWWW-VVVV";
     let mut bodies = vec![check_with(&app, SETUP_ORG, Some(wrong)).await.1];
     let nonce = right_code_nonce(&app, SETUP_ORG).await;
-    bodies.push(claim(&app, SETUP_ORG, "999999", &nonce).await.1);
+    bodies.push(claim(&app, SETUP_ORG, "312345678901234567", &nonce).await.1);
     bodies.push(claim(&app, "org-other", &a, &nonce).await.1);
     bodies.push(claim(&app, SETUP_ORG, &a, &nonce).await.1);
     bodies.push(claim(&app, SETUP_ORG, &a, &nonce).await.1);
@@ -6953,19 +7111,19 @@ async fn signup_routes_are_probed_by_the_network_e2e() {
     }
 }
 
-// N1 (m3 audit): Zitadel answering something that can't be read as the claim's user is not
+// N1 (m3 audit): identity answering something that can't be read as the claim's user is not
 // "gone": no replacement, 503, the nonce stays live and the claim unchanged.
 #[tokio::test]
-async fn signup_unreadable_zitadel_answer_keeps_the_claim() {
+async fn signup_unreadable_identity_answer_keeps_the_claim() {
     let neon = fresh_install();
-    let mock = MockZitadel::start().await;
-    let first = mock.add_user_in(SETUP_ORG, "first@x.com", "pw", true);
-    let new = mock.add_user_in(SETUP_ORG, "new@x.com", "pw", true);
+    let mock = FakeIdentity::start().await;
+    let first = mock.with_user(&Pool::Members, "first@x.com", "password1");
+    let new = mock.with_user(&Pool::Members, "new@x.com", "password1");
     let app = setup_app(neon.clone(), Mode::SelfHosted, Some(SETUP_CODE), Some(&mock)).await;
     let n = right_code_nonce(&app, SETUP_ORG).await;
     assert_eq!(claim(&app, SETUP_ORG, &first, &n).await, (200, json!({"bound": true})));
     let n = right_code_nonce(&app, SETUP_ORG).await;
-    mock.fail(&format!("GET /v2/users/{first}"), 200, "Odd.Answer", 1);
+    mock.fail(&format!("GET /internal/v1/pools/members/users/{first}"), 500, "odd_answer", 1);
     let (status, body) = claim(&app, SETUP_ORG, &new, &n).await;
     assert_eq!((status, error_code(&body)), (503, "unavailable"), "{body}");
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(first.as_str()));

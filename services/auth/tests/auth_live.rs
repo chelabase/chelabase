@@ -272,6 +272,94 @@ where
     }
 }
 
+/// `POST /auth/v1/<path>` as Studio's session calls make it, with `cookie`: the status, the body
+/// and the `name=value` of `chelabase_session` if it was set.
+async fn session_call(path: &str, cookie: Option<&str>, body: Option<Value>) -> (u16, Value, Option<String>) {
+    let mut req = reqwest::Client::new()
+        .post(format!("{}/auth/v1/{path}", gateway()))
+        .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
+        .header("x-chelabase-studio", "1");
+    if let Some(cookie) = cookie {
+        req = req.header("cookie", cookie);
+    }
+    if let Some(body) = body {
+        req = req.json(&body);
+    }
+    let resp = req.send().await.expect("the gateway answers");
+    let status = resp.status().as_u16();
+    let set = resp
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter(|c| c.starts_with("chelabase_session=") && !c.starts_with("chelabase_session=;"))
+        .map(|c| c.split(';').next().unwrap().to_string())
+        .next();
+    let body = resp.json().await.unwrap_or(Value::Null);
+    (status, body, set)
+}
+
+/// #121 AC 1 against the stack: an open sign-up waits as pending, and once active the member signs
+/// in, gets a token the gateway and orchestrator accept, and loses it at logout. Open sign-up is
+/// switched on for the demo tenant meanwhile; the row and the user go afterwards, pass or fail.
+#[tokio::test]
+#[ignore = "needs the workbench stack and the metadata database"]
+async fn member_sign_in_live() {
+    let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
+    let was_open = metadata_sql(&format!("SELECT open_signup FROM tenants WHERE id = '{DEMO_TENANT_ID}'")).await;
+    metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
+    let run = email.clone();
+    let outcome = tokio::spawn(async move {
+        let email = run;
+        let creds = json!({"email": email, "password": STRONG});
+        let mut sign_up = creds.clone();
+        sign_up["givenName"] = json!("Live");
+        sign_up["familyName"] = json!("Member");
+        let (status, body, _) = session_call("sign-up", None, Some(sign_up)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "pending"})), "sign-up");
+        let status_of = |email: String| async move {
+            metadata_sql(&format!("SELECT status FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await
+        };
+        assert_eq!(status_of(email.clone()).await, "pending");
+        let (_, body, _) = session_call("sign-in", None, Some(creds.clone())).await;
+        assert_eq!(body, json!({"next": "pending"}), "before approval");
+
+        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        let (status, body, cookie) = session_call("sign-in", None, Some(creds.clone())).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "sign-in");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let token = body["access_token"].as_str().expect("a token").to_string();
+        let (status, me) = send(reqwest::Client::new().get(format!("{}/v1/me", gateway())).bearer_auth(&token)).await;
+        assert_eq!(status, 200, "/v1/me: {me}");
+        assert_eq!(me["tenant_id"], DEMO_TENANT_ID);
+        assert_eq!(me["member"]["status"], "active");
+
+        // Suspended: `/token` stops at once, whatever the session.
+        metadata_sql(&format!("UPDATE members SET status = 'suspended' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "suspended");
+        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 200);
+
+        // Without Studio's header, and after logout with the same bytes.
+        let bare = reqwest::Client::new()
+            .post(format!("{}/auth/v1/token", gateway()))
+            .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
+            .header("cookie", &cookie);
+        assert_eq!(send(bare).await.0, 403);
+        assert_eq!(session_call("logout", Some(&cookie), Some(json!({}))).await.0, 200);
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
+    })
+    .await;
+    metadata_sql(&format!("UPDATE tenants SET open_signup = {was_open} WHERE id = '{DEMO_TENANT_ID}'")).await;
+    let _ = metadata_sql(&format!("DELETE FROM members WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+    let _ = metadata_sql(&format!(r#"DELETE FROM identity_members."user" WHERE email = '{email}'"#)).await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
 fn accept(user: &str, code: &str, password: &str) -> Value {
     json!({"user": user, "code": code, "reset": false, "password": password})
 }

@@ -13,6 +13,8 @@ pub enum ErrorCode {
     /// 403: the caller is known but lacks the access; may carry `extra.required` (the level needed).
     Forbidden,
     TenantNotBound,
+    /// A person with several tenants signed in without choosing one (`?tenant=`).
+    TenantRequired,
     NotFound,
     MethodNotAllowed,
     InvalidRequest,
@@ -162,10 +164,11 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every code, in declaration order (the docs check that each has a row).
-    pub const ALL: [ErrorCode; 107] = [
+    pub const ALL: [ErrorCode; 108] = [
         Self::Unauthorized,
         Self::Forbidden,
         Self::TenantNotBound,
+        Self::TenantRequired,
         Self::NotFound,
         Self::MethodNotAllowed,
         Self::InvalidRequest,
@@ -277,6 +280,7 @@ impl ErrorCode {
             Self::Unauthorized => "unauthorized",
             Self::Forbidden => "forbidden",
             Self::TenantNotBound => "tenant_not_bound",
+            Self::TenantRequired => "tenant_required",
             Self::NotFound => "not_found",
             Self::MethodNotAllowed => "method_not_allowed",
             Self::InvalidRequest => "invalid_request",
@@ -483,10 +487,11 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
 
-    const ALL: [(ErrorCode, &str); 107] = [
+    const ALL: [(ErrorCode, &str); 108] = [
         (ErrorCode::Unauthorized, "unauthorized"),
         (ErrorCode::Forbidden, "forbidden"),
         (ErrorCode::TenantNotBound, "tenant_not_bound"),
+        (ErrorCode::TenantRequired, "tenant_required"),
         (ErrorCode::NotFound, "not_found"),
         (ErrorCode::MethodNotAllowed, "method_not_allowed"),
         (ErrorCode::InvalidRequest, "invalid_request"),
