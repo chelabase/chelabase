@@ -1,10 +1,9 @@
 import { ApiError } from "@chelabase/management-client";
-import { useEffect, useState, type FormEvent, type ReactNode, type Ref } from "react";
+import { useState, type FormEvent, type ReactNode, type Ref } from "react";
 import { Button } from "@/components/ui/button";
-import { useGetAuthRequest, useSignIn } from "@/lib/login-client/generated/endpoints";
-import type { NextStep, SignedIn } from "@/lib/login-client/generated/model";
+import { useSignIn } from "@/lib/login-client/generated/endpoints";
+import type { SignInAnswer } from "@/lib/login-client/generated/model";
 
-export const EXPIRED = "This sign-in has expired, start again";
 const UNAVAILABLE = "Sign-in is unavailable, try again";
 
 /**
@@ -14,10 +13,13 @@ const UNAVAILABLE = "Sign-in is unavailable, try again";
 export const SECRET = { mutation: { gcTime: 0 } };
 
 export interface FormProps {
-  authRequest?: string;
   initialCode?: string;
-  go: (url: string) => void;
+  /** Signed in: the cookie session is set; open the app. */
+  toApp: () => void;
+  /** The email needs its code first. */
   toVerify: () => void;
+  /** An admin hasn't approved this person yet. */
+  toPending: () => void;
   toRegister?: () => void;
   /** Sign-up found the email taken: go to sign-in with auth's message. */
   toLogin?: (notice: string) => void;
@@ -32,21 +34,27 @@ export function messageOf(err: unknown): string {
   return err instanceof ApiError && !UNAVAILABLE_CODES.has(err.code) ? err.message : UNAVAILABLE;
 }
 
-/** What a failed login call shows: auth's message, plus a restart link when the sign-in is over. */
+/** What a failed login call shows: auth's message, plus a restart link when the code step's cookie has expired. */
 export interface LoginProblem {
   message: string;
   restart: boolean;
 }
 
-export const EXPIRED_PROBLEM: LoginProblem = { message: EXPIRED, restart: true };
-
 export function problemOf(err: unknown): LoginProblem {
   return { message: messageOf(err), restart: err instanceof ApiError && err.code === "sign_in_expired" };
 }
 
-export function follow(next: NextStep | SignedIn, go: (url: string) => void, toVerify: () => void) {
-  if (next.next === "done") go(next.redirect);
-  else toVerify();
+/** Where an answer sends the person. `done` (verify-email, accept-invite) is a signed-in session. */
+export function follow(answer: SignInAnswer | { next: "done" }, to: Pick<FormProps, "toApp" | "toVerify" | "toPending">) {
+  switch (answer.next) {
+    case "studio":
+    case "done":
+      return to.toApp();
+    case "verify":
+      return to.toVerify();
+    case "pending":
+      return to.toPending();
+  }
 }
 
 export function LoginLayout({ title, titleRef, children }: { title: string; titleRef?: Ref<HTMLHeadingElement>; children: ReactNode }) {
@@ -80,46 +88,65 @@ export function Problem({ message, restart }: { message: string; restart?: boole
   return (
     <div role="alert" className="text-sm text-destructive">
       {message}
-      {restart && (<> <a href="/" className="underline">Start again</a></>)}
+      {restart && (<> <a href="/login" className="underline">Start again</a></>)}
     </div>
   );
 }
 
-export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice }: FormProps) {
+/** The tenant ids a `tenant_required` answer lists; null for any other error. */
+function tenantsOf(err: unknown): string[] | null {
+  if (!(err instanceof ApiError) || err.code !== "tenant_required") return null;
+  const list = err.extra.tenants;
+  return Array.isArray(list) && list.length > 0 && list.every((t) => typeof t === "string") ? (list as string[]) : null;
+}
+
+export function SignInForm({ toApp, toVerify, toPending, toRegister, notice }: FormProps) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<LoginProblem | null>(authRequest ? null : EXPIRED_PROBLEM);
-  // Whether this instance takes sign-ups (the pending sign-in's answer); closed until it says so.
-  const [canSignUp, setCanSignUp] = useState(false);
-  const { mutate: lookUp } = useGetAuthRequest();
+  const [error, setError] = useState<LoginProblem | null>(null);
+  // Several tenants have this person: the ids to choose from, until one is picked.
+  const [tenants, setTenants] = useState<string[] | null>(null);
   const signIn = useSignIn(SECRET);
 
-  useEffect(() => {
-    if (!authRequest) return;
-    lookUp({ data: { authRequest } }, {
-      onSuccess: ({ signUp, signUpAllowed }) => {
-        setCanSignUp(signUpAllowed);
-        // A request for account creation (prompt=create) only forwards while sign-up is open.
-        if (signUp && signUpAllowed && !notice) toRegister?.();
-      },
-      onError: (err) => setError(problemOf(err)),
-    });
-  }, [lookUp, authRequest, toRegister, notice]);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
+  async function attempt(tenant?: string) {
     if (busy) return;
     setBusy(true);
     setError(null);
     try {
-      follow(await signIn.mutateAsync({ data: { authRequest, email, password } }), go, toVerify);
+      follow(await signIn.mutateAsync({ data: { email, password }, ...(tenant ? { params: { tenant } } : {}) }), { toApp, toVerify, toPending });
     } catch (err) {
-      setError(problemOf(err));
+      const choices = tenant ? null : tenantsOf(err);
+      if (choices) setTenants(choices);
+      else setError(problemOf(err));
       setBusy(false);
     } finally {
       signIn.reset();
     }
+  }
+
+  function submit(event: FormEvent) {
+    event.preventDefault();
+    void attempt();
+  }
+
+  if (tenants) {
+    return (
+      <LoginLayout title="Choose a workspace">
+        <p className="text-sm text-muted-foreground">Your account is in more than one. Pick the one to sign in to.</p>
+        <ul className="space-y-2">
+          {tenants.map((id) => (
+            <li key={id}>
+              <Button type="button" variant="outline" disabled={busy} onClick={() => void attempt(id)} className="w-full justify-start font-mono">
+                {id}
+              </Button>
+            </li>
+          ))}
+        </ul>
+        {error && <Problem message={error.message} restart={error.restart} />}
+        <Button type="button" variant="ghost" onClick={() => { setTenants(null); setError(null); }}>Back</Button>
+      </LoginLayout>
+    );
   }
 
   return (
@@ -129,20 +156,18 @@ export function SignInForm({ authRequest = "", go, toVerify, toRegister, notice 
         <Field label="Email" type="email" value={email} onChange={setEmail} autoComplete="username" />
         <Field label="Password" type="password" value={password} onChange={setPassword} autoComplete="current-password" />
         {error && <Problem message={error.message} restart={error.restart} />}
-        <Button type="submit" disabled={busy || !authRequest} className="w-full">Sign in</Button>
+        <Button type="submit" disabled={busy} className="w-full">Sign in</Button>
       </form>
       <p className="text-sm text-muted-foreground">
         <a href="/password-reset" className="underline">Forgot your password?</a>
       </p>
-      {canSignUp && toRegister ? (
-        <p className="text-sm text-muted-foreground">
-          No account? <button type="button" onClick={toRegister} className="underline">Create account</button>
-        </p>
-      ) : (
-        // The sign-in answer never says whether an email has an account, so this is always shown
-        // while sign-up is closed.
-        <p className="text-sm text-muted-foreground">No account? Ask your admin for an invite.</p>
-      )}
+      <p className="text-sm text-muted-foreground">
+        {toRegister ? (
+          <>No account? <button type="button" onClick={toRegister} className="underline">Create account</button> or ask your admin for an invite.</>
+        ) : (
+          "No account? Ask your admin for an invite."
+        )}
+      </p>
     </LoginLayout>
   );
 }

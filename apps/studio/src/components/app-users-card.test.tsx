@@ -50,7 +50,7 @@ describe("AppUsersCard", () => {
     expect(screen.getByLabelText("Schema")).toHaveValue("public");
     expect(screen.getByLabelText("Table")).toHaveValue("users");
     expect(screen.getByLabelText("Require email verification")).not.toBeChecked();
-    expect(screen.getByLabelText("When a user is deleted in Zitadel")).toHaveValue("delete");
+    expect(screen.getByLabelText("When a user is deleted in the identity service")).toHaveValue("delete");
     expect(screen.getByText(/GRANT INSERT \(col\) ON <table> TO authenticated/)).toBeInTheDocument();
     expect(screen.getByText(/RLS is on/)).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Enable app users" }));

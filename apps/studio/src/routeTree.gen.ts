@@ -12,10 +12,10 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AcceptInviteRouteImport } from './routes/accept-invite'
 import { Route as AppRouteImport } from './routes/app'
-import { Route as CallbackRouteImport } from './routes/callback'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as LogoutRouteImport } from './routes/logout'
 import { Route as PasswordResetRouteImport } from './routes/password-reset'
+import { Route as PendingRouteImport } from './routes/pending'
 import { Route as RegisterRouteImport } from './routes/register'
 import { Route as VerifyRouteImport } from './routes/verify'
 import { Route as AppIndexRouteImport } from './routes/app.index'
@@ -45,11 +45,6 @@ const AppRoute = AppRouteImport.update({
   path: '/app',
   getParentRoute: () => rootRouteImport,
 } as any)
-const CallbackRoute = CallbackRouteImport.update({
-  id: '/callback',
-  path: '/callback',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
@@ -63,6 +58,11 @@ const LogoutRoute = LogoutRouteImport.update({
 const PasswordResetRoute = PasswordResetRouteImport.update({
   id: '/password-reset',
   path: '/password-reset',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PendingRoute = PendingRouteImport.update({
+  id: '/pending',
+  path: '/pending',
   getParentRoute: () => rootRouteImport,
 } as any)
 const RegisterRoute = RegisterRouteImport.update({
@@ -146,10 +146,10 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/accept-invite': typeof AcceptInviteRoute
   '/app': typeof AppRouteWithChildren
-  '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
   '/logout': typeof LogoutRoute
   '/password-reset': typeof PasswordResetRoute
+  '/pending': typeof PendingRoute
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
@@ -167,10 +167,10 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/accept-invite': typeof AcceptInviteRoute
-  '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
   '/logout': typeof LogoutRoute
   '/password-reset': typeof PasswordResetRoute
+  '/pending': typeof PendingRoute
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
@@ -190,10 +190,10 @@ export interface FileRoutesById {
   '/': typeof IndexRoute
   '/accept-invite': typeof AcceptInviteRoute
   '/app': typeof AppRouteWithChildren
-  '/callback': typeof CallbackRoute
   '/login': typeof LoginRoute
   '/logout': typeof LogoutRoute
   '/password-reset': typeof PasswordResetRoute
+  '/pending': typeof PendingRoute
   '/register': typeof RegisterRoute
   '/verify': typeof VerifyRoute
   '/app/api': typeof AppApiRoute
@@ -214,10 +214,10 @@ export interface FileRouteTypes {
     | '/'
     | '/accept-invite'
     | '/app'
-    | '/callback'
     | '/login'
     | '/logout'
     | '/password-reset'
+    | '/pending'
     | '/register'
     | '/verify'
     | '/app/api'
@@ -235,10 +235,10 @@ export interface FileRouteTypes {
   to:
     | '/'
     | '/accept-invite'
-    | '/callback'
     | '/login'
     | '/logout'
     | '/password-reset'
+    | '/pending'
     | '/register'
     | '/verify'
     | '/app/api'
@@ -257,10 +257,10 @@ export interface FileRouteTypes {
     | '/'
     | '/accept-invite'
     | '/app'
-    | '/callback'
     | '/login'
     | '/logout'
     | '/password-reset'
+    | '/pending'
     | '/register'
     | '/verify'
     | '/app/api'
@@ -280,10 +280,10 @@ export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AcceptInviteRoute: typeof AcceptInviteRoute
   AppRoute: typeof AppRouteWithChildren
-  CallbackRoute: typeof CallbackRoute
   LoginRoute: typeof LoginRoute
   LogoutRoute: typeof LogoutRoute
   PasswordResetRoute: typeof PasswordResetRoute
+  PendingRoute: typeof PendingRoute
   RegisterRoute: typeof RegisterRoute
   VerifyRoute: typeof VerifyRoute
 }
@@ -311,13 +311,6 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRouteImport
       parentRoute: typeof rootRouteImport
     }
-    '/callback': {
-      id: '/callback'
-      path: '/callback'
-      fullPath: '/callback'
-      preLoaderRoute: typeof CallbackRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/login': {
       id: '/login'
       path: '/login'
@@ -337,6 +330,13 @@ declare module '@tanstack/react-router' {
       path: '/password-reset'
       fullPath: '/password-reset'
       preLoaderRoute: typeof PasswordResetRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pending': {
+      id: '/pending'
+      path: '/pending'
+      fullPath: '/pending'
+      preLoaderRoute: typeof PendingRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/register': {
@@ -472,10 +472,10 @@ const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AcceptInviteRoute: AcceptInviteRoute,
   AppRoute: AppRouteWithChildren,
-  CallbackRoute: CallbackRoute,
   LoginRoute: LoginRoute,
   LogoutRoute: LogoutRoute,
   PasswordResetRoute: PasswordResetRoute,
+  PendingRoute: PendingRoute,
   RegisterRoute: RegisterRoute,
   VerifyRoute: VerifyRoute,
 }
