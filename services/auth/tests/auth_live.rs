@@ -1,9 +1,10 @@
-//! Auth's refusal mapping against the real stack (#61, #78): the stack's auth, orchestrator and
-//! Zitadel v4.19.1, through the gateway as Studio and an app reach them. The unit tests prove
-//! the arms against the mock; these prove the real Zitadel's answers reach them.
+//! Auth against the real stack: the stack's auth, orchestrator and identity service, through the
+//! gateway as Studio and an app reach them. The unit tests prove the arms against the fakes;
+//! these prove the real services' answers reach them.
 //!
-//! Runs in the workbench runner, which has `demo.env` (the issuer, the admin PAT), the gateway's
-//! entry URLs, `CHELABASE_CLI` (`chelabase dev token`: the demo tenant admin) and the metadata
+//! Runs in the workbench runner, which has the gateway's entry URLs, `CHELABASE_CLI`
+//! (`chelabase dev token`: the demo tenant admin), the identity service's URL and auth's token
+//! for it (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`) and the metadata
 //! database's URL:
 //!
 //! ```text
@@ -22,19 +23,16 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use chelabase_zitadel::client::{UserState, Zitadel};
+use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
+use chelabase_identity::{CodeKind, CodeRequest, Delivery, Identity, Pool};
 use reqwest::Method;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
 const DEMO_TENANT_ID: &str = "00000000-0000-4000-8000-000000000001";
 
-/// Passes Zitadel's default password policy and auth's own checks.
+/// Passes auth's password rule.
 const STRONG: &str = "Live-pass-12!";
-/// Passes auth's own checks (a Unicode lowercase letter counts there) but not Zitadel's default
-/// policy, which wants an ASCII one: the answer is Zitadel's refusal (`DOMAIN-co3Xw` on a set,
-/// `COMMA-co3Xw` on a create), which auth maps by its id.
-const ZITADEL_WEAK: &str = "ÉCOLE#2026é";
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
@@ -129,68 +127,22 @@ fn code_of(body: &Value) -> &str {
     body["error"]["code"].as_str().unwrap_or("")
 }
 
-/// Zitadel with the admin PAT, at `CHELABASE_ZITADEL_INTERNAL_URL` (else the `zitadel` service)
-/// with the issuer's host as `Host`, as the apps call it.
-struct Admin {
-    base: String,
-    host: String,
-    pat: String,
+/// The identity service as auth calls it (auth's token): codes returned instead of mailed, user
+/// reads and deletes.
+fn identity() -> Identity {
+    let file = PathBuf::from(need("CHELABASE_IDENTITY_TOKEN_FILE"));
+    let file = if file.is_relative() { workspace_root().join(file) } else { file };
+    Identity::from_token_file(&need("CHELABASE_IDENTITY_URL"), &file).expect("auth's identity token")
 }
 
-fn admin() -> Admin {
-    let issuer = need("CHELABASE_ZITADEL_ISSUER");
-    let host = issuer
-        .split_once("://")
-        .map(|(_, rest)| rest.trim_end_matches('/').to_string())
-        .expect("the issuer has a host");
-    let base =
-        env("CHELABASE_ZITADEL_INTERNAL_URL").unwrap_or_else(|| "http://zitadel:8080".into());
-    let file = PathBuf::from(need("CHELABASE_ZITADEL_ADMIN_PAT_FILE"));
-    let file = if file.is_relative() {
-        workspace_root().join(file)
-    } else {
-        file
-    };
-    Admin {
-        base: base.trim_end_matches('/').to_string(),
-        host,
-        pat: std::fs::read_to_string(file).unwrap().trim().to_string(),
-    }
-}
-
-impl Admin {
-    fn client(&self) -> Zitadel {
-        Zitadel::new(&self.base, &self.pat).with_host(Some(&self.host))
-    }
-
-    /// A password-reset code for the user, returned instead of mailed (anyone can have one
-    /// mailed, a deactivated user too).
-    async fn reset_code(&self, user: &str) -> String {
-        let resp = reqwest::Client::new()
-            .post(format!("{}/v2/users/{user}/password_reset", self.base))
-            .header(reqwest::header::HOST, &self.host)
-            .bearer_auth(&self.pat)
-            .json(&json!({"returnCode": {}}))
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        assert_eq!(status, 200, "a reset code for {user}: {body}");
-        body["verificationCode"]
-            .as_str()
-            .expect("verificationCode")
-            .to_string()
-    }
-
-    async fn state(&self, user: &str) -> UserState {
-        self.client()
-            .get_user(user)
-            .await
-            .unwrap()
-            .expect("the user exists")
-            .state
-    }
+/// A code of `kind` for the member `user`, handed back instead of mailed.
+async fn code_for(user: &str, kind: CodeKind) -> String {
+    identity()
+        .create_code(&Pool::Members, &CodeRequest::new(user, kind, Delivery::Return))
+        .await
+        .unwrap_or_else(|e| panic!("a {kind:?} code for {user}: {e}"))
+        .code
+        .expect("a returned code")
 }
 
 /// One statement against the metadata database, as the e2e scripts' `metadata_sql` runs it.
@@ -230,8 +182,10 @@ async fn metadata_sql(sql: &str) -> String {
 struct Invited {
     member: String,
     invite: Uuid,
+    email: String,
     user: String,
     code: String,
+    t: String,
 }
 
 fn query_param(url: &str, name: &str) -> String {
@@ -244,7 +198,7 @@ fn query_param(url: &str, name: &str) -> String {
 }
 
 /// Invites a fresh person by link, runs `checks`, then removes the member and deletes their
-/// Zitadel user, pass or fail.
+/// identity user, pass or fail.
 async fn with_invitee<F, Fut>(name: &str, checks: F)
 where
     F: FnOnce(Invited) -> Fut,
@@ -271,8 +225,10 @@ where
             .unwrap()
             .parse()
             .unwrap(),
+        email: email.clone(),
         user: query_param(url, "user"),
         code: query_param(url, "code"),
+        t: query_param(url, "t"),
     };
     let outcome = tokio::spawn(checks(invited.clone())).await;
     let _ = api(
@@ -281,7 +237,7 @@ where
         None,
     )
     .await;
-    let _ = admin().client().delete_user(&invited.user).await;
+    let _ = identity().delete_user(&Pool::Members, &invited.user).await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }
@@ -417,31 +373,56 @@ async fn member_sign_in_live() {
     assert!(failed.is_empty(), "cleanup: {failed:?}");
 }
 
-fn accept(user: &str, code: &str, password: &str) -> Value {
-    json!({"user": user, "code": code, "reset": false, "password": password})
+fn accept(inv: &Invited, code: &str, password: &str) -> Value {
+    json!({"user": inv.user, "t": inv.t, "code": code, "password": password})
 }
 
-fn reset_accept(user: &str, code: &str, password: &str) -> Value {
-    json!({"user": user, "code": code, "reset": true, "password": password})
+/// `POST /auth/v1/accept-invite` as Studio sends it: the status, the body and the session cookie
+/// if one was set.
+async fn accept_call(body: Value) -> (u16, Value, Option<String>) {
+    session_call("accept-invite", None, Some(body)).await
 }
 
-/// An invitee whose Zitadel user was deleted gets 410 `invite_revoked` (AC 1).
+/// #124 AC 1 against the stack: the link's code sets the first password and verifies the email,
+/// the member row turns active, and the session cookie mints a token for the demo tenant. The
+/// code is single use.
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the identity service"]
+async fn invite_accept_live() {
+    with_invitee("accept", |inv| async move {
+        let (status, body, cookie) = accept_call(accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "accept");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let user = identity().get_user(&Pool::Members, &inv.user).await.unwrap();
+        assert!(user.email_verified, "the code verified the email");
+        let row = metadata_sql(&format!("SELECT status FROM members WHERE id = '{}'", inv.member)).await;
+        assert_eq!(row, "active");
+        let (status, body, cookie) = accept_call(accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!((status, code_of(&body), cookie), (400, "invalid_request", None), "the code again: {body}");
+    })
+    .await;
+}
+
+/// Ported from the Zitadel era (#124): an invitee whose identity user was deleted gets 410
+/// `invite_revoked`.
+#[tokio::test]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn accept_invite_for_a_deleted_user_is_revoked() {
     with_invitee("deleted", |inv| async move {
-        admin().client().delete_user(&inv.user).await.unwrap();
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        identity().delete_user(&Pool::Members, &inv.user).await.unwrap();
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!((status, code_of(&body)), (410, "invite_revoked"), "{body}");
     })
     .await;
 }
 
-/// Zitadel answers a wrong and an expired code alike (`COMMAND-Wgn4q`): the stored invite tells
-/// them apart. A wrong code on an invite whose stored expiry passed is 410 `invite_expired`; the
-/// same code once it is open again is 400 `invalid_request`; the right code still works (AC 2).
+/// The stored invite tells an expired link from a wrong code: a wrong code on an invite whose
+/// stored expiry passed is 410 `invite_expired`; once it is open again, 400 `invalid_request`;
+/// the right code still works (ported to the identity service's codes, #124).
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
     with_invitee("expiry", |inv| async move {
         let set_expiry = |interval: &'static str| {
@@ -452,97 +433,74 @@ async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
             }
         };
         assert_eq!(set_expiry("- interval '1 minute'").await, inv.invite.to_string());
-        let (status, body) = ui("accept-invite", accept(&inv.user, "WRONG1", STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, "000000", STRONG)).await;
         assert_eq!((status, code_of(&body)), (410, "invite_expired"), "{body}");
         set_expiry("+ interval '1 day'").await;
-        let (status, body) = ui("accept-invite", accept(&inv.user, "WRONG1", STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, "000000", STRONG)).await;
         assert_eq!((status, code_of(&body)), (400, "invalid_request"), "{body}");
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!(status, 200, "the right code: {body}");
     })
     .await;
 }
 
-/// A password Zitadel's policy refuses (by `DOMAIN-` id) is `weak_password` in accept-invite:
-/// after the code (with a ticket to finish), and in a reset before anything changes (AC 1).
+/// Replaces `zitadel_policy_refusals_are_weak_passwords_in_accept_invite` (#124): a weak password
+/// is refused (`weak_password`) before the code is used, with no ticket, so the same code then
+/// sets a strong one; and a reset's confirm refuses it before anything changes.
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
-async fn zitadel_policy_refusals_are_weak_passwords_in_accept_invite() {
+#[ignore = "needs the workbench stack and the identity service"]
+async fn weak_passwords_keep_the_invite_code_live() {
     with_invitee("weak", |inv| async move {
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, ZITADEL_WEAK)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, "weakpass")).await;
         assert_eq!((status, code_of(&body)), (400, "weak_password"), "{body}");
-        let ticket = body["error"]["accept_ticket"]
-            .as_str()
-            .unwrap_or_else(|| panic!("no ticket: {body}"));
+        assert!(body["error"].get("accept_ticket").is_none(), "nothing was spent: {body}");
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
+        assert_eq!(status, 200, "the same code: {body}");
+        let code = code_for(&inv.user, CodeKind::Reset).await;
         let (status, body) = ui(
-            "accept-invite",
-            json!({"user": inv.user, "acceptTicket": ticket, "reset": false, "password": STRONG}),
-        )
-        .await;
-        assert_eq!(status, 200, "finishing with the ticket: {body}");
-        // A reset code: the policy refuses the password, and the old one still signs in.
-        let code = admin().reset_code(&inv.user).await;
-        let (status, body) = ui(
-            "accept-invite",
-            reset_accept(&inv.user, &code, ZITADEL_WEAK),
+            "password-reset/confirm",
+            json!({"email": inv.email, "code": code, "password": "weakpass"}),
         )
         .await;
         assert_eq!((status, code_of(&body)), (400, "weak_password"), "{body}");
-        admin()
-            .client()
-            .create_session(&inv.user, STRONG)
+        identity()
+            .sign_in(&Pool::Members, &inv.email, STRONG)
             .await
             .expect("the password is unchanged");
     })
     .await;
 }
 
-/// #78: a removed member asks for a reset code (anyone can) and uses it on accept-invite. The
-/// code checks out, but with no open invite they stay inactive and get no session.
+/// #78, ported to the identity service (#124): a removed member (banned with our reason) asks for
+/// a reset code (anyone can) and uses it. The reset sets the password, but nothing lifts the ban:
+/// the code accepts no invite, sign-in sets no session, and the ban keeps its reason.
 #[tokio::test]
-#[ignore = "needs the workbench stack and demo.env (Zitadel admin)"]
+#[ignore = "needs the workbench stack and the identity service"]
 async fn a_removed_members_own_reset_code_never_reactivates() {
     with_invitee("removed", |inv| async move {
-        let (status, body) = ui("accept-invite", accept(&inv.user, &inv.code, STRONG)).await;
+        let (status, body) = ui("accept-invite", accept(&inv, &inv.code, STRONG)).await;
         assert_eq!(status, 200, "accept: {body}");
         let (status, body) =
             api(Method::DELETE, &format!("/v1/members/{}", inv.member), None).await;
         assert!(status == 200 || status == 204, "remove: {status} {body}");
-        let z = admin();
-        assert_eq!(
-            z.state(&inv.user).await,
-            UserState::Inactive,
-            "removal deactivates"
-        );
-        let code = z.reset_code(&inv.user).await;
-        let resp = reqwest::Client::new()
-            .post(format!("{}/auth/v1/accept-invite", gateway()))
-            .header("origin", need("CHELABASE_ENTRY_STUDIO_URL"))
-            .json(&reset_accept(&inv.user, &code, "Other-pass-34!"))
-            .timeout(Duration::from_secs(60))
-            .send()
-            .await
-            .unwrap();
-        let status = resp.status().as_u16();
-        let cookies: Vec<String> = resp
-            .headers()
-            .get_all(reqwest::header::SET_COOKIE)
-            .iter()
-            .map(|v| v.to_str().unwrap_or("").to_string())
-            .collect();
-        let body: Value = resp.json().await.unwrap_or(Value::Null);
-        assert_eq!((status, code_of(&body)), (400, "invalid_request"), "{body}");
-        assert!(
-            !cookies
-                .iter()
-                .any(|c| c.starts_with("chelabase_session=") && !c.contains("Max-Age=0")),
-            "{cookies:?}"
-        );
-        assert_eq!(
-            z.state(&inv.user).await,
-            UserState::Inactive,
-            "still inactive"
-        );
+        let banned = || async {
+            let d = identity().user_detail(&Pool::Members, &inv.user).await.unwrap();
+            (d.user.banned, d.ban_reason)
+        };
+        assert_eq!(banned().await, (true, Some(MEMBER_REMOVED_BAN_REASON.to_string())), "removal bans");
+        let code = code_for(&inv.user, CodeKind::Reset).await;
+        let (status, body, cookie) = accept_call(accept(&inv, &code, "Other-pass-34!")).await;
+        assert_eq!((status, code_of(&body), cookie), (400, "invalid_request", None), "{body}");
+        let (status, body) = ui(
+            "password-reset/confirm",
+            json!({"email": inv.email, "code": code, "password": "Other-pass-34!"}),
+        )
+        .await;
+        assert_eq!(status, 200, "the reset itself: {body}");
+        let (status, body, cookie) =
+            session_call("sign-in", None, Some(json!({"email": inv.email, "password": "Other-pass-34!"}))).await;
+        assert_eq!((status, code_of(&body), cookie), (401, "invalid_credentials", None), "{body}");
+        assert_eq!(banned().await, (true, Some(MEMBER_REMOVED_BAN_REASON.to_string())), "still banned");
     })
     .await;
 }

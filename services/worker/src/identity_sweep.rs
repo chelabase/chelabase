@@ -4,6 +4,11 @@
 //! same metadata write the Actions webhook uses (which marks the member offboarded, D7). It is
 //! the backstop for a missed webhook, both ways: a marked member whose user reads active again
 //! loses the mark.
+//!
+//! Only Zitadel-era members are swept. A member whose id comes from the identity service (a
+//! UUID; Zitadel's ids are digits) is skipped: Zitadel would answer 404 and the sweep would strip
+//! their logins. Their removal and suspension revoke inline (m9), so nothing is lost; m13 removes
+//! the sweep with Zitadel.
 
 use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
@@ -48,14 +53,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             return (0, 0);
         };
         let members = match self.metadata.members_with_live_logins().await {
-            Ok(members) => members,
+            Ok(members) => zitadel_members(members),
             Err(e) => {
                 warn!("identity sweep: reading the members with live logins: {e}");
                 return (0, 0);
             }
         };
         let marked = match self.metadata.offboarded_members().await {
-            Ok(marked) => marked,
+            Ok(marked) => zitadel_members(marked),
             Err(e) => {
                 warn!("identity sweep: reading the offboarded members (their marks are checked next pass): {e}");
                 Vec::new()
@@ -149,6 +154,18 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             self.member_role_requests.request(BranchId::from(branch));
         }
     }
+}
+
+/// An identity-service user id: a UUID. Zitadel's are digits.
+fn is_identity_service_id(id: &str) -> bool {
+    Uuid::parse_str(id).is_ok()
+}
+
+/// The rows whose user is Zitadel's: the only ones the sweep may look up.
+fn zitadel_members<T>(rows: Vec<(T, Uuid, String)>) -> Vec<(T, Uuid, String)> {
+    rows.into_iter()
+        .filter(|(_, _, user)| !is_identity_service_id(user))
+        .collect()
 }
 
 #[cfg(test)]
@@ -589,6 +606,34 @@ mod tests {
         assert_eq!(revoked, 1);
         assert!(s.revoked(&deleted));
         assert!(!is_marked(&s, m), "the active user's mark stays");
+    }
+
+    /// #124: a member whose id comes from the identity service (a UUID) is never looked up in
+    /// Zitadel, which would answer 404 and offboard them: their logins stay and their mark is
+    /// left alone (removal and suspension revoke inline since m9). A Zitadel member in the same
+    /// pass is still swept, and a pass of identity members only reads nothing.
+    #[tokio::test]
+    async fn identity_service_members_are_skipped() {
+        let mut s = setup().await;
+        let tenant = s.tenant();
+        let identity_user = Uuid::new_v4().to_string();
+        let kept = s.member_in(tenant, &identity_user);
+        let marked_user = Uuid::new_v4().to_string();
+        let m = marked(&mut s, &marked_user);
+        let (checked, revoked) = s.w.sweep_identities_once().await;
+        assert_eq!((checked, revoked), (0, 0));
+        assert!(!s.revoked(&kept), "an identity-service member lost a login");
+        assert!(is_marked(&s, m));
+        assert_eq!((s.lookups(&identity_user), s.lookups(&marked_user)), (0, 0));
+        // With a deleted Zitadel member beside them, the Zitadel one is revoked, as before.
+        let deleted = s.member();
+        let found = s.member();
+        s.mock.remove_user(&deleted.zitadel);
+        let (checked, revoked) = s.w.sweep_identities_once().await;
+        assert_eq!((checked, revoked), (2, 1));
+        assert!(s.revoked(&deleted) && !s.revoked(&found));
+        assert!(!s.revoked(&kept));
+        assert_eq!(s.lookups(&identity_user), 0);
     }
 
     /// Without a Zitadel client nothing can be read: no lookup, nothing revoked, no panic.

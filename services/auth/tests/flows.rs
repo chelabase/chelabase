@@ -224,31 +224,6 @@ fn signup(email: &str, pw: &str) -> Value {
     json!({"email": email, "password": pw, "givenName": "A", "familyName": "B"})
 }
 
-// R37: a closed instance never offers sign-up, even to a request that asked for it.
-// Until m11, verify-email still finishes a Zitadel step (an identity user's code is refused).
-#[tokio::test]
-async fn verify_email_finishes_a_zitadel_step() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Secret-pass1", false);
-    let session = Zitadel::new(&h.mock.base, TOKEN).create_session(&id, "Secret-pass1").await.unwrap();
-    let state = auth::cookie::LoginState {
-        auth_request: h.mock.add_auth_request(false),
-        user_id: Some(id),
-        session_id: Some(session.id),
-        session_token: Some(session.token),
-        step: auth::cookie::Step::Verify,
-        decoy: false,
-        exp: auth::cookie::now_secs() + 60,
-    };
-    let login = format!("chelabase_login={}", auth::cookie::seal_login(&h.cookie_key, &state));
-    let bad = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&login), "1.1.1.1").await;
-    assert_eq!((bad.status, bad.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
-    let done = h.post("/auth/v1/verify-email", json!({"code": EMAIL_CODE}), Some(&login), "1.1.1.1").await;
-    assert_eq!(done.body["next"], "done");
-    assert!(done.cookies.iter().any(|c| c.starts_with("chelabase_login=;") && c.contains("Max-Age=0")));
-    assert!(h.mock.user("ada@example.com").unwrap().verified);
-}
-
 // #79: only Zitadel's password-policy refusals on create are `weak_password`; another 400 (a
 // missing org: the instance is misconfigured) or a refusal nobody captured is 503 `unavailable`.
 #[tokio::test]
@@ -478,130 +453,6 @@ async fn a_non_json_request_is_refused() {
 }
 
 #[tokio::test]
-async fn password_reset_answers_the_same_whether_or_not_the_user_exists() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let known = h
-        .post(
-            "/auth/v1/password-reset",
-            json!({"email": "ADA@example.com"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    let unknown = h
-        .post(
-            "/auth/v1/password-reset",
-            json!({"email": "nobody@example.com"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (known.status, known.body.clone()),
-        (StatusCode::OK, json!({}))
-    );
-    assert_eq!((unknown.status, unknown.body), (known.status, known.body));
-    // The email goes out in the background.
-    for _ in 0..50 {
-        if !h.mock.emails().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(h.mock.emails(), vec![(id, "reset".to_string())]);
-}
-
-#[tokio::test]
-async fn confirm_sets_the_new_password() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let bad = h
-        .post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": id, "code": "000000", "password": "New-pass-12"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (bad.status, bad.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("invalid_code", messages::BAD_CODE)
-        )
-    );
-    let ok = h
-        .post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": id, "code": RESET_CODE, "password": "New-pass-12"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!((ok.status, ok.body), (StatusCode::OK, json!({})));
-    assert_eq!(
-        h.mock.user("ada@example.com").unwrap().password,
-        "New-pass-12"
-    );
-}
-
-// Zitadel hashes with bcrypt (72 bytes at most): platform sign-up and reset confirm refuse a
-// longer password before Zitadel sees it, counted in bytes (39 characters can be 74), and take
-// one of exactly 72.
-#[tokio::test]
-async fn platform_sign_up_and_confirm_refuse_a_password_over_72_bytes_before_zitadel() {
-    let h = harness().await;
-    let long = format!("Aa1!{}", "é".repeat(35));
-    let max = format!("Aa1!{}", "é".repeat(34));
-    assert_eq!((long.chars().count(), long.len(), max.len()), (39, 74, 72));
-    let a = h
-        .post("/auth/v1/sign-up", signup("new@example.com", &long), None, "1.1.1.1")
-        .await;
-    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
-    assert!(!h.identity.calls().iter().any(|c| *c == "POST /internal/v1/pools/members/users"), "{:?}", h.identity.calls());
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let a = h
-        .post("/auth/v1/password-reset/confirm", json!({"userId": id, "code": RESET_CODE, "password": long}), None, "1.1.1.1")
-        .await;
-    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
-    assert!(!h.mock.calls().iter().any(|c| c.ends_with("/password")), "{:?}", h.mock.calls());
-    assert_eq!(h.mock.user("ada@example.com").unwrap().password, "Old-pass-1");
-    // 72 bytes is fine on both.
-    let a = h
-        .post("/auth/v1/sign-up", signup("max@example.com", &max), None, "1.1.1.1")
-        .await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
-    let a = h
-        .post("/auth/v1/password-reset/confirm", json!({"userId": id, "code": RESET_CODE, "password": max}), None, "1.1.1.1")
-        .await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({})));
-    assert_eq!(h.mock.user("ada@example.com").unwrap().password, max);
-}
-
-// Review Focus 3.
-#[tokio::test]
-async fn confirm_with_a_weak_password_says_so() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let a = h
-        .post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": id, "code": RESET_CODE, "password": "short"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("weak_password", messages::WEAK_PASSWORD)
-        )
-    );
-}
-
-#[tokio::test]
 async fn logout_ends_the_session_and_clears_both_cookies() {
     let h = harness().await;
     h.member("ada@example.com", &[T1]);
@@ -615,19 +466,6 @@ async fn logout_ends_the_session_and_clears_both_cookies() {
     }
     let again = h.post("/auth/v1/logout", json!({}), None, "1.1.1.1").await;
     assert_eq!(again.status, StatusCode::OK);
-}
-
-// --- Security review fixes -------------------------------------------------------------
-
-// Live finding: Zitadel's session API can't see a user for a moment after CreateUser.
-// C1: ids go into Zitadel URL paths, so only Zitadel-shaped ids are accepted.
-#[tokio::test]
-async fn ids_that_are_not_zitadel_ids_never_reach_zitadel() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let confirm = h.post("/auth/v1/password-reset/confirm", json!({"userId": format!("{id}/lock?x="), "code": RESET_CODE, "password": "New-pass-12"}), None, "1.1.1.1").await;
-    assert_eq!((confirm.status, confirm.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
-    assert_eq!(h.mock.user("ada@example.com").unwrap().password, "Old-pass-1");
 }
 
 // I1: a cookieless resend must not share a rate-limit bucket with decoy cookies.
@@ -687,7 +525,7 @@ async fn code_endpoints_take_the_minimum_time() {
     let start = Instant::now();
     h.post(
         "/auth/v1/password-reset/confirm",
-        json!({"userId": "3000999", "code": "x", "password": "New-pass-12"}),
+        json!({"email": "nobody@example.com", "code": "123456", "password": "New-pass-12"}),
         None,
         "5.5.5.5",
     )
@@ -769,70 +607,6 @@ async fn sign_up_never_duplicates_an_existing_email() {
         (StatusCode::OK, json!({"next": "verify"}))
     );
     assert_eq!(h.users_with("ada@example.com").await, 1);
-}
-
-// N2: two accounts already sharing an email (made outside these checks) still mean "taken".
-// I5: the weak-password answer doesn't depend on whether the user id exists.
-#[tokio::test]
-async fn a_weak_password_is_refused_before_the_user_is_looked_up() {
-    let h = harness().await;
-    let a = h
-        .post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": "3000999", "code": RESET_CODE, "password": "alllowercase1!"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("weak_password", messages::WEAK_PASSWORD)
-        )
-    );
-    let b = h
-        .post(
-            "/auth/v1/sign-up",
-            signup("new@example.com",
-                "NoSymbol123",
-            ),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (b.status, b.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("weak_password", messages::WEAK_PASSWORD)
-        )
-    );
-}
-
-// I6: codes are limited per account too, not only per IP.
-#[tokio::test]
-async fn confirm_is_limited_per_user_across_ips() {
-    let h = harness().await;
-    let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    for i in 0..10 {
-        h.post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": id, "code": "000000", "password": "New-pass-12"}),
-            None,
-            &format!("8.8.8.{i}"),
-        )
-        .await;
-    }
-    let a = h
-        .post(
-            "/auth/v1/password-reset/confirm",
-            json!({"userId": id, "code": RESET_CODE, "password": "New-pass-12"}),
-            None,
-            "8.8.9.9",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
 // Self-hosted (verification off): a taken email is told so; there's no code step to hide behind.
@@ -917,31 +691,6 @@ async fn sign_up_answers_take_the_longer_minimum() {
     )
     .await;
     assert!(start.elapsed() >= Duration::from_millis(1300));
-}
-
-// Platform mode: the real owner of a taken email hears about the attempt (a reset link).
-#[tokio::test]
-async fn a_decoy_sign_up_emails_the_owner_a_reset_link() {
-    let h = harness().await;
-    // The reset stays on Zitadel until m11.
-    let id = h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
-    h.post(
-        "/auth/v1/sign-up",
-        signup("ada@example.com",
-            "Secret-pass1",
-        ),
-        None,
-        "1.1.1.1",
-    )
-    .await;
-    for _ in 0..50 {
-        if !h.mock.emails().is_empty() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(h.mock.emails(), vec![(id, "reset".to_string())]);
 }
 
 const SIGN_UP_CALL: &str = "POST /internal/signup/check";
@@ -1030,939 +779,6 @@ async fn platform_sign_up_refused() {
     assert!(h.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
-fn accept(ar: &str, user: &str, code: &str, pw: &str) -> Value {
-    json!({"authRequest": ar, "user": user, "code": code, "password": pw})
-}
-
-// M4: after the password is set, Zitadel's session API may not see the user yet (a 404 for a
-// moment): accept-invite waits for it instead of failing with a spent code.
-#[tokio::test]
-async fn accept_invite_waits_for_zitadel_to_see_the_user() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("lag@example.com");
-    h.mock.hide_user(&id, 3);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["next"], "done");
-    assert!(a.cookie("chelabase_session").is_some());
-}
-
-// M4: accept-invite may wait out that lag, so its floor sits above sign-in's (SIGN_UP_EXTRA), or
-// an answer after a lag would be slower than one without.
-#[tokio::test]
-async fn accept_invite_answers_take_the_longer_minimum() {
-    let h = harness_with(false, 300).await;
-    let (id, code) = h.mock.add_invited_user("slow@example.com");
-    let start = Instant::now();
-    h.post(
-        "/auth/v1/accept-invite",
-        accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-        None,
-        "1.1.1.1",
-    )
-    .await;
-    assert!(start.elapsed() >= Duration::from_millis(300) + Duration::from_millis(1000));
-    // A refused one (a wrong code) is held as long.
-    let start = Instant::now();
-    let bad = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, "wrong", "Secret-pass1"),
-            None,
-            "1.1.1.2",
-        )
-        .await;
-    assert_eq!(bad.status, StatusCode::BAD_REQUEST);
-    assert!(start.elapsed() >= Duration::from_millis(300) + Duration::from_millis(1000));
-}
-
-#[tokio::test]
-async fn accept_invite_sets_password_and_signs_in() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let ar = h.mock.add_auth_request(false);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&ar, &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body["next"], "done");
-    assert!(a.body["redirect"].as_str().unwrap().contains("callback"));
-    assert!(a.cookie("chelabase_session").is_some());
-    let user = h.mock.user_by_id(&id).unwrap();
-    assert_eq!(user.password, "Secret-pass1");
-    assert!(user.verified);
-    // The code is single use.
-    let again = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Other-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(again.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "Secret-pass1");
-}
-
-// I1: a deactivated user (a removed member invited again) is reactivated only once the code is
-// verified; a wrong code leaves them deactivated.
-#[tokio::test]
-async fn accept_invite_reactivates_a_deactivated_user_after_the_code() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("back@example.com");
-    h.mock.set_inactive(&id, true);
-    h.internal.set_open_invite(&id, true);
-    let wrong = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, "WRONG", "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
-    assert!(h.mock.user_by_id(&id).unwrap().inactive, "a wrong code reactivates nothing");
-    let ok = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert!(!h.mock.user_by_id(&id).unwrap().inactive, "reactivated by the accept");
-}
-
-// Live finding: Zitadel makes no invite code for a user who has a password ("User is already
-// initialized"), so a removed member invited again gets a password-reset code, behind the
-// accept-invite link with `reset: true`. The code sets the password (a wrong one sets nothing
-// and reactivates nothing); only then is the user reactivated.
-#[tokio::test]
-async fn accept_invite_with_a_reset_code_sets_the_password_then_reactivates() {
-    let h = harness().await;
-    let id = h.mock.add_user("again@example.com", "Old-pass-12", true);
-    h.mock.set_inactive(&id, true);
-    h.internal.set_open_invite(&id, true);
-    let reset = |code: &str, pw: &str| {
-        let mut body = accept(&h.mock.add_auth_request(false), &id, code, pw);
-        body["reset"] = json!(true);
-        body
-    };
-    let wrong = h.post("/auth/v1/accept-invite", reset("000000", "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
-    let user = h.mock.user_by_id(&id).unwrap();
-    assert!(user.inactive, "a wrong code reactivates nothing");
-    assert_eq!(user.password, "Old-pass-12", "a wrong code sets nothing");
-    assert!(!h.mock.calls().iter().any(|c| c.contains("invite_code")), "no invite code is checked");
-    let ok = h.post("/auth/v1/accept-invite", reset(RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert_eq!(ok.body["next"], "done");
-    let user = h.mock.user_by_id(&id).unwrap();
-    assert!(!user.inactive, "reactivated by the accept");
-    assert_eq!(user.password, "Secret-pass1");
-    assert!(user.verified);
-}
-
-#[tokio::test]
-async fn accept_invite_weak_password_keeps_the_code() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let ar = h.mock.add_auth_request(false);
-    let weak = h
-        .post("/auth/v1/accept-invite", accept(&ar, &id, &code, "weak"), None, "1.1.1.1")
-        .await;
-    assert_eq!(weak.status, StatusCode::BAD_REQUEST);
-    assert_eq!(weak.body["error"]["code"], "weak_password");
-    let ok = h
-        .post("/auth/v1/accept-invite", accept(&ar, &id, &code, "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-}
-
-#[tokio::test]
-async fn accept_invite_expired() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.expire_invite(&id);
-    // Zitadel answers an expired code like a wrong one; the stored expiry tells them apart.
-    h.internal.set_open_invite(&id, false);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::GONE);
-    assert_eq!(a.body["error"]["code"], "invite_expired");
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "");
-}
-
-#[tokio::test]
-async fn accept_invite_revoked() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.remove_user(&id);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::GONE);
-    assert_eq!(a.body["error"]["code"], "invite_revoked");
-}
-
-#[tokio::test]
-async fn accept_invite_rejects_malformed_input() {
-    let h = harness().await;
-    for body in [
-        accept("V2_1", "not-a-number", "ABC", "Secret-pass1"),
-        accept("V2_1", "30001", "", "Secret-pass1"),
-    ] {
-        let a = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST);
-        assert_eq!(a.body["error"]["code"], "invalid_request");
-    }
-}
-
-#[tokio::test]
-async fn accept_invite_is_rate_limited_like_sign_up() {
-    let h = harness().await;
-    let (id, _) = h.mock.add_invited_user("bob@example.com");
-    let mut last = StatusCode::OK;
-    for _ in 0..6 {
-        last = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, "WRONG", "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await
-            .status;
-    }
-    assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
-}
-
-// A turned-away attempt spends nothing: after a burst over the budget in which no attempt
-// failed, the address is not locked.
-#[tokio::test(flavor = "multi_thread", worker_threads = 64)]
-async fn accept_invite_concurrent_burst_of_valid_accepts_does_not_lock_the_ip() {
-    let h = Arc::new(harness().await);
-    h.mock.on_request("/invite_code/verify", || std::thread::sleep(Duration::from_millis(300)));
-    let mut tasks = Vec::new();
-    for i in 0..40 {
-        let (id, code) = h.mock.add_invited_user(&format!("b{i}@example.com"));
-        let ar = h.mock.add_auth_request(false);
-        let h = h.clone();
-        tasks.push(tokio::spawn(async move {
-            h.post("/auth/v1/accept-invite", accept(&ar, &id, &code, "Secret-pass1"), None, "1.1.1.1")
-                .await
-                .status
-        }));
-    }
-    let mut ok = 0;
-    let mut limited = 0;
-    for t in tasks {
-        match t.await.unwrap() {
-            StatusCode::OK => ok += 1,
-            StatusCode::TOO_MANY_REQUESTS => limited += 1,
-            other => panic!("unexpected {other}"),
-        }
-    }
-    h.mock.clear_on_request();
-    // The burst is over and not one attempt failed: a later valid accept must go through.
-    let (id, code) = h.mock.add_invited_user("after@example.com");
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    // The burst must actually reach the limit, or the check below proves nothing.
-    assert!(limited > 0, "burst: {ok} ok, none got 429: the requests didn't overlap");
-    assert_eq!(a.status, StatusCode::OK, "burst: {ok} ok, {limited} got 429; afterwards: {}", a.body);
-}
-
-// Only failed attempts spend the per-IP budget: a success needs a valid code for that user, so
-// an office behind one NAT can accept many invites in a minute.
-#[tokio::test]
-async fn accept_invite_successes_do_not_spend_the_ip_budget() {
-    let h = harness().await;
-    for i in 0..25 {
-        let (id, code) = h.mock.add_invited_user(&format!("u{i}@example.com"));
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::OK, "accept {i}: {}", a.body);
-    }
-}
-
-#[tokio::test]
-async fn accept_invite_failed_codes_exhaust_the_ip_budget() {
-    let h = harness().await;
-    for i in 0..20 {
-        let (id, _) = h.mock.add_invited_user(&format!("u{i}@example.com"));
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, "WRONG", "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "guess {i}");
-    }
-    let (id, code) = h.mock.add_invited_user("late@example.com");
-    let late = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS);
-    // Another address is untouched.
-    let other = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "2.2.2.2",
-        )
-        .await;
-    assert_eq!(other.status, StatusCode::OK, "{}", other.body);
-}
-
-#[tokio::test]
-async fn accept_invite_unknown_users_and_bad_bodies_count() {
-    for malformed in [false, true] {
-        let h = harness().await;
-        for i in 0..20 {
-            let body = if malformed {
-                accept("V2_1", "not-a-number", "ABC", "Secret-pass1")
-            } else {
-                accept(&h.mock.add_auth_request(false), &format!("9000{i}"), "ABC", "Secret-pass1")
-            };
-            let a = h.post("/auth/v1/accept-invite", body, None, "1.1.1.1").await;
-            let want = if malformed { StatusCode::BAD_REQUEST } else { StatusCode::GONE };
-            assert_eq!(a.status, want, "attempt {i}: {}", a.body);
-        }
-        let (id, code) = h.mock.add_invited_user("late@example.com");
-        let late = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "malformed: {malformed}");
-    }
-}
-
-#[tokio::test]
-async fn accept_invite_weak_password_and_outage_do_not_count() {
-    // One more attempt than the budget (21) per case, each from its own address. Answers are
-    // padded to about a second, so the cases that don't share a mock failure rule run side by
-    // side. A valid accept from each address at the end proves its budget is untouched.
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let again = h.mock.add_user("again@example.com", "Old-pass-12", true);
-    h.mock.fail("/invite_code/verify", 500, "Errors.Internal", 21);
-    h.mock.fail("/password", 400, "Errors.User.PasswordComplexityPolicy.HasSymbol", 21);
-    let weak = async {
-        for i in 0..21 {
-            let a = h
-                .post(
-                    "/auth/v1/accept-invite",
-                    accept(&h.mock.add_auth_request(false), &id, &code, "weak"),
-                    None,
-                    "1.1.1.1",
-                )
-                .await;
-            assert_eq!(a.body["error"]["code"], "weak_password", "weak {i}");
-        }
-    };
-    let verify_outage = async {
-        for i in 0..21 {
-            let a = h
-                .post(
-                    "/auth/v1/accept-invite",
-                    accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                    None,
-                    "2.2.2.2",
-                )
-                .await;
-            assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "outage {i}: {}", a.body);
-        }
-    };
-    // A reset code with a password Zitadel refuses: the code isn't spent and nothing is guessed.
-    let refused = async {
-        for i in 0..21 {
-            let mut body = accept(&h.mock.add_auth_request(false), &again, RESET_CODE, "Secret-pass1");
-            body["reset"] = json!(true);
-            let a = h.post("/auth/v1/accept-invite", body, None, "3.3.3.3").await;
-            assert_eq!(a.body["error"]["code"], "weak_password", "refused {i}: {}", a.body);
-        }
-    };
-    tokio::join!(weak, verify_outage, refused);
-    // The user lookup fails for everyone, so this case runs alone.
-    h.mock.fail("GET /v2/users/", 500, "Errors.Internal", 21);
-    for i in 0..21 {
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "4.4.4.4",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "get_user outage {i}: {}", a.body);
-    }
-    for ip in ["1.1.1.1", "2.2.2.2", "3.3.3.3", "4.4.4.4"] {
-        let (id, code) = h.mock.add_invited_user(&format!("last-{ip}@example.com"));
-        let ok = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                ip,
-            )
-            .await;
-        assert_eq!(ok.status, StatusCode::OK, "{ip}: {}", ok.body);
-    }
-}
-
-/// A user to accept for: an invitee, or for `reset` a user with a pending reset code.
-fn code_holder(h: &Harness, email: &str, reset: bool) -> (String, String) {
-    if reset {
-        (h.mock.add_user(email, "Old-pass-12", true), RESET_CODE.to_string())
-    } else {
-        h.mock.add_invited_user(email)
-    }
-}
-
-fn accept_or_reset(h: &Harness, id: &str, code: &str, reset: bool) -> Value {
-    let mut body = accept(&h.mock.add_auth_request(false), id, code, "Secret-pass1");
-    if reset {
-        body["reset"] = json!(true);
-    }
-    body
-}
-
-#[tokio::test]
-async fn accept_invite_any_rejected_code_check_counts_against_the_ip() {
-    // Zitadel answering about the code with a status that isn't 400/412 (here 403) is still a
-    // refused guess, on the invite path and on the reset path. Five per user (their own limit),
-    // four users: the address's 20.
-    for reset in [false, true] {
-        let h = harness().await;
-        h.mock.fail(if reset { "/password" } else { "/invite_code/verify" }, 403, "Errors.Forbidden", 20);
-        for u in 0..4 {
-            let (id, code) = code_holder(&h, &format!("bob{u}@example.com"), reset);
-            for i in 0..5 {
-                let a = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "1.1.1.1").await;
-                assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "reset {reset}, user {u}, attempt {i}: {}", a.body);
-            }
-        }
-        let (id, code) = code_holder(&h, "eve@example.com", reset);
-        let late = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "1.1.1.1").await;
-        assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}");
-    }
-}
-
-// Epic review (5): a refusal of the code check that isn't a wrong code by its captured id never
-// hands the invitee's attempt back, so from new addresses a sixth is still refused (fail closed).
-#[tokio::test]
-async fn accept_invite_any_rejected_code_check_counts_against_the_user() {
-    for reset in [false, true] {
-        let h = harness().await;
-        let (id, code) = code_holder(&h, "bob@example.com", reset);
-        h.mock.fail(if reset { "/password" } else { "/invite_code/verify" }, 403, "Errors.Forbidden", 20);
-        for i in 0..5 {
-            let ip = format!("1.1.1.{i}");
-            let a = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, &ip).await;
-            assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "reset {reset}, attempt {i}: {}", a.body);
-        }
-        let sixth = h.post("/auth/v1/accept-invite", accept_or_reset(&h, &id, &code, reset), None, "2.2.2.2").await;
-        assert_eq!(sixth.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}: {}", sixth.body);
-    }
-}
-
-#[tokio::test]
-async fn accept_invite_user_deleted_after_lookup_counts_against_the_ip() {
-    // get_user finds the user but /invite_code/verify says Errors.User.NotFound (deleted in
-    // between): 410 and a counted failure.
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("/invite_code/verify", 400, "Errors.User.NotFound", 20);
-    for i in 0..20 {
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::GONE, "attempt {i}: {}", a.body);
-    }
-    let late = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS);
-}
-
-#[tokio::test]
-async fn accept_invite_reset_user_deleted_after_lookup_is_revoked_and_counts_against_the_ip() {
-    // get_user finds the user but the reset's POST /password answers Zitadel's captured
-    // not-found (deleted in between): 410 invite_revoked, the invitee's attempt handed back (no
-    // 429 after five), the address's counted (the 21st is 429).
-    let h = harness().await;
-    let id = h.mock.add_user("bob@example.com", "Old-pass-12", true);
-    h.mock.fail("/password", 400, "Errors.User.NotFound", 20);
-    let reset = || reset_accept(&h.mock.add_auth_request(false), &id, RESET_CODE, "Secret-pass1");
-    for i in 0..20 {
-        let a = h.post("/auth/v1/accept-invite", reset(), None, "1.1.1.1").await;
-        assert_eq!(a.status, StatusCode::GONE, "attempt {i}: {}", a.body);
-        assert_eq!(a.body["error"]["code"], "invite_revoked", "attempt {i}");
-    }
-    let late = h.post("/auth/v1/accept-invite", reset(), None, "1.1.1.1").await;
-    assert_eq!(late.status, StatusCode::TOO_MANY_REQUESTS, "{}", late.body);
-}
-
-#[tokio::test]
-async fn accept_invite_concurrent_failures_cannot_exceed_the_ip_budget() {
-    let h = Arc::new(harness().await);
-    let mut tasks = Vec::new();
-    for i in 0..60 {
-        let h = h.clone();
-        tasks.push(tokio::spawn(async move {
-            h.post(
-                "/auth/v1/accept-invite",
-                accept("V2_1", &format!("8000{i}"), "WRONG", "Secret-pass1"),
-                None,
-                "6.6.6.6",
-            )
-            .await
-            .status
-        }));
-    }
-    let mut answered = 0;
-    for t in tasks {
-        if t.await.unwrap() != StatusCode::TOO_MANY_REQUESTS {
-            answered += 1;
-        }
-    }
-    assert!(answered <= 20, "{answered} of 60 concurrent failed attempts from one IP were answered");
-}
-
-fn ticket_of(a: &Answer) -> String {
-    a.body["error"]["accept_ticket"].as_str().unwrap().to_string()
-}
-
-fn with_ticket(ar: &str, user: &str, ticket: &str, pw: &str) -> Value {
-    json!({"authRequest": ar, "user": user, "acceptTicket": ticket, "password": pw})
-}
-
-#[tokio::test]
-async fn accept_invite_failure_after_verify_returns_ticket() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("/password", 500, "Errors.Internal", 1);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
-    assert!(!ticket_of(&a).is_empty());
-    // The code is spent: retrying with it alone is refused.
-    let again = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(again.status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn accept_invite_retry_with_ticket_completes() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("PATCH /v2/users/", 500, "Errors.Internal", 1);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
-    let ticket = ticket_of(&a);
-    let ok = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &ticket, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert_eq!(ok.body["next"], "done");
-    assert!(ok.cookie("chelabase_session").is_some());
-    let user = h.mock.user_by_id(&id).unwrap();
-    assert_eq!((user.password.as_str(), user.verified), ("Secret-pass1", true));
-}
-
-#[tokio::test]
-async fn ticket_for_other_user_refused() {
-    let h = harness().await;
-    let (a_id, a_code) = h.mock.add_invited_user("a@example.com");
-    let (b_id, _) = h.mock.add_invited_user("b@example.com");
-    h.mock.fail("/password", 500, "Errors.Internal", 1);
-    let failed = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &a_id, &a_code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    let ticket = ticket_of(&failed);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &b_id, &ticket, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
-    assert_eq!(a.body["error"]["code"], "invalid_request");
-    assert_eq!(h.mock.user_by_id(&b_id).unwrap().password, "");
-    assert!(a.cookie("chelabase_session").is_none());
-}
-
-#[tokio::test]
-async fn expired_ticket_refused() {
-    let h = harness().await;
-    let (id, _) = h.mock.add_invited_user("bob@example.com");
-    let old = auth::cookie::seal_ticket(
-        &h.cookie_key,
-        &auth::cookie::AcceptTicket { user_id: id.clone(), exp: auth::cookie::now_secs() - 1, nonce: "n1".into() },
-    );
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &old, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "");
-    // A ticket sealed with another key is refused alike, and a code together with a ticket.
-    let foreign = auth::cookie::seal_ticket(
-        &SecretKey::generate(),
-        &auth::cookie::AcceptTicket { user_id: id.clone(), exp: auth::cookie::now_secs() + 600, nonce: "n2".into() },
-    );
-    let b = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &foreign, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(b.status, StatusCode::BAD_REQUEST);
-    let both = h
-        .post(
-            "/auth/v1/accept-invite",
-            json!({"user": id, "code": "X", "acceptTicket": foreign, "password": "Secret-pass1"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(both.status, StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn accept_invite_without_the_admin_client_is_503_and_spends_no_code() {
-    let h = harness_full(false, 1, auth::config::Mode::SelfHosted, false).await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        !h.mock.calls().iter().any(|c| c.contains("invite_code/verify")),
-        "{:?}",
-        h.mock.calls()
-    );
-    assert!(h.mock.inner.lock().unwrap().invites.contains_key(&id));
-}
-
-#[tokio::test]
-async fn verify_errors_map_by_the_captured_refusal() {
-    let h = harness().await;
-    // 401, 403, 429, a missing route and a 5xx are ours or transient: 503, never "invalid link".
-    for (status, key) in [
-        (401, "Errors.Token.Invalid"),
-        (403, "Errors.PermissionDenied"),
-        (429, "Errors.RateLimit"),
-        (404, "Errors.Route.NotFound"),
-        (500, "Errors.Internal"),
-    ] {
-        let (id, code) = h.mock.add_invited_user(&format!("u{status}@example.com"));
-        h.mock.fail("/invite_code/verify", status, key, 1);
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{status}: {}", a.body);
-        assert_eq!(a.body["error"]["code"], "unavailable", "{status}");
-        assert_eq!(h.mock.user_by_id(&id).unwrap().password, "", "{status}");
-    }
-    // Any other 400 is a bad link.
-    let (id, code) = h.mock.add_invited_user("other@example.com");
-    h.mock.fail("/invite_code/verify", 400, "Errors.Something.Else", 1);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("invalid_request")));
-    // Zitadel's invalid-code refusal (`COMMAND-Wgn4q`, a wrong or an expired code alike) is an
-    // expired invite when the stored invite has expired; its user-not-found (`COMMAND-F5g2h`, a
-    // 400) is a revoked one.
-    h.internal.set_open_invite(&id, false);
-    h.mock.fail("/invite_code/verify", 400, "Errors.User.Code.Expired", 1);
-    let b = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(b.body["error"]["code"], "invite_expired");
-    h.mock.fail("/invite_code/verify", 400, "Errors.User.NotFound", 1);
-    let c = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(c.body["error"]["code"], "invite_revoked");
-}
-
-#[tokio::test]
-async fn set_password_maps_only_the_policy_key_to_weak_password() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("/password", 400, "Errors.User.PasswordComplexityPolicy.HasSymbol", 1);
-    let weak = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(weak.status, StatusCode::BAD_REQUEST);
-    assert_eq!(weak.body["error"]["code"], "weak_password");
-    let ticket = ticket_of(&weak);
-    // Another 400 is not the password's fault.
-    h.mock.fail("/password", 400, "Errors.Something.Else", 1);
-    let other = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &ticket, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(other.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(other.body["error"]["code"], "invite_incomplete");
-    let ok = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &ticket_of(&other), "Better-pass1!"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-}
-
-#[tokio::test]
-async fn an_expired_sign_in_still_completes_the_accept() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept("V2_999999", &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(a.body, json!({"next": "done", "redirect": "http://studio.chelabase.localhost:8000"}));
-    assert!(a.cookie("chelabase_session").is_some());
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "Secret-pass1");
-}
-
-#[tokio::test]
-async fn accept_invite_for_another_orgs_user_is_refused_and_keeps_the_code() {
-    let h = harness().await;
-    let id = h.mock.add_user_in("o2", "app@example.com", "", false);
-    h.mock
-        .inner
-        .lock()
-        .unwrap()
-        .invites
-        .insert(id.clone(), ("CODE1".into(), false));
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, "CODE1", "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "");
-    assert!(h.mock.inner.lock().unwrap().invites.contains_key(&id));
-}
-
-#[tokio::test]
-async fn accept_invite_never_touches_an_active_user_or_another_users_code() {
-    let h = harness().await;
-    let active = h.mock.add_user("active@example.com", "Original-pass1", true);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &active, "ANYCODE", "Hijack-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.mock.user_by_id(&active).unwrap().password, "Original-pass1");
-    assert!(a.cookie("chelabase_session").is_none());
-    // A's code against B's id.
-    let (a_id, a_code) = h.mock.add_invited_user("a@example.com");
-    let (b_id, _) = h.mock.add_invited_user("b@example.com");
-    let cross = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &b_id, &a_code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(cross.status, StatusCode::BAD_REQUEST);
-    assert_eq!(h.mock.user_by_id(&b_id).unwrap().password, "");
-    assert!(h.mock.inner.lock().unwrap().invites.contains_key(&a_id));
-}
-
-#[tokio::test]
-async fn accept_invite_is_limited_per_ip_across_users() {
-    let h = harness().await;
-    let mut statuses = Vec::new();
-    for i in 0..21 {
-        statuses.push(
-            h.post(
-                "/auth/v1/accept-invite",
-                accept("V2_1", &format!("4000{i}"), "WRONG", "Secret-pass1"),
-                None,
-                "2.2.2.2",
-            )
-            .await
-            .status,
-        );
-    }
-    assert!(statuses[..20].iter().all(|s| *s != StatusCode::TOO_MANY_REQUESTS));
-    assert_eq!(statuses[20], StatusCode::TOO_MANY_REQUESTS);
-}
-
-#[tokio::test]
-async fn only_failed_codes_count_against_an_invitee() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    // Weak-password typos don't count.
-    for _ in 0..7 {
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept("V2_1", &id, &code, "weak"),
-                None,
-                "3.3.3.3",
-            )
-            .await;
-        assert_eq!(a.body["error"]["code"], "weak_password");
-    }
-    let ok = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "3.3.3.3",
-        )
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-}
-
 #[tokio::test]
 async fn the_gate_refuses_what_it_does_not_clearly_allow() {
     let h = harness().await;
@@ -1984,189 +800,14 @@ async fn the_gate_refuses_what_it_does_not_clearly_allow() {
     assert_eq!(h.users_with("new@example.com").await, 1);
 }
 
-#[tokio::test]
-async fn ticket_replay_after_success_refused() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("/password", 500, "Errors.Internal", 1);
-    let failed = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    let ticket = ticket_of(&failed);
-    let ok = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &ticket, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    // The same ticket can't set the password again.
-    let replay = h
-        .post(
-            "/auth/v1/accept-invite",
-            with_ticket(&h.mock.add_auth_request(false), &id, &ticket, "Attacker-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(replay.status, StatusCode::BAD_REQUEST);
-    assert_eq!(replay.body["error"]["code"], "invalid_request");
-    assert!(replay.cookie("chelabase_session").is_none());
-    assert_eq!(h.mock.user_by_id(&id).unwrap().password, "Secret-pass1");
-}
-
-#[tokio::test]
-async fn accept_invite_answers_are_never_cached() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("/password", 500, "Errors.Internal", 1);
-    let post = |body: Value| {
-        h.http
-            .post(format!("{}/auth/v1/accept-invite", h.base))
-            .json(&body)
-            .header("x-forwarded-for", "9.9.9.9, 1.1.1.1")
-            .send()
-    };
-    let failed = post(accept("V2_1", &id, &code, "Secret-pass1")).await.unwrap();
-    assert_eq!(failed.headers().get("cache-control").unwrap(), "no-store");
-    let failed: Value = failed.json().await.unwrap();
-    let ticket = failed["error"]["accept_ticket"].as_str().unwrap().to_string();
-    let ok = post(with_ticket(&h.mock.add_auth_request(false), &id, &ticket, "Secret-pass1"))
-        .await
-        .unwrap();
-    assert_eq!(ok.status(), StatusCode::OK);
-    assert_eq!(ok.headers().get("cache-control").unwrap(), "no-store");
-    let bad = post(accept("V2_1", "not-a-number", "X", "Secret-pass1")).await.unwrap();
-    assert_eq!(bad.headers().get("cache-control").unwrap(), "no-store");
-}
-
-fn cookie_value(a: &Answer, name: &str) -> String {
-    a.cookie(name).unwrap().split_once('=').unwrap().1.to_string()
-}
-
-#[tokio::test]
-async fn tickets_and_cookies_are_not_interchangeable() {
-    let h = harness().await;
-    // A real session cookie (from an accept) and a real login cookie (from a sign-up).
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let done = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    let session = cookie_value(&done, "chelabase_session");
-    let up = h
-        .post(
-            "/auth/v1/sign-up",
-            signup("new@example.com", "Secret-pass1"),
-            None,
-            "1.1.1.2",
-        )
-        .await;
-    let login = cookie_value(&up, "chelabase_login");
-    let (other, _) = h.mock.add_invited_user("carol@example.com");
-    for value in [session, login] {
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                with_ticket(&h.mock.add_auth_request(false), &other, &value, "Secret-pass1"),
-                None,
-                "1.1.1.3",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST);
-        assert_eq!(h.mock.user_by_id(&other).unwrap().password, "");
-    }
-    // A ticket presented as a cookie opens nothing.
-    h.mock.fail("/password", 500, "Errors.Internal", 1);
-    let (id2, code2) = h.mock.add_invited_user("dan@example.com");
-    let failed = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id2, &code2, "Secret-pass1"),
-            None,
-            "1.1.1.4",
-        )
-        .await;
-    let ticket = ticket_of(&failed);
-    let as_login = h
-        .post(
-            "/auth/v1/verify-email",
-            json!({"code": "123456"}),
-            Some(&format!("chelabase_login={ticket}")),
-            "1.1.1.4",
-        )
-        .await;
-    assert_eq!(as_login.status, StatusCode::GONE);
-    let before = h.mock.calls().iter().filter(|c| c.starts_with("DELETE /v2/sessions")).count();
-    h.post(
-        "/auth/v1/logout",
-        json!({}),
-        Some(&format!("chelabase_session={ticket}")),
-        "1.1.1.4",
-    )
-    .await;
-    let after = h.mock.calls().iter().filter(|c| c.starts_with("DELETE /v2/sessions")).count();
-    assert_eq!(before, after);
-    // Control: a real session cookie does end its session.
-    h.post(
-        "/auth/v1/logout",
-        json!({}),
-        Some(&format!("chelabase_session={}", cookie_value(&done, "chelabase_session"))),
-        "1.1.1.4",
-    )
-    .await;
-    let ended = h.mock.calls().iter().filter(|c| c.starts_with("DELETE /v2/sessions")).count();
-    assert_eq!(ended, after + 1);
-}
-
-#[tokio::test]
-async fn zitadel_error_keys_match_exactly() {
-    let h = harness().await;
-    // Keys that merely contain a known key are not that key.
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    for (key, expect) in [
-        ("Errors.User.Code.ExpiredToken", "invalid_request"),
-        ("Errors.User.NotFound.Org", "invalid_request"),
-    ] {
-        h.mock.fail("/invite_code/verify", 400, key, 1);
-        let a = h
-            .post(
-                "/auth/v1/accept-invite",
-                accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.body["error"]["code"], expect, "{key}");
-    }
-    h.mock.fail("/password", 400, "Errors.Org.PasswordComplexityPolicy.Other", 1);
-    let a = h
-        .post(
-            "/auth/v1/accept-invite",
-            accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
-}
-
 // T12x (R32): the accept page describes an invite by (Zitadel user, link token) alone.
 fn token_hash_hex(token: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(token.as_bytes()))
 }
+
+/// An identity user id.
+const U1: &str = "0195b3e6-7a10-7c3e-9d50-6f8a3b1c2d4e";
 
 const INVITE_TOKEN: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNO-_";
 
@@ -2198,19 +839,19 @@ async fn describe_invite_returns_the_description_for_the_link_token() {
     assert_eq!(INVITE_TOKEN.len(), 43);
     let h = harness().await;
     let want = json!({"inviter_name": "Alice", "inviter_email": "alice@x.com", "tenant_name": "acme"});
-    h.internal.set_invite("123", &token_hash_hex(INVITE_TOKEN), want.clone());
-    let a = h.describe(json!({"user": "123", "t": INVITE_TOKEN}), "1.1.1.1").await;
+    h.internal.set_invite(U1, &token_hash_hex(INVITE_TOKEN), want.clone());
+    let a = h.describe(json!({"user": U1, "t": INVITE_TOKEN}), "1.1.1.1").await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     assert_eq!(a.body["inviter_name"], "Alice");
     assert_eq!(a.body["inviter_email"], "alice@x.com");
     assert_eq!(a.body["tenant_name"], "acme");
     assert_eq!(a.body["_cache_control"], "no-store");
     // The old GET is gone: a link's secrets never go in a URL.
-    let old = h.get(&format!("/auth/v1/invite?user=123&t={INVITE_TOKEN}"), "1.1.1.1").await;
+    let old = h.get(&format!("/auth/v1/invite?user={U1}&t={INVITE_TOKEN}"), "1.1.1.1").await;
     assert_eq!(old.status, StatusCode::METHOD_NOT_ALLOWED);
     // The orchestrator was asked with the hash, never the token itself, and not in the URL.
     let bodies = h.internal.bodies("POST /internal/invites/describe");
-    assert_eq!(bodies, vec![json!({"user": "123", "token_hash": token_hash_hex(INVITE_TOKEN)})]);
+    assert_eq!(bodies, vec![json!({"user": U1, "token_hash": token_hash_hex(INVITE_TOKEN)})]);
     assert!(!bodies[0].to_string().contains(INVITE_TOKEN));
     assert_eq!(h.internal.queries("POST /internal/invites/describe"), vec![String::new()]);
 }
@@ -2218,19 +859,19 @@ async fn describe_invite_returns_the_description_for_the_link_token() {
 #[tokio::test]
 async fn describe_invite_wrong_anything_is_the_same_404() {
     let h = harness().await;
-    h.internal.set_invite("123", &token_hash_hex(INVITE_TOKEN), json!({"inviter_name": "A", "inviter_email": null, "tenant_name": "acme"}));
+    h.internal.set_invite(U1, &token_hash_hex(INVITE_TOKEN), json!({"inviter_name": "A", "inviter_email": null, "tenant_name": "acme"}));
     let other = "ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqponml-_";
     assert_eq!(other.len(), 43);
     let short = &INVITE_TOKEN[..42];
     let mut answers = Vec::new();
     for body in [
-        json!({"user": "123", "t": other}),
-        json!({"user": "124", "t": INVITE_TOKEN}),
-        json!({"user": "123", "t": short}),
-        json!({"user": "123"}),
+        json!({"user": U1, "t": other}),
+        json!({"user": "0195b3e6-7a10-7c3e-9d50-6f8a3b1c2d4f", "t": INVITE_TOKEN}),
+        json!({"user": U1, "t": short}),
+        json!({"user": U1}),
         json!({}),
-        json!({"user": "12x", "t": INVITE_TOKEN}),
-        json!({"user": "123", "t": format!("{}+", &INVITE_TOKEN[..42])}),
+        json!({"user": "0195b3e6-7a10-7c3e-9d50-6f8a3b1c2d4x", "t": INVITE_TOKEN}),
+        json!({"user": U1, "t": format!("{}+", &INVITE_TOKEN[..42])}),
     ] {
         let a = h.describe(body.clone(), "1.1.1.1").await;
         assert_eq!(a.status, StatusCode::NOT_FOUND, "{body}: {}", a.body);
@@ -2245,7 +886,7 @@ async fn describe_invite_wrong_anything_is_the_same_404() {
 #[tokio::test]
 async fn describe_invite_is_rate_limited_and_fails_closed() {
     let h = harness().await;
-    let body = json!({"user": "123", "t": INVITE_TOKEN});
+    let body = json!({"user": U1, "t": INVITE_TOKEN});
     for _ in 0..60 {
         let a = h.describe(body.clone(), "2.2.2.2").await;
         assert_eq!(a.status, StatusCode::NOT_FOUND);
@@ -2338,10 +979,10 @@ async fn an_unbound_claim_keeps_the_account() {
 async fn instance_says_whether_setup_is_required() {
     let h = harness().await;
     let a = h.get("/auth/v1/instance", "1.1.1.1").await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    assert_eq!((a.status, a.body["setupRequired"].clone()), (StatusCode::OK, json!(false)));
     h.internal.set_setup_code(SETUP_CODE);
     let a = h.get("/auth/v1/instance", "1.1.1.1").await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": true})));
+    assert_eq!((a.status, a.body["setupRequired"].clone()), (StatusCode::OK, json!(true)));
     // The question carries no code.
     assert!(h.internal.bodies(SIGN_UP_CALL).iter().all(|b| *b == json!({"org": "o1"})));
     h.internal.set_signup_status(Some(503));
@@ -2356,7 +997,7 @@ async fn instance_says_whether_setup_is_required() {
     // Platform mode: never, without asking.
     let p = harness_mode(false, 1, auth::config::Mode::Platform).await;
     let a = p.get("/auth/v1/instance", "1.1.1.1").await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false})));
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"setupRequired": false, "signUpAllowed": false})));
     assert!(p.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
@@ -2579,144 +1220,6 @@ async fn studio_config_shape() {
     assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::OK);
 }
 
-/// Sends an accept-invite as a client that gives up after 100 ms, from `ip`. Ok(status) when
-/// the answer beat the timeout (a 429 does), Err when the client hung up first.
-async fn hang_up_accept(h: &Harness, body: Value, ip: &str) -> Result<StatusCode, reqwest::Error> {
-    let impatient = reqwest::Client::builder().timeout(Duration::from_millis(100)).build().unwrap();
-    impatient
-        .post(format!("{}/auth/v1/accept-invite", h.base))
-        .json(&body)
-        .header("x-forwarded-for", format!("9.9.9.9, {ip}"))
-        .send()
-        .await
-        .map(|r| r.status())
-}
-
-// A client that hangs up while Zitadel checks the code still spends the attempt: the check ran
-// (a right reset code even set the password), so a dropped request can't be a free guess.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accept_invite_cancelled_code_checks_still_count_against_the_ip() {
-    for reset in [false, true] {
-        let h = harness().await;
-        let (victim, right, path) = if reset {
-            (h.mock.add_user("victim@example.com", "Old-pass-12", true), RESET_CODE.to_string(), "/password")
-        } else {
-            let (id, code) = h.mock.add_invited_user("victim@example.com");
-            (id, code, "/invite_code/verify")
-        };
-        // Zitadel takes 300 ms to answer the code check; the attacker hangs up at 100 ms.
-        h.mock.on_request(path, || std::thread::sleep(Duration::from_millis(300)));
-        let mut guesses: Vec<String> = (0..30).map(|i| format!("{:06}", 100000 + i)).collect();
-        guesses.push(right); // the 31st guess is the right one
-        for (i, code) in guesses.iter().enumerate() {
-            let mut body = accept(&h.mock.add_auth_request(false), &victim, code, "Attacker-pw-1");
-            body["reset"] = json!(reset);
-            match hang_up_accept(&h, body, "7.7.7.7").await {
-                Err(e) => assert!(e.is_timeout(), "reset {reset} guess {i}: {e}"),
-                Ok(status) => assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "reset {reset} guess {i}"),
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        h.mock.clear_on_request();
-        let checks = h.mock.calls().iter().filter(|c| c.ends_with(path)).count();
-        assert!(checks <= 20, "reset {reset}: {checks} code checks from one IP reached Zitadel");
-        let pw = h.mock.user_by_id(&victim).unwrap().password;
-        assert_ne!(pw, "Attacker-pw-1", "reset {reset}: the attacker set the victim's password");
-        let mut body = accept(&h.mock.add_auth_request(false), &victim, "999999", "Attacker-pw-1");
-        body["reset"] = json!(reset);
-        let next = h.post("/auth/v1/accept-invite", body, None, "7.7.7.7").await;
-        assert_eq!(next.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}: {}", next.body);
-    }
-}
-
-// The same for the per-user budget: hung-up code checks on one user from five addresses spend
-// its five attempts.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn accept_invite_cancelled_code_checks_still_count_against_the_user() {
-    for reset in [false, true] {
-        let h = harness().await;
-        let (victim, path) = if reset {
-            (h.mock.add_user("victim@example.com", "Old-pass-12", true), "/password")
-        } else {
-            (h.mock.add_invited_user("victim@example.com").0, "/invite_code/verify")
-        };
-        h.mock.on_request(path, || std::thread::sleep(Duration::from_millis(300)));
-        for i in 0..5 {
-            let mut body = accept(&h.mock.add_auth_request(false), &victim, "999999", "Attacker-pw-1");
-            body["reset"] = json!(reset);
-            let r = hang_up_accept(&h, body, &format!("8.8.8.{i}")).await;
-            assert!(r.as_ref().is_err_and(|e| e.is_timeout()), "reset {reset} attempt {i}: {r:?}");
-        }
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        h.mock.clear_on_request();
-        let mut body = accept(&h.mock.add_auth_request(false), &victim, "999999", "Attacker-pw-1");
-        body["reset"] = json!(reset);
-        let next = h.post("/auth/v1/accept-invite", body, None, "8.8.8.9").await;
-        assert_eq!(next.status, StatusCode::TOO_MANY_REQUESTS, "reset {reset}: {}", next.body);
-    }
-}
-
-// Zitadel refusing the user lookup (a 4xx that isn't its 404) is an answer, not an outage, so
-// it counts against the address; only transport errors and 5xx are free.
-#[tokio::test]
-async fn accept_invite_refused_user_lookup_counts_against_the_ip() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("GET /v2/users/", 403, "Errors.Permission", 20);
-    for i in 0..20 {
-        let a = h
-            .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "6.6.6.7")
-            .await;
-        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "lookup {i}: {}", a.body);
-    }
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "6.6.6.7")
-        .await;
-    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
-}
-
-// A missing admin token or org id is our outage: 21 such answers leave the address's budget
-// untouched.
-#[tokio::test]
-async fn accept_invite_unconfigured_503s_do_not_count() {
-    // Answers are padded to about a second, so the two cases run side by side.
-    let no_admin = async {
-        let h = harness_full(false, 1, auth::config::Mode::SelfHosted, false).await;
-        let (id, code) = h.mock.add_invited_user("bob@example.com");
-        for i in 0..21 {
-            let a = h
-                .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "5.5.5.5")
-                .await;
-            assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "no admin {i}: {}", a.body);
-        }
-        // A bad body is checked before the admin token, so it's answered (not 429) only if the
-        // budget is still there.
-        let a = h
-            .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), "not-an-id", &code, "Secret-pass1"), None, "5.5.5.5")
-            .await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "no admin: {}", a.body);
-    };
-    let no_org = async {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("org-id");
-        let p = path.clone();
-        let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| c.org_id = org_file(&p)).await;
-        let (id, code) = h.mock.add_invited_user("bob@example.com");
-        for i in 0..21 {
-            let a = h
-                .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "5.5.5.6")
-                .await;
-            assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "no org {i}: {}", a.body);
-        }
-        write_id(&path, "o1\n");
-        let ok = h
-            .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "5.5.5.6")
-            .await;
-        assert_eq!(ok.status, StatusCode::OK, "no org: {}", ok.body);
-    };
-    tokio::join!(no_admin, no_org);
-}
-
 // ---- #74: the sign-in email limit under concurrency and hang-ups ------------------------------
 
 /// An identity service whose every password check is refused, slowly: after `delay`, or
@@ -2896,241 +1399,6 @@ async fn sign_in_outages_do_not_spend_the_email_budget() {
     assert_eq!(got[5], StatusCode::TOO_MANY_REQUESTS, "{got:?}");
 }
 
-fn reset_accept(ar: &str, user: &str, code: &str, pw: &str) -> Value {
-    let mut body = accept(ar, user, code, pw);
-    body["reset"] = json!(true);
-    body
-}
-
-// #78: Zitadel makes a reset code for an inactive user too, and anyone can ask for one. A removed
-// member's own reset code checks out, but without an open invite it reactivates nothing and signs
-// nobody in.
-#[tokio::test]
-async fn a_reset_code_never_reactivates_a_member_without_an_open_invite() {
-    let h = harness().await;
-    let id = h.mock.add_user("gone@example.com", "Old-pass-12", true);
-    h.mock.set_inactive(&id, true);
-    // No invite at all, then one that expired.
-    for expired in [false, true] {
-        if expired {
-            h.internal.set_open_invite(&id, false);
-        }
-        let ar = h.mock.add_auth_request(false);
-        let a = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-        assert_eq!(a.status, StatusCode::BAD_REQUEST, "expired {expired}: {}", a.body);
-        assert_eq!(a.body["error"]["code"], "invalid_request", "expired {expired}");
-        assert!(a.cookie("chelabase_session").is_none(), "expired {expired}");
-        assert!(h.mock.user_by_id(&id).unwrap().inactive, "expired {expired}: still inactive");
-    }
-    assert!(!h.mock.calls().iter().any(|c| c.ends_with("/reactivate")), "{:?}", h.mock.calls());
-    assert!(!h.mock.calls().iter().any(|c| c == "POST /v2/sessions"), "{:?}", h.mock.calls());
-    assert_eq!(h.internal.bodies("POST /internal/invites/open"), vec![json!({"user": id}); 2]);
-    // Invited again: the same reset code reactivates and signs in.
-    h.internal.set_open_invite(&id, true);
-    let ar = h.mock.add_auth_request(false);
-    let ok = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert!(!h.mock.user_by_id(&id).unwrap().inactive);
-}
-
-// #78: when the orchestrator can't say whether an invite is open, nobody is reactivated (fail
-// closed): 503 with a ticket, and the retry completes once it answers.
-#[tokio::test]
-async fn an_orchestrator_outage_never_reactivates() {
-    for status in [500, 401] {
-        let h = harness().await;
-        let (id, code) = h.mock.add_invited_user("back@example.com");
-        h.mock.set_inactive(&id, true);
-        h.internal.set_open_invite(&id, true);
-        h.internal.set_open_status(Some(status));
-        let a = h
-            .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
-            .await;
-        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{status}: {}", a.body);
-        assert_eq!(a.body["error"]["code"], "invite_incomplete", "{status}");
-        assert!(a.cookie("chelabase_session").is_none(), "{status}");
-        assert!(h.mock.user_by_id(&id).unwrap().inactive, "{status}: still inactive");
-        assert!(!h.mock.calls().iter().any(|c| c.ends_with("/reactivate")), "{status}");
-        h.internal.set_open_status(None);
-        let ok = h
-            .post(
-                "/auth/v1/accept-invite",
-                with_ticket(&h.mock.add_auth_request(false), &id, &ticket_of(&a), "Secret-pass1"),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(ok.status, StatusCode::OK, "{status}: {}", ok.body);
-        assert!(!h.mock.user_by_id(&id).unwrap().inactive, "{status}");
-    }
-}
-
-// A suspended member's Zitadel user is active and locked (#76). A reset code and an open invite
-// still give no session: accept-invite never unlocks, and Zitadel refuses the locked user's
-// session (`SESSION-Gj4ko` or `COMMAND-JLK35`), so the answer is `invite_incomplete`.
-#[tokio::test]
-async fn accept_invite_never_signs_in_a_suspended_member() {
-    // Zitadel's user check (`SESSION-Gj4ko`) or its password check (`COMMAND-JLK35`).
-    for by_password_check in [false, true] {
-        let h = harness().await;
-        h.mock.set_lock_seen_by_password_check(by_password_check);
-        let id = h.mock.add_user("held@example.com", "Old-pass-12", true);
-        h.mock.lock(&id);
-        h.internal.set_open_invite(&id, true);
-        let ar = h.mock.add_auth_request(false);
-        let a = h.post("/auth/v1/accept-invite", reset_accept(&ar, &id, RESET_CODE, "Secret-pass1"), None, "1.1.1.1").await;
-        let why = format!("by the password check: {by_password_check}");
-        // Suspended, not unfinished: a retry can never succeed, so no ticket invites one.
-        assert_eq!(a.status, StatusCode::FORBIDDEN, "{why}: {}", a.body);
-        assert_eq!(a.body["error"]["code"], "member_suspended", "{why}");
-        assert!(a.body["error"]["accept_ticket"].is_null(), "{why}: {}", a.body);
-        assert!(a.cookie("chelabase_session").is_none(), "{why}");
-        let user = h.mock.user_by_id(&id).unwrap();
-        assert!(user.locked && !user.inactive, "{why}: still locked");
-        assert!(!h.mock.calls().iter().any(|c| c.ends_with("/unlock") || c.ends_with("/reactivate")), "{why}");
-    }
-}
-
-// Zitadel answers a wrong and an expired invite code alike (`COMMAND-Wgn4q`). Only then does auth
-// read the stored invite: an expired one is `invite_expired`, anything else the invalid link.
-#[tokio::test]
-async fn a_refused_code_is_expired_only_when_the_stored_invite_expired() {
-    let h = harness().await;
-    // A right code never asks.
-    let (other, other_code) = h.mock.add_invited_user("other@example.com");
-    let ok = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &other, &other_code, "Secret-pass1"), None, "1.1.1.9")
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert!(h.internal.bodies("POST /internal/invites/open").is_empty());
-    let (id, _) = h.mock.add_invited_user("bob@example.com");
-    let h = &h;
-    let wrong = |ip: &'static str| {
-        let body = accept(&h.mock.add_auth_request(false), &id, "WRONG", "Secret-pass1");
-        async move { h.post("/auth/v1/accept-invite", body, None, ip).await }
-    };
-    // No invite stored, an open one, an expired one, and the orchestrator down.
-    let a = wrong("1.1.1.1").await;
-    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("invalid_request")));
-    h.internal.set_open_invite(&id, true);
-    let a = wrong("1.1.1.2").await;
-    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("invalid_request")));
-    h.internal.set_open_invite(&id, false);
-    let a = wrong("1.1.1.3").await;
-    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::GONE, json!("invite_expired")));
-    h.internal.set_open_status(Some(500));
-    let a = wrong("1.1.1.4").await;
-    assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::BAD_REQUEST, json!("invalid_request")));
-    h.internal.set_open_status(None);
-    assert_eq!(h.internal.bodies("POST /internal/invites/open"), vec![json!({"user": id}); 4]);
-    // Every one of them counted against the invitee: the fifth still answers, the sixth is 429.
-    assert_eq!(wrong("1.1.1.5").await.body["error"]["code"], "invite_expired");
-    assert_eq!(wrong("1.1.1.6").await.status, StatusCode::TOO_MANY_REQUESTS);
-}
-
-// Every arm that hands an attempt back matches one exact captured refusal, and a wrong code is
-// never one of them, whatever the invite's state: per case, the sixth wrong code for one user is
-// 429 on the invitee's key, and the address has spent five of its 20.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn wrong_codes_never_reach_a_refunding_arm() {
-    // Answers are padded to about a second, so the cases run side by side.
-    let cases = ["invite", "reset", "reset-inactive", "no-invite", "open", "expired", "lookup-down"];
-    let runs: Vec<_> = cases.into_iter().map(|case| tokio::spawn(wrong_codes_case(case))).collect();
-    for run in runs {
-        run.await.unwrap();
-    }
-}
-
-async fn wrong_codes_case(case: &'static str) {
-    let h = harness().await;
-    let reset = case.starts_with("reset");
-    let id = if reset {
-        h.mock.add_user("bob@example.com", "Old-pass-12", true)
-    } else {
-        h.mock.add_invited_user("bob@example.com").0
-    };
-    match case {
-        "reset-inactive" => h.mock.set_inactive(&id, true),
-        "no-invite" => h.mock.inner.lock().unwrap().invites.clear(),
-        "open" => h.internal.set_open_invite(&id, true),
-        "expired" => h.internal.set_open_invite(&id, false),
-        "lookup-down" => h.internal.set_open_status(Some(500)),
-        _ => {}
-    }
-    let wrong = || {
-        let ar = h.mock.add_auth_request(false);
-        if reset { reset_accept(&ar, &id, "000000", "Secret-pass1") } else { accept(&ar, &id, "WRONG", "Secret-pass1") }
-    };
-    for i in 0..5 {
-        let a = h.post("/auth/v1/accept-invite", wrong(), None, "1.1.1.1").await;
-        assert!(
-            matches!(a.status, StatusCode::BAD_REQUEST | StatusCode::GONE),
-            "{case} {i}: {} {}",
-            a.status,
-            a.body
-        );
-    }
-    let sixth = h.post("/auth/v1/accept-invite", wrong(), None, "1.1.1.1").await;
-    assert_eq!(sixth.status, StatusCode::TOO_MANY_REQUESTS, "{case}: {}", sixth.body);
-    // The address counted the five: 15 more failures, then even a right code is 429.
-    for i in 0..15 {
-        let (other, _) = h.mock.add_invited_user(&format!("u{i}@example.com"));
-        let a = h
-            .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &other, "WRONG", "Secret-pass1"), None, "1.1.1.1")
-            .await;
-        assert_ne!(a.status, StatusCode::TOO_MANY_REQUESTS, "{case}: failure {i} after the five");
-    }
-    let (late, code) = h.mock.add_invited_user("late@example.com");
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &late, &code, "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{case}: the address spent 20");
-}
-
-// Zitadel hashes passwords with bcrypt, which takes 72 bytes at most: a longer one would pass its
-// validation and fail with a 500. Counted in bytes: 39 characters can be 74 bytes.
-#[tokio::test]
-async fn accept_invite_refuses_a_password_over_72_bytes_before_zitadel() {
-    let h = harness().await;
-    let long = format!("Aa1!{}", "é".repeat(35));
-    assert_eq!((long.chars().count(), long.len()), (39, 74));
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, &long), None, "1.1.1.1")
-        .await;
-    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
-    assert_eq!(a.body["error"]["code"], "weak_password");
-    assert!(!h.mock.calls().iter().any(|c| c.contains("/invite_code/verify")), "{:?}", h.mock.calls());
-    // 72 bytes is fine, and the code wasn't spent.
-    let max = format!("Aa1!{}", "é".repeat(34));
-    assert_eq!(max.len(), 72);
-    let ok = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, &max), None, "1.1.1.1")
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-}
-
-// Epic review (10): only Zitadel's captured "no such auth request" (`QUERY-Thee9` on the read,
-// `COMMAND-jae5P` on finishing) is an expired sign-in; any other refusal is unavailability.
-// Epic review (10): after the code is spent, a refusal of finishing the sign-in that isn't the
-// captured "no such auth request" is a step to retry (a ticket), not a finished sign-in.
-#[tokio::test]
-async fn accept_invite_finish_refused_otherwise_hands_back_a_ticket() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("POST /v2/oidc/auth_requests/", 400, "Errors.Something.Else", 1);
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
-    let ok = h
-        .post("/auth/v1/accept-invite", with_ticket(&h.mock.add_auth_request(false), &id, &ticket_of(&a), "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
-    assert_eq!(ok.body["next"], "done");
-}
-
 // Epic review (9): only identity's `conflict` is a taken email at sign-up; another 409 is
 // unavailability.
 #[tokio::test]
@@ -3142,21 +1410,6 @@ async fn sign_up_reads_only_the_captured_conflict_as_taken() {
     h.identity.fail("POST /internal/v1/pools/members/users", 409, "something_else", 1);
     let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
     assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)));
-}
-
-// Epic review (9): the session API's lag is waited out only on its captured "no such user"
-// (`QUERY-Dfbg2`); another 404 is not retried.
-#[tokio::test]
-async fn accept_invite_retries_only_the_captured_missing_user() {
-    let h = harness().await;
-    let (id, code) = h.mock.add_invited_user("bob@example.com");
-    h.mock.fail("POST /v2/sessions", 404, "Errors.Something.Else", 1);
-    let a = h
-        .post("/auth/v1/accept-invite", accept(&h.mock.add_auth_request(false), &id, &code, "Secret-pass1"), None, "1.1.1.1")
-        .await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
-    assert_eq!(a.body["error"]["code"], "invite_incomplete");
-    assert_eq!(h.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count(), 1);
 }
 
 // ---- #121: members sign in, up and out against the identity service --------------------------
@@ -3441,9 +1694,9 @@ async fn unverified_sign_in_sends_a_code() {
     let b = h.sign_in("", "new@example.com", PW, "1.1.1.1").await;
     assert_eq!((b.status, &b.body), (StatusCode::OK, &json!({"next": "verify"})));
     assert!(b.cookie("chelabase_login").is_some() && b.cookie("chelabase_session").is_none());
-    // Until m11 the code step is Zitadel's, so it refuses an identity user: never a session.
+    // A wrong code: never a session.
     let done = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&b.cookie("chelabase_login").unwrap()), "1.1.1.1").await;
-    assert_eq!(done.status, StatusCode::BAD_REQUEST);
+    assert_eq!((done.status, done.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
     assert!(done.cookies.is_empty());
     let sent = h.identity.codes_sent();
     assert_eq!(sent.len(), 2);
@@ -3652,17 +1905,576 @@ async fn token_tid_bound_to_sealed_tenant() {
     assert_eq!(h.claims(&same).tid, T1);
 }
 
-// The Zitadel-era session (accept-invite, until m11) mints nothing.
+// ---- #124 (m11): invites, verification and resets on the identity service ---------------------
+
+use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
+use chelabase_identity::{CodeKind, CodeRequest, Delivery};
+
+const NEW_PW: &str = "Fresh-pass-12";
+
+/// A link token (43 base64url characters), distinct per `n`.
+fn link_token(n: u32) -> String {
+    format!("tok{n:0>40}")
+}
+
+fn accept_code(user: &str, t: &str, code: &str, pw: &str) -> Value {
+    json!({"user": user, "t": t, "code": code, "password": pw})
+}
+
+fn accept_notice(t: &str, email: &str, pw: &str) -> Value {
+    json!({"t": t, "email": email, "password": pw})
+}
+
+impl Harness {
+    /// An open invite of T1 for `user`, whose link token is `t`.
+    fn open_invite_for(&self, user: &str, t: &str) {
+        self.internal.set_signup_tenant(T1);
+        self.internal.set_invite(
+            user,
+            &token_hash_hex(t),
+            json!({"inviter_name": "Alice", "inviter_email": "alice@x.com", "tenant_name": "acme"}),
+        );
+        self.internal.set_open_invite(user, true);
+    }
+
+    /// A code of `kind` for `user`, handed back as a link delivery would.
+    async fn code_for(&self, user: &str, kind: CodeKind) -> String {
+        self.identity
+            .client()
+            .create_code(&Pool::Members, &CodeRequest::new(user, kind, Delivery::Return))
+            .await
+            .unwrap()
+            .code
+            .unwrap()
+    }
+
+    /// A new person invited to T1 with link token `t`: their user id and invite code.
+    async fn invitee(&self, email: &str, t: &str) -> (String, String) {
+        let id = self.identity.with_invited_user(&Pool::Members, email);
+        self.open_invite_for(&id, t);
+        let code = self.code_for(&id, CodeKind::Invite).await;
+        (id, code)
+    }
+
+    async fn accept(&self, body: Value, ip: &str) -> Answer {
+        self.post("/auth/v1/accept-invite", body, None, ip).await
+    }
+
+    /// Whether `email` signs in to identity with `pw`.
+    async fn signs_in(&self, email: &str, pw: &str) -> bool {
+        self.identity.client().sign_in(&Pool::Members, email, pw).await.is_ok()
+    }
+
+    /// The latest mailed code of `kind` for `user`.
+    fn mailed(&self, user: &str, kind: CodeKind) -> Option<String> {
+        self.identity
+            .codes_sent()
+            .into_iter()
+            .rev()
+            .find(|c| c.user_id == user && c.kind == kind)
+            .map(|c| c.code)
+    }
+
+    /// Waits for a background send (a reset) to land: up to a second.
+    async fn mailed_eventually(&self, user: &str, kind: CodeKind) -> Option<String> {
+        for _ in 0..100 {
+            if let Some(code) = self.mailed(user, kind) {
+                return Some(code);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        None
+    }
+}
+
+fn session_set(a: &Answer) -> bool {
+    a.cookies.iter().any(|c| c.starts_with("chelabase_session=") && !c.contains("Max-Age=0"))
+}
+
+// AC 1: the code sets the first password and verifies the email; the member row is activated
+// by the orchestrator (member tokens make no row), and the answer is a signed-in session.
 #[tokio::test]
-async fn a_zitadel_session_cookie_mints_nothing() {
+async fn accept_invite_signs_in_and_verifies() {
     let h = harness().await;
-    let sealed = auth::cookie::seal_session(
-        &h.cookie_key,
-        &auth::cookie::SessionState::Zitadel {
-            session_id: "1".into(),
-            session_token: "t".into(),
-            exp: auth::cookie::now_secs() + 60,
-        },
+    let t = link_token(1);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    assert!(session_set(&a));
+    let claims = h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await);
+    assert_eq!((claims.sub.as_str(), claims.tid), (id.as_str(), T1));
+    let user = h.identity.user(&Pool::Members, &id).unwrap();
+    assert!(user.verified && user.has_password && !user.banned);
+    assert!(h.signs_in("bob@example.com", NEW_PW).await);
+    assert_eq!(
+        h.internal.bodies("POST /internal/invites/accept"),
+        vec![json!({"org": "o1", "user": id, "token_hash": token_hash_hex(&t), "email": "bob@example.com", "name": ""})]
     );
-    assert_eq!(h.token(&format!("chelabase_session={sealed}")).await.status, StatusCode::UNAUTHORIZED);
+}
+
+// AC 1, failure path: the code is single use, and so is a retry ticket. A step after the code
+// fails hands back a ticket; the ticket finishes once, then never again.
+#[tokio::test]
+async fn accept_invite_ticket_single_use() {
+    let h = harness().await;
+    let t = link_token(2);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    h.identity.fail("POST /internal/v1/pools/members/sessions", 503, "unavailable", 1);
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::SERVICE_UNAVAILABLE, Some("invite_incomplete")), "{}", a.body);
+    assert!(!session_set(&a));
+    let ticket = a.body["error"]["accept_ticket"].as_str().expect("a ticket").to_string();
+    // The code is spent.
+    let again = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.2").await;
+    assert_eq!(again.status, StatusCode::BAD_REQUEST, "{}", again.body);
+    let with_ticket = json!({"user": id, "t": t, "acceptTicket": ticket, "password": NEW_PW});
+    let done = h.accept(with_ticket.clone(), "1.1.1.3").await;
+    assert_eq!((done.status, &done.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", done.body);
+    assert!(session_set(&done));
+    let replay = h.accept(with_ticket, "1.1.1.4").await;
+    assert_eq!((replay.status, replay.body), (StatusCode::BAD_REQUEST, err("invalid_request", messages::BAD_INVITE)));
+}
+
+// A ticket proves the code, not the password: a retry with another password is refused, with
+// no new ticket, and sets nothing.
+#[tokio::test]
+async fn accept_ticket_needs_the_password_the_code_set() {
+    let h = harness().await;
+    let t = link_token(3);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    h.internal.set_accept_refusal(Some((503, "unavailable")));
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    let ticket = a.body["error"]["accept_ticket"].as_str().expect("a ticket").to_string();
+    h.internal.set_accept_refusal(None);
+    let wrong = h.accept(json!({"user": id, "t": t, "acceptTicket": ticket, "password": "Other-pass-34"}), "1.1.1.1").await;
+    assert_eq!((wrong.status, wrong.body.clone()), (StatusCode::BAD_REQUEST, err("invalid_request", messages::BAD_INVITE)));
+    assert!(!session_set(&wrong));
+    assert!(h.signs_in("bob@example.com", NEW_PW).await, "the code's password stands");
+}
+
+// AC 2, adapted: m9's suspend ends sessions and the access check refuses the member; it bans
+// no account. What accept-invite meets instead:
+// - an account banned for any reason but ours (an abuse ban outside Chelabase) is refused
+//   with 403 `member_suspended` before the code is spent, and stays banned;
+// - a member row the orchestrator holds suspended is 403 `member_suspended`, with no session.
+#[tokio::test]
+async fn accept_invite_suspended_403() {
+    let h = harness().await;
+    let t = link_token(4);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    h.identity.client().ban(&Pool::Members, &id, Some("abuse")).await.unwrap();
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::FORBIDDEN, err("member_suspended", messages::MEMBER_SUSPENDED)));
+    assert!(!session_set(&a));
+    let user = h.identity.user(&Pool::Members, &id).unwrap();
+    assert_eq!((user.banned, user.ban_reason.as_deref(), user.has_password), (true, Some("abuse"), false));
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+    // The code wasn't spent.
+    h.identity.client().unban(&Pool::Members, &id).await.unwrap();
+    h.identity.client().verify_code(&Pool::Members, &id, CodeKind::Invite, &code, Some(NEW_PW)).await.expect("the code still works");
+
+    let h = harness().await;
+    let (id, code) = h.invitee("carol@example.com", &t).await;
+    h.internal.set_accept_refusal(Some((403, "member_suspended")));
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::FORBIDDEN, err("member_suspended", messages::MEMBER_SUSPENDED)));
+    assert!(!session_set(&a));
+    assert_eq!(h.sessions(), 0);
+}
+
+// AC 3: a removed member (banned with our reason) with a fresh open invite: the ban is lifted
+// and they are signed in, by a code (no password yet) or by their own credentials (an
+// established account, which got the code-less notice).
+#[tokio::test]
+async fn accept_invite_reopens_removed() {
+    let h = harness().await;
+    let t = link_token(5);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    h.identity.client().ban(&Pool::Members, &id, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    assert!(!h.identity.user(&Pool::Members, &id).unwrap().banned);
+    assert_eq!(h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await).tid, T1);
+
+    let id = h.identity.with_user(&Pool::Members, "ann@example.com", PW);
+    let t = link_token(6);
+    h.open_invite_for(&id, &t);
+    h.identity.client().ban(&Pool::Members, &id, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    let a = h.accept(accept_notice(&t, "Ann@Example.com", PW), "1.1.1.2").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    assert!(!h.identity.user(&Pool::Members, &id).unwrap().banned);
+    assert!(h.signs_in("ann@example.com", PW).await, "their own password");
+}
+
+// Our ban is lifted only with an open invite that matches the link: a removed member's old
+// link, or a wrong token, leaves them banned, and a wrong password on the notice path lifts
+// nothing either. A banned account answers each of these as a wrong password, as sign-in does,
+// so the notice path tells nobody a banned account's password is right; a foreign ban too.
+#[tokio::test]
+async fn our_ban_stays_without_a_matching_open_invite() {
+    let h = harness().await;
+    let id = h.identity.with_user(&Pool::Members, "ann@example.com", PW);
+    h.identity.client().ban(&Pool::Members, &id, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    let wrong = (StatusCode::UNAUTHORIZED, err("invalid_credentials", messages::BAD_CREDENTIALS));
+    let t = link_token(7);
+    let a = h.accept(accept_notice(&t, "ann@example.com", PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body), wrong.clone(), "no open invite");
+    h.open_invite_for(&id, &t);
+    let a = h.accept(accept_notice(&link_token(8), "ann@example.com", PW), "1.1.1.2").await;
+    assert_eq!((a.status, a.body), wrong.clone(), "another link's token");
+    let a = h.accept(accept_notice(&t, "ann@example.com", "Wrong-pass-1"), "1.1.1.3").await;
+    assert_eq!((a.status, a.body), wrong.clone(), "a wrong password");
+    let user = h.identity.user(&Pool::Members, &id).unwrap();
+    assert_eq!((user.banned, user.ban_reason.as_deref()), (true, Some(MEMBER_REMOVED_BAN_REASON)));
+    h.identity.client().ban(&Pool::Members, &id, Some("abuse")).await.unwrap();
+    let a = h.accept(accept_notice(&t, "ann@example.com", PW), "1.1.1.4").await;
+    assert_eq!((a.status, a.body), wrong, "a foreign ban");
+    assert_eq!(h.identity.user(&Pool::Members, &id).unwrap().ban_reason.as_deref(), Some("abuse"));
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+}
+
+// AC 8: an established account accepts by signing in as themselves; no password is set and no
+// code is used. A wrong password joins nothing.
+#[tokio::test]
+async fn accept_existing_account_sets_no_password() {
+    let h = harness().await;
+    let id = h.identity.with_user(&Pool::Members, "ann@example.com", PW);
+    let t = link_token(9);
+    h.open_invite_for(&id, &t);
+    let wrong = h.accept(accept_notice(&t, "ann@example.com", NEW_PW), "1.1.1.1").await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+    let a = h.accept(accept_notice(&t, "ann@example.com", PW), "1.1.1.2").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    assert_eq!(h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await).sub, id);
+    assert!(h.signs_in("ann@example.com", PW).await && !h.signs_in("ann@example.com", NEW_PW).await);
+    assert!(h.identity.calls().iter().all(|c| !c.contains("/codes") && !c.ends_with("/password")), "{:?}", h.identity.calls());
+}
+
+// AC 9: an account someone else pre-registered (a password, an unverified email) gets an
+// invite code; accepting replaces the old password and ends every session of it.
+#[tokio::test]
+async fn accept_preregistered_account_drops_old_password() {
+    let h = harness().await;
+    let id = h.identity.with_unverified_user(&Pool::Members, "bob@example.com", "Squatter-pw1");
+    let (squatter, _) = h.identity.with_session(&Pool::Members, &id);
+    let t = link_token(10);
+    h.open_invite_for(&id, &t);
+    let code = h.code_for(&id, CodeKind::Invite).await;
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    assert!(!h.signs_in("bob@example.com", "Squatter-pw1").await);
+    assert!(h.identity.client().session_by_id(&Pool::Members, &squatter).await.is_err(), "the squatter's session is gone");
+    assert!(h.identity.user(&Pool::Members, &id).unwrap().verified);
+}
+
+// Live gate (ported): an invitee whose identity user is gone gets 410 `invite_revoked`.
+#[tokio::test]
+async fn accept_invite_for_a_deleted_user_is_revoked() {
+    let h = harness().await;
+    let t = link_token(11);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    h.identity.client().delete_user(&Pool::Members, &id).await.unwrap();
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::GONE, err("invite_revoked", messages::INVITE_REVOKED)));
+}
+
+// Live gate (ported): a link whose stored invite expired is 410 `invite_expired`; with the
+// invite open, a wrong code is 400 and the right one still works.
+#[tokio::test]
+async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
+    let h = harness().await;
+    let t = link_token(12);
+    let id = h.identity.with_invited_user(&Pool::Members, "bob@example.com");
+    let code = h.code_for(&id, CodeKind::Invite).await;
+    h.internal.set_open_invite(&id, false);
+    let a = h.accept(accept_code(&id, &t, "000000", NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::GONE, err("invite_expired", messages::INVITE_EXPIRED)));
+    h.open_invite_for(&id, &t);
+    let a = h.accept(accept_code(&id, &t, "000000", NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("invalid_request", messages::BAD_INVITE)));
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+}
+
+// AC 6: a weak password is refused before the code is used, on accept and on confirm, by
+// auth's own rule or by identity's: the code still works afterwards.
+#[tokio::test]
+async fn weak_password_keeps_code() {
+    let h = harness().await;
+    let t = link_token(13);
+    let (id, code) = h.invitee("bob@example.com", &t).await;
+    let a = h.accept(accept_code(&id, &t, &code, "short"), "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    h.identity.fail("POST /internal/v1/pools/members/codes/verify", 400, "weak_password", 1);
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    assert!(a.body["error"].get("accept_ticket").is_none(), "nothing was spent");
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+
+    let id = h.member("ann@example.com", &[T1]);
+    let code = h.code_for(&id, CodeKind::Reset).await;
+    let confirm = |pw: &str| json!({"email": "ann@example.com", "code": code, "password": pw});
+    let a = h.post("/auth/v1/password-reset/confirm", confirm("alllowercase1!"), None, "2.2.2.2").await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    h.identity.fail("POST /internal/v1/pools/members/codes/verify", 400, "weak_password", 1);
+    let a = h.post("/auth/v1/password-reset/confirm", confirm(NEW_PW), None, "2.2.2.2").await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
+    let a = h.post("/auth/v1/password-reset/confirm", confirm(NEW_PW), None, "2.2.2.2").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({})));
+    assert!(h.signs_in("ann@example.com", NEW_PW).await);
+}
+
+// AC 4: a confirmed reset ends every session of the user: an earlier session's `/token` is 401.
+#[tokio::test]
+async fn reset_confirm_revokes_sessions() {
+    let h = harness().await;
+    let id = h.member("ann@example.com", &[T1]);
+    let cookie = h.session("", "ann@example.com", "1.1.1.1").await;
+    assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    let a = h.post("/auth/v1/password-reset", json!({"email": "ANN@example.com"}), None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({})));
+    let code = h.mailed_eventually(&id, CodeKind::Reset).await.expect("a reset code is mailed");
+    let link = h.identity.codes_sent().last().unwrap().link.clone().unwrap();
+    assert_eq!(link, "http://studio.chelabase.localhost:8000/password-reset", "no id or code in the link");
+    let bad = h.post("/auth/v1/password-reset/confirm", json!({"email": "ann@example.com", "code": "000000", "password": NEW_PW}), None, "1.1.1.1").await;
+    assert_eq!((bad.status, bad.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
+    let ok = h.post("/auth/v1/password-reset/confirm", json!({"email": "ann@example.com", "code": code, "password": NEW_PW}), None, "1.1.1.1").await;
+    assert_eq!((ok.status, ok.body), (StatusCode::OK, json!({})));
+    assert_eq!(h.token(&cookie).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.sessions(), 0);
+    assert!(h.signs_in("ann@example.com", NEW_PW).await && !h.signs_in("ann@example.com", PW).await);
+}
+
+// AC 5: a reset for an unknown email is answered like a known one: status, body and the padded
+// time; only the known one gets a code. A confirm for an unknown email is a bad code.
+#[tokio::test]
+async fn reset_unknown_email_indistinguishable() {
+    const PAD_MS: u64 = 300;
+    let h = harness_with(false, PAD_MS).await;
+    let id = h.member("ann@example.com", &[T1]);
+    let mut answers = Vec::new();
+    for email in ["ann@example.com", "nobody@example.com"] {
+        let start = Instant::now();
+        let a = h.post("/auth/v1/password-reset", json!({"email": email}), None, "1.1.1.1").await;
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(PAD_MS) && took < Duration::from_millis(PAD_MS + 250), "{email}: {took:?}");
+        answers.push((a.status, a.body, a.cookies));
+    }
+    assert_eq!(answers[0], answers[1]);
+    assert!(h.mailed_eventually(&id, CodeKind::Reset).await.is_some());
+    assert_eq!(h.identity.codes_sent().len(), 1);
+    let a = h.post("/auth/v1/password-reset/confirm", json!({"email": "nobody@example.com", "code": "123456", "password": NEW_PW}), None, "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
+}
+
+// A removed member (banned with our reason) can reset their password, which anyone can, but
+// that lifts nothing: no session, the ban stays, and a reset code never accepts an invite.
+#[tokio::test]
+async fn a_removed_members_own_reset_code_never_reactivates() {
+    let h = harness().await;
+    let id = h.member("ann@example.com", &[]);
+    h.identity.client().ban(&Pool::Members, &id, Some(MEMBER_REMOVED_BAN_REASON)).await.unwrap();
+    let t = link_token(14);
+    h.open_invite_for(&id, &t);
+    let code = h.code_for(&id, CodeKind::Reset).await;
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "a reset code is no invite code: {}", a.body);
+    assert!(h.identity.user(&Pool::Members, &id).unwrap().banned);
+    let a = h.post("/auth/v1/password-reset/confirm", json!({"email": "ann@example.com", "code": code, "password": NEW_PW}), None, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    let s = h.sign_in("", "ann@example.com", NEW_PW, "1.1.1.1").await;
+    assert_eq!(s.status, StatusCode::UNAUTHORIZED);
+    assert!(!session_set(&s));
+    let user = h.identity.user(&Pool::Members, &id).unwrap();
+    assert_eq!((user.banned, user.ban_reason.as_deref()), (true, Some(MEMBER_REMOVED_BAN_REASON)));
+}
+
+// AC 7: the limits stay: accept-invite (20 failures an hour per address), verify (10 a
+// minute), resend (20 an hour per address), reset (5 an hour per email), confirm (10 an hour
+// per email across addresses); and codes go out at most 5 an hour per user and kind, however
+// many addresses or flows ask (resend, reset, the decoy's reset).
+#[tokio::test]
+async fn member_code_limits_kept() {
+    let h = harness().await;
+    // Failures for 20 different invitees spend the address's budget; one invitee alone is
+    // stopped at 5.
+    let (id, _) = h.invitee("bob@example.com", &link_token(15)).await;
+    for i in 0..5 {
+        let a = h.accept(accept_code(&id, &link_token(15), "000000", NEW_PW), &format!("1.1.2.{i}")).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{i}");
+    }
+    assert_eq!(h.accept(accept_code(&id, &link_token(15), "000000", NEW_PW), "1.1.2.9").await.status, StatusCode::TOO_MANY_REQUESTS);
+    for i in 0..20 {
+        let a = h.accept(accept_code(&Uuid::new_v4().to_string(), &link_token(15), "000000", NEW_PW), "1.1.1.1").await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{i}");
+    }
+    let a = h.accept(accept_code(&Uuid::new_v4().to_string(), &link_token(15), "000000", NEW_PW), "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
+
+    for i in 0..10 {
+        assert_eq!(h.post("/auth/v1/verify-email", json!({"code": "000000"}), None, "2.2.2.2").await.status, StatusCode::GONE, "{i}");
+    }
+    assert_eq!(h.post("/auth/v1/verify-email", json!({"code": "000000"}), None, "2.2.2.2").await.status, StatusCode::TOO_MANY_REQUESTS);
+    for i in 0..20 {
+        assert_eq!(h.post("/auth/v1/resend-code", json!({}), None, "3.3.3.3").await.status, StatusCode::OK, "{i}");
+    }
+    assert_eq!(h.post("/auth/v1/resend-code", json!({}), None, "3.3.3.3").await.status, StatusCode::TOO_MANY_REQUESTS);
+
+    let ann = h.member("ann@example.com", &[T1]);
+    for i in 0..5 {
+        let a = h.post("/auth/v1/password-reset", json!({"email": "ann@example.com"}), None, &format!("4.4.4.{i}")).await;
+        assert_eq!(a.status, StatusCode::OK, "{i}");
+    }
+    let a = h.post("/auth/v1/password-reset", json!({"email": "ann@example.com"}), None, "4.4.5.5").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
+    // The decoy's reset (a sign-up for her email) shares her per-user code budget.
+    h.post("/auth/v1/sign-up", signup("ann@example.com", PW), None, "4.4.6.6").await;
+    for _ in 0..50 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let resets = h.identity.codes_sent().into_iter().filter(|c| c.user_id == ann && c.kind == CodeKind::Reset).count();
+    assert_eq!(resets, 5, "capped per user and kind");
+
+    for i in 0..10 {
+        let a = h.post("/auth/v1/password-reset/confirm", json!({"email": "ann@example.com", "code": "000000", "password": NEW_PW}), None, &format!("5.5.5.{i}")).await;
+        assert_eq!(a.status, StatusCode::BAD_REQUEST, "{i}");
+    }
+    let a = h.post("/auth/v1/password-reset/confirm", json!({"email": "ann@example.com", "code": "000000", "password": NEW_PW}), None, "5.5.6.6").await;
+    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+// Resend issues within the per-user code budget too: a sign-up's code plus 6 resends from
+// fresh addresses is 5 codes.
+#[tokio::test]
+async fn resend_codes_are_limited_per_user() {
+    let h = harness().await;
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", PW), None, "1.1.1.1").await;
+    let login = a.cookie("chelabase_login").unwrap();
+    for i in 0..6 {
+        h.post("/auth/v1/resend-code", json!({}), Some(&login), &format!("6.6.6.{i}")).await;
+    }
+    let sent = h.identity.codes_sent();
+    assert_eq!(sent.len(), 5, "{sent:?}");
+    assert!(sent.iter().all(|c| c.kind == CodeKind::Verify && c.link.as_deref() == Some("http://studio.chelabase.localhost:8000/verify")));
+}
+
+// #121 TODO: with verification on, an open sign-up joins once its email is verified, as a
+// pending member; the answer is `pending`.
+#[tokio::test]
+async fn verify_email_joins_an_open_sign_up() {
+    let h = harness().await;
+    h.internal.set_signup_tenant(T1);
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", PW), None, "1.1.1.1").await;
+    let login = a.cookie("chelabase_login").unwrap();
+    let id = h.identity.user_by_email(&Pool::Members, "new@example.com").unwrap();
+    let code = h.mailed(&id, CodeKind::Verify).unwrap();
+    let done = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&login), "1.1.1.1").await;
+    assert_eq!((done.status, &done.body), (StatusCode::OK, &json!({"next": "pending"})), "{}", done.body);
+    assert!(h.identity.user(&Pool::Members, &id).unwrap().verified);
+    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"org": "o1", "user_id": id})]);
+    assert!(done.cookies.iter().any(|c| c.starts_with("chelabase_login=;")));
+    assert!(!session_set(&done));
+}
+
+// A member who already has a row (the fresh-install admin, an approved member) verifies and
+// lands in Studio: no join is asked, whatever sign-up's state.
+#[tokio::test]
+async fn verify_email_of_a_member_signs_in() {
+    let h = harness().await;
+    let id = h.identity.with_unverified_user(&Pool::Members, "ann@example.com", PW);
+    h.internal.set_memberships(&id, &[T1], &[]);
+    h.internal.set_joined_closed();
+    let a = h.sign_in("", "ann@example.com", PW, "1.1.1.1").await;
+    assert_eq!(a.body, json!({"next": "verify"}));
+    let code = h.mailed(&id, CodeKind::Verify).unwrap();
+    let done = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&a.cookie("chelabase_login").unwrap()), "1.1.1.1").await;
+    assert_eq!((done.status, &done.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", done.body);
+    assert_eq!(h.claims(&h.token(&done.cookie("chelabase_session").unwrap()).await).tid, T1);
+    assert!(h.internal.bodies("POST /internal/signup/joined").is_empty());
+}
+
+// Sign-up closed between the sign-up and its code: the visitor is told sign-up is closed
+// (403 `sign_up_closed`), the session and the step end, and the account is deleted, so a
+// sign-up once it reopens starts afresh.
+#[tokio::test]
+async fn verify_email_after_sign_up_closed() {
+    let h = harness().await;
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", PW), None, "1.1.1.1").await;
+    let login = a.cookie("chelabase_login").unwrap();
+    let id = h.identity.user_by_email(&Pool::Members, "new@example.com").unwrap();
+    let code = h.mailed(&id, CodeKind::Verify).unwrap();
+    h.internal.set_joined_closed();
+    let done = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&login), "1.1.1.1").await;
+    assert_eq!((done.status, done.body.clone()), (StatusCode::FORBIDDEN, err("sign_up_closed", messages::SIGN_UP_CLOSED)));
+    assert!(!session_set(&done));
+    assert!(done.cookies.iter().any(|c| c.starts_with("chelabase_login=;")), "the step ends");
+    assert_eq!(h.users_with("new@example.com").await, 0);
+    assert_eq!(h.sessions(), 0);
+}
+
+// The join fails after the code is used: the step stays, and a retry with the same (spent)
+// code finishes, because the email is verified already.
+#[tokio::test]
+async fn verify_email_retry_after_a_failed_join_finishes() {
+    let h = harness().await;
+    h.internal.set_signup_tenant(T1);
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", PW), None, "1.1.1.1").await;
+    let login = a.cookie("chelabase_login").unwrap();
+    let id = h.identity.user_by_email(&Pool::Members, "new@example.com").unwrap();
+    let code = h.mailed(&id, CodeKind::Verify).unwrap();
+    h.internal.set_joined_status(Some(500));
+    let failed = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&login), "1.1.1.1").await;
+    assert_eq!((failed.status, failed.body.clone()), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)));
+    assert!(failed.cookies.is_empty(), "the step stays");
+    assert_eq!(h.users_with("new@example.com").await, 1, "the account stays");
+    h.internal.set_joined_status(None);
+    let done = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&login), "1.1.1.1").await;
+    assert_eq!((done.status, &done.body), (StatusCode::OK, &json!({"next": "pending"})), "{}", done.body);
+    // An unverified user's wrong code is still refused.
+    let b = h.post("/auth/v1/sign-up", signup("other@example.com", PW), None, "1.1.1.2").await;
+    let wrong = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&b.cookie("chelabase_login").unwrap()), "1.1.1.2").await;
+    assert_eq!((wrong.status, wrong.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
+}
+
+// m12: the sign-in page hides "Create account" unless sign-up is open (or the instance waits
+// for its first account).
+#[tokio::test]
+async fn instance_says_whether_sign_up_is_allowed() {
+    let h = harness().await;
+    for (allowed, reason, want) in [(true, "open", true), (false, "closed", false)] {
+        h.internal.set_signup(allowed, reason);
+        let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+        assert_eq!((a.status, a.body["signUpAllowed"].clone()), (StatusCode::OK, json!(want)), "{reason}");
+    }
+    h.internal.set_setup_code(SETUP_CODE);
+    let a = h.get("/auth/v1/instance", "1.1.1.1").await;
+    assert_eq!(a.body, json!({"setupRequired": true, "signUpAllowed": true}));
+    let p = harness_mode(false, 1, auth::config::Mode::Platform).await;
+    assert_eq!(p.get("/auth/v1/instance", "1.1.1.1").await.body, json!({"setupRequired": false, "signUpAllowed": false}));
+}
+
+// The emailed invite link carries no code, so the page sends the code typed from the mail;
+// malformed input is refused before any call, and the answer is never cached.
+#[tokio::test]
+async fn accept_invite_rejects_malformed_input() {
+    let h = harness().await;
+    let t = link_token(16);
+    for body in [
+        json!({"user": "123", "t": t, "code": "123456", "password": NEW_PW}),
+        json!({"user": U1, "t": "short", "code": "123456", "password": NEW_PW}),
+        json!({"user": U1, "t": t, "code": "12345x", "password": NEW_PW}),
+        json!({"user": U1, "t": t, "password": NEW_PW}),
+        json!({"user": U1, "t": t, "code": "123456", "acceptTicket": "x", "password": NEW_PW}),
+        json!({"t": t, "password": NEW_PW}),
+        json!({"t": t, "email": "a@example.com", "code": "123456", "password": NEW_PW}),
+    ] {
+        let a = h.accept(body.clone(), "1.1.1.1").await;
+        assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("invalid_request", messages::BAD_INVITE)), "{body}");
+    }
+    assert!(h.identity.calls().is_empty(), "{:?}", h.identity.calls());
+    assert!(h.internal.bodies("POST /internal/invites/describe").is_empty());
+    let resp = h.http.post(format!("{}/auth/v1/accept-invite", h.base)).json(&json!({"t": t, "password": "x"})).send().await.unwrap();
+    assert_eq!(resp.headers()["cache-control"], "no-store");
 }

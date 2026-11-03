@@ -131,6 +131,9 @@ struct FakeSetup {
     tenants_of: HashMap<String, Vec<(TenantId, chelabase_metadata::members::MemberStatus)>>,
     /// `admit_sign_up` fails with a database error.
     admit_fails: bool,
+    /// identity user -> what `admit_sign_up` with `Closed` makes of their existing row (an
+    /// invited row with an open invite is activated; a suspended one stays).
+    rows: HashMap<String, chelabase_metadata::members::MemberStatus>,
 }
 
 impl FakeNeon {
@@ -758,7 +761,7 @@ impl NeonMetadataPort for FakeNeon {
         Ok(match admission {
             Admission::Active => Some(MemberStatus::Active),
             Admission::Pending => Some(MemberStatus::Pending),
-            Admission::Closed => None,
+            Admission::Closed => st.rows.get(identity_user_id).copied(),
         })
     }
 
@@ -7139,4 +7142,89 @@ async fn signup_unreadable_identity_answer_keeps_the_claim() {
     assert_eq!((status, error_code(&body)), (503, "unavailable"), "{body}");
     assert_eq!(neon.setup_claim_of(SETUP_ORG).as_deref(), Some(first.as_str()));
     assert!(neon.live_nonces(SETUP_ORG).contains(&nonce_sha(&n)));
+}
+
+const ACCEPT: &str = "/internal/invites/accept";
+
+/// #124: accept-invite writes the member row itself (a member token makes none). Only the open
+/// invite whose stored hash the link's token matches activates it; a retry once it is active is
+/// answered the same; every success clears the offboarded mark.
+#[tokio::test]
+async fn accept_invite_activates_the_row_for_the_link_token_only() {
+    use chelabase_metadata::members::{Admission, MemberStatus};
+    let t1 = TenantId(Uuid::from_u128(1));
+    let neon = FakeNeon::default();
+    neon.tenants.lock().unwrap().insert("o1".into(), t1);
+    invite_fixture(&neon, Some(token_hash("right")));
+    neon.setup.lock().unwrap().rows.insert("u1".into(), MemberStatus::Active);
+    let app = describe_app(neon.clone()).await;
+    let ask = |org: &str, user: &str, hash: String| {
+        let body = json!({"org": org, "user": user, "token_hash": hash, "email": "u1@x.com", "name": "U One"});
+        let app = &app;
+        async move { app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), body).await }
+    };
+    // Wrong token, wrong user, unknown org, malformed: the same 404, nothing written.
+    let wrong = ask("o1", "u1", token_hash_hex("wrong")).await;
+    assert_eq!((wrong.0, error_code(&wrong.1)), (404, "not_found"));
+    assert_eq!(ask("o1", "u2", token_hash_hex("right")).await, wrong);
+    assert_eq!(ask("o9", "u1", token_hash_hex("right")).await, wrong);
+    assert_eq!(ask("o1", "u1", "zz".into()).await, wrong);
+    assert_eq!(app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), json!({"user": 1})).await, wrong);
+    assert!(neon.setup.lock().unwrap().admitted.is_empty());
+    assert!(neon.clears.lock().unwrap().is_empty());
+    // The right token activates the row (`Closed`: nobody new is admitted) and clears the mark.
+    let ok = ask("o1", "u1", token_hash_hex("right")).await;
+    assert_eq!(ok, (200, json!({"tenant_id": t1.as_uuid()})));
+    assert_eq!(
+        neon.setup.lock().unwrap().admitted,
+        vec![("o1".into(), "u1".into(), "u1@x.com".into(), "U One".into(), Admission::Closed)]
+    );
+    assert_eq!(*neon.clears.lock().unwrap(), vec![(t1, "u1".to_string())]);
+    // A retry once the invite is closed and the row active: the same answer, no new admit.
+    neon.invites.lock().unwrap().remove("u1");
+    neon.setup.lock().unwrap().tenants_of.insert("u1".into(), vec![(t1, MemberStatus::Active)]);
+    assert_eq!(ask("o1", "u1", token_hash_hex("right")).await, ok);
+    assert_eq!(neon.setup.lock().unwrap().admitted.len(), 1);
+    // The bearer is the app-auth one.
+    let body = json!({"org": "o1", "user": "u1", "token_hash": token_hash_hex("right")});
+    assert_eq!(app.post_json(ACCEPT, Some("wrong"), body.clone()).await.0, 401);
+    assert_eq!(app.post_json(ACCEPT, Some(REALTIME_TOKEN), body.clone()).await.0, 401);
+    assert_eq!(app.post_json(ACCEPT, None, body).await.0, 401);
+}
+
+/// What the row is after the write decides the answer: suspended is 403 `member_suspended`, still
+/// invited (the invite expired before the write) 410 `invite_expired`; neither clears the mark.
+/// A failing write or clear is a 500, which auth answers with a retry ticket.
+#[tokio::test]
+async fn accept_invite_answers_the_rows_state() {
+    use chelabase_metadata::members::MemberStatus;
+    let t1 = TenantId(Uuid::from_u128(1));
+    let neon = FakeNeon::default();
+    neon.tenants.lock().unwrap().insert("o1".into(), t1);
+    invite_fixture(&neon, Some(token_hash("right")));
+    let app = describe_app(neon.clone()).await;
+    let ask = || {
+        let body = json!({"org": "o1", "user": "u1", "token_hash": token_hash_hex("right"), "email": "", "name": ""});
+        let app = &app;
+        async move { app.post_json(ACCEPT, Some(APP_AUTH_TOKEN), body).await }
+    };
+    for (row, status, code) in [
+        (Some(MemberStatus::Suspended), 403, "member_suspended"),
+        (Some(MemberStatus::Invited), 410, "invite_expired"),
+        (None, 404, "not_found"),
+    ] {
+        match row {
+            Some(r) => neon.setup.lock().unwrap().rows.insert("u1".into(), r),
+            None => neon.setup.lock().unwrap().rows.remove("u1"),
+        };
+        let a = ask().await;
+        assert_eq!((a.0, error_code(&a.1)), (status, code), "{row:?}");
+    }
+    assert!(neon.clears.lock().unwrap().is_empty());
+    neon.setup.lock().unwrap().rows.insert("u1".into(), MemberStatus::Active);
+    *neon.fail_clear.lock().unwrap() = true;
+    assert_eq!(ask().await.0, 500);
+    *neon.fail_clear.lock().unwrap() = false;
+    neon.setup.lock().unwrap().admit_fails = true;
+    assert_eq!(ask().await.0, 500);
 }

@@ -6,7 +6,8 @@
  */
 
 export interface ConfirmBody {
+  /** The six-digit code from the reset email. */
   code: string;
+  email: string;
   password: string;
-  userId: string;
 }

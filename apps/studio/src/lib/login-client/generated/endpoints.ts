@@ -52,7 +52,6 @@ import type {
   SignInBody,
   SignInParams,
   SignUpBody,
-  SignedInRedirect,
   StudioConfig
 } from './model';
 
@@ -88,9 +87,9 @@ export const getAcceptInviteUrl = () => {
 }
 
 /**
- * Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.
+ * Accepts a member invite and signs in (the HttpOnly session cookie). With `user` and `code` (the code from the invite email), the code sets the first password and verifies the email; an account someone else registered without proving the email has its old password replaced and every session ended. With `email` (an existing account, from the invite notice), the account's own password signs in and no password is set. The link's token `t` must match an open invite. A removed member's ban is lifted only then; any other ban is `member_suspended`. If a step after the code fails, the error is `invite_incomplete` with `error.accept_ticket`: send it back in place of `code`, with the same password, to finish. A weak password is refused before the code is used.
  */
-export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<SignedInRedirect> => {
+export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -106,7 +105,7 @@ export const acceptInvite = async (acceptInviteBody: AcceptInviteBody, options?:
     }
     return headers;
   };
-return customFetch<SignedInRedirect>(getAcceptInviteUrl(),
+return customFetch<SignInAnswer>(getAcceptInviteUrl(),
   {
     ...options,
     method: 'POST',
@@ -1219,7 +1218,7 @@ export const getGetInstanceUrl = () => {
 }
 
 /**
- * Whether this instance is unclaimed, so the sign-up page asks for the setup code. Sets no cookie.
+ * Whether this instance is unclaimed, so the sign-up page asks for the setup code, and whether it takes sign-ups, so the sign-in page offers one. Sets no cookie.
  */
 export const getInstance = async ( options?: Parameters<typeof customFetch>[1]): Promise<InstanceInfo> => {
 
@@ -1317,7 +1316,7 @@ export const getDescribeInviteUrl = () => {
 }
 
 /**
- * Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no Zitadel code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.
+ * Describes an open invite for the accept page: who invited the visitor, and to which workspace. The invite link's own token (`t`) is the credential, so this spends no code. It is a POST so that the user id and the token are never in a URL. A closed (accepted, revoked or expired) invite, a wrong or missing user or token, and a malformed value all answer the same `not_found`.
  */
 export const describeInvite = async (describeInviteBody: DescribeInviteBody, options?: Parameters<typeof customFetch>[1]): Promise<InviteDescription> => {
 
@@ -1487,7 +1486,7 @@ export const getRequestPasswordResetUrl = () => {
 }
 
 /**
- * Emails a password-reset link if the account exists. Always answers the same, whether or not it does.
+ * Emails a password-reset code if the account exists, in the background. Always answers the same, in the same padded time, whether or not it does. At most 5 codes go out per person an hour.
  */
 export const requestPasswordReset = async (emailBody: EmailBody, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1572,7 +1571,7 @@ export const getConfirmPasswordResetUrl = () => {
 }
 
 /**
- * Sets a new password with the code from the reset email.
+ * Sets a new password with the code from the reset email, verifies the email and ends every session of the account. A wrong code and an unknown email answer alike. Sets no cookie: sign in with the new password.
  */
 export const confirmPasswordReset = async (confirmBody: ConfirmBody, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -1657,7 +1656,7 @@ export const getResendCodeUrl = () => {
 }
 
 /**
- * Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent.
+ * Sends the verification code again. Reads the HttpOnly step cookie. Always answers the same, whether or not a code was sent; at most 5 codes go out per person an hour.
  */
 export const resendCode = async (emptyRequest: EmptyRequest, options?: Parameters<typeof customFetch>[1]): Promise<EmptyResponse> => {
 
@@ -2096,9 +2095,9 @@ export const getVerifyEmailUrl = () => {
 }
 
 /**
- * Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.
+ * Checks the emailed code. Reads the HttpOnly step cookie and clears it once the email is verified. An open sign-up joins its tenant now, as a person waiting for approval. The answer is a sign-in's: `studio` sets the HttpOnly session cookie, `pending` sets none. If sign-up closed since the account was made, the answer is `sign_up_closed` and the account is deleted. A retry after a failure past the code finishes with the same code.
  */
-export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeof customFetch>[1]): Promise<SignedInRedirect> => {
+export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeof customFetch>[1]): Promise<SignInAnswer> => {
 
     const getHeaders = (h?: NonNullable<RequestInit['headers']>): Record<string, string | readonly string[]> => {
     if (!h) return {};
@@ -2114,7 +2113,7 @@ export const verifyEmail = async (codeBody: CodeBody, options?: Parameters<typeo
     }
     return headers;
   };
-return customFetch<SignedInRedirect>(getVerifyEmailUrl(),
+return customFetch<SignInAnswer>(getVerifyEmailUrl(),
   {
     ...options,
     method: 'POST',

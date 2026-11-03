@@ -647,6 +647,7 @@ where
         .route("/internal/members/active", post(signup::active::<M, L>))
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
         .route("/internal/invites/open", post(invite::open::<M, L>))
+        .route("/internal/invites/accept", post(invite::accept::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));
     let rest_tokens: Arc<[Arc<str>]> =
         Arc::new([state.rest_token.as_str().into(), realtime_token]);

@@ -325,6 +325,40 @@ impl InternalClient {
         }
     }
 
+    /// Accepts the open member invite of `user` (an identity user id) whose link token hashes to
+    /// `token_hash` (hex SHA-256), in the tenant of `org`: the orchestrator activates the invited
+    /// row, closes the invite and clears the offboarded mark. A row already active there is
+    /// answered the same, so a retry finishes. The tenant's id. `Refused` 404 when no open
+    /// invite matches and the person isn't a member, 403 `member_suspended`, 410 when the invite
+    /// expired meanwhile.
+    pub async fn accept_invite(
+        &self,
+        org_id: &str,
+        user: &str,
+        token_hash: &str,
+        email: &str,
+        name: &str,
+    ) -> Result<Uuid, InternalError> {
+        #[derive(Deserialize)]
+        struct Accepted {
+            tenant_id: Uuid,
+        }
+        let answer: Accepted = self
+            .json(
+                Method::POST,
+                "/internal/invites/accept",
+                Some(serde_json::json!({
+                    "org": org_id,
+                    "user": user,
+                    "token_hash": token_hash,
+                    "email": email,
+                    "name": name,
+                })),
+            )
+            .await?;
+        Ok(answer.tenant_id)
+    }
+
     /// Whether this Zitadel user has an open member invite, and its stored expiry. Any refusal
     /// (a wrong token, a 404) is an error, never "no invite".
     pub async fn open_invite(&self, user: &str) -> Result<OpenInvite, InternalError> {

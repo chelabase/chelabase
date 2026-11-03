@@ -9,7 +9,7 @@ import { SignInForm } from "./sign-in-form";
 import { SignUpForm } from "./sign-up-form";
 import { VerifyEmailForm } from "./verify-email-form";
 
-const DONE = { next: "done", redirect: "http://studio.chelabase.localhost:8000/" };
+const STUDIO = { next: "studio" };
 const EXPIRED_BODY = { error: { code: "sign_in_expired", message: "This sign-in has expired, start again" } };
 
 /** Renders a login form against fake auth routes, with the login client pointed at them. */
@@ -77,7 +77,7 @@ describe("SignInForm", () => {
     expect(answers.map((r) => new URL(r.url).searchParams.get("tenant"))).toEqual([null, "t-beta"]);
     // The retry carries the same credentials; the chooser did not ask for them again.
     expect(await answers[1]!.clone().json()).toEqual({ email: "a@b.c", password: "Secret-pass1" });
-    expect(f.calls).toHaveLength(2);
+    expect(f.calls.filter((r) => new URL(r.url).pathname === "/auth/v1/sign-in")).toHaveLength(2);
   });
 
   it("a_failed_retry_after_choosing_shows_the_error_and_the_chooser_stays", async () => {
@@ -149,12 +149,27 @@ describe("SignInForm", () => {
     expect(alert).toHaveTextContent("Too many attempts, wait a minute");
   });
 
-  it("offers account creation and the invite line", async () => {
+  it("offers account creation and the invite line while sign-up is open", async () => {
     const n = nav();
-    renderLogin(<SignInForm {...n} />);
+    renderLogin(<SignInForm {...n} />, {
+      "GET /auth/v1/instance": () => jsonResponse({ setupRequired: false, signUpAllowed: true }),
+    });
     await userEvent.click(await screen.findByRole("button", { name: "Create account" }));
     expect(n.toRegister).toHaveBeenCalledTimes(1);
     expect(screen.getByText(/ask your admin for an invite/i)).toBeInTheDocument();
+  });
+
+  it("hides account creation when sign-up is closed, or unknown", async () => {
+    for (const instance of [
+      () => jsonResponse({ setupRequired: false, signUpAllowed: false }),
+      () => jsonResponse({ error: { code: "unavailable", message: "down" } }, 503),
+    ]) {
+      const r = renderLogin(<SignInForm {...nav()} />, { "GET /auth/v1/instance": instance });
+      await waitFor(() => expect(r.f.calls.some((c) => new URL(c.url).pathname === "/auth/v1/instance")).toBe(true));
+      expect(await screen.findByText("No account? Ask your admin for an invite.")).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Create account" })).toBeNull();
+      r.unmount();
+    }
   });
 
   it("shows_the_notice", () => {
@@ -242,12 +257,31 @@ describe("VerifyEmailForm", () => {
   it("prefills the code from the email link, verifies and opens the app", async () => {
     const toApp = vi.fn();
     const { f } = renderLogin(<VerifyEmailForm initialCode="123456" toApp={toApp} toVerify={vi.fn()} toPending={vi.fn()} />, {
-      "POST /auth/v1/verify-email": () => jsonResponse(DONE),
+      "POST /auth/v1/verify-email": () => jsonResponse(STUDIO),
     });
     expect(screen.getByLabelText("Code")).toHaveValue("123456");
     await userEvent.click(screen.getByRole("button", { name: "Verify" }));
     await waitFor(() => expect(toApp).toHaveBeenCalled());
     expect(await call(f, "/auth/v1/verify-email")!.clone().json()).toEqual({ code: "123456" });
+  });
+
+  it("a sign-up that waits for an admin goes to the waiting screen", async () => {
+    const toPending = vi.fn();
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={toPending} />, {
+      "POST /auth/v1/verify-email": () => jsonResponse({ next: "pending" }),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Verify" }));
+    await waitFor(() => expect(toPending).toHaveBeenCalled());
+  });
+
+  it("says sign-up closed meanwhile, with no restart link", async () => {
+    renderLogin(<VerifyEmailForm initialCode="123456" toApp={vi.fn()} toVerify={vi.fn()} toPending={vi.fn()} />, {
+      "POST /auth/v1/verify-email": () =>
+        jsonResponse({ error: { code: "sign_up_closed", message: "Sign-up is closed; ask an administrator for an invite" } }, 403),
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Verify" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Sign-up is closed; ask an administrator for an invite");
+    expect(screen.queryByRole("link", { name: "Start again" })).toBeNull();
   });
 
   it("resends the code", async () => {
