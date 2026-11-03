@@ -801,7 +801,7 @@ fn sweep_reads_parse_only_whole_answers() {
     assert!(parse_references(&format!("v|{v}\n")).is_err(), "cut off");
     assert!(parse_references("v|nope\nend").is_err());
     let (dbs, clock) = parse_databases(&format!(
-        "d|{}|t\nd|{}|f\nc|1000000000.5\nend",
+        "d|{}|true\nd|{}|false\nc|1000000000.5\nend",
         hex::encode("app"),
         hex::encode("a|b\nc")
     ))
@@ -815,7 +815,13 @@ fn sweep_reads_parse_only_whole_answers() {
         SystemTime::UNIX_EPOCH + Duration::from_secs_f64(1_000_000_000.5)
     );
     assert!(parse_databases("").is_err());
-    assert!(parse_databases("d|61|t\nend").is_err(), "no clock");
+    assert!(parse_databases("d|61|true\nend").is_err(), "no clock");
+    // What Postgres writes for a boolean joined to text; anything else is refused, not read
+    // as closed.
+    assert!(
+        parse_databases("d|61|t\nc|1\nend").is_err(),
+        "a value that isn't true or false"
+    );
     // Audit B1: templates are read, only template0 is left out; closed ones are named.
     assert!(DATABASES_SQL.contains("WHERE datname <> 'template0'"));
     assert!(!DATABASES_SQL.contains("datistemplate"));
@@ -900,7 +906,7 @@ mod worker_reads {
     fn databases(names: &[&str], now: SystemTime) -> String {
         let mut out: String = names
             .iter()
-            .map(|n| format!("d|{}|t\n", hex::encode(n)))
+            .map(|n| format!("d|{}|true\n", hex::encode(n)))
             .collect();
         let secs = now
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -1012,7 +1018,7 @@ mod worker_reads {
         w.computes.answer(
             "datallowconn",
             &format!(
-                "d|{}|t\nd|{}|f\nc|{secs}\nend\n",
+                "d|{}|true\nd|{}|false\nc|{secs}\nend\n",
                 hex::encode("app"),
                 hex::encode("shut")
             ),

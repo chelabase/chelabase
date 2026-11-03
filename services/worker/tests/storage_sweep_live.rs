@@ -581,6 +581,16 @@ async fn audit_m8_live() {
                         .unwrap();
                     println!("{close}, pass {pass}: {r:?}");
                     assert_eq!(r.deleted, 0, "{close}: {r:?}");
+                    // Each must reach its own outcome, or a pass refused for any other
+                    // reason would satisfy the checks here.
+                    if close.starts_with("ALLOW_CONNECTIONS") {
+                        assert!(
+                            r.refused && r.blocked.iter().any(|b| b.contains(&fx.database)),
+                            "{close}: {r:?}"
+                        );
+                    } else {
+                        assert!(!r.refused && r.referenced == 1, "{close}: {r:?}");
+                    }
                 }
                 assert!(
                     blobs(&store, &prefix).await.contains(&version),

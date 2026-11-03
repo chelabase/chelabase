@@ -875,7 +875,7 @@ async fn purge(
 // --- Reading a branch -----------------------------------------------------------------------
 
 /// Every database of the compute but `template0` (templates are read too: an owner can make
-/// a live database one), hex-encoded with whether it takes connections (`d|hex|t`), the
+/// a live database one), hex-encoded with whether it takes connections (`d|hex|true`), the
 /// compute's clock (`c|epoch`), then `end`.
 pub const DATABASES_SQL: &str = "SET search_path = pg_catalog, pg_temp;
 SELECT 'd|' || encode(convert_to(datname, 'UTF8'), 'hex') || '|' || datallowconn FROM pg_database WHERE datname <> 'template0';
@@ -964,7 +964,12 @@ pub fn parse_databases(out: &str) -> Result<(Vec<(String, bool)>, SystemTime), S
             let (name, allow) = line
                 .split_once('|')
                 .ok_or_else(|| format!("a database line {line:?}"))?;
-            Ok((unhex(name)?, allow == "t"))
+            let allow = match allow {
+                "true" => true,
+                "false" => false,
+                other => return Err(format!("a database line says {other:?}")),
+            };
+            Ok((unhex(name)?, allow))
         })
         .collect::<Result<_, String>>()?;
     let clock = match tagged(out, "c|")?.as_slice() {
