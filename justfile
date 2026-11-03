@@ -104,7 +104,7 @@ check:
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
-    scripts/tests/no-zitadel.sh
+    scripts/tests/no-copyleft.sh
     scripts/tests/compose-image-pins.sh
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
