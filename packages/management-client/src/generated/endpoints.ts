@@ -7331,7 +7331,7 @@ export const getCreateInviteUrl = () => {
 }
 
 /**
- * Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: "link"` (only for a new person, or an account with no password and an unverified email; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.
+ * Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: "link"` (only for a new person, or an account with no password and an unverified email that no other tenant holds by an invite or a membership; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.
  * @summary Invite a person
  */
 export const createInvite = async (createInviteRequest: CreateInviteRequest, options?: Parameters<typeof customFetch>[1]): Promise<InviteResult> => {
@@ -7597,7 +7597,7 @@ export const getResendInviteUrl = (inviteId: string,) => {
 }
 
 /**
- * A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: "link"` (only for an invitee with no password and an unverified email; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).
+ * A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: "link"` (only for an invitee with no password and an unverified email whom no other tenant holds; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).
  * @summary Send an invite again
  */
 export const resendInvite = async (inviteId: string,
@@ -8322,7 +8322,7 @@ export const getReinstateMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. A ban for any other reason stays, and so does the mark, so they stay refused (`member_offboarded`) until that ban is lifted and they are reinstated again. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.
+ * The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. An account banned for any other reason is 409 `conflict` and nothing changes: the member stays suspended until that ban is lifted. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.
  * @summary Reinstate a suspended member
  */
 export const reinstateMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {

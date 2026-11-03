@@ -2102,23 +2102,6 @@ fn take_invite_send(user: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// The members-pool user with exactly this (normalised) email. The service's search matches a
-/// part of the address, so every page of matches is read until the exact one turns up.
-async fn find_identity_user(identity: &Identity, email: &str) -> Result<Option<User>, IdentityError> {
-    const PAGE: u32 = 200;
-    let mut offset = 0u32;
-    loop {
-        let page = identity.search_users(&Pool::Members, email, PAGE, offset).await?;
-        if let Some(user) = page.users.iter().find(|u| normalize_email(&u.email) == email) {
-            return Ok(Some(user.clone()));
-        }
-        offset = offset.saturating_add(u32::try_from(page.users.len()).unwrap_or(PAGE));
-        if page.users.is_empty() || u64::from(offset) >= page.total {
-            return Ok(None);
-        }
-    }
-}
-
 /// How an invite reaches the person.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InviteSend {
@@ -2131,7 +2114,8 @@ enum InviteSend {
 /// What an invite to this person may send. `detail` is `None` for a user this call made.
 ///
 /// - A link carries a code that sets the password, so it is only for a new user, or one with
-///   no password and an unverified email; anyone else is 409 `link_not_allowed`.
+///   no password and an unverified email; anyone else is 409 `link_not_allowed`
+///   ([`refuse_shared_link`] adds another tenant's hold).
 /// - By email an established account (a password and a verified email) gets the notice, never a
 ///   code. Anyone else gets the code, which only their mailbox can read (a pre-registered
 ///   account's password is replaced when it is accepted).
@@ -2141,6 +2125,31 @@ async fn invite_send(identity: &Identity, detail: Option<&UserDetail>, delivery:
         (Delivery::Link, _) => Ok(InviteSend::Code(CodeDelivery::Return)),
         (Delivery::Email, Some(d)) if d.has_password && d.user.email_verified => Ok(InviteSend::Notice),
         (Delivery::Email, _) => Ok(InviteSend::Code(CodeDelivery::Email)),
+    }
+}
+
+/// A link's code sets the password, so it is also refused (409 `link_not_allowed`) while
+/// another tenant holds the person, by an open invite or any other row that isn't removed:
+/// whoever accepts the link first would own the account that tenant reaches. By email only the
+/// mailbox owner reads the code, so that stays allowed. `except` is this tenant's own row.
+async fn refuse_shared_link<M, J>(
+    state: &AppState<M, J>,
+    identity: &Identity,
+    user: &str,
+    except: Option<Uuid>,
+    send: InviteSend,
+    what: &str,
+) -> Result<InviteSend, ApiError>
+where
+    M: MetadataPort,
+{
+    if send != InviteSend::Code(CodeDelivery::Return) {
+        return Ok(send);
+    }
+    match state.metadata.other_memberships(user, except).await {
+        Ok(others) if others.live => Err(link_refused(identity).await),
+        Ok(_) => Ok(send),
+        Err(err) => Err(internal(what, err)),
     }
 }
 
@@ -2209,7 +2218,8 @@ where
     let actor = actor(principal.member.as_ref())?;
     let tenant = principal.tenant_id;
     let found = match &state.identity_service {
-        Some(identity) => find_identity_user(identity, &email)
+        Some(identity) => identity
+            .find_user_by_email(&Pool::Members, &email)
             .await
             .map_err(|err| identity_failed("invite: find user", &err))?,
         None => None,
@@ -2330,6 +2340,7 @@ where
             .await
             .map_err(|err| identity_failed("invite: read user", &err))?;
         let send = invite_send(identity, Some(&detail), delivery).await?;
+        let send = refuse_shared_link(state, identity, &user.id, None, send, "invite: other memberships").await?;
         take_invite_send(&user.id)?;
         Ok(send)
     };
@@ -2348,7 +2359,8 @@ where
                 // tenant that won is the store's 409 `conflict`.
                 Err(IdentityError::Conflict(_)) => {
                     warn!(request_id = %principal.request_id, "invite: the user was made by another call meanwhile");
-                    let found = find_identity_user(identity, email)
+                    let found = identity
+                        .find_user_by_email(&Pool::Members, email)
                         .await
                         .map_err(|err| identity_failed("invite: find user again", &err))?;
                     let Some(user) = found else {
@@ -3087,10 +3099,10 @@ where
         .other_memberships(user, Some(member))
         .await
         .map_err(|err| retry_later(what, "other memberships", err))?;
-    let identity = identity_client(state)?;
     if others.active {
         return Ok(());
     }
+    let identity = identity_client(state)?;
     let gone = |result: Result<(), IdentityError>| match result {
         Err(IdentityError::NotFound(Missing::User)) => Ok(()),
         other => other,
@@ -3179,7 +3191,7 @@ where
     operation_id = "reinstateMember",
     tag = "members",
     summary = "Reinstate a suspended member",
-    description = "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. A ban for any other reason stays, and so does the mark, so they stay refused (`member_offboarded`) until that ban is lifted and they are reinstated again. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
+    description = "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. An account banned for any other reason is 409 `conflict` and nothing changes: the member stays suspended until that ban is lifted. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The reinstated member", body = Member),
@@ -3187,9 +3199,9 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant; `forbidden`: only a tenant admin may", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`conflict`: the member isn't suspended (invited, pending or removed)", body = ErrorEnvelope),
+        (status = 409, description = "`conflict`: the member isn't suspended (invited, pending or removed), or their account is banned for a reason Chelabase didn't set (nothing changes; lift that ban first)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`identity_unavailable`: reinstated in Chelabase, but the identity service couldn't lift the ban; reinstate again to finish", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service couldn't read the account (nothing changes), or the member was reinstated in Chelabase but it couldn't lift the ban; reinstate again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn reinstate_member<M, J>(
@@ -3204,6 +3216,24 @@ where
     tri!(authorize(&state, &principal, ep::REINSTATE_MEMBER.policy.access, Target::None).await);
     let actor = tri!(actor(principal.member.as_ref()));
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
+    // The account is read before anything is written. A ban for a reason that isn't ours is
+    // lifted outside Chelabase, never here: reinstating under it would make the row usable while
+    // the person stays banned, so it is 409 and the member stays suspended.
+    let identity = tri!(identity_client(&state));
+    let ours = match identity.user_detail(&Pool::Members, &m.identity_user_id).await {
+        Ok(d) if d.user.banned && d.ban_reason.as_deref() != Some(MEMBER_REMOVED_BAN_REASON) => {
+            info!(request_id = %principal.request_id, member_id = %id, reason = ?d.ban_reason, "reinstate member: refused, the account is banned outside Chelabase");
+            return ApiError::new(
+                409,
+                ErrorCode::Conflict,
+                "this person's account is banned outside Chelabase: lift that ban first, then reinstate",
+            )
+            .into_response();
+        }
+        Ok(d) => d.user.banned,
+        Err(IdentityError::NotFound(Missing::User)) => false,
+        Err(err) => return identity_failed("reinstate member: read user", &err).into_response(),
+    };
     // P16: the projects the member reaches, own and team grants.
     let projects = tri!(
         state
@@ -3219,26 +3249,12 @@ where
             reconcile_tenant(&state, principal.tenant_id).await;
         }
     }
-    // Then, on every call: the account's ban is lifted when it is ours (another reason is left in
-    // place), and the offboarded mark goes. Realtime re-checks once more after the clear.
-    // A ban for any other reason stays, and so does the mark: the row isn't made usable while
-    // the account is banned. Each step depends on the one before, so a failure ends the call.
-    let identity = tri!(identity_client(&state));
-    let clear = match identity.user_detail(&Pool::Members, &m.identity_user_id).await {
-        Ok(d) if d.user.banned && d.ban_reason.as_deref() == Some(MEMBER_REMOVED_BAN_REASON) => {
-            if let Err(err) = identity.unban(&Pool::Members, &m.identity_user_id).await {
-                return identity_failed("reinstate member: unban", &err).into_response();
-            }
-            true
-        }
-        Ok(d) if d.user.banned => {
-            warn!(member_id = %id, reason = ?d.ban_reason, "reinstate member: the account is banned for another reason; left banned, the offboarded mark kept");
-            false
-        }
-        Ok(_) | Err(IdentityError::NotFound(Missing::User)) => true,
-        Err(err) => return identity_failed("reinstate member: read user", &err).into_response(),
-    };
-    if clear && let Err(err) = state.metadata.clear_offboarded(principal.tenant_id, &m.identity_user_id).await {
+    // Then, on every call: our ban is lifted and the offboarded mark goes. Realtime re-checks
+    // once more after the clear. A failed unban ends the call; reinstating again finishes it.
+    if ours && let Err(err) = identity.unban(&Pool::Members, &m.identity_user_id).await {
+        return identity_failed("reinstate member: unban", &err).into_response();
+    }
+    if let Err(err) = state.metadata.clear_offboarded(principal.tenant_id, &m.identity_user_id).await {
         return internal("reinstate member: clear the offboarded mark", err).into_response();
     }
     access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
@@ -3352,7 +3368,7 @@ where
     operation_id = "createInvite",
     tag = "members",
     summary = "Invite a person",
-    description = "Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only for a new person, or an account with no password and an unverified email; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
+    description = "Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only for a new person, or an account with no password and an unverified email that no other tenant holds by an invite or a membership; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
     request_body = CreateInviteRequest,
     responses(
         (status = 200, description = "An existing member got the grants", body = InviteResult),
@@ -3361,7 +3377,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: a grant's project doesn't exist in the tenant", body = ErrorEnvelope),
-        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account, or whom another tenant holds (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -3413,7 +3429,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account, or whom another tenant holds (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured, or a concurrent request (another invite of the same person, or a change to a team) won: send again; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
@@ -3464,7 +3480,7 @@ where
     operation_id = "resendInvite",
     tag = "members",
     summary = "Send an invite again",
-    description = "A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: \"link\"` (only for an invitee with no password and an unverified email; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).",
+    description = "A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: \"link\"` (only for an invitee with no password and an unverified email whom no other tenant holds; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).",
     params(("invite_id" = Uuid, Path, description = "Invite id")),
     request_body = Option<ResendInviteRequest>,
     responses(
@@ -3473,7 +3489,7 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such invite (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee with an account; `conflict`: email delivery with no SMTP configured", body = ErrorEnvelope),
+        (status = 409, description = "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee with an account, or whom another tenant holds; `conflict`: email delivery with no SMTP configured", body = ErrorEnvelope),
         (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the body isn't a JSON object with a valid `delivery`", body = ErrorEnvelope),
@@ -3511,6 +3527,7 @@ where
             .map_err(|err| identity_failed("resend invite: read user", &err))
     );
     let send = tri!(invite_send(identity, Some(&detail), delivery).await);
+    let send = tri!(refuse_shared_link(&state, identity, &m.identity_user_id, Some(m.id), send, "resend invite: other memberships").await);
     tri!(take_invite_send(&m.identity_user_id));
     // A new token per send: the earlier link's stops describing the invite.
     let token = InviteToken::mint();
@@ -3553,7 +3570,7 @@ fn resend_delivery(body: &[u8]) -> Result<Delivery, ApiError> {
         (status = 404, description = "`not_found`: no such invite (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`invite_closed`: the invite was accepted, or its member was invited again since", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`identity_unavailable`: revoked in Chelabase, but the identity service couldn't be reached for the account (revoke again to finish)", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: revoked in Chelabase, but the identity service couldn't be reached for the account; `unavailable`: revoked, but their other memberships couldn't be read. Either way, revoke again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn revoke_invite<M, J>(
@@ -3613,7 +3630,7 @@ where
             .other_memberships(&user, Some(m.id))
             .await
             .map(|others| others.live)
-            .map_err(|err| internal("revoke invite: other memberships", err))
+            .map_err(|err| retry_later("revoke invite", "other memberships", err))
     );
     let identity = tri!(identity_client(&state));
     if let Err(err) = clean_up_revoked_user(identity, &user, shared).await {
