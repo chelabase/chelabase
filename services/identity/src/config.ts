@@ -1,6 +1,6 @@
 // Service configuration, read once at start-up. Secrets come from files (`*_FILE`), never
 // from plain env values, matching the Rust services' house style.
-import { readFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
 
 /**
  * The internal services allowed to call identity. Each has its own token file. `bootstrap` is
@@ -53,10 +53,41 @@ export interface Config {
 const MIN_SECRET_BYTES = 32;
 const MIN_TOKEN_BYTES = 32;
 
+/** The largest secret file read, as the Rust services' `FileValue::MAX_LEN`. */
+const MAX_SECRET_FILE_LEN = 64 * 1024;
+
+/**
+ * A secret file, read with the Rust services' `FileValue` rules for a secret: a regular file
+ * (never a symlink, a FIFO or a device), writable and readable by its owner only (`chmod 600`),
+ * at most 64 KiB, not empty. The checks are on the descriptor that was opened (`O_NOFOLLOW`,
+ * `O_NONBLOCK`), so a name swapped after a check is never trusted. Errors name the variable and
+ * the path, never the contents.
+ */
 function readSecretFile(name: string, path: string): string {
-  const value = readFileSync(path, "utf8").trim();
-  if (value === "") throw new Error(`${name} points at an empty file`);
-  return value;
+  const refuse = (reason: string) => new Error(`refusing ${name}=${path}: ${reason}`);
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ELOOP") throw refuse("it is a symlink");
+    throw refuse(`opening it: ${(e as NodeJS.ErrnoException).code ?? "error"}`);
+  }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw refuse("it is not a regular file");
+    const mode = stat.mode & 0o7777;
+    const octal = mode.toString(8).padStart(4, "0");
+    if (mode & 0o022) throw refuse(`it is writable by its group or others (mode ${octal}); chmod 600 it`);
+    if (mode & 0o077) {
+      throw refuse(`it holds a secret but is readable by its group or others (mode ${octal}); chmod 600 it`);
+    }
+    if (stat.size > MAX_SECRET_FILE_LEN) throw refuse(`it is larger than ${MAX_SECRET_FILE_LEN} bytes`);
+    const value = readFileSync(fd, "utf8").trim();
+    if (value === "") throw new Error(`${name} points at an empty file`);
+    return value;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** The value of `NAME_FILE` (a file path) or `NAME`; secrets accept only the file form. */

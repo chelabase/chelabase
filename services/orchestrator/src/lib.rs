@@ -2244,7 +2244,7 @@ struct MeResponse {
     #[schema(required = true)]
     member: Option<MeMember>,
     /// Whether the caller may use instance routes (self-hosted: an active tenant admin;
-    /// platform: a member of the operator organisation).
+    /// platform: a member of the operator tenant).
     instance_admin: bool,
     /// Each project the caller may use, with their platform role and the Postgres roles they
     /// may act as there. A tenant admin is Admin with every role on every project.

@@ -22,7 +22,7 @@ This table is generated from `ModePolicy` and checked by a test (`just check`).
 
 | Rule | What it decides | Self-hosted | Platform |
 |---|---|---|---|
-| `instance_admin` | Who may use instance-level routes. | active tenant admin | member of the operator organisation |
+| `instance_admin` | Who may use instance-level routes. | active tenant admin | member of the operator tenant |
 | `sign_up` | Whether a visitor may create their own account. | gated by the tenant | refused |
 | `open_signup_switchable` | Whether the tenant may switch open sign-up on. | true | false |
 | `email_verification_default` | Whether sign-ups must verify their email by default. | false | true |

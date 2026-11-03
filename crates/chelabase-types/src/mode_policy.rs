@@ -48,7 +48,7 @@ impl ModePolicy {
     }
 
     /// Who may use `Instance` routes: self-hosted, an active tenant admin; platform, only
-    /// members of the operator organisation (nobody when it is unset).
+    /// members of the operator tenant (nobody when it is unset).
     pub fn instance_admin(&self, active_tenant_admin: bool, in_operator_org: bool) -> bool {
         match self.mode {
             Mode::SelfHosted => active_tenant_admin,
@@ -132,7 +132,7 @@ impl ModePolicy {
         match rule {
             "instance_admin" => match self.mode {
                 Mode::SelfHosted => "active tenant admin",
-                Mode::Platform => "member of the operator organisation",
+                Mode::Platform => "member of the operator tenant",
             }
             .to_string(),
             "sign_up" => match self.sign_up() {

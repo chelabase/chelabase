@@ -331,7 +331,7 @@ pub enum Access {
     DataKey,
     /// Any verified identity.
     SignedIn,
-    /// Self-hosted: an active tenant admin. Platform: a member of the operator organisation.
+    /// Self-hosted: an active tenant admin. Platform: a member of the operator tenant.
     Instance,
     /// Any active member of the caller's tenant.
     TenantMember,

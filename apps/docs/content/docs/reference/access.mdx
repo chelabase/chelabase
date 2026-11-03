@@ -12,7 +12,7 @@ Every route is declared once, in `chelabase-routes`, with the credential it take
 | Public | No identity. Health, the API document, sign-in and accept-invite (the code is the credential). |
 | Data API key | A data API key, checked by the gateway. |
 | Signed in | Any verified identity (`/v1/me`). |
-| Instance admin | Self-hosted: an active tenant admin. Platform: a member of the operator organization. |
+| Instance admin | Self-hosted: an active tenant admin. Platform: an active member of the operator tenant (`CHELABASE_OPERATOR_TENANT_ID`). |
 | Tenant member | Any active member of the caller's tenant. |
 | Tenant admin | An active tenant admin. |
 | Project *role* | The caller's effective platform role on the project is at least *role* (Viewer, Developer, Admin). A tenant admin is Admin on every project. |
