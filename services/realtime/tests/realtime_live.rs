@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use chelabase_auth::internal::{
     AuthMethod, IDENTITY_HEADER, Identity, InternalSigner, InternalVerifier, generate_keypair_pem,
 };
+use chelabase_auth::member_token::{MEMBER_MAX_TTL_SECS, MemberTokenSigner, MemberTokenVerifier};
 use chelabase_nats::rt::AccessEvent;
 use futures_util::{SinkExt, StreamExt};
 use realtime::app::{Deps, Realtime, build_with};
@@ -63,8 +64,39 @@ fn chelabase_cli() -> std::path::PathBuf {
     exe.parent().unwrap().parent().unwrap().join("chelabase")
 }
 
-/// A fresh access token of the demo tenant's user.
+/// An access token of the demo tenant's user that lives [`MEMBER_MAX_TTL_SECS`] from now.
+///
+/// `chelabase dev token` hands back its kept token while it has more than a minute left (auth's
+/// default lifetime is 300 s), and these tests hold one socket for minutes, so a socket opened
+/// with it as it comes can meet its `exp` mid-test (4001 "the token expired"). Its claims are
+/// signed again with the runner's member key: the same member, tenant and live session (`sid`),
+/// only the times are new.
 async fn dev_token() -> String {
+    let token = cli_dev_token().await;
+    let config = Config::from_env().unwrap();
+    let issuer = config.issuer.expect("the member tokens' issuer");
+    let public = config
+        .member_jwt_public_key
+        .expect("CHELABASE_MEMBER_JWT_PUBLIC_KEY");
+    let keys = env("CHELABASE_KEYS_DIR").expect("CHELABASE_KEYS_DIR (the runner's)");
+    let private = std::path::Path::new(&keys).join("auth/member-jwt.key");
+    let verifier = MemberTokenVerifier::from_pem_file(std::path::Path::new(&public), &issuer)
+        .expect("the member verify key");
+    let mut claims = verifier.verify(&token).expect("the dev token verifies");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    claims.iat = now;
+    claims.exp = now + MEMBER_MAX_TTL_SECS;
+    MemberTokenSigner::from_pem_files(&private, std::path::Path::new(&public), &issuer)
+        .expect("the runner's member signing key")
+        .sign(&claims)
+        .expect("sign the dev token again")
+}
+
+/// The CLI's access token of the demo tenant's user (at least a minute left).
+async fn cli_dev_token() -> String {
     let checkout = env("CHELABASE_CHECKOUT").map_or_else(workspace_root, Into::into);
     let out = tokio::process::Command::new(chelabase_cli())
         .args(["dev", "token"])
@@ -310,7 +342,7 @@ async fn member_of(token: &str) -> MemberToken {
     let config = Config::from_env().unwrap();
     let issuer = config.issuer.expect("the member tokens' issuer");
     let key = config.member_jwt_public_key.expect("CHELABASE_MEMBER_JWT_PUBLIC_KEY");
-    let member = chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(&key, &issuer)
+    let member = MemberTokenVerifier::from_pem_file(&key, &issuer)
         .expect("the member verify key");
     MemberVerifier::new(Some(member))
         .verify(token)
