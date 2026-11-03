@@ -73,6 +73,8 @@ pub struct FakeState {
     pub joined_status: Option<u16>,
     /// `joined`'s `joined` is `false`.
     pub joined_closed: bool,
+    /// Answer `/internal/invites/accept` with this status and error code instead.
+    pub accept_refusal: Option<(u16, String)>,
 }
 
 #[derive(Clone)]
@@ -335,6 +337,34 @@ async fn open_invite(State(s): S, Json(q): Json<HashMap<String, String>>) -> Res
     }
 }
 
+/// As the orchestrator's accept: the open invite of `user` whose token hashes to `token_hash`
+/// makes them active in the bootstrapped tenant (the invite closes); a user already active
+/// there is answered the same (a retry); anything else is 404.
+async fn accept_invite(State(s): S, Json(q): Json<Value>) -> Response {
+    let mut st = s.lock().unwrap();
+    if let Some((status, code)) = st.accept_refusal.clone() {
+        return error(StatusCode::from_u16(status).unwrap(), &code);
+    }
+    let user = q["user"].as_str().unwrap_or_default().to_string();
+    let hash = q["token_hash"].as_str().unwrap_or_default().to_string();
+    let Some(tenant) = st.signup_tenant else {
+        return error(StatusCode::NOT_FOUND, "not_found");
+    };
+    if st.invites.remove(&(user.clone(), hash)).is_some() {
+        st.open_invites.remove(&user);
+        let row = st.memberships.entry(user).or_default();
+        row.1.retain(|t| *t != tenant);
+        if !row.0.contains(&tenant) {
+            row.0.push(tenant);
+        }
+        return Json(json!({"tenant_id": tenant})).into_response();
+    }
+    match st.memberships.get(&user) {
+        Some((active, _)) if active.contains(&tenant) => Json(json!({"tenant_id": tenant})).into_response(),
+        _ => error(StatusCode::NOT_FOUND, "not_found"),
+    }
+}
+
 async fn sync() -> StatusCode {
     StatusCode::ACCEPTED
 }
@@ -363,6 +393,7 @@ impl FakeInternal {
             .route("/internal/members/active", post(members_active))
             .route("/internal/invites/describe", post(describe_invite))
             .route("/internal/invites/open", post(open_invite))
+            .route("/internal/invites/accept", post(accept_invite))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
             .with_state(inner.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -416,6 +447,12 @@ impl FakeInternal {
             user.into(),
             json!({"open": open, "expires_at": at.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)}),
         );
+    }
+
+    /// `/internal/invites/accept` answers `status` with this error code (`None`: as the
+    /// orchestrator would).
+    pub fn set_accept_refusal(&self, refusal: Option<(u16, &str)>) {
+        self.inner.lock().unwrap().accept_refusal = refusal.map(|(s, c)| (s, c.to_string()));
     }
 
     pub fn set_open_status(&self, status: Option<u16>) {

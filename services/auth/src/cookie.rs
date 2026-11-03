@@ -44,19 +44,12 @@ pub enum SessionState {
         tenant: Uuid,
         exp: u64,
     },
-    /// A Zitadel session from accept-invite, kept only to end it at logout. Mints nothing. #124
-    /// (m11) moves accept-invite to identity and deletes this variant.
-    Zitadel {
-        session_id: String,
-        session_token: String,
-        exp: u64,
-    },
 }
 
 impl SessionState {
     fn exp(&self) -> u64 {
         match self {
-            Self::Identity { exp, .. } | Self::Zitadel { exp, .. } => *exp,
+            Self::Identity { exp, .. } => *exp,
         }
     }
 }
@@ -184,9 +177,10 @@ mod tests {
         // A session cookie can't be replayed as a login cookie.
         let session = seal_session(
             &key,
-            &SessionState::Zitadel {
+            &SessionState::Identity {
                 session_id: "s".into(),
                 session_token: "t".into(),
+                tenant: Uuid::nil(),
                 exp: now_secs() + 60,
             },
         );
