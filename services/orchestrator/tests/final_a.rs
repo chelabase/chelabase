@@ -89,7 +89,7 @@ fn log_event(
 
 // ---- D7 ------------------------------------------------------------------------------------
 
-// D7: a member whose Zitadel user was offboarded (the mark) is refused every route but
+// D7: a member whose identity user was offboarded (the mark) is refused every route but
 // `GET /v1/me` with 403 `member_offboarded`, whatever its grants: tenant routes, project and
 // database routes, and a new personal login. `/me` answers, with no project to use.
 #[tokio::test]

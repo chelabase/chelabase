@@ -84,7 +84,8 @@ Each milestone issue declares one review level with a one-line reason:
   tests (not committed), and does not fix the code. Required when the milestone:
   - touches authentication, crypto, secrets, roles, privileges, RLS or member access
     (`crates/chelabase-auth`, `crates/chelabase-secrets`, `services/auth`,
-    `crates/chelabase-zitadel`, privilege code in `crates/chelabase-metadata`);
+    `crates/chelabase-identity`, `services/identity`, privilege code in
+    `crates/chelabase-metadata`);
   - adds or changes a migration, or the metadata migrator;
   - makes a breaking change to a published contract (`openapi/`, `packages/client`, the
     compute spec);

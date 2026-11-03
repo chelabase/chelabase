@@ -23,7 +23,7 @@ workbench *args:
 
 # Rerun this stack's bootstrap as `workbench up` does: `chelabase-init bootstrap --demo` inside the
 # stack (the identity service's setup, the dev member on a fresh stack)
-dev-bootstrap admin_email="":
+stack-bootstrap admin_email="":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build -q -p init

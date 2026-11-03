@@ -92,7 +92,7 @@ pub enum Admission {
 /// ([`MetadataClient::ensure_member_first_comer_for_tests`] against [`MetadataClient::admit_member`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdminClaim {
-    /// Only the Zitadel user the tenant's `setup_claims` row binds (a code-gated sign-up).
+    /// Only the identity user the tenant's `setup_claims` row binds (a code-gated sign-up).
     /// No row: nobody. What every service uses.
     SetupBound,
     /// Whoever asks first: the tests' and tools' shortcut. No service calls it.
@@ -102,7 +102,7 @@ enum AdminClaim {
 /// A tenant's fresh-install claim ([`MetadataClient::setup_claim`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupClaim {
-    /// The Zitadel user the claim binds.
+    /// The identity user the claim binds.
     pub identity_user_id: String,
     pub created_at: DateTime<Utc>,
     /// Whether that user has a member row in the tenant (any status).
@@ -129,16 +129,15 @@ pub struct MemberRecord {
     /// Lowercased and trimmed. `None` when unknown or stale (R8: the newest claim of an email
     /// wins, so a member whose address another member claimed since has none until its own next
     /// request brings its current one). For T5: show such a member without an email. For T7:
-    /// matching an invite by email never matches a `None`, and Zitadel stays the truth for who
+    /// matching an invite by email never matches a `None`, and identity stays the truth for who
     /// holds an address.
     pub email: Option<String>,
     pub display_name: String,
     pub tenant_admin: bool,
     pub status: MemberStatus,
     pub accepted_at: Option<DateTime<Utc>>,
-    /// D7: the member's Zitadel user was deactivated, locked or removed (the Actions webhook's
-    /// or the identity sweep's mark, `members.offboarded_at`); cleared when Zitadel shows the
-    /// user active again. Independent of `status`.
+    /// D7: the member's identity user was offboarded (`members.offboarded_at`); cleared when an
+    /// accepted invite shows the user back. Independent of `status`.
     pub offboarded: bool,
     /// D10: when the member was suspended (`members.suspended_at`); `None` unless suspended.
     pub suspended_at: Option<DateTime<Utc>>,
@@ -333,7 +332,7 @@ pub enum AccessAction {
     MemberApproved,
     /// An admin declined a pending sign-up (R40).
     MemberDeclined,
-    /// A person already in the tenant's Zitadel org was invited: added active, no invite code.
+    /// A person who already has an identity account was invited: added active, no invite code.
     MemberAdded,
     /// A tenant admin suspended an active member (members hub D5).
     MemberSuspended,
@@ -957,7 +956,7 @@ pub type InviteState = (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateT
 /// An open invite's token hash, inviter name and email, tenant slug and display name.
 type InviteDescriptionRow = (Uuid, Option<Vec<u8>>, String, Option<String>, String, Option<String>);
 
-/// The person [`MetadataClient::create_invited_member`] invites: their Zitadel user, email, the
+/// The person [`MetadataClient::create_invited_member`] invites: their identity user, email, the
 /// invite's expiry and token hash, and the grants they get once active.
 #[derive(Debug, Clone, Copy)]
 pub struct NewInvite<'a> {
@@ -1701,10 +1700,10 @@ impl MetadataClient {
     }
 
     /// [`MetadataClient::ensure_member_first_comer_for_tests`] as the orchestrator runs it on
-    /// every request: while the tenant has no active admin, only the Zitadel user its `setup_claims` row binds (the
+    /// every request: while the tenant has no active admin, only the identity user its `setup_claims` row binds (the
     /// account a sign-up with the right setup code created) claims `tenant_admin`, and only
-    /// from no row at all. Without a claim row nobody does. Anyone else (Zitadel's
-    /// FirstInstance human, a machine user, the loser of a sign-up race, a member left after the
+    /// from no row at all. Without a claim row nobody does. Anyone else (an
+    /// account made outside the claim, the loser of a sign-up race, a member left after the
     /// sole admin was suspended) is a newcomer like any other and becomes what `admission`
     /// says. The claim row is read in the same transaction, under the tenant lock that
     /// [`MetadataClient::claim_setup`] takes too.
@@ -2316,11 +2315,11 @@ impl MetadataClient {
         Ok(ProjectAccess { grants, overrides, teams })
     }
 
-    /// Adds a person who is already in the tenant's Zitadel org, active and with a password
+    /// Adds a person who already has an identity account, active and with a password
     /// (an invite that needs no code): an `active` member with these grants, one
     /// `member_added` event (with the project when there is exactly one grant). The email takes
-    /// the address from any other live holder (R8: Zitadel is the truth for who holds it). Any
-    /// member row with that Zitadel user, a removed one included (R29: a removed member comes
+    /// the address from any other live holder (R8: identity is the truth for who holds it). Any
+    /// member row with that identity user, a removed one included (R29: a removed member comes
     /// back only through an invite code), or a grant naming `owner` (R7), is `Conflict`; a
     /// project that isn't active in the tenant, or a missing tenant, `NotFound`.
     #[allow(clippy::too_many_arguments)] // the pinned signature (P25)
@@ -2440,7 +2439,7 @@ impl MetadataClient {
     }
 
     /// Declines a pending member (R40): `removed`; one `member_declined` event. A member that
-    /// isn't pending is `Conflict` (a removed or missing one `NotFound`). Returns the Zitadel user
+    /// isn't pending is `Conflict` (a removed or missing one `NotFound`). Returns the identity user
     /// to deactivate.
     pub async fn decline_member(&self, actor: Uuid, member: Uuid) -> Result<String, AccessWriteError> {
         let tenant = member_tenant(&self.pool, member)
@@ -2982,8 +2981,8 @@ impl MetadataClient {
     }
 
     /// Stores an `invited` member with its grants (inert until it is active) and an invite.
-    /// A removed member with the same Zitadel user is invited again (same row, `tenant_admin`
-    /// false, old grants gone). A live member with that Zitadel user or email, an empty email,
+    /// A removed member with the same identity user is invited again (same row, `tenant_admin`
+    /// false, old grants gone). A live member with that identity user or email, an empty email,
     /// a grant naming `owner` (R7), or a project twice is `Conflict`; a project that isn't active
     /// in the tenant, or a missing tenant, `NotFound`.
     pub async fn create_invited_member(
@@ -3154,7 +3153,7 @@ impl MetadataClient {
     }
 
     /// Revokes an open invite: the member becomes `removed` and its grants and overrides are
-    /// deleted. Returns the never-activated Zitadel user to delete. A revoked or accepted
+    /// deleted. Returns the never-activated identity user to delete. A revoked or accepted
     /// invite, or a member no longer invited, is `Conflict`.
     pub async fn revoke_invite(
         &self,
@@ -3321,7 +3320,7 @@ impl MetadataClient {
     /// - The tenant has an active admin: the nonce is spent, `AlreadyClaimed`, no row.
     /// - No claim yet, or one of this same user: `Bound`.
     /// - A claim of another user: replaced (`Bound`, the old user kept in `replaced_user_id`)
-    ///   only when the caller found that user gone from Zitadel (`replace_stale` names it) and
+    ///   only when the caller found that user gone from identity (`replace_stale` names it) and
     ///   it still has no member row; otherwise `AlreadyClaimed`, the claim unchanged.
     pub async fn claim_setup(
         &self,

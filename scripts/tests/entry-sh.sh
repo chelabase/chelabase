@@ -58,8 +58,8 @@ for name in CHELABASE_AUTH_HOST_NAME CHELABASE_PUBLIC_PORT CHELABASE_PUBLIC_SECU
 done
 
 # `chelabase dev bootstrap` reads the stack env itself and refuses a stack without one (m4, #11).
-if ! just --show dev-bootstrap | grep -q 'dev bootstrap'; then
-  echo "entry-sh: the dev-bootstrap recipe doesn't run \`chelabase dev bootstrap\` (which loads the stack's env)" >&2
+if ! just --show stack-bootstrap | grep -q 'dev bootstrap'; then
+  echo "entry-sh: the stack-bootstrap recipe doesn't run \`chelabase dev bootstrap\` (which loads the stack's env)" >&2
   fail=1
 fi
 

@@ -82,7 +82,7 @@ pub(crate) enum PersonalLoginRevokeReason {
     Suspended,
     /// A tenant admin revoked the member's Postgres access.
     RevokedNow,
-    /// The member's Zitadel user was deactivated, locked or removed.
+    /// The member's identity user was banned or removed.
     IdentityOffboarded,
     /// The member was removed.
     MemberRemoved,

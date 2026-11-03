@@ -20,11 +20,15 @@ pub fn repo_root() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// The stack's bootstrap dir (`CHELABASE_BOOTSTRAP_DIR`, which the stack env sets): the dev
-/// member's password, for `chelabase dev token`.
+/// The stack's bootstrap dir (`CHELABASE_BOOTSTRAP_DIR`, which the stack env sets, else
+/// `$CHELABASE_STACK_DIR/bootstrap`, else the main stack's): the dev member's password, for
+/// `chelabase dev token`.
 pub fn bootstrap_dir() -> PathBuf {
-    if let Ok(dir) = env::var("CHELABASE_BOOTSTRAP_DIR") {
+    if let Some(dir) = env::var_os("CHELABASE_BOOTSTRAP_DIR").filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
+    }
+    if let Some(stack) = env::var_os("CHELABASE_STACK_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(stack).join("bootstrap");
     }
     repo_root().join(".chelabase/stacks/main/bootstrap")
 }

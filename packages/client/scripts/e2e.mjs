@@ -159,7 +159,7 @@ Object.assign(phases, {
     const users = {};
     for (const [name, display] of [["a", "Alice"], ["b", "Bob"]]) {
       const { db } = userClient(name);
-      // The refused sign-up above left no Zitadel user behind, so A's email is still free.
+      // The refused sign-up above left no identity user behind, so A's email is still free.
       const r = await db.auth.signUp({ email: email(name), password: PASSWORD, data: { display_name: display } });
       assert.ok(r.session, `${name}: no session (verification is off by default)`);
       assert.equal(r.verificationRequired, false);

@@ -596,7 +596,7 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::BranchBusy>, MetadataError>> + Send;
 
-    /// The tenant's member with this Zitadel user id, whatever its status.
+    /// The tenant's member with this identity user id, whatever its status.
     fn member_by_identity_user(
         &self,
         tenant: TenantId,

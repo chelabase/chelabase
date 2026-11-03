@@ -100,7 +100,7 @@ for f in $(grep -lE 'PROXY_HTTP_PORT|:4444' "${scripts[@]}" || true); do
 done
 # I2: recipe arguments are passed as arguments, never re-split by the shell.
 grep -q '^set positional-arguments' justfile || fail "the justfile sets positional-arguments"
-for r in workbench bench-data-api dev-bootstrap; do
+for r in workbench bench-data-api stack-bootstrap; do
   just --show "$r" | gq -E '"\$(@|1)"' || fail "$r passes its arguments quoted (\"\$@\" or \"\$1\")"
   ! just --show "$r" | gq -F '{{' || fail "$r interpolates its arguments into the shell line"
 done
@@ -123,9 +123,9 @@ grep -q 'CHELABASE_PROXY_PORT' scripts/neon-e2e.sh ||
 # m4 (#11): the bootstrap runs `chelabase-init bootstrap` in a container on the stack's compose
 # network (the CLI's `dev bootstrap`), so the host needs no route into the stack and the recipe
 # only builds the tool and calls the CLI; the CLI loads the stack env.
-just --show dev-bootstrap | gq 'cargo build -q -p init' || fail "dev-bootstrap builds chelabase-init first"
-just --show dev-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
-  fail "dev-bootstrap runs the CLI's dev bootstrap"
+just --show stack-bootstrap | gq 'cargo build -q -p init' || fail "stack-bootstrap builds chelabase-init first"
+just --show stack-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
+  fail "stack-bootstrap runs the CLI's dev bootstrap"
 just --show check | gq 'scripts/tests/retired-names.sh' || fail "just check runs retired-names.sh"
 # W2 live: the worker's live tests share the stack (branch_live restarts its pageserver, roles_live
 # recreates its orchestrator, caps count every database), so they run one at a time, as the

@@ -48,7 +48,7 @@ async fn bearer_token_without_identity_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
     let resp = reqwest::Client::new()
         .post(format!("{}/v1/databases", app.base))
-        .bearer_auth("some-zitadel-jwt")
+        .bearer_auth("some-unsigned-jwt")
         .json(&create_body(TenantId::new()))
         .send()
         .await
@@ -9254,7 +9254,7 @@ async fn app_user_routes_apply_the_auth_database_override() {
     let base = format!("/v1/projects/{}", w.project);
     let create = json!({ "email": "a@example.test", "password": "correct-horse-9" });
 
-    // Without an override: not refused (the Zitadel client is missing, which is another answer).
+    // Without an override: not refused (the identity client is missing, which is another answer).
     let ok = body_of(w.app.send_as("pat", "org-1", Method::DELETE, &format!("{base}/app-users"), None).await).await;
     assert!(!access_refusal(&ok), "{ok}");
     w.metadata.narrow(pat, w.db, OverrideRow { platform_role: Some(PlatformRole::Viewer), pg_roles: None });
@@ -10660,7 +10660,7 @@ async fn access_events_page_newest_first() {
 
 // ---- T12x: API additions for the Members UI ------------------------------------------------
 
-/// The invite link's `t` parameter: the token of the template Zitadel was given.
+/// The invite link's `t` parameter: the token of the template identity was given.
 fn token_of(template: &str) -> String {
     template.split("&t=").nth(1).expect("the template carries t=").to_string()
 }
@@ -13510,13 +13510,13 @@ async fn role_create_update_delete_write_events_with_the_branch() {
 //
 // Through the fakes: the routes' powers row by row (Part 7), the password shown once, names
 // (D3), every revocation path clearing the proxy cache (P4) and reconciling (P16 b),
-// suspension with Zitadel's lock (D5, S7), and what personal logins are hidden from (MH-11,
+// suspension with identity's ban (D5, S7), and what personal logins are hidden from (MH-11,
 // MH-12, MH-21). The fake's personal-login records (`FakeLogin`) stand for T3's metadata.
 
 use chelabase_metadata::personal_logins::{LoginEndpoint, LoginStatus, RevokeReason};
 
 /// The T8 world: `mw`'s (project Billing, database web1 with main `ep-0123456789ab` and `dev`),
-/// each member behind a Zitadel mock user (their sub) so suspension can lock them: `alice` and
+/// each member behind a fake identity user (their sub) so suspension can lock them: `alice` and
 /// `bob` Developers with `app`, `vera` a Viewer, `pam` an Admin of Billing, and `oscar` an
 /// Admin of project Elsewhere only. Each is (member id, sub).
 struct Pl {
@@ -13593,7 +13593,7 @@ impl Pl {
     fn status_of(&self, member: uuid::Uuid) -> MemberStatus {
         self.t.w.metadata.members.lock().unwrap().iter().find(|m| m.id == member).unwrap().status
     }
-    /// One more member of the tenant behind a Zitadel mock user, granted `role` on `project`.
+    /// One more member of the tenant behind a fake identity user, granted `role` on `project`.
     fn add_person(&self, name: &str, project: ProjectId, role: PlatformRole) -> (uuid::Uuid, String) {
         let sub = self.t.identity.with_user(&Pool::Members, &format!("{name}@x.com"), "Secret-pass1");
         (self.t.w.metadata.add_granted(self.t.w.tenant, &sub, project, role, &["app"]), sub)
@@ -15542,7 +15542,7 @@ async fn member_token_removed_member_403() {
 }
 
 // AC 5: `tid` names a tenant the subject isn't a member of: 403 and no member row, even with
-// open sign-up on and a recent admin claim (both would admit a newcomer on the Zitadel path).
+// open sign-up on and a recent admin claim (neither makes a member row from a token).
 #[tokio::test]
 async fn member_token_wrong_tenant_403_no_jit() {
     let w = member_world(Mode::SelfHosted).await;
@@ -15588,16 +15588,6 @@ async fn member_token_unknown_tenant_401() {
         assert_eq!(code_of(&err), "unauthorized", "{path}");
     }
     assert_eq!(w.metadata.members.lock().unwrap().len(), before);
-}
-
-// The Zitadel path is unchanged beside the member path: org-1's admin still passes, and the
-// same person by member token is the same member.
-#[tokio::test]
-async fn member_token_and_zitadel_token_are_the_same_member() {
-    let w = member_world(Mode::SelfHosted).await;
-    let path = format!("/v1/databases/{}", w.db);
-    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
-    assert_eq!(send_member(&w.app, DEFAULT_SUB, w.tenant.as_uuid(), Method::GET, &path).await.status(), 200);
 }
 
 // `CHELABASE_OPERATOR_TENANT_ID`: in platform mode a member token naming the operator tenant

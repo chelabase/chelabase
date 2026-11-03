@@ -3078,8 +3078,7 @@ async fn passwords_over_72_bytes_are_refused_before_identity() {
 }
 
 // Identity's own password refusal (`weak_password`) is `weak_password` on every path that sets
-// one; its other refusals are not. (Retires the Zitadel-policy test, and with it the live
-// `zitadel_policy_refusals_are_weak_passwords_for_app_users`.)
+// one; its other refusals are not.
 #[tokio::test]
 async fn identity_password_refusals_are_weak_passwords() {
     let h = harness().await;

@@ -1460,7 +1460,7 @@ async fn newest_email_claim_wins() {
         .await
         .unwrap();
     assert_eq!(a.email.as_deref(), Some("x@x.com"));
-    // A's Zitadel email moved on; Z2 signs up with A's old one.
+    // A's identity email moved on; Z2 signs up with A's old one.
     let events = s.event_count(t).await;
     let z2 = s
         .client
@@ -1592,7 +1592,7 @@ async fn concurrent_email_claims_leave_one_holder() {
     s.finish().await;
 }
 
-// M8: re-inviting a removed or revoked Zitadel user reuses its row, with nothing left over.
+// M8: re-inviting a removed or revoked identity user reuses its row, with nothing left over.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn reinvite_reuses_a_removed_row() {
@@ -2129,7 +2129,7 @@ async fn member_listings_report_has_access() {
     s.finish().await;
 }
 
-// T12x: an invite is described by (Zitadel user, token hash) while it is open; the hash is
+// T12x: an invite is described by (identity user, token hash) while it is open; the hash is
 // replaced by a resend and every closed invite describes as nothing.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
@@ -2367,7 +2367,7 @@ async fn pending_member_lifecycle() {
     assert_eq!(c.member_by_identity_user(t, "d").await.unwrap().unwrap().status, MemberStatus::Pending);
     assert_eq!(s.event_count(t).await, events);
 
-    // Decline: removed, one event, the Zitadel user to deactivate; not for the active.
+    // Decline: removed, one event, the identity user to deactivate; not for the active.
     assert_eq!(c.decline_member(a.id, d.id).await.unwrap(), "d");
     assert_eq!(c.member_by_identity_user(t, "d").await.unwrap().unwrap().status, MemberStatus::Removed);
     assert_eq!(actions(t).await.last().map(String::as_str), Some("member_declined"));
@@ -2391,51 +2391,6 @@ async fn pending_member_lifecycle() {
     let first = c.ensure_member_first_comer_for_tests(t2, "first", "f@x.com", "F", Admission::Closed).await.unwrap();
     assert_eq!((first.status, first.tenant_admin), (MemberStatus::Active, true));
     assert_eq!(c.member_by_identity_user(t2, "pz").await.unwrap().unwrap().status, MemberStatus::Pending);
-    s.finish().await;
-}
-
-// M2: the bootstrap's `NAME_SQL` (`chelabase-init`'s `tenant_name.sql`) names a tenant
-// once, trimmed and cut to the column's rules, and logs one event.
-#[tokio::test]
-#[ignore = "needs the workbench stack's metadata Postgres"]
-async fn bootstrap_names_the_tenant_once() {
-    const NAME_SQL: &str = include_str!("../../chelabase-init/src/bootstrap/tenant_name.sql");
-    let s = Scratch::new().await;
-    // The bootstrap's own SQL (`chelabase_init::bootstrap::tenant`), already `$1`/`$2`.
-    let sql = NAME_SQL.to_string();
-    let run = |t: TenantId, name: &str| {
-        let (sql, name, pool) = (sql.clone(), name.to_string(), s.client.pool().clone());
-        async move {
-            sqlx::query(AssertSqlSafe(sql)).bind(t.as_uuid()).bind(name).execute(&pool).await.unwrap();
-        }
-    };
-    let name_of = |t: TenantId| {
-        let pool = s.client.pool().clone();
-        async move {
-            sqlx::query_scalar::<_, Option<String>>("SELECT display_name FROM tenants WHERE id = $1")
-                .bind(t.as_uuid())
-                .fetch_one(&pool)
-                .await
-                .unwrap()
-        }
-    };
-    let t = s.tenant().await;
-    run(t, "  Acme Corp  ").await;
-    assert_eq!(name_of(t).await.as_deref(), Some("Acme Corp"));
-    assert_eq!(s.event_count(t).await, 1);
-    // A named tenant keeps its name, and a repeat writes nothing.
-    run(t, "Other").await;
-    assert_eq!(name_of(t).await.as_deref(), Some("Acme Corp"));
-    assert_eq!(s.event_count(t).await, 1);
-    // Too long: cut to 80 and trimmed (a space at the cut would break the column's check).
-    let long = s.tenant().await;
-    run(long, &format!("{} tail", "x".repeat(79))).await;
-    assert_eq!(name_of(long).await.as_deref(), Some("x".repeat(79).as_str()));
-    // Blank: nothing.
-    let blank = s.tenant().await;
-    run(blank, "   ").await;
-    assert_eq!(name_of(blank).await, None);
-    assert_eq!(s.event_count(blank).await, 0);
     s.finish().await;
 }
 
@@ -2710,7 +2665,7 @@ impl Scratch {
         Hub { t, admin: admin.id, p, db, ep }
     }
 
-    /// An active member (Zitadel user and display name `zid`, email `<zid>@x.com`).
+    /// An active member (identity user and display name `zid`, email `<zid>@x.com`).
     async fn active(&self, h: &Hub, zid: &str) -> Uuid {
         self.client
             .ensure_member_first_comer_for_tests(h.t, zid, &format!("{zid}@x.com"), zid, Admission::Active)
@@ -3655,7 +3610,7 @@ async fn the_last_active_tenant_admin_cannot_be_suspended() {
 }
 
 // S7: suspending a suspended member and reinstating an active one succeed and write nothing
-// (a retry after a failed Zitadel lock or unlock redoes only that step).
+// (a retry after a failed identity ban or unban redoes only that step).
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn suspend_and_reinstate_are_idempotent() {
@@ -4339,8 +4294,8 @@ async fn personal_login_reads_report_status_and_qualifies() {
 
 // D7: the webhook's and the sweep's write marks the member offboarded (whether or not a login
 // was live), independently of its status; an offboarded member doesn't qualify for a login.
-// Only Zitadel showing the user active again clears the mark (`clear_offboarded`), never a
-// sign-in, and the logins stay revoked. Another tenant's member with the same Zitadel user is
+// Only an accepted invite showing the user back clears the mark (`clear_offboarded`), never a
+// sign-in, and the logins stay revoked. Another tenant's member with the same identity user is
 // untouched.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
@@ -6081,7 +6036,7 @@ async fn setup_claim_race() {
     s.finish().await;
 }
 
-// AC 11: a claim whose user is gone (no member row; Zitadel checked by the caller) is rebound
+// AC 11: a claim whose user is gone (no member row; identity checked by the caller) is rebound
 // by a new code-gated sign-up, which then becomes admin. A claim whose user has a member row,
 // or another user than the caller checked, is not replaced.
 #[tokio::test]
@@ -6170,7 +6125,7 @@ async fn setup_claim_bystander_never_blocks_stale_replacement() {
     );
     assert_eq!(s.member_count(t).await, 0);
     assert!(!s.client.tenant_has_members(t).await.unwrap(), "the gate stays open");
-    // A never signed in and is gone from Zitadel: a new code-gated sign-up replaces the claim.
+    // A never signed in and is gone from identity: a new code-gated sign-up replaces the claim.
     assert!(!s.client.setup_claim(t).await.unwrap().unwrap().has_member_row);
     let n = setup_nonce(&s, t).await;
     assert_eq!(

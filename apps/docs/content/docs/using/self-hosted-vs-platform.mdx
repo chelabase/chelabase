@@ -30,8 +30,7 @@ This table is generated from `ModePolicy` and checked by a test (`just check`).
 | `password_strength_forced` | Whether role passwords must pass the strength check. | false | true |
 | `prehashed_passwords_allowed` | Whether role passwords may be supplied pre-hashed. | true | false |
 | `ca_file_on_reveal` | Whether revealing connection details includes the dev CA path. | true | false |
-| `cli_manages_studio_login` | Whether the CLI manages Studio's login settings in Zitadel. | true | false |
-| `auto_create_members` | Whether a person in the tenant's org becomes a member on their first request. | true | false |
+| `auto_create_members` | Whether a signed-in person with no member row becomes one on their first request. | true | false |
 | `default_internal_token_allowed` | Whether the services may start with the development internal bearer (a platform instance refuses to start with it). | true | false |
 
 {/* END GENERATED mode-table */}

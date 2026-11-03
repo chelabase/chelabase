@@ -29,7 +29,10 @@ pub struct DevMember {
 
 impl std::fmt::Debug for DevMember {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DevMember").field("email", &self.email).field("password", &"<redacted>").finish()
+        f.debug_struct("DevMember")
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .finish()
     }
 }
 
@@ -56,12 +59,19 @@ pub fn new_password() -> String {
 /// replaced by nothing on a refusal: it is removed again.
 pub async fn ensure(w: &Waiter, out: &Outputs, cfg: &DevMemberConfig) -> Result<DevMember> {
     if let Some(bytes) = out.read(DEV_MEMBER)? {
-        let member: DevMember = serde_json::from_slice(&bytes)
-            .with_context(|| format!("{} isn't the dev member's file", out.path().join(DEV_MEMBER).display()))?;
+        let member: DevMember = serde_json::from_slice(&bytes).with_context(|| {
+            format!(
+                "{} isn't the dev member's file",
+                out.path().join(DEV_MEMBER).display()
+            )
+        })?;
         info!(email = %member.email, "the dev member exists");
         return Ok(member);
     }
-    let member = DevMember { email: cfg.email.clone(), password: new_password() };
+    let member = DevMember {
+        email: cfg.email.clone(),
+        password: new_password(),
+    };
     let health = HttpProbe::new("auth", &format!("{}/health", cfg.auth_url));
     w.until(&health.name(), || health.check()).await?;
     out.write_secret(DEV_MEMBER, &serde_json::to_vec_pretty(&member)?)?;
@@ -70,7 +80,9 @@ pub async fn ensure(w: &Waiter, out: &Outputs, cfg: &DevMemberConfig) -> Result<
         .build()
         .context("the auth client")?;
     let signed_up = w
-        .until("auth (the dev member's sign-up)", || sign_up(&http, cfg, &member))
+        .until("auth (the dev member's sign-up)", || {
+            sign_up(&http, cfg, &member)
+        })
         .await;
     if let Err(e) = signed_up {
         let _ = std::fs::remove_file(out.path().join(DEV_MEMBER));
@@ -118,12 +130,18 @@ pub async fn sign_up(
             "auth wants the dev member's email verified: this stack requires email verification \
              (unset CHELABASE_REQUIRE_EMAIL_VERIFICATION for the workbench)"
         ),
-        (200, Some("pending"), _) | (403, _, "sign_up_closed" | "setup_code_invalid") | (409, _, _) => bail!(
+        (200, Some("pending"), _)
+        | (403, _, "sign_up_closed" | "setup_code_invalid")
+        | (409, _, _) => bail!(
             "the stack's tenant is already claimed ({}{}), so the dev member can't claim it: \
              sign in with the account that did, or start from a fresh stack (`just workbench purge`, \
              then `just workbench up`)",
             status.as_u16(),
-            if code.is_empty() { String::new() } else { format!(" {code}") }
+            if code.is_empty() {
+                String::new()
+            } else {
+                format!(" {code}")
+            }
         ),
         (503, _, _) => Ok(Check::Wait(format!("auth answers 503 {code}"))),
         _ => bail!("auth answers {status} to POST {url}: {code}"),
@@ -140,13 +158,19 @@ mod tests {
         assert_ne!(a, b);
         for p in [&a, &b] {
             assert!(chelabase_identity::rules::strong_password(p), "{p}");
-            assert!(p.len() <= chelabase_identity::rules::PASSWORD_MAX_BYTES, "{p}");
+            assert!(
+                p.len() <= chelabase_identity::rules::PASSWORD_MAX_BYTES,
+                "{p}"
+            );
         }
     }
 
     #[test]
     fn debug_hides_the_password() {
-        let m = DevMember { email: "dev@x".into(), password: "Secret-1!".into() };
+        let m = DevMember {
+            email: "dev@x".into(),
+            password: "Secret-1!".into(),
+        };
         assert!(!format!("{m:?}").contains("Secret-1!"));
     }
 }

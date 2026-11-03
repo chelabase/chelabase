@@ -255,7 +255,7 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         admission: Admission,
     ) -> impl Future<Output = Result<Option<MemberStatus>, MetadataError>> + Send;
 
-    /// D7: the tenant member with this Zitadel user is no longer marked offboarded (its user
+    /// D7: the tenant member with this identity user is no longer marked offboarded (its user
     /// was reactivated or unlocked); `true` when a mark was cleared. Logins stay revoked.
     fn clear_offboarded(
         &self,

@@ -69,7 +69,7 @@ pub enum Scope {
 pub enum Auth {
     /// No credential required.
     Public,
-    /// Zitadel-issued management token (developers / operators).
+    /// A member access token from `POST /auth/v1/token` (Studio, the CLI).
     Management,
     /// A data API key of either kind (`chk_pub_` or `chk_sec_`).
     DataKey,
@@ -703,7 +703,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Removes a member: grants gone, Zitadel user deactivated, sessions ended.
+    /// Removes a member: grants gone, identity user banned, sessions ended.
     pub const REMOVE_MEMBER: Endpoint = key_endpoint(
         "orchestrator.remove_member",
         Method::Delete,
@@ -719,7 +719,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Declines a pending sign-up: removed, its Zitadel user deactivated (R40).
+    /// Declines a pending sign-up: removed, its identity user banned (R40).
     pub const DECLINE_MEMBER: Endpoint = key_endpoint(
         "orchestrator.decline_member",
         Method::Post,
@@ -739,7 +739,7 @@ pub mod orchestrator {
         Access::TenantAdmin,
     );
 
-    /// Revokes an open invite (the never-activated Zitadel user is deleted).
+    /// Revokes an open invite (the never-activated identity user is deleted).
     pub const REVOKE_INVITE: Endpoint = key_endpoint(
         "orchestrator.revoke_invite",
         Method::Delete,
@@ -823,7 +823,7 @@ pub mod orchestrator {
         Access::Instance,
     );
 
-    /// Whether Zitadel can email invites (an active email provider).
+    /// Whether identity can email invites (SMTP is configured).
     pub const GET_INVITE_DELIVERY: Endpoint = key_endpoint(
         "orchestrator.get_invite_delivery",
         Method::Get,
@@ -877,7 +877,7 @@ pub mod orchestrator {
         Access::TenantMember,
     );
 
-    /// Suspends a member (D5): refused everywhere, logins revoked, Zitadel user locked.
+    /// Suspends a member (D5): refused everywhere, logins revoked, identity user banned.
     pub const SUSPEND_MEMBER: Endpoint = key_endpoint(
         "orchestrator.suspend_member",
         Method::Post,

@@ -463,8 +463,8 @@ async fn get_app_users_404_until_enabled_then_the_settings() {
         ),
         (Some(false), Some("delete"))
     );
-    // No org any more: app users live in the identity pool `app-<project>`.
-    assert!(body["zitadel_org_id"].is_null(), "{body}");
+    // No org field: app users live in the identity pool `app-<project>`.
+    assert!(body.as_object().unwrap().keys().all(|k| !k.ends_with("_org_id")), "{body}");
     assert!(body["error"].is_null());
 }
 

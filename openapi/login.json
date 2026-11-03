@@ -221,7 +221,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -332,7 +332,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -571,7 +571,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -692,7 +692,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -917,7 +917,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1112,7 +1112,7 @@
             }
           },
           "503": {
-            "description": "Zitadel, the orchestrator or the database is unavailable: `unavailable`",
+            "description": "The identity service, the orchestrator or the database is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1163,7 +1163,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1267,7 +1267,7 @@
             }
           },
           "503": {
-            "description": "Zitadel or the orchestrator is unavailable: `unavailable`",
+            "description": "The identity service or the orchestrator is unavailable: `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1562,16 +1562,6 @@
           },
           "429": {
             "description": "Too many attempts: `rate_limited`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "The instance isn't set up yet (its org id isn't written): `unavailable`",
             "content": {
               "application/json": {
                 "schema": {
@@ -2002,26 +1992,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StudioConfig"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "The bootstrap hasn't written the ids yet: `unavailable`",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorEnvelope"
                 }
               }
             }
@@ -2610,7 +2580,6 @@
         "enum": [
           "unauthorized",
           "forbidden",
-          "tenant_not_bound",
           "tenant_required",
           "not_found",
           "method_not_allowed",
@@ -2696,8 +2665,6 @@
           "member_role_reconcile_failed",
           "link_not_allowed",
           "signup_pending",
-          "email_ambiguous",
-          "email_in_use_elsewhere",
           "invite_closed",
           "permission_denied",
           "dependents_changed",

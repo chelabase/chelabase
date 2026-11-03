@@ -57,7 +57,7 @@ fn sha256_hex(s: &str) -> String {
 }
 
 type KeyEntry = ([u8; 32], DataKeyLookup);
-/// Members hub T8: personal-login rows by (tenant, Zitadel user id).
+/// Members hub T8: personal-login rows by (tenant, identity user id).
 
 /// An invite's stored expiry and whether the database clock calls it open.
 type InviteExpiry = (chrono::DateTime<chrono::Utc>, bool);
@@ -3951,7 +3951,7 @@ async fn spec_route_sets_console_url() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// App users (step 6b): branch info, sessions, sync and the Zitadel Actions webhook.
+// App users (step 6b): branch info, sessions and sync.
 // ---------------------------------------------------------------------------------------------
 
 const SYNC_PW: &str = "sync-password";
@@ -4290,7 +4290,7 @@ async fn hung_identity() -> chelabase_identity::Identity {
     chelabase_identity::Identity::new(&format!("http://{addr}"), "t")
 }
 
-/// Waits up to 2 s for `check` (background work such as the webhook's Zitadel deletes).
+/// Waits up to 2 s for `check` (background work).
 async fn eventually(check: impl Fn() -> bool) -> bool {
     for _ in 0..100 {
         if check() {
@@ -4720,7 +4720,7 @@ async fn peek_answers_the_user_and_rotates_nothing() {
 }
 
 // #59: an unknown, revoked or two-rotations-old token is `refresh_token_invalid`, the previous
-// token after the grace `refresh_token_reused`; peek revokes nothing and ends no Zitadel session.
+// token after the grace `refresh_token_reused`; peek revokes nothing and ends no identity session.
 #[tokio::test]
 async fn peek_gives_refresh_verdicts_without_revoking() {
     let w = app_world();
