@@ -1295,7 +1295,21 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
             };
             email_slot.refund();
             let (user_id, may_unban) = match &signed {
-                Some(signed) => (signed.user.id.clone(), false),
+                // The link's token must match this account's open invite: without it, the
+                // orchestrator's retry for an active member would sign anyone in with any `t`.
+                Some(signed) => match orchestrator.describe_invite(&signed.user.id, &token_hash).await {
+                    Ok(Some(_)) => (signed.user.id.clone(), false),
+                    Ok(None) => {
+                        drop_session(s, &signed.session_id).await;
+                        return bad_invite();
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "accept-invite: the invite check failed");
+                        drop_session(s, &signed.session_id).await;
+                        slot.refund();
+                        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+                    }
+                },
                 // A banned account: our ban is lifted only for an open invite this link matches.
                 // Anything else answers as sign-in does for a banned account (a wrong password),
                 // so this is no oracle for a banned account's password.
@@ -1635,6 +1649,16 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
         }
         Err(e) => return identity_unavailable(&e),
     };
+    // On both arms, before anything changes: the step's session must still be live and the
+    // account's. A reset or an accepted invite ends every session of the account, and a step
+    // cookie from before it proves nothing any more, so it may not delete, join or sign in.
+    match s.identity.session_by_id(&Pool::Members, &session_id).await {
+        Ok(live) if live.user.id == user_id => {}
+        Ok(_) | Err(IdentityError::NotFound(Missing::Session | Missing::User)) => {
+            return step_ended(s, error(StatusCode::GONE, ErrorCode::SignInExpired, GONE));
+        }
+        Err(e) => return identity_unavailable(&e),
+    }
     match join_verified(s, org, &user.id).await {
         Ok(true) => {}
         Ok(false) => return step_ended(s, sign_up_closed_meanwhile(s, &user.id, &session_id).await),
