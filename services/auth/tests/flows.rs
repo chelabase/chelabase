@@ -2478,3 +2478,80 @@ async fn accept_invite_rejects_malformed_input() {
     let resp = h.http.post(format!("{}/auth/v1/accept-invite", h.base)).json(&json!({"t": t, "password": "x"})).send().await.unwrap();
     assert_eq!(resp.headers()["cache-control"], "no-store");
 }
+
+// #124 audit B1: a confirmed reset ends every session of the account, so a step cookie made
+// before it is dead. A wrong code with it is 410 `sign_in_expired` and the step ends; nothing
+// happens to the account: with sign-up closed it isn't deleted, and with it open it doesn't
+// join. (A squatter pre-registers the owner's email; the owner takes it back with a reset.)
+#[tokio::test]
+async fn a_step_cookie_from_before_a_reset_changes_nothing() {
+    for open in [false, true] {
+        let h = harness().await;
+        let id = h.identity.with_unverified_user(&Pool::Members, "own@example.com", "Squatter-pw1");
+        let s = h.sign_in("", "own@example.com", "Squatter-pw1", "1.1.1.1").await;
+        assert_eq!(s.body, json!({"next": "verify"}));
+        let step = s.cookie("chelabase_login").unwrap();
+        let code = h.code_for(&id, CodeKind::Reset).await;
+        let ok = h
+            .post("/auth/v1/password-reset/confirm", json!({"email": "own@example.com", "code": code, "password": NEW_PW}), None, "2.2.2.2")
+            .await;
+        assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+        assert_eq!(h.sessions(), 0);
+        if open {
+            h.internal.set_signup_tenant(T1);
+        } else {
+            h.internal.set_joined_closed();
+        }
+        let v = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&step), "1.1.1.3").await;
+        assert_eq!((v.status, v.body.clone()), (StatusCode::GONE, err("sign_in_expired", messages::GONE)), "open: {open}");
+        assert!(v.cookies.iter().any(|c| c.starts_with("chelabase_login=;")), "the step ends");
+        assert!(!session_set(&v));
+        assert!(h.identity.user(&Pool::Members, &id).is_some(), "the owner's reclaimed account stays");
+        assert!(h.internal.bodies("POST /internal/signup/joined").is_empty(), "no join");
+        assert!(h.signs_in("own@example.com", NEW_PW).await);
+    }
+}
+
+// #124 audit B1: accepting an invite ends every session of a pre-registered account, so the
+// squatter's step cookie is never answered `studio` with a session cookie for a dead session.
+#[tokio::test]
+async fn a_step_cookie_from_before_an_accepted_invite_is_expired() {
+    let h = harness().await;
+    let id = h.identity.with_unverified_user(&Pool::Members, "bob@example.com", "Squatter-pw1");
+    let s = h.sign_in("", "bob@example.com", "Squatter-pw1", "1.1.1.1").await;
+    assert_eq!(s.body, json!({"next": "verify"}));
+    let step = s.cookie("chelabase_login").unwrap();
+    let t = link_token(17);
+    h.open_invite_for(&id, &t);
+    let code = h.code_for(&id, CodeKind::Invite).await;
+    let a = h.accept(accept_code(&id, &t, &code, NEW_PW), "2.2.2.2").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "{}", a.body);
+    let v = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&step), "1.1.1.3").await;
+    assert_eq!((v.status, v.body.clone()), (StatusCode::GONE, err("sign_in_expired", messages::GONE)));
+    assert!(!session_set(&v), "no cookie for a dead session");
+    assert!(v.cookies.iter().any(|c| c.starts_with("chelabase_login=;")), "the step ends");
+    // The owner's own session is untouched.
+    assert_eq!(h.token(&a.cookie("chelabase_session").unwrap()).await.status, StatusCode::OK);
+}
+
+// #124 audit S1: the account's own password with a link token that matches no open invite of
+// theirs is refused before the orchestrator is asked, even for an active member: no session,
+// and the offboarded mark isn't touched.
+#[tokio::test]
+async fn an_active_member_with_a_foreign_token_is_refused() {
+    let h = harness().await;
+    h.member("ann@example.com", &[T1]);
+    h.internal.set_signup_tenant(T1);
+    let a = h.accept(accept_notice(&link_token(18), "ann@example.com", PW), "1.1.1.1").await;
+    assert_eq!((a.status, a.body.clone()), (StatusCode::BAD_REQUEST, err("invalid_request", messages::BAD_INVITE)));
+    assert!(!session_set(&a));
+    assert_eq!(h.sessions(), 0, "the sign-in's session is dropped");
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+    // Another user's open invite and token don't help either.
+    let other = h.identity.with_invited_user(&Pool::Members, "bob@example.com");
+    let t = link_token(19);
+    h.open_invite_for(&other, &t);
+    let a = h.accept(accept_notice(&t, "ann@example.com", PW), "1.1.1.2").await;
+    assert_eq!(a.status, StatusCode::BAD_REQUEST, "{}", a.body);
+    assert!(h.internal.bodies("POST /internal/invites/accept").is_empty());
+}
