@@ -361,6 +361,7 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
         (status = 401, description = "`invalid_token`, `token_expired`", body = StorageErrorEnvelope),
         (status = 403, description = "`token_not_valid`: used already, another object's, or its key was revoked; `not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`", body = StorageErrorEnvelope),
+        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
     ),
 )]

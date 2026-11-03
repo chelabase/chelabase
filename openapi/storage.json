@@ -1014,6 +1014,16 @@
               }
             }
           },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "409": {
             "description": "`conflict`",
             "content": {
@@ -1489,6 +1499,16 @@
           },
           "403": {
             "description": "`not_allowed`: no policy allows it, or the caller can't see the bucket (every object route needs a SELECT policy on `storage.buckets`); `database_not_allowed`, `role_not_allowed`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1988,6 +2008,16 @@
           },
           "404": {
             "description": "`upload_not_found`: missing, finished, or another caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
             "content": {
               "application/json": {
                 "schema": {
