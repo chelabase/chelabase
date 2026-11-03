@@ -450,9 +450,10 @@ impl MetadataClient {
     }
 
     /// Records (`Some`) or clears (`None`) the worker's last reconcile error on an `enabled`
-    /// row: a pool gone from the identity service, a branch it can't upgrade. Only an
-    /// `enabled` row: an enable's own outcome ends `enabling`, and a `failed` row keeps the
-    /// enable's error. A row already holding the value is left alone.
+    /// row (a pool gone from the identity service, a branch it can't upgrade), or why a
+    /// `disabling` row's disable is on hold (its pool still has users). Not an `enabling` row
+    /// (an enable's own outcome ends it), nor a `failed` one (it keeps the enable's error). A
+    /// row already holding the value is left alone.
     pub async fn set_app_users_error(
         &self,
         project: ProjectId,
@@ -460,7 +461,8 @@ impl MetadataClient {
     ) -> Result<(), MetadataError> {
         sqlx::query(
             "UPDATE project_auth SET error = $2, updated_at = now()
-             WHERE project_id = $1 AND status = 'enabled' AND error IS DISTINCT FROM $2",
+             WHERE project_id = $1 AND status IN ('enabled', 'disabling')
+               AND error IS DISTINCT FROM $2",
         )
         .bind(project.as_uuid())
         .bind(error)

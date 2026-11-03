@@ -341,7 +341,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     }
 
     /// Disables app users on a `disabling` row: the teardown on every live branch, the
-    /// sessions revoked, the pool dropped (idempotent), then the row. Any failure is retried.
+    /// sessions revoked, the pool dropped (idempotent, and only while it holds no users), then
+    /// the row. Any failure is retried.
     /// The row goes last, so a new enable can't start until the drop is done. Disables can run
     /// twice at once (the consumer, the periodic pass, a repeated request): the row is read
     /// again before the drop and only a `disabling` row is deleted, so a slow copy leaves an
@@ -373,6 +374,27 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| e.to_string())?;
         if current.is_none_or(|a| a.status != AppUsersStatus::Disabling) {
             return Ok(());
+        }
+        // Review S5: the orchestrator checked the pool was empty before the disable began, but
+        // a sign-up that raced it can still have made a user. The drop is irreversible, so the
+        // pool is counted again: one with users is kept, and the row stays `disabling` with the
+        // reason (acked: a retry can't empty it; the periodic pass tries again).
+        match identity.list_users(&app_pool(project), 1, 0).await {
+            Ok(page) if page.total > 0 => {
+                let error = format!(
+                    "the app-user pool {} still holds {} user(s), who signed up while app users were being disabled; the pool is kept and the disable finishes once it is empty",
+                    app_pool(project),
+                    page.total
+                );
+                warn!(%project, "{error}");
+                return self
+                    .metadata
+                    .set_app_users_error(project, Some(&error))
+                    .await
+                    .map_err(|e| e.to_string());
+            }
+            Ok(_) | Err(IdentityError::NotFound(Missing::Pool)) => {}
+            Err(e) => return Err(format!("counting the app-user pool's users before the drop: {e}")),
         }
         drop_pool(identity, project).await?;
         let finished = self
@@ -1266,6 +1288,49 @@ pub(crate) mod tests {
     }
 
     // --- Disable ----------------------------------------------------------------------
+
+    // Review S5: a user who signed up while the disable was under way (auth's cached
+    // `enabled`, before its uncached check) is never dropped with the pool: the worker counts
+    // again right before the drop, keeps the pool and leaves the row `disabling` with the
+    // reason on it, where `GET …/app-users` shows it. Once the pool is empty a later pass
+    // finishes.
+    #[tokio::test]
+    async fn disable_keeps_a_pool_that_still_has_users() {
+        let s = setup(AppUsersStatus::Disabling).await;
+        s.with_pool();
+        let late = s.add_user("late@example.com");
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .expect("acked: retrying can't empty the pool");
+        assert!(s.pool_exists().await, "the pool was dropped with a user in it");
+        assert!(
+            !s.fake.calls().iter().any(|c| c.starts_with("DELETE ") && c.ends_with(&s.pool().to_string())),
+            "{:?}",
+            s.fake.calls()
+        );
+        {
+            let state = s.w.metadata.state();
+            let row = &state.project_auth[&s.project];
+            assert_eq!(row.status, AppUsersStatus::Disabling);
+            let error = row.error.as_deref().expect("the reason is on the row");
+            assert!(error.contains("1 user"), "{error}");
+        }
+        // The user is gone: the next pass finishes.
+        s.fake
+            .client()
+            .delete_user(&s.pool(), &late.to_string())
+            .await
+            .unwrap();
+        s.w.handle_app_users_job(&AppUsersJob::Disable {
+            project_id: s.project,
+        })
+        .await
+        .unwrap();
+        assert!(!s.pool_exists().await);
+        assert!(!s.w.metadata.state().project_auth.contains_key(&s.project));
+    }
 
     #[tokio::test]
     async fn disable_tears_down_revokes_drops_pool_and_row() {
