@@ -19,6 +19,10 @@ pub struct MemberToken {
     /// A member token's tenant (`tid`, #119).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    /// The identity session it was minted from (`sid`): a member's sockets from different
+    /// sessions never share a re-authorization answer.
+    #[serde(default)]
+    pub sid: String,
     /// Unix seconds.
     pub exp: u64,
     pub name: Option<String>,
@@ -69,6 +73,7 @@ impl TokenVerifier for MemberVerifier {
             Ok(c) => Ok(MemberToken {
                 sub: c.sub,
                 tenant_id: Some(c.tid),
+                sid: c.sid,
                 exp: c.exp,
                 name: Some(c.name).filter(|n| !n.is_empty()),
                 email: Some(c.email).filter(|e| !e.is_empty()),

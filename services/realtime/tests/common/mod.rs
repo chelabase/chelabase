@@ -63,13 +63,24 @@ pub fn token(sub: &str, exp_in: i64) -> String {
 }
 
 pub fn token_in(sub: &str, tenant: Uuid, exp_in: i64) -> String {
+    token_session(sub, tenant, &format!("sid-{sub}"), exp_in)
+}
+
+/// A member token for `sub` in `tenant` from identity session `sid`.
+pub fn token_session(sub: &str, tenant: Uuid, sid: &str, exp_in: i64) -> String {
     FakeVerifier::token(&MemberToken {
         sub: sub.into(),
         tenant_id: Some(tenant),
+        sid: sid.into(),
         exp: (now() as i64 + exp_in) as u64,
         name: Some(format!("Name {sub}")),
         email: Some(format!("{sub}@example.com")),
     })
+}
+
+/// The session a fake token names.
+pub fn sid_of(token: &str) -> Option<String> {
+    FakeVerifier::decode(token).map(|t| t.sid)
 }
 
 /// The sub a fake token names.
@@ -323,7 +334,7 @@ impl Harness {
             name: Some(format!("Name {sub}")),
         };
         self.signer
-            .sign_for_tenant("realtime", &identity, tenant)
+            .sign_for_tenant("realtime", &identity, tenant, &format!("sid-{sub}"))
             .unwrap()
     }
 
@@ -351,7 +362,9 @@ impl Harness {
     }
 
     pub async fn ticket_on(&self, rt: &Realtime, sub: &str, tenant: Uuid) -> String {
-        let (status, _, body) = self.post_ticket(rt, Some(&self.identity(sub, tenant))).await;
+        let (status, _, body) = self
+            .post_ticket(rt, Some(&self.identity(sub, tenant)))
+            .await;
         assert_eq!(status, 201, "ticket for {sub}: {body}");
         body["ticket"].as_str().expect("a ticket").to_string()
     }

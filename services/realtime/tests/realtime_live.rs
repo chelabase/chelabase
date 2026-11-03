@@ -336,7 +336,7 @@ impl Live {
             .header(
                 IDENTITY_HEADER,
                 self.signer
-                    .sign_for_tenant("realtime", &identity, member.tenant_id.expect("a tenant"))
+                    .sign_for_tenant("realtime", &identity, member.tenant_id.expect("a tenant"), &member.sid)
                     .unwrap(),
             )
             .send()

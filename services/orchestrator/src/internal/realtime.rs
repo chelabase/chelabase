@@ -10,8 +10,12 @@
 //!   the body's shape.
 //! - `POST /internal/realtime/projects {token}`: the projects (and their live databases) the
 //!   member may see, for realtime's project channels.
-//! - `POST /internal/realtime/member {sub, tenant_id}` (T8-1, D7): may this person get a Studio
-//!   ticket now? `{allowed}` (with `reason: "forbidden"` when not).
+//! - `POST /internal/realtime/member {sub, tenant_id, sid}` (T8-1, D7): may this person get a
+//!   Studio ticket now? `{allowed}` (with `reason: "forbidden"` when not).
+//!
+//! Every route that takes a member token, and `/member` with its `sid`, also requires the
+//! token's identity session to be live ([`crate::member_sessions`]): an ended one is
+//! `forbidden`, and identity unable to say is `unavailable`.
 //! - `POST /internal/realtime/visible {…}`: the owner's privilege probe and key conversion
 //!   (R19, W2, W4, P7, S12) on the console's owner pool, by relation OID with the keys bound.
 //!   With `convert: true` (T8, owner deletes) it only prints `keys` in the owner session's form
@@ -46,6 +50,7 @@ use uuid::Uuid;
 
 use super::BoxFuture;
 use crate::access::{Target, authorize};
+use crate::member_sessions::Liveness;
 use crate::{AppState, AuthPrincipal, JobPort, MetadataPort};
 use chelabase_routes::orchestrator as ep;
 
@@ -234,6 +239,12 @@ where
         MemberTokenError::Expired => Refusal::TokenExpired,
         MemberTokenError::Invalid => Refusal::Forbidden,
     })?;
+    // Review fix 1: an ended identity session (logout, a reset) refuses like a bad token.
+    match state.member_sessions.check(&claims.sub, Some(&claims.sid)).await {
+        Liveness::Live => {}
+        Liveness::Ended => return Err(Refusal::Forbidden),
+        Liveness::Unavailable => return Err(Refusal::Unavailable),
+    }
     match crate::read_only_member_principal(state, &claims).await {
         Ok(Some(principal)) => Ok((principal, claims)),
         Ok(None) => Err(Refusal::Forbidden),
@@ -430,13 +441,17 @@ struct MemberBody {
     sub: String,
     /// The member token's tenant (#119).
     tenant_id: Uuid,
+    /// The member token's identity session (review fix 1); none is refused.
+    #[serde(default)]
+    sid: Option<String>,
 }
 
 /// T8-1, D7: realtime asks before it issues a Studio ticket, with the gateway's identity
-/// (`sub`, `tenant_id`). `{allowed: true}` only for a member of that tenant in good standing
-/// (active, not offboarded); a suspended, offboarded, pending, invited or removed member, a
-/// person with no row, or an unknown tenant is `{allowed: false, reason: "forbidden"}`. The
-/// member is read, never made. A metadata failure is 503.
+/// (`sub`, `tenant_id`, and the member token's `sid`, which must be live). `{allowed: true}`
+/// only for a member of that tenant in good standing (active, not offboarded); a suspended,
+/// offboarded, pending, invited or removed member, a person with no row, an unknown tenant, or
+/// an ended session is `{allowed: false, reason: "forbidden"}`. The member is read, never made.
+/// A metadata failure, or identity unable to check the session, is 503.
 async fn member_route<M, J>(State(state): State<Arc<AppState<M, J>>>, bytes: Bytes) -> Response
 where
     M: MetadataPort,
@@ -451,6 +466,12 @@ where
     };
     if request.tenant_id.is_nil() {
         return refused();
+    }
+    // Review fix 1: an ended identity session gets no ticket.
+    match state.member_sessions.check(&request.sub, request.sid.as_deref()).await {
+        Liveness::Live => {}
+        Liveness::Ended => return refused(),
+        Liveness::Unavailable => return Refusal::Unavailable.response(),
     }
     // The membership read below is what admits it; an unknown tenant has none.
     let tenant = chelabase_types::TenantId(request.tenant_id);

@@ -24,7 +24,7 @@ async fn a_ticket_is_issued_only_to_a_member_the_orchestrator_lets_in() {
     assert_eq!(status, 201, "{body}");
     assert_eq!(
         h.orch.member_calls(),
-        vec![json!({ "sub": "ana", "tenant_id": TENANT })],
+        vec![json!({ "sub": "ana", "tenant_id": TENANT, "sid": "sid-ana" })],
         "the ticket route didn't ask the orchestrator"
     );
 

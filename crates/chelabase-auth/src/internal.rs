@@ -90,6 +90,10 @@ pub struct InternalClaims {
     pub email: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The member token's identity session (`sid`): the orchestrator checks it is still live.
+    /// Always set with `tenant_id`; `None` for a data key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 pub struct InternalSigner {
@@ -127,28 +131,34 @@ impl InternalSigner {
         self.sign_claims(audience, identity, None, issued_at)
     }
 
-    /// Sign for a member whose token named `tenant` (`tid`, #119); never the nil tenant.
+    /// Sign for a member whose token named `tenant` (`tid`, #119) and identity session `sid`;
+    /// never the nil tenant, never an empty session.
     pub fn sign_for_tenant(
         &self,
         audience: &str,
         identity: &Identity,
         tenant: Uuid,
+        sid: &str,
     ) -> Result<String, AuthError> {
         if tenant.is_nil() {
             return Err(AuthError::Config("a member identity names a tenant".into()));
         }
-        self.sign_claims(audience, identity, Some(tenant), now_secs())
+        if sid.trim().is_empty() {
+            return Err(AuthError::Config("a member identity names its session".into()));
+        }
+        self.sign_claims(audience, identity, Some((tenant, sid)), now_secs())
     }
 
     fn sign_claims(
         &self,
         audience: &str,
         identity: &Identity,
-        tenant_id: Option<Uuid>,
+        member: Option<(Uuid, &str)>,
         issued_at: u64,
     ) -> Result<String, AuthError> {
         let claims = InternalClaims {
-            tenant_id,
+            tenant_id: member.map(|(tenant, _)| tenant),
+            sid: member.map(|(_, sid)| sid.to_string()),
             iss: INTERNAL_ISSUER.to_string(),
             aud: audience.to_string(),
             iat: issued_at,

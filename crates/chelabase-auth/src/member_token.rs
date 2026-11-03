@@ -188,6 +188,8 @@ impl MemberTokenVerifier {
             && claims.aud == MEMBER_AUDIENCE
             && !claims.sub.is_empty()
             && !claims.tid.is_nil()
+            // The session is what logout and a reset end (the orchestrator checks it).
+            && !claims.sid.trim().is_empty()
             && claims.iat <= now + MEMBER_LEEWAY_SECS
             && claims.exp > claims.iat
             && claims.exp - claims.iat <= MEMBER_MAX_TTL_SECS;

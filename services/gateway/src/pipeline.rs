@@ -514,7 +514,7 @@ impl Pipeline {
             email: Some(claims.email).filter(|e| !e.is_empty()),
             name: Some(claims.name).filter(|n| !n.is_empty()),
         };
-        self.signer.sign_for_tenant(service.name(), &identity, claims.tid).map_err(|err| {
+        self.signer.sign_for_tenant(service.name(), &identity, claims.tid, &claims.sid).map_err(|err| {
             error!("mint internal identity: {err}");
             json_response(500, error_json("internal", "internal error"))
         })

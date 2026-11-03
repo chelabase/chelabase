@@ -195,7 +195,13 @@ impl Shared {
     /// cycle's cached one, so the member's other sockets don't act on a stale answer this
     /// cycle. Only answers about the member's access are kept (not an expired token's, not a
     /// transient `unavailable`).
-    pub fn fresh_answer(&self, sub: &str, target: &AuthTarget, outcome: &AuthorizeOutcome) {
+    pub fn fresh_answer(
+        &self,
+        sub: &str,
+        sid: &str,
+        target: &AuthTarget,
+        outcome: &AuthorizeOutcome,
+    ) {
         if matches!(
             outcome,
             AuthorizeOutcome::Allowed { .. }
@@ -206,7 +212,7 @@ impl Shared {
             self.cycle_cache
                 .lock()
                 .unwrap()
-                .put(sub, target, cycle, outcome.clone());
+                .put(sub, sid, target, cycle, outcome.clone());
         }
     }
 

@@ -310,6 +310,60 @@ async fn member_sign_in_cleanup() -> Vec<String> {
     failed
 }
 
+/// Review fix 1 against the stack, the review's own probe: a member token minted before logout
+/// stops working on the management API once the orchestrator's session-check window
+/// (`CHELABASE_MEMBER_SESSION_CHECK_SECS`, at most 30 s) has passed. Same setup and cleanup as
+/// [`member_sign_in_live`].
+#[tokio::test]
+#[ignore = "needs the workbench stack and the metadata database"]
+async fn member_token_stops_after_logout_live() {
+    let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
+    let stale = member_sign_in_cleanup().await;
+    assert!(stale.is_empty(), "cleaning up an earlier run: {stale:?}");
+    let run = email.clone();
+    let outcome = tokio::spawn(async move {
+        let email = run;
+        metadata_sql(&format!("UPDATE tenants SET open_signup = true WHERE id = '{DEMO_TENANT_ID}'")).await;
+        let creds = json!({"email": email, "password": STRONG});
+        let mut sign_up = creds.clone();
+        sign_up["givenName"] = json!("Live");
+        sign_up["familyName"] = json!("Logout");
+        assert_eq!(session_call("sign-up", None, Some(sign_up)).await.0, 200, "sign-up");
+        metadata_sql(&format!("UPDATE members SET status = 'active' WHERE tenant_id = '{DEMO_TENANT_ID}' AND email = '{email}'")).await;
+        let (status, body, cookie) = session_call("sign-in", None, Some(creds)).await;
+        assert_eq!((status, &body), (200, &json!({"next": "studio"})), "sign-in");
+        let cookie = cookie.expect("the session cookie");
+        let (status, body, _) = session_call("token", Some(&cookie), None).await;
+        assert_eq!(status, 200, "token: {body}");
+        let token = body["access_token"].as_str().expect("a token").to_string();
+        let me = || async { send(reqwest::Client::new().get(format!("{}/v1/me", gateway())).bearer_auth(&token)).await };
+        let (status, body) = me().await;
+        assert_eq!(status, 200, "/v1/me before logout: {body}");
+
+        assert_eq!(session_call("logout", Some(&cookie), Some(json!({}))).await.0, 200);
+        assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
+        // The token itself is still unexpired; the orchestrator refuses it once its cached
+        // "live" answer (from the call above) is older than the window. One call a second.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(35);
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        let mut last = (0, Value::Null);
+        while tokio::time::Instant::now() < deadline {
+            tick.tick().await;
+            last = me().await;
+            if last.0 != 200 {
+                break;
+            }
+        }
+        assert_eq!(last.0, 401, "/v1/me with the pre-logout token, past the window: {}", last.1);
+    })
+    .await;
+    let failed = member_sign_in_cleanup().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+    assert!(failed.is_empty(), "cleanup: {failed:?}");
+}
+
 /// #121 AC 1 against the stack: an open sign-up waits as pending, and once active the member signs
 /// in, gets a token the gateway and orchestrator accept, and loses it at logout. Open sign-up is
 /// switched on for the demo tenant meanwhile; [`member_sign_in_cleanup`] runs afterwards, pass or

@@ -270,6 +270,7 @@ fn the_identity_comes_from_the_gateway_claims() {
         data: None,
         email: Some("ana@example.com".into()),
         name: Some("Ana".into()),
+        sid: None,
     };
     assert_eq!(TicketIdentity::from_claims(&claims), ana());
     assert_eq!(ana().kind(), TicketKind::Studio);
