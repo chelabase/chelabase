@@ -321,9 +321,13 @@ const LIVE_MEMBERS: &str = "auth-live-member-%@example.com";
 /// midway: the demo tenant's open sign-up goes back first, then each member is removed through the
 /// API as an admin would (`access_events` is append-only and names the row, so it is never
 /// deleted), then their identity users go. Returns what failed.
-async fn member_sign_in_cleanup(was_open: bool) -> Vec<String> {
+///
+/// Open sign-up goes back to the demo tenant's baseline, `false` (the column's default; the
+/// seed never sets it), never to a value read at the start: a run killed after switching it on
+/// would otherwise make `true` the next run's "original".
+async fn member_sign_in_cleanup() -> Vec<String> {
     let mut failed = Vec::new();
-    if let Err(e) = try_metadata_sql(&format!("UPDATE tenants SET open_signup = {was_open} WHERE id = '{DEMO_TENANT_ID}'")).await {
+    if let Err(e) = try_metadata_sql(&format!("UPDATE tenants SET open_signup = false WHERE id = '{DEMO_TENANT_ID}'")).await {
         failed.push(e);
     }
     let ids = try_metadata_sql(&format!(
@@ -358,9 +362,8 @@ async fn member_sign_in_cleanup(was_open: bool) -> Vec<String> {
 #[ignore = "needs the workbench stack and the metadata database"]
 async fn member_sign_in_live() {
     let email = format!("auth-live-member-{}@example.com", &Uuid::new_v4().simple().to_string()[..12]);
-    let was_open = metadata_sql(&format!("SELECT open_signup FROM tenants WHERE id = '{DEMO_TENANT_ID}'")).await == "t";
     // Leftovers of an earlier run first: their pending rows and users would get in the way.
-    let stale = member_sign_in_cleanup(was_open).await;
+    let stale = member_sign_in_cleanup().await;
     assert!(stale.is_empty(), "cleaning up an earlier run: {stale:?}");
     let run = email.clone();
     let outcome = tokio::spawn(async move {
@@ -407,7 +410,7 @@ async fn member_sign_in_live() {
         assert_eq!(session_call("token", Some(&cookie), None).await.0, 401, "replayed after logout");
     })
     .await;
-    let failed = member_sign_in_cleanup(was_open).await;
+    let failed = member_sign_in_cleanup().await;
     if let Err(panic) = outcome {
         std::panic::resume_unwind(panic.into_panic());
     }

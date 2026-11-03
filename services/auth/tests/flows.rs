@@ -3508,6 +3508,47 @@ async fn setup_claim_bind_failure_deletes_user() {
     assert_eq!(h.users_with("first@example.com").await, 1);
 }
 
+// #121 audit S2: the bind failed and so did deleting the account. The claimant's retry with
+// the code and the same password heals the claim (`claimed` again for that user writes the
+// row), so the install keeps its admin. A wrong password heals nothing.
+#[tokio::test]
+async fn setup_claim_double_failure_heals_on_retry() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_signup_tenant(T1);
+    let body = json!({"email": "first@example.com", "password": PW, "givenName": "A", "familyName": "B", "setupCode": SETUP_CODE});
+    h.internal.set_claimed_status(Some(500));
+    h.identity.fail("DELETE /internal/v1/pools/members/users/", 503, "unavailable", 1);
+    let a = h.post("/auth/v1/sign-up", body.clone(), None, "2.2.3.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.users_with("first@example.com").await, 1, "the delete failed: the account stays");
+    h.internal.set_claimed_status(None);
+    let mut wrong = body.clone();
+    wrong["password"] = json!("Another-pass1");
+    let a = h.post("/auth/v1/sign-up", wrong, None, "2.2.3.2").await;
+    assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::CONFLICT, Some("email_taken")));
+    assert_eq!(h.internal.bodies(CLAIMED_CALL).len(), 1, "a wrong password claims nothing");
+    assert_eq!(h.sessions(), 0);
+    let a = h.post("/auth/v1/sign-up", body, None, "2.2.3.3").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "the retry heals");
+    let user = h.identity.client().search_users(&Pool::Members, "first@example.com", 10, 0).await.unwrap().users.remove(0);
+    assert_eq!(h.internal.bodies(CLAIMED_CALL).last().unwrap()["user_id"], json!(user.id));
+    let claims = h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await);
+    assert_eq!((claims.sub, claims.tid), (user.id, T1));
+}
+
+// #121 audit S1: with verification on, an open sign-up writes no row for an address nobody
+// has proven. The join waits for the verified email (m11's verify-email).
+#[tokio::test]
+async fn unverified_sign_up_writes_no_member_row() {
+    let h = harness().await; // verification on
+    h.internal.set_signup_tenant(T1);
+    let a = h.post("/auth/v1/sign-up", json!({"email": "victim@example.com", "password": PW, "givenName": "V", "familyName": "W"}), None, "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "verify"})));
+    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), Vec::<Value>::new(), "a pending row for an unverified address");
+    assert_eq!(h.users_with("victim@example.com").await, 1, "the account stays, waiting for its code");
+}
+
 // The loser of the claim race, and an open sign-up, wait as pending: the row is written at
 // sign-up, because a member token never makes one.
 #[tokio::test]

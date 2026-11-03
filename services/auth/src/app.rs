@@ -404,6 +404,9 @@ fn signed_in(s: &AppState, session: Session, redirect: String) -> Response {
 }
 
 /// The code step: the identity session waits in the step cookie, and no session cookie is set.
+/// The identity session is kept, sealed in the 10-minute step cookie: a verified code finishes
+/// the sign-in with it, since nothing at that step can make a session without the password.
+/// An abandoned step leaves it to expire on its own.
 fn verify_step(s: &AppState, signed: SignedIn) -> Response {
     let state = LoginState {
         auth_request: String::new(),
@@ -835,7 +838,14 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     };
     let user = match s.identity.create_user(&Pool::Members, &new).await {
         Ok(user) => user,
-        Err(IdentityError::Conflict(_)) => return taken(s, &email),
+        Err(IdentityError::Conflict(_)) => {
+            if let Some(nonce) = &nonce
+                && let Some(healed) = heal_claim(s, org, &email, &b.password, nonce).await
+            {
+                return healed;
+            }
+            return taken(s, &email);
+        }
         Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
@@ -851,11 +861,54 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         Ok(signed) => signed,
         Err(e) => return identity_unavailable(&e),
     };
+    signed_up(s, signed).await
+}
+
+/// The answer to a sign-up whose account is enrolled, from its first session.
+async fn signed_up(s: &AppState, signed: SignedIn) -> Response {
     match conclude(s, signed, None).await {
         Concluded::Answer(answer) => answer,
         // Enrolled a moment ago, and already out of the tenant.
         Concluded::Refused => error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
     }
+}
+
+/// A code-gated sign-up for an email that has an account: the claimant whose earlier attempt
+/// left the account behind (#121 audit S2: the bind or its row failed, and so did deleting
+/// the account). With that account's password, the claim is asked again for it, which writes
+/// the row that is missing, so the install isn't left without an admin. `None` for a wrong
+/// password (the caller answers as for any taken email); on a failed claim the account stays,
+/// because this sign-up didn't make it.
+async fn heal_claim(
+    s: &AppState,
+    org: &str,
+    email: &str,
+    password: &str,
+    nonce: &crate::app_users::internal::ClaimNonce,
+) -> Option<Response> {
+    let signed = match s.identity.sign_in(&Pool::Members, email, password).await {
+        Ok(signed) => signed,
+        Err(
+            IdentityError::BadCredentials
+            | IdentityError::Banned
+            | IdentityError::SessionRevoked
+            | IdentityError::Invalid { .. },
+        ) => return None,
+        Err(e) => return Some(identity_unavailable(&e)),
+    };
+    let claimed = match &s.signup_gate {
+        Some(gate) => gate.signup_claimed(org, &signed.user.id, nonce).await,
+        None => Err(crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into())),
+    };
+    match claimed {
+        Ok(bound) => info!(user_id = %signed.user.id, bound, "fresh-install claim, asked again for an existing account"),
+        Err(failed) => {
+            warn!(user_id = %signed.user.id, error = %failed, "asking the claim again failed");
+            drop_session(s, &signed.session_id).await;
+            return Some(refusal(failed).response());
+        }
+    }
+    Some(signed_up(s, signed).await)
 }
 
 /// Why the sign-up gate refused; [`Refusal::response`] is its answer.
@@ -942,6 +995,13 @@ async fn sign_up_gate(
 /// a `pending` row (a member token never makes one). `None` when that's done, the loser of the
 /// claim race included (they wait as pending). On any failure the account is deleted, so a
 /// retry with the same email can succeed, and the answer is why.
+///
+/// With email verification on, an open sign-up gets no row yet (#121 audit S1): a `pending`
+/// row for an address nobody proved would squat that email in the admins' request list.
+/// TODO(m11, #124): verify-email must join it. Once `codes/verify(kind: verify)` succeeds and
+/// the email is marked verified, call `signup_joined(org, user_id)` before [`conclude`] picks a
+/// tenant; `joined` re-asks the gate (sign-up may have closed meanwhile) and refuses an
+/// unverified user, so it must run after the email is marked verified.
 async fn enroll(
     s: &AppState,
     org: &str,
@@ -953,6 +1013,11 @@ async fn enroll(
         (Some(gate), Some(nonce)) => gate.signup_claimed(org, user_id, nonce).await.map(|bound| {
             info!(user_id, bound, "fresh-install claim");
         }),
+        // The join waits for the verified email: see above.
+        (Some(_), None) if !s.config.skip_email_verification => {
+            info!(user_id, "open sign-up: the row waits for the verified email");
+            Ok(())
+        }
         (Some(gate), None) => gate.signup_joined(org, user_id).await.and_then(|joined| {
             if joined {
                 Ok(())
@@ -969,11 +1034,17 @@ async fn enroll(
     if let Err(e) = s.identity.delete_user(&Pool::Members, user_id).await {
         warn!(user_id, error = %e, "deleting the unenrolled account failed");
     }
-    Some(match failed {
+    Some(refusal(failed))
+}
+
+/// Why the orchestrator refused to enroll an account.
+fn refusal(failed: crate::app_users::internal::InternalError) -> Refusal {
+    use crate::app_users::internal::InternalError;
+    match failed {
         InternalError::Refused { code, .. } if code == "sign_up_closed" => Refusal::Closed,
         InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
         InternalError::Unavailable(_) => Refusal::Unavailable,
-    })
+    }
 }
 
 /// Both fields default to empty, so a missing one is a `not_found` like a wrong one.
