@@ -30,7 +30,7 @@ Members and app users never share a pool, a signing key or a token audience.
 Email verification, password reset and invites use six-digit codes:
 
 - one live code per user and kind (`verify`, `reset`, `invite`); a new one replaces the old;
-- verification and reset codes last 15 minutes, invite codes 7 days; each takes at most 5 wrong guesses;
+- verification and reset codes last 15 minutes, invite codes 7 days, though the invite itself expires after 72 hours, which is the limit an invitee meets; each takes at most 5 wrong guesses;
 - a code is stored only as an HMAC-SHA256 under `identity/secret`, bound to the pool, the user, the kind and the user's current email, so changing the email kills every outstanding code;
 - `auth` issues at most 5 verification or reset codes an hour per person and kind. Invite codes come from the orchestrator and are limited there instead, to 5 invite sends (first invites and resends together) an hour per person.
 
