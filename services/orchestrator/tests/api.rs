@@ -17318,3 +17318,262 @@ async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
     assert_eq!(t.send(DEFAULT_SUB, Method::DELETE, &format!("/v1/invites/{invite}"), None).await.status(), 204);
     assert!(!t.mock.user_by_id(&zr).unwrap().inactive, "revoke: still a member elsewhere");
 }
+
+// --- #119: member tokens (the gateway's identity names a tenant, `tid`) ------------------------
+
+/// The gateway's identity for a member token of person `sub` naming `tenant`.
+fn member_identity_token(app: &TestApp, sub: &str, tenant: uuid::Uuid) -> String {
+    app.signer
+        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub, ""), tenant)
+        .unwrap()
+}
+
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
+async fn send_member(app: &TestApp, sub: &str, tenant: uuid::Uuid, method: Method, path: &str) -> reqwest::Response {
+    reqwest::Client::new()
+        .request(method, format!("{}{path}", app.base))
+        .header(IDENTITY_HEADER, member_identity_token(app, sub, tenant))
+        .send()
+        .await
+        .unwrap()
+}
+
+fn set_status(metadata: &FakeMetadata, tenant: TenantId, sub: &str, status: MemberStatus) {
+    let mut members = metadata.members.lock().unwrap();
+    let m = members.iter_mut().find(|m| m.tenant_id == tenant && m.identity_user_id == sub).unwrap();
+    m.status = status;
+}
+
+// AC 1 and AC 4: an active member reaches the route as that member of `tid`; once suspended in
+// metadata, the same (still valid) token is refused with 403, and once removed with today's
+// refusal for a removed member.
+#[tokio::test]
+async fn member_token_removed_member_403() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.add_granted(w.tenant, "rita", w.project, PlatformRole::Viewer, &[]);
+    let path = format!("/v1/databases/{}", w.db);
+    let tid = w.tenant.as_uuid();
+    assert_eq!(send_member(&w.app, "rita", tid, Method::GET, &path).await.status(), 200);
+    let me: Value = send_member(&w.app, "rita", tid, Method::GET, "/v1/me")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["member"]["status"], "active", "{me}");
+    assert_eq!(me["tenant_id"], json!(tid), "{me}");
+
+    set_status(&w.metadata, w.tenant, "rita", MemberStatus::Suspended);
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, &path).await, 403).await;
+    assert_eq!(code_of(&err), "member_suspended");
+
+    // A removed member is refused as today (`access::decide`: a removed member is told
+    // nothing exists, 404 on every tenant route).
+    set_status(&w.metadata, w.tenant, "rita", MemberStatus::Removed);
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, &path).await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    let err = error_of(send_member(&w.app, "rita", tid, Method::GET, "/v1/members").await, 404).await;
+    assert_eq!(code_of(&err), "not_found");
+    assert_eq!(w.metadata.member(w.tenant, "rita").unwrap().status, MemberStatus::Removed, "never reactivated");
+}
+
+// AC 5: `tid` names a tenant the subject isn't a member of: 403 and no member row, even with
+// open sign-up on and a recent admin claim (both would admit a newcomer on the Zitadel path).
+#[tokio::test]
+async fn member_token_wrong_tenant_403_no_jit() {
+    let w = member_world(Mode::SelfHosted).await;
+    w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
+    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
+    // A member of another tenant names this one.
+    let other = TenantId::new();
+    w.metadata.bind_org("org-2", other);
+    w.metadata.add_member(other, "mallory", MemberStatus::Active, true);
+    let before = (w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len());
+    let path = format!("/v1/databases/{}", w.db);
+    for sub in ["mallory", "newcomer"] {
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, &path).await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        let err = error_of(send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/members").await, 403).await;
+        assert_eq!(code_of(&err), "no_access_yet", "{sub}");
+        let me: Value = send_member(&w.app, sub, w.tenant.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+        assert!(me["member"].is_null(), "{sub}: {me}");
+        assert!(w.metadata.member(w.tenant, sub).is_none(), "{sub}: no member row");
+    }
+    assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
+    // mallory's own tenant still works for her.
+    let me: Value = send_member(&w.app, "mallory", other.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+    assert_eq!(me["member"]["status"], "active", "{me}");
+}
+
+// A tenant that no longer exists: 401, and nothing is written.
+#[tokio::test]
+async fn member_token_unknown_tenant_401() {
+    let w = member_world(Mode::SelfHosted).await;
+    let before = w.metadata.members.lock().unwrap().len();
+    let gone = uuid::Uuid::new_v4();
+    for path in ["/v1/me".to_string(), format!("/v1/databases/{}", w.db), "/v1/members".into()] {
+        let err = error_of(send_member(&w.app, DEFAULT_SUB, gone, Method::GET, &path).await, 401).await;
+        assert_eq!(code_of(&err), "unauthorized", "{path}");
+    }
+    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
+}
+
+// The Zitadel path is unchanged beside the member path: org-1's admin still passes, and the
+// same person by member token is the same member.
+#[tokio::test]
+async fn member_token_and_zitadel_token_are_the_same_member() {
+    let w = member_world(Mode::SelfHosted).await;
+    let path = format!("/v1/databases/{}", w.db);
+    assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
+    assert_eq!(send_member(&w.app, DEFAULT_SUB, w.tenant.as_uuid(), Method::GET, &path).await.status(), 200);
+}
+
+// `CHELABASE_OPERATOR_TENANT_ID`: in platform mode a member token naming the operator tenant
+// passes the instance check; the operator org's id as a tenant, or another tenant, doesn't.
+#[tokio::test]
+async fn operator_tenant_is_instance_admin_for_member_tokens() {
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let resp = send_member(&app, "op", ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
+    assert_eq!(resp.status(), 200);
+    let err = error_of(send_member(&app, DEFAULT_SUB, tenant.as_uuid(), Method::GET, INSTANCE_PROBE).await, 403).await;
+    assert_eq!(err["error"]["required"], "instance admin");
+    // The Zitadel path doesn't read the tenant setting: ops-org isn't the operator org.
+    let err = error_of(app.send_as("op", "ops-org", Method::GET, INSTANCE_PROBE, None).await, 403).await;
+    assert_eq!(err["error"]["required"], "instance admin");
+}
+
+// #119 on the realtime routes: a member token is verified here with the member key; the member
+// is read (never made) in the tenant `tid` names; `/internal/realtime/member` takes the
+// gateway identity's `tenant_id` instead of an org, never both.
+#[tokio::test]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
+async fn realtime_routes_take_member_tokens() {
+    use chelabase_auth::member_token::{MemberClaims, MemberTokenSigner, MemberTokenVerifier, MEMBER_AUDIENCE};
+    const ISSUER: &str = "http://auth.test";
+    let (private, public) = chelabase_auth::internal::generate_keypair_pem();
+    let signer = MemberTokenSigner::from_pem(private.as_bytes(), public.as_bytes(), ISSUER).unwrap();
+    let metadata = FakeMetadata::default();
+    let tenant = TenantId::new();
+    metadata.bind_org("org-1", tenant);
+    let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
+    metadata.add_granted(tenant, "rita", project, PlatformRole::Viewer, &[]);
+    metadata.add_granted(tenant, "sus", project, PlatformRole::Viewer, &[]);
+    metadata.set_member(tenant, "sus", |m| m.status = MemberStatus::Suspended);
+    let other = TenantId::new();
+    metadata.bind_org("org-2", other);
+    let app = spawn_app_member_tokens(
+        metadata.clone(),
+        Mode::SelfHosted,
+        MemberTokenVerifier::from_pem(public.as_bytes(), ISSUER).unwrap(),
+    )
+    .await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let token = |sub: &str, tid: uuid::Uuid| {
+        signer
+            .sign(&MemberClaims {
+                iss: ISSUER.into(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: sub.into(),
+                tid,
+                sid: "s".into(),
+                email: format!("{sub}@example.test"),
+                name: sub.into(),
+                iat: now,
+                exp: now + 300,
+            })
+            .unwrap()
+    };
+    let post = |path: &'static str, body: Value| {
+        let base = app.base.clone();
+        async move {
+            let resp = reqwest::Client::new()
+                .post(format!("{base}{path}"))
+                .bearer_auth(REALTIME_TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status().as_u16();
+            (status, resp.json::<Value>().await.unwrap_or(Value::Null))
+        }
+    };
+    const PROJECTS: &str = "/internal/realtime/projects";
+    const MEMBER: &str = "/internal/realtime/member";
+
+    let (status, body) = post(PROJECTS, json!({ "token": token("rita", tenant.as_uuid()) })).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["tenant_id"], json!(tenant.as_uuid()), "{body}");
+    // Another tenant (rita isn't a member there), an unknown tenant, a suspended member, and a
+    // token from another key are refused; nothing is created.
+    let members_before = metadata.members.lock().unwrap().len();
+    let (o_private, o_public) = chelabase_auth::internal::generate_keypair_pem();
+    let foreign = MemberTokenSigner::from_pem(o_private.as_bytes(), o_public.as_bytes(), ISSUER).unwrap();
+    let forged = foreign
+        .sign(&MemberClaims {
+            iss: ISSUER.into(),
+            aud: MEMBER_AUDIENCE.into(),
+            sub: "rita".into(),
+            tid: tenant.as_uuid(),
+            sid: "s".into(),
+            email: "r@x".into(),
+            name: "r".into(),
+            iat: now,
+            exp: now + 300,
+        })
+        .unwrap();
+    for (what, t) in [
+        ("other tenant", token("rita", other.as_uuid())),
+        ("unknown tenant", token("rita", uuid::Uuid::new_v4())),
+        ("suspended", token("sus", tenant.as_uuid())),
+        ("foreign key", forged),
+    ] {
+        let (status, body) = post(PROJECTS, json!({ "token": t })).await;
+        assert_ne!(status, 200, "{what}: {body}");
+    }
+    assert_eq!(metadata.members.lock().unwrap().len(), members_before);
+
+    let ask = |body: Value| post(MEMBER, body);
+    let (status, body) = ask(json!({ "sub": "rita", "tenant_id": tenant.as_uuid() })).await;
+    assert_eq!((status, body["allowed"].clone()), (200, json!(true)), "{body}");
+    for (what, b) in [
+        ("suspended", json!({ "sub": "sus", "tenant_id": tenant.as_uuid() })),
+        ("other tenant", json!({ "sub": "rita", "tenant_id": other.as_uuid() })),
+        ("unknown tenant", json!({ "sub": "rita", "tenant_id": uuid::Uuid::new_v4() })),
+        ("both", json!({ "sub": "rita", "tenant_id": tenant.as_uuid(), "org_id": "org-1" })),
+        ("neither", json!({ "sub": "rita" })),
+    ] {
+        let (status, body) = ask(b).await;
+        assert_eq!((status, body["allowed"].clone()), (200, json!(false)), "{what}: {body}");
+    }
+    // The Zitadel shape still works.
+    let (_, body) = ask(json!({ "sub": "rita", "org_id": "org-1" })).await;
+    assert_eq!(body["allowed"], json!(true), "{body}");
+}
+
+// `tid` is never trusted alone: naming the operator tenant makes no one an operator without an
+// active membership there, on the instance check and on `/v1/me` alike.
+#[tokio::test]
+async fn operator_tenant_needs_an_active_membership() {
+    let metadata = FakeMetadata::default();
+    let ops = TenantId::new();
+    metadata.bind_org("ops-org", ops);
+    metadata.add_member(ops, "op", MemberStatus::Active, false);
+    metadata.add_member(ops, "sus", MemberStatus::Suspended, false);
+    metadata.add_member(ops, "off", MemberStatus::Active, false);
+    metadata.set_member(ops, "off", |m| m.offboarded = true);
+    let app = spawn_app_operator_tenant(metadata.clone(), Mode::Platform, Some(ops)).await;
+    let before = metadata.members.lock().unwrap().len();
+    assert_eq!(send_member(&app, "op", ops.as_uuid(), Method::GET, INSTANCE_PROBE).await.status(), 200);
+    for sub in ["stranger", "sus", "off"] {
+        let resp = send_member(&app, sub, ops.as_uuid(), Method::GET, INSTANCE_PROBE).await;
+        assert_eq!(resp.status(), 403, "{sub}");
+        let me: Value = send_member(&app, sub, ops.as_uuid(), Method::GET, "/v1/me").await.json().await.unwrap();
+        assert_eq!(me["instance_admin"], json!(false), "{sub}: {me}");
+    }
+    assert_eq!(metadata.members.lock().unwrap().len(), before, "nothing is admitted");
+}

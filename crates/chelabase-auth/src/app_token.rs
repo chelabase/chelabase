@@ -54,7 +54,7 @@ pub fn kid_for(raw_public: &[u8; 32]) -> String {
 }
 
 /// The raw 32-byte key out of an Ed25519 SPKI PEM (44 bytes of DER; the key is the last 32).
-fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
+pub(crate) fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
     let text = std::str::from_utf8(public_pem)
         .map_err(|e| AuthError::Config(format!("app public key: {e}")))?;
     let body: String = text
@@ -76,7 +76,7 @@ fn raw_public(public_pem: &[u8]) -> Result<[u8; 32], AuthError> {
     Ok(raw)
 }
 
-fn read(path: &Path) -> Result<Vec<u8>, AuthError> {
+pub(crate) fn read(path: &Path) -> Result<Vec<u8>, AuthError> {
     std::fs::read(path).map_err(|e| AuthError::Config(format!("read {}: {e}", path.display())))
 }
 

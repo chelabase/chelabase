@@ -30,6 +30,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router, middleware};
+use chelabase_auth::member_token::{member_shaped, MemberTokenError, MemberTokenVerifier};
 use chelabase_auth::{AuthError, JwtVerifier, VerifiedClaims};
 
 use chelabase_metadata::{BranchDatabase, BranchKind, BranchRecord, BranchStatus, DataApiState, DatabaseRecord};
@@ -80,6 +81,9 @@ impl RtEvents for async_nats::Client {
 pub struct RealtimeAuth {
     pub token: String,
     pub verifier: JwtVerifier,
+    /// Member tokens signed by auth (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119). Every EdDSA token
+    /// is decided here alone; `None` refuses them all.
+    pub member: Option<MemberTokenVerifier>,
 }
 
 /// Shared by both states.
@@ -250,6 +254,29 @@ where
     M: MetadataPort,
     J: JobPort,
 {
+    if member_shaped(token) {
+        // #119: never falls through to the Zitadel verifier.
+        let member = state.realtime.member.as_ref().ok_or(Refusal::Forbidden)?;
+        let claims = member.verify(token).map_err(|err| match err {
+            MemberTokenError::Expired => Refusal::TokenExpired,
+            MemberTokenError::Invalid => Refusal::Forbidden,
+        })?;
+        let verified = VerifiedClaims {
+            sub: claims.sub.clone(),
+            org_id: String::new(),
+            email: Some(claims.email.clone()).filter(|e| !e.is_empty()),
+            name: Some(claims.name.clone()).filter(|n| !n.is_empty()),
+            exp: claims.exp,
+        };
+        return match crate::read_only_member_principal(state, &claims).await {
+            Ok(Some(principal)) => Ok((principal, verified)),
+            Ok(None) => Err(Refusal::Forbidden),
+            Err(err) => {
+                warn!("realtime: reading the member failed: {err}");
+                Err(Refusal::Unavailable)
+            }
+        };
+    }
     let claims = verify(&state.realtime.verifier, token).await?;
     match crate::read_only_principal(state, &claims).await {
         Ok(Some(principal)) => Ok((principal, claims)),
@@ -446,7 +473,12 @@ where
 #[serde(deny_unknown_fields)]
 struct MemberBody {
     sub: String,
+    /// The Zitadel path's org; empty for a member token's identity.
+    #[serde(default)]
     org_id: String,
+    /// A member token's tenant (#119); never beside an org.
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
 }
 
 /// T8-1, D7: realtime asks before it issues a Studio ticket, with the gateway's identity
@@ -466,7 +498,13 @@ where
     let refused = || {
         Json(json!({ "allowed": false, "reason": Refusal::Forbidden.reason() })).into_response()
     };
-    let tenant = match state.metadata.get_tenant_by_zitadel_org_id(&request.org_id).await {
+    let lookup = match (request.tenant_id, request.org_id.is_empty()) {
+        // The membership read below is what admits it; an unknown tenant has none.
+        (Some(tenant), true) => Ok(Some(chelabase_types::TenantId(tenant))),
+        (None, false) => state.metadata.get_tenant_by_zitadel_org_id(&request.org_id).await,
+        _ => return refused(),
+    };
+    let tenant = match lookup {
         Ok(Some(tenant)) => tenant,
         Ok(None) => return refused(),
         Err(err) => {

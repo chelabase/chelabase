@@ -18,6 +18,7 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 pub mod app_token;
+pub mod member_token;
 pub mod internal;
 
 /// Zitadel org id claim (when asserted via org-scoped flows).

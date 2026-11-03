@@ -8,6 +8,7 @@ use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
 use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
+use chelabase_auth::member_token::{member_shaped, MemberTokenError, MemberTokenVerifier};
 use chelabase_auth::{AuthError, JwtVerifier};
 use chelabase_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
 use chelabase_types::data_key::DataKeyKind;
@@ -122,6 +123,8 @@ pub struct Pipeline {
     /// The one origin Studio CORS allows (`<scheme>://<studio host>`).
     studio_origin: String,
     verifier: JwtVerifier,
+    /// Member tokens signed by auth (#119); `None` refuses every EdDSA bearer.
+    members: Option<MemberTokenVerifier>,
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
     users: Arc<UserTokens>,
@@ -147,11 +150,18 @@ impl Pipeline {
             registry,
             studio_origin,
             verifier,
+            members: None,
             signer,
             keys,
             users,
             ready_seen: std::sync::atomic::AtomicU8::new(READY_UNKNOWN),
         }
+    }
+
+    /// Verify member tokens (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119) before Zitadel's.
+    pub fn with_member_tokens(mut self, members: Option<MemberTokenVerifier>) -> Self {
+        self.members = members;
+        self
     }
 
     pub async fn handle(&self, req: &RequestParts<'_>) -> Handled {
@@ -481,6 +491,11 @@ impl Pipeline {
     }
 
     /// Verify the management token and mint an internal identity for `service`.
+    ///
+    /// #119: an EdDSA bearer is a member token and only the member verifier decides it: any
+    /// refusal there is 401 and never falls through to Zitadel (whose tokens are RS256). A
+    /// member names its tenant (`tid`) and no org; the orchestrator still requires an active
+    /// membership there. Zitadel tokens keep their path until m13.
     async fn authenticate(
         &self,
         service: Service,
@@ -488,6 +503,28 @@ impl Pipeline {
         request_id: &str,
     ) -> Result<String, GatewayResponse> {
         let token = bearer_token(headers).ok_or_else(|| unauthorized(&AuthError::Unauthorized))?;
+        if member_shaped(token) {
+            let Some(members) = &self.members else {
+                return Err(unauthorized(&AuthError::InvalidToken("member tokens aren't accepted here".into())));
+            };
+            let claims = members.verify(token).map_err(|err| match err {
+                MemberTokenError::Expired => unauthorized(&AuthError::Expired),
+                MemberTokenError::Invalid => unauthorized(&AuthError::InvalidToken("not a valid member token".into())),
+            })?;
+            let identity = Identity {
+                sub: claims.sub,
+                org_id: String::new(),
+                auth: AuthMethod::ManagementJwt,
+                request_id: request_id.to_string(),
+                data: None,
+                email: Some(claims.email).filter(|e| !e.is_empty()),
+                name: Some(claims.name).filter(|n| !n.is_empty()),
+            };
+            return self.signer.sign_for_tenant(service.name(), &identity, claims.tid).map_err(|err| {
+                error!("mint internal identity: {err}");
+                json_response(500, error_json("internal", "internal error"))
+            });
+        }
         let claims = self.verifier.verify(token).await.map_err(|err| match err {
             AuthError::Unauthorized | AuthError::InvalidToken(_) | AuthError::Expired => unauthorized(&err),
             AuthError::Jwks(_) | AuthError::Config(_) => {

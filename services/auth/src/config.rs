@@ -367,9 +367,119 @@ impl AppConfig {
     }
 }
 
+/// #119: auth's member-token keys (`auth/member-jwt.{key,pub}`) and lifetime.
+#[derive(Debug, Clone)]
+pub struct MemberTokenConfig {
+    /// `CHELABASE_MEMBER_JWT_PRIVATE_KEY`: the PKCS#8 signing key (auth only).
+    pub private_key: PathBuf,
+    /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY`: its public half (gives the tokens' `kid`).
+    pub public_key: PathBuf,
+    /// `CHELABASE_MEMBER_ACCESS_TTL_SECS`: 300 unless set, from 60 to 900.
+    pub ttl: Duration,
+}
+
+pub const DEFAULT_MEMBER_ACCESS_TTL_SECS: u64 = chelabase_auth::member_token::MEMBER_DEFAULT_TTL_SECS;
+
+impl MemberTokenConfig {
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Both keys or neither (`None`: auth signs no member tokens); one alone refuses to start.
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        const PRIVATE: &str = "CHELABASE_MEMBER_JWT_PRIVATE_KEY";
+        const PUBLIC: &str = "CHELABASE_MEMBER_JWT_PUBLIC_KEY";
+        const TTL: &str = "CHELABASE_MEMBER_ACCESS_TTL_SECS";
+        let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+        let (private_key, public_key) = match (get(PRIVATE), get(PUBLIC)) {
+            (None, None) => return Ok(None),
+            (Some(k), Some(p)) => (PathBuf::from(k), PathBuf::from(p)),
+            (Some(_), None) => anyhow::bail!("{PRIVATE} is set without {PUBLIC}"),
+            (None, Some(_)) => anyhow::bail!("{PUBLIC} is set without {PRIVATE}"),
+        };
+        let max = chelabase_auth::member_token::MEMBER_MAX_TTL_SECS;
+        let ttl = match get(TTL) {
+            None => DEFAULT_MEMBER_ACCESS_TTL_SECS,
+            Some(v) => v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (60..=max).contains(n))
+                .with_context(|| format!("{TTL}={v}: expected seconds from 60 to {max}"))?,
+        };
+        Ok(Some(Self { private_key, public_key, ttl: Duration::from_secs(ttl) }))
+    }
+}
+
+/// #119: auth's identity-service client, from `CHELABASE_IDENTITY_URL` and
+/// `CHELABASE_IDENTITY_TOKEN_FILE` (`tokens/auth-identity.token`): both or neither (`None`);
+/// one alone, or an unreadable or empty token file, refuses to start.
+pub fn identity_from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<chelabase_identity::Identity>> {
+    const URL: &str = "CHELABASE_IDENTITY_URL";
+    const TOKEN: &str = "CHELABASE_IDENTITY_TOKEN_FILE";
+    let get = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    match (get(URL), get(TOKEN)) {
+        (None, None) => Ok(None),
+        (Some(url), Some(file)) => chelabase_identity::Identity::from_token_file(&url, std::path::Path::new(&file))
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("{TOKEN}: {e}")),
+        (Some(_), None) => anyhow::bail!("{URL} is set without {TOKEN}"),
+        (None, Some(_)) => anyhow::bail!("{TOKEN} is set without {URL}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn member_vars(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> + use<> {
+        let pairs: Vec<(&'static str, &'static str)> = pairs.to_vec();
+        move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| v.to_string())
+    }
+
+    // #119: the member-token pair is both or neither; the TTL is 300 s unless set, 60..=900.
+    #[test]
+    fn member_token_config_is_both_keys_and_a_bounded_ttl() {
+        assert!(MemberTokenConfig::from_lookup(member_vars(&[])).unwrap().is_none());
+        let keys = [
+            ("CHELABASE_MEMBER_JWT_PRIVATE_KEY", "/s/auth/member-jwt.key"),
+            ("CHELABASE_MEMBER_JWT_PUBLIC_KEY", "/s/auth/member-jwt.pub"),
+        ];
+        let c = MemberTokenConfig::from_lookup(member_vars(&keys)).unwrap().unwrap();
+        assert_eq!(c.private_key, PathBuf::from("/s/auth/member-jwt.key"));
+        assert_eq!(c.public_key, PathBuf::from("/s/auth/member-jwt.pub"));
+        assert_eq!(c.ttl, Duration::from_secs(300));
+        for (one, missing) in [(keys[0], keys[1].0), (keys[1], keys[0].0)] {
+            let err = MemberTokenConfig::from_lookup(member_vars(&[one])).unwrap_err().to_string();
+            assert!(err.contains(missing), "{err}");
+        }
+        for (ttl, ok) in [("60", true), ("900", true), ("901", false), ("59", false), ("soon", false)] {
+            let mut v = keys.to_vec();
+            v.push(("CHELABASE_MEMBER_ACCESS_TTL_SECS", ttl));
+            let got = MemberTokenConfig::from_lookup(member_vars(&v));
+            assert_eq!(got.is_ok(), ok, "{ttl}");
+            if ok {
+                assert_eq!(got.unwrap().unwrap().ttl.as_secs(), ttl.parse::<u64>().unwrap());
+            }
+        }
+    }
+
+    // #119: auth's identity client is the URL and its token file, both or neither.
+    #[test]
+    fn the_identity_client_needs_its_url_and_token_file() {
+        assert!(identity_from_lookup(member_vars(&[])).unwrap().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("auth-identity.token");
+        std::fs::write(&file, "tok\n").unwrap();
+        let path: &'static str = Box::leak(file.to_str().unwrap().to_string().into_boxed_str());
+        let both = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", path)];
+        assert!(identity_from_lookup(member_vars(&both)).unwrap().is_some());
+        for (one, missing) in [(both[0], both[1].0), (both[1], both[0].0)] {
+            let err = identity_from_lookup(member_vars(&[one])).unwrap_err().to_string();
+            assert!(err.contains(missing), "{err}");
+        }
+        let gone = [("CHELABASE_IDENTITY_URL", "http://identity:8080"), ("CHELABASE_IDENTITY_TOKEN_FILE", "/nonexistent/t")];
+        assert!(identity_from_lookup(vars(&gone)).is_err());
+    }
 
     // m13 audit N2: how auth builds `Config.zitadel` (sign-in, invites, app users' admin calls).
     #[test]

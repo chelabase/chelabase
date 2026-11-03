@@ -25,6 +25,7 @@ fn ticket() -> TicketIdentity {
     TicketIdentity {
         sub: "ana".into(),
         org_id: "org-1".into(),
+        tenant_id: None,
         auth: AuthMethod::ManagementJwt,
         email: None,
         name: None,
@@ -36,6 +37,7 @@ fn token(sub: &str, org: &str, exp: u64) -> MemberToken {
     MemberToken {
         sub: sub.into(),
         org_id: org.into(),
+        tenant_id: None,
         exp,
         name: None,
         email: None,
@@ -110,6 +112,7 @@ async fn the_oidc_verifier_returns_the_members_exp() {
         MemberToken {
             sub: "ana".into(),
             org_id: "org-1".into(),
+            tenant_id: None,
             exp: exp as u64,
             name: Some("Ana".into()),
             email: Some("ana@example.com".into()),

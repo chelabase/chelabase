@@ -1413,3 +1413,179 @@ async fn an_app_server_forwards_its_users_address_with_the_secret_key() {
     assert!(!saw.contains_key("chelabase-server-key") && !saw.contains_key("chelabase-client-ip"));
     assert_eq!(saw["x-forwarded-for"], "127.0.0.1");
 }
+
+// #119: member tokens signed by auth (`auth/member-jwt.key`), verified with the public key.
+mod member_tokens {
+    use super::*;
+    use chelabase_auth::app_token::{app_audience, AppClaims, AppTokenSigner, APP_ISSUER};
+    use chelabase_auth::member_token::{MemberClaims, MemberTokenSigner, MEMBER_AUDIENCE};
+    use uuid::Uuid;
+
+    struct MemberStack {
+        base: String,
+        jwks: MockJwks,
+        verify: InternalVerifier,
+        seen: Seen,
+        signer: MemberTokenSigner,
+        _keys: tempfile::TempDir,
+        _gateway: GatewayProcess,
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    }
+
+    /// A gateway with `CHELABASE_MEMBER_JWT_PUBLIC_KEY` set (`with_key`) or unset.
+    async fn member_stack(with_key: bool) -> MemberStack {
+        let jwks = MockJwks::start().await;
+        let (upstream, seen) = spawn_upstream().await;
+        let (private, public) = generate_keypair_pem();
+        let keys = tempfile::tempdir().unwrap();
+        let public_path = keys.path().join("member-jwt.pub");
+        std::fs::write(&public_path, &public).unwrap();
+        let path = public_path.to_str().unwrap().to_string();
+        let env: Vec<(&str, &str)> =
+            if with_key { vec![("CHELABASE_MEMBER_JWT_PUBLIC_KEY", path.as_str())] } else { vec![] };
+        let (base, verify, gateway) = spawn_gateway_with(&upstream, &jwks, &env).await;
+        let signer = MemberTokenSigner::from_pem(private.as_bytes(), public.as_bytes(), jwks.issuer()).unwrap();
+        MemberStack { base, jwks, verify, seen, signer, _keys: keys, _gateway: gateway }
+    }
+
+    impl MemberStack {
+        fn claims(&self, tid: Uuid) -> MemberClaims {
+            MemberClaims {
+                iss: self.jwks.issuer().to_string(),
+                aud: MEMBER_AUDIENCE.into(),
+                sub: "user_ana".into(),
+                tid,
+                sid: "sess_1".into(),
+                email: "ana@example.com".into(),
+                name: "Ana Lima".into(),
+                iat: now(),
+                exp: now() + 300,
+            }
+        }
+
+        async fn post(&self, bearer: &str) -> reqwest::Response {
+            reqwest::Client::new()
+                .post(format!("{}/v1/databases", self.base))
+                .header("authorization", format!("Bearer {bearer}"))
+                .json(&serde_json::json!({ "name": "demo" }))
+                .send()
+                .await
+                .unwrap()
+        }
+
+        fn upstream_saw(&self) -> Option<HashMap<String, String>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    // AC 1: the request reaches the orchestrator as that member of tenant `tid`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_token_reaches_orchestrator() {
+        let stack = member_stack(true).await;
+        let tid = Uuid::new_v4();
+        let token = stack.signer.sign(&stack.claims(tid)).unwrap();
+        let resp = stack.post(&token).await;
+        assert_eq!(resp.status(), 200);
+        let seen = stack.upstream_saw().expect("upstream was called");
+        assert!(!seen.contains_key("authorization"));
+        let claims = stack.verify.verify(&seen[IDENTITY_HEADER], "orchestrator").unwrap();
+        assert_eq!(claims.sub, "user_ana");
+        assert_eq!(claims.tenant_id, Some(tid));
+        assert_eq!(claims.org_id, "", "a member token names no Zitadel org");
+        assert_eq!(claims.auth, chelabase_auth::internal::AuthMethod::ManagementJwt);
+        assert_eq!(claims.email.as_deref(), Some("ana@example.com"));
+        assert_eq!(claims.name.as_deref(), Some("Ana Lima"));
+    }
+
+    // AC 7: a Zitadel token still works with the member verifier configured, and names no
+    // tenant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zitadel_token_still_accepted() {
+        let stack = member_stack(true).await;
+        let resp = stack.post(&stack.jwks.token_for_org("user-1", "org-1", 300)).await;
+        assert_eq!(resp.status(), 200);
+        let seen = stack.upstream_saw().expect("upstream was called");
+        let claims = stack.verify.verify(&seen[IDENTITY_HEADER], "orchestrator").unwrap();
+        assert_eq!(claims.org_id, "org-1");
+        assert_eq!(claims.tenant_id, None);
+    }
+
+    // AC 2, AC 3, AC 6 at the gateway: each is 401 and never proxied, and no EdDSA token falls
+    // through to the Zitadel path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bad_member_tokens_are_401_and_never_proxied() {
+        let stack = member_stack(true).await;
+        let tid = Uuid::new_v4();
+        let mut bad: Vec<(&str, String)> = Vec::new();
+
+        let (other_private, other_public) = generate_keypair_pem();
+        let foreign = MemberTokenSigner::from_pem(other_private.as_bytes(), other_public.as_bytes(), stack.jwks.issuer()).unwrap();
+        bad.push(("foreign key", foreign.sign(&stack.claims(tid)).unwrap()));
+
+        let mut wrong_aud = stack.claims(tid);
+        wrong_aud.aud = app_audience(Uuid::new_v4());
+        bad.push(("aud", stack.signer.sign(&wrong_aud).unwrap()));
+        let mut wrong_iss = stack.claims(tid);
+        wrong_iss.iss = "http://evil.example".into();
+        bad.push(("iss", stack.signer.sign(&wrong_iss).unwrap()));
+        let mut expired = stack.claims(tid);
+        expired.iat = now() - 400;
+        expired.exp = now() - 31;
+        bad.push(("expired", stack.signer.sign(&expired).unwrap()));
+
+        let project = Uuid::new_v4();
+        let app = AppClaims {
+            iss: APP_ISSUER.into(),
+            aud: app_audience(project),
+            sub: Uuid::new_v4(),
+            sid: Uuid::new_v4(),
+            project,
+            email: "a@example.com".into(),
+            email_verified: true,
+            role: "authenticated".into(),
+            iat: now(),
+            exp: now() + 300,
+        };
+        let (app_private, app_public) = generate_keypair_pem();
+        let app_signer = AppTokenSigner::from_pem(app_private.as_bytes(), app_public.as_bytes()).unwrap();
+        bad.push(("app token", app_signer.sign(&app).unwrap()));
+
+        // The gateway's own internal token, minted by another gateway key.
+        let (gw_private, _) = generate_keypair_pem();
+        let internal = chelabase_auth::internal::InternalSigner::from_pem(gw_private.as_bytes()).unwrap();
+        let identity = chelabase_auth::internal::Identity {
+            sub: "user_ana".into(),
+            org_id: String::new(),
+            auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
+            request_id: "r".into(),
+            data: None,
+            email: None,
+            name: None,
+        };
+        bad.push(("internal token", internal.sign_for_tenant("orchestrator", &identity, tid).unwrap()));
+
+        // `alg: none` (`{"alg":"none"}`) over a good token's payload.
+        let good = stack.signer.sign(&stack.claims(tid)).unwrap();
+        let payload = good.split('.').nth(1).unwrap();
+        bad.push(("alg none", format!("eyJhbGciOiJub25lIn0.{payload}.")));
+
+        for (what, token) in bad {
+            let resp = stack.post(&token).await;
+            assert_eq!(resp.status(), 401, "{what}");
+            assert!(stack.upstream_saw().is_none(), "{what} was proxied");
+        }
+    }
+
+    // Without the member key, a member token is refused; it never reaches the Zitadel path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn member_token_without_the_key_is_401() {
+        let stack = member_stack(false).await;
+        let token = stack.signer.sign(&stack.claims(Uuid::new_v4())).unwrap();
+        assert_eq!(stack.post(&token).await.status(), 401);
+        assert!(stack.upstream_saw().is_none());
+        assert_eq!(stack.post(&stack.jwks.token_for_org("user-1", "org-1", 300)).await.status(), 200);
+    }
+}
