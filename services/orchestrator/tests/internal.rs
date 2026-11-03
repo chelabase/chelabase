@@ -22,7 +22,6 @@ use chelabase_zitadel::client::Zitadel;
 use chelabase_identity::Pool;
 use uuid::Uuid;
 use chelabase_identity::mock::FakeIdentity;
-use chelabase_zitadel::mock::MockZitadel;
 use orchestrator::internal::app::AppJobPort;
 use chelabase_secrets::{Purpose, SecretKey, seal_credential};
 use chelabase_types::BranchId;
@@ -4172,7 +4171,7 @@ struct AppApp {
     rt_events: FakeRtEvents,
 }
 
-async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<&MockZitadel>) -> AppApp {
+async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, identity: Option<chelabase_identity::Identity>) -> AppApp {
     let jobs = FakeJobs::default();
     let rt_events = FakeRtEvents::default();
     let app = spawn_with_app(
@@ -4185,8 +4184,8 @@ async fn spawn_app(world: &AppWorld, signing_key: Option<&str>, zitadel: Option<
         AppSetup {
             key: world.key.clone(),
             signing_key: signing_key.map(Into::into),
-            zitadel: zitadel.map(|z| z.base.clone()),
-            identity: None,
+            zitadel: None,
+            identity,
             jobs: jobs.clone(),
             resync: FakeResync::default(),
             mode: Mode::SelfHosted,
@@ -4328,18 +4327,60 @@ fn sha256(s: &str) -> [u8; 32] {
     Sha256::digest(s.as_bytes()).into()
 }
 
-/// A Zitadel mock holding session `id` of some user.
-async fn zitadel_with_sessions(ids: &[&str]) -> MockZitadel {
-    let z = MockZitadel::start().await;
-    {
-        let mut inner = z.inner.lock().unwrap();
-        for id in ids {
-            inner
-                .sessions
-                .insert((*id).into(), ("u1".into(), format!("tok-{id}")));
-        }
+/// #123: an identity fake whose app pool for `project` holds one session of one user per name;
+/// the app sessions the tests make name these as their `identity_session_id`.
+struct IdSessions {
+    fake: FakeIdentity,
+    pool: Pool,
+    ids: std::collections::HashMap<String, String>,
+}
+
+async fn identity_with_sessions(project: ProjectId, names: &[&str]) -> IdSessions {
+    let fake = FakeIdentity::start().await;
+    let pool = Pool::App(project.as_uuid());
+    let user = fake.with_user(&pool, "u1@example.com", "password-u1");
+    let ids = names
+        .iter()
+        .map(|n| ((*n).to_string(), fake.with_session(&pool, &user).0))
+        .collect();
+    IdSessions { fake, pool, ids }
+}
+
+impl IdSessions {
+    fn id(&self, name: &str) -> &str {
+        &self.ids[name]
     }
-    z
+    fn client(&self) -> Option<chelabase_identity::Identity> {
+        Some(self.fake.client())
+    }
+    fn count(&self) -> usize {
+        self.fake.session_count(&self.pool)
+    }
+    /// The identity session revokes asked for, by name.
+    fn revoked(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .fake
+            .calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix(&format!("DELETE /internal/v1/pools/{}/sessions/", self.pool)))
+            .filter_map(|id| self.ids.iter().find(|(_, v)| v.as_str() == id).map(|(k, _)| k.clone()))
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// An identity client whose service accepts connections and never answers.
+async fn hung_identity() -> chelabase_identity::Identity {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    chelabase_identity::Identity::new(&format!("http://{addr}"), "t")
 }
 
 /// Waits up to 2 s for `check` (background work such as the webhook's Zitadel deletes).
@@ -4647,6 +4688,8 @@ async fn refresh_rotates() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["session_id"], json!(sid));
     assert_eq!(body["user_id"], json!(user));
+    // #123: auth checks the identity session behind it.
+    assert_eq!(body["identity_session_id"], "zs1");
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     assert_ne!(t1, t0);
     assert!(t1.starts_with(&format!("{sid}.")), "{t1}");
@@ -4680,11 +4723,11 @@ async fn refresh_grace_returns_the_same_token() {
 
 // Review Focus 1.
 #[tokio::test]
-async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
+async fn refresh_reuse_revokes_and_ends_the_identity_session() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     a.edit_session(sid, |f| f.grace_until = Some(chrono::Utc::now() - chrono::Duration::seconds(1)));
@@ -4692,8 +4735,8 @@ async fn refresh_reuse_revokes_and_deletes_the_zitadel_session() {
     assert_eq!(status, 401, "{body}");
     assert_eq!(error_code(&body), "refresh_token_reused");
     assert!(a.revoked(sid));
-    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
-    assert!(z.calls().contains(&"DELETE /v2/sessions/zs1".to_string()), "{:?}", z.calls());
+    assert!(eventually(|| z.count() == 0).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["zs1"]);
     // The current token is dead too.
     let (status, body) = a.refresh(w.project, &t1).await;
     assert_eq!(status, 401);
@@ -4747,7 +4790,7 @@ async fn peek_answers_the_user_and_rotates_nothing() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
-        json!({ "session_id": sid, "user_id": user, "grace": false }),
+        json!({ "session_id": sid, "user_id": user, "identity_session_id": "zs1", "grace": false }),
         "no token in the answer"
     );
     let before = a.session(sid);
@@ -4760,7 +4803,10 @@ async fn peek_answers_the_user_and_rotates_nothing() {
     for (token, grace) in [(&t0, true), (&t1, false)] {
         let (status, body) = a.peek(w.project, token).await;
         assert_eq!(status, 200, "{body}");
-        assert_eq!(body, json!({ "session_id": sid, "user_id": user, "grace": grace }));
+        assert_eq!(
+            body,
+            json!({ "session_id": sid, "user_id": user, "identity_session_id": "zs1", "grace": grace })
+        );
     }
     let after = a.session(sid);
     assert_eq!((after.hash, after.prev, after.grace_until), (rotated.hash, rotated.prev, rotated.grace_until));
@@ -4772,9 +4818,9 @@ async fn peek_answers_the_user_and_rotates_nothing() {
 #[tokio::test]
 async fn peek_gives_refresh_verdicts_without_revoking() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let (_, body) = a.refresh(w.project, &t0).await;
     let t1 = body["refresh_token"].as_str().unwrap().to_string();
     let (_, body) = a.refresh(w.project, &t1).await;
@@ -4799,11 +4845,7 @@ async fn peek_gives_refresh_verdicts_without_revoking() {
     let after = a.session(sid);
     assert_eq!((after.s, after.hash), (before.s, before.hash), "peek wrote nothing");
     assert!(!a.revoked(sid), "only refresh revokes on reuse");
-    assert!(
-        !z.calls().iter().any(|c| c.starts_with("DELETE /v2/sessions/")),
-        "peek ended no Zitadel session: {:?}",
-        z.calls()
-    );
+    assert!(z.revoked().is_empty(), "peek ended no identity session: {:?}", z.fake.calls());
     // The current token still works; the reuse still revokes when it reaches refresh.
     let (status, _) = a.peek(w.project, &t2).await;
     assert_eq!(status, 200);
@@ -4885,13 +4927,13 @@ async fn session_liveness() {
 #[tokio::test]
 async fn revoke_user_sessions_keeps_one() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let z = identity_with_sessions(w.project, &["z1", "z2", "z3", "z4", "z5"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
     let (u, v) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
-    let (s1, _) = a.create_session(w.project, u, "z1").await;
-    let (s2, _) = a.create_session(w.project, u, "z2").await;
-    let (s3, _) = a.create_session(w.project, u, "z3").await;
-    let (s4, _) = a.create_session(w.project, v, "z4").await;
+    let (s1, _) = a.create_session(w.project, u, z.id("z1")).await;
+    let (s2, _) = a.create_session(w.project, u, z.id("z2")).await;
+    let (s3, _) = a.create_session(w.project, u, z.id("z3")).await;
+    let (s4, _) = a.create_session(w.project, v, z.id("z4")).await;
     let (status, body) = a
         .app
         .post_json(
@@ -4903,11 +4945,8 @@ async fn revoke_user_sessions_keeps_one() {
     assert_eq!(status, 204, "{body}");
     assert!(a.revoked(s1) && a.revoked(s3));
     assert!(!a.revoked(s2) && !a.revoked(s4));
-    assert!(eventually(|| z.calls().iter().filter(|c| c.starts_with("DELETE")).count() == 2).await, "{:?}", z.calls());
-    let calls = z.calls();
-    assert!(calls.contains(&"DELETE /v2/sessions/z1".to_string()), "{calls:?}");
-    assert!(calls.contains(&"DELETE /v2/sessions/z3".to_string()), "{calls:?}");
-    assert!(!calls.iter().any(|c| c.ends_with("/z2") || c.ends_with("/z4")), "{calls:?}");
+    assert!(eventually(|| z.revoked().len() == 2).await, "{:?}", z.fake.calls());
+    assert_eq!(z.revoked(), ["z1", "z3"]);
     // Another project's revoke leaves the user's sessions alone (I5).
     let (status, _) = a
         .app
@@ -4921,7 +4960,7 @@ async fn revoke_user_sessions_keeps_one() {
     assert!(!a.revoked(s2));
     // `created_before` limits it to older sessions.
     let cut = a.session(s2).s.created_at;
-    let (s5, _) = a.create_session(w.project, u, "z5").await;
+    let (s5, _) = a.create_session(w.project, u, z.id("z5")).await;
     a.edit_session(s5, |f| f.s.created_at = cut + chrono::Duration::seconds(5));
     let (status, _) = a
         .app
@@ -4935,15 +4974,13 @@ async fn revoke_user_sessions_keeps_one() {
     assert!(a.revoked(s2) && !a.revoked(s5));
 }
 
-/// T7: every revoke path answers without waiting for Zitadel to end the sessions (a slow
-/// or hung Zitadel would otherwise hold sign-out everywhere and change-password for up to
-/// 10 s per session).
+/// T7: every revoke path answers without waiting for identity to end the sessions (a slow
+/// or hung identity service would otherwise hold sign-out everywhere and change-password for
+/// up to 10 s per session).
 #[tokio::test]
-async fn revokes_answer_before_zitadel_ends_the_sessions() {
+async fn revokes_answer_before_identity_ends_the_sessions() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["z1", "z2", "z3", "z4", "z5"]).await;
-    z.set_session_delete_delay(std::time::Duration::from_millis(600));
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), Some(hung_identity().await)).await;
     let u = uuid::Uuid::new_v4();
     let (s1, _) = a.create_session(w.project, u, "z1").await;
     let (s2, _) = a.create_session(w.project, u, "z2").await;
@@ -4993,25 +5030,16 @@ async fn revokes_answer_before_zitadel_ends_the_sessions() {
     let (status, body) = a.refresh(w.project, &t0).await;
     assert_eq!((status, error_code(&body)), (401, "refresh_token_reused"));
     assert!(start.elapsed() < fast, "refresh reuse waited {:?}", start.elapsed());
-
-    // They still end, in the background.
-    let mut done = false;
-    for _ in 0..200 {
-        if z.session_count() == 0 {
-            done = true;
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    assert!(done, "{:?}", z.calls());
+    // That they still end, in the background, is `revoke_user_sessions_keeps_one` and the
+    // other revoke tests.
 }
 
 #[tokio::test]
 async fn revoke_by_token_ignores_a_wrong_token_or_project() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
+    let (sid, t0) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let revoke = |project: ProjectId, token: String| {
         let a = &a;
         async move {
@@ -5029,10 +5057,10 @@ async fn revoke_by_token_ignores_a_wrong_token_or_project() {
     assert_eq!(revoke(w.project, "garbage".into()).await, 204);
     assert_eq!(revoke(w.bare_project, t0.clone()).await, 204);
     assert!(!a.revoked(sid));
-    assert_eq!(z.session_count(), 1);
+    assert_eq!(z.count(), 1);
     assert_eq!(revoke(w.project, t0.clone()).await, 204);
     assert!(a.revoked(sid));
-    assert!(eventually(|| z.session_count() == 0).await, "{:?}", z.calls());
+    assert!(eventually(|| z.count() == 0).await, "{:?}", z.fake.calls());
     // Idempotent.
     assert_eq!(revoke(w.project, t0).await, 204);
 }
@@ -5041,9 +5069,9 @@ async fn revoke_by_token_ignores_a_wrong_token_or_project() {
 #[tokio::test]
 async fn revoke_other_project_session_is_a_no_op() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["zs1"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
-    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), "zs1").await;
+    let z = identity_with_sessions(w.project, &["zs1"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
+    let (sid, _) = a.create_session(w.project, uuid::Uuid::new_v4(), z.id("zs1")).await;
     let path = format!("/internal/app/sessions/{sid}/revoke");
     let (status, _) = a
         .app
@@ -5051,18 +5079,14 @@ async fn revoke_other_project_session_is_a_no_op() {
         .await;
     assert_eq!(status, 204);
     assert!(!a.revoked(sid));
-    assert!(!z.calls().iter().any(|c| c.starts_with("DELETE")), "{:?}", z.calls());
+    assert!(z.revoked().is_empty(), "{:?}", z.fake.calls());
     let (status, _) = a
         .app
         .post_json(&path, Some(APP_AUTH_TOKEN), json!({ "project_id": w.project }))
         .await;
     assert_eq!(status, 204);
     assert!(a.revoked(sid));
-    assert!(
-        eventually(|| z.calls().contains(&"DELETE /v2/sessions/zs1".to_string())).await,
-        "{:?}",
-        z.calls()
-    );
+    assert!(eventually(|| z.revoked() == ["zs1"]).await, "{:?}", z.fake.calls());
     // Idempotent, and an unknown session is fine too.
     let (status, _) = a
         .app
@@ -5171,8 +5195,10 @@ async fn webhook_rejects_bad_signature_and_ignores_other_orgs() {
     assert!(a.published().is_empty(), "{:?}", a.published());
 }
 
+/// #123: app users live in identity pools, and every write to them goes through auth or the
+/// orchestrator, which sync inline. A Zitadel event for a project's (old) app org does nothing.
 #[tokio::test]
-async fn webhook_publishes_sync_for_user_events() {
+async fn webhook_ignores_app_org_user_events() {
     let w = app_world();
     let a = spawn_app(&w, Some(SIGNING_KEY), None).await;
     let user = uuid::Uuid::new_v4();
@@ -5181,44 +5207,27 @@ async fn webhook_publishes_sync_for_user_events() {
         let body = user_event(kind, ORG, &user.to_string(), chrono::Utc::now());
         assert_eq!(a.app.event(&body, signed(&body)).await, 200, "{kind}");
     }
-    assert!(eventually(|| a.published().len() == kinds.len()).await, "{:?}", a.published());
-    for job in a.published() {
-        assert_eq!(
-            job,
-            AppUsersSyncJob {
-                project_id: w.project,
-                user_id: user,
-                data: None,
-                origin_branch_id: None,
-            }
-        );
-    }
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(a.published().is_empty(), "{:?}", a.published());
 }
 
+/// #123: auth's change-password and reset revoke app sessions inline; a Zitadel
+/// password-changed event for a project's (old) app org revokes nothing.
 #[tokio::test]
-async fn webhook_password_changed_revokes_older_sessions_only() {
+async fn webhook_password_changed_for_an_app_org_revokes_nothing() {
     let w = app_world();
-    let z = zitadel_with_sessions(&["z-old", "z-new"]).await;
-    let a = spawn_app(&w, Some(SIGNING_KEY), Some(&z)).await;
+    let z = identity_with_sessions(w.project, &["z-old"]).await;
+    let a = spawn_app(&w, Some(SIGNING_KEY), z.client()).await;
     let user = uuid::Uuid::new_v4();
-    let (old, _) = a.create_session(w.project, user, "z-old").await;
-    let (new, _) = a.create_session(w.project, user, "z-new").await;
+    let (old, _) = a.create_session(w.project, user, z.id("z-old")).await;
     let changed = chrono::Utc::now();
     a.edit_session(old, |f| f.s.created_at = changed - chrono::Duration::minutes(5));
-    a.edit_session(new, |f| f.s.created_at = changed + chrono::Duration::seconds(1));
     let body = user_event("user.human.password.changed", ORG, &user.to_string(), changed);
     assert_eq!(a.app.event(&body, signed(&body)).await, 200);
-    // Revoked before the answer.
-    assert!(a.revoked(old));
-    assert!(!a.revoked(new), "the session that changed the password stays");
-    assert!(
-        eventually(|| z.calls().contains(&"DELETE /v2/sessions/z-old".to_string())).await,
-        "{:?}",
-        z.calls()
-    );
-    assert!(!z.calls().iter().any(|c| c.ends_with("/z-new")));
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    assert!(a.published().is_empty(), "no sync for a password change");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!a.revoked(old));
+    assert!(z.revoked().is_empty(), "{:?}", z.fake.calls());
+    assert!(a.published().is_empty());
 }
 
 #[tokio::test]
@@ -6268,7 +6277,8 @@ async fn a_failed_tenant_lookup_on_offboarding_is_500() {
 
 // D7: `user.reactivated` and `user.unlocked` for a tenant org clear the member's offboarded
 // mark (its logins stay revoked: nothing is revoked or published for them); a failed clear is
-// a 500 so Zitadel retries; an app-users org's reactivation still syncs the app user.
+// a 500 so Zitadel retries. An app-users org's reactivation does nothing (#123: app users live
+// in identity pools).
 #[tokio::test]
 async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
     for kind in ["user.reactivated", "user.unlocked"] {
@@ -6290,7 +6300,8 @@ async fn a_reactivated_or_unlocked_user_loses_the_offboarded_mark() {
     let user = uuid::Uuid::new_v4();
     let body = user_event("user.reactivated", ORG, &user.to_string(), chrono::Utc::now());
     assert_eq!(a.app.event(&body, signed(&body)).await, 200);
-    assert!(eventually(|| a.published().len() == 1).await, "{:?}", a.published());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(a.published().is_empty(), "{:?}", a.published());
 }
 
 // ---- Fork round 4, C4 (RT4-2, SP1, SP4, SP11, SP23) ----

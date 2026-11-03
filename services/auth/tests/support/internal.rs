@@ -181,9 +181,9 @@ async fn peek(State(s): S, Json(b): Json<Value>) -> Response {
         Some((sid, _, false)) if st.sessions[&sid].grace_over => {
             error(StatusCode::UNAUTHORIZED, "refresh_token_reused")
         }
-        Some((sid, user, current)) => {
-            Json(json!({"session_id": sid, "user_id": user, "grace": !current})).into_response()
-        }
+        Some((sid, user, current)) => Json(json!({"session_id": sid, "user_id": user,
+            "identity_session_id": st.sessions[&sid].identity_session_id, "grace": !current}))
+        .into_response(),
     }
 }
 
@@ -209,9 +209,10 @@ async fn refresh(State(s): S, Json(b): Json<Value>) -> Response {
     } else {
         st.sessions[&sid].token.clone()
     };
+    let identity_session_id = st.sessions[&sid].identity_session_id.clone();
     Json(
-        json!({"session_id": sid, "user_id": user, "refresh_token": next,
-        "expires_at": "2026-11-02T10:00:00Z"}),
+        json!({"session_id": sid, "user_id": user, "identity_session_id": identity_session_id,
+        "refresh_token": next, "expires_at": "2026-11-02T10:00:00Z"}),
     )
     .into_response()
 }

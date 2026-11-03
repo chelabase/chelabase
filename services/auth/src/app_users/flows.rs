@@ -4,22 +4,22 @@ use super::identity::{AppCaller, unavailable as not_configured};
 use super::internal::{
     AppBranchInfo, CreateSession, InternalError, RefreshRequest, RevokeUserSessions, SyncRequest,
 };
-use super::{AppUsers, CODE_TEMPLATE};
-use crate::app::{
-    AppState, CREATE_PASSWORD_POLICY, SET_PASSWORD_POLICY, SIGN_UP_EXTRA, usable_password,
-};
+use super::AppUsers;
+use crate::app::{AppState, SIGN_UP_EXTRA, usable_password};
 use crate::guard::{Slot, email_tag, pad};
-use crate::zitadel::{EmailMatch, NewUser, Session, UserState, ZError, ZUser};
-use chelabase_zitadel::refusals;
+use crate::session::may_issue_code;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chelabase_auth::app_token::{APP_ISSUER, AppClaims, app_audience};
+use chelabase_identity::rules::normalize_email;
+use chelabase_identity::{
+    CodeKind, CodeRequest, Delivery, IdentityError, Missing, NewUser, Pool, SignedIn, User,
+};
 use chelabase_query::app_users::{NewUserRow, UserRowError};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::api_extract::ApiJson;
-use chelabase_zitadel::rules::normalize_email;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -524,10 +524,13 @@ async fn app_jwks(State(s): S) -> Response {
     }
 }
 
+
 // ---- the flows -----------------------------------------------------------------------------
 
 const MINUTE: Duration = Duration::from_secs(60);
 const HOUR: Duration = Duration::from_secs(3600);
+/// A page of the identity user search (its maximum).
+const SEARCH_PAGE: u32 = 200;
 
 mod text {
     pub const BAD_CREDENTIALS: &str = "Email or password is incorrect";
@@ -543,6 +546,8 @@ mod text {
     pub const NO_USER: &str = "This needs a signed-in user (the Chelabase-User header)";
     pub const BAD_EMAIL: &str = "email is not a valid address";
     pub const EMAIL_NOT_CHANGED: &str = "This is already the account's email";
+    pub const REFUSED_INPUT: &str = "This email or password was refused";
+    pub const REFRESH_INVALID: &str = "The refresh token is invalid or expired";
 }
 
 type Flow<T = Response> = Result<T, ApiError>;
@@ -551,14 +556,18 @@ fn fail(status: u16, code: ErrorCode, message: impl Into<String>) -> ApiError {
     ApiError::new(status, code, message)
 }
 
-fn zitadel_down(e: &ZError) -> ApiError {
-    warn!(error = %e, "zitadel call failed");
+fn unavailable() -> ApiError {
     fail(503, ErrorCode::Unavailable, text::UNAVAILABLE)
+}
+
+fn identity_down(e: &IdentityError) -> ApiError {
+    warn!(error = %e, "identity call failed");
+    unavailable()
 }
 
 fn internal_down(e: &InternalError) -> ApiError {
     warn!(error = %e, "orchestrator internal call failed");
-    fail(503, ErrorCode::Unavailable, text::UNAVAILABLE)
+    unavailable()
 }
 
 fn disabled() -> ApiError {
@@ -581,8 +590,17 @@ fn no_user() -> ApiError {
     fail(401, ErrorCode::UserTokenInvalid, text::NO_USER)
 }
 
-fn inactive(state: UserState) -> bool {
-    matches!(state, UserState::Inactive | UserState::Locked)
+fn inactive() -> ApiError {
+    fail(403, ErrorCode::UserInactive, text::INACTIVE)
+}
+
+fn refresh_invalid() -> ApiError {
+    fail(401, ErrorCode::RefreshTokenInvalid, text::REFRESH_INVALID)
+}
+
+/// Identity refused a password it was given (`weak_password`).
+fn is_weak(e: &IdentityError) -> bool {
+    matches!(e, IdentityError::Invalid { code, .. } if code == "weak_password")
 }
 
 /// The extractor answered 503 already when app users aren't configured.
@@ -592,7 +610,13 @@ fn app(s: &AppState) -> &AppUsers {
         .expect("AppCaller checks app users are configured")
 }
 
-/// A short shape check; Zitadel has the final word.
+/// The project's pool. `info.project_id` is the caller's project: [`branch_info`] refuses any
+/// other, so a key of project A's branch never reaches pool B.
+fn pool(info: &AppBranchInfo) -> Pool {
+    Pool::App(info.project_id)
+}
+
+/// A short shape check; identity has the final word.
 fn valid_email(email: &str) -> bool {
     email.len() <= 254
         && !email.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -624,7 +648,8 @@ fn rate_limit(
     }
 }
 
-/// The branch's app-user settings (cached for 30 s); 409 unless app users are `enabled`.
+/// The branch's app-user settings (cached for 30 s); 409 unless app users are `enabled` for
+/// the caller's own project.
 async fn branch_info(app: &AppUsers, caller: &AppCaller) -> Flow<Arc<AppBranchInfo>> {
     let info = match app.branches.get(&caller.branch_id).await {
         Some(info) => info,
@@ -640,39 +665,40 @@ async fn branch_info(app: &AppUsers, caller: &AppCaller) -> Flow<Arc<AppBranchIn
             Err(e) => return Err(internal_down(&e)),
         },
     };
-    if info.status != "enabled"
-        || info.project_id != caller.project_id
-        || info.zitadel_org_id.is_none()
-    {
+    if info.status != "enabled" || info.project_id != caller.project_id {
         return Err(disabled());
     }
     Ok(info)
 }
 
-fn org(info: &AppBranchInfo) -> &str {
-    info.zitadel_org_id.as_deref().unwrap_or_default()
-}
-
-/// The org's user with this email, when it has a Chelabase (uuid) id (P15). An email several
-/// users share (made outside Chelabase's checks) names no one; it is logged (N2).
-async fn find_user(s: &AppState, info: &AppBranchInfo, email: &str) -> Flow<Option<(Uuid, ZUser)>> {
-    match s.zitadel.find_user_in_org(org(info), email).await {
-        Ok(EmailMatch::One(u)) => Ok(Uuid::parse_str(&u.id).ok().map(|id| (id, u))),
-        Ok(EmailMatch::Many) => {
-            warn!(email = %email_tag(email), "several users of the org share this email; it signs no one in");
-            Ok(None)
+/// The pool's user with exactly this (normalized) email. Identity searches by substring, so
+/// every page is read until an exact match. A search identity refuses (an address no account
+/// could have) is no one; a user whose id isn't a uuid is no one either.
+async fn find_user(s: &AppState, info: &AppBranchInfo, email: &str) -> Flow<Option<(Uuid, User)>> {
+    let pool = pool(info);
+    let mut offset = 0u32;
+    loop {
+        let page = match s.identity.search_users(&pool, email, SEARCH_PAGE, offset).await {
+            Ok(page) => page,
+            Err(IdentityError::Invalid { .. }) => return Ok(None),
+            Err(e) => return Err(identity_down(&e)),
+        };
+        if let Some(u) = page.users.iter().find(|u| normalize_email(&u.email) == email) {
+            return Ok(Uuid::parse_str(&u.id).ok().map(|id| (id, u.clone())));
         }
-        Ok(EmailMatch::None) => Ok(None),
-        Err(e) => Err(zitadel_down(&e)),
+        offset += page.users.len() as u32;
+        if page.users.is_empty() || u64::from(offset) >= page.total {
+            return Ok(None);
+        }
     }
 }
 
-fn view(id: Uuid, u: &ZUser) -> AppUserView {
+fn view(id: Uuid, u: &User) -> AppUserView {
     AppUserView {
         id,
         email: u.email.clone(),
         email_verified: u.email_verified,
-        created_at: u.created_at.unwrap_or_else(Utc::now),
+        created_at: u.created_at,
     }
 }
 
@@ -706,7 +732,7 @@ fn session_response(
     };
     let access_token = app.signer.sign(&claims).map_err(|e| {
         warn!(error = %e, "signing an app token failed");
-        fail(503, ErrorCode::Unavailable, text::UNAVAILABLE)
+        unavailable()
     })?;
     Ok(SessionResponse {
         access_token,
@@ -717,79 +743,37 @@ fn session_response(
     })
 }
 
-enum SignInError {
-    /// Zitadel refused the password check: a wrong password, or a user it refuses a session for.
-    Credentials,
-    Answer(ApiError),
-}
-
-impl From<ApiError> for SignInError {
-    fn from(r: ApiError) -> Self {
-        Self::Answer(r)
+/// Ends one identity session; one already gone is fine, a failure is only logged (the app
+/// session it would back was never made, or is revoked).
+async fn end_identity_session(s: &AppState, pool: &Pool, session_id: &str) {
+    match s.identity.revoke_session(pool, session_id).await {
+        Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
+        Err(e) => warn!(error = %e, "ending an identity session failed"),
     }
 }
 
-/// Checks the password with a new Zitadel session, then the user's state, then opens the app
-/// session. A just-created user may take a moment to be visible to sessions (`fresh`).
+/// With the password checked (`signed`, a new identity session): the user's state, then the
+/// app session, linked to the identity session by its id (the token is never kept). Any
+/// refusal ends the identity session.
 async fn open_session(
     s: &AppState,
     info: &AppBranchInfo,
-    user_id: Uuid,
-    password: &str,
-    fresh: bool,
-) -> Result<(SessionResponse, Uuid), SignInError> {
-    let session = check_password(s, user_id, password, fresh).await?;
-    Ok(open_checked(s, info, user_id, session).await?)
-}
-
-/// The password check alone: a new Zitadel session. `Credentials` is any refusal of Zitadel's
-/// own; `Answer` is only Zitadel being unavailable (503).
-async fn check_password(
-    s: &AppState,
-    user_id: Uuid,
-    password: &str,
-    fresh: bool,
-) -> Result<Session, SignInError> {
-    let zid = user_id.to_string();
-    let mut attempt = 0;
-    loop {
-        match s.zitadel.create_session(&zid, password).await {
-            Ok(session) => return Ok(session),
-            Err(e) if fresh && e.is(refusals::SESSION_USER_NOT_FOUND) && attempt < 10 => {
-                attempt += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(ZError::Rejected { .. }) => return Err(SignInError::Credentials),
-            Err(e) => return Err(zitadel_down(&e).into()),
-        }
-    }
-}
-
-/// With the password checked (`session`): the user's state, then the app session.
-async fn open_checked(
-    s: &AppState,
-    info: &AppBranchInfo,
-    user_id: Uuid,
-    session: Session,
-) -> Result<(SessionResponse, Uuid), ApiError> {
+    signed: SignedIn,
+) -> Flow<(SessionResponse, Uuid)> {
     let app = app(s);
-    let zid = user_id.to_string();
+    let pool = pool(info);
     let end = |why: ApiError| async {
-        if let Err(e) = s.zitadel.delete_session(&session).await {
-            warn!(error = %e, "ending the Zitadel session failed");
-        }
+        end_identity_session(s, &pool, &signed.session_id).await;
         why
     };
-    // Only now, with the password checked, may the answer say anything about the account.
-    let current = match s.zitadel.get_user(&zid).await {
-        Ok(Some(u)) if u.org_id == org(info) => u,
-        Ok(_) => return Err(end(refused()).await),
-        Err(e) => return Err(end(zitadel_down(&e)).await),
+    let Ok(user_id) = Uuid::parse_str(&signed.user.id) else {
+        warn!("identity answered a user id that isn't a uuid");
+        return Err(end(unavailable()).await);
     };
-    if inactive(current.state) {
-        return Err(end(fail(403, ErrorCode::UserInactive, text::INACTIVE)).await);
+    if signed.user.banned {
+        return Err(end(inactive()).await);
     }
-    if info.email_verification && !current.email_verified {
+    if info.email_verification && !signed.user.email_verified {
         return Err(end(fail(403, ErrorCode::EmailNotVerified, text::NOT_VERIFIED)).await);
     }
     let created = match app
@@ -797,7 +781,7 @@ async fn open_checked(
         .create_session(&CreateSession {
             project_id: info.project_id,
             user_id,
-            identity_session_id: session.id.clone(),
+            identity_session_id: signed.session_id.clone(),
         })
         .await
     {
@@ -809,7 +793,7 @@ async fn open_checked(
         info.project_id,
         created.session_id,
         created.refresh_token,
-        view(user_id, &current),
+        view(user_id, &signed.user),
     )?;
     Ok((response, created.session_id))
 }
@@ -818,6 +802,21 @@ async fn publish_sync(app: &AppUsers, req: SyncRequest) {
     if let Err(e) = app.internal.sync(&req).await {
         // The reconcile heals a missed sync.
         warn!(error = %e, user = %req.user_id, "publishing the app user sync failed");
+    }
+}
+
+/// Mails the user a code of `kind`, within [`may_issue_code`]: at most five of a kind an hour
+/// per user, whatever flow asks (m2's guess limit resets with each new code, so this is what
+/// bounds the guesses). The answer never says whether one went out; a failure is only logged.
+async fn send_code(s: &AppState, info: &AppBranchInfo, user_id: Uuid, kind: CodeKind) {
+    let user = user_id.to_string();
+    if !may_issue_code(&s.limiter, kind, &user) {
+        info!(kind = kind.as_str(), "an app user's code limit is used up; nothing sent");
+        return;
+    }
+    let request = CodeRequest::new(&user, kind, Delivery::Email);
+    if let Err(e) = s.identity.create_code(&pool(info), &request).await {
+        warn!(error = %e, kind = kind.as_str(), "sending an app user's code failed");
     }
 }
 
@@ -836,28 +835,14 @@ fn pending(id: Uuid, email: &str) -> Response {
 
 /// A sign-up for a taken email (P12). With verification off, the user is told; with it on,
 /// the answer looks like a new sign-up and the owner gets a reset code as a notice.
-async fn taken(s: &AppState, info: &AppBranchInfo, email: &str, owner: Option<String>) -> Flow {
+async fn taken(s: &AppState, info: &AppBranchInfo, email: &str) -> Flow {
     if !info.email_verification {
         info!(email = %email_tag(email), "app sign-up for a taken email");
         return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
     }
     info!(email = %email_tag(email), "app sign-up for a taken email (decoy)");
-    let owner = match owner {
-        Some(id) => Some(id),
-        None => s
-            .zitadel
-            .find_user_in_org(org(info), email)
-            .await
-            .ok()
-            .and_then(|m| match m {
-                EmailMatch::One(u) => Some(u.id),
-                _ => None,
-            }),
-    };
-    if let Some(id) = owner
-        && let Err(e) = s.zitadel.send_password_reset_code(&id, CODE_TEMPLATE).await
-    {
-        warn!(error = %e, "sending the taken-email notice failed");
+    if let Ok(Some((owner, _))) = find_user(s, info, email).await {
+        send_code(s, info, owner, CodeKind::Reset).await;
     }
     Ok(pending(Uuid::new_v4(), email))
 }
@@ -888,11 +873,30 @@ fn row_error(e: UserRowError, info: &AppBranchInfo) -> ApiError {
         UserRowError::EmailTaken => fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS),
         UserRowError::Unavailable(m) => {
             warn!(error = %m, "the users table is unavailable");
-            fail(503, ErrorCode::Unavailable, text::UNAVAILABLE)
+            unavailable()
         }
     }
 }
 
+/// Deletes the identity user a sign-up made when its row can't be written. If this fails too,
+/// the reconcile writes the row from the pool.
+async fn undo_identity_user(s: &AppState, info: &AppBranchInfo, id: Uuid) {
+    match s.identity.delete_user(&pool(info), &id.to_string()).await {
+        Ok(()) | Err(IdentityError::NotFound(Missing::User)) => {}
+        Err(e) => warn!(error = %e, user = %id, "deleting the identity user after a failed insert failed"),
+    }
+}
+
+/// Sign-up. Identity picks the user's id, and the row needs it, so the row is tried twice:
+///
+/// 1. a probe insert with a provisional id, rolled back: a bad `data` value never reaches
+///    identity (and is 422 whatever the email);
+/// 2. identity creates the user (a taken email is P12's answer);
+/// 3. the insert with identity's id, then the commit. If either fails, the identity user is
+///    deleted, so a retry starts clean; if that delete fails too, the reconcile writes the row
+///    from the pool.
+///
+/// Then the sync, and a code (verification on) or a session (off).
 async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
     let app = app(s);
     let email = normalize_email(&b.email);
@@ -922,22 +926,25 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
         }
     };
     let mut info = branch_info(app, caller).await?;
-    let id = Uuid::new_v4();
-    let row = NewUserRow {
+    let ev = info.email_verification;
+    let row = |id| NewUserRow {
         id,
         email: email.clone(),
-        email_verified: !info.email_verification,
+        email_verified: !ev,
         data: data.clone(),
     };
-    // The row first: a bad `data` value never reaches Zitadel (and is 422 whatever the email).
+    // 1. The probe.
     let mut retried = false;
-    let (pending_insert, target) = loop {
+    loop {
         let Some(target) = info.sync.clone() else {
             warn!(branch = %info.target_branch_id, "the users table's branch has no running compute");
-            return Err(fail(503, ErrorCode::Unavailable, text::UNAVAILABLE));
+            return Err(unavailable());
         };
-        match app.users_db.begin_insert(&target, &row).await {
-            Ok(p) => break (p, target),
+        match app.users_db.begin_insert(&target, &row(Uuid::new_v4())).await {
+            Ok(probe) => {
+                probe.rollback().await;
+                break;
+            }
             Err(UserRowError::Unavailable(m)) if !retried => {
                 // The compute may have moved or its password changed: ask again.
                 warn!(error = %m, "the users table is unavailable; retrying with fresh settings");
@@ -945,100 +952,76 @@ async fn sign_up(s: &AppState, caller: &AppCaller, b: AppSignUpBody) -> Flow {
                 app.branches.invalidate(&caller.branch_id).await;
                 info = branch_info(app, caller).await?;
             }
-            Err(UserRowError::EmailTaken) => return taken(s, &info, &email, None).await,
+            Err(UserRowError::EmailTaken) => return taken(s, &info, &email).await,
             Err(e) => return Err(row_error(e, &info)),
         }
-    };
-    let ev = info.email_verification;
-    // Any user with this email counts, a non-uuid one made outside Chelabase too.
-    match s.zitadel.find_user_in_org(org(&info), &email).await {
-        Ok(EmailMatch::One(owner)) => {
-            pending_insert.rollback().await;
-            return taken(s, &info, &email, Some(owner.id)).await;
-        }
-        Ok(EmailMatch::Many) => {
-            pending_insert.rollback().await;
-            return taken(s, &info, &email, None).await;
-        }
-        Ok(EmailMatch::None) => {}
-        Err(e) => {
-            pending_insert.rollback().await;
-            return Err(zitadel_down(&e));
-        }
     }
-    let zid = id.to_string();
-    let given = email.split('@').next().unwrap_or("user");
-    let given: String = given.chars().take(200).collect();
+    // 2. The identity user.
     let created = s
-        .zitadel
-        .create_user(&NewUser {
-            org_id: org(&info),
-            email: &email,
-            given_name: &given,
-            family_name: "-",
-            password: Some(&b.password),
-            user_id: Some(&zid),
-            username: Some(&zid),
-            send_code: ev,
-            verified: !ev,
-            url_template: CODE_TEMPLATE,
-        })
+        .identity
+        .create_user(
+            &pool(&info),
+            &NewUser {
+                email: &email,
+                password: Some(&b.password),
+                name: None,
+                email_verified: !ev,
+            },
+        )
         .await;
-    match created {
-        Ok(_) => {}
-        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => {
-            pending_insert.rollback().await;
-            return taken(s, &info, &email, None).await;
+    let user = match created {
+        Ok(u) => u,
+        Err(IdentityError::Conflict(_)) => return taken(s, &info, &email).await,
+        Err(e) if is_weak(&e) => return Err(weak_password()),
+        Err(IdentityError::Invalid { code, message }) => {
+            info!(code, message, "identity refused the new app user");
+            return Err(fail(422, ErrorCode::InvalidRequest, text::REFUSED_INPUT));
         }
-        // Zitadel's create-path refusals of the caller's input, by their captured ids, and its
-        // field validation (no id). A missing organization stays here too, as it always has.
-        Err(e)
-            if e.is_any(&CREATE_PASSWORD_POLICY)
-                || e.is_invalid_request()
-                || e.is(refusals::CREATE_USER_ORG_NOT_FOUND) =>
-        {
-            pending_insert.rollback().await;
-            info!(error = %e, "zitadel refused the new app user");
-            return Err(if e.is_any(&CREATE_PASSWORD_POLICY) {
-                weak_password()
-            } else {
-                fail(
-                    422,
-                    ErrorCode::InvalidRequest,
-                    "Zitadel refused this email or password",
-                )
-            });
-        }
-        Err(e) => {
-            pending_insert.rollback().await;
-            return Err(zitadel_down(&e));
-        }
-    }
-    if let Err(e) = pending_insert.commit().await {
-        warn!(error = %e, user = %id, "committing the app user's row failed; deleting the Zitadel user");
-        if let Err(e) = app.zitadel_admin.delete_user(&zid).await {
-            warn!(error = %e, user = %id, "deleting the Zitadel user after a failed commit failed");
-        }
-        return Err(fail(503, ErrorCode::Unavailable, text::UNAVAILABLE));
+        Err(e) => return Err(identity_down(&e)),
+    };
+    let Ok(id) = Uuid::parse_str(&user.id) else {
+        warn!("identity made a user whose id isn't a uuid");
+        return Err(unavailable());
+    };
+    // 3. The row, with identity's id.
+    let Some(target) = info.sync.clone() else {
+        undo_identity_user(s, &info, id).await;
+        return Err(unavailable());
+    };
+    let written = match app.users_db.begin_insert(&target, &row(id)).await {
+        Ok(pending) => pending.commit().await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = written {
+        warn!(user = %id, "writing the app user's row failed; deleting the identity user");
+        undo_identity_user(s, &info, id).await;
+        return Err(match e {
+            UserRowError::EmailTaken => return taken(s, &info, &email).await,
+            e => row_error(e, &info),
+        });
     }
     publish_sync(
         app,
         SyncRequest {
             project_id: info.project_id,
             user_id: id,
-            data: (!data.is_empty()).then_some(data),
+            data: (!data.is_empty()).then_some(data.clone()),
             origin_branch_id: Some(target.branch_id),
         },
     )
     .await;
     if ev {
+        send_code(s, &info, id, CodeKind::Verify).await;
         return Ok(pending(id, &email));
     }
-    match open_session(s, &info, id, &b.password, true).await {
-        Ok((session, _)) => Ok((StatusCode::CREATED, Json(session)).into_response()),
-        Err(SignInError::Answer(r)) => Err(r),
-        Err(SignInError::Credentials) => Err(fail(503, ErrorCode::Unavailable, text::UNAVAILABLE)),
-    }
+    // The account exists and is written; a sign-in that fails here leaves it for the next.
+    let signed = s
+        .identity
+        .sign_in(&pool(&info), &email, &b.password)
+        .await
+        .map_err(|e| identity_down(&e))?;
+    let (session, _) = open_session(s, &info, signed).await?;
+    Ok((StatusCode::CREATED, Json(session)).into_response())
 }
 
 async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
@@ -1053,24 +1036,19 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     // lands, and a client that hangs up during the check still spends it. Only these outcomes
     // give it back:
     //
-    // | Outcome                                                        | Answer  | Email slot |
-    // |----------------------------------------------------------------|---------|------------|
-    // | the email's 5 a minute are used                                | 429     | none held  |
-    // | the user lookup fails                                          | 503     | refunded   |
-    // | no user (or several) has this email, or not a Chelabase id     | 401     | counts     |
-    // | `SignInError::Credentials`: the password check is refused      | 401     | counts     |
-    // | `SignInError::Answer`: the password check is unavailable       | 503     | refunded   |
-    // | the password is right (refunded before anything else awaits)   | any     | refunded   |
-    // | the request is dropped undecided (the client hung up)          | none    | counts     |
+    // | Outcome                                                         | Answer | Email slot |
+    // |-----------------------------------------------------------------|--------|------------|
+    // | the email's 5 a minute are used                                 | 429    | none held  |
+    // | `BadCredentials`: an unknown email or a wrong password          | 401    | counts     |
+    // | `Invalid`: identity's request validation (the caller's input)   | 401    | counts     |
+    // | `Banned`: the password is right, the user banned                | 403    | refunded   |
+    // | the password is right (refunded before anything else awaits)    | any    | refunded   |
+    // | identity unavailable, or any other answer of its                | 503    | refunded   |
+    // | the request is dropped undecided (the client hung up)           | none   | counts     |
     //
-    // `Credentials` is any refusal of Zitadel's own: a wrong password
-    // (`refusals::PASSWORD_INVALID`), no such user (`SESSION_USER_NOT_FOUND`), a locked or
-    // inactive user (`SESSION_USER_LOCKED`, `SESSION_USER_NOT_ACTIVE`), or its request validation
-    // (`ZError::is_invalid_request`, e.g. a password over 200 characters: the caller's input).
-    // `Answer` from [`check_password`] is only `ZError::Unavailable`: no answer, a 5xx, or a 4xx
-    // that isn't Zitadel's own error. Whatever [`open_checked`] answers afterwards (403 inactive
-    // or unverified, 401 another org's user, 503) comes after the refund. An unknown email and
-    // a wrong password both count and answer the same 401, padded alike.
+    // An unknown email and a wrong password are one answer of identity's, so they count and
+    // answer the same 401, padded alike. Whatever [`open_session`] answers afterwards (403
+    // unverified, 503) comes after the refund.
     let key = format!(
         "app:{}:sign-in:email:{}",
         caller.project_id,
@@ -1079,63 +1057,59 @@ async fn sign_in(s: &AppState, caller: &AppCaller, b: AppSignInBody) -> Flow {
     let Some(slot) = Slot::reserve(&s.limiter, key, 5, MINUTE) else {
         return Err(fail(429, ErrorCode::RateLimited, text::TOO_MANY));
     };
-    let user_id = match find_user(s, &info, &email).await {
-        Ok(Some((user_id, _))) => user_id,
-        Ok(None) => return Err(refused()),
-        Err(r) => {
+    let signed = match s.identity.sign_in(&pool(&info), &email, &b.password).await {
+        Ok(signed) => {
             slot.refund();
-            return Err(r);
+            signed
         }
-    };
-    let session = match check_password(s, user_id, &b.password, false).await {
-        Ok(session) => {
-            slot.refund();
-            session
-        }
-        Err(SignInError::Credentials) => {
+        Err(IdentityError::BadCredentials | IdentityError::Invalid { .. }) => {
             info!(email = %email_tag(&email), "app sign-in refused");
             return Err(refused());
         }
-        Err(SignInError::Answer(r)) => {
+        Err(IdentityError::Banned) => {
             slot.refund();
-            return Err(r);
+            return Err(inactive());
+        }
+        Err(e) => {
+            slot.refund();
+            return Err(identity_down(&e));
         }
     };
-    let (session, _) = open_checked(s, &info, user_id, session).await?;
+    let (session, _) = open_session(s, &info, signed).await?;
     Ok(Json(session).into_response())
 }
 
-/// Checks the token's user, then rotates the refresh token.
+/// Checks the token's session, then rotates the refresh token.
 ///
 /// Invariant (#57): clients drop their cookies on `refresh_token_invalid`,
 /// `refresh_token_reused` and `user_inactive`, so a refresh revokes the session or answers one
 /// of them only on a definitive verdict: the orchestrator's 401 `refresh_token_invalid` or
-/// `refresh_token_reused`, Zitadel's definite "no such user" (a 404) or a user of another org,
-/// or an inactive user. Every other upstream outcome (any other orchestrator status or code,
-/// a Zitadel 5xx or other refusal, a timeout, an unreadable or partial success answer) answers
+/// `refresh_token_reused`, or identity's verdict on the app session's identity session (see
+/// [`current_user`]). Every other upstream outcome (any other orchestrator status or code, an
+/// identity 5xx or other refusal, a timeout, an unreadable or partial success answer) answers
 /// 503 `unavailable` and revokes nothing.
 ///
-/// And (#59): nothing rotates before the user check. The orchestrator's peek names the token's
-/// user without writing, and says whether the token is the current one or the previous one
-/// inside its 10 s grace.
-/// - A current token: Zitadel is asked about the user first, and only then does `refresh`
-///   rotate. A fault before the rotation (peek, Zitadel, or the lookup taking longer than
-///   [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP)) answers 503 and leaves the token the client holds current, so
-///   a later retry with it works, however late, unless another request rotates it meanwhile.
-/// - A grace token goes to `refresh` first, then the user is checked, as before #59: its
-///   grace answer writes nothing, and holding it through a slow Zitadel could outlast the
-///   grace and turn it into reuse (#59 audit B1). A fault after that answers 503; the client
-///   keeps a grace token, which works again only until its grace ends.
+/// And (#59): nothing rotates before the session check. The orchestrator's peek names the
+/// token's session, user and identity session without writing, and says whether the token is
+/// the current one or the previous one inside its 10 s grace.
+/// - A current token: identity is asked about the session first, and only then does `refresh`
+///   rotate. A fault before the rotation (peek, identity, or the lookup taking longer than
+///   [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP)) answers 503 and leaves the token the
+///   client holds current, so a later retry with it works, however late, unless another
+///   request rotates it meanwhile.
+/// - A grace token goes to `refresh` first, then the session is checked: its grace answer
+///   writes nothing, and holding it through a slow identity could outlast the grace and turn it
+///   into reuse (#59 audit B1). A fault after that answers 503; the client keeps a grace
+///   token, which works again only until its grace ends.
 /// - A peek verdict goes on to `refresh`, so the orchestrator applies its own rules (it
-///   revokes on reuse); a user that `refresh` names but peek didn't check is checked after it.
+///   revokes on reuse); a session that `refresh` names but peek didn't check is checked after.
 ///
 /// A request that peeked a current token just before a parallel one rotated it reaches
 /// `refresh` holding a grace token. [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP) caps
 /// the lookup at half of [`APP_REFRESH_GRACE`](chelabase_auth::app_token::APP_REFRESH_GRACE)
-/// or less (4 s of 10 s, checked at compile time), so it gets the grace answer provided the
-/// peek's reply, the `refresh` call and its row lock take under the remaining ~6 s. If they
-/// take longer, the grace has ended: `refresh` answers `refresh_token_reused` and revokes the
-/// session, an accepted residual (#59 second audit).
+/// or less, so it gets the grace answer provided the peek's reply, the `refresh` call and its
+/// row lock take under the rest. If they take longer, the grace has ended: `refresh` answers
+/// `refresh_token_reused` and revokes the session, an accepted residual (#59 second audit).
 /// `refresh_ends_a_session_only_on_a_definitive_verdict` in `tests/app_flows.rs` checks every
 /// combination against a model of this.
 async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
@@ -1157,8 +1131,8 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     };
     let checked = match peeked {
         Some(p) if !p.grace => Some((
-            p.user_id,
-            current_user(s, &info, p.user_id, p.session_id).await?,
+            p.session_id,
+            current_user(s, &info, p.user_id, &p.identity_session_id, p.session_id).await?,
         )),
         _ => None,
     };
@@ -1175,19 +1149,24 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
         // it. A bare 401 (a mismatched internal bearer), a 404 or a 422 is our fault, not the
         // token's, so it answers 503 and the client keeps the session.
         Err(InternalError::Refused { status: 401, code }) if code == "refresh_token_invalid" => {
-            return Err(fail(
-                401,
-                ErrorCode::RefreshTokenInvalid,
-                "The refresh token is invalid or expired",
-            ));
+            return Err(refresh_invalid());
         }
         Err(e) => return Err(internal_down(&e)),
     };
     let current = match checked {
-        Some((user, current)) if user == refreshed.user_id => current,
-        // A grace token, a peek verdict that refresh then didn't give, or another user: check
-        // the user `refresh` answered for.
-        _ => current_user(s, &info, refreshed.user_id, refreshed.session_id).await?,
+        Some((session, current)) if session == refreshed.session_id => current,
+        // A grace token, a peek verdict that refresh then didn't give, or another session:
+        // check the one `refresh` answered for.
+        _ => {
+            current_user(
+                s,
+                &info,
+                refreshed.user_id,
+                &refreshed.identity_session_id,
+                refreshed.session_id,
+            )
+            .await?
+        }
     };
     let session = session_response(
         app,
@@ -1199,44 +1178,68 @@ async fn refresh(s: &AppState, caller: &AppCaller, b: AppRefreshBody) -> Flow {
     Ok(Json(session).into_response())
 }
 
-/// The session's user as Zitadel has it now, when they may still refresh. Revokes the session
-/// and answers 401 `refresh_token_invalid` when Zitadel definitely has no such user (a 404) or
-/// they belong to another org, and 403 `user_inactive` when inactive; any Zitadel fault,
-/// including no answer within [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP), answers 503 and revokes nothing.
+/// The app session's user, as identity has them now, when the session may still refresh.
+///
+/// Identity is asked for the identity session behind the app session, by id, in the project's
+/// own pool (never by token: none is kept). Its definitive verdicts revoke the app session:
+/// - the session is gone (revoked, expired, its user deleted or banned: identity drops a banned
+///   user's sessions whenever it finds one, so one made after a ban never reads as live): 403
+///   `user_inactive` when the user is banned, else 401 `refresh_token_invalid` (also when that
+///   follow-up read fails: the session's end is already certain);
+/// - the session belongs to another user than the app session's: 401;
+/// - its user is banned: 403.
+///
+/// Any other answer (a missing pool, a refusal of ours, a 5xx, an unreadable answer, or none
+/// within [`REFRESH_USER_LOOKUP`](super::REFRESH_USER_LOOKUP)) answers 503 and revokes nothing.
 async fn current_user(
     s: &AppState,
     info: &AppBranchInfo,
     user_id: Uuid,
+    identity_session_id: &str,
     session_id: Uuid,
-) -> Flow<ZUser> {
+) -> Flow<User> {
     let app = app(s);
+    let pool = pool(info);
     let revoke = || async {
         if let Err(e) = app.internal.revoke(session_id, info.project_id).await {
             warn!(error = %e, "revoking the app session failed");
         }
     };
-    // `None` is a definite 404; an unreadable answer is an error (503), never "gone".
-    let id = user_id.to_string();
-    let answer = tokio::time::timeout(app.refresh_user_lookup, s.zitadel.get_user(&id))
-        .await
-        .unwrap_or_else(|_| Err(ZError::Unavailable("the user lookup timed out".into())));
-    let current = match answer {
-        Ok(Some(u)) if u.org_id == org(info) => u,
-        Ok(_) => {
-            revoke().await;
-            return Err(fail(
-                401,
-                ErrorCode::RefreshTokenInvalid,
-                "The refresh token is invalid or expired",
-            ));
-        }
-        Err(e) => return Err(zitadel_down(&e)),
+    let lookup = app.refresh_user_lookup;
+    let timed_out = || IdentityError::Unavailable("the session lookup timed out".into());
+    // An app session always names its identity session; an empty one names nothing.
+    let answer = if identity_session_id.is_empty() {
+        Err(IdentityError::NotFound(Missing::Session))
+    } else {
+        tokio::time::timeout(lookup, s.identity.session_by_id(&pool, identity_session_id))
+            .await
+            .unwrap_or_else(|_| Err(timed_out()))
     };
-    if inactive(current.state) {
+    let found = match answer {
+        Ok(found) => found,
+        Err(IdentityError::NotFound(Missing::Session)) => {
+            revoke().await;
+            let user = tokio::time::timeout(lookup, s.identity.get_user(&pool, &user_id.to_string()))
+                .await
+                .unwrap_or_else(|_| Err(timed_out()));
+            return Err(match user {
+                Ok(u) if u.banned => inactive(),
+                _ => refresh_invalid(),
+            });
+        }
+        Err(e) => return Err(identity_down(&e)),
+    };
+    let mine = user_id.to_string();
+    if found.session.user_id != mine || found.user.id != mine {
+        warn!(session = %session_id, "an app session's identity session belongs to another user");
         revoke().await;
-        return Err(fail(403, ErrorCode::UserInactive, text::INACTIVE));
+        return Err(refresh_invalid());
     }
-    Ok(current)
+    if found.user.banned {
+        revoke().await;
+        return Err(inactive());
+    }
+    Ok(found.user)
 }
 
 async fn sign_out(s: &AppState, caller: &AppCaller, b: AppSignOutBody) -> Flow {
@@ -1266,10 +1269,10 @@ async fn user(s: &AppState, caller: &AppCaller) -> Flow {
         return Err(no_user());
     };
     let info = branch_info(app(s), caller).await?;
-    match s.zitadel.get_user(&claims.sub.to_string()).await {
-        Ok(Some(u)) if u.org_id == org(&info) => Ok(Json(view(claims.sub, &u)).into_response()),
-        Ok(_) => Err(no_user()),
-        Err(e) => Err(zitadel_down(&e)),
+    match s.identity.get_user(&pool(&info), &claims.sub.to_string()).await {
+        Ok(u) => Ok(Json(view(claims.sub, &u)).into_response()),
+        Err(IdentityError::NotFound(Missing::User)) => Err(no_user()),
+        Err(e) => Err(identity_down(&e)),
     }
 }
 
@@ -1289,13 +1292,19 @@ async fn verify_email(s: &AppState, caller: &AppCaller, b: AppVerifyEmailBody) -
         return Err(bad_code());
     };
     match s
-        .zitadel
-        .verify_email(&user_id.to_string(), b.code.trim())
+        .identity
+        .verify_code(&pool(&info), &user_id.to_string(), CodeKind::Verify, b.code.trim(), None)
         .await
     {
-        Ok(()) => {}
-        Err(ZError::Rejected { .. }) => return Err(bad_code()),
-        Err(e) => return Err(zitadel_down(&e)),
+        Ok(_) => {}
+        // A wrong, used, expired or locked code, a malformed one, or a user gone meanwhile:
+        // the same answer as an unknown email.
+        Err(
+            IdentityError::CodeInvalid
+            | IdentityError::Invalid { .. }
+            | IdentityError::NotFound(Missing::User),
+        ) => return Err(bad_code()),
+        Err(e) => return Err(identity_down(&e)),
     }
     publish_sync(
         app,
@@ -1322,11 +1331,7 @@ async fn resend_code(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow 
     )?;
     let info = branch_info(app(s), caller).await?;
     match find_user(s, &info, &email).await {
-        Ok(Some((id, u))) if !u.email_verified => {
-            if let Err(e) = s.zitadel.resend_code(&id.to_string(), CODE_TEMPLATE).await {
-                warn!(error = %e, "resending the app verification code failed");
-            }
-        }
+        Ok(Some((id, u))) if !u.email_verified => send_code(s, &info, id, CodeKind::Verify).await,
         Ok(_) => info!(email = %email_tag(&email), "app resend-code with nothing to send"),
         Err(_) => {}
     }
@@ -1345,21 +1350,17 @@ async fn password_reset(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Fl
     )?;
     let info = branch_info(app(s), caller).await?;
     match find_user(s, &info, &email).await {
-        Ok(Some((id, _))) => {
-            if let Err(e) = s
-                .zitadel
-                .send_password_reset_code(&id.to_string(), CODE_TEMPLATE)
-                .await
-            {
-                warn!(error = %e, "sending the app password reset failed");
-            }
-        }
+        Ok(Some((id, _))) => send_code(s, &info, id, CodeKind::Reset).await,
         Ok(None) => info!(email = %email_tag(&email), "app password reset for an unknown email"),
         Err(_) => {}
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// The code sets the password and ends the user's identity sessions in one step (identity's
+/// `verify_code`), then the app sessions are revoked. If that revocation fails, the answer is
+/// still 204: each old app session is refused at its next refresh, because the identity session
+/// behind it is gone. A retry can't redo it (the code is spent), and needn't.
 async fn password_reset_confirm(
     s: &AppState,
     caller: &AppCaller,
@@ -1375,7 +1376,7 @@ async fn password_reset_confirm(
             ("confirm", "email", &email_tag(&email), 10, HOUR),
         ],
     )?;
-    // Before Zitadel sees the email, so this answer can't tell accounts apart.
+    // Before identity sees the email, so this answer can't tell accounts apart.
     if !usable_password(&b.password) {
         return Err(weak_password());
     }
@@ -1384,17 +1385,26 @@ async fn password_reset_confirm(
         return Err(bad_code());
     };
     match s
-        .zitadel
-        .set_password(&user_id.to_string(), b.code.trim(), &b.password)
+        .identity
+        .verify_code(
+            &pool(&info),
+            &user_id.to_string(),
+            CodeKind::Reset,
+            b.code.trim(),
+            Some(&b.password),
+        )
         .await
     {
-        Ok(()) => {}
-        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
+        Ok(_) => {}
+        Err(e) if is_weak(&e) => return Err(weak_password()),
         // A wrong code, or a user gone meanwhile: the same answer as an unknown email.
-        Err(ZError::Rejected { .. }) => return Err(bad_code()),
-        Err(e) => return Err(zitadel_down(&e)),
+        Err(
+            IdentityError::CodeInvalid
+            | IdentityError::Invalid { .. }
+            | IdentityError::NotFound(Missing::User),
+        ) => return Err(bad_code()),
+        Err(e) => return Err(identity_down(&e)),
     }
-    // The password-changed webhook revokes them too (P11); this doesn't wait for it.
     if let Err(e) = app
         .internal
         .revoke_user_sessions(
@@ -1407,11 +1417,15 @@ async fn password_reset_confirm(
         )
         .await
     {
-        warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed");
+        warn!(error = %e, user = %user_id, "revoking the app sessions after a reset failed; their refresh is refused anyway");
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Sets the new address, unverified when verification is on (then a code goes to it), and
+/// syncs. Sessions continue. A failure at `set_email` changes nothing; after it, a lost code is
+/// what `resend-code` is for and a lost sync is the reconcile's (a retry answers 409
+/// `conflict`: the address is the account's already).
 async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
@@ -1430,35 +1444,34 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow
         return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
     }
     let info = branch_info(app, caller).await?;
-    match s.zitadel.find_user_in_org(org(&info), &email).await {
-        Ok(EmailMatch::Many) => {
-            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
+    match find_user(s, &info, &email).await? {
+        Some((id, _)) if id == claims.sub => {
+            return Err(fail(409, ErrorCode::Conflict, text::EMAIL_NOT_CHANGED));
         }
-        Ok(EmailMatch::One(other)) if other.id != claims.sub.to_string() => {
-            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
-        }
-        Ok(_) => {}
-        Err(e) => return Err(zitadel_down(&e)),
+        Some(_) => return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS)),
+        None => {}
     }
     let ev = info.email_verification;
     match s
-        .zitadel
-        .set_email(&claims.sub.to_string(), &email, !ev, Some(CODE_TEMPLATE))
+        .identity
+        .set_email(&pool(&info), &claims.sub.to_string(), &email, !ev)
         .await
     {
-        Ok(()) => {}
-        // Matched by captured id only. Zitadel has no captured set-email 409 (a taken address
-        // is found by the lookup above), so any 409 here is a refusal nobody captured: 503.
-        Err(e) if e.is(refusals::SET_EMAIL_USER_NOT_FOUND) => return Err(no_user()),
-        Err(e) if e.is(refusals::EMAIL_NOT_CHANGED) => {
-            return Err(fail(409, ErrorCode::Conflict, text::EMAIL_NOT_CHANGED));
+        Ok(_) => {}
+        // Taken between the lookup and the write.
+        Err(IdentityError::Conflict(_)) => {
+            return Err(fail(409, ErrorCode::EmailTaken, text::ACCOUNT_EXISTS));
         }
-        // Zitadel's validation of the field (no id): the caller's input.
-        Err(e) if e.is_invalid_request() => {
-            info!(error = %e, "zitadel refused the new email");
+        Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
+        // Identity's check of the address: the caller's input.
+        Err(IdentityError::Invalid { code, message }) if code != "weak_password" => {
+            info!(code, message, "identity refused the new email");
             return Err(fail(422, ErrorCode::InvalidRequest, text::BAD_EMAIL));
         }
-        Err(e) => return Err(zitadel_down(&e)),
+        Err(e) => return Err(identity_down(&e)),
+    }
+    if ev {
+        send_code(s, &info, claims.sub, CodeKind::Verify).await;
     }
     publish_sync(
         app,
@@ -1473,6 +1486,19 @@ async fn change_email(s: &AppState, caller: &AppCaller, b: AppEmailBody) -> Flow
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
+/// Changes the password and returns a new session; every other session ends. In order:
+///
+/// 1. the current password is checked with an identity sign-in;
+/// 2. `set_password`. A failure up to here changes nothing (the check's identity session is
+///    ended), and a retry works;
+/// 3. the user's sessions end in both stores, identity's then the app sessions, each attempted
+///    whatever the other did. Either alone refuses every old refresh token: a revoked app
+///    session directly, one whose identity session is gone at its next refresh. Only when both
+///    fail is the answer 503, with the password changed and the old sessions alive;
+/// 4. a sign-in with the new password, and its app session. If that fails, the answer is 503
+///    with the change done and every session ended: the user signs in with the new password.
+///
+/// After step 2, a retry with the same body is refused (the current password is the new one).
 async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordBody) -> Flow {
     let app = app(s);
     let Some(claims) = &caller.user else {
@@ -1491,50 +1517,69 @@ async fn change_password(s: &AppState, caller: &AppCaller, b: AppChangePasswordB
         return Err(weak_password());
     }
     let info = branch_info(app, caller).await?;
-    // The new session below needs a verified email when verification is on: refuse first,
-    // so a 403 never means "changed anyway".
-    if info.email_verification {
-        match s.zitadel.get_user(&sub).await {
-            Ok(Some(u)) if u.email_verified => {}
-            Ok(Some(_)) => {
-                return Err(fail(403, ErrorCode::EmailNotVerified, text::NOT_VERIFIED));
-            }
-            Ok(None) => return Err(no_user()),
-            Err(e) => return Err(zitadel_down(&e)),
-        }
-    }
-    match s
-        .zitadel
-        .change_password(&sub, &b.current_password, &b.password)
-        .await
-    {
-        Ok(()) => {}
-        Err(e) if e.is_any(&SET_PASSWORD_POLICY) => return Err(weak_password()),
-        // A wrong current password, or a user Zitadel no longer has.
-        Err(ZError::Rejected { .. }) => return Err(refused()),
-        Err(e) => return Err(zitadel_down(&e)),
-    }
-    let (session, sid) = match open_session(s, &info, claims.sub, &b.password, false).await {
-        Ok(opened) => opened,
-        Err(SignInError::Answer(r)) => return Err(r),
-        Err(SignInError::Credentials) => {
-            return Err(fail(503, ErrorCode::Unavailable, text::UNAVAILABLE));
-        }
+    let pool = pool(&info);
+    let current = match s.identity.get_user(&pool, &sub).await {
+        Ok(u) => u,
+        Err(IdentityError::NotFound(Missing::User)) => return Err(no_user()),
+        Err(e) => return Err(identity_down(&e)),
     };
-    // The webhook revokes sessions older than the change too (P11); this keeps the new one.
-    if let Err(e) = app
+    // The new session needs a verified email when verification is on: refuse first, so a 403
+    // never means "changed anyway".
+    if info.email_verification && !current.email_verified {
+        return Err(fail(403, ErrorCode::EmailNotVerified, text::NOT_VERIFIED));
+    }
+    // 1.
+    let check = match s.identity.sign_in(&pool, &current.email, &b.current_password).await {
+        Ok(signed) if signed.user.id == sub => signed,
+        Ok(signed) => {
+            end_identity_session(s, &pool, &signed.session_id).await;
+            return Err(refused());
+        }
+        Err(IdentityError::BadCredentials | IdentityError::Banned | IdentityError::Invalid { .. }) => {
+            return Err(refused());
+        }
+        Err(e) => return Err(identity_down(&e)),
+    };
+    // 2.
+    if let Err(e) = s.identity.set_password(&pool, &sub, &b.password).await {
+        end_identity_session(s, &pool, &check.session_id).await;
+        return Err(match e {
+            e if is_weak(&e) => weak_password(),
+            IdentityError::NotFound(Missing::User) => no_user(),
+            e => identity_down(&e),
+        });
+    }
+    // 3.
+    let identity_ended = s.identity.revoke_user_sessions(&pool, &sub).await;
+    let app_ended = app
         .internal
         .revoke_user_sessions(
             claims.sub,
             &RevokeUserSessions {
                 project_id: info.project_id,
-                keep_session_id: Some(sid),
+                keep_session_id: None,
                 created_before: None,
             },
         )
-        .await
-    {
-        warn!(error = %e, user = %claims.sub, "revoking the other app sessions failed");
+        .await;
+    match (&identity_ended, &app_ended) {
+        (Err(i), Err(a)) => {
+            warn!(identity = %i, app = %a, user = %sub, "the password changed but no session was ended");
+            return Err(unavailable());
+        }
+        (Err(e), Ok(())) => {
+            warn!(error = %e, user = %sub, "ending the identity sessions after a password change failed");
+        }
+        (Ok(()), Err(e)) => {
+            warn!(error = %e, user = %sub, "revoking the app sessions after a password change failed; their refresh is refused anyway");
+        }
+        (Ok(()), Ok(())) => {}
     }
+    // 4.
+    let signed = match s.identity.sign_in(&pool, &current.email, &b.password).await {
+        Ok(signed) => signed,
+        Err(e) => return Err(identity_down(&e)),
+    };
+    let (session, _) = open_session(s, &info, signed).await?;
     Ok(Json(session).into_response())
 }
