@@ -18785,7 +18785,7 @@
           },
           "instance_admin": {
             "type": "boolean",
-            "description": "Whether the caller may use instance routes (self-hosted: an active tenant admin;\nplatform: a member of the operator organisation)."
+            "description": "Whether the caller may use instance routes (self-hosted: an active tenant admin;\nplatform: a member of the operator tenant)."
           },
           "member": {
             "oneOf": [
