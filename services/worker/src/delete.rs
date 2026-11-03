@@ -16,10 +16,14 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// each branch and the database `deleted`. `Err` (the job is retried, and the rows stay
     /// `deleting`) when any of that fails.
     pub async fn handle_delete(&self, id: DatabaseId) -> Result<(), String> {
+        // object-storage m8: once the database is gone, its blobs' prefix goes too. The marker
+        // first, so the periodic job queues the purge until it is done, whatever happens to
+        // the request below.
+        self.mark_purge_pending(id).await?;
         let result = self.delete_database(id).await;
-        // object-storage m8: once the database is gone, its blobs' prefix goes too.
         if result.is_ok() {
-            self.sweep_requests.request(id);
+            self.sweep_requests
+                .request(id, crate::storage_sweep::SweepCause::Purge);
         }
         result
     }

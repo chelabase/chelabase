@@ -2,6 +2,10 @@
 //! API and SeaweedFS: objects made through the gateway, deleted on main but kept on a child,
 //! moved to another bucket, deleted everywhere; one in-process sweep with no grace and no
 //! history window deletes only the blob nothing references, and an open multipart upload.
+//! Then (audit rounds 1 and 2) template and closed databases, a backup read through a static
+//! compute, upload sessions (open ones survive zero-grace passes and complete; expired ones lose
+//! their upload first and their row a pass later; a child's expired copy of a live session) and
+//! tickets, all on real Postgres.
 //!
 //! `shared-state`: provisions a database and a branch on the workbench stack, deleted
 //! afterwards pass or fail, with every blob and mark it made.
@@ -13,12 +17,13 @@
 // Test code: plain clients against local test servers (clippy.toml allows tests only).
 #![allow(clippy::disallowed_methods, clippy::disallowed_types)]
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chelabase_metadata::{
-    BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient, NewBranch,
+    BranchKind, BranchStatus, CreateBranchOutcome, DEMO_TENANT_ID, DatabaseStatus, MetadataClient,
+    NewBranch,
 };
 use chelabase_nats::BranchJob;
 use chelabase_neon::ComputeBackend;
@@ -28,7 +33,9 @@ use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use serde_json::{Value, json};
 use uuid::Uuid;
 use worker::config::RealWorker;
-use worker::storage_sweep::{SweepBranch, SweepDatabase, SweepSource, sweep_database};
+use worker::storage_sweep::{
+    BranchRead, ReadError, SweepBranch, SweepDatabase, SweepSource, sweep_database,
+};
 
 mod common;
 use common::{cleanup, proxy_ca_path, proxy_hostaddr, setup, workspace_root};
@@ -98,6 +105,15 @@ impl Fx {
         cleanup(&self.worker, &self.metadata, self.id).await;
     }
 
+    /// SQL as cloud_admin in `database` on main.
+    async fn admin_in(&self, database: &str, sql: &str) -> String {
+        self.worker
+            .computes
+            .admin_sql(&self.ep, database, sql)
+            .await
+            .unwrap_or_else(|e| panic!("admin_sql {sql:?}: {e:#}"))
+    }
+
     async fn admin(&self, sql: &str) -> String {
         self.worker
             .computes
@@ -153,6 +169,11 @@ impl Fx {
 
     /// A child of main, made by the worker's create job.
     async fn child(&self, name: &str) -> BranchId {
+        self.child_of(self.main, name).await
+    }
+
+    /// A child of `parent`, made by the worker's create job.
+    async fn child_of(&self, parent: BranchId, name: &str) -> BranchId {
         let child = BranchId::new();
         let outcome = self
             .metadata
@@ -160,7 +181,7 @@ impl Fx {
                 id: child,
                 database_id: self.id,
                 name,
-                parent_branch_id: self.main,
+                parent_branch_id: parent,
                 branched_at_time: None,
                 branched_at_lsn: None,
             })
@@ -308,8 +329,18 @@ impl SweepSource for NoWindow<'_> {
         db: DatabaseId,
         b: &SweepBranch,
         expire: bool,
-    ) -> Result<(HashSet<Uuid>, u64), String> {
-        self.0.references(db, b, expire).await
+        open: &[String],
+    ) -> Result<BranchRead, ReadError> {
+        self.0.references(db, b, expire, open).await
+    }
+
+    async fn branch_point(
+        &self,
+        db: DatabaseId,
+        timeline: &str,
+        recorded: &BTreeSet<String>,
+    ) -> Result<Option<SystemTime>, String> {
+        self.0.branch_point(db, timeline, recorded).await
     }
 }
 
@@ -328,28 +359,7 @@ async fn storage_sweep_live() {
 
 async fn run(fx: &Fx) {
     let store = object_store().await;
-    for name in ["files", "other"] {
-        fx.admin(&format!(
-            "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{name}'); COMMIT;"
-        ))
-        .await;
-    }
-    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)").await;
-    for (i, (command, using, check)) in [
-        ("SELECT", "'true'", "NULL"),
-        ("INSERT", "NULL", "'true'"),
-        ("UPDATE", "'true'", "'true'"),
-        ("DELETE", "'true'", "NULL"),
-    ]
-    .iter()
-    .enumerate()
-    {
-        fx.owner(&format!(
-            "SELECT storage.create_policy('o_{i}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
-        ))
-        .await;
-    }
-    let key = fx.secret_key(fx.main, "sw-main").await;
+    let key = fixture(fx).await;
     let mut versions = std::collections::HashMap::new();
     for name in ["kept-on-child", "moved", "gone", "stays"] {
         let (status, b) = object(
@@ -494,6 +504,199 @@ async fn run(fx: &Fx) {
     assert_eq!(blobs(&store, &prefix).await, left);
 }
 
+/// Buckets `files` and `other`, policies letting `authenticated` do anything, and a key on
+/// main.
+async fn fixture(fx: &Fx) -> String {
+    for name in ["files", "other"] {
+        fx.admin(&format!(
+            "BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.buckets (name) VALUES ('{name}'); COMMIT;"
+        ))
+        .await;
+    }
+    fx.owner("SELECT storage.create_policy('b_select', 'buckets', 'SELECT', ARRAY['authenticated']::name[], 'true', NULL)").await;
+    for (i, (command, using, check)) in [
+        ("SELECT", "'true'", "NULL"),
+        ("INSERT", "NULL", "'true'"),
+        ("UPDATE", "'true'", "'true'"),
+        ("DELETE", "'true'", "NULL"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        fx.owner(&format!(
+            "SELECT storage.create_policy('o_{i}', 'objects', '{command}', ARRAY['authenticated']::name[], {using}, {check})"
+        ))
+        .await;
+    }
+    fx.secret_key(fx.main, "sw-main").await
+}
+
+/// Uploads `files/{name}` with `key`; its version.
+async fn upload(key: &str, name: &str) -> String {
+    let (status, b) = object(
+        "POST",
+        &format!("/storage/v1/object/files/{name}"),
+        key,
+        Some(name.as_bytes().to_vec()),
+        false,
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&b));
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    body["version_id"].as_str().unwrap().to_string()
+}
+
+/// Runs `f` on a fresh database; its blobs and marks are purged and the database deleted,
+/// pass or fail.
+async fn with_fx(f: fn(Arc<Fx>) -> futures_util::future::BoxFuture<'static, ()>) {
+    let fx = Arc::new(Fx::provision().await);
+    let outcome = tokio::spawn(f(fx.clone())).await;
+    fx.purge(&object_store().await).await;
+    fx.teardown().await;
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic.into_panic());
+    }
+}
+
+/// Audit B1: a database made a template, or closed to connections, still holds live rows.
+/// The sweep reads the template and refuses the closed one; either way the object survives
+/// and downloads once the database is opened again.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn audit_m8_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let version = upload(&key, "victim").await;
+            let prefix = fx.prefix().await;
+            let source = NoWindow(&fx.worker);
+            let db = fx.database.replace('"', "\"\"");
+            for (close, open) in [
+                ("IS_TEMPLATE true", "IS_TEMPLATE false"),
+                ("ALLOW_CONNECTIONS false", "ALLOW_CONNECTIONS true"),
+            ] {
+                fx.admin_in("postgres", &format!("ALTER DATABASE \"{db}\" {close}"))
+                    .await;
+                for pass in 0..2 {
+                    let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false)
+                        .await
+                        .unwrap();
+                    println!("{close}, pass {pass}: {r:?}");
+                    assert_eq!(r.deleted, 0, "{close}: {r:?}");
+                    // Each must reach its own outcome, or a pass refused for any other
+                    // reason would satisfy the checks here.
+                    if close.starts_with("ALLOW_CONNECTIONS") {
+                        assert!(
+                            r.refused && r.blocked.iter().any(|b| b.contains(&fx.database)),
+                            "{close}: {r:?}"
+                        );
+                    } else {
+                        assert!(!r.refused && r.referenced == 1, "{close}: {r:?}");
+                    }
+                }
+                assert!(
+                    blobs(&store, &prefix).await.contains(&version),
+                    "{close}: the sweep deleted a blob a live row references"
+                );
+                fx.admin_in("postgres", &format!("ALTER DATABASE \"{db}\" {open}"))
+                    .await;
+                let (status, b) =
+                    object("GET", "/storage/v1/object/files/victim", &key, None, false).await;
+                assert_eq!((status, &b[..]), (200, &b"victim"[..]), "{close}");
+            }
+        })
+    })
+    .await;
+}
+
+/// Audit S8 (AC 4): main restored to before an upload; its backup alone references the
+/// object. Passes read the backup through a static compute and keep the blob; a branch made
+/// from the backup downloads it.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn audit_m8_backup_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let noted = fx.value("SELECT pg_current_wal_insert_lsn()").await;
+            let version = upload(&key, "kept-by-backup").await;
+            // As the API does: the branch is claimed for the restore first.
+            assert!(
+                fx.metadata
+                    .set_branch_status(fx.main, &[BranchStatus::Ready], BranchStatus::Resetting)
+                    .await
+                    .unwrap(),
+                "main was not ready"
+            );
+            fx.worker
+                .handle_branch_job(BranchJob::Restore {
+                    branch_id: fx.main,
+                    backup_id: BranchId::new(),
+                    backup_name: "main-before-restore-20261103T120000Z".into(),
+                    at: chelabase_nats::PointInTime::Lsn(noted),
+                })
+                .await
+                .expect("restore job");
+            let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+            assert_eq!(main.status, BranchStatus::Ready, "{:?}", main.error);
+            let record = fx
+                .metadata
+                .list_branches(fx.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|b| b.kind == BranchKind::Backup)
+                .unwrap_or_else(|| panic!("no backup: main {main:?}"));
+            let backup = record.id;
+            assert_eq!(
+                (record.kind, record.status, record.endpoint_id.is_none()),
+                (BranchKind::Backup, BranchStatus::Ready, true)
+            );
+            let source = NoWindow(&fx.worker);
+            for pass in 0..3 {
+                let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false)
+                    .await
+                    .unwrap();
+                println!("pass {pass}: {r:?}");
+                assert_eq!(
+                    (r.blocked.as_deref(), r.referenced, r.deleted),
+                    (None, 1, 0),
+                    "{r:?}"
+                );
+            }
+            assert!(blobs(&store, &prefix).await.contains(&version));
+            // The static computes are gone: only the branch's own endpoint is left.
+            let main = fx.metadata.get_branch(fx.main).await.unwrap().unwrap();
+            let left: Vec<String> = fx
+                .metadata
+                .list_branches(fx.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .filter_map(|b| b.endpoint_id)
+                .collect();
+            assert_eq!(left, [main.endpoint_id.clone().unwrap()]);
+            let from_backup = fx.child_of(backup, "from-backup").await;
+            let child_key = fx.secret_key(from_backup, "sw-from-backup").await;
+            let (status, b) = object(
+                "GET",
+                "/storage/v1/object/files/kept-by-backup",
+                &child_key,
+                None,
+                false,
+            )
+            .await;
+            assert_eq!((status, &b[..]), (200, &b"kept-by-backup"[..]));
+        })
+    })
+    .await;
+}
+
 /// The blob keys under `prefix`, without it.
 async fn blobs(store: &chelabase_storage::S3Store, prefix: &str) -> HashSet<String> {
     store
@@ -503,4 +706,193 @@ async fn blobs(store: &chelabase_storage::S3Store, prefix: &str) -> HashSet<Stri
         .into_iter()
         .map(|o| o.key[prefix.len()..].to_string())
         .collect()
+}
+
+// --- Sessions and tickets on real Postgres (audit round 2) -------------------------------------
+
+async fn start_session(key: &str, name: &str) -> String {
+    let (status, b) = object("POST", &format!("/storage/v1/upload/files/{name}"), key, None, false).await;
+    assert_eq!(status, 200, "create: {}", String::from_utf8_lossy(&b));
+    let body: Value = serde_json::from_slice(&b).unwrap();
+    body["id"].as_str().unwrap().to_string()
+}
+
+async fn put_part(key: &str, id: &str, n: u32, bytes: Vec<u8>) -> u16 {
+    let (status, _) = object("PUT", &format!("/storage/v1/upload/session/{id}/{n}"), key, Some(bytes), false).await;
+    status
+}
+
+async fn complete(key: &str, id: &str) -> (u16, Value) {
+    let (status, b) = object("POST", &format!("/storage/v1/upload/session/{id}/complete"), key, None, false).await;
+    (status, serde_json::from_slice(&b).unwrap_or(Value::Null))
+}
+
+fn expire_sql(id: &str) -> String {
+    format!(
+        "BEGIN; SET LOCAL ROLE chelabase_storage; UPDATE storage.upload_sessions SET expires_at = clock_timestamp() - interval '1 hour' WHERE id = '{id}'; COMMIT;"
+    )
+}
+
+/// An open session survives zero-grace sweeps and still completes, next to an
+/// upload no session names, which goes.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sweep_open_session_survives_and_completes_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let id = start_session(&key, "big").await;
+            assert_eq!(put_part(&key, &id, 1, vec![b'a'; 6 << 20]).await, 200);
+            let session_upload = fx.value("SELECT upload_id FROM storage.upload_sessions").await;
+            let stray = format!("{prefix}{}", Uuid::new_v4());
+            store.multipart_create(&stray, None).await.unwrap();
+            let source = NoWindow(&fx.worker);
+            let mut aborted = 0;
+            for pass in 0..4 {
+                let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+                println!("pass {pass}: {r:?}");
+                assert_eq!(r.blocked, None, "{r:?}");
+                aborted += r.uploads_aborted;
+                let open = store.list_uploads(&prefix).await.unwrap();
+                assert!(open.iter().any(|u| u.upload_id == session_upload), "pass {pass}: the session's upload went: {open:?}");
+            }
+            assert_eq!(aborted, 1, "the stray upload goes, once");
+            assert_eq!(store.list_uploads(&prefix).await.unwrap().len(), 1);
+            // Parts still go up, and the upload completes.
+            assert_eq!(put_part(&key, &id, 2, b"tail".to_vec()).await, 200);
+            let (status, body) = complete(&key, &id).await;
+            assert_eq!(status, 200, "{body}");
+            let (status, b) = object("GET", "/storage/v1/object/files/big", &key, None, false).await;
+            assert_eq!((status, b.len()), (200, (6 << 20) + 4));
+            for _ in 0..2 {
+                let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+                assert_eq!((r.blocked.as_deref(), r.referenced, r.deleted), (None, 1, 0), "{r:?}");
+            }
+            assert_eq!(fx.value("SELECT count(*) FROM storage.upload_sessions").await, "0");
+        })
+    })
+    .await;
+}
+
+/// An expired session whose upload is still open: never a row deleted while the
+/// upload is open; upload aborted after the grace (SeaweedFS: timed by a mark), then the row
+/// goes. A live neighbour is untouched and completes. A session whose upload is gone goes at once.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sweep_expired_session_lifecycle_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let dead = start_session(&key, "dead").await;
+            assert_eq!(put_part(&key, &dead, 1, b"dead".to_vec()).await, 200);
+            let live = start_session(&key, "live").await;
+            assert_eq!(put_part(&key, &live, 1, b"live".to_vec()).await, 200);
+            let gone = start_session(&key, "gone").await;
+            let gone_upload = fx.value(&format!("SELECT upload_id FROM storage.upload_sessions WHERE id = '{gone}'")).await;
+            let gone_version = fx.value(&format!("SELECT version_id FROM storage.upload_sessions WHERE id = '{gone}'")).await;
+            store.multipart_abort(&format!("{prefix}{gone_version}"), &gone_upload).await.unwrap();
+            fx.admin(&expire_sql(&dead)).await;
+            fx.admin(&expire_sql(&gone)).await;
+            let count = || fx.value("SELECT count(*) FROM storage.upload_sessions");
+            let source = NoWindow(&fx.worker);
+
+            let dry = sweep_database(&source, &store, fx.id, Duration::ZERO, true).await.unwrap();
+            println!("dry: {dry:?}");
+            assert_eq!(count().await, "3", "a dry run deletes no session");
+            assert_eq!(store.list_uploads(&prefix).await.unwrap().len(), 2);
+
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("pass 1: {r:?}");
+            assert_eq!((r.blocked.as_deref(), r.uploads_aborted, r.tickets_deleted), (None, 0, 1), "{r:?}");
+            assert_eq!(count().await, "2", "only the session whose upload is gone");
+            assert_eq!(store.list_uploads(&prefix).await.unwrap().len(), 2);
+
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("pass 2: {r:?}");
+            assert_eq!((r.blocked.as_deref(), r.uploads_aborted, r.tickets_deleted), (None, 1, 0), "{r:?}");
+            assert_eq!(count().await, "2", "the row outlives its upload by one pass");
+            assert_eq!(store.list_uploads(&prefix).await.unwrap().len(), 1);
+
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("pass 3: {r:?}");
+            assert_eq!((r.blocked.as_deref(), r.uploads_aborted, r.tickets_deleted), (None, 0, 1), "{r:?}");
+            assert_eq!(count().await, "1");
+            assert_eq!(fx.value("SELECT id FROM storage.upload_sessions").await, live);
+            assert!(store.list(&format!("_sweep/{}/uploads/", fx.id)).await.unwrap().is_empty(), "upload marks left");
+            let (status, body) = complete(&key, &live).await;
+            assert_eq!(status, 200, "{body}");
+        })
+    })
+    .await;
+}
+
+/// A branch copies a session's row: expired on the child, live on main, the upload stays and
+/// main completes it; then the child's dead copy goes.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sweep_session_copied_to_a_child_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let id = start_session(&key, "shared").await;
+            assert_eq!(put_part(&key, &id, 1, b"shared".to_vec()).await, 200);
+            let child = fx.child("copy").await;
+            let child_ep = fx.metadata.get_branch(child).await.unwrap().unwrap().endpoint_id.unwrap();
+            fx.worker.computes.admin_sql(&child_ep, &fx.database, &expire_sql(&id)).await.unwrap();
+            let source = NoWindow(&fx.worker);
+            for _ in 0..3 {
+                let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+                println!("{r:?}");
+                assert_eq!((r.blocked.as_deref(), r.uploads_aborted), (None, 0), "{r:?}");
+            }
+            assert_eq!(store.list_uploads(&prefix).await.unwrap().len(), 1);
+            let (status, body) = complete(&key, &id).await;
+            assert_eq!(status, 200, "{body}");
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("{r:?}");
+            assert_eq!((r.blocked.as_deref(), r.tickets_deleted, r.referenced), (None, 1, 1), "{r:?}");
+            let left = fx.worker.computes.admin_sql(&child_ep, &fx.database, "SELECT 'n=' || count(*) FROM storage.upload_sessions").await.unwrap();
+            assert!(left.contains("n=0"), "{left}");
+        })
+    })
+    .await;
+}
+
+/// Tickets on the real schema: another timeline's copy goes, the live one stays and keeps its
+/// blob; once expired it goes and the blob follows.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_sweep_tickets_live() {
+    with_fx(|fx| {
+        Box::pin(async move {
+            let fx = &*fx;
+            let store = object_store().await;
+            let _key = fixture(fx).await;
+            let prefix = fx.prefix().await;
+            let v = Uuid::new_v4();
+            store.put(&format!("{prefix}{v}"), bytes::Bytes::from_static(b"x"), chelabase_storage::PutOptions::default()).await.unwrap();
+            fx.admin(&format!("BEGIN; SET LOCAL ROLE chelabase_storage; INSERT INTO storage.upload_tickets (version_id, bucket_id, name, size, etag, expires_at, caller_role, owner) SELECT '{v}', id, 'x', 1, 'e', clock_timestamp() + interval '20 seconds', 'authenticated', NULL FROM storage.buckets WHERE name = 'files'; COMMIT;")).await;
+            let _child = fx.child("tickets").await;
+            let source = NoWindow(&fx.worker);
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("{r:?}");
+            assert_eq!((r.blocked.as_deref(), r.tickets_deleted, r.referenced), (None, 1, 1), "{r:?}");
+            fx.admin("SELECT pg_sleep(21)").await;
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            println!("{r:?}");
+            assert_eq!((r.blocked.as_deref(), r.tickets_deleted, r.marked), (None, 1, 1), "{r:?}");
+            let r = sweep_database(&source, &store, fx.id, Duration::ZERO, false).await.unwrap();
+            assert_eq!(r.deleted, 1, "{r:?}");
+        })
+    })
+    .await;
 }

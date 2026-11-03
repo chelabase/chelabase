@@ -93,10 +93,11 @@ pub struct StorageSweepJob {
     pub database_id: DatabaseId,
 }
 
-/// The JetStream message id of a database's sweep job: the stream drops a second one inside
-/// its duplicate window, so a burst of events for one database queues one sweep.
-pub fn storage_sweep_msg_id(database: DatabaseId) -> String {
-    format!("storage-sweep-{database}")
+/// The JetStream message id of a database's sweep job, `storage-sweep-{db}-{tag}`: the stream
+/// drops a second one with the same tag inside its duplicate window. The tag is the period
+/// (the periodic job), an event's id, or `purge`, so one kind never swallows another.
+pub fn storage_sweep_msg_id(database: DatabaseId, tag: &str) -> String {
+    format!("storage-sweep-{database}-{tag}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1587,6 +1588,7 @@ where
 pub async fn publish_storage_sweep(
     js: &async_nats::jetstream::Context,
     job: &StorageSweepJob,
+    tag: &str,
 ) -> Result<(), NatsError> {
     let envelope = JobEnvelope {
         job_id: Uuid::new_v4(),
@@ -1594,7 +1596,7 @@ pub async fn publish_storage_sweep(
     };
     let payload = serde_json::to_vec(&envelope)?;
     let mut headers = async_nats::HeaderMap::new();
-    headers.insert("Nats-Msg-Id", storage_sweep_msg_id(job.database_id).as_str());
+    headers.insert("Nats-Msg-Id", storage_sweep_msg_id(job.database_id, tag).as_str());
     js.publish_with_headers(SUBJECT_STORAGE_SWEEP.to_string(), headers, payload.into())
         .await
         .map_err(|e| NatsError::JetStream(e.to_string()))?
@@ -1603,16 +1605,22 @@ pub async fn publish_storage_sweep(
     Ok(())
 }
 
-/// Run the storage sweep consumer loop, calling `handler` for each job (one at a time).
+/// Run the storage sweep consumer loop, calling `handler` for each job (one at a time) with
+/// its delivery attempt (1-based), so the handler can give up on a job that keeps failing.
 pub async fn run_storage_sweep_consumer<F, Fut>(
     js: async_nats::jetstream::Context,
     handler: F,
 ) -> Result<(), NatsError>
 where
-    F: FnMut(JobEnvelope<StorageSweepJob>) -> Fut,
+    F: FnMut(JobEnvelope<StorageSweepJob>, u64) -> Fut,
     Fut: std::future::Future<Output = Result<(), String>>,
 {
-    run_consumer(js, CONSUMER_STORAGE_SWEEP, SUBJECT_STORAGE_SWEEP, handler).await
+    consume(
+        js,
+        ConsumerSpec::control(CONSUMER_STORAGE_SWEEP, SUBJECT_STORAGE_SWEEP),
+        handler,
+    )
+    .await
 }
 
 /// Run the app users consumer loop, calling `handler` for each job.
@@ -2472,9 +2480,12 @@ mod tests {
         assert_eq!(CONSUMER_STORAGE_SWEEP, "chelabase-worker-storage-sweep");
         assert!(control_subjects().contains(&SUBJECT_STORAGE_SWEEP.to_string()));
         let (a, b) = (DatabaseId::new(), DatabaseId::new());
-        assert_eq!(storage_sweep_msg_id(a), storage_sweep_msg_id(a));
-        assert_ne!(storage_sweep_msg_id(a), storage_sweep_msg_id(b));
-        assert!(storage_sweep_msg_id(a).contains(&a.to_string()));
+        assert_eq!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "7"));
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(b, "7"));
+        // Audit B2: a period's, an event's and a purge's ids never collide.
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "8"));
+        assert_ne!(storage_sweep_msg_id(a, "7"), storage_sweep_msg_id(a, "purge"));
+        assert_eq!(storage_sweep_msg_id(a, "purge"), format!("storage-sweep-{a}-purge"));
         let job = StorageSweepJob { database_id: a };
         let json = serde_json::to_value(&job).unwrap();
         assert_eq!(json, serde_json::json!({ "database_id": a }));
