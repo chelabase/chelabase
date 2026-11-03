@@ -1188,8 +1188,14 @@ mod tests {
     }
 
     /// The workbench: the files the overlay's top-level `secrets:` block reads from
-    /// `${CHELABASE_KEYS_DIR}`, all of which chelabase-init makes.
+    /// `${CHELABASE_KEYS_DIR}`, all of which chelabase-init makes. The one other file it may
+    /// read is the stack's setup code, which chelabase-init writes into the stack dir (#126).
     fn workbench_secret_files() -> Vec<String> {
+        const STACK_SETUP_CODE: &str = "setup/setup.code";
+        assert!(
+            LAYOUT.iter().any(|e| e.path == STACK_SETUP_CODE),
+            "{STACK_SETUP_CODE} is in chelabase-init's layout"
+        );
         let text = compose_file("docker-compose.workbench.yml");
         let block = text
             .split("\nsecrets:\n")
@@ -1207,6 +1213,8 @@ mod tests {
             let file = rest.split('"').next().unwrap();
             if let Some(p) = file.strip_prefix("${CHELABASE_KEYS_DIR}/") {
                 keys.push(p.to_string());
+            } else if file.strip_prefix("${CHELABASE_STACK_DIR}/") == Some(STACK_SETUP_CODE) {
+                // Not in the keys dir, so not checked against a keys-dir run below.
             } else {
                 others.push(file.to_string());
             }
