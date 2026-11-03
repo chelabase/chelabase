@@ -136,7 +136,7 @@ describe("BP-1: what each address's answer means", () => {
   });
 
   it("edit_and_retry_reopens_with_exactly_the_failed_addresses", async () => {
-    const fail = () => jsonResponse({ error: { code: "email_in_use_elsewhere", message: "x" } }, 409);
+    const fail = () => jsonResponse({ error: { code: "signup_pending", message: "x" } }, 409);
     setup({ "a@x.test": fail, "b@x.test": fail, "ines@x.test": activeAnswer("ines@x.test") });
     const dialog = await compose("a@x.test, ines@x.test, b@x.test, c@x.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Send 4 invites" }));

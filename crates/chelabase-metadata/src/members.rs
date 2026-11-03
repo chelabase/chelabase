@@ -1589,6 +1589,15 @@ async fn delete_team_memberships(tx: &mut Tx, member: Uuid) -> Result<Value, sql
     ))
 }
 
+/// An identity user's other member rows, from [`MetadataClient::other_memberships`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OtherMemberships {
+    /// One is `active`: the account's sessions serve that tenant.
+    pub active: bool,
+    /// One isn't `removed` (invited, pending, active or suspended): the account is still needed.
+    pub live: bool,
+}
+
 fn members_from(rows: Vec<MemberRow>) -> Result<Vec<MemberRecord>, sqlx::Error> {
     rows.into_iter().map(MemberRecord::try_from).collect()
 }
@@ -1635,18 +1644,23 @@ impl MetadataClient {
             .collect())
     }
 
-    /// Whether `member`'s Zitadel user has another member row, in any tenant, that isn't
-    /// removed: a removal then leaves the user active (only its sessions end). An unknown
-    /// `member` is `false`.
-    pub async fn has_other_membership(&self, member: Uuid) -> Result<bool, MetadataError> {
-        Ok(sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM members m JOIN members o
-                              ON o.identity_user_id = m.identity_user_id AND o.id <> m.id
-                            WHERE m.id = $1 AND o.status <> 'removed')",
+    /// Where `identity_user_id`'s member rows stand in every tenant, `except` one row (the row
+    /// being removed, declined or revoked; `None` counts them all). A removal ends the account's
+    /// sessions unless another row is `active`, and bans it only when no other row is `live`.
+    pub async fn other_memberships(
+        &self,
+        identity_user_id: &str,
+        except: Option<Uuid>,
+    ) -> Result<OtherMemberships, MetadataError> {
+        let (active, live): (bool, bool) = sqlx::query_as(
+            "SELECT COALESCE(bool_or(status = 'active'), false), count(*) > 0 FROM members
+              WHERE identity_user_id = $1 AND status <> 'removed' AND ($2::uuid IS NULL OR id <> $2)",
         )
-        .bind(member)
+        .bind(identity_user_id)
+        .bind(except)
         .fetch_one(&self.pool)
-        .await?)
+        .await?;
+        Ok(OtherMemberships { active, live })
     }
 
     /// The caller's member row, made on its first request. Runs on every request, so an active

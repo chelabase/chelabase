@@ -7890,7 +7890,7 @@ export const getRemoveMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When this was their last membership in any tenant, their account's sessions end and it is banned; while they are a member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Removing a removed member again redoes every step after the removal.
+ * The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end, and when no other tenant holds them at all (an open invite, a pending sign-up or a suspension counts) the account is banned too. While they are an active member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Every step runs even when one fails; removing a removed member again redoes every step after the removal.
  * @summary Remove a member
  */
 export const removeMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8145,7 +8145,7 @@ export const getDeclineMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked and, when this was their last membership in any tenant, their account's sessions end and it is banned. A still-valid token is refused at once. Declining a removed member again redoes those steps.
+ * The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked, their account's sessions end when they are an active member of no other tenant, and the account is banned when no other tenant holds them at all. A still-valid token is refused at once. Every step runs even when one fails; declining a removed member again redoes those steps.
  * @summary Decline a sign-up
  */
 export const declineMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<void> => {
@@ -8322,7 +8322,7 @@ export const getReinstateMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted (a ban for any other reason stays), and their offboarded mark is cleared. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.
+ * The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted, and their offboarded mark is cleared. A ban for any other reason stays, and so does the mark, so they stay refused (`member_offboarded`) until that ban is lifted and they are reinstated again. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.
  * @summary Reinstate a suspended member
  */
 export const reinstateMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {
@@ -8472,7 +8472,7 @@ export const getSuspendMemberUrl = (memberId: string,) => {
 }
 
 /**
- * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are a member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.
+ * The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are an active member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.
  * @summary Suspend a member
  */
 export const suspendMember = async (memberId: string, options?: Parameters<typeof customFetch>[1]): Promise<Member> => {

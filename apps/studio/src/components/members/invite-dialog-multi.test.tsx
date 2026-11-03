@@ -106,7 +106,7 @@ describe("multi-email invite", () => {
   it("multi_email_invite_sends_one_request_per_email_and_shows_each_result", async () => {
     const route = inviteRoute((email) => {
       if (email === "ops@contractor.io") {
-        return jsonResponse({ error: { code: "email_in_use_elsewhere", message: "x" } }, 409);
+        return jsonResponse({ error: { code: "signup_pending", message: "x", member_id: "m-ops" } }, 409);
       }
       if (email === "ines@x.test") return jsonResponse({ outcome: "existing_member", member: invited(email) }, 200);
       return okInvite(email);
@@ -134,7 +134,7 @@ describe("multi-email invite", () => {
     expect(results[0]).toHaveTextContent(/invited/i);
     expect(results[1]).toHaveTextContent(/ops@contractor\.io/);
     expect(results[1]).toHaveTextContent(/not sent/i);
-    expect(results[1]).toHaveTextContent(/Another account outside this organisation already uses ops@contractor\.io/);
+    expect(results[1]).toHaveTextContent(/ops@contractor\.io signed up and is waiting for approval/);
     expect(results[2]).toHaveTextContent(/already a member/i);
     expect(results[3]).toHaveTextContent(/nadia@x\.test/);
 
