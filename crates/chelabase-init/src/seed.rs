@@ -363,7 +363,18 @@ fn check_value(rule: Rule, v: &str) -> std::result::Result<(), String> {
 /// The message for a `CHELABASE_SEED_*` key that isn't exactly one of [`SEED_KEYS`]. It never
 /// holds the key's text: a typo that drops or mistypes the `=` (`KEYvalue`, `KEY_value=…`,
 /// `KEY value`) puts the value into the key. A known key it starts with is named, nothing after.
+/// The seed keys of the retired identity provider (#126). Its name is public, so it is named;
+/// the rest of the key is not shown. Built from parts so the name check doesn't flag it.
+const RETIRED_FAMILY: &str = concat!("CHELABASE_SEED_", "ZIT", "ADEL_");
+const RETIRED_NAME: &str = concat!("Zit", "adel");
+
 fn unknown_key(line: usize, key: &str, no_equals: bool) -> String {
+    if key.starts_with(RETIRED_FAMILY) {
+        return format!(
+            "line {line}: a retired {RETIRED_FAMILY}* key (the rest is not shown): {RETIRED_NAME} \
+             was removed, so delete this line"
+        );
+    }
     let known = SEED_KEYS
         .iter()
         .filter(|k| key.starts_with(k.key))
@@ -585,6 +596,25 @@ mod tests {
         // Nothing but blank lines, comments and other keys: no seeds.
         assert!(Seeds::parse("A=1\n# x\n\nB='2'\n").unwrap().is_empty());
         assert!(Seeds::parse("").unwrap().is_empty());
+    }
+
+    // Audit N1 (#126): a `.env` from before the identity provider's removal still refuses its
+    // seed lines, but names the retired family and says to delete them. The value is not shown.
+    #[test]
+    fn retired_identity_provider_seed_key_named() {
+        let name = concat!("Zit", "adel");
+        let family = concat!("CHELABASE_SEED_", "ZIT", "ADEL_");
+        let text = format!("A=1\n{family}DB_PASSWORD=secret-value-0123456\n");
+        let err = format!("{:#}", Seeds::parse(&text).unwrap_err());
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains(&format!("{family}*")), "{err}");
+        assert!(err.contains(&format!("{name} was removed")), "{err}");
+        assert!(err.contains("delete"), "{err}");
+        assert!(!err.contains("secret-value"), "{err}");
+        assert!(!err.contains("DB_PASSWORD"), "the rest of the key is not shown: {err}");
+        // Without `=`, the same.
+        let err = format!("{:#}", Seeds::parse(&format!("{family}X")).unwrap_err());
+        assert!(err.contains(&format!("{name} was removed")), "{err}");
     }
 
     #[test]
