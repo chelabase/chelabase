@@ -274,16 +274,19 @@ fn demo_reads_the_setup_code_and_the_email() {
     assert!(!err.contains("ABCD"), "{err}");
 }
 
+/// Each sign-up request the fake auth saw: its headers and body.
+type SeenRequests = Arc<Mutex<Vec<(HashMap<String, String>, Value)>>>;
+
 /// A stand-in for auth: `/health` answers 200, `/auth/v1/sign-up` records each request (its
 /// headers and body) and answers `reply`'s next answer (the last one repeats).
 struct FakeAuth {
     url: String,
-    seen: Arc<Mutex<Vec<(HashMap<String, String>, Value)>>>,
+    seen: SeenRequests,
 }
 
 async fn fake_auth(replies: Vec<(u16, Value)>) -> FakeAuth {
     use axum::routing::{get, post};
-    let seen: Arc<Mutex<Vec<(HashMap<String, String>, Value)>>> = Arc::default();
+    let seen: SeenRequests = Arc::default();
     let replies = Arc::new(Mutex::new(replies));
     let s = seen.clone();
     let app = axum::Router::new()

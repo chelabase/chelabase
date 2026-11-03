@@ -491,7 +491,6 @@ impl Http for Fake {
                 retry_after: None,
                 body: body.to_string().into_bytes(),
                 session: Some(Secret::new(format!("SESSION{all}"))),
-                ..Response::default()
             });
         }
         s.log.push(key.clone());
@@ -513,7 +512,6 @@ impl Http for Fake {
                 Value::String(lines) => lines.clone().into_bytes(),
                 _ => body.to_string().into_bytes(),
             },
-            ..Response::default()
         })
     }
 }
