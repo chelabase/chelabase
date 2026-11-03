@@ -1,0 +1,8 @@
+Subject: You're invited to {{project}}
+
+You've been invited to {{project}}. You already have an account, so there's nothing to set up.
+
+Sign in with your own password to accept the invitation:
+{{link}}
+
+Chelabase will never ask you to choose a new password to accept an invitation. If you weren't expecting this, you can ignore this email.

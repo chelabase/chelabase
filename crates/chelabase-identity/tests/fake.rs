@@ -451,3 +451,78 @@ async fn ids_are_uuids_and_search_matches_part_of_the_email() {
         f.calls()
     );
 }
+
+#[tokio::test]
+async fn invite_notice_sends_no_code() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let uid = f.with_user(&Pool::Members, "ann@x.io", "password-ann-1");
+    let link = "https://studio.test/accept-invite?t=abc";
+    id.send_invite_notice(&Pool::Members, &uid, Some("Acme"), link)
+        .await
+        .unwrap();
+    assert_eq!(f.notices_sent().len(), 1);
+    assert_eq!(f.notices_sent()[0].user_id, uid);
+    assert_eq!(f.notices_sent()[0].link, link);
+    assert!(f.codes_sent().is_empty(), "a notice is not a code");
+
+    // As the service: a link with a code, no SMTP, an app pool, an unknown user.
+    let coded = id
+        .send_invite_notice(&Pool::Members, &uid, None, "https://s.test/a?t=1&code=123456")
+        .await;
+    assert!(matches!(coded, Err(IdentityError::Invalid { .. })), "{coded:?}");
+    let unknown = id
+        .send_invite_notice(&Pool::Members, "00000000-0000-4000-8000-000000000000", None, link)
+        .await;
+    assert_eq!(unknown, Err(IdentityError::NotFound(Missing::User)));
+    let app = app_pool();
+    f.with_pool(&app);
+    let wrong_pool = id.send_invite_notice(&app, &uid, None, link).await;
+    assert!(matches!(wrong_pool, Err(IdentityError::Invalid { .. })), "{wrong_pool:?}");
+    f.set_email_configured(false);
+    assert_eq!(
+        id.send_invite_notice(&Pool::Members, &uid, None, link).await,
+        Err(IdentityError::EmailNotConfigured)
+    );
+    assert_eq!(f.notices_sent().len(), 1);
+}
+
+#[tokio::test]
+async fn user_detail_tells_password_and_ban_reason() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let with = f.with_user(&Pool::Members, "ann@x.io", "password-ann-1");
+    let pre = f.with_unverified_user(&Pool::Members, "pre@x.io", "password-pre-1");
+    let without = f.with_invited_user(&Pool::Members, "new@x.io");
+    assert!(id.user_detail(&Pool::Members, &with).await.unwrap().has_password);
+    let detail = id.user_detail(&Pool::Members, &pre).await.unwrap();
+    assert!(detail.has_password && !detail.user.email_verified);
+    assert!(!id.user_detail(&Pool::Members, &without).await.unwrap().has_password);
+
+    id.ban(&Pool::Members, &with, Some("ours")).await.unwrap();
+    let banned = id.user_detail(&Pool::Members, &with).await.unwrap();
+    assert!(banned.user.banned);
+    assert_eq!(banned.ban_reason.as_deref(), Some("ours"));
+    id.unban(&Pool::Members, &with).await.unwrap();
+    assert_eq!(id.user_detail(&Pool::Members, &with).await.unwrap().ban_reason, None);
+}
+
+// As the service: members' sessions last 30 days, app users' 90.
+#[tokio::test]
+async fn session_lifetime_per_pool() {
+    let f = FakeIdentity::start().await;
+    let id = f.client();
+    let app = app_pool();
+    let day = |n: u64| Duration::from_secs(n * 24 * 3600);
+    f.with_user(&Pool::Members, "m@x.io", "password-m-1");
+    let a = f.with_user(&app, "a@x.io", "password-a-1");
+    let member = id.sign_in(&Pool::Members, "m@x.io", "password-m-1").await.unwrap();
+    let (app_session, _) = f.with_session(&app, &a);
+    f.advance(day(29));
+    assert!(id.session_by_id(&Pool::Members, &member.session_id).await.is_ok());
+    f.advance(day(2));
+    assert!(id.session_by_id(&Pool::Members, &member.session_id).await.is_err(), "past 30 days");
+    assert!(id.session_by_id(&app, &app_session).await.is_ok());
+    f.advance(day(60));
+    assert!(id.session_by_id(&app, &app_session).await.is_err(), "past 90 days");
+}

@@ -117,6 +117,17 @@ describeDb("pools", () => {
     }
   });
 
+  // Defence in depth: nothing may drop the members pool, the worker (which may drop pools)
+  // included.
+  it("members_pool_is_never_dropped", async () => {
+    await createPool(h, "members");
+    for (const as of ["worker", "auth", "orchestrator", "bootstrap"] as const) {
+      const r = await call(h, "DELETE", "/internal/v1/pools/members", { as });
+      expect(r.status, as).toBe(403);
+    }
+    expect(await schemaExists(h.db, "identity_members")).toBe(true);
+  });
+
   it("creating a pool twice is idempotent", async () => {
     const a = newAppPool();
     await createPool(h, a.pool);

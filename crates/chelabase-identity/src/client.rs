@@ -2,7 +2,7 @@
 
 use crate::error::{IdentityError, classify_status};
 use crate::ops::{self, Op};
-use crate::types::{NewUser, Pool, SessionInfo, SignedIn, User, UserPage};
+use crate::types::{NewUser, Pool, SessionInfo, SignedIn, User, UserDetail, UserPage};
 use chelabase_http::Method;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -32,6 +32,11 @@ impl std::fmt::Debug for Identity {
 #[derive(Deserialize)]
 struct UserBody {
     user: User,
+}
+
+#[derive(Deserialize)]
+struct UserDetailBody {
+    user: UserDetail,
 }
 
 impl Identity {
@@ -217,7 +222,17 @@ impl Identity {
     }
 
     pub async fn get_user(&self, pool: &Pool, user_id: &str) -> Result<User, IdentityError> {
-        let out: UserBody = self
+        Ok(self.user_detail(pool, user_id).await?.user)
+    }
+
+    /// The user with what only a single read tells: whether they have a password, and why
+    /// they are banned.
+    pub async fn user_detail(
+        &self,
+        pool: &Pool,
+        user_id: &str,
+    ) -> Result<UserDetail, IdentityError> {
+        let out: UserDetailBody = self
             .call(&ops::GET_USER, Some(pool), Some(user_id), &[], None)
             .await?;
         Ok(out.user)

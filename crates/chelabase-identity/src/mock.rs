@@ -26,7 +26,14 @@ use std::time::Duration;
 /// The bearer the fake's [`FakeIdentity::client`] sends. Any non-empty bearer is accepted.
 pub const TOKEN: &str = "test-identity-token";
 
-const SESSION_TTL_DAYS: i64 = 7;
+/// Session lifetime, as the service sets it per pool: 30 days for members, 90 for app users.
+fn session_ttl(pool: &str) -> ChronoDuration {
+    if pool == "members" {
+        ChronoDuration::days(30)
+    } else {
+        ChronoDuration::days(90)
+    }
+}
 const MIN_PASSWORD: usize = 8;
 const MAX_PASSWORD: usize = 128;
 
@@ -38,6 +45,7 @@ pub(crate) struct FUser {
     pub name: String,
     pub verified: bool,
     pub banned: bool,
+    pub ban_reason: Option<String>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -66,6 +74,26 @@ pub struct SentCode {
     pub email: String,
     pub kind: CodeKind,
     pub code: String,
+    /// The `link` the mail carried, if any.
+    pub link: Option<String>,
+}
+
+/// What a test may read of a fake user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FakeUser {
+    pub email: String,
+    pub has_password: bool,
+    pub verified: bool,
+    pub banned: bool,
+    pub ban_reason: Option<String>,
+}
+
+/// An invite notice the fake "mailed". It holds no code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SentNotice {
+    pub user_id: String,
+    pub email: String,
+    pub link: String,
 }
 
 struct Fault {
@@ -83,6 +111,7 @@ pub(crate) struct Inner {
     pub down: bool,
     pub email_configured: bool,
     pub sent: Vec<SentCode>,
+    pub notices: Vec<SentNotice>,
     faults: Vec<Fault>,
 }
 
@@ -290,6 +319,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                     .to_string(),
                 verified,
                 banned: false,
+                ban_reason: None,
                 created: now,
                 updated: now,
             };
@@ -349,10 +379,13 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 ),
             )
         }
-        ("GET", ["users", id]) => (
-            200,
-            Some(json!({ "user": user_out(&p.users[user_idx(p, id)?]) })),
-        ),
+        ("GET", ["users", id]) => {
+            let u = &p.users[user_idx(p, id)?];
+            let mut out = user_out(u);
+            out["has_password"] = json!(u.password.is_some());
+            out["ban_reason"] = json!(u.ban_reason);
+            (200, Some(json!({ "user": out })))
+        }
         ("DELETE", ["users", id]) => {
             let at = user_idx(p, id)?;
             p.users.remove(at);
@@ -388,6 +421,13 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
             let at = user_idx(p, id)?;
             let u = &mut p.users[at];
             (u.banned, u.updated) = (*verb == "ban", now);
+            u.ban_reason = (*verb == "ban").then(|| {
+                body.get("reason")
+                    .and_then(Value::as_str)
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or("No reason")
+                    .to_string()
+            });
             let out = user_out(u);
             if *verb == "ban" {
                 p.sessions.retain(|s| s.user_id != *id);
@@ -420,7 +460,7 @@ fn route(i: &mut Inner, method: &str, path: &str, query: &str, body: &Value) -> 
                 token: format!("tok-{}", tick()),
                 user_id: u.id.clone(),
                 created: now,
-                expires: now + ChronoDuration::days(SESSION_TTL_DAYS),
+                expires: now + session_ttl(&name),
             };
             let out = json!({ "session_id": s.id, "session_token": s.token, "user": user_out(&u) });
             p.sessions.push(s);
@@ -531,6 +571,7 @@ impl FakeIdentity {
             down: false,
             email_configured: true,
             sent: Vec::new(),
+            notices: Vec::new(),
             faults: Vec::new(),
         }));
         let app = Router::new().fallback(handle).with_state(inner.clone());
@@ -564,6 +605,11 @@ impl FakeIdentity {
         self.add_user(pool, email, Some(password), true)
     }
 
+    /// A user with a password and an unverified email (pre-registered: nobody proved the address).
+    pub fn with_unverified_user(&self, pool: &Pool, email: &str, password: &str) -> String {
+        self.add_user(pool, email, Some(password), false)
+    }
+
     /// A user with no password yet and an unverified email (an invitee).
     pub fn with_invited_user(&self, pool: &Pool, email: &str) -> String {
         self.add_user(pool, email, None, false)
@@ -581,6 +627,7 @@ impl FakeIdentity {
                 name: String::new(),
                 verified,
                 banned: false,
+                ban_reason: None,
                 created: now,
                 updated: now,
             });
@@ -593,13 +640,14 @@ impl FakeIdentity {
         self.with(|i| {
             let now = i.now();
             let (id, token) = (i.uuid(), i.id("tok-"));
-            let p = i.pools.get_mut(&pool.to_string()).expect("the pool exists");
+            let name = pool.to_string();
+            let p = i.pools.get_mut(&name).expect("the pool exists");
             p.sessions.push(FSession {
                 id: id.clone(),
                 token: token.clone(),
                 user_id: user_id.to_string(),
                 created: now,
-                expires: now + ChronoDuration::days(SESSION_TTL_DAYS),
+                expires: now + session_ttl(&name),
             });
             (id, token)
         })
@@ -612,7 +660,10 @@ impl FakeIdentity {
             p.users
                 .iter_mut()
                 .filter(|u| u.id == user_id)
-                .for_each(|u| u.banned = true);
+                .for_each(|u| {
+                    u.banned = true;
+                    u.ban_reason = Some("No reason".into());
+                });
             p.sessions.retain(|s| s.user_id != user_id);
         });
     }
@@ -653,6 +704,34 @@ impl FakeIdentity {
     /// Every code the fake mailed, oldest first.
     pub fn codes_sent(&self) -> Vec<SentCode> {
         self.with(|i| i.sent.clone())
+    }
+
+    /// Every invite notice the fake mailed, oldest first.
+    pub fn notices_sent(&self) -> Vec<SentNotice> {
+        self.with(|i| i.notices.clone())
+    }
+
+    /// The user's state, for assertions: `None` when they are gone.
+    pub fn user(&self, pool: &Pool, user_id: &str) -> Option<FakeUser> {
+        self.with(|i| {
+            let p = i.pools.get(&pool.to_string())?;
+            let u = p.users.iter().find(|u| u.id == user_id)?;
+            Some(FakeUser {
+                email: u.email.clone(),
+                has_password: u.password.is_some(),
+                verified: u.verified,
+                banned: u.banned,
+                ban_reason: u.ban_reason.clone(),
+            })
+        })
+    }
+
+    /// The user with this email.
+    pub fn user_by_email(&self, pool: &Pool, email: &str) -> Option<String> {
+        self.with(|i| {
+            let p = i.pools.get(&pool.to_string())?;
+            Some(p.users.iter().find(|u| u.email == email)?.id.clone())
+        })
     }
 
     pub fn session_count(&self, pool: &Pool) -> usize {

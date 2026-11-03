@@ -30,8 +30,6 @@ use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::{ApiJson, ApiPath, BranchId};
 use chelabase_identity::rules::{normalize_email, strong_password};
 use chelabase_identity::{Identity, IdentityError, Missing, NewUser, Pool, User};
-use chelabase_zitadel::client::ZError;
-use chelabase_zitadel::refusals;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
@@ -162,154 +160,9 @@ pub(crate) fn identity_failed(what: &str, err: &IdentityError) -> ApiError {
     }
 }
 
-pub(crate) fn zitadel_unavailable() -> ApiError {
-    ApiError::new(503, ErrorCode::Unavailable, "the user service isn't configured")
-}
-
-/// Zitadel's refusals of a user it doesn't have, one id per endpoint.
-const USER_NOT_FOUND: &[refusals::Refusal] = &[
-    refusals::GET_USER_NOT_FOUND,
-    refusals::DELETE_USER_NOT_FOUND,
-    refusals::LOCK_USER_NOT_FOUND,
-    refusals::UNLOCK_USER_NOT_FOUND,
-    refusals::DEACTIVATE_USER_NOT_FOUND,
-    refusals::REACTIVATE_USER_NOT_FOUND,
-    refusals::SET_EMAIL_USER_NOT_FOUND,
-    refusals::UPDATE_USER_NOT_FOUND,
-    // An invite code for a missing user is a 400, not a 404.
-    refusals::CREATE_INVITE_USER_NOT_FOUND,
-];
-
-/// Zitadel's refusals of a change the user's state or value already has.
-const STATE_CONFLICT: &[refusals::Refusal] = &[
-    refusals::USER_ALREADY_EXISTS,
-    refusals::EMAIL_NOT_CHANGED,
-    refusals::DEACTIVATE_ALREADY_INACTIVE,
-    refusals::DEACTIVATE_INITIAL,
-    refusals::REACTIVATE_NOT_INACTIVE,
-    refusals::LOCK_NOT_ACTIVE,
-    refusals::UNLOCK_NOT_LOCKED,
-];
-
-/// Zitadel's password policy refusals.
-const PASSWORD_POLICY: &[refusals::Refusal] = &[
-    refusals::PASSWORD_TOO_SHORT,
-    refusals::PASSWORD_NO_UPPER,
-    refusals::PASSWORD_NO_LOWER,
-    refusals::PASSWORD_NO_NUMBER,
-    refusals::PASSWORD_NO_SYMBOL,
-    refusals::CREATE_USER_PASSWORD_TOO_SHORT,
-    refusals::CREATE_USER_PASSWORD_NO_UPPER,
-    refusals::CREATE_USER_PASSWORD_NO_LOWER,
-    refusals::CREATE_USER_PASSWORD_NO_NUMBER,
-    refusals::CREATE_USER_PASSWORD_NO_SYMBOL,
-];
-
-/// A Zitadel failure the route didn't map itself, by the refusal's captured status, code and id
-/// (never its text): an unknown user is `404`, a state or value the user has already `409`, a
-/// weak password or a value Zitadel's validation refuses `422`. Anything else (an unreachable
-/// Zitadel, one refusing Chelabase's own credential, a proxy's page, a refusal nobody captured)
-/// is `503`.
-pub(crate) fn zitadel_failed(what: &str, err: &ZError) -> ApiError {
-    match err {
-        ZError::Rejected { .. } => {
-            warn!("zitadel refused: {what}: {err}");
-            if err.is_any(USER_NOT_FOUND) {
-                ApiError::not_found("user not found")
-            } else if err.is_any(STATE_CONFLICT) {
-                conflict(ErrorCode::Conflict, "the user service refused the change: it conflicts with the user's current state")
-            } else if err.is_any(PASSWORD_POLICY) {
-                weak_password()
-            } else if err.is_invalid_request() {
-                unprocessable("the user service refused the value")
-            } else {
-                if err.is_any(&[refusals::TOKEN_INVALID, refusals::NO_PERMISSION]) {
-                    error!("zitadel refused Chelabase's credential: {what}: {err}");
-                }
-                ApiError::new(503, ErrorCode::Unavailable, "the user service can't be reached; try again")
-            }
-        }
-        ZError::Unavailable(_) => {
-            error!("zitadel: {what}: {err}");
-            ApiError::new(503, ErrorCode::Unavailable, "the user service can't be reached; try again")
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn zitadel(r: refusals::Refusal) -> ZError {
-        ZError::Rejected { status: r.status, code: Some(r.code), id: Some(r.id.into()), message: "localized text".into() }
-    }
-
-    /// A refusal without Zitadel's code and id: a proxy's page, or a changed API.
-    fn bare(status: u16, message: &str) -> ZError {
-        ZError::Rejected { status, code: None, id: None, message: message.into() }
-    }
-
-    /// Each captured refusal maps by its status, code and id; anything else is `503`.
-    #[test]
-    fn zitadel_refusals_map_by_captured_id() {
-        use refusals as r;
-        let validation = ZError::Rejected { status: 400, code: Some(r::INVALID_ARGUMENT), id: None, message: "invalid field".into() };
-        let cases = [
-            (zitadel(r::EMAIL_NOT_CHANGED), 409, ErrorCode::Conflict),
-            (zitadel(r::DEACTIVATE_ALREADY_INACTIVE), 409, ErrorCode::Conflict),
-            (zitadel(r::REACTIVATE_NOT_INACTIVE), 409, ErrorCode::Conflict),
-            (zitadel(r::USER_ALREADY_EXISTS), 409, ErrorCode::Conflict),
-            (zitadel(r::GET_USER_NOT_FOUND), 404, ErrorCode::NotFound),
-            (zitadel(r::DELETE_USER_NOT_FOUND), 404, ErrorCode::NotFound),
-            (zitadel(r::UPDATE_USER_NOT_FOUND), 404, ErrorCode::NotFound),
-            (zitadel(r::SET_EMAIL_USER_NOT_FOUND), 404, ErrorCode::NotFound),
-            (zitadel(r::CREATE_INVITE_USER_NOT_FOUND), 404, ErrorCode::NotFound),
-            (validation, 422, ErrorCode::InvalidRequest),
-            (zitadel(r::PASSWORD_TOO_SHORT), 422, ErrorCode::WeakPassword),
-            (zitadel(r::PASSWORD_NO_SYMBOL), 422, ErrorCode::WeakPassword),
-            (zitadel(r::CREATE_USER_PASSWORD_TOO_SHORT), 422, ErrorCode::WeakPassword),
-            (zitadel(r::CREATE_USER_PASSWORD_NO_UPPER), 422, ErrorCode::WeakPassword),
-            (zitadel(r::CREATE_USER_PASSWORD_NO_LOWER), 422, ErrorCode::WeakPassword),
-            (zitadel(r::CREATE_USER_PASSWORD_NO_NUMBER), 422, ErrorCode::WeakPassword),
-            (zitadel(r::CREATE_USER_PASSWORD_NO_SYMBOL), 422, ErrorCode::WeakPassword),
-            (zitadel(r::TOKEN_INVALID), 503, ErrorCode::Unavailable),
-            (zitadel(r::NO_PERMISSION), 503, ErrorCode::Unavailable),
-            (ZError::Unavailable("timeout".into()), 503, ErrorCode::Unavailable),
-        ];
-        for (err, status, code) in cases {
-            let api = zitadel_failed("test", &err);
-            assert_eq!((api.status, api.code), (status, code), "{err}");
-        }
-    }
-
-    /// A refusal without Zitadel's code and id, or with a status that isn't its captured one, is
-    /// never read as not found, a conflict or a bad value, whatever its text says.
-    #[test]
-    fn refusals_without_a_captured_id_are_503() {
-        use refusals as r;
-        let moved = |r: refusals::Refusal, status| ZError::Rejected { status, code: Some(r.code), id: Some(r.id.into()), message: String::new() };
-        let cases = [
-            bare(404, "<html>404 Not Found</html>"),
-            bare(404, "Errors.User.NotFound"),
-            bare(400, "Errors.User.Email.NotChanged (COMMAND-Uch5e)"),
-            bare(400, "Errors.User.AlreadyInactive"),
-            bare(400, "Errors.User.Email.Invalid"),
-            bare(400, "Errors.User.Password.PasswordComplexityPolicy"),
-            bare(409, "Errors.User.AlreadyExists"),
-            bare(412, "something"),
-            bare(422, ""),
-            bare(401, ""),
-            bare(403, "Errors.PermissionDenied"),
-            // A captured id on another endpoint's status isn't the captured refusal.
-            moved(r::GET_USER_NOT_FOUND, 400),
-            moved(r::USER_ALREADY_EXISTS, 400),
-            ZError::Rejected { status: 400, code: Some(r::FAILED_PRECONDITION), id: Some("COMMAND-unseen".into()), message: String::new() },
-        ];
-        for err in cases {
-            let api = zitadel_failed("test", &err);
-            assert_eq!((api.status, api.code), (503, ErrorCode::Unavailable), "{err}");
-        }
-    }
 
     /// The identity service's refusals, by type; anything it has no answer for is `503`.
     #[test]

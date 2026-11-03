@@ -238,3 +238,74 @@ async fn identity_live_email_status() {
     // Answers whether or not SMTP is configured.
     l.auth.email_status().await.unwrap();
 }
+
+// #122: nothing drops the members pool, the worker included.
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_members_pool_is_never_dropped() {
+    let Some(l) = live() else { return };
+    for caller in [&l.worker, &l.auth] {
+        assert!(
+            matches!(caller.drop_pool(&Pool::Members).await, Err(IdentityError::Forbidden(_))),
+            "the members pool answered something other than 403"
+        );
+    }
+}
+
+// #122: the single-user read tells whether there is a password, and why a ban was placed.
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_user_detail() {
+    with_pools(1, |id, p| async move {
+        let with = id
+            .create_user(&p[0], &chelabase_identity::NewUser { email: "pw@x.io", password: Some("password-live-1"), ..Default::default() })
+            .await
+            .unwrap();
+        let without = id
+            .create_user(&p[0], &chelabase_identity::NewUser { email: "nopw@x.io", ..Default::default() })
+            .await
+            .unwrap();
+        assert!(id.user_detail(&p[0], &with.id).await.unwrap().has_password);
+        assert!(!id.user_detail(&p[0], &without.id).await.unwrap().has_password);
+        id.ban(&p[0], &without.id, Some("live-reason")).await.unwrap();
+        let banned = id.user_detail(&p[0], &without.id).await.unwrap();
+        assert_eq!(banned.ban_reason.as_deref(), Some("live-reason"));
+    })
+    .await;
+}
+
+// #122: the orchestrator's invite notice, in the members pool (the user it makes is deleted
+// again). Also needs `CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE`. With SMTP the notice is
+// sent; without, it is 409 `email_not_configured`. A link holding a code is refused either way.
+#[tokio::test]
+#[ignore = "needs CHELABASE_IDENTITY_URL"]
+async fn identity_live_invite_notice() {
+    if live().is_none() {
+        return;
+    }
+    let Some(file) = std::env::var_os("CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE") else {
+        eprintln!("CHELABASE_IDENTITY_ORCHESTRATOR_TOKEN_FILE is unset: skipped");
+        return;
+    };
+    let url = std::env::var("CHELABASE_IDENTITY_URL").unwrap();
+    let orchestrator = Identity::from_token_file(&url, std::path::Path::new(&file)).unwrap();
+    let email = format!("notice-{}@example.test", uuid::Uuid::new_v4());
+    let user = orchestrator
+        .create_user(&Pool::Members, &chelabase_identity::NewUser { email: &email, ..Default::default() })
+        .await
+        .unwrap();
+    let configured = orchestrator.email_status().await.unwrap().configured;
+    let sent = orchestrator
+        .send_invite_notice(&Pool::Members, &user.id, Some("Live"), "https://studio.test/accept-invite?t=live")
+        .await;
+    let coded = orchestrator
+        .send_invite_notice(&Pool::Members, &user.id, None, "https://studio.test/accept-invite?t=live&code=123456")
+        .await;
+    orchestrator.delete_user(&Pool::Members, &user.id).await.unwrap();
+    if configured {
+        sent.unwrap();
+    } else {
+        assert_eq!(sent, Err(IdentityError::EmailNotConfigured));
+    }
+    assert!(matches!(coded, Err(IdentityError::Invalid { .. })), "{coded:?}");
+}

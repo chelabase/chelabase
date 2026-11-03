@@ -37,8 +37,11 @@ use chelabase_types::access::{PgRole, PlatformRole, RoleSet, act_as_reserved};
 use chelabase_types::api_error::{ApiError, ErrorCode, ErrorEnvelope};
 use chelabase_types::role_name::check_any_role_name;
 use chelabase_types::{ApiJson, ApiPath, BranchId, DatabaseId, ProjectId, TenantId};
-use chelabase_zitadel::client::{EmailMatch, UserState, ZError, ZUser, Zitadel};
-use chelabase_zitadel::refusals;
+use chelabase_identity::rules::{MEMBER_REMOVED_BAN_REASON, normalize_email};
+use chelabase_identity::{
+    CodeKind, CodeRequest, Delivery as CodeDelivery, Identity, IdentityError, Missing, NewUser, Pool,
+    User, UserDetail,
+};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, Utc};
@@ -51,7 +54,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::access::{RoleGraph, Target, authorize, authorize_project};
-use crate::app_user_admin::{zitadel_failed, zitadel_unavailable};
+use crate::app_user_admin::{identity_failed, identity_unavailable};
 use crate::{
     AllRoles, ApiBytes, AppState, AuthPrincipal, BoxError, InstancePrincipal, JobPort, MeRoles,
     MemberStatusView, MetadataPort, NatsPorts, roles,
@@ -311,19 +314,6 @@ pub trait MembersPort: Send + Sync + 'static {
         new: NewInvite<'_>,
     ) -> impl Future<Output = Result<(MemberListing, Uuid), AccessWriteError>> + Send;
 
-    /// A person already in the tenant's org, added active, in `teams` (P12, P25).
-    #[allow(clippy::too_many_arguments)]
-    fn add_existing_user(
-        &self,
-        actor: Uuid,
-        tenant: TenantId,
-        identity_user_id: &str,
-        email: &str,
-        name: &str,
-        grants: &[(Uuid, GrantRow)],
-        teams: &[TeamSeen],
-    ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
-
     /// Also replaces the invite's token (by its hash).
     fn resend_invite(
         &self,
@@ -333,7 +323,7 @@ pub trait MembersPort: Send + Sync + 'static {
         token_hash: [u8; 32],
     ) -> impl Future<Output = Result<(), AccessWriteError>> + Send;
 
-    /// Returns the never-activated Zitadel user to delete.
+    /// Returns the invite's identity user.
     fn revoke_invite(
         &self,
         actor: Uuid,
@@ -365,19 +355,35 @@ pub trait MembersPort: Send + Sync + 'static {
         teams: &[TeamSeen],
     ) -> impl Future<Output = Result<MemberListing, AccessWriteError>> + Send;
 
-    /// Whether the member's Zitadel user has another non-removed member row, in any tenant: a
-    /// removal, a decline or a revoke then leaves the user active.
+    /// Whether the member's identity user has another non-removed member row, in any tenant: a
+    /// removal, a decline or a revoke then leaves the account alone.
     fn has_other_membership(
         &self,
         member: Uuid,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
-    /// Declines a pending member: removed. Returns its Zitadel user, to deactivate.
+    /// Declines a pending member: removed. Returns its identity user.
     fn decline_member(
         &self,
         actor: Uuid,
         member: Uuid,
     ) -> impl Future<Output = Result<String, AccessWriteError>> + Send;
+
+    /// D4: marks the tenant's member with this identity user offboarded and revokes every live
+    /// personal login of theirs; the member's login rows, for the proxies. Idempotent.
+    fn revoke_logins_for_identity_user(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> impl Future<Output = Result<Vec<LoginEndpoint>, MetadataError>> + Send;
+
+    /// D7: the tenant's member with this identity user is no longer marked offboarded; `true`
+    /// when a mark was cleared.
+    fn clear_offboarded(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
     /// Sets (or, with `None`, clears) the tenant's display name; an unchanged name writes
     /// nothing.
@@ -608,20 +614,6 @@ impl MembersPort for MetadataClient {
         MetadataClient::create_invited_member(self, actor, tenant, new).await
     }
 
-    async fn add_existing_user(
-        &self,
-        actor: Uuid,
-        tenant: TenantId,
-        identity_user_id: &str,
-        email: &str,
-        name: &str,
-        grants: &[(Uuid, GrantRow)],
-        teams: &[TeamSeen],
-    ) -> Result<MemberListing, AccessWriteError> {
-        MetadataClient::add_existing_user(self, actor, tenant, identity_user_id, email, name, grants, teams)
-            .await
-    }
-
     async fn resend_invite(
         &self,
         actor: Uuid,
@@ -667,6 +659,18 @@ impl MembersPort for MetadataClient {
         MetadataClient::decline_member(self, actor, member).await
     }
 
+    async fn revoke_logins_for_identity_user(
+        &self,
+        tenant: TenantId,
+        identity_user_id: &str,
+    ) -> Result<Vec<LoginEndpoint>, MetadataError> {
+        MetadataClient::revoke_logins_for_identity_user(self, tenant, identity_user_id).await
+    }
+
+    async fn clear_offboarded(&self, tenant: TenantId, identity_user_id: &str) -> Result<bool, MetadataError> {
+        MetadataClient::clear_offboarded(self, tenant, identity_user_id).await
+    }
+
     async fn set_tenant_display_name(
         &self,
         actor: Uuid,
@@ -700,9 +704,14 @@ impl MemberRolesQueue for NatsPorts {
     }
 }
 
-/// How long an invite code lives. Zitadel's default invite-code lifetime is 72 hours; the stored
-/// `expires_at` mirrors it (Zitadel itself refuses an older code).
+/// How long an invite lives. The identity service's invite code lives 7 days; the invite's own
+/// `expires_at` is the shorter bound, and accept-invite checks it.
 const INVITE_LIFETIME_HOURS: i64 = 72;
+
+/// Invite mails and codes per person per hour, first invites and resends together, in this
+/// process. Each new code resets that code's wrong-guess count, so this is what bounds the
+/// guesses (the identity service's own limiter is in `services/auth`, which this doesn't pass).
+const INVITE_SENDS_PER_HOUR: usize = 5;
 
 /// Access-log pages: the default and the most a page may hold.
 const EVENTS_DEFAULT: u32 = 50;
@@ -737,7 +746,7 @@ where
 
 // --- Shapes ------------------------------------------------------------------------------------
 
-/// A member of the tenant: a person in its Zitadel organisation.
+/// A member of the tenant: a person of the members pool.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct Member {
     id: Uuid,
@@ -931,7 +940,8 @@ pub(crate) struct ApproveMemberRequest {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Delivery {
-    /// Zitadel mails the link (needs an active email provider, see `getInviteDelivery`).
+    /// Mailed: an invite code, or for an existing account a notice to sign in and accept (needs
+    /// SMTP, see `getInviteDelivery`).
     #[default]
     Email,
     /// The response carries the link (`invite_url`) once; the admin hands it over. Nothing is
@@ -995,11 +1005,9 @@ pub(crate) struct ResendInviteRequest {
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InviteOutcome {
-    /// A new person: Zitadel mailed them an invite link (or, with `link` delivery, the response
-    /// carries it); they are `invited` until they accept.
+    /// Not a member yet: they got an invite (or, with `link` delivery, the response carries it)
+    /// and are `invited` until they accept.
     Invited,
-    /// A person already in the organisation: now an active member, no mail sent.
-    Added,
     /// Already a member: they got the grants.
     ExistingMember,
 }
@@ -1030,17 +1038,15 @@ pub(crate) struct ResentInvite {
 #[derive(Debug, Clone, Copy, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryReason {
-    /// Zitadel has no active email provider.
-    NoEmailProvider,
-    /// Zitadel couldn't be asked.
-    ZitadelUnavailable,
-    /// This instance has no Zitadel admin access.
-    ZitadelNotConfigured,
+    /// No SMTP server is configured.
+    EmailNotConfigured,
+    /// The identity service couldn't be asked.
+    IdentityUnavailable,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct InviteDelivery {
-    /// Whether Zitadel has an active email provider, so `email` delivery works.
+    /// Whether an SMTP server is configured, so `email` delivery works.
     email_available: bool,
     /// Why not; `null` when it is available.
     #[schema(required = true)]
@@ -1411,7 +1417,7 @@ fn access_changed<M, J>(state: &AppState<M, J>, tenant: TenantId, member_sub: Op
 ///    proxy makes now is refused even when this message is lost);
 /// 3. every branch of `projects` reconciles its member roles ([`reconcile_projects`]).
 ///
-/// `members` are `(member id, Zitadel sub)` pairs. Grant, override, tenant-admin, remove,
+/// `members` are `(member id, identity user id)` pairs. Grant, override, tenant-admin, remove,
 /// suspend, reinstate and revoke-now handlers call it; step 2's team writes will too.
 pub(crate) async fn access_changed_for<M, J>(
     state: &AppState<M, J>,
@@ -1760,7 +1766,7 @@ const INVITE_TEAMS_MAX: usize = 50;
 
 /// An invite's or approval's `team_ids` (P12): duplicates dropped (the first stays), at most
 /// [`INVITE_TEAMS_MAX`], each a team of the tenant (else 422 naming it in `team_id`). Read
-/// before anything is made, so a refused id leaves no Zitadel user behind.
+/// before anything is made, so a refused id leaves no identity user behind.
 async fn invite_team_ids<M, J>(
     state: &AppState<M, J>,
     tenant: TenantId,
@@ -1924,9 +1930,9 @@ fn grant_rows(grants: &[CheckedGrant]) -> Vec<(Uuid, GrantRow)> {
 }
 
 /// An invite's email: trimmed, lowercased, one `@` with text on both sides, no spaces, 200
-/// characters at most (Zitadel's limit).
+/// characters at most.
 fn invite_email(raw: &str) -> Result<String, ApiError> {
-    let email = chelabase_zitadel::rules::normalize_email(raw);
+    let email = normalize_email(raw);
     let shaped = email.len() <= 200
         && !email.chars().any(char::is_whitespace)
         && email.split_once('@').is_some_and(|(local, domain)| {
@@ -1984,52 +1990,19 @@ where
     Ok(out)
 }
 
-/// The invite link Zitadel mails: Studio's accept page with the user id, the code and the
-/// invite's own token (`t`, which lets the page describe the invite before the code is spent).
-fn invite_template<M, J>(state: &AppState<M, J>, token: &InviteToken) -> String {
-    format!(
-        "{}/accept-invite?user={{{{.UserID}}}}&code={{{{.Code}}}}&t={}",
-        state.studio_url.trim_end_matches('/'),
-        token.secret
-    )
-}
-
-/// The link a password-reset mail carries for an invite (a person who already has a way to sign
-/// in, whom Zitadel gives no invite code): the invite's link, marked `reset=1` so accept-invite
-/// sets the password with the code.
-fn reset_template<M, J>(state: &AppState<M, J>, token: &InviteToken) -> String {
-    format!("{}&reset=1", invite_template(state, token))
-}
-
-/// Whether Zitadel refuses `user` an invite code because they already have a way to sign in (a
-/// password, also one set at creation in the Initial state, a passkey, an OTP or U2F factor, an
-/// IdP link): Zitadel answers "User is already initialized". Such a person is mailed a
-/// password-reset code instead, which Zitadel makes for any user, a deactivated one included.
-async fn needs_reset_code(z: &Zitadel, user: &ZUser) -> Result<bool, ZError> {
-    if user.has_password {
-        return Ok(true);
-    }
-    z.has_auth_methods(&user.id).await
-}
-
-/// Mails `user` the invite's code: an invite code, or a password-reset code (`reset`) for a
-/// person Zitadel gives no invite code.
-async fn mail_code<M, J>(
-    state: &AppState<M, J>,
-    z: &Zitadel,
-    user: &str,
-    reset: bool,
-    token: &InviteToken,
-) -> Result<(), ZError> {
-    if reset {
-        z.send_password_reset(user, &reset_template(state, token)).await
-    } else {
-        z.create_invite_code(user, &invite_template(state, token)).await
+/// The accept page's address for an invite's mail or notice: Studio's accept page with the
+/// invite's own token (`t`, which lets the page describe the invite). A code mail adds the user,
+/// and the person types the code from the mail; a notice carries only the ticket.
+fn ticket_link<M, J>(state: &AppState<M, J>, user: Option<&str>, token: &InviteToken) -> String {
+    let base = format!("{}/accept-invite", state.studio_url.trim_end_matches('/'));
+    match user {
+        Some(user) => format!("{base}?user={user}&t={}", token.secret),
+        None => format!("{base}?t={}", token.secret),
     }
 }
 
-/// The link `Delivery::Link` hands the admin: what the mail's template would give, with the
-/// user and the code filled in. The code is spent on first use; Chelabase never stores or logs it.
+/// The link `Delivery::Link` hands the admin: the accept page with the user, the code and the
+/// token. The code is spent on first use; Chelabase never stores or logs it.
 fn invite_link<M, J>(state: &AppState<M, J>, user: &str, code: &str, token: &InviteToken) -> String {
     format!(
         "{}/accept-invite?user={user}&code={code}&t={}",
@@ -2063,16 +2036,23 @@ impl InviteToken {
     }
 }
 
-/// 409 `link_not_allowed`: a link invite for a user who has a way to sign in. It says whether
-/// email delivery works now, so Studio can offer it (a Zitadel that can't be asked counts as no).
-async fn link_refused(z: &Zitadel) -> ApiError {
-    let email_available = z.email_provider_active().await.unwrap_or(false);
+/// 409 `link_not_allowed`: a link would hand the admin a code that sets the password of an
+/// account they don't own. It says whether email delivery works now, so Studio can offer it (an
+/// identity service that can't be asked counts as no).
+async fn link_refused(identity: &Identity) -> ApiError {
+    let email_available = identity.email_status().await.is_ok_and(|s| s.configured);
     ApiError::new(
         409,
         ErrorCode::LinkNotAllowed,
-        "this person already has a way to sign in: send the invite by email (delivery: \"email\")",
+        "this person already has an account: send the invite by email (delivery: \"email\")",
     )
     .with_extra("email_available", json!(email_available))
+}
+
+/// 409 `conflict`: email delivery with no SMTP configured.
+fn email_not_configured() -> ApiError {
+    ApiError::new(409, ErrorCode::Conflict, "email isn't configured: invite by link (delivery: \"link\")")
+        .with_extra("email_available", json!(false))
 }
 
 /// 409 `invite_closed`: revoked, accepted or replaced since.
@@ -2084,20 +2064,126 @@ fn invite_expiry() -> DateTime<Utc> {
     Utc::now() + chrono::Duration::hours(INVITE_LIFETIME_HOURS)
 }
 
-fn admin_zitadel<M, J>(state: &AppState<M, J>) -> Result<&Zitadel, ApiError> {
-    state.zitadel.as_ref().ok_or_else(zitadel_unavailable)
+fn identity_client<M, J>(state: &AppState<M, J>) -> Result<&Identity, ApiError> {
+    state.identity_service.as_ref().ok_or_else(identity_unavailable)
 }
 
-/// The invite itself (spec part 5). The person is matched by Zitadel user id first, then by a
-/// member's non-NULL email (R8, R18):
+/// Sends of invite mails and codes in the last hour, per identity user.
+static INVITE_SENDS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Takes one of the person's [`INVITE_SENDS_PER_HOUR`] sends, or 429 `rate_limited`.
+fn take_invite_send(user: &str) -> Result<(), ApiError> {
+    let hour = std::time::Duration::from_secs(3600);
+    let now = std::time::Instant::now();
+    let mut sends = INVITE_SENDS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    sends.retain(|_, times| {
+        while times.front().is_some_and(|t| now.duration_since(*t) >= hour) {
+            times.pop_front();
+        }
+        !times.is_empty()
+    });
+    let times = sends.entry(user.to_string()).or_default();
+    if times.len() >= INVITE_SENDS_PER_HOUR {
+        let wait = times.front().map_or(hour, |t| hour.saturating_sub(now.duration_since(*t)));
+        let mut err = ApiError::new(429, ErrorCode::RateLimited, "too many invites to this person this hour; try again later");
+        err.retry_after = Some(u32::try_from(wait.as_secs().max(1)).unwrap_or(3600));
+        return Err(err);
+    }
+    times.push_back(now);
+    Ok(())
+}
+
+/// The members-pool user with exactly this (normalised) email. The service's search matches a
+/// part of the address, so every page of matches is read until the exact one turns up.
+async fn find_identity_user(identity: &Identity, email: &str) -> Result<Option<User>, IdentityError> {
+    const PAGE: u32 = 200;
+    let mut offset = 0u32;
+    loop {
+        let page = identity.search_users(&Pool::Members, email, PAGE, offset).await?;
+        if let Some(user) = page.users.iter().find(|u| normalize_email(&u.email) == email) {
+            return Ok(Some(user.clone()));
+        }
+        offset = offset.saturating_add(u32::try_from(page.users.len()).unwrap_or(PAGE));
+        if page.users.is_empty() || u64::from(offset) >= page.total {
+            return Ok(None);
+        }
+    }
+}
+
+/// How an invite reaches the person.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InviteSend {
+    /// An invite code: mailed, or handed back for the admin's link.
+    Code(CodeDelivery),
+    /// The code-less notice, for an established account: they accept by signing in.
+    Notice,
+}
+
+/// What an invite to this person may send. `detail` is `None` for a user this call made.
+///
+/// - A link carries a code that sets the password, so it is only for a new user, or one with
+///   no password and an unverified email; anyone else is 409 `link_not_allowed`.
+/// - By email an established account (a password and a verified email) gets the notice, never a
+///   code. Anyone else gets the code, which only their mailbox can read (a pre-registered
+///   account's password is replaced when it is accepted).
+async fn invite_send(identity: &Identity, detail: Option<&UserDetail>, delivery: Delivery) -> Result<InviteSend, ApiError> {
+    match (delivery, detail) {
+        (Delivery::Link, Some(d)) if d.has_password || d.user.email_verified => Err(link_refused(identity).await),
+        (Delivery::Link, _) => Ok(InviteSend::Code(CodeDelivery::Return)),
+        (Delivery::Email, Some(d)) if d.has_password && d.user.email_verified => Ok(InviteSend::Notice),
+        (Delivery::Email, _) => Ok(InviteSend::Code(CodeDelivery::Email)),
+    }
+}
+
+/// Sends the invite; the link for the admin with `Code(Return)`. A code the service refuses
+/// because the account became established meanwhile is a notice by email, and
+/// `link_not_allowed` for a link.
+async fn send_invite<M, J>(
+    state: &AppState<M, J>,
+    identity: &Identity,
+    user: &str,
+    send: InviteSend,
+    token: &InviteToken,
+) -> Result<Option<String>, ApiError> {
+    let notice = async || {
+        identity
+            .send_invite_notice(&Pool::Members, user, None, &ticket_link(state, None, token))
+            .await
+            .map(|()| None)
+    };
+    let sent = match send {
+        InviteSend::Notice => notice().await,
+        InviteSend::Code(delivery) => {
+            let link = ticket_link(state, Some(user), token);
+            let mut request = CodeRequest::new(user, CodeKind::Invite, delivery);
+            if delivery == CodeDelivery::Email {
+                request.link = Some(&link);
+            }
+            match identity.create_code(&Pool::Members, &request).await {
+                Ok(_) if delivery == CodeDelivery::Email => Ok(None),
+                Ok(issued) => match issued.code {
+                    Some(code) => Ok(Some(invite_link(state, user, &code, token))),
+                    None => Err(IdentityError::Unavailable("no code in a return delivery".into())),
+                },
+                Err(IdentityError::InviteRefused(_)) if delivery == CodeDelivery::Email => notice().await,
+                Err(IdentityError::InviteRefused(_)) => return Err(link_refused(identity).await),
+                Err(err) => Err(err),
+            }
+        }
+    };
+    sent.map_err(|err| match err {
+        IdentityError::EmailNotConfigured => email_not_configured(),
+        err => identity_failed("invite: send", &err),
+    })
+}
+
+/// The invite itself (spec part 5). The person is the members-pool user with the email, else a
+/// member with that (non-NULL) email (R8, R18):
 /// 1. a live member already: they get the grants (all or none);
-/// 2. an Active user of the tenant's Zitadel org who has a password and was never a member: an
-///    active member with the grants, no mail;
-/// 3. anyone else (R29): an `invited` member with its (inert) grants and an invite, then
-///    Zitadel mails a code. That covers a removed member and an org user who is deactivated,
-///    in another state, or never set a password (a deactivated user stays so until
-///    accept-invite verifies the code, I1), and a new person (a passwordless Zitadel user is
-///    made).
+/// 2. anyone else (R29): an `invited` member with its (inert) grants and an invite, then the
+///    invite is sent ([`invite_send`]). That covers a removed member and an existing account,
+///    who join by accepting, and a new person (a passwordless user is made).
 ///
 /// The grants keep the invariant ([`RoleContext::check_effective`]) before anything is written.
 async fn invite<M, J>(
@@ -2114,45 +2200,25 @@ where
 {
     let actor = actor(principal.member.as_ref())?;
     let tenant = principal.tenant_id;
-    let found = match &state.zitadel {
-        Some(z) => Some(
-            z.find_user_in_org(&principal.org_id, &email)
-                .await
-                .map_err(|err| zitadel_failed("invite: find user", &err))?,
-        ),
+    let found = match &state.identity_service {
+        Some(identity) => find_identity_user(identity, &email)
+            .await
+            .map_err(|err| identity_failed("invite: find user", &err))?,
         None => None,
     };
     let existing = match found {
-        Some(EmailMatch::Many) => {
-            return Err(ApiError::new(
-                409,
-                ErrorCode::EmailAmbiguous,
-                "more than one user of the organisation has this email; resolve it in Zitadel first",
-            ));
-        }
-        Some(EmailMatch::One(user)) => {
-            match state.metadata.member_by_identity_user(tenant, &user.id).await {
-                Ok(Some(m)) if m.status != MemberStatus::Removed => m,
-                Ok(row) => {
-                    let usable = user.state == UserState::Active && user.has_password;
-                    return if usable && row.is_none() {
-                        add_user(state, principal, actor, user, &email, &grants, &teams).await
-                    } else {
-                        invite_with_code(state, principal, actor, &email, &grants, &teams, Some(user), delivery).await
-                    };
-                }
-                Err(err) => return Err(internal("invite: member by user", err)),
+        Some(user) => match state.metadata.member_by_identity_user(tenant, &user.id).await {
+            Ok(Some(m)) if m.status != MemberStatus::Removed => m,
+            Ok(_) => return invite_with_code(state, principal, actor, &email, &grants, &teams, Some(user), delivery).await,
+            Err(err) => return Err(internal("invite: member by user", err)),
+        },
+        None => match state.metadata.member_by_email(tenant, &email).await {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                return invite_with_code(state, principal, actor, &email, &grants, &teams, None, delivery).await;
             }
-        }
-        Some(EmailMatch::None) | None => {
-            match state.metadata.member_by_email(tenant, &email).await {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    return invite_with_code(state, principal, actor, &email, &grants, &teams, None, delivery).await;
-                }
-                Err(err) => return Err(internal("invite: member by email", err)),
-            }
-        }
+            Err(err) => return Err(internal("invite: member by email", err)),
+        },
     };
     // A sign-up waiting for approval is answered by approving it, with the grants chosen there.
     if existing.status == MemberStatus::Pending {
@@ -2219,64 +2285,11 @@ where
     ))
 }
 
-/// Invite step 2: an Active org user with a password, never a member, becomes an active member.
-async fn add_user<M, J>(
-    state: &AppState<M, J>,
-    principal: &AuthPrincipal,
-    actor: Uuid,
-    user: chelabase_zitadel::client::ZUser,
-    email: &str,
-    checked: &[CheckedGrant],
-    teams: &[Uuid],
-) -> Result<(StatusCode, InviteResult), ApiError>
-where
-    M: MetadataPort,
-    J: JobPort,
-{
-    let email = Some(user.email.as_str())
-        .filter(|e| !e.trim().is_empty())
-        .unwrap_or(email);
-    let grants = grant_rows(checked);
-    // T9-I1: what the caller sees is read before the write.
-    let visible = visible_projects(state, principal).await?;
-    // P25: a team changed between the check and the write is checked again.
-    let mut tries = 0;
-    let (listing, seen) = loop {
-        tries += 1;
-        let seen = teams_seen(state, principal.tenant_id, teams).await?;
-        check_invite(state, None, checked, &seen).await?;
-        match state
-            .metadata
-            .add_existing_user(actor, principal.tenant_id, &user.id, email, &user.display_name, &grants, &seen)
-            .await
-        {
-            Err(AccessWriteError::Changed) if tries < CHECKED_WRITE_TRIES => continue,
-            other => {
-                break (
-                    other.map_err(|err| write_failed("invite: add user", err, "project not found"))?,
-                    seen,
-                );
-            }
-        }
-    };
-    info!(request_id = %principal.request_id, member_id = %listing.id, "invite: a user of the organisation was added");
-    reconcile_projects(state, invite_projects(&grants, &seen)).await;
-    let access = written_access(&listing.member, &visible, &grants, &seen);
-    Ok((
-        StatusCode::CREATED,
-        InviteResult {
-            outcome: InviteOutcome::Added,
-            member: Member::new(listing, None, access),
-            invite_url: None,
-        },
-    ))
-}
-
-/// Invite step 3 (R29): an `invited` member and a code (mailed, or with `Delivery::Link` handed
-/// back to the admin inside the link, R35), for `existing` (an org user who
-/// may not be added straight away: reactivated first when deactivated) or a new passwordless
-/// user. Each step undoes the earlier ones when it fails, so a failed invite leaves no new
-/// user, member or mail behind.
+/// Invite step 2 (R29): an `invited` member and its invite, for `existing` (a members-pool user
+/// who isn't a live member here) or a new passwordless user, then the invite is sent (mailed, or
+/// with `Delivery::Link` handed back inside the link, R35). Each step undoes the earlier ones when
+/// it fails: the invite is revoked, and a user this call made is deleted, unless another tenant
+/// holds it by then. A user that existed before is never deleted.
 #[allow(clippy::too_many_arguments)]
 async fn invite_with_code<M, J>(
     state: &AppState<M, J>,
@@ -2285,7 +2298,7 @@ async fn invite_with_code<M, J>(
     email: &str,
     checked: &[CheckedGrant],
     teams: &[Uuid],
-    existing: Option<chelabase_zitadel::client::ZUser>,
+    existing: Option<User>,
     delivery: Delivery,
 ) -> Result<(StatusCode, InviteResult), ApiError>
 where
@@ -2297,59 +2310,58 @@ where
     // made; P25: a team that changes before the write is read and checked again there.
     let mut seen = teams_seen(state, principal.tenant_id, teams).await?;
     check_invite(state, None, checked, &seen).await?;
-    let z = admin_zitadel(state)?;
+    let identity = identity_client(state)?;
     // T9-I1: what the caller sees is read before anything is made (a failed read here leaves
     // nothing behind).
     let visible = visible_projects(state, principal).await?;
     let created = existing.is_none();
-    // A link carries the code and nothing else: it is for a user who is made now, or one who has
-    // never had any way to sign in (password, passkey, OTP or U2F, IdP link). Anyone else is told
-    // by email, which only they can read.
-    if delivery == Delivery::Link
-        && let Some(user) = &existing
-        && (user.has_password
-            || z.has_auth_methods(&user.id).await.map_err(|err| zitadel_failed("invite: read auth methods", &err))?)
-    {
-        return Err(link_refused(z).await);
-    }
-    let reset = match &existing {
-        Some(user) if delivery == Delivery::Email => needs_reset_code(z, user)
-            .await
-            .map_err(|err| zitadel_failed("invite: read auth methods", &err))?,
-        _ => false,
-    };
-    let user = match existing {
-        // I1: a deactivated user stays deactivated; accept-invite reactivates them once the
-        // emailed code is verified, so an invite that expires or is revoked never lets an old
-        // password work again.
-        Some(user) => user.id,
-        None => match z
-            .create_user_without_password(&principal.org_id, email)
-            .await
-        {
-            Ok(user) => user,
-            Err(err) if err.is(refusals::USER_ALREADY_EXISTS) => {
-                return Err(ApiError::new(
-                    409,
-                    ErrorCode::EmailInUseElsewhere,
-                    "a user with this email already exists outside the tenant's organisation",
-                ));
+    let (user, send) = match existing {
+        Some(user) => {
+            let detail = identity
+                .user_detail(&Pool::Members, &user.id)
+                .await
+                .map_err(|err| identity_failed("invite: read user", &err))?;
+            let send = invite_send(identity, Some(&detail), delivery).await?;
+            take_invite_send(&user.id)?;
+            (user.id, send)
+        }
+        None => {
+            let new = NewUser { email, ..NewUser::default() };
+            match identity.create_user(&Pool::Members, &new).await {
+                // A new user's first send always fits; it starts the person's count.
+                Ok(user) => {
+                    let _ = take_invite_send(&user.id);
+                    (user.id, invite_send(identity, None, delivery).await?)
+                }
+                // Made by another invite since the search: inviting again finds it.
+                Err(IdentityError::Conflict(_)) => {
+                    warn!(request_id = %principal.request_id, "invite: the user was made by another call meanwhile");
+                    return Err(identity_unavailable());
+                }
+                Err(err) => return Err(identity_failed("invite: create user", &err)),
             }
-            Err(err) => return Err(zitadel_failed("invite: create user", &err)),
-        },
+        }
     };
-    // Undoes what this invite did to the Zitadel user: a new one is deleted, an existing one is
-    // left deactivated (as a removal leaves it).
-    let undo = |why: &'static str| {
+    // Undoes what this call did to the identity user: one it made is deleted, unless another
+    // tenant's invite holds it by now (`member`: this call's member row, once there is one).
+    let undo = |why: &'static str, member: Option<Uuid>| {
         let user = user.clone();
         async move {
-            let result = if created {
-                z.delete_user(&user).await
-            } else {
-                z.deactivate_user_settled(&user).await
-            };
-            if let Err(err) = result {
-                error!(user_id = %user, "invite: undoing the Zitadel user after {why} failed: {err}");
+            if !created {
+                return;
+            }
+            if let Some(member) = member {
+                match state.metadata.has_other_membership(member).await {
+                    Ok(false) => {}
+                    Ok(true) => return,
+                    Err(err) => {
+                        error!(user_id = %user, "invite: keeping the new user after {why} failed: other memberships unreadable: {err}");
+                        return;
+                    }
+                }
+            }
+            if let Err(err) = identity.delete_user(&Pool::Members, &user).await {
+                error!(user_id = %user, "invite: undoing the new user after {why} failed: {err}");
             }
         }
     };
@@ -2379,44 +2391,48 @@ where
                 let again = match teams_seen(state, principal.tenant_id, teams).await {
                     Ok(again) => again,
                     Err(err) => {
-                        undo("a team gone").await;
+                        undo("a team gone", None).await;
                         return Err(err);
                     }
                 };
                 if let Err(err) = check_invite(state, None, checked, &again).await {
-                    undo("a refused team").await;
+                    undo("a refused team", None).await;
                     return Err(err);
                 }
                 seen = again;
             }
             Err(err) => {
-                undo("a refused member").await;
+                undo("a refused member", None).await;
                 return Err(write_failed("invite: store", err, "project not found"));
             }
         }
     };
-    let sent = match delivery {
-        Delivery::Email => mail_code(state, z, &user, reset, &token).await.map(|()| None),
-        Delivery::Link => z
-            .return_invite_code(&user)
-            .await
-            .map(|code| Some(invite_link(state, &user, &code, &token))),
+    // A removed member's row keeps the offboarded mark (D7); invited again, it goes, or the
+    // accepted member would be refused everything.
+    let cleared = if created {
+        Ok(false)
+    } else {
+        state.metadata.clear_offboarded(principal.tenant_id, &user).await
+    };
+    let sent = match cleared {
+        Ok(_) => send_invite(state, identity, &user, send, &token).await,
+        Err(err) => Err(internal("invite: clear the offboarded mark", err)),
     };
     let invite_url = match sent {
         Ok(url) => url,
         Err(err) => {
             if let Err(failed) = state.metadata.revoke_undelivered_invite(actor, invite).await {
-                error!(%invite, "invite: revoking after a failed mail failed: {failed}");
+                error!(%invite, "invite: revoking after a failed send failed: {failed}");
             }
-            undo("a failed mail").await;
-            return Err(zitadel_failed("invite: send code", &err));
+            undo("a failed send", Some(listing.id)).await;
+            return Err(err);
         }
     };
     info!(request_id = %principal.request_id, member_id = %listing.id, %invite, ?delivery, "invite: created");
     // P25: the reconcile covers the grants' and the teams' projects.
     reconcile_projects(state, invite_projects(&grants, &seen)).await;
     // Built from what the write returned and the grants it made: nothing is read after the
-    // mail (T9-I1: a link invite's URL is never lost to a failed read).
+    // send (T9-I1: a link invite's URL is never lost to a failed read).
     let access = written_access(&listing.member, &visible, &grants, &seen);
     let member = Member::new(
         listing,
@@ -2436,18 +2452,22 @@ where
     ))
 }
 
-/// After a revoke (I4: metadata first): a never-activated Zitadel user (no password) is
-/// deleted; one that once had a password (a removed member invited again, R29) is deactivated
-/// instead. One already gone, or already inactive, is fine, so this can be retried. A user with
-/// another non-removed membership in any tenant (`shared`) is left as it is.
-async fn clean_up_revoked_user(z: &Zitadel, user: &str, shared: bool) -> Result<(), ZError> {
+/// After a revoke (I4: metadata first): a user who never set a password is deleted, as nobody
+/// else can use it; an account with a password is left as it is (a removed member's ban stays).
+/// A user still a member of another tenant (`shared`) is left alone too. One already gone is
+/// fine, so this can be retried.
+async fn clean_up_revoked_user(identity: &Identity, user: &str, shared: bool) -> Result<(), IdentityError> {
     if shared {
         return Ok(());
     }
-    match z.get_user(user).await? {
-        None => Ok(()),
-        Some(u) if u.has_password => z.deactivate_user_settled(user).await,
-        Some(_) => z.delete_user(user).await,
+    let gone = |result: Result<(), IdentityError>| match result {
+        Err(IdentityError::NotFound(Missing::User)) => Ok(()),
+        other => other,
+    };
+    match identity.user_detail(&Pool::Members, user).await {
+        Ok(detail) if detail.has_password => Ok(()),
+        Ok(_) => gone(identity.delete_user(&Pool::Members, user).await),
+        Err(err) => gone(Err(err)),
     }
 }
 
@@ -2820,7 +2840,7 @@ where
     operation_id = "removeMember",
     tag = "members",
     summary = "Remove a member",
-    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, and their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Removing a removed member again retries the Zitadel steps.",
+    description = "The member's grants, overrides and open invites go, their Postgres member roles are dropped on every branch, their personal logins are revoked (the member is marked offboarded) and realtime drops what they watched, all in this request. When this was their last membership in any tenant, their account's sessions end and it is banned; while they are a member of another tenant the account is left alone (its sessions name the tenant they were made for, and minting a token checks that membership). A still-valid token is refused at once. Removing a removed member again redoes every step after the removal.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Removed"),
@@ -2830,7 +2850,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`last_tenant_admin`: the tenant would have no active tenant admin", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: removed in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); remove again to retry", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: removed in Chelabase (refused at once), but the identity service couldn't end the sessions or ban the account; remove again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn remove_member<M, J>(
@@ -2861,26 +2881,17 @@ where
             .map_err(|err| write_failed("remove member", err, "member not found"))
     );
     info!(request_id = %principal.request_id, member_id = %id, "member: removed");
+    // The offboarded mark and the logins first, so realtime's re-check sees them. Every call
+    // runs every step: a retry finishes what an earlier one didn't.
+    let offboarded = state.metadata.revoke_logins_for_identity_user(principal.tenant_id, &m.identity_user_id).await;
     access_changed_for(&state, principal.tenant_id, &[(id, m.identity_user_id.clone())], touched).await;
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
-    let z = tri!(admin_zitadel(&state));
-    // The user is deactivated only when this was its last membership in any tenant. Already
-    // inactive (a retry), already gone, or Initial and locked, is done; any other refusal is 503.
-    let shared = tri!(
-        state
-            .metadata
-            .has_other_membership(id)
-            .await
-            .map_err(|err| internal("remove member: other memberships", err))
-    );
-    if !shared && let Err(err) = deactivate_for_removal(z, &m.identity_user_id).await {
-        return zitadel_failed("remove member: deactivate user", &err).into_response();
+    if let Err(err) = offboarded {
+        return internal("remove member: revoke personal logins", err).into_response();
     }
-    if let Err(err) = z.delete_user_sessions(&m.identity_user_id).await {
-        return zitadel_failed("remove member: end sessions", &err).into_response();
-    }
+    tri!(end_identity_access(&state, id, &m.identity_user_id, true, "remove member").await);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -2966,7 +2977,7 @@ where
     operation_id = "declineMember",
     tag = "members",
     summary = "Decline a sign-up",
-    description = "The pending member becomes `removed` (one `member_declined` event), then their Zitadel user's sessions end. The user is also deactivated when this was its last membership in any tenant (one that never finished sign-up can't be deactivated, so it is locked instead); while it is still a member of another tenant it stays active. A still-valid token is refused at once. Declining a removed member again retries the Zitadel steps.",
+    description = "The pending member becomes `removed` (one `member_declined` event), then, as for a removal, their personal logins are revoked and, when this was their last membership in any tenant, their account's sessions end and it is banned. A still-valid token is refused at once. Declining a removed member again redoes those steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 204, description = "Declined"),
@@ -2976,7 +2987,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the member isn't waiting for approval", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: declined in Chelabase, but Zitadel couldn't deactivate the user or end their sessions (or isn't configured); decline again to retry", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: declined in Chelabase, but the identity service couldn't end the sessions or ban the account; decline again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn decline_member<M, J>(
@@ -2999,7 +3010,7 @@ where
     );
     let actor = tri!(actor(principal.member.as_ref()));
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
-    // A removed member is a retry of the Zitadel steps; anything else must be pending.
+    // A removed member is a retry of the later steps; anything else must be pending.
     if m.status != MemberStatus::Removed {
         tri!(
             state
@@ -3009,23 +3020,14 @@ where
                 .map_err(|err| write_failed("decline member", err, "member not found"))
         );
         info!(request_id = %principal.request_id, member_id = %id, "member: declined");
-        access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
     }
-    let z = tri!(admin_zitadel(&state));
-    // As a removal: deactivated only when this was the user's last membership.
-    let shared = tri!(
-        state
-            .metadata
-            .has_other_membership(id)
-            .await
-            .map_err(|err| internal("decline member: other memberships", err))
-    );
-    if !shared && let Err(err) = deactivate_for_removal(z, &m.identity_user_id).await {
-        return zitadel_failed("decline member: deactivate user", &err).into_response();
+    // As a removal, on every call.
+    let offboarded = state.metadata.revoke_logins_for_identity_user(principal.tenant_id, &m.identity_user_id).await;
+    access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
+    if let Err(err) = offboarded {
+        return internal("decline member: revoke personal logins", err).into_response();
     }
-    if let Err(err) = z.delete_user_sessions(&m.identity_user_id).await {
-        return zitadel_failed("decline member: end sessions", &err).into_response();
-    }
+    tri!(end_identity_access(&state, id, &m.identity_user_id, true, "decline member").await);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -3040,56 +3042,51 @@ pub(crate) struct RevokeResult {
     rotated_branches: usize,
 }
 
-/// 503 after the Chelabase side of a suspension or reinstatement is done: Zitadel didn't lock
-/// (or unlock) the user or end its sessions. The same call again completes it (S7).
-fn zitadel_step_failed(what: &str, err: &ZError, retry: &str) -> ApiError {
-    warn!("{what}: {err}");
-    ApiError::new(
-        503,
-        ErrorCode::Unavailable,
-        format!("done in Chelabase, but the user service couldn't finish it; {retry} again to retry"),
-    )
-}
-
-/// Locks a suspended member's Zitadel user. An inactive user (removed earlier) isn't locked,
-/// and Zitadel refuses to lock it (`LOCK_NOT_ACTIVE`, the same answer as for a locked one); left
-/// inactive, accept-invite with a reset code would reactivate it. So it is reactivated, then
-/// locked: it ends active and locked, and a reinstate's unlock gives back a working sign-in. The
-/// caller ends the sessions whatever this returns, so none made in between survives. When the lock
-/// fails after the reactivate, the user is deactivated again so the 503 leaves it as closed as
-/// it was (if that fails too, both are logged and the lock's error is still the answer); the
-/// same call again re-runs the steps. A removal running at the same time can have its deactivate
-/// undone by the reactivate: the user then ends active and locked, and a removal retry
-/// deactivates it.
-async fn lock_for_suspension(z: &Zitadel, user: &str) -> Result<(), ZError> {
-    match z.lock_user(user).await {
-        Err(err) if err.is(refusals::LOCK_NOT_ACTIVE) => match z.get_user(user).await? {
-            Some(u) if u.state == UserState::Inactive => {
-                z.reactivate_user_settled(user).await?;
-                let locked = z.lock_user(user).await;
-                if let Err(lock_err) = &locked
-                    && let Err(deactivate_err) = z.deactivate_user_settled(user).await
-                {
-                    warn!("suspend member: lock after reactivate failed: {lock_err}; deactivating it again failed too: {deactivate_err}");
-                }
-                locked
-            }
-            _ => Err(err),
-        },
-        other => other,
+/// The identity half of ending a member's access, after the Chelabase half (suspend, remove,
+/// decline). While the person is a member of another tenant nothing is touched: their sessions
+/// carry the tenant they were made for, and `/auth/v1/token` checks that membership on every
+/// call. Otherwise every session ends, and with `ban` the account is banned with
+/// [`MEMBER_REMOVED_BAN_REASON`] (an existing ban keeps its own reason). Both steps are tried,
+/// a gone user counts as done, and any failure is 503 `identity_unavailable`: the member is
+/// already refused by the orchestrator, and the same call again finishes it.
+async fn end_identity_access<M, J>(
+    state: &AppState<M, J>,
+    member: Uuid,
+    user: &str,
+    ban: bool,
+    what: &str,
+) -> Result<(), ApiError>
+where
+    M: MetadataPort,
+{
+    let shared = state
+        .metadata
+        .has_other_membership(member)
+        .await
+        .map_err(|err| internal(&format!("{what}: other memberships"), err))?;
+    let identity = identity_client(state)?;
+    if shared {
+        return Ok(());
     }
-}
-
-/// Deactivates a removed (or declined) member's Zitadel user, settled. One in the Initial state
-/// can't be deactivated (`DEACTIVATE_INITIAL`, "can only be deleted"); it is locked instead, so
-/// it can't finish sign-up, and that is done. The caller runs it only for the user's last
-/// non-removed membership in any tenant (one Zitadel user can be a member of several); otherwise
-/// it only ends the user's sessions.
-async fn deactivate_for_removal(z: &Zitadel, user: &str) -> Result<(), ZError> {
-    match z.deactivate_user_settled(user).await {
-        Err(err) if err.is(refusals::DEACTIVATE_INITIAL) => z.lock_user(user).await,
+    let gone = |result: Result<(), IdentityError>| match result {
+        Err(IdentityError::NotFound(Missing::User)) => Ok(()),
         other => other,
-    }
+    };
+    let banned = if ban {
+        match identity.get_user(&Pool::Members, user).await {
+            Ok(u) if u.banned => Ok(()),
+            Ok(_) => gone(identity.ban(&Pool::Members, user, Some(MEMBER_REMOVED_BAN_REASON)).await.map(drop)),
+            Err(err) => gone(Err(err)),
+        }
+    } else {
+        Ok(())
+    };
+    let ended = gone(identity.revoke_user_sessions(&Pool::Members, user).await);
+    banned.and(ended).map_err(|err| match err {
+        // Never a 404: the member exists; their account is what failed.
+        IdentityError::NotFound(_) => identity_unavailable(),
+        err => identity_failed(what, &err),
+    })
 }
 
 #[utoipa::path(
@@ -3098,7 +3095,7 @@ async fn deactivate_for_removal(z: &Zitadel, user: &str) -> Result<(), ZError> {
     operation_id = "suspendMember",
     tag = "members",
     summary = "Suspend a member",
-    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and their Zitadel user is locked (an inactive one is reactivated first, so it ends locked) with its sessions ended, even when the lock fails. Suspending a suspended member again writes nothing new; the proxies, the member roles and the Zitadel steps are redone.",
+    description = "The member is refused everywhere but `GET /v1/me` (`member_suspended`) and keeps their grants. Their personal Postgres logins are revoked at once (the proxies forget them), their member roles get new passwords on every branch they reach (open sessions end), and realtime drops what they watched, all in this request. When they are a member of no other tenant, their account's sessions end too; otherwise those sessions stay, and minting a token for this tenant is refused. The account isn't banned. Suspending a suspended member again writes nothing new; every other step is redone.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The suspended member", body = Member),
@@ -3108,7 +3105,7 @@ async fn deactivate_for_removal(z: &Zitadel, user: &str) -> Result<(), ZError> {
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: yourself, or a member who isn't active (invited, pending or removed); `last_tenant_admin`: the tenant would have no active tenant admin", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: suspended in Chelabase, but Zitadel couldn't lock the user or end their sessions (or isn't configured); suspend again to retry", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: suspended in Chelabase (refused at once), but the identity service couldn't end the sessions; suspend again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn suspend_member<M, J>(
@@ -3144,17 +3141,7 @@ where
     if m.tenant_admin {
         reconcile_tenant(&state, principal.tenant_id).await;
     }
-    let z = tri!(admin_zitadel(&state));
-    // The sessions end even when the lock failed: one made while the user was reactivated
-    // doesn't survive the 503.
-    let locked = lock_for_suspension(z, &m.identity_user_id).await;
-    let ended = z.delete_user_sessions(&m.identity_user_id).await;
-    if let Err(err) = locked {
-        return zitadel_step_failed("suspend member: lock user", &err, "suspend").into_response();
-    }
-    if let Err(err) = ended {
-        return zitadel_step_failed("suspend member: end sessions", &err, "suspend").into_response();
-    }
+    tri!(end_identity_access(&state, id, &m.identity_user_id, false, "suspend member").await);
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
     Json(tri!(member_view(&state, &principal, m).await)).into_response()
 }
@@ -3165,7 +3152,7 @@ where
     operation_id = "reinstateMember",
     tag = "members",
     summary = "Reinstate a suspended member",
-    description = "The member is active again with their grants, and their Zitadel user is unlocked. Their personal logins stay revoked: they make new ones. Reinstating an active member again only redoes the unlock.",
+    description = "The member is active again with their grants; a ban Chelabase placed on their account when they were removed is lifted (a ban for any other reason stays), and their offboarded mark is cleared. Their personal logins stay revoked: they make new ones. Reinstating an active member again redoes the account steps.",
     params(("member_id" = Uuid, Path, description = "Member id")),
     responses(
         (status = 200, description = "The reinstated member", body = Member),
@@ -3175,7 +3162,7 @@ where
         (status = 404, description = "`not_found`: no such member (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`conflict`: the member isn't suspended (invited, pending or removed)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: reinstated in Chelabase, but Zitadel couldn't unlock the user (or isn't configured); reinstate again to retry", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: reinstated in Chelabase, but the identity service couldn't lift the ban; reinstate again to finish", body = ErrorEnvelope),
     ),
 )]
 async fn reinstate_member<M, J>(
@@ -3205,21 +3192,25 @@ where
             reconcile_tenant(&state, principal.tenant_id).await;
         }
     }
-    let z = tri!(admin_zitadel(&state));
-    if let Err(err) = z.unlock_user(&m.identity_user_id).await {
-        return zitadel_step_failed("reinstate member: unlock user", &err, "reinstate").into_response();
+    // Then, on every call: the account's ban is lifted when it is ours (another reason is left in
+    // place), and the offboarded mark goes. Realtime re-checks once more after the clear.
+    let identity = tri!(identity_client(&state));
+    match identity.user_detail(&Pool::Members, &m.identity_user_id).await {
+        Ok(d) if d.user.banned && d.ban_reason.as_deref() == Some(MEMBER_REMOVED_BAN_REASON) => {
+            if let Err(err) = identity.unban(&Pool::Members, &m.identity_user_id).await {
+                return identity_failed("reinstate member: unban", &err).into_response();
+            }
+        }
+        Ok(d) if d.user.banned => {
+            warn!(member_id = %id, reason = ?d.ban_reason, "reinstate member: the account is banned for another reason; left banned");
+        }
+        Ok(_) | Err(IdentityError::NotFound(Missing::User)) => {}
+        Err(err) => return identity_failed("reinstate member: read user", &err).into_response(),
     }
-    // A suspend whose lock failed after its reactivate left the user inactive again (see
-    // `lock_for_suspension`): reinstating instead of retrying it reactivates the user, so the
-    // member can sign in.
-    let reactivated = match z.get_user(&m.identity_user_id).await {
-        Ok(Some(u)) if u.state == UserState::Inactive => z.reactivate_user_settled(&m.identity_user_id).await,
-        Ok(_) => Ok(()),
-        Err(err) => Err(err),
-    };
-    if let Err(err) = reactivated {
-        return zitadel_step_failed("reinstate member: reactivate user", &err, "reinstate").into_response();
+    if let Err(err) = state.metadata.clear_offboarded(principal.tenant_id, &m.identity_user_id).await {
+        return internal("reinstate member: clear the offboarded mark", err).into_response();
     }
+    access_changed(&state, principal.tenant_id, Some(&m.identity_user_id));
     let m = tri!(tenant_member(&state, principal.tenant_id, id).await);
     Json(tri!(member_view(&state, &principal, m).await)).into_response()
 }
@@ -3330,7 +3321,7 @@ where
     operation_id = "createInvite",
     tag = "members",
     summary = "Invite a person",
-    description = "Matches the email to a person: an existing member just gets the grants, all or none (200); an active user of the organisation who has a password and was never a member becomes an active member (201, `added`, no mail); anyone else, a removed member or a deactivated or passwordless user of the organisation included, gets a Zitadel invite mail with a link to Studio's `/accept-invite` and is `invited` until they accept (201); one who already has a way to sign in (a removed member invited again) gets Zitadel's password-reset mail with the same link marked `reset=1`, since Zitadel makes no invite code for them. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only when the invite makes the Zitadel user, or the user has never had a way to sign in (password, passkey, OTP, U2F, IdP link); else 409 `link_not_allowed`, send by email) nothing is mailed (no email provider needed): the response carries the link as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
+    description = "Matches the email to a person: an existing member just gets the grants, all or none (200); anyone else is `invited` until they accept (201), a removed member and a person with an account included. By email, an account with a password and a verified email gets a notice to sign in and accept, with a link to Studio's `/accept-invite` and no code; anyone else (a new person, whose account is made now, or one whose account has no password or an unverified email) gets an invite code. A person whose own sign-up is pending is 409 `signup_pending`: approve it instead. With `delivery: \"link\"` (only for a new person, or an account with no password and an unverified email; else 409 `link_not_allowed`, send by email) nothing is mailed (no SMTP needed): the response carries the link with its code as `invite_url`, once, with `Cache-Control: no-store`; it is never stored or logged. Invite mails and codes are limited to 5 per person per hour, resends included (429 `rate_limited`). Every grant is checked first, as `putProjectGrant` checks it, with the member's overrides.",
     request_body = CreateInviteRequest,
     responses(
         (status = 200, description = "An existing member got the grants", body = InviteResult),
@@ -3339,12 +3330,13 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: a grant's project doesn't exist in the tenant", body = ErrorEnvelope),
-        (status = 409, description = "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: a grant's project is being deleted", body = ErrorEnvelope),
+        (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the email isn't one, a project is named twice, or a role can't be granted (`role` names it; `chain`, `database_id`, `branch_id`, `branch` and `branch_main` too when its memberships on a branch are why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: Zitadel can't be reached or isn't configured", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service can't be reached", body = ErrorEnvelope),
     ),
 )]
 async fn create_invite<M, J>(
@@ -3390,12 +3382,13 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`email_ambiguous`: more than one user of the organisation has the email; `email_in_use_elsewhere`: a user outside the organisation has it; `signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone who can sign in; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
+        (status = 409, description = "`signup_pending`: their sign-up waits for approval; `link_not_allowed`: a link for someone with an account (`email_available` says whether email works now); `conflict`: email delivery with no SMTP configured; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
+        (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 415, description = "`invalid_request`: the request isn't `Content-Type: application/json`", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the email isn't one, or a role can't be granted (`role` names it; `chain`, `database_id`, `branch_id`, `branch` and `branch_main` too when its memberships on a branch are why)", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: Zitadel can't be reached or isn't configured", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service can't be reached", body = ErrorEnvelope),
     ),
 )]
 async fn create_project_invite<M, J>(
@@ -3440,7 +3433,7 @@ where
     operation_id = "resendInvite",
     tag = "members",
     summary = "Send an invite again",
-    description = "Zitadel mails a new code (the old one stops working), or with `delivery: \"link\"` (only for an invitee with no way to sign in yet; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. The body may be left out (then `email`).",
+    description = "A new code is mailed (the old one stops working; an account with a password and a verified email gets the notice again instead), or with `delivery: \"link\"` (only for an invitee with no password and an unverified email; others get 409 `link_not_allowed`) the response carries the new link as `invite_url` (once, `Cache-Control: no-store`, never stored or logged); either way the link's token changes and the invite lives another 72 hours. An expired invite can be resent. At most 5 sends per person per hour, the first invite included (429 `rate_limited`). The body may be left out (then `email`).",
     params(("invite_id" = Uuid, Path, description = "Invite id")),
     request_body = Option<ResendInviteRequest>,
     responses(
@@ -3449,11 +3442,12 @@ where
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
         (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such invite (another tenant's answers the same)", body = ErrorEnvelope),
-        (status = 409, description = "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee who can sign in", body = ErrorEnvelope),
+        (status = 409, description = "`invite_closed`: the invite was revoked or accepted; `link_not_allowed`: `link` delivery for an invitee with an account; `conflict`: email delivery with no SMTP configured", body = ErrorEnvelope),
+        (status = 429, description = "`rate_limited`: 5 invite mails or codes to this person in the last hour; `Retry-After` says when", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
         (status = 422, description = "`invalid_request`: the body isn't a JSON object with a valid `delivery`", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: Zitadel can't be reached or isn't configured", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: the identity service can't be reached", body = ErrorEnvelope),
     ),
 )]
 async fn resend_invite<M, J>(
@@ -3478,45 +3472,18 @@ where
     let delivery = tri!(resend_delivery(&body));
     let actor = tri!(actor(principal.member.as_ref()));
     let m = tri!(open_invite(&state, principal.tenant_id, id).await);
-    let z = tri!(admin_zitadel(&state));
-    let mut reset = false;
-    if delivery == Delivery::Link {
-        match z.get_user(&m.identity_user_id).await {
-            Ok(Some(u)) if u.has_password => return link_refused(z).await.into_response(),
-            Ok(_) => {}
-            Err(err) => return zitadel_failed("resend invite: read user", &err).into_response(),
-        }
-        match z.has_auth_methods(&m.identity_user_id).await {
-            Ok(true) => return link_refused(z).await.into_response(),
-            // Gone: the code call below says so.
-            Ok(false) => {}
-            Err(err) if err.is(refusals::AUTH_METHODS_USER_NOT_FOUND) => {}
-            Err(err) => return zitadel_failed("resend invite: read auth methods", &err).into_response(),
-        }
-    } else {
-        // Gone: the code call below says so.
-        match z.get_user(&m.identity_user_id).await {
-            Ok(Some(u)) => match needs_reset_code(z, &u).await {
-                Ok(r) => reset = r,
-                Err(err) => return zitadel_failed("resend invite: read auth methods", &err).into_response(),
-            },
-            Ok(None) => {}
-            Err(err) => return zitadel_failed("resend invite: read user", &err).into_response(),
-        }
-    }
+    let identity = tri!(identity_client(&state));
+    let detail = tri!(
+        identity
+            .user_detail(&Pool::Members, &m.identity_user_id)
+            .await
+            .map_err(|err| identity_failed("resend invite: read user", &err))
+    );
+    let send = tri!(invite_send(identity, Some(&detail), delivery).await);
+    tri!(take_invite_send(&m.identity_user_id));
     // A new token per send: the earlier link's stops describing the invite.
     let token = InviteToken::mint();
-    let sent = match delivery {
-        Delivery::Email => mail_code(&state, z, &m.identity_user_id, reset, &token).await.map(|()| None),
-        Delivery::Link => z
-            .return_invite_code(&m.identity_user_id)
-            .await
-            .map(|code| Some(invite_link(&state, &m.identity_user_id, &code, &token))),
-    };
-    let invite_url = match sent {
-        Ok(url) => url,
-        Err(err) => return zitadel_failed("resend invite", &err).into_response(),
-    };
+    let invite_url = tri!(send_invite(&state, identity, &m.identity_user_id, send, &token).await);
     let expires_at = invite_expiry();
     tri!(
         state
@@ -3545,7 +3512,7 @@ fn resend_delivery(body: &[u8]) -> Result<Delivery, ApiError> {
     operation_id = "revokeInvite",
     tag = "members",
     summary = "Revoke an invite",
-    description = "The member becomes `removed` and its grants go; then the invitee's Zitadel user is deleted when it never set a password, or deactivated when it once had one (a removed member invited again); one that is still a member of another tenant is left as it is. Revoking an invite whose member is still removed retries the Zitadel step.",
+    description = "The member becomes `removed` and its grants go; then the invitee's account is deleted when it never set a password; an account with a password, or one that is still a member of another tenant, is left as it is. Revoking an invite whose member is still removed retries that step.",
     params(("invite_id" = Uuid, Path, description = "Invite id")),
     responses(
         (status = 204, description = "Revoked"),
@@ -3555,7 +3522,7 @@ fn resend_delivery(body: &[u8]) -> Result<Delivery, ApiError> {
         (status = 404, description = "`not_found`: no such invite (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`invite_closed`: the invite was accepted, or its member was invited again since", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
-        (status = 503, description = "`unavailable`: Zitadel isn't configured (nothing changed), or can't be reached after the revoke (revoke again to retry)", body = ErrorEnvelope),
+        (status = 503, description = "`identity_unavailable`: revoked in Chelabase, but the identity service couldn't be reached for the account (revoke again to finish)", body = ErrorEnvelope),
     ),
 )]
 async fn revoke_invite<M, J>(
@@ -3577,7 +3544,6 @@ where
         .await
     );
     let actor = tri!(actor(principal.member.as_ref()));
-    let z = tri!(admin_zitadel(&state));
     let not_found = || ApiError::not_found("invite not found").into_response();
     let (member, _, revoked, accepted) = match state.metadata.invite(id).await {
         Ok(Some(row)) => row,
@@ -3590,8 +3556,9 @@ where
         Err(err) => return internal("load invite member", err).into_response(),
     };
     let closed = || invite_closed().into_response();
-    // I4: the metadata revoke first, under the member's lock; then Zitadel. A revoked invite
-    // whose member is still removed retries the Zitadel step; any other closed one is 409.
+    // I4: the metadata revoke first, under the member's lock; then the identity service. A
+    // revoked invite whose member is still removed retries that step; any other closed one is
+    // 409.
     let user = if revoked.is_some() && accepted.is_none() && m.status == MemberStatus::Removed {
         m.identity_user_id.clone()
     } else if revoked.is_some() || accepted.is_some() || m.status != MemberStatus::Invited {
@@ -3616,8 +3583,9 @@ where
             .await
             .map_err(|err| internal("revoke invite: other memberships", err))
     );
-    if let Err(err) = clean_up_revoked_user(z, &user, shared).await {
-        return zitadel_failed("revoke invite: Zitadel user", &err).into_response();
+    let identity = tri!(identity_client(&state));
+    if let Err(err) = clean_up_revoked_user(identity, &user, shared).await {
+        return identity_failed("revoke invite: identity user", &err).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -4192,7 +4160,7 @@ where
     operation_id = "getInviteDelivery",
     tag = "members",
     summary = "Can invites be emailed?",
-    description = "Asks Zitadel whether an email provider is active. Without one, invite by link (`delivery: \"link\"`). A Zitadel that can't be asked is not an error: the answer is `email_available: false` with the reason.",
+    description = "Asks the identity service whether SMTP is configured. Without it, invite by link (`delivery: \"link\"`). An identity service that can't be asked is not an error: the answer is `email_available: false` with the reason.",
     responses(
         (status = 200, description = "Whether invites can be emailed", body = InviteDelivery),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
@@ -4218,14 +4186,14 @@ where
         )
         .await
     );
-    let (email_available, reason) = match &state.zitadel {
-        None => (false, Some(DeliveryReason::ZitadelNotConfigured)),
-        Some(z) => match z.email_provider_active().await {
-            Ok(true) => (true, None),
-            Ok(false) => (false, Some(DeliveryReason::NoEmailProvider)),
+    let (email_available, reason) = match &state.identity_service {
+        None => (false, Some(DeliveryReason::IdentityUnavailable)),
+        Some(identity) => match identity.email_status().await {
+            Ok(status) if status.configured => (true, None),
+            Ok(_) => (false, Some(DeliveryReason::EmailNotConfigured)),
             Err(err) => {
-                warn!(request_id = %principal.request_id, "invite delivery: asking Zitadel failed: {err}");
-                (false, Some(DeliveryReason::ZitadelUnavailable))
+                warn!(request_id = %principal.request_id, "invite delivery: asking the identity service failed: {err}");
+                (false, Some(DeliveryReason::IdentityUnavailable))
             }
         },
     };
