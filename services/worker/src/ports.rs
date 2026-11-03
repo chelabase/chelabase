@@ -604,10 +604,16 @@ pub trait WorkerMetadata: Send + Sync + 'static {
         project: ProjectId,
         outcome: Result<(), String>,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
+    /// The row, whatever its status: the project is being deleted.
     fn delete_project_auth(
         &self,
         project: ProjectId,
     ) -> impl Future<Output = Result<(), MetadataError>> + Send;
+    /// Deletes the row only while it's still `disabling`. True when it did.
+    fn finish_disable_app_users(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
     fn enabled_app_projects(
         &self,
     ) -> impl Future<Output = Result<Vec<ProjectAuth>, MetadataError>> + Send;
@@ -1366,6 +1372,10 @@ impl WorkerMetadata for MetadataClient {
 
     async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         MetadataClient::delete_project_auth(self, project).await
+    }
+
+    async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        MetadataClient::finish_disable_app_users(self, project).await
     }
 
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

@@ -1,4 +1,5 @@
-//! A project's delete, after its databases: its app sessions, the rows, then its app-user pool.
+//! A project's delete, after its databases: its app sessions, its app users settings, its
+//! app-user pool, then the rest of its rows.
 
 use chelabase_metadata::ProjectStatus;
 use chelabase_neon::ComputeBackend;
@@ -13,14 +14,16 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     Worker<M, S, C, N, P>
 {
     /// Finishes a `deleting` project once none of its databases is left: its app sessions
-    /// revoked, `finish_project_delete` (the metadata rows go), then its app-user pool dropped.
-    /// While databases remain, the first one's error (or how many are left) is recorded on the
-    /// project and the job fails, to be redelivered; the periodic pass is the backstop.
+    /// revoked, its `project_auth` row deleted, its app-user pool dropped, then
+    /// `finish_project_delete`. While databases remain, the first one's error (or how many are
+    /// left) is recorded on the project and the job fails, to be redelivered; the periodic pass
+    /// is the backstop.
     ///
-    /// The drop comes last so nothing can recreate the pool after it (an enable needs the
-    /// `project_auth` row, which is gone by then). A failed drop fails the job, and its
-    /// redelivery finds the project `deleted` (or its row gone) and drops the pool again until
-    /// it succeeds. The drop is idempotent and names only this project's pool.
+    /// The project stays `deleting` until the drop succeeded, so a failed drop is retried by a
+    /// redelivery and by the periodic pass alike (which has no message to redeliver). The row
+    /// goes before the drop so nothing starts an enable after it; an enable already past its
+    /// read checks the row again after creating the pool, and drops it when the row is gone
+    /// (`enable_steps`). The drop is idempotent and names only this project's pool.
     pub async fn handle_project_delete(&self, project: ProjectId) -> Result<(), String> {
         let record = self
             .metadata
@@ -30,7 +33,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         match record.map(|p| p.status) {
             Some(ProjectStatus::Deleting) => {}
             Some(ProjectStatus::Deleted) | None => {
-                // A redelivery after the rows went: only the pool may be left.
+                // A redelivery of a finished delete, or one that finished before the drop
+                // moved ahead of the rows: only the pool may be left.
                 return drop_pool(self.identity()?, project).await;
             }
             Some(status) => {
@@ -65,14 +69,22 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .await
             .map_err(|e| format!("revoking the app sessions: {e}"))?;
         self.metadata
+            .delete_project_auth(project)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Err(e) = drop_pool(identity, project).await {
+            warn!(%project, "dropping the app-user pool; the delete is retried: {e}");
+            self.metadata
+                .set_project_error(project, Some(&e))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Err(e);
+        }
+        self.metadata
             .finish_project_delete(project)
             .await
             .map_err(|e| e.to_string())?;
         info!(%project, "project deleted");
-        if let Err(e) = drop_pool(identity, project).await {
-            warn!(%project, "dropping the app-user pool; the delete job is retried: {e}");
-            return Err(e);
-        }
         Ok(())
     }
 }
@@ -146,7 +158,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_delete_revokes_finishes_rows_then_drops_pool() {
+    async fn project_delete_revokes_drops_pool_then_finishes_rows() {
         let s = setup(AppUsersStatus::Enabled).await;
         s.with_pool();
         set_deleting(&s);
@@ -175,11 +187,15 @@ mod tests {
             .iter()
             .position(|e| e == "metadata.revoke_project_sessions")
             .unwrap();
+        let auth_gone = journal
+            .iter()
+            .position(|e| e == "metadata.delete_project_auth")
+            .unwrap();
         let finished = journal
             .iter()
             .position(|e| e == "metadata.finish_project_delete")
             .unwrap();
-        assert!(revoked < finished, "{journal:?}");
+        assert!(revoked < auth_gone && auth_gone < finished, "{journal:?}");
 
         // Again (a redelivery): done already; the drop is idempotent.
         s.w.handle_project_delete(s.project).await.unwrap();
@@ -198,9 +214,9 @@ mod tests {
         assert_eq!(s.pool_calls(), ["DELETE "]);
     }
 
-    /// AC 2: the pool is dropped only after the metadata rows go; with the identity service
-    /// down the job fails and is redelivered until the drop succeeds. Other projects' pools
-    /// are untouched.
+    /// AC 2: the pool is dropped before the project is `deleted`; with the identity service
+    /// down the job fails and is redelivered until the drop succeeds, the project `deleting`
+    /// with the error on it. Other projects' pools are untouched.
     #[tokio::test]
     async fn drops_pool_and_retries_unavailable() {
         let mut s = setup(AppUsersStatus::Enabled).await;
@@ -221,14 +237,15 @@ mod tests {
         assert!(s.w.metadata.auth(s.project).is_some());
         s.w.identity = identity;
 
-        // The identity service down: the rows go, the drop fails, the job is retried.
+        // The identity service down: the settings go, the drop fails, the job is retried.
         s.fake.set_down(true);
         let err = s.w.handle_project_delete(s.project).await.unwrap_err();
         assert!(err.contains("dropping the app-user pool"), "{err}");
-        assert_eq!(
-            s.w.metadata.state().projects[&s.project].status,
-            ProjectStatus::Deleted
-        );
+        {
+            let state = s.w.metadata.state();
+            assert_eq!(state.projects[&s.project].status, ProjectStatus::Deleting);
+            assert_eq!(state.projects[&s.project].error.as_deref(), Some(err.as_str()));
+        }
         assert!(s.w.metadata.auth(s.project).is_none());
         s.fake.set_down(false);
         assert!(s.pool_exists().await, "not dropped while down");
@@ -239,9 +256,14 @@ mod tests {
         s.w.handle_project_delete(s.project).await.unwrap_err();
         assert!(s.pool_exists().await);
 
-        // The redelivery (the project row now `deleted`) drops it.
+        // The redelivery drops it and finishes.
         s.w.handle_project_delete(s.project).await.unwrap();
         assert!(!s.pool_exists().await);
+        assert_eq!(
+            s.w.metadata.state().projects[&s.project].status,
+            ProjectStatus::Deleted
+        );
+        assert_eq!(s.w.metadata.state().projects[&s.project].error, None);
         s.fake
             .client()
             .get_user(&other, &neighbour.to_string())
@@ -269,5 +291,43 @@ mod tests {
         s.w.handle_project_delete(s.project).await.unwrap();
         assert!(s.pool_exists().await);
         assert!(s.pool_calls().iter().all(|c| !c.starts_with("DELETE")));
+    }
+
+    /// B4: the periodic pass has no message to redeliver: the project stays `deleting` until
+    /// the drop succeeded, so the next pass tries again.
+    #[tokio::test]
+    async fn periodic_backstop_retries_the_pool_drop() {
+        let s = setup(AppUsersStatus::Enabled).await;
+        s.with_pool();
+        s.add_user("ada@example.com");
+        let age = |s: &crate::app_users::tests::Setup| {
+            s.w.metadata
+                .state()
+                .projects
+                .get_mut(&s.project)
+                .unwrap()
+                .updated_at = chrono::Utc::now() - chrono::Duration::minutes(10);
+        };
+        set_deleting(&s);
+        databases_gone(&s);
+        age(&s);
+
+        s.fake.set_down(true);
+        s.w.app_users_reconcile_once().await;
+        s.fake.set_down(false);
+        assert_eq!(
+            s.w.metadata.state().projects[&s.project].status,
+            ProjectStatus::Deleting,
+            "orphaned pool: nothing would retry the drop"
+        );
+        assert!(s.pool_exists().await);
+
+        age(&s);
+        s.w.app_users_reconcile_once().await;
+        assert!(!s.pool_exists().await);
+        assert_eq!(
+            s.w.metadata.state().projects[&s.project].status,
+            ProjectStatus::Deleted
+        );
     }
 }

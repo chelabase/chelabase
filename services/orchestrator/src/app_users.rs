@@ -57,7 +57,7 @@ pub struct AppUsersSettings {
     pub table: String,
     pub email_verification: bool,
     pub on_delete: OnDelete,
-    /// `null` until the worker has created the project's Zitadel org.
+    /// Unused: always `null`. App users live in the identity pool `app-<project>`.
     #[schema(required = true)]
     pub zitadel_org_id: Option<String>,
 }
@@ -95,7 +95,7 @@ pub struct PutAppUsersRequest {
     /// Default false.
     #[serde(default)]
     pub email_verification: Option<bool>,
-    /// What deleting a user in Zitadel does to its row: `delete` (default) or `mark`.
+    /// What deleting a user does to its row: `delete` (default) or `mark`.
     #[serde(default)]
     pub on_delete: Option<String>,
 }
@@ -396,7 +396,7 @@ where
     operation_id = "putAppUsers",
     tag = "app-users",
     summary = "Enable app users, or change their settings",
-    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's Zitadel org, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
+    description = "With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.",
     params(("id" = Uuid, Path, description = "Project id")),
     request_body = PutAppUsersRequest,
     responses(

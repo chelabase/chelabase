@@ -1138,6 +1138,7 @@ mod tests {
         assert!(identity_client(&c).is_none(), "the URL is needed too");
     }
 
+    /// Both settings and a readable file give a client; anything less gives none.
     #[test]
     fn zitadel_client_needs_issuer_and_pat_file() {
         let dir = tempfile::tempdir().unwrap();

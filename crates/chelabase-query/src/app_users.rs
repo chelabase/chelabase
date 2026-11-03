@@ -26,7 +26,7 @@ use crate::server_tls::ServerTls;
 pub const SYNC_ROLE: &str = "chelabase_auth_sync";
 
 /// Columns Chelabase owns: `data` can't name them.
-pub const MANAGED_COLUMNS: [&str; 5] = ["id", "email", "email_verified", "created_at", "deleted_at"];
+pub const MANAGED_COLUMNS: [&str; 6] = ["id", "email", "email_verified", "created_at", "deleted_at", "banned_at"];
 
 /// The `SQLSTATE` unique-violation code and the email index's name (the branch's migration).
 const UNIQUE_VIOLATION: &str = "23505";
@@ -522,6 +522,12 @@ mod tests {
         fn constraint(&self) -> Option<&str> {
             self.constraint
         }
+    }
+
+    /// B1: sign-up data can't set a ban.
+    #[test]
+    fn the_ban_column_is_managed() {
+        assert!(MANAGED_COLUMNS.contains(&"banned_at"));
     }
 
     #[test]
