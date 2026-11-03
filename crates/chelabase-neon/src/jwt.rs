@@ -270,7 +270,7 @@ pub fn load_signer(dir: &std::path::Path) -> anyhow::Result<ComputeSigner> {
         std::fs::read_to_string(&path).with_context(|| {
             format!(
                 "read {} (the compute-JWT key pair; self-hosted: `init-secrets` creates it, see \
-                 `docker compose logs init-secrets`; workbench: run `just zitadel-bootstrap`)",
+                 `docker compose logs init-secrets`; workbench: run `just workbench up`)",
                 path.display()
             )
         })
@@ -279,7 +279,7 @@ pub fn load_signer(dir: &std::path::Path) -> anyhow::Result<ComputeSigner> {
         format!(
             "the compute-JWT key pair in {} is corrupt; delete both files, then recreate them \
              (self-hosted: `docker compose up -d` runs `init-secrets`; workbench: \
-             `just zitadel-bootstrap`)",
+             `just workbench up`)",
             dir.display()
         )
     })
@@ -340,7 +340,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = format!("{:#}", load_signer(dir.path()).err().expect("no keys"));
         assert!(err.contains("init-secrets"), "{err}");
-        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+        assert!(err.contains("just workbench up"), "{err}");
     }
 
     #[test]
@@ -351,7 +351,7 @@ mod tests {
         let err = format!("{:#}", load_signer(dir.path()).err().expect("corrupt keys"));
         assert!(err.contains("corrupt"), "{err}");
         assert!(err.contains("init-secrets"), "{err}");
-        assert!(err.contains("just zitadel-bootstrap"), "{err}");
+        assert!(err.contains("just workbench up"), "{err}");
     }
 
     #[test]

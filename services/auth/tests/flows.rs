@@ -8,11 +8,9 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use support::*;
 use auth::app::{AppState, messages, router};
 use auth::config::Config;
 use auth::guard::RateLimiter;
-use auth::zitadel::Zitadel;
 use chelabase_auth::member_token::{MemberClaims, MemberTokenVerifier};
 use chelabase_identity::Pool;
 use chelabase_identity::mock::FakeIdentity;
@@ -21,7 +19,6 @@ use uuid::Uuid;
 pub struct Harness {
     pub internal: support::internal::FakeInternal,
     pub cookie_key: SecretKey,
-    pub mock: MockZitadel,
     pub identity: FakeIdentity,
     pub clock: auth::session::Clock,
     /// The member tokens' public key.
@@ -36,30 +33,24 @@ pub async fn harness_with(skip: bool, min_ms: u64) -> Harness {
 }
 
 pub async fn harness_mode(skip: bool, min_ms: u64, mode: auth::config::Mode) -> Harness {
-    harness_full(skip, min_ms, mode, true).await
+    harness_tweaked(skip, min_ms, mode, |_| {}).await
 }
 
-/// `admin`: whether the service has the admin Zitadel client. The mock refuses the login
-/// token on the calls accept-invite makes, so only the admin client can complete them.
-pub async fn harness_full(
-    skip: bool,
-    min_ms: u64,
-    mode: auth::config::Mode,
-    admin: bool,
-) -> Harness {
-    harness_tweaked(skip, min_ms, mode, admin, |_| {}).await
-}
-
-/// [`harness_full`] with the config changed by `tweak` (m5: ids from files, Studio's config).
+/// [`harness_mode`] with the config changed by `tweak` (Studio's config, cookies).
 pub async fn harness_tweaked(
     skip: bool,
     min_ms: u64,
     mode: auth::config::Mode,
-    admin: bool,
     tweak: impl FnOnce(&mut Config),
 ) -> Harness {
-    harness_on_identity(skip, min_ms, mode, admin, tweak, None).await
+    harness_on_identity(skip, min_ms, mode, tweak, None).await
 }
+
+/// A well-formed code nobody was sent.
+const EMAIL_CODE: &str = "123456";
+
+/// The member tokens' issuer (the auth host) in these tests.
+pub const ISSUER: &str = "http://auth.test";
 
 /// [`harness_tweaked`], talking to the identity service at `identity_base` when given (a stub
 /// of a test's own) instead of its [`FakeIdentity`].
@@ -67,7 +58,6 @@ pub async fn harness_on_identity(
     skip: bool,
     min_ms: u64,
     mode: auth::config::Mode,
-    admin: bool,
     tweak: impl FnOnce(&mut Config),
     identity_base: Option<String>,
 ) -> Harness {
@@ -89,16 +79,11 @@ pub async fn harness_on_identity(
     };
     std::fs::write(&member_config.private_key, &private).unwrap();
     std::fs::write(&member_config.public_key, &member_public).unwrap();
-    let mock = MockZitadel::start().await;
-    mock.set_strict_login(true);
     let cookie_key = SecretKey::generate();
     let mut config = Config {
         listen: String::new(),
-        issuer: mock.base.clone(),
-        zitadel: chelabase_types::entry::ZitadelAt { base: mock.base.clone(), host: None },
-        token: TOKEN.into(),
+        issuer: ISSUER.into(),
         cookie_key: cookie_key.clone(),
-        org_id: "o1".into(),
         studio_url: "http://studio.chelabase.localhost:8000".into(),
         studio: Default::default(),
         skip_email_verification: skip,
@@ -111,7 +96,6 @@ pub async fn harness_on_identity(
     tweak(&mut config);
     let tokens = auth::member_token::MemberTokens::from_config(&member_config, &config.issuer).unwrap();
     let state = Arc::new(AppState {
-        zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
         limiter: RateLimiter::default(),
         app: None,
@@ -120,7 +104,6 @@ pub async fn harness_on_identity(
             support::internal::INTERNAL_TOKEN,
         )),
         used_tickets: Default::default(),
-        admin: admin.then(|| Zitadel::new(&mock.base, ADMIN_TOKEN)),
         member_tokens: tokens,
         identity: client,
         clock: clock.clone(),
@@ -138,7 +121,6 @@ pub async fn harness_on_identity(
     Harness {
         internal,
         cookie_key,
-        mock,
         identity,
         clock,
         member_public,
@@ -224,8 +206,8 @@ fn signup(email: &str, pw: &str) -> Value {
     json!({"email": email, "password": pw, "givenName": "A", "familyName": "B"})
 }
 
-// #79: only Zitadel's password-policy refusals on create are `weak_password`; another 400 (a
-// missing org: the instance is misconfigured) or a refusal nobody captured is 503 `unavailable`.
+// #79: only identity's password-policy refusal on create is `weak_password`; another 400 is the
+// visitor's input, and a refusal nobody captured is 503 `unavailable`.
 #[tokio::test]
 async fn sign_up_answers_weak_password_only_for_a_policy_refusal() {
     let h = harness().await;
@@ -242,8 +224,6 @@ async fn sign_up_answers_weak_password_only_for_a_policy_refusal() {
     assert_eq!(h.users_with("new@example.com").await, 0);
 }
 
-/// A name Zitadel would refuse is refused before it is called, and a validation refusal that
-/// still comes back (code 3, no id) is the visitor's input, never a weak password (#79).
 /// A bad name is refused before identity is called, and a refusal that still comes back is the
 /// visitor's input, never a weak password (#79).
 #[tokio::test]
@@ -676,7 +656,8 @@ async fn only_failed_sign_ins_count_against_an_email() {
     }
 }
 
-// Sign-up waits out Zitadel's projection lag, so its floor sits above sign-in's.
+// Sign-up does more than sign-in (the user, its row, its session), so its floor sits above
+// sign-in's.
 #[tokio::test]
 async fn sign_up_answers_take_the_longer_minimum() {
     let h = harness_with(false, 300).await;
@@ -711,7 +692,7 @@ async fn sign_up_refused_when_closed() {
     assert_eq!(a.body["error"]["code"], "sign_up_closed");
     assert_eq!(h.users_with("new@example.com").await, 0);
     let asked = h.internal.bodies(SIGN_UP_CALL);
-    assert_eq!(asked, vec![json!({"org": "o1"})]);
+    assert_eq!(asked, vec![json!({})]);
 }
 
 #[tokio::test]
@@ -800,7 +781,7 @@ async fn the_gate_refuses_what_it_does_not_clearly_allow() {
     assert_eq!(h.users_with("new@example.com").await, 1);
 }
 
-// T12x (R32): the accept page describes an invite by (Zitadel user, link token) alone.
+// T12x (R32): the accept page describes an invite by (identity user, link token) alone.
 fn token_hash_hex(token: &str) -> String {
     use sha2::Digest;
     hex::encode(sha2::Sha256::digest(token.as_bytes()))
@@ -915,7 +896,7 @@ fn signup_with_code(email: &str, code: Option<&str>) -> Value {
     body
 }
 
-// AC 1: no or a wrong code: 403 `setup_code_invalid`, no Zitadel user, no claim.
+// AC 1: no or a wrong code: 403 `setup_code_invalid`, no identity user, no claim.
 #[tokio::test]
 async fn sign_up_with_bad_code_creates_no_user() {
     let h = harness().await;
@@ -935,9 +916,9 @@ async fn sign_up_with_bad_code_creates_no_user() {
     assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
     // The code goes in the gate's body; a blank one is not sent at all.
     let asked = h.internal.bodies(SIGN_UP_CALL);
-    assert_eq!(asked[0], json!({"org": "o1"}));
-    assert_eq!(asked[1], json!({"org": "o1"}));
-    assert_eq!(asked[2], json!({"org": "o1", "setup_code": "WRONG-CODE"}));
+    assert_eq!(asked[0], json!({}));
+    assert_eq!(asked[1], json!({}));
+    assert_eq!(asked[2], json!({"setup_code": "WRONG-CODE"}));
     assert!(h.internal.queries(SIGN_UP_CALL).iter().all(String::is_empty), "nothing in a URL");
 }
 
@@ -954,7 +935,7 @@ async fn sign_up_with_the_code_binds_the_claim() {
     let user = h.identity.client().search_users(&Pool::Members, "first@example.com", 10, 0).await.unwrap().users.remove(0);
     assert_eq!(
         h.internal.bodies(CLAIMED_CALL),
-        vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
+        vec![json!({"user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
     );
 }
 
@@ -984,7 +965,7 @@ async fn instance_says_whether_setup_is_required() {
     let a = h.get("/auth/v1/instance", "1.1.1.1").await;
     assert_eq!((a.status, a.body["setupRequired"].clone()), (StatusCode::OK, json!(true)));
     // The question carries no code.
-    assert!(h.internal.bodies(SIGN_UP_CALL).iter().all(|b| *b == json!({"org": "o1"})));
+    assert!(h.internal.bodies(SIGN_UP_CALL).iter().all(|b| *b == json!({})));
     h.internal.set_signup_status(Some(503));
     assert_eq!(h.get("/auth/v1/instance", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
     // Rate-limited per client.
@@ -1091,88 +1072,12 @@ async fn log_and_error_scrub() {
     }
 }
 
-// ---- Selfhost-install m5: the bootstrap's outputs from files ----
-
-fn write_id(path: &std::path::Path, value: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(path, value).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
-}
-
-fn org_file(path: &std::path::Path) -> chelabase_types::file_value::FileValue {
-    chelabase_types::file_value::FileValue::file(
-        "CHELABASE_ZITADEL_ORG_ID_FILE",
-        path,
-        chelabase_types::file_value::Sensitivity::Public,
-    )
-}
-
-// AC 1: auth starts before the bootstrap has written the org id. Until it is there, sign-in,
-// sign-up (before any gate call or account), the instance probe and password reset answer
-// 503 `unavailable`, and the health check reports not-ready. Once the file appears the next
-// request succeeds, without a restart.
-#[tokio::test]
-async fn sign_up_503_until_org_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("org-id");
-    let p = path.clone();
-    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
-        c.org_id = org_file(&p)
-    })
-    .await;
-    h.internal.set_signup(true, "open");
-    let unavailable = || err("unavailable", messages::UNAVAILABLE);
-    for round in ["absent", "empty"] {
-        if round == "empty" {
-            write_id(&path, "\n");
-        }
-        assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
-        let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
-        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
-        let a = h.get("/auth/v1/instance", "1.1.1.3").await;
-        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
-        let a = h.post("/auth/v1/password-reset", json!({"email": "ada@example.com"}), None, "1.1.1.4").await;
-        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
-    }
-    assert_eq!(h.users_with("new@example.com").await, 0, "no account was made");
-    assert!(h.internal.bodies(SIGN_UP_CALL).is_empty(), "the gate was never asked");
-
-    write_id(&path, "o1\n");
-    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
-    let a = h
-        .post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2")
-        .await;
-    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
-    assert_eq!(h.internal.bodies(SIGN_UP_CALL), vec![json!({"org": "o1"})]);
-}
-
-// A refused org file (a symlink here) is 503 too, never a sign-in against no org.
-#[tokio::test]
-async fn a_refused_org_file_is_503() {
-    let dir = tempfile::tempdir().unwrap();
-    let real = dir.path().join("real");
-    write_id(&real, "o1\n");
-    let link = dir.path().join("org-id");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
-        c.org_id = org_file(&link)
-    })
-    .await;
-    let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
-}
-
-// AC 5: `GET /auth/v1/studio-config` is exactly the six public values Studio needs, cacheable
-// for 60 s. Not configured here (the workbench) it is 404, so Studio uses its build values;
-// configured but not written yet it is 503, uncached, and auth isn't ready.
+// AC 5, #126: `GET /auth/v1/studio-config` is exactly the public values Studio needs, cacheable
+// for 60 s, with nothing to wait for (auth's health is ok from the start).
 #[tokio::test]
 async fn studio_config_shape() {
-    use chelabase_types::file_value::{FileValue, Sensitivity};
-    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, |c| {
+    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, |c| {
         c.studio = auth::config::StudioSettings {
-            client_id: Some("c-studio".into()),
-            project_id: Some("p1".into()),
             api_url: "http://api.chelabase.localhost:8000".into(),
             studio_host: "studio.chelabase.localhost:8000".into(),
         };
@@ -1190,34 +1095,6 @@ async fn studio_config_shape() {
         })
     );
     assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
-
-    let plain = harness().await;
-    let a = plain.get("/auth/v1/studio-config", "1.1.1.1").await;
-    assert_eq!(a.status, StatusCode::NOT_FOUND);
-    assert_eq!(a.body["error"]["code"], "not_found");
-    assert_eq!(plain.get("/health", "1.1.1.1").await.status, StatusCode::OK, "nothing to wait for");
-
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("studio-client-id");
-    let p = path.clone();
-    let late = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| {
-        c.studio = auth::config::StudioSettings {
-            client_id: Some(FileValue::file("CHELABASE_ZITADEL_STUDIO_CLIENT_ID_FILE", &p, Sensitivity::Public)),
-            project_id: Some("p1".into()),
-            api_url: "http://api.chelabase.localhost:8000".into(),
-            studio_host: "studio.chelabase.localhost:8000".into(),
-        };
-    })
-    .await;
-    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(a.body["error"]["code"], "unavailable");
-    assert_eq!(a.body["_cache_control"], "no-store");
-    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
-    write_id(&path, "c-late\n");
-    let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
-    assert_eq!((a.status, a.body["apiUrl"].clone()), (StatusCode::OK, json!("http://api.chelabase.localhost:8000")));
-    assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::OK);
 }
 
 // ---- #74: the sign-in email limit under concurrency and hang-ups ------------------------------
@@ -1298,7 +1175,7 @@ async fn assert_budget_unspent(h: &Harness, tag: &str) {
 async fn sign_in_email_limit_holds_under_concurrency() {
     // A slow password check, so every request is in flight before the first answer.
     let stub = PasswordStub::start(Some(Duration::from_millis(300))).await;
-    let h = Arc::new(harness_on_identity(false, 1, auth::config::Mode::SelfHosted, true, |_| {}, Some(stub.base.clone())).await);
+    let h = Arc::new(harness_on_identity(false, 1, auth::config::Mode::SelfHosted, |_| {}, Some(stub.base.clone())).await);
     let mut tasks = Vec::new();
     for i in 0..30 {
         let h = h.clone();
@@ -1320,13 +1197,13 @@ async fn sign_in_email_limit_holds_under_concurrency() {
     assert_eq!((refused, limited), (5, 25));
 }
 
-// AC 3: a client that hangs up while Zitadel checks the password still spends the attempt.
+// AC 3: a client that hangs up while identity checks the password still spends the attempt.
 // AC 3: a client that hangs up while identity checks the password still spends the attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sign_in_cancelled_password_checks_still_count() {
     // Identity holds each password check, so each client hangs up in the middle of it.
     let stub = PasswordStub::start(None).await;
-    let h = harness_on_identity(false, 1, auth::config::Mode::SelfHosted, true, |_| {}, Some(stub.base.clone())).await;
+    let h = harness_on_identity(false, 1, auth::config::Mode::SelfHosted, |_| {}, Some(stub.base.clone())).await;
     for i in 0..5 {
         hang_up_sign_in(&h, &stub, signin("ada@example.com", "Wrong-pass1"), &format!("1.3.{i}.1")).await;
     }
@@ -1357,8 +1234,6 @@ async fn concurrent_correct_sign_ins_do_not_spend_the_email_budget() {
     assert_budget_unspent(&h, "1").await;
 }
 
-// AC 8: outages and sign-ins that are dead before the password check spend nothing; Zitadel's
-// own refusals of the input (its request validation) count like a wrong password.
 // AC 8: outages spend nothing; identity's own refusals of the input count like a wrong password.
 #[tokio::test]
 async fn sign_in_outages_do_not_spend_the_email_budget() {
@@ -1465,7 +1340,7 @@ impl Harness {
 
     fn claims(&self, a: &Answer) -> MemberClaims {
         assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-        MemberTokenVerifier::from_pem(self.member_public.as_bytes(), &self.mock.base)
+        MemberTokenVerifier::from_pem(self.member_public.as_bytes(), ISSUER)
             .unwrap()
             .verify(a.body["access_token"].as_str().unwrap())
             .expect("the gateway's verifier accepts it")
@@ -1497,7 +1372,7 @@ async fn member_sign_in_token_roundtrip() {
     let token = h.identity.client().sign_in(&Pool::Members, "ada@example.com", PW).await.unwrap().session_token;
     assert!(a.cookies.iter().all(|c| !c.contains(&token)), "the session token is sealed");
     // Without identity's Secure flag in dev; on for HTTPS deployments.
-    let secure = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, |c| c.secure_cookies = true).await;
+    let secure = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, |c| c.secure_cookies = true).await;
     secure.member("ada@example.com", &[T1]);
     let a = secure.sign_in("", "ada@example.com", PW, "1.1.1.1").await;
     assert!(a.cookies.iter().any(|c| c.starts_with("chelabase_session=") && c.contains("; Secure")));
@@ -1732,7 +1607,7 @@ async fn setup_claim_binds_identity_user() {
     assert!(user.email_verified, "verification is off here");
     assert_eq!(
         h.internal.bodies(CLAIMED_CALL),
-        vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
+        vec![json!({"user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
     );
     let claims = h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await);
     assert_eq!((claims.sub, claims.tid), (user.id, T1));
@@ -1821,7 +1696,7 @@ async fn sign_ups_without_the_claim_wait_as_pending() {
     let a = h.post("/auth/v1/sign-up", body, None, "2.2.2.2").await;
     assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "pending"})), "open sign-up");
     let user = h.identity.client().search_users(&Pool::Members, "open@example.com", 10, 0).await.unwrap().users.remove(0);
-    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"org": "o1", "user_id": user.id})]);
+    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"user_id": user.id})]);
     assert_eq!(h.sessions(), 0);
 }
 
@@ -2008,7 +1883,7 @@ async fn accept_invite_signs_in_and_verifies() {
     assert!(h.signs_in("bob@example.com", NEW_PW).await);
     assert_eq!(
         h.internal.bodies("POST /internal/invites/accept"),
-        vec![json!({"org": "o1", "user": id, "token_hash": token_hash_hex(&t), "email": "bob@example.com", "name": ""})]
+        vec![json!({"user": id, "token_hash": token_hash_hex(&t), "email": "bob@example.com", "name": ""})]
     );
 }
 
@@ -2373,7 +2248,7 @@ async fn verify_email_joins_an_open_sign_up() {
     let done = h.post("/auth/v1/verify-email", json!({"code": code}), Some(&login), "1.1.1.1").await;
     assert_eq!((done.status, &done.body), (StatusCode::OK, &json!({"next": "pending"})), "{}", done.body);
     assert!(h.identity.user(&Pool::Members, &id).unwrap().verified);
-    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"org": "o1", "user_id": id})]);
+    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"user_id": id})]);
     assert!(done.cookies.iter().any(|c| c.starts_with("chelabase_login=;")));
     assert!(!session_set(&done));
 }

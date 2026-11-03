@@ -131,10 +131,10 @@ fn secrets_with_seeds() {
     let owners = owners(t.path());
     let dir = t.path().join("secrets");
     let d = dir.to_str().unwrap();
-    let (metadata, nats, masterkey) = (
+    let (metadata, nats, storcon) = (
         "Sntl9Q-binary-metadata-0001",
         "Sntl9Q-binary-nats-runner-0001",
-        "Sntl9QBinaryMasterkey00000000001",
+        "Sntl9QBinaryStorcon00000000001",
     );
     let env = t.path().join(".env");
     let write_env = |text: &str, mode: u32| {
@@ -146,7 +146,7 @@ fn secrets_with_seeds() {
             "# compose settings\nCHELABASE_KEYS_DIR=/srv/keys\n\
              CHELABASE_SEED_METADATA_DB_PASSWORD={metadata}\n\
              CHELABASE_SEED_NATS_RUNNER_PASSWORD='{nats}'\r\n\
-             CHELABASE_SEED_ZITADEL_MASTERKEY=\"{masterkey}\"\n"
+             CHELABASE_SEED_STORCON_DB_PASSWORD=\"{storcon}\"\n"
         ),
         0o600,
     );
@@ -157,7 +157,7 @@ fn secrets_with_seeds() {
     let read = |p: &str| std::fs::read_to_string(dir.join(p)).unwrap();
     assert_eq!(read("db/metadata.password"), metadata);
     assert_eq!(read("nats/runner.password"), nats);
-    assert_eq!(read("zitadel/masterkey"), masterkey);
+    assert_eq!(read("db/storcon.password"), storcon);
     assert!(first_err.contains("seeded") && first_err.contains("db/metadata.password"));
     assert!(first_err.contains("3 seeded"), "{first_err}");
     assert!(!first_err.contains("warning"), "{first_err}");
@@ -189,7 +189,7 @@ fn secrets_with_seeds() {
     assert_eq!(read("db/metadata.password"), metadata);
 
     // An invalid seed fails before anything is written, even the root.
-    write_env("CHELABASE_SEED_ZITADEL_MASTERKEY=Sntl9Q-too-short\n", 0o600);
+    write_env("CHELABASE_SEED_STORCON_DB_PASSWORD=Sntl9Q-short\n", 0o600);
     let fresh = t.path().join("fresh");
     let invalid = run(&[
         "secrets",
@@ -201,7 +201,7 @@ fn secrets_with_seeds() {
         e,
     ]);
     assert!(!invalid.status.success());
-    assert!(String::from_utf8_lossy(&invalid.stderr).contains("CHELABASE_SEED_ZITADEL_MASTERKEY"));
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("CHELABASE_SEED_STORCON_DB_PASSWORD"));
     assert!(!fresh.exists());
 
     // A symlinked seeds file is refused.

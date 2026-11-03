@@ -7,7 +7,6 @@ use auth::app::{AppState, router};
 use auth::app_users::{AppUsers, InternalClient, REFRESH_USER_LOOKUP};
 use auth::config::Config;
 use auth::guard::RateLimiter;
-use auth::zitadel::Zitadel;
 use axum::body::{Body, to_bytes};
 use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
@@ -350,7 +349,7 @@ struct Ans {
 
 fn info(project: Uuid, target: Uuid, verification: bool) -> Value {
     json!({
-        "project_id": project, "status": "enabled", "zitadel_org_id": null,
+        "project_id": project, "status": "enabled",
         "email_verification": verification, "on_delete": "delete",
         "auth_database_id": Uuid::nil(), "pg_database": "app", "schema": "public",
         "table": "users", "target_branch_id": target,
@@ -385,15 +384,12 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         fail: Arc::default(),
         proxy: proxy.clone(),
     };
-    // Nothing of app users reaches Zitadel any more: its address answers nothing.
-    let nowhere = "http://127.0.0.1:9";
     let app = app_on.then(|| {
         let mut app = AppUsers::new(
             InternalVerifier::from_pem(id_pub.as_bytes()).unwrap(),
             InternalClient::new(&iproxy.base, INTERNAL_TOKEN),
             AppTokenSigner::from_pem(app_priv.as_bytes(), app_pub.as_bytes()).unwrap(),
             Arc::new(db.clone()),
-            Zitadel::new(nowhere, "unused"),
             Duration::from_secs(900),
         );
         app.refresh_user_lookup = lookup;
@@ -402,10 +398,7 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
     let config = Config {
         listen: String::new(),
         issuer: "http://auth.chelabase.localhost:8000".into(),
-        zitadel: chelabase_types::entry::ZitadelAt { base: nowhere.into(), host: None },
-        token: "unused".into(),
         cookie_key: SecretKey::generate(),
-        org_id: "o1".into(),
         studio_url: "http://studio.chelabase.localhost:8000".into(),
         studio: Default::default(),
         skip_email_verification: true,
@@ -426,13 +419,11 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
     std::fs::write(&member_config.public_key, &public).unwrap();
     let member_tokens = auth::member_token::MemberTokens::from_config(&member_config, &config.issuer).unwrap();
     let state = Arc::new(AppState {
-        zitadel: Zitadel::new(nowhere, "unused"),
         config,
         limiter: RateLimiter::default(),
         app,
         signup_gate: None,
         used_tickets: Default::default(),
-        admin: None,
         member_tokens,
         identity: chelabase_identity::Identity::new(&proxy.base, chelabase_identity::mock::TOKEN),
         clock: Default::default(),
@@ -513,7 +504,6 @@ impl H {
                 "auth",
                 &Identity {
                     sub: format!("key:{}", self.key),
-                    org_id: String::new(),
                     auth: AuthMethod::DataKey,
                     request_id: "rid-1".into(),
                     data: Some(DataIdentity {
@@ -540,7 +530,6 @@ impl H {
                 "auth",
                 &Identity {
                     sub: format!("key:{}", self.key),
-                    org_id: String::new(),
                     auth: AuthMethod::DataKey,
                     request_id: "rid-1".into(),
                     data: Some(DataIdentity {
@@ -2581,14 +2570,12 @@ async fn app_users_disabled_409() {
     assert_eq!(code(&a), "app_users_disabled");
 }
 
-/// #123: the branch's app users no longer need a Zitadel org: an enabled project without one
-/// signs in (the failing live test, `zitadel_policy_refusals_are_weak_passwords_for_app_users`,
-/// was this). A branch of another project is still disabled.
+/// #123: an enabled project's app users sign in from its identity pool. A branch of another
+/// project is still disabled.
 #[tokio::test]
-async fn enabled_without_a_zitadel_org_works_and_another_project_does_not() {
+async fn an_enabled_project_works_and_another_project_does_not() {
     let h = harness().await;
     h.add_user("ada@example.com", true).await;
-    assert!(h.internal.inner.lock().unwrap().branches[&h.branch]["zitadel_org_id"].is_null());
     let a = h.sign_in("ada@example.com", PW).await;
     assert_eq!(a.status, StatusCode::OK, "{}", a.body);
     // A branch whose settings name another project (the key's project is checked).

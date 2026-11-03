@@ -256,9 +256,6 @@ pub struct FakeState {
     /// T6: every personal-login record (any database), as `personal_login_records` reads them
     /// (`qualifies` is whatever the test sets).
     pub personal_logins: Vec<chelabase_metadata::personal_logins::PersonalLoginRecord>,
-    /// T7: each member's personal-row endpoints, as `revoke_logins_for_identity_user` returns
-    /// them (revoked logins' rows included, as the real read does).
-    pub login_endpoints: HashMap<uuid::Uuid, Vec<chelabase_metadata::personal_logins::LoginEndpoint>>,
     /// PB: each branch's login-role guard exemptions, in stored order (missing key: none). A
     /// new branch and a restore's backup copy their source's.
     pub guard_exemptions: HashMap<BranchId, Vec<String>>,
@@ -691,7 +688,6 @@ impl FakeMetadata {
                 project_id: project,
                 status,
                 error: None,
-                zitadel_org_id: None,
                 database_id: db,
                 pg_database: "app".to_string(),
                 schema_name: "public".to_string(),
@@ -708,7 +704,7 @@ impl FakeMetadata {
         self.state().project_auth.get(&project).cloned()
     }
 
-    /// A live app session of `user`, with Zitadel session `identity_session_id`.
+    /// A live app session of `user`, with identity session `identity_session_id`.
     pub fn add_session(&self, project: ProjectId, user: uuid::Uuid, identity_session_id: &str) -> uuid::Uuid {
         let id = uuid::Uuid::new_v4();
         let now = chrono::Utc::now();
@@ -2361,41 +2357,6 @@ impl WorkerMetadata for FakeMetadata {
         Ok(true)
     }
 
-    /// As the metadata's (D7): the marked members, by tenant then member.
-    async fn offboarded_members(
-        &self,
-    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
-        record(&self.journal, "metadata.offboarded_members".to_string());
-        let state = self.read("offboarded_members")?;
-        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
-            .members
-            .iter()
-            .filter(|m| m.offboarded)
-            .map(|m| (m.tenant_id, m.id, m.identity_user_id.clone()))
-            .collect();
-        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
-        Ok(rows)
-    }
-
-    /// As the metadata's (D7): the tenant's member with this Zitadel user loses its mark; true
-    /// when it had one.
-    async fn clear_offboarded(
-        &self,
-        tenant: TenantId,
-        identity_user_id: &str,
-    ) -> Result<bool, MetadataError> {
-        let mut state = self.write("clear_offboarded")?;
-        let Some(m) = state
-            .members
-            .iter_mut()
-            .find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id && m.offboarded)
-        else {
-            return Ok(false);
-        };
-        m.offboarded = false;
-        Ok(true)
-    }
-
     async fn member_acted_roles(
         &self,
         branch: uuid::Uuid,
@@ -2478,52 +2439,6 @@ impl WorkerMetadata for FakeMetadata {
             .insert(role_name.to_string(), FakeLogin::new(RoleOrigin::Personal, None, false));
         ep.set_verifier(role_name, verifier.as_deref());
         Ok(())
-    }
-
-    /// As the metadata's: one row per member holding a login that isn't revoked, by tenant
-    /// then member.
-    async fn members_with_live_logins(
-        &self,
-    ) -> Result<Vec<(TenantId, uuid::Uuid, String)>, MetadataError> {
-        record(&self.journal, "metadata.members_with_live_logins".to_string());
-        let state = self.read("members_with_live_logins")?;
-        let mut rows: Vec<(TenantId, uuid::Uuid, String)> = state
-            .members
-            .iter()
-            .filter(|m| state.personal_logins.iter().any(|l| l.member_id == m.id && !l.revoked))
-            .map(|m| (m.tenant_id, m.id, m.identity_user_id.clone()))
-            .collect();
-        rows.sort_by_key(|(tenant, member, _)| (tenant.as_uuid(), *member));
-        Ok(rows)
-    }
-
-    /// As the metadata's: the tenant's member with this Zitadel user has every login revoked
-    /// (`revoked`, no verifier) and the member's endpoints come back; an unknown user: empty.
-    async fn revoke_logins_for_identity_user(
-        &self,
-        tenant: TenantId,
-        identity_user_id: &str,
-    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        // `write` journals the call once (the tests count one entry per revocation).
-        let mut state = self.write("revoke_logins_for_identity_user")?;
-        let state = &mut *state;
-        let Some(member) = state
-            .members
-            .iter()
-            .find(|m| m.tenant_id == tenant && m.identity_user_id == identity_user_id)
-            .map(|m| m.id)
-        else {
-            return Ok(Vec::new());
-        };
-        for login in state.personal_logins.iter_mut().filter(|l| l.member_id == member) {
-            login.revoked = true;
-            login.scram_verifier = None;
-        }
-        // D7: the member is marked offboarded too.
-        if let Some(m) = state.members.iter_mut().find(|m| m.id == member) {
-            m.offboarded = true;
-        }
-        Ok(state.login_endpoints.get(&member).cloned().unwrap_or_default())
     }
 
     async fn delete_personal_role_row(
@@ -2826,22 +2741,6 @@ impl WorkerMetadata for FakeMetadata {
             .values()
             .find(|a| a.database_id == db)
             .cloned())
-    }
-
-    async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
-        let mut state = self.write("set_app_users_org")?;
-        if state
-            .project_auth
-            .values()
-            .any(|a| a.project_id != project && a.zitadel_org_id.as_deref() == Some(org_id))
-        {
-            return Err(MetadataError::Conflict);
-        }
-        if let Some(a) = state.project_auth.get_mut(&project) {
-            a.zitadel_org_id = Some(org_id.to_string());
-            a.updated_at = Utc::now();
-        }
-        Ok(())
     }
 
     async fn finish_enable_app_users(
@@ -4156,12 +4055,9 @@ pub fn worker() -> (FakeWorker, Journal) {
         schema_check_cursor: Mutex::default(),
         enabling_seen: Mutex::default(),
         recreate_backoff: Mutex::default(),
-        zitadel: None,
         identity: None,
         app_users_reconcile_every: Duration::from_secs(300),
         member_roles_sweep_every: Duration::from_secs(300),
-        identity_sweep_every: Duration::from_secs(600),
-        identity_sweep_warned: Default::default(),
         remove_orphans: true,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,

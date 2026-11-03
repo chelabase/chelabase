@@ -1,13 +1,11 @@
-//! A stateful fake of the public endpoints the seed uses (auth, Zitadel's OIDC, the members
-//! API), with crash and failure injection. Every secret it hands out is recorded, so a test can
+//! A stateful fake of the public endpoints the seed uses (auth's sign-in pages and
+//! `/auth/v1/token`, the members API), with crash and failure injection. Every secret it hands out is recorded, so a test can
 //! scan output for them.
 
-use super::session::{Body, Http, Request, Response, Site};
+use super::session::{Body, Http, Request, Response, Secret, Site};
 use anyhow::{Result, anyhow, bail};
-use base64::Engine;
-use reqwest::{Method, Url};
+use reqwest::Method;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -57,16 +55,14 @@ pub struct Member {
 #[derive(Default)]
 pub struct State {
     /// The email the setup claim is bound to (the orchestrator's `setup_claims` row). A code
-    /// sign-up only binds it; the claimant's first bearer request makes the admin member row.
+    /// sign-up binds it and writes the claimant's admin member row in the same step.
     pub claimed_by: Option<String>,
     pub open_sign_up: bool,
     /// email -> (user id, password)
     pub users: BTreeMap<String, (String, Option<String>)>,
     pub members: BTreeMap<String, Member>,
-    /// authRequest -> (state, challenge)
-    pending: BTreeMap<String, (String, String)>,
-    /// code -> (email, challenge)
-    codes: BTreeMap<String, (String, String)>,
+    /// session cookie -> email
+    sessions: BTreeMap<String, String>,
     /// user id -> open invite code
     invite_codes: BTreeMap<String, String>,
     tokens: BTreeMap<String, String>,
@@ -118,12 +114,11 @@ pub struct FTeam {
 
 pub struct Fake(pub Mutex<State>);
 
-const WRITES: [&str; 23] = [
+const WRITES: [&str; 22] = [
     "POST /auth/v1/sign-up",
     "POST /v1/invites",
     "POST /v1/invites/resend",
     "POST /auth/v1/accept-invite",
-    "POST /fake/claim",
     "POST /v1/projects",
     "POST /v1/databases",
     "POST /v1/branches",
@@ -225,17 +220,21 @@ impl State {
         s
     }
 
-    fn done(&mut self, auth_request: &str, email: &str) -> Result<Value> {
-        let (state, challenge) = self
-            .pending
-            .remove(auth_request)
-            .ok_or_else(|| anyhow!("unknown authRequest"))?;
-        let code = self.secret("OIDCCODE");
-        self.codes
-            .insert(code.clone(), (email.to_string(), challenge));
-        Ok(
-            json!({"next": "done", "redirect": format!("{STUDIO}/callback?code={code}&state={state}")}),
-        )
+    /// auth's answer to a sign-in, a sign-up or an accept: `studio` with a session cookie for
+    /// an active member, `pending` (no cookie) for one waiting for approval.
+    fn signed_in(&mut self, email: &str) -> (u16, Value, Option<String>) {
+        if self.members.get(email).is_some_and(|m| m.status == "active") {
+            let session = self.secret("SESSION");
+            self.sessions.insert(session.clone(), email.to_string());
+            (200, json!({"next": "studio"}), Some(session))
+        } else {
+            (200, json!({"next": "pending"}), None)
+        }
+    }
+
+    /// The tenant has an active admin.
+    fn has_admin(&self) -> bool {
+        self.members.values().any(|m| m.admin && m.status == "active")
     }
 
     /// `setupRequired` as the orchestrator answers it: no member that isn't removed.
@@ -250,7 +249,13 @@ impl State {
     }
 
     fn create_member(&mut self, email: &str, status: &'static str, admin: bool) -> String {
-        let id = self.create_user(email, None);
+        self.create_user(email, None);
+        self.add_member(email, status, admin)
+    }
+
+    /// The member row of an existing account.
+    fn add_member(&mut self, email: &str, status: &'static str, admin: bool) -> String {
+        let id = self.users[email].0.clone();
         self.members.insert(
             email.into(),
             Member {
@@ -271,36 +276,9 @@ impl State {
         format!("{STUDIO}/accept-invite?user={user}&code={code}&t={t}")
     }
 
-    /// The caller of a bearer request. Like the orchestrator's `admit_member`, their first
-    /// request makes their member row: the tenant admin when the setup claim is bound to them
-    /// and the tenant has no active admin, else a pending newcomer. It also activates an
-    /// accepted invite.
+    /// The caller of a bearer request. A member token never makes a member row.
     fn caller(&mut self, r: &Request) -> Option<String> {
-        let email = self.tokens.get(r.bearer.as_ref()?.expose())?.clone();
-        if !self.members.contains_key(&email) {
-            let user = self.users[&email].0.clone();
-            let has_admin = self
-                .members
-                .values()
-                .any(|m| m.admin && m.status == "active");
-            let admin = !has_admin && self.claimed_by.as_deref() == Some(email.as_str());
-            let member = Member {
-                user,
-                status: if admin { "active" } else { "pending" },
-                admin,
-                invite: None,
-            };
-            self.members.insert(email.clone(), member);
-        }
-        let has_password = self.users.get(&email).is_some_and(|u| u.1.is_some());
-        if let Some(m) = self.members.get_mut(&email)
-            && m.status == "invited"
-            && has_password
-        {
-            m.status = "active";
-            m.invite = None;
-        }
-        Some(email)
+        self.tokens.get(r.bearer.as_ref()?.expose()).cloned()
     }
 
     fn handle(&mut self, r: &Request, key: &str) -> Result<(u16, Value, Option<String>)> {
@@ -319,64 +297,54 @@ impl State {
         Ok(match key {
             "GET /auth/v1/studio-config" => (
                 200,
-                json!({"issuer": "http://auth.chelabase.localhost:8000", "clientId": "studio-1", "projectId": "p1", "orgId": "o1", "apiUrl": "x", "studioHost": "y"}),
+                json!({"apiUrl": "http://api.chelabase.localhost:8000", "studioHost": "studio.chelabase.localhost:8000"}),
                 None,
             ),
             "GET /auth/v1/instance" => (200, json!({"setupRequired": self.setup_required()}), None),
-            "GET /oauth/v2/authorize" => {
-                let url = Url::parse(&format!("http://x{}", r.path))?;
-                let q: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
-                if q["client_id"] != "studio-1"
-                    || q["redirect_uri"] != format!("{STUDIO}/callback")
-                    || q["code_challenge_method"] != "S256"
-                {
-                    bail!("bad authorize: {q:?}");
-                }
-                let id = format!("V2_{}", self.id());
-                self.secrets.push(id.clone());
-                self.pending.insert(
-                    id.clone(),
-                    (q["state"].clone(), q["code_challenge"].clone()),
-                );
-                (
-                    302,
-                    Value::Null,
-                    Some(format!("{STUDIO}/login?authRequest={id}")),
-                )
-            }
             "POST /auth/v1/sign-up" => {
                 let email = s(&body, "email");
                 if self.users.contains_key(&email) {
                     return err(409, "email_taken");
                 }
-                // The account only: the member row comes with the first bearer request.
                 if self.setup_required() {
                     if body.get("setupCode").and_then(Value::as_str) != Some(SETUP_CODE) {
                         return err(403, "setup_code_invalid");
                     }
-                    // `bind_claim`: a claim already bound leaves this account a newcomer.
-                    if self.claimed_by.is_none() {
+                    // `claimed`: binds the claim and writes the admin row, unless another
+                    // user holds the claim (then this account waits as `pending`).
+                    self.create_user(&email, Some(s(&body, "password")));
+                    let bound = !self.has_admin()
+                        && self.claimed_by.as_deref().is_none_or(|c| c == email);
+                    if bound {
                         self.claimed_by = Some(email.clone());
                     }
-                } else if !self.open_sign_up {
+                    self.add_member(&email, if bound { "active" } else { "pending" }, bound);
+                } else if self.open_sign_up {
+                    self.create_user(&email, Some(s(&body, "password")));
+                    self.add_member(&email, "pending", false);
+                } else {
                     return err(403, "sign_up_closed");
                 }
-                self.create_user(&email, Some(s(&body, "password")));
-                (200, self.done(&s(&body, "authRequest"), &email)?, None)
+                self.signed_in(&email)
             }
             "POST /auth/v1/sign-in" => {
                 let email = s(&body, "email");
+                let member = self.members.get(&email).map(|m| m.status);
                 match self.users.get(&email) {
-                    Some((_, Some(p))) if *p == s(&body, "password") => {
-                        (200, self.done(&s(&body, "authRequest"), &email)?, None)
+                    Some((_, Some(p)))
+                        if *p == s(&body, "password")
+                            && matches!(member, Some("active" | "pending")) =>
+                    {
+                        self.signed_in(&email)
                     }
                     _ => return err(401, "invalid_credentials"),
                 }
             }
             "POST /auth/v1/accept-invite" => {
                 let user = s(&body, "user");
-                if self.invite_codes.get(&user).map(String::as_str)
-                    != Some(s(&body, "code").as_str())
+                if s(&body, "t").is_empty()
+                    || self.invite_codes.get(&user).map(String::as_str)
+                        != Some(s(&body, "code").as_str())
                 {
                     return err(400, "invalid_request");
                 }
@@ -388,33 +356,27 @@ impl State {
                     .map(|(e, _)| e.clone())
                     .unwrap();
                 self.users.get_mut(&email).unwrap().1 = Some(s(&body, "password"));
-                (200, self.done(&s(&body, "authRequest"), &email)?, None)
-            }
-            "POST /oauth/v2/token" => {
-                let Body::Form(f) = &r.body else {
-                    bail!("token wants a form")
-                };
-                let f: BTreeMap<&str, &str> = f.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                let Some((email, challenge)) = self.codes.remove(f["code"]) else {
-                    return err(400, "invalid_grant");
-                };
-                let want = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                    .encode(Sha256::digest(f["code_verifier"].as_bytes()));
-                self.secrets.push(f["code_verifier"].to_string());
-                if want != challenge
-                    || f["redirect_uri"] != format!("{STUDIO}/callback")
-                    || f["client_id"] != "studio-1"
-                {
-                    return err(400, "invalid_grant");
+                // The orchestrator's accept writes the member row: the invite closes.
+                if let Some(m) = self.members.get_mut(&email) {
+                    m.status = "active";
+                    m.invite = None;
                 }
+                self.signed_in(&email)
+            }
+            "POST /auth/v1/token" => {
+                let email = r
+                    .session
+                    .as_ref()
+                    .and_then(|c| self.sessions.get(c.expose()))
+                    .cloned();
+                let Some(email) = email.filter(|e| {
+                    self.members.get(e).is_some_and(|m| m.status == "active")
+                }) else {
+                    return err(401, "unauthorized");
+                };
                 let token = format!("eyJ{}", self.secret("TOKEN"));
-                self.secrets.push(token.clone());
                 self.tokens.insert(token.clone(), email);
-                (
-                    200,
-                    json!({"access_token": token, "token_type": "Bearer"}),
-                    None,
-                )
+                (200, json!({"access_token": token, "expires_in": 300}), None)
             }
             _ => {
                 let Some(caller) = self.caller(r) else {
@@ -512,11 +474,11 @@ impl Http for Fake {
         } else {
             normalise(&r.method, path, r)
         };
-        let site_ok = match path {
-            "/oauth/v2/authorize" | "/oauth/v2/token" => r.site == Site::Auth,
-            _ => r.site == Site::Api,
-        };
-        assert!(site_ok, "{key} to the wrong host");
+        assert!(r.site == Site::Api, "{key} to the wrong host");
+        // auth's sign-in pages answer only Studio; nothing else gets the session cookie.
+        let auth = path.starts_with("/auth/v1/") && r.method == Method::POST;
+        assert_eq!(r.studio, auth, "{key}: sent as Studio only to auth's POSTs");
+        assert!(auth || r.session.is_none(), "{key}: the session cookie went outside auth");
         assert!(r.method != Method::GET || r.idempotent, "{key}");
         let n = s.calls;
         s.calls += 1;
@@ -526,9 +488,10 @@ impl Http for Fake {
             let body = json!({"error": {"code": "internal", "message": format!("code={all} t={all} Bearer eyJ{all}")}});
             return Ok(Response {
                 status: 500,
-                location: Some(format!("{STUDIO}/callback?code={all}")),
                 retry_after: None,
                 body: body.to_string().into_bytes(),
+                session: Some(Secret::new(format!("SESSION{all}"))),
+                ..Response::default()
             });
         }
         s.log.push(key.clone());
@@ -540,16 +503,17 @@ impl Http for Fake {
             s.crash = None;
             return Err(anyhow!("connection reset (crash)"));
         }
-        let (status, body, location) = answer;
+        let (status, body, session) = answer;
         Ok(Response {
             status,
-            location,
+            session: session.map(Secret::new),
             retry_after: None,
             body: match &body {
                 Value::Null => Vec::new(),
                 Value::String(lines) => lines.clone().into_bytes(),
                 _ => body.to_string().into_bytes(),
             },
+            ..Response::default()
         })
     }
 }

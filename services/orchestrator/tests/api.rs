@@ -69,7 +69,7 @@ async fn expired_identity_is_401() {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     let token = app
         .signer
-        .sign_at(Service::Orchestrator.name(), &identity("org-1"), now - 3600)
+        .sign_at(Service::Orchestrator.name(), &identity_of(DEFAULT_SUB), now - 3600)
         .unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
@@ -78,7 +78,7 @@ async fn expired_identity_is_401() {
 #[tokio::test]
 async fn identity_minted_for_another_service_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let token = app.signer.sign("some-other-service", &identity("org-1")).unwrap();
+    let token = app.signer.sign("some-other-service", &identity_of(DEFAULT_SUB)).unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
@@ -89,23 +89,22 @@ async fn identity_from_untrusted_key_is_401() {
     let (other_private, _) = generate_keypair_pem();
     let forger = InternalSigner::from_pem(other_private.as_bytes()).unwrap();
     let token = forger
-        .sign(Service::Orchestrator.name(), &identity("org-1"))
+        .sign(Service::Orchestrator.name(), &identity_of(DEFAULT_SUB))
         .unwrap();
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
     assert_eq!(resp.status(), 401);
 }
 
+// #126: an identity that names no tenant (no member token) is 401: nothing finds a tenant
+// any other way.
 #[tokio::test]
-async fn unbound_org_is_tenant_not_bound() {
+async fn an_identity_without_a_tenant_is_401() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let token = app.token_for_org("org-not-bound");
+    let token = app.token_for_org("no-such-tenant");
     let resp = post_create(&app, Some(&token), create_body(TenantId::new())).await;
-    assert_eq!(resp.status(), 403);
+    assert_eq!(resp.status(), 401);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(code_of(&body), "tenant_not_bound");
-    let message = message_of(&body);
-    assert!(message.contains("init-bootstrap"), "{message}");
-    assert!(message.contains("just zitadel-bootstrap"), "{message}");
+    assert_eq!(code_of(&body), "unauthorized");
 }
 
 #[tokio::test]
@@ -322,7 +321,7 @@ async fn get_me(app: &TestApp, identity_header: Option<&str>) -> reqwest::Respon
 }
 
 #[tokio::test]
-async fn me_for_bound_org_returns_tenant_projects_and_databases() {
+async fn me_returns_tenant_projects_and_databases() {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
@@ -333,7 +332,6 @@ async fn me_for_bound_org_returns_tenant_projects_and_databases() {
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["user"]["sub"], "user-1");
-    assert_eq!(body["user"]["org_id"], "org-1");
     assert_eq!(body["tenant"]["id"], serde_json::json!(tenant));
     assert_eq!(body["tenant"]["slug"], "demo");
     let project = &body["tenant"]["projects"][0];
@@ -347,18 +345,18 @@ async fn me_for_bound_org_returns_tenant_projects_and_databases() {
 }
 
 #[tokio::test]
-async fn me_for_unbound_org_returns_null_tenant() {
+async fn me_without_a_tenant_returns_null_tenant() {
     let app = spawn_app(FakeMetadata::default(), FakeJobs::default()).await;
-    let resp = get_me(&app, Some(&app.token_for_org("org-unbound"))).await;
+    let resp = get_me(&app, Some(&app.token_for_org("no-tenant"))).await;
     assert_eq!(resp.status(), 200);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["user"]["org_id"], "org-unbound");
+    assert_eq!(body["user"], json!({ "sub": DEFAULT_SUB }));
     assert!(body["tenant"].is_null());
 }
 
 // Review Focus 2.
 #[tokio::test]
-async fn me_for_bound_org_with_missing_tenant_row_returns_null_tenant() {
+async fn me_with_a_missing_tenant_row_returns_null_tenant() {
     let metadata = FakeMetadata::default();
     metadata.bind_org("org-1", TenantId::new());
     let app = spawn_app(metadata, FakeJobs::default()).await;
@@ -5347,9 +5345,6 @@ async fn me_lists_project_name_and_status() {
     assert_eq!((projects[1]["name"].as_str(), projects[1]["status"].as_str()), (Some("Going"), Some("deleting")));
 }
 
-// The Zitadel mock and client, used by the members tests below.
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
 use chelabase_identity::Pool;
 use chelabase_identity::mock::FakeIdentity;
 use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
@@ -5368,9 +5363,7 @@ impl Branching {
         if self.metadata.member(tenant, sub).is_none() {
             self.metadata.add_member(tenant, sub, MemberStatus::Active, true);
         }
-        let mut id = identity("org-1");
-        id.sub = sub.into();
-        let token = self.app.signer.sign(Service::Orchestrator.name(), &id).unwrap();
+        let token = self.app.sign(&identity_of(sub), Some(tenant));
         let mut req = reqwest::Client::new()
             .request(method, format!("{}{path}", self.app.base))
             .header(IDENTITY_HEADER, token);
@@ -8317,20 +8310,6 @@ async fn removed_member_is_refused_with_a_valid_token() {
     assert_eq!(code_of(&err), "not_found");
 }
 
-#[tokio::test]
-async fn invited_member_activates_on_first_request() {
-    let w = member_world(Mode::SelfHosted).await;
-    let id = w.metadata.add_member(w.tenant, "carol", MemberStatus::Invited, false);
-    w.metadata.add_open_invite(id);
-    w.metadata.grant(id, w.project, PlatformRole::Viewer, &[]);
-    let path = format!("/v1/databases/{}", w.db);
-    assert_eq!(w.app.send_as("carol", "org-1", Method::GET, &path, None).await.status(), 200);
-    let m = w.metadata.member(w.tenant, "carol").unwrap();
-    assert_eq!(m.status, MemberStatus::Active);
-    assert!(m.accepted_at.is_some());
-    assert_eq!(m.email.as_deref(), Some("carol@example.test"), "the token's claims are stored");
-}
-
 // I1: an invited member whose invite expired (or never existed) stays invited and gets
 // `no_access_yet`, whatever token they hold.
 #[tokio::test]
@@ -8399,8 +8378,8 @@ async fn me_lists_narrowed_databases() {
     assert!(me["projects"].as_array().unwrap().iter().all(|p| p["databases"] == json!([]) && p["roles"] == "all"), "{me}");
 }
 
-// R39: sign-up is off unless the tenant switched it on: a person in the org with no invite and
-// no row is refused (the "ask your admin for an invite" answer) and nothing is written.
+// R39: a person with no row is refused (the "ask your admin for an invite" answer) and nothing
+// is written: rows are made only by sign-up and accept-invite (#126).
 #[tokio::test]
 async fn closed_signup_creates_no_member() {
     let w = member_world(Mode::SelfHosted).await;
@@ -8412,94 +8391,9 @@ async fn closed_signup_creates_no_member() {
     assert_eq!(code_of(&err), "no_access_yet");
     assert!(w.metadata.member(w.tenant, "hal").is_none(), "no member row");
     assert_eq!((w.metadata.members.lock().unwrap().len(), w.metadata.events.lock().unwrap().len()), before);
-    // /v1/me still answers, with no membership.
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(me["projects"], json!([]));
-}
-
-// M7 (R41): on a fresh install two people may sign up before either has a member row (the gate
-// counts members). The one whose first request comes second is not stranded: while the tenant's
-// admin claim is recent they are a pending request (shown in Requests). Anyone later is refused.
-#[tokio::test]
-async fn first_member_race_loser_is_a_pending_request() {
-    let w = member_world(Mode::SelfHosted).await;
-    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::minutes(5)));
-    let me: Value = w.app.send_as("late", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    let late = w.metadata.member(w.tenant, "late").expect("a member row");
-    assert_eq!((late.status, late.tenant_admin), (MemberStatus::Pending, false));
-    assert_eq!(me["member"]["status"], "pending", "{me}");
-    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
-    assert_eq!(events, vec!["member_joined".to_string()]);
-    // The admin sees the request.
-    let list: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/members", None).await.json().await.unwrap();
-    assert!(list.as_array().unwrap().iter().any(|m| m["status"] == "pending"), "{list}");
-
-    // Once the claim is old, a person with no row is refused again, and nothing is written.
-    w.metadata.set_admin_claim(w.tenant, Some(chrono::Utc::now() - chrono::Duration::hours(3)));
-    let before = w.metadata.members.lock().unwrap().len();
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(w.metadata.members.lock().unwrap().len(), before);
-    // And a tenant whose admin was not claimed through sign-up never admits one.
-    w.metadata.set_admin_claim(w.tenant, None);
-    let me: Value = w.app.send_as("ivy", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-}
-
-// AC 6 through `admit` (reworded after the m3 re-audit, B3): two code-gated sign-ups, the claim
-// bound to A. A becomes the admin whichever first request comes first. B is refused
-// (`no_access_yet`, nothing written) until A's first request, and a pending request after it.
-#[tokio::test]
-async fn setup_race_loser_is_refused_until_the_winner_signs_in() {
-    for loser_first in [true, false] {
-        let w = member_world(Mode::SelfHosted).await;
-        w.metadata.members.lock().unwrap().retain(|m| m.tenant_id != w.tenant);
-        w.metadata.set_admin_claim(w.tenant, None);
-        w.metadata.set_setup_claim(w.tenant, "user-a");
-        let me = |sub: &'static str| {
-            let w = &w;
-            async move { w.app.send_as(sub, "org-1", Method::GET, "/v1/me", None).await.json::<Value>().await.unwrap() }
-        };
-        if loser_first {
-            let b = me("user-b").await;
-            assert!(b["member"].is_null(), "B before A: refused, {b}");
-            assert!(w.metadata.member(w.tenant, "user-b").is_none(), "nothing written");
-            let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
-            assert_eq!(code_of(&err), "no_access_yet");
-            assert!(w.metadata.member(w.tenant, "user-b").is_none());
-        }
-        assert!(!me("user-a").await["member"].is_null());
-        let a = w.metadata.member(w.tenant, "user-a").unwrap();
-        assert_eq!((a.status, a.tenant_admin), (MemberStatus::Active, true), "loser_first={loser_first}");
-        assert!(!me("user-b").await["member"].is_null());
-        let b = w.metadata.member(w.tenant, "user-b").unwrap();
-        assert_eq!((b.status, b.tenant_admin), (MemberStatus::Pending, false), "loser_first={loser_first}");
-        let err = error_of(w.app.send_as("user-b", "org-1", Method::GET, "/v1/members", None).await, 403).await;
-        assert_eq!(code_of(&err), "pending_approval");
-    }
-}
-
-// R39: with open sign-up on, the same person becomes a pending member (one `member_joined`
-// event) who can do nothing yet.
-#[tokio::test]
-async fn open_signup_creates_pending_member() {
-    let w = member_world(Mode::SelfHosted).await;
-    w.metadata.open_signups.lock().unwrap().insert(w.tenant, true);
-    let me: Value = w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    let hal = w.metadata.member(w.tenant, "hal").unwrap().id;
-    assert_eq!(me["member"], json!({ "id": hal, "status": "pending", "tenant_admin": false }));
-    assert_eq!(me["projects"], json!([]));
-    let m = w.metadata.member(w.tenant, "hal").expect("a member row");
-    assert_eq!((m.status, m.tenant_admin), (MemberStatus::Pending, false), "the tenant has an admin already");
-    let events: Vec<String> = w.metadata.events.lock().unwrap().iter().map(|e| e.action.clone()).collect();
-    assert_eq!(events, vec!["member_joined"]);
-    // Asking again changes nothing, and a pending member stays out.
-    let path = format!("/v1/databases/{}", w.db);
-    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, &path, None).await, 403).await;
-    assert_eq!(code_of(&err), "pending_approval");
-    assert_eq!(w.metadata.members.lock().unwrap().iter().filter(|m| m.identity_user_id == "hal").count(), 1);
-    assert_eq!(w.metadata.events.lock().unwrap().len(), 1, "no second event");
+    // #119: `/v1/me` tells a member token with no row nothing of the tenant.
+    let err = error_of(w.app.send_as("hal", "org-1", Method::GET, "/v1/me", None).await, 403).await;
+    assert_eq!(code_of(&err), "no_access_yet");
 }
 
 // R40: a pending member is 403 `pending_approval` on every route except /v1/me.
@@ -8733,30 +8627,6 @@ async fn decline_removes_and_bans() {
     assert_eq!(code_of(&err), "not_found");
 }
 
-// R39, R40: a pending member never becomes the first admin; whoever finds the tenant without
-// one claims it.
-#[tokio::test]
-async fn pending_never_becomes_first_admin() {
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.members.lock().unwrap().retain(|m| m.identity_user_id != DEFAULT_SUB); // no admin yet
-    metadata.open_signups.lock().unwrap().insert(tenant, true);
-    let pat = metadata.add_member(tenant, "pat", MemberStatus::Pending, false);
-    let app = spawn_app_full(metadata.clone(), FakeJobs::default(), "http://127.0.0.1:9", Mode::SelfHosted, 10).await;
-    let me: Value = app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!(me["member"], json!({ "id": pat, "status": "pending", "tenant_admin": false }));
-    let m = metadata.member(tenant, "pat").unwrap();
-    assert_eq!((m.id, m.status, m.tenant_admin), (pat, MemberStatus::Pending, false));
-    let me: Value = app.send_as("first", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert_eq!((&me["member"]["status"], &me["member"]["tenant_admin"]), (&json!("active"), &json!(true)));
-    assert!(me["member"]["id"].as_str().is_some_and(|id| id.len() == 36), "{me}");
-    assert_eq!(metadata.member(tenant, "pat").unwrap().status, MemberStatus::Pending);
-    // Even with the claim made by someone else, pat stays pending on every later request.
-    app.send_as("pat", "org-1", Method::GET, "/v1/me", None).await;
-    assert!(!metadata.member(tenant, "pat").unwrap().tenant_admin);
-}
-
 #[tokio::test]
 async fn platform_mode_creates_no_members() {
     let w = member_world(Mode::Platform).await;
@@ -8764,14 +8634,13 @@ async fn platform_mode_creates_no_members() {
     let path = format!("/v1/databases/{}", w.db);
     let err = error_of(w.app.send_as("dave", "org-1", Method::GET, &path, None).await, 403).await;
     assert_eq!(code_of(&err), "not_available_in_platform_mode");
-    let me: Value = w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
-    assert!(me["member"].is_null(), "{me}");
-    assert_eq!(me["projects"], json!([]));
+    let err = error_of(w.app.send_as("dave", "org-1", Method::GET, "/v1/me", None).await, 403).await;
+    assert_eq!(code_of(&err), "not_available_in_platform_mode");
     assert_eq!(w.metadata.members.lock().unwrap().len(), before);
     assert!(w.metadata.member(w.tenant, "dave").is_none());
 
     // An existing member is served; a tenant admin isn't an instance admin without the
-    // operator org.
+    // operator tenant.
     assert_eq!(w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, &path, None).await.status(), 200);
     let me: Value = w.app.send_as(DEFAULT_SUB, "org-1", Method::GET, "/v1/me", None).await.json().await.unwrap();
     assert_eq!(me["instance_admin"], json!(false));
@@ -8968,42 +8837,6 @@ async fn put_app_users_reads_the_database_override() {
     assert_eq!(err["error"]["required"], "admin");
 }
 
-// I2 (R18): a token without email or name claims gets them from Zitadel, once.
-#[tokio::test]
-async fn missing_claims_are_read_from_zitadel() {
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.open_signups.lock().unwrap().insert(tenant, true);
-    let mock = MockZitadel::start().await;
-    let zed = mock.add_user("Zed@Example.Test", "correct-horse-9", true);
-    mock.set_display_name(&zed, "Zed Zulu");
-    let app = spawn_app_parts(
-        metadata.clone(),
-        FakeJobs::default(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        10,
-        Some(Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-    )
-    .await;
-    let bare = |sub: &str| Identity { email: None, name: None, ..identity_of(sub, "org-1") };
-    let me = body_of(app.send_identity(&bare(&zed), Method::GET, "/v1/me").await).await;
-    assert_eq!(me["email"], "zed@example.test", "{me}");
-    assert_eq!(me["name"], "Zed Zulu");
-    let m = metadata.member(tenant, &zed).unwrap();
-    assert_eq!((m.email.as_deref(), m.display_name.as_str()), (Some("zed@example.test"), "Zed Zulu"));
-    // Known now: the next request doesn't ask Zitadel again.
-    app.send_identity(&bare(&zed), Method::GET, "/v1/me").await;
-    let lookups = mock.inner.lock().unwrap().calls.iter().filter(|c| c.contains(&format!("/v2/users/{zed}"))).count();
-    assert_eq!(lookups, 1);
-    // A Zitadel failure isn't fatal: the member is made without them (pending, as zed is).
-    let me = body_of(app.send_identity(&bare("ghost"), Method::GET, "/v1/me").await).await;
-    assert!(me["email"].is_null() && me["name"].is_null(), "{me}");
-    assert_eq!(me["member"]["status"], "pending");
-}
-
 // I3: `create_merge` goes by the branch merged into.
 #[tokio::test]
 async fn create_merge_into_protected_parent_needs_admin() {
@@ -9075,13 +8908,13 @@ async fn the_member_row_is_read_once_per_request() {
     for mode in [Mode::SelfHosted, Mode::Platform] {
         let w = member_world(mode).await;
         let path = format!("/v1/databases/{}", w.db);
-        let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
-        let full = identity_of(DEFAULT_SUB, "org-1");
+        let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB) };
+        let full = identity_of(DEFAULT_SUB);
         for (label, identity) in [("claims", &full), ("no claims", &bare)] {
             // The first request may refresh the claims; count the steady state.
-            w.app.send_identity(identity, Method::GET, &path).await;
+            w.app.send_identity(identity, "org-1", Method::GET, &path).await;
             let before = w.metadata.member_reads.load(Ordering::SeqCst);
-            assert_eq!(w.app.send_identity(identity, Method::GET, &path).await.status(), 200);
+            assert_eq!(w.app.send_identity(identity, "org-1", Method::GET, &path).await.status(), 200);
             assert_eq!(w.metadata.member_reads.load(Ordering::SeqCst) - before, 1, "{mode:?} {label}");
         }
     }
@@ -9095,53 +8928,10 @@ async fn me_name_is_null_when_unknown() {
         m.display_name = String::new();
         m.email = None;
     });
-    let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB, "org-1") };
-    let me = body_of(w.app.send_identity(&bare, Method::GET, "/v1/me").await).await;
+    let bare = Identity { email: None, name: None, ..identity_of(DEFAULT_SUB) };
+    let me = body_of(w.app.send_identity(&bare, "org-1", Method::GET, "/v1/me").await).await;
     assert!(me["name"].is_null(), "{me}");
     assert!(me["email"].is_null(), "{me}");
-}
-
-// M7 (R19): `Instance` routes are checked before the tenant binding, so a platform operator
-// whose org is no tenant reaches them; every other route still answers `tenant_not_bound`.
-#[tokio::test]
-async fn instance_routes_skip_tenant_binding_for_operators() {
-    let spawn = |mode: Mode, metadata: FakeMetadata| async move {
-        spawn_app_custom(
-            metadata,
-            FakeJobs::default(),
-            "http://127.0.0.1:9",
-            mode,
-            10,
-            None,
-            Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-            Some("ops"),
-        )
-        .await
-    };
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    metadata.add_member(tenant, "plain", MemberStatus::Active, false);
-    let app = spawn(Mode::Platform, metadata.clone()).await;
-    // The operator org isn't a tenant: the probe passes, any tenant route doesn't.
-    let resp = app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await;
-    assert_eq!(resp.status(), 200);
-    assert_eq!(resp.text().await.unwrap(), "op");
-    let err = error_of(app.send_as("op", "ops", Method::GET, "/v1/projects", None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
-    // In platform mode a tenant admin isn't an instance admin, and another org is unbound.
-    let err = error_of(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!((code_of(&err), err["error"]["required"].as_str()), ("forbidden", Some("instance admin")));
-    let err = error_of(app.send_as("x", "elsewhere", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
-
-    // Self-hosted: the tenant admin passes, another member doesn't, the operator org is nothing.
-    let app = spawn(Mode::SelfHosted, metadata).await;
-    assert_eq!(app.send_as(DEFAULT_SUB, "org-1", Method::GET, INSTANCE_PROBE, None).await.status(), 200);
-    let err = error_of(app.send_as("plain", "org-1", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(err["error"]["required"], "instance admin");
-    let err = error_of(app.send_as("op", "ops", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(code_of(&err), "tenant_not_bound");
 }
 
 // --- Route-specific refinements (members and roles, T6) --------------------------------------
@@ -9449,7 +9239,6 @@ async fn app_user_routes_apply_the_auth_database_override() {
         project_id: w.project,
         status: AppUsersStatus::Enabled,
         error: None,
-        zitadel_org_id: Some("zorg".into()),
         database_id,
         pg_database: "web1".into(),
         schema_name: "public".into(),
@@ -9738,8 +9527,7 @@ async fn delete_database_refuses_the_app_auth_database() {
             project_id: w.project,
             status: AppUsersStatus::Enabled,
             error: None,
-            zitadel_org_id: Some("zorg".into()),
-            database_id: w.db,
+                database_id: w.db,
             pg_database: "web1".into(),
             schema_name: "public".into(),
             table_name: "users".into(),
@@ -9776,7 +9564,7 @@ async fn create_database_takes_the_tenant_from_the_caller() {
 
 /// The member world (org-1's tenant; project Billing with database web1, owner `postgres`,
 /// main plus `dev`), with the identity fake behind the orchestrator (its members pool exists)
-/// and, in platform mode, `ops` as the operator org.
+/// and `ops` as the operator tenant, whose active member `operator` is.
 struct Mw {
     w: MemberWorld,
     identity: FakeIdentity,
@@ -9795,6 +9583,9 @@ async fn mw_with(mode: Mode, with_identity: bool) -> Mw {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
+    let ops = TenantId::new();
+    metadata.bind_org("ops", ops);
+    metadata.add_member(ops, "operator", MemberStatus::Active, false);
     let jobs = FakeJobs::default();
     let identity = FakeIdentity::start().await;
     identity.with_pool(&Pool::Members);
@@ -9804,12 +9595,9 @@ async fn mw_with(mode: Mode, with_identity: bool) -> Mw {
         "http://127.0.0.1:9",
         mode,
         10,
-        None,
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        Some("ops"),
         None,
-        unused_oidc(),
-        None,
+        Some(ops),
         None,
         with_identity.then(|| identity.client()),
     )
@@ -15701,7 +15489,7 @@ async fn revoking_an_invite_leaves_a_user_who_is_a_member_elsewhere() {
 /// The gateway's identity for a member token of person `sub` naming `tenant`.
 fn member_identity_token(app: &TestApp, sub: &str, tenant: uuid::Uuid) -> String {
     app.signer
-        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub, ""), tenant)
+        .sign_for_tenant(Service::Orchestrator.name(), &identity_of(sub), tenant)
         .unwrap()
 }
 
@@ -15813,7 +15601,7 @@ async fn member_token_and_zitadel_token_are_the_same_member() {
 }
 
 // `CHELABASE_OPERATOR_TENANT_ID`: in platform mode a member token naming the operator tenant
-// passes the instance check; the operator org's id as a tenant, or another tenant, doesn't.
+// passes the instance check; another tenant doesn't.
 #[tokio::test]
 async fn operator_tenant_is_instance_admin_for_member_tokens() {
     let metadata = FakeMetadata::default();
@@ -15827,14 +15615,11 @@ async fn operator_tenant_is_instance_admin_for_member_tokens() {
     assert_eq!(resp.status(), 200);
     let err = error_of(send_member(&app, DEFAULT_SUB, tenant.as_uuid(), Method::GET, INSTANCE_PROBE).await, 403).await;
     assert_eq!(err["error"]["required"], "instance admin");
-    // The Zitadel path doesn't read the tenant setting: ops-org isn't the operator org.
-    let err = error_of(app.send_as("op", "ops-org", Method::GET, INSTANCE_PROBE, None).await, 403).await;
-    assert_eq!(err["error"]["required"], "instance admin");
 }
 
 // #119 on the realtime routes: a member token is verified here with the member key; the member
 // is read (never made) in the tenant `tid` names; `/internal/realtime/member` takes the
-// gateway identity's `tenant_id` instead of an org, never both.
+// gateway identity's `tenant_id`.
 #[tokio::test]
 #[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
 async fn realtime_routes_take_member_tokens() {
@@ -15929,15 +15714,15 @@ async fn realtime_routes_take_member_tokens() {
         ("suspended", json!({ "sub": "sus", "tenant_id": tenant.as_uuid() })),
         ("other tenant", json!({ "sub": "rita", "tenant_id": other.as_uuid() })),
         ("unknown tenant", json!({ "sub": "rita", "tenant_id": uuid::Uuid::new_v4() })),
-        ("both", json!({ "sub": "rita", "tenant_id": tenant.as_uuid(), "org_id": "org-1" })),
-        ("neither", json!({ "sub": "rita" })),
+        ("nil tenant", json!({ "sub": "rita", "tenant_id": uuid::Uuid::nil() })),
     ] {
         let (status, body) = ask(b).await;
         assert_eq!((status, body["allowed"].clone()), (200, json!(false)), "{what}: {body}");
     }
-    // The Zitadel shape still works.
-    let (_, body) = ask(json!({ "sub": "rita", "org_id": "org-1" })).await;
-    assert_eq!(body["allowed"], json!(true), "{body}");
+    // #126: the tenant is required, and nothing else is taken (an org is an unknown field).
+    for b in [json!({ "sub": "rita" }), json!({ "sub": "rita", "tenant_id": tenant.as_uuid(), "org_id": "org-1" })] {
+        assert_eq!(ask(b).await.0, 400);
+    }
 }
 
 // `tid` is never trusted alone: naming the operator tenant makes no one an operator without an

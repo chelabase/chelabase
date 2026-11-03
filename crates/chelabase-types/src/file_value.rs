@@ -1,6 +1,6 @@
 //! A value an app reads from a file that may appear after it starts: the bootstrap's outputs
-//! (`chelabase-init bootstrap --out <dir>`), which a self-hosted stack writes into a volume once
-//! Zitadel is up, while the apps are already running.
+//! (`chelabase-init bootstrap --out <dir>`), which a self-hosted stack writes into a volume while
+//! the apps are already running.
 //!
 //! [`FileValue::get`] reads the file on first use and caches its text once the file is present
 //! and non-empty; until then it answers [`Unavailable::NotYet`], which a handler turns into
@@ -350,8 +350,8 @@ mod tests {
     #[test]
     fn not_yet_then_cached() {
         let t = tmp();
-        let path = t.0.join("org-id");
-        let v = FileValue::file("CHELABASE_ZITADEL_ORG_ID_FILE", &path, Sensitivity::Public);
+        let path = t.0.join("some-id");
+        let v = FileValue::file("CHELABASE_SOME_ID_FILE", &path, Sensitivity::Public);
         assert!(matches!(v.get(), Err(Unavailable::NotYet { .. })), "absent");
         assert!(!v.is_ready());
         write(&path, "", 0o644);
@@ -507,15 +507,15 @@ mod tests {
     fn config_refuses_env_and_file_both() {
         let err = FileValue::from_lookup(
             vars(&[
-                ("CHELABASE_ZITADEL_ORG_ID", "o1"),
-                ("CHELABASE_ZITADEL_ORG_ID_FILE", "/x/org-id"),
+                ("CHELABASE_SOME_ID", "o1"),
+                ("CHELABASE_SOME_ID_FILE", "/x/some-id"),
             ]),
-            "CHELABASE_ZITADEL_ORG_ID",
+            "CHELABASE_SOME_ID",
             Sensitivity::Public,
         )
         .unwrap_err();
         assert!(
-            err.contains("CHELABASE_ZITADEL_ORG_ID ") && err.contains("not both"),
+            err.contains("CHELABASE_SOME_ID ") && err.contains("not both"),
             "{err}"
         );
         assert!(!err.contains("o1"), "{err}");

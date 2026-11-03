@@ -1,6 +1,6 @@
 //! Gateway-minted internal identity tokens.
 //!
-//! The gateway verifies an external credential (a Zitadel JWT today), then
+//! The gateway verifies an external credential (a member token or a data key), then
 //! signs a short-lived EdDSA JWT describing the caller for exactly one
 //! upstream service (`aud`). Services verify it with the gateway's public key
 //! and never talk to the identity provider. Asymmetric keys mean a service can
@@ -58,12 +58,10 @@ pub struct DataIdentity {
     pub server_vouched: bool,
 }
 
-/// The caller, as established by the gateway. For a data key, `sub` is the key id and
-/// `org_id` is empty.
+/// The caller, as established by the gateway. For a data key, `sub` is the key id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     pub sub: String,
-    pub org_id: String,
     pub auth: AuthMethod,
     pub request_id: String,
     pub data: Option<DataIdentity>,
@@ -80,10 +78,7 @@ pub struct InternalClaims {
     pub iat: u64,
     pub exp: u64,
     pub sub: String,
-    pub org_id: String,
-    /// The member's tenant, from a member token's `tid` (#119); then `org_id` is empty.
-    /// `None` for a Zitadel token, a data key, and tokens minted before it existed. Until m13
-    /// removes `org_id`, a consumer that binds a member to a tenant reads this first.
+    /// The member's tenant, from a member token's `tid` (#119). `None` for a data key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
     pub auth: AuthMethod,
@@ -132,18 +127,15 @@ impl InternalSigner {
         self.sign_claims(audience, identity, None, issued_at)
     }
 
-    /// Sign for a member whose token named `tenant` (`tid`, #119). `identity.org_id` must be
-    /// empty: a token never carries both a tenant and a Zitadel org.
+    /// Sign for a member whose token named `tenant` (`tid`, #119); never the nil tenant.
     pub fn sign_for_tenant(
         &self,
         audience: &str,
         identity: &Identity,
         tenant: Uuid,
     ) -> Result<String, AuthError> {
-        if !identity.org_id.is_empty() || tenant.is_nil() {
-            return Err(AuthError::Config(
-                "a member identity names a tenant and no Zitadel org".into(),
-            ));
+        if tenant.is_nil() {
+            return Err(AuthError::Config("a member identity names a tenant".into()));
         }
         self.sign_claims(audience, identity, Some(tenant), now_secs())
     }
@@ -162,7 +154,6 @@ impl InternalSigner {
             iat: issued_at,
             exp: issued_at + INTERNAL_TOKEN_TTL_SECS,
             sub: identity.sub.clone(),
-            org_id: identity.org_id.clone(),
             auth: identity.auth,
             rid: identity.request_id.clone(),
             data: identity.data.clone(),
@@ -209,9 +200,9 @@ impl InternalVerifier {
         let claims = decode::<InternalClaims>(token, &self.key, &validation)
             .map(|data| data.claims)
             .map_err(|e| AuthError::InvalidToken(e.to_string()))?;
-        // #119: a member names a tenant or a Zitadel org, never both, never a nil tenant.
-        if claims.tenant_id.is_some_and(|t| t.is_nil() || !claims.org_id.is_empty()) {
-            return Err(AuthError::InvalidToken("an identity names both a tenant and an org".into()));
+        // #119: a member never names the nil tenant.
+        if claims.tenant_id.is_some_and(|t| t.is_nil()) {
+            return Err(AuthError::InvalidToken("an identity names the nil tenant".into()));
         }
         Ok(claims)
     }

@@ -62,14 +62,6 @@ pub struct WorkerConfig {
     /// `CHELABASE_BRANCH_ROLE_CAP`, `CHELABASE_BRANCH_DATABASE_CAP` and
     /// `CHELABASE_PASSWORD_STRENGTH` (platform mode forces strength on).
     pub roles: RoleSettings,
-    /// Zitadel's base URL, from `CHELABASE_AUTH_HOST` (and `CHELABASE_PUBLIC_SCHEME`).
-    pub zitadel_issuer: Option<String>,
-    /// Where calls to Zitadel go when the issuer is set: `CHELABASE_ZITADEL_INTERNAL_URL` with
-    /// the auth host as `Host` (#24); `None` (or the variable unset): the issuer.
-    pub zitadel_at: Option<chelabase_types::entry::ZitadelAt>,
-    /// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`: the admin PAT (org create/delete, user reads,
-    /// session deletes). Read by [`build`].
-    pub zitadel_admin_pat_file: Option<PathBuf>,
     /// `CHELABASE_IDENTITY_URL`: the identity service (app-user pools and users). Read with
     /// [`Self::identity_token_file`] by [`identity_client`].
     pub identity_url: Option<String>,
@@ -80,9 +72,6 @@ pub struct WorkerConfig {
     /// `CHELABASE_MEMBER_ROLES_SWEEP_SECS` (default 300, 30 to 86,400): how often every branch's
     /// member roles are reconciled, the backstop for lost or failed reconcile publishes.
     pub member_roles_sweep_every: Duration,
-    /// `CHELABASE_IDENTITY_SWEEP_SECS` (default 600, 1 to 86,400): how often personal-login
-    /// owners' Zitadel state is checked.
-    pub identity_sweep_every: Duration,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS` (default on): reconcile removes this stack's compute
     /// containers no endpoint row records. Listing is scoped to the stack, so this is an
     /// opt-out for debugging, not a guard against other stacks.
@@ -143,12 +132,6 @@ impl WorkerConfig {
             Some("true" | "1" | "yes")
         );
         let roles = RoleSettings::from_lookup(mode, &get).map_err(|e| anyhow!(e))?;
-        let zitadel_issuer = chelabase_types::entry::issuer_from_lookup(&get).map_err(anyhow::Error::new)?;
-        let zitadel_at = zitadel_issuer
-            .as_deref()
-            .map(|issuer| chelabase_types::entry::zitadel_at(&get, issuer))
-            .transpose()
-            .map_err(anyhow::Error::new)?;
         let config = Self {
             storcon_url: or_default("CHELABASE_STORCON_URL", "http://127.0.0.1:1234"),
             safekeeper_http: safekeeper_http(non_blank(&get, "CHELABASE_SAFEKEEPER_HTTP"))?,
@@ -171,10 +154,6 @@ impl WorkerConfig {
             policy: ModePolicy::new(mode),
             owner_superuser_requested,
             roles,
-            zitadel_issuer,
-            zitadel_at,
-            zitadel_admin_pat_file: non_blank(&get, "CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-                .map(PathBuf::from),
             identity_url: non_blank(&get, "CHELABASE_IDENTITY_URL"),
             identity_token_file: non_blank(&get, "CHELABASE_IDENTITY_TOKEN_FILE")
                 .map(PathBuf::from),
@@ -186,10 +165,6 @@ impl WorkerConfig {
                 "CHELABASE_MEMBER_ROLES_SWEEP_SECS",
                 non_blank(&get, "CHELABASE_MEMBER_ROLES_SWEEP_SECS"),
             )?,
-            identity_sweep_every: identity_sweep_every(non_blank(
-                &get,
-                "CHELABASE_IDENTITY_SWEEP_SECS",
-            ))?,
             remove_orphans: remove_orphans(non_blank(&get, "CHELABASE_WORKER_REMOVE_ORPHANS"))?,
             compute_control_network: or_default(
                 "CHELABASE_COMPUTE_CONTROL_NETWORK",
@@ -298,18 +273,6 @@ fn reconcile_every(name: &str, value: Option<String>) -> anyhow::Result<Duration
     }
 }
 
-/// `CHELABASE_IDENTITY_SWEEP_SECS`: whole seconds from 1 to 86,400; 600 when unset.
-fn identity_sweep_every(value: Option<String>) -> anyhow::Result<Duration> {
-    const NAME: &str = "CHELABASE_IDENTITY_SWEEP_SECS";
-    let Some(value) = value else {
-        return Ok(Duration::from_secs(600));
-    };
-    match value.parse::<u64>() {
-        Ok(secs) if (1..=86_400).contains(&secs) => Ok(Duration::from_secs(secs)),
-        _ => Err(anyhow!("{NAME}={value:?}: expected whole seconds from 1 to 86400")),
-    }
-}
-
 /// Whether two directory settings name the same directory: by their real paths when both
 /// exist, otherwise (they may not exist yet) spelled alike once `.` components, repeated and
 /// trailing slashes are normalised away.
@@ -390,35 +353,6 @@ pub fn identity_client(config: &WorkerConfig) -> Option<chelabase_identity::Iden
     }
 }
 
-/// Zitadel with the admin PAT, when both settings are given and the file reads; otherwise
-/// `None` (logged), and app users jobs fail and are retried until it's configured.
-pub fn zitadel_client(config: &WorkerConfig) -> Option<chelabase_zitadel::client::Zitadel> {
-    let (Some(issuer), Some(file)) = (&config.zitadel_issuer, &config.zitadel_admin_pat_file)
-    else {
-        tracing::warn!(
-            "CHELABASE_AUTH_HOST or CHELABASE_ZITADEL_ADMIN_PAT_FILE is unset: app users jobs wait until both are set"
-        );
-        return None;
-    };
-    match std::fs::read_to_string(file) {
-        Ok(pat) if !pat.trim().is_empty() => {
-            let at = config.zitadel_at.clone().unwrap_or_else(|| chelabase_types::entry::ZitadelAt {
-                base: issuer.clone(),
-                host: None,
-            });
-            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
-        }
-        Ok(_) => {
-            tracing::warn!(file = %file.display(), "the Zitadel admin PAT file is empty: app users jobs wait until it's set");
-            None
-        }
-        Err(e) => {
-            tracing::warn!(file = %file.display(), "reading the Zitadel admin PAT: {e}; app users jobs wait until it's readable");
-            None
-        }
-    }
-}
-
 /// The env var naming the `chelabase_realtime` role's password file (S1).
 const REALTIME_PG_PASSWORD_FILE: &str = "CHELABASE_REALTIME_PG_PASSWORD_FILE";
 
@@ -466,7 +400,7 @@ pub fn build_with(
     attach: AttachSource,
     connect: impl FnOnce(ComputeSettings, DockerSettings) -> anyhow::Result<Backend>,
 ) -> anyhow::Result<RealWorker> {
-    // First, so a missing key pair names its fix (`init-secrets` or `just zitadel-bootstrap`) before anything else fails.
+    // First, so a missing key pair names its fix (`init-secrets` or `just workbench up`) before anything else fails.
     let signer = chelabase_neon::jwt::load_signer(&config.compute_jwt_dir)?;
     let cidrs = config.member_login_cidrs.clone().ok_or_else(|| {
         anyhow!(
@@ -478,7 +412,7 @@ pub fn build_with(
     let ca = Arc::new(ComputeCa::load(&config.compute_ca_dir).with_context(|| {
         format!(
             "loading the compute CA from {} (CHELABASE_COMPUTE_CA_DIR; self-hosted: `init-secrets` creates it, see `docker compose logs init-secrets`; \
-             workbench: `just zitadel-bootstrap`)",
+             workbench: `just workbench up`)",
             config.compute_ca_dir.display()
         )
     })?);
@@ -555,12 +489,9 @@ pub fn build_with(
         schema_check_cursor: Default::default(),
         enabling_seen: Default::default(),
         recreate_backoff: Default::default(),
-        zitadel: zitadel_client(config),
         identity: identity_client(config),
         app_users_reconcile_every: config.app_users_reconcile_every,
         member_roles_sweep_every: config.member_roles_sweep_every,
-        identity_sweep_every: config.identity_sweep_every,
-        identity_sweep_warned: Default::default(),
         remove_orphans: config.remove_orphans,
         merge_tx_timeout: crate::merge::MERGE_TX_TIMEOUT,
         merge_online_step_timeout: crate::merge::MERGE_ONLINE_STEP_TIMEOUT,
@@ -758,8 +689,7 @@ mod tests {
             .collect();
         assert!(bearers.is_empty(), "the worker reads a bearer without the dev-default check: {bearers:?}");
         // Every field, none a bearer. Credentials it does hold have no default: the Valkey
-        // password and realtime's role password are files the stack mounts, and the Zitadel
-        // admin PAT is a file too.
+        // password, realtime's role password and the identity token are files the stack mounts.
         let WorkerConfig {
             storcon_url: _,
             safekeeper_http: _,
@@ -775,14 +705,10 @@ mod tests {
             policy: _,
             owner_superuser_requested: _,
             roles: _,
-            zitadel_issuer: _,
-            zitadel_at: _,
-            zitadel_admin_pat_file,
             identity_url: _,
             identity_token_file,
             app_users_reconcile_every: _,
             member_roles_sweep_every: _,
-            identity_sweep_every: _,
             remove_orphans: _,
             compute_control_network: _,
             compute_ca_dir: _,
@@ -796,11 +722,10 @@ mod tests {
         assert_eq!(
             (
                 valkey_password_file,
-                zitadel_admin_pat_file,
                 identity_token_file,
                 realtime_pg_password_file
             ),
-            (None, None, None, None),
+            (None, None, None),
             "unset, a credential file is absent, never a default"
         );
     }
@@ -985,22 +910,12 @@ mod tests {
     fn config_reads_reconcile_interval() {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(300));
-        assert_eq!(c.zitadel_issuer, None);
-        assert_eq!(c.zitadel_admin_pat_file, None);
         let c = WorkerConfig::from_lookup(lookup(&[
             IMAGE,
             ("CHELABASE_APP_USERS_RECONCILE_SECS", "45"),
-            ("CHELABASE_PUBLIC_SCHEME", "http"),
-            ("CHELABASE_AUTH_HOST", "auth.chelabase.localhost:8000"),
-            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", ".chelabase/stacks/main/zitadel/admin.pat"),
         ]))
         .unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(45));
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("http://auth.chelabase.localhost:8000"));
-        assert_eq!(
-            c.zitadel_admin_pat_file,
-            Some(PathBuf::from(".chelabase/stacks/main/zitadel/admin.pat"))
-        );
         for edge in ["30", "86400"] {
             let c = WorkerConfig::from_lookup(lookup(&[
                 IMAGE,
@@ -1022,11 +937,9 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[
             IMAGE,
             ("CHELABASE_APP_USERS_RECONCILE_SECS", " "),
-            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", ""),
         ]))
         .unwrap();
         assert_eq!(c.app_users_reconcile_every, Duration::from_secs(300));
-        assert_eq!(c.zitadel_admin_pat_file, None);
     }
 
     /// T8 fix round (I2): the member-role sweep, the backstop for lost reconcile publishes.
@@ -1040,25 +953,6 @@ mod tests {
         let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, " ")])).unwrap();
         assert_eq!(c.member_roles_sweep_every, Duration::from_secs(300));
         for bad in ["29", "86401", "x"] {
-            let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, bad)]))
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(VAR), "{bad}: {err}");
-        }
-    }
-
-    /// T7: the identity sweep runs every 10 minutes by default; whole seconds from 1 to 86,400,
-    /// a bad value fails startup naming the variable, a blank one is unset.
-    #[test]
-    fn the_interval_is_bounded() {
-        const VAR: &str = "CHELABASE_IDENTITY_SWEEP_SECS";
-        let c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
-        assert_eq!(c.identity_sweep_every, Duration::from_secs(600));
-        for (value, secs) in [("1", 1), ("45", 45), ("86400", 86_400), (" ", 600)] {
-            let c = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, value)])).unwrap();
-            assert_eq!(c.identity_sweep_every, Duration::from_secs(secs), "{value:?}");
-        }
-        for bad in ["0", "86401", "-1", "x", "1.5", "600s"] {
             let err = WorkerConfig::from_lookup(lookup(&[IMAGE, (VAR, bad)]))
                 .unwrap_err()
                 .to_string();
@@ -1084,35 +978,6 @@ mod tests {
         assert!(err.contains(VAR), "{err}");
     }
 
-    // #24: the app users jobs reach Zitadel in-network with the auth host as Host; the issuer
-    // stays the public one.
-    #[test]
-    fn zitadel_is_reached_at_the_in_network_url() {
-        let c = WorkerConfig::from_lookup(lookup(&[
-            IMAGE,
-            ("CHELABASE_PUBLIC_SCHEME", "https"),
-            ("CHELABASE_AUTH_HOST", "auth.example.com"),
-            ("CHELABASE_ZITADEL_INTERNAL_URL", "http://zitadel:8080"),
-        ]))
-        .unwrap();
-        assert_eq!(c.zitadel_issuer.as_deref(), Some("https://auth.example.com"));
-        assert_eq!(
-            c.zitadel_at,
-            Some(chelabase_types::entry::ZitadelAt {
-                base: "http://zitadel:8080".into(),
-                host: Some("auth.example.com".into()),
-            })
-        );
-        let err = WorkerConfig::from_lookup(lookup(&[
-            IMAGE,
-            ("CHELABASE_AUTH_HOST", "auth.example.com"),
-            ("CHELABASE_ZITADEL_INTERNAL_URL", "ftp://zitadel"),
-        ]))
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("CHELABASE_ZITADEL_INTERNAL_URL"), "{err}");
-    }
-
     /// Both settings and a readable file give a client; anything less gives none.
     #[test]
     fn identity_client_needs_url_and_token_file() {
@@ -1136,22 +1001,6 @@ mod tests {
         assert!(identity_client(&c2).is_some());
         c.identity_token_file = Some(token);
         assert!(identity_client(&c).is_none(), "the URL is needed too");
-    }
-
-    /// Both settings and a readable file give a client; anything less gives none.
-    #[test]
-    fn zitadel_client_needs_issuer_and_pat_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let pat = dir.path().join("admin.pat");
-        std::fs::write(&pat, "secret-pat\n").unwrap();
-        let mut c = WorkerConfig::from_lookup(lookup(&[IMAGE])).unwrap();
-        assert!(zitadel_client(&c).is_none());
-        c.zitadel_issuer = Some("http://auth.chelabase.localhost:8000".into());
-        assert!(zitadel_client(&c).is_none());
-        c.zitadel_admin_pat_file = Some(dir.path().join("missing.pat"));
-        assert!(zitadel_client(&c).is_none());
-        c.zitadel_admin_pat_file = Some(pat);
-        assert!(zitadel_client(&c).is_some());
     }
 
     #[test]
@@ -1183,15 +1032,7 @@ mod tests {
             Err(err) => format!("{err:#}"),
         };
         assert!(err.contains("init-secrets"), "{err}");
-        assert!(err.contains("just zitadel-bootstrap"), "{err}");
-    }
-
-    #[test]
-    fn a_lone_zitadel_issuer_is_refused() {
-        let err = WorkerConfig::from_lookup(lookup(&[IMAGE, ("CHELABASE_ZITADEL_ISSUER", "http://old-issuer.example")]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("CHELABASE_AUTH_HOST"), "{err}");
+        assert!(err.contains("just workbench up"), "{err}");
     }
 
     use std::path::PathBuf;

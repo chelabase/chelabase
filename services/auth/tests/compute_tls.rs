@@ -14,7 +14,6 @@ fn vars(extra: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         ("CHELABASE_APP_JWT_PRIVATE_KEY", "/k/app-jwt.key"),
         ("CHELABASE_APP_JWT_PUBLIC_KEY", "/k/app-jwt.pub"),
         ("CHELABASE_INTERNAL_VERIFY_KEY", "/k/internal.pub"),
-        ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/k/admin.pat"),
     ]
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -51,7 +50,6 @@ fn branch_info_carries_the_sync_servers_name() {
     let info: AppBranchInfo = serde_json::from_value(serde_json::json!({
         "project_id": uuid::Uuid::nil(),
         "status": "enabled",
-        "zitadel_org_id": "o1",
         "email_verification": false,
         "on_delete": "delete",
         "auth_database_id": uuid::Uuid::nil(),

@@ -117,7 +117,7 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<BranchConnectionRow>, MetadataError>> + Send;
 
-    // App users (step 6b): what the `auth` service, the gateway and Zitadel's webhook need.
+    // App users (step 6b): what the `auth` service and the gateway need.
 
     fn project_by_id(
         &self,
@@ -126,10 +126,6 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     fn project_auth(
         &self,
         project: ProjectId,
-    ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
-    fn project_auth_by_org(
-        &self,
-        org_id: &str,
     ) -> impl Future<Output = Result<Option<ProjectAuth>, MetadataError>> + Send;
     fn get_branch(
         &self,
@@ -190,45 +186,43 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         created_before: Option<DateTime<Utc>>,
     ) -> impl Future<Output = Result<Vec<AppSession>, MetadataError>> + Send;
 
-    /// What the sign-up gate needs for the tenant of this Zitadel org; `None` when no tenant
-    /// has it.
+    /// What the sign-up gate needs for `tenant`; `None` when it doesn't exist.
     fn signup_facts(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
     ) -> impl Future<Output = Result<Option<SignUpFacts>, MetadataError>> + Send;
 
-    /// Stores a claim nonce's SHA-256 for the tenant of this Zitadel org, live for `ttl`;
-    /// `false` when no tenant has the org.
+    /// Stores a claim nonce's SHA-256 for `tenant`, live for `ttl`; `false` when it doesn't
+    /// exist.
     fn insert_setup_nonce(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         nonce_hash: [u8; 32],
         ttl: std::time::Duration,
     ) -> impl Future<Output = Result<bool, MetadataError>> + Send;
 
-    /// The fresh-install claim of the tenant of this Zitadel org (`None`: no claim, or no
-    /// tenant).
+    /// The fresh-install claim of `tenant` (`None`: no claim, or no tenant).
     fn setup_claim(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::SetupClaim>, MetadataError>> + Send;
 
-    /// [`MetadataClient::claim_setup`] for the tenant of this Zitadel org (`None`: no tenant).
+    /// [`MetadataClient::claim_setup`] for `tenant` (`None`: no tenant).
     fn claim_setup(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         nonce_hash: [u8; 32],
         identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError>> + Send;
 
-    /// What the open invite of this Zitadel user shows (`None` when it has none).
+    /// What the open invite of this identity user shows (`None` when it has none).
     fn open_invite_for_user(
         &self,
         identity_user_id: &str,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::members::InviteDescription>, MetadataError>> + Send;
 
-    /// [`MetadataClient::invite_expiry_for_user`]: the stored expiry of this Zitadel user's
+    /// [`MetadataClient::invite_expiry_for_user`]: the stored expiry of this identity user's
     /// unclosed member invite, expired or not, and whether the database clock calls it open
     /// (`None` when it has none).
     fn invite_expiry_for_user(
@@ -236,40 +230,30 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
         identity_user_id: &str,
     ) -> impl Future<Output = Result<Option<(DateTime<Utc>, bool)>, MetadataError>> + Send;
 
-    /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
+    /// [`MetadataClient::accepted_invites_for_user`]: `(tenant, token_hash)` of each accepted
+    /// invite of this identity user, newest first.
+    fn accepted_invites_for_user(
+        &self,
+        identity_user_id: &str,
+    ) -> impl Future<Output = Result<Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>, MetadataError>> + Send;
+
     /// The tenants this identity user is an active or pending member of.
     fn member_tenants(
         &self,
         identity_user_id: &str,
     ) -> impl Future<Output = Result<Vec<(chelabase_types::TenantId, MemberStatus)>, MetadataError>> + Send;
 
-    /// [`MetadataClient::admit_member`] for the tenant of this org, for someone signing up
-    /// (a member token never makes a row): the row's status, or `None` when `Closed` turned
-    /// them away or no tenant owns the org.
+    /// [`MetadataClient::admit_member`] in `tenant`, for someone signing up or accepting an
+    /// invite (a member token never makes a row): the row's status, or `None` when `Closed`
+    /// turned them away or the tenant doesn't exist.
     fn admit_sign_up(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
     ) -> impl Future<Output = Result<Option<MemberStatus>, MetadataError>> + Send;
-
-    fn tenant_by_org(
-        &self,
-        zitadel_org_id: &str,
-    ) -> impl Future<Output = Result<Option<chelabase_types::TenantId>, MetadataError>> + Send;
-
-    /// Members hub D4: the tenant member with this Zitadel user loses every live personal
-    /// login (`identity_offboarded`); returns every personal row of theirs (revoked ones
-    /// included); an unknown user has none.
-    fn revoke_logins_for_identity_user(
-        &self,
-        tenant: chelabase_types::TenantId,
-        identity_user_id: &str,
-    ) -> impl Future<
-        Output = Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError>,
-    > + Send;
 
     /// D7: the tenant member with this Zitadel user is no longer marked offboarded (its user
     /// was reactivated or unlocked); `true` when a mark was cleared. Logins stay revoked.
@@ -366,9 +350,6 @@ impl NeonMetadataPort for MetadataClient {
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         MetadataClient::project_auth(self, project).await
     }
-    async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
-        MetadataClient::project_auth_by_org(self, org_id).await
-    }
     async fn get_branch(&self, id: BranchId) -> Result<Option<BranchRecord>, MetadataError> {
         MetadataClient::get_branch(self, id).await
     }
@@ -449,10 +430,10 @@ impl NeonMetadataPort for MetadataClient {
     ) -> Result<Option<(DateTime<Utc>, bool)>, MetadataError> {
         MetadataClient::invite_expiry_for_user(self, identity_user_id).await
     }
-    async fn signup_facts(&self, zitadel_org_id: &str) -> Result<Option<SignUpFacts>, MetadataError> {
-        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+    async fn signup_facts(&self, tenant: chelabase_types::TenantId) -> Result<Option<SignUpFacts>, MetadataError> {
+        if !MetadataClient::tenant_exists(self, tenant).await? {
             return Ok(None);
-        };
+        }
         Ok(Some(SignUpFacts {
             open: MetadataClient::open_signup(self, tenant).await?,
             has_members: MetadataClient::tenant_has_members(self, tenant).await?,
@@ -460,38 +441,41 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn insert_setup_nonce(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         nonce_hash: [u8; 32],
         ttl: std::time::Duration,
     ) -> Result<bool, MetadataError> {
-        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+        if !MetadataClient::tenant_exists(self, tenant).await? {
             return Ok(false);
-        };
+        }
         MetadataClient::insert_setup_nonce(self, tenant, nonce_hash, ttl).await?;
         Ok(true)
     }
     async fn setup_claim(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
     ) -> Result<Option<chelabase_metadata::members::SetupClaim>, MetadataError> {
-        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
-            return Ok(None);
-        };
         MetadataClient::setup_claim(self, tenant).await
     }
     async fn claim_setup(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         nonce_hash: [u8; 32],
         identity_user_id: &str,
         replace_stale: Option<&str>,
     ) -> Result<Option<chelabase_metadata::members::SetupClaimOutcome>, MetadataError> {
-        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+        if !MetadataClient::tenant_exists(self, tenant).await? {
             return Ok(None);
-        };
+        }
         MetadataClient::claim_setup(self, tenant, nonce_hash, identity_user_id, replace_stale)
             .await
             .map(Some)
+    }
+    async fn accepted_invites_for_user(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(chelabase_types::TenantId, Option<Vec<u8>>)>, MetadataError> {
+        MetadataClient::accepted_invites_for_user(self, identity_user_id).await
     }
     async fn member_tenants(
         &self,
@@ -501,33 +485,20 @@ impl NeonMetadataPort for MetadataClient {
     }
     async fn admit_sign_up(
         &self,
-        zitadel_org_id: &str,
+        tenant: chelabase_types::TenantId,
         identity_user_id: &str,
         email: &str,
         name: &str,
         admission: Admission,
     ) -> Result<Option<MemberStatus>, MetadataError> {
-        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+        if !MetadataClient::tenant_exists(self, tenant).await? {
             return Ok(None);
-        };
+        }
         match MetadataClient::admit_member(self, tenant, identity_user_id, email, name, admission).await {
             Ok(member) => Ok(Some(member.status)),
             Err(MetadataError::NotAdmitted(_)) => Ok(None),
             Err(e) => Err(e),
         }
-    }
-    async fn tenant_by_org(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<chelabase_types::TenantId>, MetadataError> {
-        MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await
-    }
-    async fn revoke_logins_for_identity_user(
-        &self,
-        tenant: chelabase_types::TenantId,
-        identity_user_id: &str,
-    ) -> Result<Vec<chelabase_metadata::personal_logins::LoginEndpoint>, MetadataError> {
-        MetadataClient::revoke_logins_for_identity_user(self, tenant, identity_user_id).await
     }
     async fn clear_offboarded(
         &self,
@@ -554,7 +525,7 @@ pub struct InternalState<M, L> {
     pub rest_token: String,
     /// Realtime's token: connection info and key lookups too (`require_any_bearer`, R10).
     pub realtime_token: String,
-    /// Publishes realtime's events (the DDL hook's `pg_database.*`, the webhook's access ones).
+    /// Publishes realtime's events (the DDL hook's `pg_database.*`).
     pub rt_events: Arc<dyn realtime::RtEvents>,
     /// Opens the `authenticator` passwords handed to the REST service, and re-seals an API
     /// role's password when SQL renames it.
@@ -576,11 +547,9 @@ pub struct InternalState<M, L> {
     pub app_sessions_token: String,
     /// How much longer a refresh keeps an app session alive (capped at 90 days by creation).
     pub app_refresh_ttl: std::time::Duration,
-    /// Checks the Zitadel Actions webhook; `None`, or a key file not written yet (m5: the
-    /// bootstrap writes it after the orchestrator starts), makes it answer 503.
-    pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
-    /// Admin access to Zitadel, to delete its sessions (best effort); `None` skips that.
-    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    /// The instance's tenant (self-hosted: the seeded one): the sign-up gate's, and the one a
+    /// fresh install's setup claim binds.
+    pub tenant: chelabase_types::TenantId,
     /// The identity service: a fresh-install claim's user is checked there; `None` binds no claim.
     pub identity: Option<chelabase_identity::Identity>,
     /// Publishes app-user sync jobs.

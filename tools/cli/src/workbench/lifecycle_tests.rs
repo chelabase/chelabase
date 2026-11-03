@@ -19,8 +19,6 @@ fn read(p: &Path) -> String {
 fn the_old_layout_moves_into_main_stack_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let m = tmp.path();
-    touch(&m.join(".chelabase/zitadel/admin.pat"), "pat");
-    touch(&m.join(".chelabase/zitadel/demo.env"), "X=1");
     touch(&m.join(".chelabase/neon/proxy-ca.crt"), "ca");
     touch(&m.join(".chelabase/neon/compute-jwt.key"), "k");
     touch(&m.join(".chelabase/secrets/secrets.key"), "s");
@@ -37,10 +35,7 @@ fn the_old_layout_moves_into_main_stack_dir() {
     assert!(!done.is_empty(), "it says what it did");
 
     let s = m.join(".chelabase/stacks/main");
-    assert_eq!(read(&s.join("zitadel/admin.pat")), "pat");
-    assert_eq!(read(&s.join("zitadel/demo.env")), "X=1");
     assert_eq!(read(&s.join("neon/proxy-ca.crt")), "ca");
-    assert!(!m.join(".chelabase/zitadel").exists());
     assert!(!m.join(".chelabase/neon/proxy-ca.crt").exists());
     assert_eq!(read(&m.join(".chelabase/neon/compute-jwt.key")), "k", "machine keys stay");
     assert_eq!(read(&m.join(".chelabase/secrets/secrets.key")), "s", "machine keys stay");
@@ -62,10 +57,10 @@ fn the_old_layout_moves_into_main_stack_dir() {
 fn a_second_run_does_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let m = tmp.path();
-    touch(&m.join(".chelabase/zitadel/admin.pat"), "pat");
+    touch(&m.join(".chelabase/neon/proxy-ca.crt"), "ca");
     migrate_main_layout(m).unwrap();
     assert!(migrate_main_layout(m).unwrap().is_empty());
-    assert_eq!(read(&m.join(".chelabase/stacks/main/zitadel/admin.pat")), "pat");
+    assert_eq!(read(&m.join(".chelabase/stacks/main/neon/proxy-ca.crt")), "ca");
 }
 
 #[test]
@@ -78,12 +73,12 @@ fn a_fresh_checkout_has_nothing_to_move() {
 fn both_layouts_present_is_an_error_and_nothing_moves() {
     let tmp = tempfile::tempdir().unwrap();
     let m = tmp.path();
-    touch(&m.join(".chelabase/zitadel/admin.pat"), "old");
-    touch(&m.join(".chelabase/stacks/main/zitadel/admin.pat"), "new");
+    touch(&m.join(".chelabase/neon/proxy-ca.crt"), "old");
+    touch(&m.join(".chelabase/stacks/main/neon/proxy-ca.crt"), "new");
     let err = migrate_main_layout(m).unwrap_err().to_string();
-    assert!(err.contains(".chelabase/zitadel"), "{err}");
-    assert_eq!(read(&m.join(".chelabase/zitadel/admin.pat")), "old");
-    assert_eq!(read(&m.join(".chelabase/stacks/main/zitadel/admin.pat")), "new");
+    assert!(err.contains(".chelabase/neon/proxy-ca.crt"), "{err}");
+    assert_eq!(read(&m.join(".chelabase/neon/proxy-ca.crt")), "old");
+    assert_eq!(read(&m.join(".chelabase/stacks/main/neon/proxy-ca.crt")), "new");
 }
 
 #[test]

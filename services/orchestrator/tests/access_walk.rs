@@ -86,9 +86,9 @@ fn plan(e: &Endpoint, caller: Caller, mode: Mode) -> Call {
         (Caller::Suspended, Access::Public | Access::DataKey) => call("suspended", None, Skip),
         (Caller::Suspended, Access::SignedIn) => call("suspended", None, Pass),
         (Caller::Suspended, _) => call("suspended", Some("app"), Refuse((403, "member_suspended", None))),
-        (Caller::AtMinimum, Access::Public | Access::SignedIn | Access::DataKey) => {
-            call("stranger", None, Pass)
-        }
+        (Caller::AtMinimum, Access::Public | Access::DataKey) => call("stranger", None, Pass),
+        // #119, #126: a member token's `/v1/me` needs a row in its tenant (a stranger is 403).
+        (Caller::AtMinimum, Access::SignedIn) => call("outsider", None, Pass),
         (_, Access::Public | Access::SignedIn | Access::DataKey) => call("stranger", None, Skip),
 
         // A pending member is refused everywhere, whatever the route needs.

@@ -3,15 +3,13 @@
 use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
-use chelabase_zitadel::refusals;
 use chelabase_identity::{
     CodeKind, CodeRequest, Delivery, Identity, IdentityError, Missing, NewUser, Pool, SignedIn,
 };
 use chelabase_identity::rules::MEMBER_REMOVED_BAN_REASON;
-use chelabase_zitadel::rules::{normalize_email, strong_password};
+use chelabase_identity::rules::{PASSWORD_MAX_BYTES, normalize_email, strong_password};
 use crate::app_users::internal::OpenInvite;
 use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, may_issue_code};
-use crate::zitadel::Zitadel;
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -58,8 +56,6 @@ pub mod messages {
 use messages::*;
 
 pub struct AppState {
-    /// No member flow calls Zitadel since #124; m13 removes this with Zitadel.
-    pub zitadel: Zitadel,
     pub config: Config,
     pub limiter: RateLimiter,
     /// Accept tickets already spent.
@@ -68,9 +64,6 @@ pub struct AppState {
     pub app: Option<crate::app_users::AppUsers>,
     /// Asks the orchestrator whether sign-up is open. `None` fails closed (sign-up answers 503).
     pub signup_gate: Option<crate::app_users::InternalClient>,
-    /// Zitadel with the admin token. Unused since #124 (accept-invite runs on the identity
-    /// service); m13 removes it with Zitadel.
-    pub admin: Option<Zitadel>,
     /// The member-token signer (`CHELABASE_MEMBER_JWT_*`): `/auth/v1/token` mints with it.
     pub member_tokens: crate::member_token::MemberTokens,
     /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`): members
@@ -110,7 +103,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let (platform, _) = platform_router().split_for_parts();
     let (app_users, _) = crate::app_users::flows::api_router().split_for_parts();
     platform
-        // Readiness for compose `--wait` and k8s: not ready until the bootstrap's ids are there.
+        // Liveness and readiness for compose `--wait` and k8s.
         .route("/health", axum::routing::get(health))
         // Every body here is a few short fields; this also bounds rate-limit keys.
         .layer(DefaultBodyLimit::max(8 * 1024))
@@ -182,34 +175,10 @@ pub struct StudioConfig {
     studio_host: String,
 }
 
-/// Every bootstrap output auth waits for, with why it isn't usable yet (`Ok` when it is).
-fn bootstrap_outputs(s: &AppState) -> Vec<Result<&str, chelabase_types::file_value::Unavailable>> {
-    std::iter::once(&s.config.org_id)
-        .chain(s.config.studio.client_id.as_ref())
-        .chain(s.config.studio.project_id.as_ref())
-        .map(|v| v.get())
-        .collect()
-}
-
-/// 200 once every bootstrap output auth reads is there, else 503 naming the variables that
-/// wait (never a value).
-async fn health(State(s): S) -> Response {
-    let waiting: Vec<String> = bootstrap_outputs(&s)
-        .into_iter()
-        .filter_map(|r| r.err())
-        .map(|e| {
-            not_ready(&e);
-            e.to_string()
-        })
-        .collect();
-    if waiting.is_empty() {
-        return reply(StatusCode::OK, json!({"status": "ok"}), Vec::new());
-    }
-    reply(
-        StatusCode::SERVICE_UNAVAILABLE,
-        json!({"status": "waiting for the bootstrap", "waiting": waiting}),
-        Vec::new(),
-    )
+/// 200: auth needs nothing written after it starts (its keys and the identity client are read
+/// at startup).
+async fn health() -> Response {
+    reply(StatusCode::OK, json!({"status": "ok"}), Vec::new())
 }
 
 #[utoipa::path(
@@ -220,31 +189,10 @@ async fn health(State(s): S) -> Response {
     description = "Studio's runtime config: the API URL and Studio's host. Public; cacheable for 60 s.",
     responses(
         (status = 200, description = "The config (`Cache-Control: public, max-age=60`)", body = StudioConfig),
-        (status = 404, description = "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`", body = ErrorEnvelope),
-        (status = 503, description = "The bootstrap hasn't written the ids yet: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn studio_config(State(s): S) -> Response {
-    let no_store = |mut r: Response| {
-        r.headers_mut()
-            .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
-        r
-    };
     let studio = &s.config.studio;
-    let (Some(client_id), Some(project_id)) = (&studio.client_id, &studio.project_id) else {
-        return no_store(error(
-            StatusCode::NOT_FOUND,
-            ErrorCode::NotFound,
-            "Studio's runtime config isn't set up on this instance",
-        ));
-    };
-    let values = (s.config.org_id.get(), client_id.get(), project_id.get());
-    let (Ok(_), Ok(_), Ok(_)) = values else {
-        for e in [values.0.err(), values.1.err(), values.2.err()].into_iter().flatten() {
-            not_ready(&e);
-        }
-        return no_store(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
-    };
     let body = StudioConfig {
         api_url: studio.api_url.clone(),
         studio_host: studio.studio_host.clone(),
@@ -297,27 +245,6 @@ fn reply(status: StatusCode, body: Value, cookies: Vec<String>) -> Response {
 
 fn error(status: StatusCode, code: ErrorCode, message: &str) -> Response {
     ApiError::new(status.as_u16(), code, message).into_response()
-}
-
-/// The platform org's id, or the 503 `unavailable` every route that needs it answers while
-/// the bootstrap hasn't written it (m5: `CHELABASE_ZITADEL_ORG_ID_FILE` may appear after auth
-/// starts). Nothing runs against a missing org: `None` is answered with [`no_org`].
-fn org_id(s: &AppState) -> Option<&str> {
-    s.config.org_id.get().map_err(|e| not_ready(&e)).ok()
-}
-
-fn no_org() -> Response {
-    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
-}
-
-/// Logs why a bootstrap output isn't usable yet: the path, never a value.
-fn not_ready(e: &chelabase_types::file_value::Unavailable) {
-    match e {
-        chelabase_types::file_value::Unavailable::NotYet { .. } => {
-            info!("waiting for the bootstrap: {e}")
-        }
-        chelabase_types::file_value::Unavailable::Refused { .. } => warn!("{e}"),
-    }
 }
 
 fn login_cookie(s: &AppState, state: &LoginState) -> String {
@@ -758,9 +685,6 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     if !usable_name(&b.given_name) || !usable_name(&b.family_name) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_NAME);
     }
-    let Some(org) = org_id(s) else {
-        return no_org();
-    };
     let nonce = match sign_up_gate(s, setup_code).await {
         Ok(nonce) => nonce,
         Err(refused) => return refused.response(),
@@ -776,7 +700,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         Ok(user) => user,
         Err(IdentityError::Conflict(_)) => {
             if let Some(nonce) = &nonce
-                && let Some(healed) = heal_claim(s, org, &email, &b.password, nonce).await
+                && let Some(healed) = heal_claim(s, &email, &b.password, nonce).await
             {
                 return healed;
             }
@@ -790,7 +714,7 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
         }
         Err(e) => return identity_unavailable(&e),
     };
-    if let Some(refused) = enroll(s, org, &user.id, nonce.as_ref()).await {
+    if let Some(refused) = enroll(s, &user.id, nonce.as_ref()).await {
         return refused.response();
     }
     let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
@@ -817,7 +741,6 @@ async fn signed_up(s: &AppState, signed: SignedIn) -> Response {
 /// because this sign-up didn't make it.
 async fn heal_claim(
     s: &AppState,
-    org: &str,
     email: &str,
     password: &str,
     nonce: &crate::app_users::internal::ClaimNonce,
@@ -833,7 +756,7 @@ async fn heal_claim(
         Err(e) => return Some(identity_unavailable(&e)),
     };
     let claimed = match &s.signup_gate {
-        Some(gate) => gate.signup_claimed(org, &signed.user.id, nonce).await,
+        Some(gate) => gate.signup_claimed(&signed.user.id, nonce).await,
         None => Err(crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into())),
     };
     match claimed {
@@ -890,11 +813,7 @@ async fn gate(
         warn!("no sign-up gate is configured");
         return Err(Refusal::Unavailable);
     };
-    let org = s.config.org_id.get().map_err(|e| {
-        not_ready(&e);
-        Refusal::Unavailable
-    })?;
-    gate.signup_check(org, setup_code).await.map_err(|e| {
+    gate.signup_check(setup_code).await.map_err(|e| {
         warn!(error = %e, "the sign-up gate failed");
         Refusal::Unavailable
     })
@@ -937,13 +856,12 @@ async fn sign_up_gate(
 /// verify-email joins it once the code has marked the email verified ([`join_verified`]).
 async fn enroll(
     s: &AppState,
-    org: &str,
     user_id: &str,
     nonce: Option<&crate::app_users::internal::ClaimNonce>,
 ) -> Option<Refusal> {
     use crate::app_users::internal::InternalError;
     let done = match (&s.signup_gate, nonce) {
-        (Some(gate), Some(nonce)) => gate.signup_claimed(org, user_id, nonce).await.map(|bound| {
+        (Some(gate), Some(nonce)) => gate.signup_claimed(user_id, nonce).await.map(|bound| {
             info!(user_id, bound, "fresh-install claim");
         }),
         // The join waits for the verified email: see above.
@@ -951,7 +869,7 @@ async fn enroll(
             info!(user_id, "open sign-up: the row waits for the verified email");
             Ok(())
         }
-        (Some(gate), None) => gate.signup_joined(org, user_id).await.and_then(|joined| {
+        (Some(gate), None) => gate.signup_joined(user_id).await.and_then(|joined| {
             if joined {
                 Ok(())
             } else {
@@ -1152,7 +1070,7 @@ async fn accept_invite(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<Acce
 /// A password identity can take: our complexity rule, and at most 72 bytes (counted in bytes, so
 /// 39 characters can be too many).
 pub(crate) fn usable_password(password: &str) -> bool {
-    password.len() <= refusals::PASSWORD_MAX_BYTES && strong_password(password)
+    password.len() <= PASSWORD_MAX_BYTES && strong_password(password)
 }
 
 fn bad_invite() -> Response {
@@ -1211,10 +1129,6 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
         slot.refund();
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
-    let Some(org) = org_id(s) else {
-        slot.refund();
-        return no_org();
-    };
     let Some(orchestrator) = &s.signup_gate else {
         warn!("accept-invite needs the orchestrator's internal client");
         slot.refund();
@@ -1222,7 +1136,6 @@ async fn accept_invite_inner(s: &AppState, headers: &HeaderMap, b: AcceptInviteB
     };
     let token_hash = hex::encode(Sha256::digest(b.t.as_bytes()));
     let accepting = |user_id, may_unban, retry| Accepting {
-        org,
         orchestrator,
         user_id,
         token_hash: &token_hash,
@@ -1426,7 +1339,6 @@ enum Retry {
 
 #[derive(Clone, Copy)]
 struct Accepting<'a> {
-    org: &'a str,
     orchestrator: &'a crate::app_users::InternalClient,
     user_id: &'a str,
     token_hash: &'a str,
@@ -1454,7 +1366,7 @@ async fn finish_accept(s: &AppState, a: &Accepting<'_>, signed: Option<SignedIn>
 
 async fn finish_steps(s: &AppState, a: &Accepting<'_>, signed: Option<SignedIn>) -> Response {
     use crate::app_users::internal::InternalError;
-    let Accepting { org, orchestrator, user_id, token_hash, password, may_unban, retry } = *a;
+    let Accepting { orchestrator, user_id, token_hash, password, may_unban, retry } = *a;
     let fail = |what: &str, e: &dyn std::fmt::Display| {
         warn!(error = %e, "accept-invite: {what} failed");
         match retry {
@@ -1474,7 +1386,7 @@ async fn finish_steps(s: &AppState, a: &Accepting<'_>, signed: Option<SignedIn>)
         return if ours { bad_invite() } else { suspended() };
     }
     let tenant = match orchestrator
-        .accept_invite(org, user_id, token_hash, &detail.user.email, &detail.user.name)
+        .accept_invite(user_id, token_hash, &detail.user.email, &detail.user.name)
         .await
     {
         Ok(tenant) => tenant,
@@ -1629,9 +1541,6 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
     ) else {
         return bad_code();
     };
-    let Some(org) = org_id(s) else {
-        return no_org();
-    };
     let user = match s
         .identity
         .verify_code(&Pool::Members, &user_id, CodeKind::Verify, b.code.trim(), None)
@@ -1659,7 +1568,7 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
         }
         Err(e) => return identity_unavailable(&e),
     }
-    match join_verified(s, org, &user.id).await {
+    match join_verified(s, &user.id).await {
         Ok(true) => {}
         Ok(false) => return step_ended(s, sign_up_closed_meanwhile(s, &user.id, &session_id).await),
         Err(()) => return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
@@ -1677,7 +1586,7 @@ async fn verify_email_inner(s: &AppState, headers: &HeaderMap, b: CodeBody) -> R
 /// `Ok(true)` once the person has a row to land in: an active or pending one already (the
 /// fresh-install admin, an approved member), or the join the gate takes now. `Ok(false)` when
 /// the gate refuses the join (sign-up closed meanwhile).
-async fn join_verified(s: &AppState, org: &str, user_id: &str) -> Result<bool, ()> {
+async fn join_verified(s: &AppState, user_id: &str) -> Result<bool, ()> {
     let Some(orchestrator) = &s.signup_gate else {
         warn!("verify-email needs the orchestrator's internal client");
         return Err(());
@@ -1690,7 +1599,7 @@ async fn join_verified(s: &AppState, org: &str, user_id: &str) -> Result<bool, (
             return Err(());
         }
     }
-    orchestrator.signup_joined(org, user_id).await.map_err(|e| {
+    orchestrator.signup_joined(user_id).await.map_err(|e| {
         warn!(error = %e, "verify-email: joining the open sign-up failed");
     })
 }
@@ -1778,7 +1687,6 @@ struct EmailBody {
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "The instance isn't set up yet (its org id isn't written): `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn password_reset(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<EmailBody>) -> Response {
@@ -1800,11 +1708,7 @@ fn password_reset_inner(s: &Arc<AppState>, headers: &HeaderMap, b: EmailBody) ->
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    // Answered the same whether or not the account exists, but never "sent" while the instance
-    // isn't set up.
-    if org_id(s).is_none() {
-        return no_org();
-    }
+    // Answered the same whether or not the account exists.
     spawn_reset_email(s, email);
     reply(StatusCode::OK, json!(EmptyResponse {}), Vec::new())
 }

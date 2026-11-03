@@ -1015,43 +1015,6 @@ impl MetadataClient {
         Ok(true)
     }
 
-    /// D7: `(tenant, member, identity_user_id)` of every member marked offboarded (the sweep
-    /// looks them up to clear the mark once Zitadel shows the user active), by tenant then
-    /// member.
-    pub async fn offboarded_members(
-        &self,
-    ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT tenant_id, id, identity_user_id FROM members
-             WHERE offboarded_at IS NOT NULL ORDER BY tenant_id, id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(tenant, member, zitadel)| (TenantId(tenant), member, zitadel))
-            .collect())
-    }
-
-    /// `(tenant, member, identity_user_id)` of every member holding a login that isn't revoked
-    /// (expired ones included: a reset renews them), for the identity sweep.
-    pub async fn members_with_live_logins(
-        &self,
-    ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT DISTINCT m.tenant_id, m.id, m.identity_user_id
-             FROM personal_logins l JOIN members m ON m.id = l.member_id
-             WHERE l.revoked_at IS NULL
-             ORDER BY m.tenant_id, m.id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(tenant, member, zitadel)| (TenantId(tenant), member, zitadel))
-            .collect())
-    }
-
     /// The roster's levels (MH-35, P13): for each (member, project) of the tenant's members on
     /// projects that aren't deleted, the best level among the member's own grant and its teams'
     /// grants (as the shared shape counts them, P4, P27), and where it comes from; by member

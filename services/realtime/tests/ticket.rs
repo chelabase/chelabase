@@ -16,7 +16,6 @@ use sha2::Digest;
 fn ana() -> TicketIdentity {
     TicketIdentity {
         sub: "user-ana-1234".into(),
-        org_id: "org-77".into(),
         tenant_id: None,
         auth: AuthMethod::ManagementJwt,
         email: Some("ana@example.com".into()),
@@ -265,7 +264,6 @@ fn the_identity_comes_from_the_gateway_claims() {
         iat: 1,
         exp: 61,
         sub: "user-ana-1234".into(),
-        org_id: "org-77".into(),
         tenant_id: None,
         auth: AuthMethod::ManagementJwt,
         rid: "rid-1".into(),

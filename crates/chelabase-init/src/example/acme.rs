@@ -624,7 +624,9 @@ impl<H: Http> Run<'_, '_, H> {
                         text(d, "database_id") == ids.database && text(d, "platform_role") == level
                     })
             }
-            SignIn::Refused => bail!("{email} can't sign in with the demo password"),
+            SignIn::Refused | SignIn::Pending => {
+                bail!("{email} can't sign in with the demo password")
+            }
         };
         if !has {
             let path = format!(

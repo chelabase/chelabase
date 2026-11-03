@@ -145,7 +145,7 @@ async fn open_sockets_stay_up_while_valkey_is_down() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(ws.join_table("2", "items", None).await["type"], "joined");
     assert_eq!(
-        h.post_ticket(h.rt(), Some(&h.identity("ana", ORG))).await.0,
+        h.post_ticket(h.rt(), Some(&h.identity("ana", TENANT))).await.0,
         503
     );
 }

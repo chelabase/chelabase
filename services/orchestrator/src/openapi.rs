@@ -176,12 +176,6 @@ enum Doc {}
 
 #[allow(unused_variables)]
 impl MetadataPort for Doc {
-    async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        match *self {}
-    }
     async fn insert_database_pending(
         &self,
         database_id: DatabaseId,

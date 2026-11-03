@@ -8,8 +8,8 @@ use crate::data_keys::{DataKeyResolver, KeyError, ResolvedKey};
 use crate::registry::{SharedRegistry, Site, Target};
 use crate::user_tokens::{UserTokenError, UserTokens};
 use chelabase_auth::internal::{AuthMethod, DataIdentity, Identity, InternalSigner, IDENTITY_HEADER};
-use chelabase_auth::member_token::{member_shaped, MemberTokenError, MemberTokenVerifier};
-use chelabase_auth::{AuthError, JwtVerifier};
+use chelabase_auth::member_token::{MemberTokenError, MemberTokenVerifier};
+use chelabase_auth::AuthError;
 use chelabase_routes::{match_endpoint, Auth, Cors, Endpoint, Match, Scope, Service};
 use chelabase_types::data_key::DataKeyKind;
 use http::HeaderMap;
@@ -22,9 +22,8 @@ use uuid::Uuid;
 pub const REQUEST_ID_HEADER: &str = "x-request-id";
 /// The gateway's own liveness check; answered before host or route checks.
 pub const GATEWAY_HEALTH_PATH: &str = "/_gateway/health";
-/// Readiness (#22): 200 once the gateway can check Zitadel tokens (its audiences are there,
-/// they may come late from the bootstrap's files), else 503. `GATEWAY_HEALTH_PATH` stays
-/// liveness: the bootstrap reaches Zitadel through the gateway before it writes the audiences.
+/// Readiness (#22): 200 once the gateway can check member tokens (its member verify key is
+/// configured), else 503. `GATEWAY_HEALTH_PATH` stays liveness.
 pub const GATEWAY_READY_PATH: &str = "/_gateway/ready";
 const MAX_REQUEST_ID_LEN: usize = 128;
 /// Client headers never forwarded upstream: upstreams only ever see the
@@ -122,8 +121,7 @@ pub struct Pipeline {
     registry: Arc<SharedRegistry>,
     /// The one origin Studio CORS allows (`<scheme>://<studio host>`).
     studio_origin: String,
-    verifier: JwtVerifier,
-    /// Member tokens signed by auth (#119); `None` refuses every EdDSA bearer.
+    /// Member tokens signed by auth (#119); `None` refuses every bearer.
     members: Option<MemberTokenVerifier>,
     signer: InternalSigner,
     keys: Arc<DataKeyResolver>,
@@ -141,7 +139,6 @@ impl Pipeline {
     pub fn new(
         registry: Arc<SharedRegistry>,
         studio_origin: String,
-        verifier: JwtVerifier,
         signer: InternalSigner,
         keys: Arc<DataKeyResolver>,
         users: Arc<UserTokens>,
@@ -149,7 +146,6 @@ impl Pipeline {
         Self {
             registry,
             studio_origin,
-            verifier,
             members: None,
             signer,
             keys,
@@ -158,7 +154,7 @@ impl Pipeline {
         }
     }
 
-    /// Verify member tokens (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119) before Zitadel's.
+    /// Verify member tokens (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`, #119).
     pub fn with_member_tokens(mut self, members: Option<MemberTokenVerifier>) -> Self {
         self.members = members;
         self
@@ -180,21 +176,23 @@ impl Pipeline {
         if req.method == "GET" && req.path == GATEWAY_READY_PATH {
             // Answered on any host: the body never says why (a variable, a path, a mode). The
             // reason is logged once each time readiness changes.
-            let ready = self.verifier.config().audiences.current();
+            let ready = self.members.is_some();
             let was = self.ready_seen.swap(
-                if ready.is_ok() { READY_YES } else { READY_NO },
+                if ready { READY_YES } else { READY_NO },
                 std::sync::atomic::Ordering::Relaxed,
             );
             return match ready {
-                Ok(_) => {
+                true => {
                     if was != READY_YES {
-                        tracing::info!("the gateway is ready: its token audiences are there");
+                        tracing::info!("the gateway is ready: it verifies member tokens");
                     }
                     respond(200, Vec::new(), json!({ "status": "ok" }))
                 }
-                Err(e) => {
+                false => {
                     if was != READY_NO {
-                        tracing::warn!("the gateway isn't ready: {e}");
+                        tracing::warn!(
+                            "the gateway isn't ready: CHELABASE_MEMBER_JWT_PUBLIC_KEY is not set"
+                        );
                     }
                     respond(503, Vec::new(), json!({ "status": "waiting" }))
                 }
@@ -427,7 +425,6 @@ impl Pipeline {
         };
         let identity = Identity {
             sub: resolved.key_id.to_string(),
-            org_id: String::new(),
             auth: AuthMethod::DataKey,
             request_id: request_id.to_string(),
             data: Some(DataIdentity {
@@ -492,10 +489,9 @@ impl Pipeline {
 
     /// Verify the management token and mint an internal identity for `service`.
     ///
-    /// #119: an EdDSA bearer is a member token and only the member verifier decides it: any
-    /// refusal there is 401 and never falls through to Zitadel (whose tokens are RS256). A
-    /// member names its tenant (`tid`) and no org; the orchestrator still requires an active
-    /// membership there. Zitadel tokens keep their path until m13.
+    /// #119: every bearer is a member token and only the member verifier decides it: any
+    /// refusal there is 401 (no verify key configured: every bearer is refused). A member names
+    /// its tenant (`tid`); the orchestrator still requires an active membership there.
     async fn authenticate(
         &self,
         service: Service,
@@ -503,50 +499,22 @@ impl Pipeline {
         request_id: &str,
     ) -> Result<String, GatewayResponse> {
         let token = bearer_token(headers).ok_or_else(|| unauthorized(&AuthError::Unauthorized))?;
-        if member_shaped(token) {
-            let Some(members) = &self.members else {
-                return Err(unauthorized(&AuthError::InvalidToken("member tokens aren't accepted here".into())));
-            };
-            let claims = members.verify(token).map_err(|err| match err {
-                MemberTokenError::Expired => unauthorized(&AuthError::Expired),
-                MemberTokenError::Invalid => unauthorized(&AuthError::InvalidToken("not a valid member token".into())),
-            })?;
-            let identity = Identity {
-                sub: claims.sub,
-                org_id: String::new(),
-                auth: AuthMethod::ManagementJwt,
-                request_id: request_id.to_string(),
-                data: None,
-                email: Some(claims.email).filter(|e| !e.is_empty()),
-                name: Some(claims.name).filter(|n| !n.is_empty()),
-            };
-            return self.signer.sign_for_tenant(service.name(), &identity, claims.tid).map_err(|err| {
-                error!("mint internal identity: {err}");
-                json_response(500, error_json("internal", "internal error"))
-            });
-        }
-        let claims = self.verifier.verify(token).await.map_err(|err| match err {
-            AuthError::Unauthorized | AuthError::InvalidToken(_) | AuthError::Expired => unauthorized(&err),
-            AuthError::Jwks(_) | AuthError::Config(_) => {
-                error!("auth infrastructure error: {err}");
-                json_response(503, error_json("unavailable", "auth unavailable"))
-            }
-            // #22: the audiences aren't written yet; no token is let through unchecked.
-            AuthError::NotReady(_) => {
-                tracing::info!("{err}");
-                json_response(503, error_json("unavailable", "auth unavailable"))
-            }
+        let Some(members) = &self.members else {
+            return Err(unauthorized(&AuthError::InvalidToken("member tokens aren't accepted here".into())));
+        };
+        let claims = members.verify(token).map_err(|err| match err {
+            MemberTokenError::Expired => unauthorized(&AuthError::Expired),
+            MemberTokenError::Invalid => unauthorized(&AuthError::InvalidToken("not a valid member token".into())),
         })?;
         let identity = Identity {
             sub: claims.sub,
-            org_id: claims.org_id,
             auth: AuthMethod::ManagementJwt,
             request_id: request_id.to_string(),
             data: None,
-            email: claims.email,
-            name: claims.name,
+            email: Some(claims.email).filter(|e| !e.is_empty()),
+            name: Some(claims.name).filter(|n| !n.is_empty()),
         };
-        self.signer.sign(service.name(), &identity).map_err(|err| {
+        self.signer.sign_for_tenant(service.name(), &identity, claims.tid).map_err(|err| {
             error!("mint internal identity: {err}");
             json_response(500, error_json("internal", "internal error"))
         })
@@ -706,10 +674,9 @@ mod tests {
     use super::*;
     use crate::registry::{Registry, Site};
     use chelabase_auth::internal::{generate_keypair_pem, InternalVerifier, IDENTITY_HEADER};
-    use chelabase_auth::test_support::{BrokenJwks, MockJwks};
+    use chelabase_auth::test_support::MemberKeys;
     use crate::user_tokens::test_support as ut;
     use chelabase_auth::app_token::AppTokenSigner;
-    use chelabase_auth::ZitadelAuthConfig;
     use http::{HeaderName, HeaderValue};
 
     #[test]
@@ -732,35 +699,37 @@ mod tests {
 
     struct Harness {
         pipeline: Pipeline,
-        jwks: MockJwks,
+        keys: MemberKeys,
         verify: InternalVerifier,
     }
 
+    /// The tenant every harness token names.
+    const TENANT: Uuid = Uuid::from_u128(0x7e7e);
+
     async fn harness(api_hosts: &[&str]) -> Harness {
-        let jwks = MockJwks::start().await;
-        let verifier = JwtVerifier::new(jwks.config(vec![]));
-        let (pipeline, verify) = pipeline_with(api_hosts, verifier);
+        let keys = MemberKeys::new();
+        let (pipeline, verify) = pipeline_with(api_hosts, Some(&keys));
         Harness {
             pipeline,
-            jwks,
+            keys,
             verify,
         }
     }
 
-    fn pipeline_with(api_hosts: &[&str], verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
-        pipeline_with_registry(Registry::new(api_hosts), verifier)
+    fn pipeline_with(api_hosts: &[&str], keys: Option<&MemberKeys>) -> (Pipeline, InternalVerifier) {
+        pipeline_with_registry(Registry::new(api_hosts), keys)
     }
 
-    fn pipeline_with_registry(registry: Registry, verifier: JwtVerifier) -> (Pipeline, InternalVerifier) {
+    fn pipeline_with_registry(registry: Registry, keys: Option<&MemberKeys>) -> (Pipeline, InternalVerifier) {
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
             Arc::new(SharedRegistry::new(registry)),
             STUDIO.to_string(),
-            verifier,
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new("http://127.0.0.1:1", "unused")),
             Arc::new(UserTokens::new(None, "http://127.0.0.1:1", "unused")),
-        );
+        )
+        .with_member_tokens(keys.map(MemberKeys::verifier));
         (pipeline, InternalVerifier::from_pem(public_pem.as_bytes()).unwrap())
     }
 
@@ -835,93 +804,43 @@ mod tests {
         assert!(Uuid::parse_str(&request_id(&HeaderMap::new())).is_ok());
     }
 
-    // #22 AC 1: the gateway starts before the bootstrap has written its audiences. Until both
-    // files are there a Zitadel bearer is 503 (never proxied, whatever its audience) and
-    // `/_gateway/ready` is 503; once they appear, the right audience is proxied and another is
-    // 401, without a restart. A refused file (group-writable) is 503 too.
+    // #22, #126: `/_gateway/ready` is 503 until the gateway can verify member tokens (and says
+    // only that, on any host); without the key every bearer is 401, never proxied.
     #[tokio::test]
-    async fn zitadel_bearer_refused_until_audiences() {
-        use chelabase_auth::Audiences;
-        use chelabase_types::file_value::{FileValue, Sensitivity};
-        use std::os::unix::fs::PermissionsExt;
-        let jwks = MockJwks::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let (project, client) = (dir.path().join("project-id"), dir.path().join("api-client-id"));
-        let mut config = jwks.config(vec![]);
-        config.audiences = Audiences::Ids(vec![
-            FileValue::file("CHELABASE_ZITADEL_PROJECT_ID_FILE", &project, Sensitivity::Public),
-            FileValue::file("CHELABASE_ZITADEL_API_CLIENT_ID_FILE", &client, Sensitivity::Public),
-        ]);
-        let (pipeline, _) = pipeline_with(&[API], JwtVerifier::new(config));
-        let token = |aud: &str| {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-            format!(
-                "Bearer {}",
-                jwks.sign(json!({
-                    "sub": "user-1", "iss": jwks.issuer(), "exp": now + 300, "aud": aud,
-                    chelabase_auth::CLAIM_ORG_ID: "org-1",
-                }))
-            )
-        };
-        let write = |path: &std::path::Path, value: &str, mode: u32| {
-            std::fs::write(path, value).unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        };
-        async fn ready(p: &Pipeline) -> u16 {
-            expect_response(run(p, "GET", GATEWAY_READY_PATH, None, &[]).await.outcome).status
+    async fn ready_once_member_tokens_can_be_verified() {
+        let keys = MemberKeys::new();
+        let (without, _) = pipeline_with(&[API], None);
+        for host in [None, Some("anyone.example")] {
+            let resp = expect_response(run(&without, "GET", GATEWAY_READY_PATH, host, &[]).await.outcome);
+            assert_eq!((resp.status, resp.body), (503, Some(json!({ "status": "waiting" }))));
         }
-        for (step, files) in [("absent", 0), ("one of two", 1), ("a group-writable file", 2)] {
-            if files >= 1 {
-                write(&project, "p1\n", 0o644);
-            }
-            if files == 2 {
-                write(&client, "c-api\n", 0o664);
-            }
-            for aud in ["p1", "c-api", "anything"] {
-                let resp = expect_response(
-                    run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token(aud))]).await.outcome,
-                );
-                assert_eq!(resp.status, 503, "{step}, aud {aud}");
-            }
-            assert_eq!(ready(&pipeline).await, 503, "{step}");
-        }
-        std::fs::set_permissions(&client, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(ready(&pipeline).await, 200);
-        let plan = expect_plan(run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token("p1"))]).await.outcome);
-        assert_eq!(plan.endpoint.service, Service::Orchestrator);
+        let bearer = format!("Bearer {}", keys.token("user-1", TENANT, 300));
         let resp = expect_response(
-            run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &token("someone-else"))]).await.outcome,
+            run(&without, "POST", "/v1/databases", None, &[("authorization", &bearer)]).await.outcome,
         );
         assert_eq!(resp.status, 401);
+        let (with, _) = pipeline_with(&[API], Some(&keys));
+        let resp = expect_response(run(&with, "GET", GATEWAY_READY_PATH, None, &[]).await.outcome);
+        assert_eq!(resp.status, 200);
+        let plan = expect_plan(run(&with, "POST", "/v1/databases", None, &[("authorization", &bearer)]).await.outcome);
+        assert_eq!(plan.endpoint.service, Service::Orchestrator);
     }
 
-    // m5 re-audit N5: `/_gateway/ready` is answered on any host, so while it waits its body says
-    // only that: no variable, no path inside the container, no mode.
+    // #126: every bearer goes to the member verifier: an RS256 token (the old provider's
+    // shape), another key's member token or garbage is 401, never a fall-through.
     #[tokio::test]
-    async fn ready_says_nothing_about_the_files() {
-        use chelabase_auth::Audiences;
-        use chelabase_types::file_value::{FileValue, Sensitivity};
-        use std::os::unix::fs::PermissionsExt;
-        let jwks = MockJwks::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("api-client-id");
-        std::fs::write(&file, "c-api\n").unwrap();
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o664)).unwrap();
-        let missing = dir.path().join("project-id");
-        let mut config = jwks.config(vec![]);
-        config.audiences = Audiences::Ids(vec![
-            FileValue::file("CHELABASE_ZITADEL_API_CLIENT_ID_FILE", &file, Sensitivity::Public),
-            FileValue::file("CHELABASE_ZITADEL_PROJECT_ID_FILE", &missing, Sensitivity::Public),
-        ]);
-        let (pipeline, _) = pipeline_with(&[API], JwtVerifier::new(config));
-        for _ in 0..2 {
-            let resp = expect_response(run(&pipeline, "GET", GATEWAY_READY_PATH, Some("anyone.example"), &[]).await.outcome);
-            assert_eq!((resp.status, resp.body.clone()), (503, Some(json!({ "status": "waiting" }))));
+    async fn only_member_tokens_are_accepted() {
+        let h = harness(&[API]).await;
+        let other = MemberKeys::new();
+        let rs256 = "eyJhbGciOiJSUzI1NiIsImtpZCI6ImsifQ.eyJzdWIiOiJ1c2VyLTEifQ.c2ln";
+        for token in [rs256.to_string(), other.token("user-1", TENANT, 300), "not-a-jwt".to_string()] {
+            let bearer = format!("Bearer {token}");
+            let resp = expect_response(
+                run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)]).await.outcome,
+            );
+            assert_eq!(resp.status, 401, "{token}");
+            assert_eq!(error_code(&resp), Some("unauthorized"));
         }
-        let empty = JwtVerifier::new(ZitadelAuthConfig { audiences: Vec::<String>::new().into(), ..jwks.config(vec![]) });
-        let (pipeline, _) = pipeline_with(&[API], empty);
-        let resp = expect_response(run(&pipeline, "GET", GATEWAY_READY_PATH, None, &[]).await.outcome);
-        assert_eq!((resp.status, resp.body), (503, Some(json!({ "status": "waiting" }))));
     }
 
     #[tokio::test]
@@ -953,12 +872,12 @@ mod tests {
     }
 
     async fn site_harness() -> Harness {
-        let jwks = MockJwks::start().await;
+        let keys = MemberKeys::new();
         let registry = Registry::new([API])
             .with_site("studio.test", Site::Studio)
-            .with_site("auth.test:8000", Site::Auth);
-        let (pipeline, verify) = pipeline_with_registry(registry, JwtVerifier::new(jwks.config(vec![])));
-        Harness { pipeline, jwks, verify }
+            .with_site("docs.test:8000", Site::Docs);
+        let (pipeline, verify) = pipeline_with_registry(registry, Some(&keys));
+        Harness { pipeline, keys, verify }
     }
 
     // Selfhost-install m5: Studio reads its runtime config from its own origin before it knows
@@ -983,14 +902,14 @@ mod tests {
             }
         }
         // Not on another site's host.
-        let handled = run(&h.pipeline, "GET", "/auth/v1/studio-config", Some("auth.test:8000"), &[]).await;
-        assert!(matches!(handled.outcome, Outcome::Site(Site::Auth)));
+        let handled = run(&h.pipeline, "GET", "/auth/v1/studio-config", Some("docs.test:8000"), &[]).await;
+        assert!(matches!(handled.outcome, Outcome::Site(Site::Docs)));
     }
 
     #[tokio::test]
     async fn site_hosts_pass_through_before_routes_auth_and_cors() {
         let h = site_harness().await;
-        for (host, site) in [("studio.test", Site::Studio), ("studio.test:8000", Site::Studio), ("auth.test:8000", Site::Auth)] {
+        for (host, site) in [("studio.test", Site::Studio), ("studio.test:8000", Site::Studio), ("docs.test:8000", Site::Docs)] {
             for method in ["GET", "POST", "OPTIONS"] {
                 let handled = run(
                     &h.pipeline,
@@ -1003,7 +922,7 @@ mod tests {
                 assert!(matches!(handled.outcome, Outcome::Site(s) if s == site), "{host} {method}");
             }
         }
-        let resp = expect_response(run(&h.pipeline, "GET", "/", Some("auth.test:9000"), &[]).await.outcome);
+        let resp = expect_response(run(&h.pipeline, "GET", "/", Some("docs.test:9000"), &[]).await.outcome);
         assert_eq!(resp.status, 404);
     }
 
@@ -1079,7 +998,7 @@ mod tests {
     #[tokio::test]
     async fn valid_bearer_mints_identity_for_the_target_service() {
         let h = harness(&[API]).await;
-        let token = h.jwks.token_for_org("user-1", "org-1", 300);
+        let token = h.keys.token("user-1", TENANT, 300);
         let bearer = format!("Bearer {token}");
         let handled = run(
             &h.pipeline,
@@ -1097,7 +1016,7 @@ mod tests {
             .verify(plan.identity.as_deref().unwrap(), "orchestrator")
             .unwrap();
         assert_eq!(claims.sub, "user-1");
-        assert_eq!(claims.org_id, "org-1");
+        assert_eq!(claims.tenant_id, Some(TENANT));
         assert_eq!(claims.rid, "rid-42");
         assert_eq!(claims.auth, AuthMethod::ManagementJwt);
     }
@@ -1105,19 +1024,10 @@ mod tests {
     #[tokio::test]
     async fn identity_carries_the_tokens_email_and_name() {
         let h = harness(&[API]).await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
-        let token = h.jwks.sign(json!({
-            "sub": "user-1",
-            "iss": h.jwks.issuer(),
-            "iat": now,
-            "exp": now + 300,
-            (chelabase_auth::CLAIM_ORG_ID): "org-1",
-            "email": "bob@x.com",
-            "name": "Bob",
-        }));
+        let mut claims = h.keys.claims("user-1", TENANT, 300);
+        claims.email = "bob@x.com".into();
+        claims.name = "Bob".into();
+        let token = h.keys.sign(&claims);
         let bearer = format!("Bearer {token}");
         let plan = expect_plan(
             run(&h.pipeline, "GET", "/v1/me", None, &[("authorization", &bearer)])
@@ -1128,8 +1038,11 @@ mod tests {
         assert_eq!(claims.email.as_deref(), Some("bob@x.com"));
         assert_eq!(claims.name.as_deref(), Some("Bob"));
 
-        // Without the claims, the identity carries none.
-        let bare = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        // With empty ones, the identity carries none.
+        let mut claims = h.keys.claims("user-1", TENANT, 300);
+        claims.email = String::new();
+        claims.name = String::new();
+        let bare = format!("Bearer {}", h.keys.sign(&claims));
         let plan = expect_plan(
             run(&h.pipeline, "GET", "/v1/me", None, &[("authorization", &bare)])
                 .await
@@ -1142,7 +1055,7 @@ mod tests {
     #[tokio::test]
     async fn lowercase_bearer_scheme_is_accepted() {
         let h = harness(&[API]).await;
-        let token = h.jwks.token_for_org("user-1", "org-1", 300);
+        let token = h.keys.token("user-1", TENANT, 300);
         let bearer = format!("bearer {token}");
         let plan = expect_plan(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
@@ -1150,29 +1063,6 @@ mod tests {
                 .outcome,
         );
         assert!(plan.identity.is_some());
-    }
-
-    #[tokio::test]
-    async fn jwks_unavailable_is_503() {
-        let broken = BrokenJwks::start().await;
-        let verifier = JwtVerifier::new(ZitadelAuthConfig {
-            issuer: "http://irrelevant-issuer".into(),
-            jwks_url: broken.jwks_url().to_string(),
-            jwks_host: None,
-            audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
-        });
-        let (pipeline, _) = pipeline_with(&[API], verifier);
-        // Any well-formed JWT with a kid triggers a JWKS fetch, which fails.
-        let signer = MockJwks::start().await;
-        let bearer = format!("Bearer {}", signer.token_for_org("user-1", "org-1", 300));
-
-        let resp = expect_response(
-            run(&pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
-                .await
-                .outcome,
-        );
-        assert_eq!(resp.status, 503);
-        assert_eq!(resp.body, Some(shape("unavailable", "auth unavailable")));
     }
 
     #[tokio::test]
@@ -1242,7 +1132,7 @@ mod tests {
     #[tokio::test]
     async fn proxied_studio_request_from_allowed_origin_gets_cors_headers() {
         let h = harness(&[API]).await;
-        let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        let bearer = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
         let plan = expect_plan(
             run(
                 &h.pipeline,
@@ -1261,7 +1151,7 @@ mod tests {
     #[tokio::test]
     async fn proxied_request_from_disallowed_origin_gets_no_cors_headers() {
         let h = harness(&[API]).await;
-        let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        let bearer = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
         let plan = expect_plan(
             run(
                 &h.pipeline,
@@ -1281,7 +1171,7 @@ mod tests {
     #[tokio::test]
     async fn studio_endpoint_varies_on_origin_even_without_origin() {
         let h = harness(&[API]).await;
-        let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        let bearer = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
         let plan = expect_plan(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
                 .await
@@ -1311,7 +1201,7 @@ mod tests {
     #[tokio::test]
     async fn upstream_headers_set_the_minted_identity_on_management_routes() {
         let h = harness(&[API]).await;
-        let bearer = format!("Bearer {}", h.jwks.token_for_org("user-1", "org-1", 300));
+        let bearer = format!("Bearer {}", h.keys.token("user-1", TENANT, 300));
         let plan = expect_plan(
             run(&h.pipeline, "POST", "/v1/databases", None, &[("authorization", &bearer)])
                 .await
@@ -1392,12 +1282,10 @@ mod tests {
         let (url, mock) = dk::start().await;
         let (sessions_url, sessions) = ut::start().await;
         let (app, app_verifier) = ut::keys();
-        let jwks = MockJwks::start().await;
         let (private_pem, public_pem) = generate_keypair_pem();
         let pipeline = Pipeline::new(
             Arc::new(SharedRegistry::new(Registry::new([API]))),
             STUDIO.to_string(),
-            JwtVerifier::new(jwks.config(vec![])),
             InternalSigner::from_pem(private_pem.as_bytes()).unwrap(),
             Arc::new(DataKeyResolver::new(&url, dk::BEARER)),
             Arc::new(UserTokens::new(Some(app_verifier), &sessions_url, ut::BEARER)),
@@ -1438,7 +1326,7 @@ mod tests {
         let claims = h.verify.verify(plan.identity.as_deref().unwrap(), "rest").unwrap();
         assert_eq!(claims.auth, AuthMethod::DataKey);
         assert_eq!(claims.sub, resolved.key_id.to_string());
-        assert_eq!(claims.org_id, "");
+        assert_eq!(claims.tenant_id, None);
         assert_eq!(claims.rid, rid);
         let data = claims.data.expect("data identity");
         assert_eq!(data.key_id, resolved.key_id);

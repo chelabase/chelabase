@@ -1,22 +1,20 @@
-//! A person's session, headless: the Studio public client's OIDC code flow with PKCE, driven
-//! through the public sign-in endpoints (sign-up, sign-in, accept-invite) instead of a browser,
-//! and an authenticated management-API client for the token it ends with.
+//! A person's session, headless: Studio's sign-in, as Studio's pages make it. Sign-in, sign-up
+//! and accept-invite (`POST /auth/v1/…`, sent with Studio's `Origin` and `X-Chelabase-Studio`)
+//! set auth's session cookie; `POST /auth/v1/token` with that cookie mints the member token the
+//! management API takes.
 //!
-//! Every request goes to the gateway service with `Host` set to the public host, so the token's
-//! `iss` is the issuer the gateway verifies. No redirect is ever followed: the pending sign-in
-//! (`authRequest`) and the code are read from `Location`. 429s are retried after `Retry-After`;
-//! an unanswered or 502–504 request is retried only when it is safe to repeat.
+//! Every request goes to the gateway service with `Host` set to the API host. 429s are retried
+//! after `Retry-After`; an unanswered or 502–504 request is retried only when it is safe to
+//! repeat.
 //!
 //! Nothing here prints or returns a secret: errors name the call, the status and the error code
-//! only (never a body, a URL with its query or a `Location`), and tokens, codes and the PKCE
-//! verifier are [`Secret`]s.
+//! only (never a body or a URL with its query), and tokens, codes and the session cookie are
+//! [`Secret`]s.
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use chelabase_types::entry::Entry;
 use reqwest::{Method, Url};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::future::Future;
 use std::time::Duration;
 
@@ -40,20 +38,21 @@ impl std::fmt::Debug for Secret {
     }
 }
 
+/// auth's session cookie.
+const SESSION_COOKIE: &str = "chelabase_session";
+
 /// Which public host a request is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
     Api,
-    Auth,
 }
 
-/// A request body. It carries passwords, the setup code, invite codes and the OIDC code, so its
-/// `Debug` shows only the field names.
+/// A request body. It carries passwords, the setup code and invite codes, so its `Debug` shows
+/// only the field names.
 #[derive(Clone)]
 pub enum Body {
     Empty,
     Json(Value),
-    Form(Vec<(&'static str, String)>),
 }
 
 impl std::fmt::Debug for Body {
@@ -65,15 +64,11 @@ impl std::fmt::Debug for Body {
                 .field(&m.keys().collect::<Vec<_>>())
                 .finish(),
             Self::Json(_) => f.write_str("Json(..)"),
-            Self::Form(pairs) => f
-                .debug_tuple("Form")
-                .field(&pairs.iter().map(|(k, _)| k).collect::<Vec<_>>())
-                .finish(),
         }
     }
 }
 
-/// The path without its query (which can hold a code or `state`).
+/// The path without its query.
 fn path_only(path: &str) -> String {
     match path.split_once('?') {
         Some((p, _)) => format!("{p}?.."),
@@ -81,7 +76,7 @@ fn path_only(path: &str) -> String {
     }
 }
 
-/// `Debug` hides the query, the bearer and the body's values.
+/// `Debug` hides the query, the bearer, the session and the body's values.
 #[derive(Clone)]
 pub struct Request {
     pub method: Method,
@@ -92,6 +87,10 @@ pub struct Request {
     pub body: Body,
     /// Safe to send again after no answer or a 502–504.
     pub idempotent: bool,
+    /// Sent as Studio sends it (`Origin` and `X-Chelabase-Studio: 1`).
+    pub studio: bool,
+    /// The session cookie's value.
+    pub session: Option<Secret>,
 }
 
 impl std::fmt::Debug for Request {
@@ -103,26 +102,29 @@ impl std::fmt::Debug for Request {
             .field("bearer", &self.bearer)
             .field("body", &self.body)
             .field("idempotent", &self.idempotent)
+            .field("studio", &self.studio)
+            .field("session", &self.session)
             .finish()
     }
 }
 
-/// `Debug` shows the status and sizes only: `Location` and the body can hold codes and tokens.
+/// `Debug` shows the status and sizes only: the body can hold tokens.
 #[derive(Clone, Default)]
 pub struct Response {
     pub status: u16,
-    pub location: Option<String>,
     pub retry_after: Option<u64>,
     pub body: Vec<u8>,
+    /// The session cookie a sign-in set.
+    pub session: Option<Secret>,
 }
 
 impl std::fmt::Debug for Response {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Response")
             .field("status", &self.status)
-            .field("location", &self.location.as_ref().map(|_| ".."))
             .field("retry_after", &self.retry_after)
             .field("body_len", &self.body.len())
+            .field("session", &self.session)
             .finish()
     }
 }
@@ -156,7 +158,6 @@ impl Http for Gateway {
     async fn send(&self, r: &Request) -> Result<Response> {
         let host = match r.site {
             Site::Api => self.entry.api_host(),
-            Site::Auth => self.entry.auth_host(),
         };
         let mut b = self
             .http
@@ -165,10 +166,20 @@ impl Http for Gateway {
         if let Some(token) = &r.bearer {
             b = b.bearer_auth(token.expose());
         }
+        if r.studio {
+            b = b
+                .header(reqwest::header::ORIGIN, self.entry.studio_origin())
+                .header("x-chelabase-studio", "1");
+        }
+        if let Some(session) = &r.session {
+            b = b.header(
+                reqwest::header::COOKIE,
+                format!("{SESSION_COOKIE}={}", session.expose()),
+            );
+        }
         b = match &r.body {
             Body::Empty => b,
             Body::Json(v) => b.json(v),
-            Body::Form(pairs) => b.form(pairs),
         };
         let answer = b.send().await.map_err(|e| anyhow!("{}", e.without_url()))?;
         let header = |name| {
@@ -178,17 +189,33 @@ impl Http for Gateway {
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string)
         };
-        let location = header(reqwest::header::LOCATION);
+        let session = session_cookie(
+            answer
+                .headers()
+                .get_all(reqwest::header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok()),
+        );
         let retry_after = header(reqwest::header::RETRY_AFTER).and_then(|v| v.trim().parse().ok());
         let status = answer.status().as_u16();
         let body = answer.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
         Ok(Response {
             status,
-            location,
             retry_after,
             body,
+            session,
         })
     }
+}
+
+/// The session cookie's value among `Set-Cookie` headers (a cleared one is none).
+fn session_cookie<'a>(mut headers: impl Iterator<Item = &'a str>) -> Option<Secret> {
+    headers.find_map(|h| {
+        let pair = h.split(';').next().unwrap_or("");
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == SESSION_COOKIE && !value.trim().is_empty())
+            .then(|| Secret(value.trim().to_string()))
+    })
 }
 
 /// A refused call: the call's name, the status and the error code (never the body).
@@ -232,46 +259,12 @@ fn error_code(body: &[u8]) -> Option<String> {
     ok.then(|| code.to_string())
 }
 
-/// A PKCE pair: a 43-character verifier and its S256 challenge.
-pub struct Pkce {
-    pub verifier: Secret,
-    pub challenge: String,
-}
-
-impl Pkce {
-    pub fn new() -> Self {
-        Self::from_verifier(crate::random::text32())
-    }
-
-    pub fn from_verifier(verifier: String) -> Self {
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(verifier.as_bytes()));
-        Self {
-            verifier: Secret(verifier),
-            challenge,
-        }
-    }
-}
-
-impl Default for Pkce {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Studio's callback, byte for byte as the bootstrap registers it: scheme and Studio host,
-/// port included.
-pub fn redirect_uri(entry: &Entry) -> String {
-    format!("{}/callback", entry.studio_origin())
-}
-
 /// What an invite link carries: the user, the invite code and the link's token.
 #[derive(Debug)]
 pub struct InviteLink {
     pub user: String,
     pub code: Secret,
     pub token: Secret,
-    pub reset: bool,
 }
 
 impl InviteLink {
@@ -294,7 +287,6 @@ impl InviteLink {
                     user,
                     code: Secret(code),
                     token: Secret(t),
-                    reset: get("reset").as_deref() == Some("1"),
                 })
             }
             _ => bail!("the invite link lacks its user, code or token"),
@@ -306,86 +298,51 @@ impl InviteLink {
 #[derive(Clone, Debug)]
 pub struct Token(pub Secret);
 
-/// Studio's public sign-in values (`GET /auth/v1/studio-config`).
-#[derive(Debug, Clone)]
-struct StudioConfig {
-    client_id: String,
-    project_id: String,
-    org_id: String,
-}
-
-/// A pending sign-in: Zitadel's `authRequest` id, our `state` and PKCE verifier.
-struct Pending {
-    id: Secret,
-    state: String,
-    pkce: Pkce,
-}
-
 /// The headless Studio client. Built by [`Session::connect`].
 pub struct Session<'a, H: Http> {
     http: &'a H,
     entry: Entry,
-    studio: StudioConfig,
     /// The length of one `Retry-After` second (shorter in tests).
     second: Duration,
     /// How long a call keeps retrying.
     timeout: Duration,
 }
 
-/// The answer to sign-in: a token, or refused credentials.
+/// The answer to a sign-in or a sign-up: a token, refused credentials, or an account that
+/// waits for an admin's approval (no session).
 pub enum SignIn {
     Token(Token),
     Refused,
+    Pending,
 }
 
 impl<'a, H: Http> Session<'a, H> {
-    /// Reads Studio's public config, retrying while the stack comes up.
+    /// Reads Studio's public config, retrying while the stack comes up, and checks that it is
+    /// this stack's.
     pub async fn connect(
         http: &'a H,
         entry: Entry,
         timeout: Duration,
         second: Duration,
     ) -> Result<Self> {
-        let mut s = Self {
+        let s = Self {
             http,
             entry,
-            studio: StudioConfig {
-                client_id: String::new(),
-                project_id: String::new(),
-                org_id: String::new(),
-            },
             second,
             timeout,
         };
         let v = s
             .json(
                 Method::GET,
-                Site::Api,
                 "/auth/v1/studio-config",
                 None,
                 Body::Empty,
                 "GET /auth/v1/studio-config",
             )
             .await?;
-        let field = |k: &str| {
-            v.get(k)
-                .and_then(Value::as_str)
-                .filter(|s| {
-                    !s.is_empty()
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                })
-                .map(str::to_string)
-                .ok_or_else(|| anyhow!("studio-config: no usable {k}"))
-        };
-        if v.get("issuer").and_then(Value::as_str) != Some(s.entry.issuer().as_str()) {
-            bail!("studio-config: the issuer is not {}", s.entry.issuer());
+        if v.get("studioHost").and_then(Value::as_str) != Some(s.entry.studio_host()) {
+            bail!("studio-config: Studio's host is not {}", s.entry.studio_host());
         }
-        s.studio = StudioConfig {
-            client_id: field("clientId")?,
-            project_id: field("projectId")?,
-            org_id: field("orgId")?,
-        };
         Ok(s)
     }
 
@@ -416,7 +373,6 @@ impl<'a, H: Http> Session<'a, H> {
     async fn json(
         &self,
         method: Method,
-        site: Site,
         path: &str,
         bearer: Option<&Token>,
         body: Body,
@@ -425,25 +381,38 @@ impl<'a, H: Http> Session<'a, H> {
         let idempotent = method == Method::GET;
         let r = Request {
             method,
-            site,
+            site: Site::Api,
             path: path.to_string(),
             bearer: bearer.map(|t| t.0.clone()),
             body,
             idempotent,
+            studio: false,
+            session: None,
         };
         let a = self.send(&r, what).await?;
-        if !(200..300).contains(&a.status) {
-            return Err(CallError {
-                what,
-                status: a.status,
-                code: error_code(&a.body),
-            }
-            .into());
-        }
-        if a.body.is_empty() {
-            return Ok(Value::Null);
-        }
-        serde_json::from_slice(&a.body).map_err(|_| anyhow!("{what}: the answer is not JSON"))
+        Ok(parse(a, what)?.0)
+    }
+
+    /// A POST to auth's sign-in pages as Studio sends it: the JSON answer and the session
+    /// cookie it set, or a [`CallError`]. Never retried after no answer: it may have signed in.
+    async fn studio_post(
+        &self,
+        path: &str,
+        body: Body,
+        session: Option<&Secret>,
+        what: &'static str,
+    ) -> Result<(Value, Option<Secret>)> {
+        let r = Request {
+            method: Method::POST,
+            site: Site::Api,
+            path: path.to_string(),
+            bearer: None,
+            body,
+            idempotent: false,
+            studio: true,
+            session: session.cloned(),
+        };
+        parse(self.send(&r, what).await?, what)
     }
 
     /// A management-API call as `token`: the JSON answer, or a [`CallError`].
@@ -456,8 +425,7 @@ impl<'a, H: Http> Session<'a, H> {
         what: &'static str,
     ) -> Result<Value> {
         let body = body.map_or(Body::Empty, Body::Json);
-        self.json(method, Site::Api, path, Some(token), body, what)
-            .await
+        self.json(method, path, Some(token), body, what).await
     }
 
     /// An unauthenticated call to the API host (`/auth/v1/…`).
@@ -469,7 +437,7 @@ impl<'a, H: Http> Session<'a, H> {
         what: &'static str,
     ) -> Result<Value> {
         let body = body.map_or(Body::Empty, Body::Json);
-        self.json(method, Site::Api, path, None, body, what).await
+        self.json(method, path, None, body, what).await
     }
 
     /// How long a call keeps retrying, and the length of one `Retry-After` second: what a
@@ -506,6 +474,8 @@ impl<'a, H: Http> Session<'a, H> {
             bearer: Some(token.0.clone()),
             body: Body::Json(body),
             idempotent: false,
+            studio: false,
+            session: None,
         };
         let a = self.send(&r, what).await?;
         if !(200..300).contains(&a.status) {
@@ -556,119 +526,12 @@ impl<'a, H: Http> Session<'a, H> {
         }
     }
 
-    /// Starts a sign-in: `GET /oauth/v2/authorize`, never followed; the pending sign-in's id
-    /// from `Location`.
-    async fn begin(&self) -> Result<Pending> {
-        let pkce = Pkce::new();
-        let state = crate::random::text32();
-        let scope = [
-            "openid".to_string(),
-            "profile".into(),
-            "email".into(),
-            "urn:zitadel:iam:user:resourceowner".into(),
-            format!(
-                "urn:zitadel:iam:org:project:id:{}:aud",
-                self.studio.project_id
-            ),
-            format!("urn:zitadel:iam:org:id:{}", self.studio.org_id),
-        ]
-        .join(" ");
-        let mut url = Url::parse("http://x/oauth/v2/authorize").expect("a valid URL");
-        url.query_pairs_mut()
-            .append_pair("client_id", &self.studio.client_id)
-            .append_pair("redirect_uri", &redirect_uri(&self.entry))
-            .append_pair("response_type", "code")
-            .append_pair("scope", &scope)
-            .append_pair("code_challenge", &pkce.challenge)
-            .append_pair("code_challenge_method", "S256")
-            .append_pair("state", &state);
-        let what = "GET /oauth/v2/authorize";
-        let r = Request {
-            method: Method::GET,
-            site: Site::Auth,
-            path: format!("/oauth/v2/authorize?{}", url.query().unwrap_or("")),
-            bearer: None,
-            body: Body::Empty,
-            idempotent: true,
-        };
-        let a = self.send(&r, what).await?;
-        let id = a
-            .location
-            .as_deref()
-            .filter(|_| (300..400).contains(&a.status))
-            .and_then(|l| query_value(l, "authRequest"))
-            .filter(|id| id.starts_with("V2_"))
-            .ok_or_else(|| anyhow!("{what}: {} without a pending sign-in in Location", a.status))?;
-        Ok(Pending {
-            id: Secret(id),
-            state,
-            pkce,
-        })
-    }
-
-    /// Finishes a sign-in from the `done` answer's `redirect`: the code from Studio's callback
-    /// URL (following Zitadel's own callback once, by hand, when that is what it is), `state`
-    /// checked, then the token.
-    async fn finish(&self, pending: &Pending, answer: &Value) -> Result<Token> {
-        let redirect = answer
-            .get("redirect")
-            .and_then(Value::as_str)
-            .filter(|_| answer.get("next").and_then(Value::as_str) == Some("done"))
-            .ok_or_else(|| anyhow!("the sign-in did not finish (no `done` with a redirect)"))?;
-        let callback = redirect_uri(&self.entry);
-        let location = if is_callback(redirect, &callback) {
-            redirect.to_string()
-        } else {
-            let issuer = self.entry.issuer();
-            let path = redirect
-                .strip_prefix(issuer.as_str())
-                .filter(|p| p.starts_with('/'))
-                .ok_or_else(|| {
-                    anyhow!("the sign-in redirects to neither Studio's callback nor the issuer")
-                })?;
-            let what = "GET Zitadel's callback";
-            let r = Request {
-                method: Method::GET,
-                site: Site::Auth,
-                path: path.to_string(),
-                bearer: None,
-                body: Body::Empty,
-                idempotent: false,
-            };
-            let a = self.send(&r, what).await?;
-            a.location
-                .filter(|l| (300..400).contains(&a.status) && is_callback(l, &callback))
-                .ok_or_else(|| {
-                    anyhow!("{what}: {} without Studio's callback in Location", a.status)
-                })?
-        };
-        let code = callback_code(&location, &pending.state)?;
-        let what = "POST /oauth/v2/token";
-        let r = Request {
-            method: Method::POST,
-            site: Site::Auth,
-            path: "/oauth/v2/token".to_string(),
-            bearer: None,
-            body: Body::Form(vec![
-                ("grant_type", "authorization_code".to_string()),
-                ("code", code.expose().to_string()),
-                ("redirect_uri", callback),
-                ("client_id", self.studio.client_id.clone()),
-                ("code_verifier", pending.pkce.verifier.expose().to_string()),
-            ]),
-            idempotent: false,
-        };
-        let a = self.send(&r, what).await?;
-        if a.status != 200 {
-            return Err(CallError {
-                what,
-                status: a.status,
-                code: error_code(&a.body),
-            }
-            .into());
-        }
-        let v: Value = serde_json::from_slice(&a.body)
-            .map_err(|_| anyhow!("{what}: the answer is not JSON"))?;
+    /// The member token for a session (`POST /auth/v1/token`).
+    async fn token(&self, session: &Secret) -> Result<Token> {
+        let what = "POST /auth/v1/token";
+        let (v, _) = self
+            .studio_post("/auth/v1/token", Body::Empty, Some(session), what)
+            .await?;
         v.get("access_token")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
@@ -676,21 +539,30 @@ impl<'a, H: Http> Session<'a, H> {
             .ok_or_else(|| anyhow!("{what}: no access_token"))
     }
 
+    /// After a sign-in, sign-up or accept: `studio` with the session cookie mints a token,
+    /// `pending` has none.
+    async fn signed_in(
+        &self,
+        (answer, session): (Value, Option<Secret>),
+        what: &'static str,
+    ) -> Result<SignIn> {
+        match (answer.get("next").and_then(Value::as_str), session) {
+            (Some("studio"), Some(session)) => Ok(SignIn::Token(self.token(&session).await?)),
+            (Some("pending"), _) => Ok(SignIn::Pending),
+            (Some("verify"), _) => {
+                bail!("{what}: auth wants the email verified first (email verification is on)")
+            }
+            (Some("studio"), None) => bail!("{what}: signed in without a session cookie"),
+            _ => bail!("{what}: an answer without a known next step"),
+        }
+    }
+
     /// Signs in with email and password.
     pub async fn sign_in(&self, email: &str, password: &str) -> Result<SignIn> {
-        let pending = self.begin().await?;
-        let body =
-            json!({"authRequest": pending.id.expose(), "email": email, "password": password});
-        match self
-            .public(
-                Method::POST,
-                "/auth/v1/sign-in",
-                Some(body),
-                "POST /auth/v1/sign-in",
-            )
-            .await
-        {
-            Ok(answer) => Ok(SignIn::Token(self.finish(&pending, &answer).await?)),
+        let what = "POST /auth/v1/sign-in";
+        let body = Body::Json(json!({"email": email, "password": password}));
+        match self.studio_post("/auth/v1/sign-in", body, None, what).await {
+            Ok(answer) => self.signed_in(answer, what).await,
             Err(e) if call_error(&e).is_some_and(|c| c.status == 401) => Ok(SignIn::Refused),
             Err(e) => Err(e),
         }
@@ -703,10 +575,9 @@ impl<'a, H: Http> Session<'a, H> {
         password: &str,
         name: (&str, &str),
         setup_code: Option<&Secret>,
-    ) -> Result<Token> {
-        let pending = self.begin().await?;
+    ) -> Result<SignIn> {
+        let what = "POST /auth/v1/sign-up";
         let mut body = json!({
-            "authRequest": pending.id.expose(),
             "email": email,
             "password": password,
             "givenName": name.0,
@@ -716,70 +587,45 @@ impl<'a, H: Http> Session<'a, H> {
             body["setupCode"] = json!(code.expose());
         }
         let answer = self
-            .public(
-                Method::POST,
-                "/auth/v1/sign-up",
-                Some(body),
-                "POST /auth/v1/sign-up",
-            )
+            .studio_post("/auth/v1/sign-up", Body::Json(body), None, what)
             .await?;
-        self.finish(&pending, &answer).await
+        self.signed_in(answer, what).await
     }
 
     /// Accepts an invite with `password` and signs in.
     pub async fn accept_invite(&self, link: &InviteLink, password: &str) -> Result<Token> {
-        let pending = self.begin().await?;
-        let body = json!({
+        let what = "POST /auth/v1/accept-invite";
+        let body = Body::Json(json!({
+            "t": link.token.expose(),
             "user": link.user,
             "code": link.code.expose(),
-            "reset": link.reset,
             "password": password,
-            "authRequest": pending.id.expose(),
-        });
+        }));
         let answer = self
-            .public(
-                Method::POST,
-                "/auth/v1/accept-invite",
-                Some(body),
-                "POST /auth/v1/accept-invite",
-            )
+            .studio_post("/auth/v1/accept-invite", body, None, what)
             .await?;
-        self.finish(&pending, &answer).await
-    }
-}
-
-/// `url` is `callback` with a query.
-fn is_callback(url: &str, callback: &str) -> bool {
-    url.strip_prefix(callback)
-        .is_some_and(|rest| rest.starts_with('?'))
-}
-
-/// One query parameter of an absolute URL.
-fn query_value(url: &str, key: &str) -> Option<String> {
-    let parsed = Url::parse(url).ok()?;
-    parsed
-        .query_pairs()
-        .find(|(k, _)| k == key)
-        .map(|(_, v)| v.into_owned())
-}
-
-/// The code from Studio's callback URL, once `state` matches. An OAuth `error` is named (it is
-/// a fixed word), never the URL.
-pub fn callback_code(location: &str, state: &str) -> Result<Secret> {
-    if query_value(location, "state").as_deref() != Some(state) {
-        bail!("the callback's state does not match");
-    }
-    match query_value(location, "code").filter(|c| !c.is_empty()) {
-        Some(code) => Ok(Secret(code)),
-        None => {
-            let error = query_value(location, "error")
-                .filter(|e| {
-                    e.len() <= 64 && e.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                })
-                .unwrap_or_else(|| "none".to_string());
-            bail!("the callback has no code (error: {error})")
+        match self.signed_in(answer, what).await? {
+            SignIn::Token(token) => Ok(token),
+            _ => bail!("{what}: the invitee was not signed in"),
         }
     }
+}
+
+/// A 2xx answer's JSON (`Null` when empty) and session cookie, or a [`CallError`].
+fn parse(a: Response, what: &'static str) -> Result<(Value, Option<Secret>)> {
+    if !(200..300).contains(&a.status) {
+        return Err(CallError {
+            what,
+            status: a.status,
+            code: error_code(&a.body),
+        }
+        .into());
+    }
+    if a.body.is_empty() {
+        return Ok((Value::Null, a.session));
+    }
+    let v = serde_json::from_slice(&a.body).map_err(|_| anyhow!("{what}: the answer is not JSON"))?;
+    Ok((v, a.session))
 }
 
 #[cfg(test)]
@@ -806,27 +652,29 @@ mod tests {
         let code = "SETU-PC0D-E234-5678-9ABC";
         let password = "demo-Password-1234";
         let token = "eyJsecretTOKEN123";
+        let session = "SESSIONcookie42";
         let json = Body::Json(json!({"setupCode": code, "password": password}));
-        let form = Body::Form(vec![("code", token.to_string())]);
         let request = Request {
             method: Method::POST,
-            site: Site::Auth,
+            site: Site::Api,
             path: format!("/x?code={code}"),
             bearer: Some(Secret::new(token)),
             body: json.clone(),
             idempotent: false,
+            studio: true,
+            session: Some(Secret::new(session)),
         };
         let response = Response {
-            status: 302,
-            location: Some(format!("http://studio/callback?code={code}")),
+            status: 201,
             retry_after: None,
             body: json!({"access_token": token}).to_string().into_bytes(),
+            session: Some(Secret::new(session)),
         };
-        let shown = format!("{json:?} {form:?} {request:?} {request:#?} {response:?}");
-        for secret in [code, password, token] {
+        let shown = format!("{json:?} {request:?} {request:#?} {response:?}");
+        for secret in [code, password, token, session] {
             assert!(!shown.contains(secret), "{secret} in {shown}");
         }
-        assert!(shown.contains("POST") && shown.contains("302"), "{shown}");
+        assert!(shown.contains("POST") && shown.contains("201"), "{shown}");
     }
 
     #[test]
@@ -855,42 +703,17 @@ mod tests {
     }
 
     #[test]
-    fn pkce_challenge_is_s256_of_the_verifier() {
-        // Computed independently: base64url(sha256(verifier)), unpadded.
-        let p = Pkce::from_verifier("dBjftJeZ4CVP-mJ92IqXLKbS0Sb2fVAuSxfNoq7f0sQ".into());
-        assert_eq!(p.challenge, "06Uhd8l1DHcTHOVafQ7MZC33DdSv1VsnMgmH3YpqHs4");
-        let fresh = Pkce::new();
-        assert_eq!(fresh.verifier.expose().len(), 43);
-        assert_ne!(fresh.verifier.expose(), Pkce::new().verifier.expose());
-        assert_eq!(format!("{:?}", fresh.verifier), "Secret(..)");
-    }
-
-    #[test]
-    fn redirect_uri_keeps_a_non_default_port() {
+    fn the_session_cookie_is_read_from_set_cookie() {
+        let headers = [
+            "chelabase_login=; Max-Age=0; Path=/auth/v1",
+            "chelabase_session=abc.def; HttpOnly; Secure; Path=/auth/v1",
+        ];
         assert_eq!(
-            redirect_uri(&entry("studio.chelabase.localhost:9443")),
-            "http://studio.chelabase.localhost:9443/callback"
+            session_cookie(headers.into_iter()).map(|s| s.expose().to_string()),
+            Some("abc.def".into())
         );
-        assert_eq!(
-            redirect_uri(&entry("studio.chelabase.localhost")),
-            "http://studio.chelabase.localhost/callback"
-        );
-    }
-
-    #[test]
-    fn callback_needs_matching_state_and_a_code() {
-        let ok = callback_code("http://s/callback?code=c0de&state=s1", "s1").unwrap();
-        assert_eq!(ok.expose(), "c0de");
-        let mismatch = callback_code("http://s/callback?code=c0de&state=evil", "s1").unwrap_err();
-        assert!(mismatch.to_string().contains("state"), "{mismatch}");
-        assert!(!mismatch.to_string().contains("c0de"));
-        let none =
-            callback_code("http://s/callback?error=access_denied&state=s1", "s1").unwrap_err();
-        assert_eq!(
-            none.to_string(),
-            "the callback has no code (error: access_denied)"
-        );
-        assert!(callback_code("http://s/callback?state=s1", "s1").is_err());
+        assert!(session_cookie(headers[..1].iter().copied()).is_none());
+        assert!(session_cookie(["chelabase_session=; Max-Age=0"].into_iter()).is_none());
     }
 
     #[test]
@@ -898,8 +721,8 @@ mod tests {
         let l = InviteLink::parse("http://studio.localhost/accept-invite?user=123&code=ABC&t=tok")
             .unwrap();
         assert_eq!(
-            (l.user.as_str(), l.code.expose(), l.token.expose(), l.reset),
-            ("123", "ABC", "tok", false)
+            (l.user.as_str(), l.code.expose(), l.token.expose()),
+            ("123", "ABC", "tok")
         );
         let e = InviteLink::parse("http://studio.localhost/accept-invite?user=123&code=SECRETCODE")
             .unwrap_err();
@@ -928,11 +751,6 @@ mod tests {
         Session {
             http,
             entry: entry("studio.chelabase.localhost:8000"),
-            studio: StudioConfig {
-                client_id: "c".into(),
-                project_id: "p".into(),
-                org_id: "o".into(),
-            },
             second: Duration::from_millis(1),
             timeout: Duration::from_secs(5),
         }
@@ -946,6 +764,8 @@ mod tests {
             bearer: None,
             body: Body::Empty,
             idempotent: false,
+            studio: false,
+            session: None,
         }
     }
 
@@ -993,31 +813,5 @@ mod tests {
             session(&http).send(&get, "GET /x").await.unwrap().status,
             200
         );
-    }
-
-    #[tokio::test]
-    async fn a_location_without_a_pending_sign_in_fails() {
-        let to = |l: &str| {
-            Ok(Response {
-                status: 302,
-                location: Some(l.into()),
-                ..Response::default()
-            })
-        };
-        let http = Script(
-            Mutex::new(vec![to(
-                "http://studio.chelabase.localhost:8000/callback?error=invalid_scope&state=x",
-            )]),
-            Mutex::new(0),
-        );
-        let e = session(&http).begin().await.err().unwrap();
-        assert!(e.to_string().contains("without a pending sign-in"), "{e}");
-        let http = Script(
-            Mutex::new(vec![to(
-                "http://studio.chelabase.localhost:8000/login?authRequest=V2_42",
-            )]),
-            Mutex::new(0),
-        );
-        assert_eq!(session(&http).begin().await.unwrap().id.expose(), "V2_42");
     }
 }

@@ -9,7 +9,7 @@
 
 include!("common/fakes.rs");
 
-use chelabase_auth::test_support::MockJwks;
+use chelabase_auth::test_support::MemberKeys;
 
 const VISIBLE: &str = "/internal/realtime/visible";
 
@@ -22,23 +22,24 @@ fn now() -> i64 {
 
 struct World {
     app: TestApp,
-    jwks: MockJwks,
+    jwks: MemberKeys,
+    tenant: TenantId,
     db: DatabaseId,
 }
 
 /// org-1's tenant: project P with database `web1` (data API on, owner `postgres`, its owner
 /// password sealed).
 async fn world() -> World {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
-    let app = spawn_app_oidc(
+    let app = spawn_app_member_tokens_with(
         metadata.clone(),
         FakeJobs::default(),
         "http://127.0.0.1:9",
         Mode::SelfHosted,
-        jwks.config(vec![]),
+        jwks.verifier(),
     )
     .await;
     let project = metadata.create_project(tenant, "P").await.unwrap().id;
@@ -64,18 +65,14 @@ async fn world() -> World {
     World {
         app,
         jwks,
+        tenant,
         db: db_id,
     }
 }
 
 impl World {
     fn body(&self, keys: Option<Value>, convert_keys: Value) -> Value {
-        let token = self.jwks.sign(json!({
-            "sub": DEFAULT_SUB,
-            "iss": self.jwks.issuer(),
-            "exp": now() + 300,
-            chelabase_auth::CLAIM_ORG_ID: "org-1",
-        }));
+        let token = signed_member_token(&self.jwks, DEFAULT_SUB, self.tenant, 300);
         json!({
             "token": token,
             "database_id": self.db,

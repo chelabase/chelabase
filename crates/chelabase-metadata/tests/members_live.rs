@@ -2161,6 +2161,28 @@ async fn invite_description_follows_the_open_invite() {
     s.finish().await;
 }
 
+// #126: the open invite names its tenant (accepting activates the row there), and once it is
+// accepted it is found among the user's accepted invites with its token hash, by tenant.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn an_invite_names_its_tenant_open_and_accepted() {
+    let s = Scratch::new().await;
+    let c = &s.client;
+    let zid = format!("z-{}", uuid::Uuid::new_v4().simple());
+    let t2 = s.tenant().await;
+    let a2 = c.ensure_member_first_comer_for_tests(t2, "a2", "a2@x.com", "A2", Admission::Active).await.unwrap();
+    assert!(c.accepted_invites_for_user(&zid).await.unwrap().is_empty());
+    c.create_invited_member(a2.id, t2, new_invite(&zid, "i@x.com", &[])).await.unwrap();
+    let d = c.open_invite_for_user(&zid).await.unwrap().unwrap();
+    assert_eq!(d.tenant_id, t2);
+    assert!(c.accepted_invites_for_user(&zid).await.unwrap().is_empty(), "not accepted yet");
+    let row = c.admit_member(t2, &zid, "i@x.com", "Ivy", Admission::Closed).await.unwrap();
+    assert_eq!(row.status, MemberStatus::Active);
+    assert!(c.open_invite_for_user(&zid).await.unwrap().is_none());
+    assert_eq!(c.accepted_invites_for_user(&zid).await.unwrap(), vec![(t2, Some(TOKEN.to_vec()))]);
+    s.finish().await;
+}
+
 // #76: the stored expiry of a user's latest invite that isn't revoked or accepted, while its
 // member is still invited, whether or not it has expired.
 #[tokio::test]
@@ -4077,19 +4099,19 @@ async fn remove_member_touches_personal_login_projects() {
     s.finish().await;
 }
 
-// D4: the webhook's and the sweep's write revokes every live login of the tenant's member with
-// that Zitadel user (`identity_offboarded`) and returns where their rows are; one event per
-// member, none when nothing was live (S18); an unknown user or another tenant's is untouched.
+// D4: removal's offboarding write revokes every live login of the tenant's member with that
+// identity user (`identity_offboarded`) and returns where their rows are; one event per member,
+// none when nothing was live (S18); an unknown user or another tenant's is untouched.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn zitadel_offboarding_revokes_by_user() {
+async fn offboarding_revokes_by_user() {
     let s = Scratch::new().await;
     let other = s.hub().await;
     let h = s.hub().await;
     let (child, child_ep) = s.child(h.db, "dev").await;
     let (db2, ep2) = s.ready_database(h.t, h.p).await;
     let c = &s.client;
-    // The same Zitadel user id in another tenant, with a live login there.
+    // The same identity user id in another tenant, with a live login there.
     let twin = s.granted(&other, "alice", PlatformRole::Developer).await;
     s.login(twin, other.db, "alice").await;
     let alice = s.granted(&h, "alice", PlatformRole::Developer).await;
@@ -4098,9 +4120,6 @@ async fn zitadel_offboarding_revokes_by_user() {
     c.upsert_personal_role_row(&h.ep, alice, h.db, "alice", V1).await.unwrap();
     c.upsert_personal_role_row(&child_ep, alice, h.db, "alice", V1).await.unwrap();
     c.upsert_personal_role_row(&ep2, alice, db2, "alice", V1).await.unwrap();
-    let live = c.members_with_live_logins().await.unwrap();
-    assert!(live.contains(&(h.t, alice, "alice".to_string())), "{live:?}");
-    assert!(live.contains(&(other.t, twin, "alice".to_string())), "{live:?}");
 
     let eps = c.revoke_logins_for_identity_user(h.t, "alice").await.unwrap();
     assert_eq!(
@@ -4115,10 +4134,7 @@ async fn zitadel_offboarding_revokes_by_user() {
     assert_eq!(revoked.len(), 1, "one event for the member");
     let after = revoked[0].after.clone().unwrap();
     assert_eq!((after["count"].as_i64(), after["reason"].as_str()), (Some(2), Some("identity_offboarded")));
-    let live = c.members_with_live_logins().await.unwrap();
-    assert!(!live.iter().any(|(_, m, _)| *m == alice), "{live:?}");
-    assert!(live.contains(&(other.t, twin, "alice".to_string())), "another tenant's member is untouched");
-    assert_eq!(logins_of(&s, twin).await[0].status, LoginStatus::Active);
+    assert_eq!(logins_of(&s, twin).await[0].status, LoginStatus::Active, "another tenant's member is untouched");
 
     // S18: nothing live, nothing written; an unknown user is nobody.
     let written = s.event_count(h.t).await;
@@ -4345,7 +4361,7 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
 
     c.revoke_logins_for_identity_user(h.t, "alice").await.unwrap();
     let marked = c.member(alice).await.unwrap().unwrap();
-    assert!(marked.offboarded, "the webhook's write marks the member");
+    assert!(marked.offboarded, "the offboarding write marks the member");
     assert_eq!(marked.status, MemberStatus::Active, "the mark isn't a status");
     c.revoke_logins_for_identity_user(h.t, "bob").await.unwrap();
     assert!(c.member(bob).await.unwrap().unwrap().offboarded, "marked without a live login too");
@@ -4359,10 +4375,6 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
     assert!(!s.sql_qualifies(alice, h.db).await);
     let refused = c.create_personal_login(alice, h.db, "alice2", V2, in_days(90)).await;
     assert!(matches!(refused, Err(LoginWriteError::NotQualified)), "{refused:?}");
-    // By tenant, then member.
-    let mut want = vec![(h.t, alice, "alice".to_string()), (h.t, bob, "bob".to_string())];
-    want.sort_by_key(|(_, m, _)| *m);
-    assert_eq!(c.offboarded_members().await.unwrap(), want);
 
     // A sign-in never clears it.
     c.ensure_member_first_comer_for_tests(h.t, "bob", "bob@x.com", "bob", Admission::Active).await.unwrap();
@@ -4379,10 +4391,7 @@ async fn offboarding_marks_the_member_until_its_user_is_active_again() {
         (LoginStatus::Revoked, Some(RevokeReason::IdentityOffboarded)),
         "the login stays revoked"
     );
-    assert_eq!(
-        c.offboarded_members().await.unwrap(),
-        vec![(h.t, bob, "bob".to_string())]
-    );
+    assert!(c.member(bob).await.unwrap().unwrap().offboarded, "bob keeps his mark");
     s.finish().await;
 }
 

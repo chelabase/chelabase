@@ -20,11 +20,13 @@ pub fn repo_root() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub fn zitadel_dir() -> PathBuf {
-    if let Ok(dir) = env::var("CHELABASE_ZITADEL_DIR") {
+/// The stack's bootstrap dir (`CHELABASE_BOOTSTRAP_DIR`, which the stack env sets): the dev
+/// member's password, for `chelabase dev token`.
+pub fn bootstrap_dir() -> PathBuf {
+    if let Ok(dir) = env::var("CHELABASE_BOOTSTRAP_DIR") {
         return PathBuf::from(dir);
     }
-    repo_root().join(".chelabase/zitadel")
+    repo_root().join(".chelabase/stacks/main/bootstrap")
 }
 
 /// Where auth's cookie key lives. Before the rename it was `.chelabase/ui-auth`; that folder is
@@ -61,10 +63,6 @@ pub fn entry() -> anyhow::Result<chelabase_types::entry::Entry> {
     Ok(chelabase_types::entry::Entry::from_env()?)
 }
 
-/// The Zitadel issuer, derived from the entry (the auth host and the scheme).
-pub fn issuer() -> anyhow::Result<String> {
-    Ok(entry()?.issuer())
-}
 
 /// Parse KEY=VALUE lines from a dotenv-style file.
 pub fn load_dotenv_file(path: &std::path::Path) -> std::collections::HashMap<String, String> {

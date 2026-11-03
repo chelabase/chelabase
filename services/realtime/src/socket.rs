@@ -149,7 +149,7 @@ pub(crate) async fn tickets(State(shared): State<Arc<Shared>>, headers: HeaderMa
     }
     // T8-1, D7: a suspended or offboarded member (or one no longer a member) gets no ticket;
     // the orchestrator decides, and one that can't answer is a 503.
-    match shared.orch.member_allowed(&claims.sub, &claims.org_id, claims.tenant_id).await {
+    match shared.orch.member_allowed(&claims.sub, claims.tenant_id).await {
         Some(true) => {}
         Some(false) => return StatusCode::FORBIDDEN.into_response(),
         None => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

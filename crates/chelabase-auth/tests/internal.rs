@@ -18,7 +18,6 @@ fn keypair() -> (InternalSigner, InternalVerifier) {
 fn identity() -> Identity {
     Identity {
         sub: "user-1".into(),
-        org_id: "org-1".into(),
         auth: AuthMethod::ManagementJwt,
         request_id: "rid-1".into(),
         data: None,
@@ -43,7 +42,6 @@ fn signed_token_verifies_and_carries_identity() {
     assert_eq!(claims.iss, INTERNAL_ISSUER);
     assert_eq!(claims.aud, "orchestrator");
     assert_eq!(claims.sub, "user-1");
-    assert_eq!(claims.org_id, "org-1");
     assert_eq!(claims.auth, AuthMethod::ManagementJwt);
     assert_eq!(claims.rid, "rid-1");
     assert_eq!(claims.exp - claims.iat, INTERNAL_TOKEN_TTL_SECS);
@@ -125,7 +123,6 @@ fn token_with_another_issuer_is_rejected() {
         "iat": now(),
         "exp": now() + 60,
         "sub": "user-1",
-        "org_id": "org-1",
         "auth": "management_jwt",
         "rid": "rid-1",
     });
@@ -155,7 +152,6 @@ fn data_identity_round_trips_in_claims() {
     };
     let identity = Identity {
         sub: data.key_id.to_string(),
-        org_id: String::new(),
         auth: AuthMethod::DataKey,
         request_id: "rid-2".into(),
         data: Some(data.clone()),
@@ -166,7 +162,6 @@ fn data_identity_round_trips_in_claims() {
     let claims = verifier.verify(&token, "rest").unwrap();
     assert_eq!(claims.auth, AuthMethod::DataKey);
     assert_eq!(claims.sub, data.key_id.to_string());
-    assert_eq!(claims.org_id, "");
     assert_eq!(claims.data, Some(data));
 }
 
@@ -182,7 +177,6 @@ fn management_claims_without_data_still_verify() {
         "iat": now(),
         "exp": now() + 60,
         "sub": "user-1",
-        "org_id": "org-1",
         "auth": "management_jwt",
         "rid": "rid-1",
     });
@@ -222,7 +216,6 @@ fn old_tokens_without_databases_parse() {
         "iat": now(),
         "exp": now() + 60,
         "sub": key_id.to_string(),
-        "org_id": "",
         "auth": "data_key",
         "rid": "rid-1",
         "data": {
@@ -286,7 +279,6 @@ fn server_vouched_defaults_to_false() {
     let vouched = DataIdentity { server_vouched: true, ..data };
     let identity = Identity {
         sub: vouched.key_id.to_string(),
-        org_id: String::new(),
         auth: AuthMethod::DataKey,
         request_id: "rid-3".into(),
         data: Some(vouched.clone()),
@@ -313,7 +305,6 @@ fn a_token_without_iss_or_aud_is_refused() {
             "iat": now(),
             "exp": now() + 60,
             "sub": "user-1",
-            "org_id": "org-1",
             "auth": "management_jwt",
             "rid": "rid-1",
         });

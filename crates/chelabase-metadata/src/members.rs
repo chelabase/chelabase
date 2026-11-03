@@ -174,6 +174,8 @@ impl std::ops::Deref for MemberListing {
 /// What an open invite tells the person holding its link.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteDescription {
+    /// The tenant whose member the invite is for: accepting it activates that row.
+    pub tenant_id: TenantId,
     /// SHA-256 of the invite's token; `None` for an invite made before tokens existed.
     pub token_hash: Option<Vec<u8>>,
     /// The inviter's display name; empty when they have none.
@@ -953,7 +955,7 @@ type Stamp = Option<DateTime<Utc>>;
 pub type InviteState = (Uuid, DateTime<Utc>, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
 
 /// An open invite's token hash, inviter name and email, tenant slug and display name.
-type InviteDescriptionRow = (Option<Vec<u8>>, String, Option<String>, String, Option<String>);
+type InviteDescriptionRow = (Uuid, Option<Vec<u8>>, String, Option<String>, String, Option<String>);
 
 /// The person [`MetadataClient::create_invited_member`] invites: their Zitadel user, email, the
 /// invite's expiry and token hash, and the grants they get once active.
@@ -2115,7 +2117,7 @@ impl MetadataClient {
         .transpose()?)
     }
 
-    /// What the link of the Zitadel user's open invite shows: `None` when the user has no open
+    /// What the link of the identity user's open invite shows: `None` when the user has no open
     /// (neither revoked, accepted nor expired) invite of an `invited` member. The caller checks
     /// the token against `token_hash` in constant time.
     pub async fn open_invite_for_user(
@@ -2123,7 +2125,7 @@ impl MetadataClient {
         identity_user_id: &str,
     ) -> Result<Option<InviteDescription>, MetadataError> {
         let row: Option<InviteDescriptionRow> = sqlx::query_as(
-            "SELECT i.token_hash, inviter.display_name, inviter.email, t.slug, t.display_name
+            "SELECT m.tenant_id, i.token_hash, inviter.display_name, inviter.email, t.slug, t.display_name
              FROM invites i
              JOIN members m ON m.id = i.member_id
              JOIN tenants t ON t.id = m.tenant_id
@@ -2136,8 +2138,9 @@ impl MetadataClient {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(
-            |(token_hash, inviter_name, inviter_email, tenant_slug, tenant_display_name)| {
+            |(tenant_id, token_hash, inviter_name, inviter_email, tenant_slug, tenant_display_name)| {
                 InviteDescription {
+                    tenant_id: TenantId(tenant_id),
                     token_hash,
                     inviter_name,
                     inviter_email,
@@ -2148,7 +2151,7 @@ impl MetadataClient {
         ))
     }
 
-    /// The stored expiry of this Zitadel user's invite that isn't revoked or accepted, while its
+    /// The stored expiry of this identity user's invite that isn't revoked or accepted, while its
     /// member is still invited, and whether it is open (`expires_at > now()`, the database clock,
     /// as [`Self::open_invite_for_user`] decides). An open invite wins over a newer expired one
     /// (in another tenant), so a user with any open invite is answered open; with none open, the
@@ -2168,6 +2171,26 @@ impl MetadataClient {
         .bind(identity_user_id)
         .fetch_optional(&self.pool)
         .await?)
+    }
+
+    /// `(tenant, token_hash)` of every accepted invite of this identity user, newest first: an
+    /// accept retried after a later step failed finds its tenant here by comparing the hash in
+    /// constant time (the open invite is gone by then).
+    pub async fn accepted_invites_for_user(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(TenantId, Option<Vec<u8>>)>, MetadataError> {
+        let rows: Vec<(Uuid, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT m.tenant_id, i.token_hash
+             FROM invites i
+             JOIN members m ON m.id = i.member_id
+             WHERE i.identity_user_id = $1 AND i.accepted_at IS NOT NULL
+             ORDER BY i.accepted_at DESC, i.id",
+        )
+        .bind(identity_user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(t, h)| (TenantId(t), h)).collect())
     }
 
     /// A member by id, whatever its status (callers check its tenant).

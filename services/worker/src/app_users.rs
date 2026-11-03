@@ -1005,8 +1005,6 @@ pub(crate) mod tests {
                 .collect()
         };
         assert_eq!(writes(&s), ["POST "]);
-        // No org is recorded any more.
-        assert_eq!(auth.zitadel_org_id, None);
 
         // Enabling again (a redelivery, or the periodic pass) keeps the pool and its users.
         let user = s.add_user("ada@example.com");

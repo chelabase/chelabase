@@ -122,7 +122,7 @@ mod tests {
         assert_eq!(upstreams.site_addr(Site::Studio), None);
         let upstreams = upstreams.with_site(Site::Studio, "http://studio:3000/").unwrap();
         assert_eq!(upstreams.site_addr(Site::Studio), Some("studio:3000"));
-        assert_eq!(upstreams.site_addr(Site::Auth), None);
+        assert_eq!(upstreams.site_addr(Site::Docs), None);
     }
 
     #[test]

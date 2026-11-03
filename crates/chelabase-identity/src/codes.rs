@@ -163,7 +163,7 @@ impl Identity {
             .await
     }
 
-    /// Whether the service can send email (replaces Zitadel's `email_provider_active`).
+    /// Whether the service can send email.
     pub async fn email_status(&self) -> Result<EmailStatus, IdentityError> {
         self.call(&ops::EMAIL_STATUS, None, None, &[], None).await
     }

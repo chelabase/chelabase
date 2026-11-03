@@ -14,6 +14,10 @@ pub fn strong_password(password: &str) -> bool {
         && password.chars().any(|c| !c.is_alphanumeric())
 }
 
+/// The longest password taken, in bytes; a longer one is refused as weak, before any account is
+/// looked up.
+pub const PASSWORD_MAX_BYTES: usize = 72;
+
 pub fn normalize_email(email: &str) -> String {
     email.trim().to_lowercase()
 }

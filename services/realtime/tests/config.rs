@@ -31,7 +31,6 @@ impl Env {
         );
         env.set("CHELABASE_PUBLIC_SCHEME", "http");
         // #22: the token audiences are required (an empty list never accepts a token).
-        env.set("CHELABASE_ZITADEL_AUDIENCES", "p1,c-api");
         env.set(
             "CHELABASE_INTERNAL_VERIFY_KEY",
             "/keys/gateway/internal-verify.pem",
@@ -85,8 +84,7 @@ fn defaults() {
     assert!(!c.valkey.tls, "S7: Valkey TLS is off by default");
     assert_eq!(c.timings, Timings::default());
     assert_eq!(c.limits, Limits::default());
-    let oidc = c.oidc.expect("the gateway's OIDC settings");
-    assert_eq!(oidc.issuer, "http://auth.feat-x.chelabase.localhost:8137");
+    assert_eq!(c.issuer.as_deref(), Some("http://auth.feat-x.chelabase.localhost:8137"));
 }
 
 #[test]
@@ -127,7 +125,6 @@ fn the_ticket_key_comes_from_its_file() {
     let h = ticket_hash("t");
     let id = realtime::ticket::TicketIdentity {
         sub: "s".into(),
-        org_id: "o".into(),
         tenant_id: None,
         auth: chelabase_auth::internal::AuthMethod::ManagementJwt,
         email: None,
@@ -253,7 +250,7 @@ fn with_defaults_is_the_defaults() {
     let c = Config::with_defaults(TicketKey::generate(), "tok");
     assert_eq!(c.addr.to_string(), "127.0.0.1:8087");
     assert_eq!(c.internal_token, "tok");
-    assert!(c.oidc.is_none());
+    assert!(c.issuer.is_none());
     assert_eq!(c.timings, Timings::default());
     assert!(!c.instance_id.is_empty());
 }
