@@ -175,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
             &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
                 .map_err(anyhow::Error::new)?,
         ),
+        identity_service: identity_service(),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
         table_api_dry_run_max_bytes,
@@ -219,6 +220,15 @@ async fn ensure_secrets_key(metadata: &MetadataClient, key: &SecretKey) -> anyho
              you can instead remove every database with `just sweep-dbs`."
         ),
     }
+}
+
+/// The identity service's client from `CHELABASE_IDENTITY_URL` and
+/// `CHELABASE_IDENTITY_TOKEN_FILE`; `None` (warned) when either is unset or the token can't be
+/// read.
+fn identity_service() -> Option<chelabase_identity::Identity> {
+    chelabase_identity::Identity::from_env()
+        .inspect_err(|err| warn!("{err}; app users can't be managed"))
+        .ok()
 }
 
 /// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from

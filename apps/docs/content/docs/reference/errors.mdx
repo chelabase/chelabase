@@ -171,6 +171,7 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 400, 422 | `weak_password` | The password doesn't meet the policy. Same split: 400 on the dashboard login API, 422 on the app-user API and the management API. |
 | 422 | `unknown_column` | Sign-up `data` names a column the users table doesn't have or sign-up can't set. |
 | 422 | `constraint_violation` | The users table refused the row. `error.constraint` names the constraint. |
+| 503 | `identity_unavailable` | The identity service that holds the project's users can't be reached. Try again. When a deactivate or delete answers this, the user's sessions were already revoked. |
 
 ### SQL editor
 
