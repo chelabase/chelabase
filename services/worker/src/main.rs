@@ -799,14 +799,14 @@ async fn identity_sweep_loop(worker: Arc<RealWorker>) {
     }
 }
 
-/// object-storage m8: every `CHELABASE_STORAGE_SWEEP_SECS`, a sweep of every ready database is
-/// queued (one job per database; the consumer runs them one at a time).
+/// How soon after start the first storage sweep is queued (audit N4): a worker restarted more
+/// often than the period still sweeps.
 const STORAGE_SWEEP_FIRST: Duration = Duration::from_secs(600);
 
+/// object-storage m8: every `CHELABASE_STORAGE_SWEEP_SECS`, a sweep of every ready database is
+/// queued (one job per database; the consumer runs them one at a time).
 async fn storage_sweep_loop(worker: Arc<RealWorker>) {
     let every = worker.storage_sweep.every;
-    // The first pass soon after start (audit N4): a worker restarted more often than the
-    // period still sweeps.
     let first = every.min(STORAGE_SWEEP_FIRST);
     let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + first, every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

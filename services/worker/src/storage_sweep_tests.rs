@@ -48,6 +48,12 @@ struct State {
     points: HashMap<String, SystemTime>,
     /// Upload ids live sessions name.
     live_uploads: HashSet<String>,
+    /// Upload ids expired sessions name: a real read deletes these rows, unless their upload
+    /// is open.
+    expired_sessions: HashSet<String>,
+    /// Runs once, at the second `references` call (the repeat read).
+    at_second_read: Option<Change>,
+    reads: u32,
     /// Every read is refused (a closed database).
     closed: bool,
 }
@@ -78,6 +84,9 @@ impl Source {
                 clock: None,
                 points: HashMap::new(),
                 live_uploads: HashSet::new(),
+                expired_sessions: HashSet::new(),
+                at_second_read: None,
+                reads: 0,
                 closed: false,
             }),
         }
@@ -103,14 +112,24 @@ impl SweepSource for Source {
         _db: DatabaseId,
         b: &SweepBranch,
         expire: bool,
-        _open: &[String],
+        open: &[String],
     ) -> Result<BranchRead, ReadError> {
         let mut st = self.st();
         if let Some(during) = st.during.take() {
             during(&mut st);
         }
+        st.reads += 1;
+        if st.reads == 2
+            && let Some(change) = st.at_second_read.take()
+        {
+            change(&mut st);
+        }
+        let mut deleted_rows = 0;
         if expire {
             st.expired.push(b.id);
+            let before = st.expired_sessions.len();
+            st.expired_sessions.retain(|id| open.contains(id));
+            deleted_rows = (before - st.expired_sessions.len()) as u64;
         }
         if st.closed {
             return Err(ReadError::Refused(
@@ -124,7 +143,7 @@ impl SweepSource for Source {
                 timelines: x.timeline.iter().cloned().collect(),
                 clock: st.clock,
                 live_uploads: st.live_uploads.clone(),
-                ..BranchRead::default()
+                deleted_rows,
             }),
             None => Err("no such branch".into()),
         }
@@ -331,6 +350,136 @@ async fn sweep_voids_only_the_marks_after_a_branch_point() {
     let r = pass(&src, &store).await;
     assert_eq!((r.marks_cleared, r.marked, r.deleted), (1, 1, 0), "{r:?}");
     assert!(exists(&store, &k).await);
+}
+
+/// Two new timelines in one pass: the earliest branch point decides (S3, M15).
+#[tokio::test]
+async fn sweep_voids_from_the_earliest_of_several_branch_points() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(10_000));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    for point in [13_700, 12_000] {
+        let b = branch(BranchKind::Normal);
+        src.st()
+            .points
+            .insert(b.timeline.clone().unwrap(), at(point));
+        src.st().branches.push((b, HashSet::new(), false));
+    }
+    store.set_now(at(13_900));
+    let r = pass(&src, &store).await;
+    assert_eq!(
+        (r.blocked.as_deref(), r.marks_cleared, r.marked, r.waiting),
+        (None, 1, 1, 0),
+        "{r:?}"
+    );
+}
+
+/// A reference only the repeat read sees keeps a blob whose mark is ripe (S3, M7).
+#[tokio::test]
+async fn sweep_honours_a_reference_only_the_second_read_sees() {
+    let store = MemoryStore::default();
+    let v = Uuid::new_v4();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let k = blob(&store, src.db, v).await;
+    store.set_now(at(GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    store.set_now(at(GRACE.as_secs() + (GRACE + RETENTION).as_secs()));
+    {
+        let mut st = src.st();
+        st.reads = 0;
+        st.at_second_read = Some(Box::new(move |st: &mut State| {
+            st.branches[0].1.insert(v);
+        }));
+    }
+    let r = pass(&src, &store).await;
+    assert!(src.st().at_second_read.is_none(), "the second read never came");
+    assert_eq!(
+        (r.blocked.as_deref(), r.deleted, r.referenced, r.marks_cleared),
+        (None, 0, 1, 1),
+        "{r:?}"
+    );
+    assert!(exists(&store, &k).await);
+}
+
+/// A reference that comes back takes the mark with it, so a later loss waits in full (N4, M10).
+#[tokio::test]
+async fn sweep_drops_a_mark_when_a_reference_returns() {
+    let store = MemoryStore::default();
+    let v = Uuid::new_v4();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let k = blob(&store, src.db, v).await;
+    store.set_now(at(GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    let marks = format!("_sweep/{}/marks/", src.db);
+    assert_eq!(store.list(&marks).await.unwrap().len(), 1);
+    src.st().branches[0].1.insert(v);
+    store.set_now(at(2 * GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marks_cleared, 1);
+    assert!(store.list(&marks).await.unwrap().is_empty());
+    src.st().branches[0].1.remove(&v);
+    store.set_now(at(10 * GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.marked, r.deleted), (1, 0), "{r:?}");
+    assert!(exists(&store, &k).await);
+}
+
+/// An expired session's row stays while its upload is open, and goes once it is aborted.
+#[tokio::test]
+async fn sweep_deletes_an_expired_session_only_after_its_upload() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let id = store
+        .multipart_create(&format!("{}/16384/{}", src.db, Uuid::new_v4()), None)
+        .await
+        .unwrap();
+    src.st().expired_sessions.insert(id.clone());
+    store.set_now(at(5 * GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.tickets_deleted, r.uploads_aborted), (0, 1), "{r:?}");
+    assert!(
+        src.st().expired_sessions.contains(&id),
+        "the row went with its upload open"
+    );
+    assert_eq!(pass(&src, &store).await.tickets_deleted, 1);
+    assert!(src.st().expired_sessions.is_empty());
+}
+
+/// S1: a restore's detached timeline voids every mark: said once per pass, and counted, so a
+/// database restored more often than the wait shows why it never reclaims anything.
+#[tokio::test]
+async fn sweep_reports_marks_a_restore_voided() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!(
+        (r.marked, r.voided_by_restore),
+        (1, 0),
+        "the first pass voids nothing: {r:?}"
+    );
+    src.st().branches[0].0.timeline = Some(Uuid::new_v4().simple().to_string());
+    store.set_now(at(2 * GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!(
+        (r.blocked.as_deref(), r.voided_by_restore, r.marks_cleared, r.marked),
+        (None, 1, 1, 1),
+        "{r:?}"
+    );
+    // A branch with a known point voids what it must, and that isn't a restore's.
+    let b = branch(BranchKind::Normal);
+    src.st().points.insert(b.timeline.clone().unwrap(), at(0));
+    src.st().branches.push((b, HashSet::new(), false));
+    store.set_now(at(3 * GRACE.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.marks_cleared, r.voided_by_restore), (1, 0), "{r:?}");
 }
 
 /// m7: an open upload a live session names is never aborted, however old; the others are.
@@ -828,13 +977,15 @@ fn sweep_reads_parse_only_whole_answers() {
     let open = ["u-1".to_string()];
     let sql = references_sql(true, &open);
     assert!(sql.contains("DELETE FROM storage.upload_tickets"));
-    // Audit S5 and m7: each table read only where it exists; expired sessions deleted as
-    // the storage role, never one whose upload is still open.
+    // Audit S5 and m7: each table read only where it exists; expired sessions deleted, never
+    // one whose upload is still open. Audit round 2 N5: no role switch for it (the guard
+    // trigger fires on inserts and updates only), as for the tickets.
+    assert!(!sql.contains("SET LOCAL ROLE"), "{sql}");
     for needle in [
         "\\if :cb_objects",
         "\\if :cb_tickets",
         "\\if :cb_sessions",
-        "SET LOCAL ROLE chelabase_storage;\nWITH d AS (DELETE FROM storage.upload_sessions s WHERE s.expires_at <= clock_timestamp()",
+        "WITH d AS (DELETE FROM storage.upload_sessions s WHERE s.expires_at <= clock_timestamp()",
         &format!("ARRAY['{}']::text[]", hex::encode("u-1")),
         "SELECT 'tl|' || coalesce(current_setting('neon.timeline_id', true), '');",
         "WHERE expires_at > clock_timestamp();",
@@ -1170,6 +1321,50 @@ mod worker_reads {
         assert_eq!(d.retention, crate::storage_sweep::NEON_DEFAULT_PITR);
     }
 
+    /// S1: the worker counts a pass that a restore's void started over.
+    #[tokio::test]
+    async fn sweep_counts_passes_a_restore_voided() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut w, _journal) = worker();
+        let store = Arc::new(MemoryStore::default());
+        w.blob_store = Some(store.clone());
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db);
+        store.set_now(at(0));
+        blob(&store, db, Uuid::new_v4()).await;
+        let answer = |now: SystemTime, tl: String| {
+            w.computes.answers.lock().unwrap().clear();
+            w.computes.answer("datallowconn", &databases(&["app"], now));
+            w.computes.answer("chelabase_storage_here", &refs(&tl, &[]));
+        };
+        store.set_now(at(86_400 * 30));
+        answer(at(86_400 * 30), timeline(&w, main.id));
+        w.storage_sweep.grace = Duration::from_secs(60);
+        w.handle_storage_sweep(db).await.unwrap();
+        assert_eq!(w.storage_sweep_restore_voids.load(Relaxed), 0);
+        // The new timeline has no recorded ancestor in the fakes: as a real restore's, detached.
+        let restored = "0123456789abcdef0123456789abcdef";
+        w.metadata
+            .state()
+            .branches
+            .get_mut(&main.id)
+            .unwrap()
+            .timeline_id = Some(restored.into());
+        let tenant: chelabase_neon::NeonId = w
+            .metadata
+            .database(db)
+            .neon_tenant_id
+            .unwrap()
+            .parse()
+            .unwrap();
+        w.storage
+            .insert_timeline(tenant.as_str(), restored, chelabase_neon::Lsn(1));
+        store.set_now(at(86_400 * 31));
+        answer(at(86_400 * 31), restored.to_string());
+        w.handle_storage_sweep(db).await.unwrap();
+        assert_eq!(w.storage_sweep_restore_voids.load(Relaxed), 1);
+    }
+
     /// Audit S2: a failing job is retried a few times, then dropped and counted.
     #[tokio::test]
     async fn sweep_jobs_stop_retrying_after_their_attempts() {
@@ -1306,9 +1501,14 @@ struct World {
     db: DatabaseId,
     ops: Vec<String>,
     ancestry: Ancestry,
+    /// A restore's timeline has no ancestor, as production's: restores detach it.
+    detached: bool,
+    /// How far the databases' clock is from the store's, in seconds.
+    skew: i64,
 }
 
 // Far above the sweep's one-hour skew margin, so marks older than a branch point survive.
+const SEEDS: u64 = 600;
 const M_GRACE: u64 = 20_000;
 const M_RETENTION: u64 = 60_000;
 /// A ticket's life: an upload's row comes within it of its blob.
@@ -1341,6 +1541,38 @@ impl World {
         (0..self.branches.len())
             .filter(|i| self.branches[*i].kind == BranchKind::Normal)
             .collect()
+    }
+
+    /// Right after a new timeline, before a pass can see it, rows on it go: the void is all
+    /// that keeps a mark from outliving a reference no pass ever read.
+    async fn lose_rows(&mut self, i: usize, store: &MemoryStore, mid_pass: bool) {
+        if mid_pass || self.rng.below(3) == 0 {
+            return;
+        }
+        self.now += 1 + self.rng.below(50);
+        store.set_now(at(self.now));
+        let all: Vec<Uuid> = self.branches[i]
+            .tl
+            .history
+            .last()
+            .unwrap()
+            .1
+            .iter()
+            .copied()
+            .collect();
+        // Every row, or a coin per row.
+        let every = self.rng.below(2) == 0;
+        let mut drop = Vec::new();
+        for v in all {
+            if every || self.rng.below(2) == 0 {
+                drop.push(v);
+            }
+        }
+        self.set(i, |s| {
+            for v in &drop {
+                s.remove(v);
+            }
+        });
     }
 
     /// A restorable point of `tl`: within the window and its own history.
@@ -1409,6 +1641,8 @@ impl World {
                     kind: BranchKind::Normal,
                     tl,
                 });
+                let i = self.branches.len() - 1;
+                self.lose_rows(i, store, mid_pass).await;
             }
             // A point-in-time restore: the old timeline becomes a backup.
             4 => {
@@ -1419,7 +1653,13 @@ impl World {
                     kind: BranchKind::Backup,
                     tl: tl.clone(),
                 });
-                self.branches[pick].tl = self.fresh(tl.at(t), Some((tl.id.clone(), t)));
+                let parent = if self.detached {
+                    None
+                } else {
+                    Some((tl.id.clone(), t))
+                };
+                self.branches[pick].tl = self.fresh(tl.at(t), parent);
+                self.lose_rows(pick, store, mid_pass).await;
             }
             // A restore from a backup.
             5 => {
@@ -1487,6 +1727,10 @@ impl World {
     }
 }
 
+fn skewed(t: u64, skew: i64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs((T0.as_secs() as i64 + t as i64 + skew) as u64)
+}
+
 struct Model {
     world: tokio::sync::Mutex<World>,
     store: Arc<MemoryStore>,
@@ -1538,7 +1782,7 @@ impl SweepSource for Model {
         Ok(BranchRead {
             versions: found.tl.history.last().unwrap().1.clone(),
             timelines: [found.tl.id.clone()].into(),
-            clock: Some(at(w.now)),
+            clock: Some(skewed(w.now, w.skew)),
             ..BranchRead::default()
         })
     }
@@ -1549,12 +1793,17 @@ impl SweepSource for Model {
         timeline: &str,
         recorded: &BTreeSet<String>,
     ) -> Result<Option<SystemTime>, String> {
-        let w = self.world.lock().await;
+        let mut w = self.world.lock().await;
+        if w.rng.below(1000) < self.interleave.load(std::sync::atomic::Ordering::Relaxed) {
+            w.step(&self.store, true).await;
+        }
         let mut at_tl = timeline.to_string();
         loop {
             match w.ancestry.get(&at_tl).cloned().flatten() {
                 None => return Ok(None),
-                Some((parent, t)) if recorded.contains(&parent) => return Ok(Some(at(t))),
+                Some((parent, t)) if recorded.contains(&parent) => {
+                    return Ok(Some(skewed(t, w.skew)));
+                }
                 Some((parent, _)) => at_tl = parent,
             }
         }
@@ -1562,14 +1811,15 @@ impl SweepSource for Model {
 }
 
 /// The invariant (AGENTS.md: a second bug in one area gets a model): over random histories of
-/// uploads, deletes, moves, branches at past points, point-in-time restores, restores from
-/// backups, branch and backup deletes and passing time, with events landing mid-pass, no
-/// pass ever deletes a blob some branch, backup or restore within the window can still need.
+/// uploads, deletes, moves, branches at past points, point-in-time restores (detached, as
+/// production's, on half the seeds), restores from backups, rows lost before any pass sees a new
+/// timeline, branch and backup deletes and passing time, with clocks up to 3000 s apart and
+/// events landing mid-pass, no pass ever deletes a blob some branch, backup or restore within the window can still need.
 /// Once the history goes quiet, every other blob is deleted (the sweep isn't vacuous).
 #[tokio::test]
 async fn sweep_model_never_deletes_a_reachable_blob() {
     let mut deleted_total = 0;
-    for seed in 1..=150u64 {
+    for seed in 1..=SEEDS {
         let store = Arc::new(MemoryStore::default());
         store.set_now(at(0));
         let model = Model {
@@ -1581,6 +1831,8 @@ async fn sweep_model_never_deletes_a_reachable_blob() {
                 db: DatabaseId::new(),
                 ops: Vec::new(),
                 ancestry: Ancestry::new(),
+                detached: seed % 2 == 0,
+                skew: (seed as i64 % 7 - 3) * 1000,
             }),
             store: store.clone(),
             interleave: (if seed % 3 == 0 { 150 } else { 0 }).into(),
@@ -1681,4 +1933,47 @@ async fn sweep_model_never_deletes_a_reachable_blob() {
         deleted_total > 100,
         "the model deleted only {deleted_total} blobs"
     );
+}
+
+/// Audit round 2 B1, directed: a marked blob; a restore to before its row went brings the row
+/// back; the row is deleted again before any pass runs. The blob stayed referenced on the
+/// restored timeline until then, so it must outlive that by the wait, not by the old mark's.
+/// The restored timeline is detached (no known branch point), as production's are.
+#[tokio::test]
+async fn sweep_a_restore_starts_the_wait_over_even_if_no_pass_saw_the_row() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let k = blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    let marked = GRACE.as_secs();
+    // Restored at marked + 2000, to a point before the mark: the row is back, then deleted
+    // before the next pass, so no pass ever reads it.
+    src.st().branches[0].0.timeline = Some(Uuid::new_v4().simple().to_string());
+    let gone = marked + 2000;
+    let wait = (GRACE + RETENTION).as_secs();
+    // The old mark's wait is over, but the restore voided it: the blob is marked again.
+    let again = marked + wait;
+    store.set_now(at(again));
+    let r = pass(&src, &store).await;
+    assert_eq!(
+        (r.blocked.as_deref(), r.voided_by_restore, r.marked, r.deleted),
+        (None, 1, 1, 0),
+        "the wait wasn't started over: {r:?}"
+    );
+    // Inside the window of `gone`: still needed.
+    store.set_now(at(gone + RETENTION.as_secs()));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.blocked.as_deref(), r.waiting, r.deleted), (None, 1, 0), "{r:?}");
+    assert!(exists(&store, &k).await);
+    // The new mark waits in full, to the second.
+    store.set_now(at(again + wait - 1));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.blocked.as_deref(), r.waiting, r.deleted), (None, 1, 0), "{r:?}");
+    assert!(exists(&store, &k).await);
+    store.set_now(at(again + wait));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.blocked.as_deref(), r.deleted), (None, 1), "{r:?}");
+    assert!(!exists(&store, &k).await);
 }

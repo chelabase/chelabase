@@ -169,4 +169,6 @@ pub struct Worker<M, S, C, N, P> {
     pub sweep_requests: storage_sweep::SweepRequests,
     /// Storage sweep passes a branch's status refused (stuck branches mean storage only grows).
     pub storage_sweep_refusals: std::sync::atomic::AtomicU64,
+    /// Storage sweep passes whose marks a restore voided.
+    pub storage_sweep_restore_voids: std::sync::atomic::AtomicU64,
 }

@@ -33,8 +33,10 @@
 //! records the timelines it saw (`_sweep/{database_id}/timelines`). A timeline it hasn't
 //! recorded holds what a recorded ancestor held at its branch point P (Neon's ancestry, walked
 //! through unrecorded timelines), plus fresh uploads: it voids the marks made after P (less
-//! [`MAX_SKEW`]), and every mark when no recorded ancestor or no time for P is found. A branch
-//! made at head voids nothing older than an hour. With the set unchanged since a mark, the
+//! [`MAX_SKEW`]), and every mark when no recorded ancestor or no time for P is found (a
+//! restore detaches its timeline, so a restore is that case: warned and counted, since a
+//! database restored more often than the wait never reclaims anything). A branch made at head
+//! voids nothing older than an hour. With the set unchanged since a mark, the
 //! blob was unreferenced on every branch from the mark on, so no restore target within the
 //! window can need it once the mark is older than the window.
 //!
@@ -61,8 +63,8 @@ use crate::Worker;
 use crate::ports::{CacheNotifier, SpecPusher, Storage, WorkerMetadata};
 use crate::provision::{new_compute_token, new_endpoint_id, sha256_hex};
 
-/// `CHELABASE_STORAGE_SWEEP_GRACE_SECS`'s default and its floor: 8 days. Two things bound it
-/// from below, and any change must keep both:
+/// `CHELABASE_STORAGE_SWEEP_GRACE_SECS`'s default and its floor: 8 days. Three things bound
+/// it from below, and any change must keep all three:
 ///
 /// - Signed download URLs (m6) pin a version and live up to
 ///   [`chelabase_storage::MAX_SIGNED_URL_TTL`] (7 days), after the row that named the version
@@ -287,6 +289,8 @@ pub struct SweepReport {
     pub tickets_deleted: u64,
     /// Keys under the prefix that aren't `{datoid}/{version}`: never touched.
     pub unknown_keys: usize,
+    /// Marks voided because a new timeline has no known branch point (a restore).
+    pub voided_by_restore: usize,
     /// The whole prefix went (a deleted database).
     pub purged: bool,
     /// Why the pass stopped before deleting anything.
@@ -587,6 +591,8 @@ pub async fn sweep_database<S: SweepSource>(
     if recorded.as_ref() != Some(&seen) {
         let mut void_from: Option<SystemTime> = None;
         let mut void_all = recorded.is_none();
+        // A new timeline with no recorded ancestor: a restore (which detaches its timeline).
+        let mut restored = false;
         if let Some(recorded) = &recorded {
             for tl in seen.difference(recorded) {
                 match source.branch_point(db, tl, recorded).await? {
@@ -594,7 +600,10 @@ pub async fn sweep_database<S: SweepSource>(
                         let p = p.checked_sub(MAX_SKEW).unwrap_or(SystemTime::UNIX_EPOCH);
                         void_from = Some(void_from.map_or(p, |v| v.min(p)));
                     }
-                    None => void_all = true,
+                    None => {
+                        void_all = true;
+                        restored = true;
+                    }
                 }
             }
         }
@@ -604,6 +613,9 @@ pub async fn sweep_database<S: SweepSource>(
             .map(|(k, _)| k.clone())
             .collect();
         report.marks_cleared += voided.len();
+        if restored {
+            report.voided_by_restore = voided.len();
+        }
         for key in voided {
             marks.remove(&key);
             if !dry_run {
@@ -890,8 +902,9 @@ pub const REQUIRED_TABLES: [&str; 2] = ["objects", "upload_tickets"];
 /// missing (`missing|…`), the versions of its objects, tickets and upload sessions (`v|…`), and
 /// its unexpired sessions' upload ids (`u|hex`; `storage.upload_sessions`, m7, read only where
 /// it exists). With `expire`, dead tickets (expired, or minted on another timeline) are
-/// deleted first, and expired sessions whose upload isn't in `open` as `chelabase_storage`
-/// (`t|count`). Ends with `end`, so a cut-off answer is never taken for a whole one.
+/// deleted first, and expired sessions whose upload isn't in `open` (`t|count`); both as
+/// cloud_admin, like the reads: `guard_tickets` and `guard_sessions` guard inserts and updates
+/// only. Ends with `end`, so a cut-off answer is never taken for a whole one.
 pub fn references_sql(expire: bool, open: &[String]) -> String {
     let (tickets, sessions) = if expire {
         let open: Vec<String> = open
@@ -901,7 +914,7 @@ pub fn references_sql(expire: bool, open: &[String]) -> String {
         (
             "WITH d AS (DELETE FROM storage.upload_tickets t WHERE t.expires_at <= clock_timestamp() OR t.timeline_id IS DISTINCT FROM current_setting('neon.timeline_id', true) RETURNING 1) SELECT 't|' || count(*) FROM d;\n".to_string(),
             format!(
-                "BEGIN;\nSET LOCAL ROLE chelabase_storage;\nWITH d AS (DELETE FROM storage.upload_sessions s WHERE s.expires_at <= clock_timestamp() AND encode(convert_to(s.upload_id::text, 'UTF8'), 'hex') <> ALL (ARRAY[{}]::text[]) RETURNING 1) SELECT 't|' || count(*) FROM d;\nCOMMIT;\n",
+                "WITH d AS (DELETE FROM storage.upload_sessions s WHERE s.expires_at <= clock_timestamp() AND encode(convert_to(s.upload_id::text, 'UTF8'), 'hex') <> ALL (ARRAY[{}]::text[]) RETURNING 1) SELECT 't|' || count(*) FROM d;\n",
                 open.join(", ")
             ),
         )
@@ -1272,6 +1285,20 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 report.blocked.as_deref().unwrap_or_default()
             );
         }
+        // A restore voids every mark (its timeline has no recorded ancestor): a database
+        // restored more often than the wait never reclaims anything, so it's counted and named.
+        if report.voided_by_restore > 0 {
+            let restore_voids = self
+                .storage_sweep_restore_voids
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            warn!(
+                database_id = %db,
+                marks = report.voided_by_restore,
+                restore_voids,
+                "storage sweep: a restore started every mark's wait over; nothing is reclaimed until the wait passes without another"
+            );
+        }
         match &report.blocked {
             Some(why) => warn!(database_id = %db, ?report, "storage sweep deleted nothing: {why}"),
             None => info!(database_id = %db, ?report, "storage sweep"),
@@ -1361,8 +1388,13 @@ impl SweepCause {
 #[derive(Default)]
 pub struct SweepRequests {
     js: std::sync::OnceLock<async_nats::jetstream::Context>,
-    sent: std::sync::Mutex<Vec<(DatabaseId, SweepCause)>>,
+    /// The last [`SENT_KEPT`] requests, for the tests.
+    sent: std::sync::Mutex<std::collections::VecDeque<(DatabaseId, SweepCause)>>,
 }
+
+/// How many requests [`SweepRequests`] remembers (the record is for the tests; a long-lived
+/// process must not grow with every period).
+const SENT_KEPT: usize = 1024;
 
 impl SweepRequests {
     pub fn connect(&self, js: async_nats::jetstream::Context) {
@@ -1371,10 +1403,13 @@ impl SweepRequests {
 
     /// Queues a sweep of `db`, off the caller's path.
     pub fn request(&self, db: DatabaseId, cause: SweepCause) {
-        self.sent
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((db, cause));
+        {
+            let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+            if sent.len() >= SENT_KEPT {
+                sent.pop_front();
+            }
+            sent.push_back((db, cause));
+        }
         let Some(js) = self.js.get().cloned() else {
             return;
         };
@@ -1393,7 +1428,12 @@ impl SweepRequests {
 
     /// The databases asked for so far, with why.
     pub fn causes(&self) -> Vec<(DatabaseId, SweepCause)> {
-        self.sent.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.sent
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .copied()
+            .collect()
     }
 }
 
