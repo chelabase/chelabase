@@ -226,7 +226,7 @@ function PeopleRoster({ members, selfId, tenantAdmin, projects, onStatus: setSta
         } else setStatus(`Sent a new invite to ${email}. The previous link no longer works.`);
       } catch (err) {
         if (err instanceof ApiError && err.code === "link_not_allowed") {
-          throw new Error(`${email} already has a way to sign in, so a link can't be used. Resend the invite by email.`);
+          throw new Error(`${email} already has an account or a pending invite elsewhere, so a link can't be used. Resend the invite by email.`);
         }
         if (err instanceof ApiError && err.code === "invite_closed") throw new Error("This invite was revoked or accepted in the meantime.");
         throw err;

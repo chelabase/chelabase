@@ -26,8 +26,8 @@ export function inviteFailure(err: unknown, email: string, rows: readonly GrantR
   switch (err.code) {
     case "link_not_allowed":
       return err.extra.email_available === true
-        ? { delivery: `${email} already has a way to sign in, so a link can't be used. Send the invite by email.`, switchToEmail: true }
-        : { delivery: `${email} already has a way to sign in, so a link can't be used. Ask them to sign in with their existing account instead.` };
+        ? { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Send the invite by email.`, switchToEmail: true }
+        : { delivery: `${email} already has an account or a pending invite elsewhere, so a link can't be used. Ask them to sign in with their existing account instead.` };
     case "signup_pending":
       return { email: `${email} signed up and is waiting for approval. Approve them under Requests.` };
     case "project_deleting":

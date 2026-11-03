@@ -233,7 +233,7 @@ describe("MembersPage", () => {
     await userEvent.click(await within(dialog).findByRole("radio", { name: /One-time link/ }));
     await userEvent.type(within(dialog).getByLabelText("Emails"), "old@example.test");
     await userEvent.click(within(dialog).getByRole("button", { name: "Create link" }));
-    expect(await within(dialog).findByText(/old@example.test already has a way to sign in/)).toBeInTheDocument();
+    expect(await within(dialog).findByText(/old@example.test already has an account or a pending invite elsewhere/)).toBeInTheDocument();
     expect(within(dialog).getByRole("radio", { name: /^Email/ })).toBeChecked();
   });
 
