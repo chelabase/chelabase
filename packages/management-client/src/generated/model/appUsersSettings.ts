@@ -26,7 +26,7 @@ export interface AppUsersSettings {
   status: AppUsersStatusView;
   table: string;
   /**
-     * `null` until the worker has created the project's Zitadel org.
+     * Unused: always `null`. App users live in the identity pool `app-<project>`.
      * @nullable
      */
   zitadel_org_id: string | null;

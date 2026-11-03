@@ -9338,7 +9338,7 @@ export const getPutAppUsersUrl = (id: string,) => {
 }
 
 /**
- * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's Zitadel org, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
+ * With no settings yet this enables app users: it checks the database, the data API on every branch and the table, then answers 202 and the worker creates the project's identity pool, the users table and its guard. Pressing it again while `enabling`, or after `failed` (same location), starts the work again (202). Once enabled it changes `email_verification` and `on_delete` only (200); another location is 409 `app_users_location_fixed`.
  * @summary Enable app users, or change their settings
  */
 export const putAppUsers = async (id: string,
@@ -10537,7 +10537,7 @@ export const getUpdateAppUserUrl = (id: string,
 }
 
 /**
- * A new email ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.
+ * Sending `email` ends the user's sessions, also when it's the address they already have, so a retry finishes a change whose answer was an error. A `5xx` for a new address may mean the address changed: send the same request again. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.
  * @summary Change a user's email
  */
 export const updateAppUser = async (id: string,

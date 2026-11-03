@@ -15,7 +15,7 @@ export interface PutAppUsersRequest {
      */
   email_verification?: boolean | null;
   /**
-     * What deleting a user in Zitadel does to its row: `delete` (default) or `mark`.
+     * What deleting a user does to its row: `delete` (default) or `mark`.
      * @nullable
      */
   on_delete?: string | null;

@@ -1379,18 +1379,25 @@ async fn update_email_verified_alone_marks_the_current_address() {
     assert!(au.user(id).await.unwrap().email_verified);
     assert_eq!(au.live_sessions(id), 1, "the address didn't change");
     assert_eq!(au.syncs().len(), 1);
-    // Again, and with the same address spelled out: nothing to change, still 200.
-    for patch in [
-        json!({"email_verified": true}),
-        json!({"email": "a@x.test", "email_verified": true}),
-    ] {
-        let (status, body) = au
-            .call(Method::PATCH, &format!("/users/{id}"), Some(patch.clone()))
-            .await;
-        assert_eq!(status, 200, "{patch}: {body}");
-        assert_eq!(body["email_verified"], true);
-    }
+    // Again: nothing to change, still 200.
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email_verified": true})))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["email_verified"], true);
     assert_eq!(au.live_sessions(id), 1);
+    assert_eq!(au.syncs().len(), 1, "nothing changed, nothing to sync");
+    // With the address spelled out it's still 200, and revokes: it may be a retry (B2).
+    let (status, body) = au
+        .call(
+            Method::PATCH,
+            &format!("/users/{id}"),
+            Some(json!({"email": "a@x.test", "email_verified": true})),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(au.live_sessions(id), 0);
+    assert_eq!(au.syncs().len(), 1);
     // The verification isn't taken back without a new address: 422, nothing changes.
     let (status, body) = au
         .call(
@@ -1659,7 +1666,8 @@ async fn other_pool_user_404() {
         (user.email.as_str(), user.banned),
         ("stranger@x.test", false)
     );
-    assert!(au.syncs().is_empty());
+    // Only the DELETE publishes, for this project: its sync finds no such user here.
+    assert_eq!(au.syncs().len(), 1);
 }
 
 #[tokio::test]
@@ -1790,4 +1798,102 @@ impl FakeMetadata {
         // As the store does: any state but off means an enable began.
         row.data_api_bootstrapped |= state != chelabase_metadata::DataApiState::Off;
     }
+}
+
+// --- White-room audit of m7: every access-ending path finishes or can be finished ------------
+
+/// B2: a metadata revoke that failed after the address changed is finished by the retry, and
+/// it didn't stop the identity revoke either.
+#[tokio::test]
+async fn email_change_retry_revokes_after_metadata_failure() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user("a@x.test");
+    au.add_session(id);
+    *au.metadata.fail_revoke.lock().unwrap() = true;
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test"})))
+        .await;
+    assert_eq!(status, 500, "{body}");
+    assert_eq!(au.fake().session_count(&au.pool()), 0, "the identity revoke still ran");
+    *au.metadata.fail_revoke.lock().unwrap() = false;
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test"})))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(au.live_sessions(id), 0, "retry said 200; the refresh token of the old address still works");
+}
+
+/// B2: the same for an identity revoke that failed.
+#[tokio::test]
+async fn email_change_retry_revokes_after_identity_failure() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user("a@x.test");
+    au.add_session(id);
+    au.fake().fail(&format!("DELETE /internal/v1/pools/{}/users/{id}/sessions", au.pool()), 503, "internal", 1);
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test"})))
+        .await;
+    assert_eq!((status, code_of(&body)), (503, "identity_unavailable"), "{body}");
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "new@x.test"})))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(au.fake().session_count(&au.pool()), 0, "retry said 200; the identity session is alive");
+}
+
+/// B2: an address the identity service refuses changes nothing, sessions included.
+#[tokio::test]
+async fn a_refused_email_change_keeps_the_sessions() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = au.add_user("a@x.test");
+    au.add_user("taken@x.test");
+    au.add_session(id);
+    let (status, body) = au
+        .call(Method::PATCH, &format!("/users/{id}"), Some(json!({"email": "taken@x.test"})))
+        .await;
+    assert_eq!((status, code_of(&body)), (409, "email_taken"), "{body}");
+    assert_eq!(au.live_sessions(id), 1);
+}
+
+/// B3: every route that promises "a 503 still ended them" does, with no client at all.
+#[tokio::test]
+async fn a_503_without_a_client_still_revoked_sessions() {
+    let au = au_env(false).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    for (method, rest) in [
+        (Method::POST, "/deactivate"),
+        (Method::DELETE, "/sessions"),
+        (Method::DELETE, ""),
+    ] {
+        let id = uuid::Uuid::new_v4();
+        let now = chrono::Utc::now();
+        au.metadata.app_sessions.lock().unwrap().push(AppSession {
+            id: uuid::Uuid::new_v4(),
+            project_id: au.project.id,
+            user_id: id,
+            identity_session_id: "s".into(),
+            created_at: now,
+            last_used_at: now,
+            expires_at: now + chrono::Duration::days(30),
+            revoked_at: None,
+        });
+        let (status, body) = au.call(method.clone(), &format!("/users/{id}{rest}"), None).await;
+        assert_eq!((status, code_of(&body)), (503, "identity_unavailable"), "{method} {rest}: {body}");
+        assert_eq!(au.live_sessions(id), 0, "{method} {rest}: 503, but the refresh token still works");
+    }
+}
+
+/// S4: a delete whose answer or sync was lost: the retry's 404 still publishes the sync, so the
+/// row can't outlive the user just because reconcile's mass-delete guard trips.
+#[tokio::test]
+async fn delete_retry_of_a_gone_user_publishes_the_sync() {
+    let au = au_env(true).await;
+    au.set_auth(AppUsersStatus::Enabled);
+    let id = uuid::Uuid::new_v4();
+    let (status, body) = au.call(Method::DELETE, &format!("/users/{id}"), None).await;
+    assert_eq!((status, code_of(&body)), (404, "not_found"), "{body}");
+    assert_eq!(au.syncs().len(), 1);
 }

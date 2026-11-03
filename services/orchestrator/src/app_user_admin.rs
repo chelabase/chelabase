@@ -5,7 +5,11 @@
 //! Ending a user's access always runs in one order: the `app_sessions` rows first (refresh is
 //! refused from that moment, even if the identity service is down), then the identity sessions
 //! (a ban or delete ends those itself), then the sync job. The sync job revokes `app_sessions`
-//! again for a banned or gone user, which catches a sign-in that raced the ban.
+//! again for a banned or gone user, which catches a sign-in that raced the ban, and reconcile
+//! does the same for every banned user, which catches a lost job.
+//!
+//! A step that fails leaves a request that can be sent again: a retried email change revokes
+//! again, a retried delete of a user already gone publishes the sync again.
 
 use std::sync::Arc;
 
@@ -360,7 +364,8 @@ where
         Some(auth) if auth.status == AppUsersStatus::Enabled => {}
         _ => return Err(app_users_disabled(409)),
     }
-    identity(state)?;
+    // The identity client isn't required here: a route that ends access revokes in metadata
+    // first, and a route that can't work without the client asks for it itself.
     Ok(Ctx { pool: Pool::App(project.id.as_uuid()), project })
 }
 
@@ -400,17 +405,22 @@ where
     })
 }
 
-/// Ends the user's sessions in metadata, then in the identity service.
-async fn revoke_sessions<M, J>(state: &AppState<M, J>, identity: &Identity, ctx: &Ctx, user: Uuid) -> Result<(), ApiError>
+/// Ends the user's sessions in metadata, then in the identity service. Each is attempted
+/// whatever the other did; the first failure is the answer.
+async fn revoke_sessions<M, J>(state: &AppState<M, J>, ctx: &Ctx, user: Uuid) -> Result<(), ApiError>
 where
     M: MetadataPort,
     J: JobPort,
 {
-    revoke_app_sessions(state, &ctx.project, user).await?;
-    identity
-        .revoke_user_sessions(&ctx.pool, &user.to_string())
-        .await
-        .map_err(|err| identity_failed("revoke user sessions", &err))
+    let app = revoke_app_sessions(state, &ctx.project, user).await;
+    let remote = match identity(state) {
+        Ok(identity) => identity
+            .revoke_user_sessions(&ctx.pool, &user.to_string())
+            .await
+            .map_err(|err| identity_failed("revoke user sessions", &err)),
+        Err(err) => Err(err),
+    };
+    app.and(remote)
 }
 
 fn checked_email(email: &str) -> Result<String, ApiError> {
@@ -740,7 +750,7 @@ where
     operation_id = "updateAppUser",
     tag = "app-users",
     summary = "Change a user's email",
-    description = "A new email ends the user's sessions. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.",
+    description = "Sending `email` ends the user's sessions, also when it's the address they already have, so a retry finishes a change whose answer was an error. A `5xx` for a new address may mean the address changed: send the same request again. `email_verified: true` alone marks the current address verified; a verified address can only become unverified with a new `email`. A password can't be changed here. The users table follows through the sync job.",
     params(("id" = Uuid, Path, description = "Project id"), ("user_id" = Uuid, Path, description = "User id")),
     request_body = UpdateAppUserRequest,
     responses(
@@ -788,37 +798,44 @@ where
     if body.email.is_none() && body.email_verified.is_none() {
         return Err(unprocessable("nothing to change: send email or email_verified"));
     }
-    let new_email = body.email.as_deref().map(checked_email).transpose()?;
+    let sent_email = body.email.as_deref().map(checked_email).transpose()?;
     let identity = identity(state)?;
     let user = user_in_pool(identity, &ctx.pool, user_id).await?;
     let uid = user_id.to_string();
     // The address the user already has isn't a change.
-    let new_email = new_email.filter(|email| *email != user.email);
+    let new_email = sent_email.clone().filter(|email| *email != user.email);
     if new_email.is_none() && body.email_verified == Some(false) && user.email_verified {
         return Err(unprocessable(
             "a verified email can't be marked unverified without changing it; set a new email with email_verified false",
         ));
     }
+    let verified_before = user.email_verified;
     let changed = if let Some(email) = &new_email {
-        let changed = identity
+        identity
             .set_email(&ctx.pool, &uid, email, body.email_verified.unwrap_or(true))
             .await
-            .map_err(|err| identity_failed("set email", &err))?;
-        // The sync still runs when this fails: the address did change.
-        let revoked = revoke_sessions(state, identity, &ctx, user_id).await;
-        publish_sync(state, &ctx.project, user_id, None).await;
-        revoked?;
-        changed
+            .map_err(|err| identity_failed("set email", &err))?
     } else if body.email_verified == Some(true) && !user.email_verified {
-        let changed = identity
+        identity
             .set_email(&ctx.pool, &uid, &user.email, true)
             .await
-            .map_err(|err| identity_failed("mark the email verified", &err))?;
-        publish_sync(state, &ctx.project, user_id, None).await;
-        changed
+            .map_err(|err| identity_failed("mark the email verified", &err))?
     } else {
         user
     };
+    // Any request naming an address revokes, even the address the user already has: nothing
+    // else tells a retry from a no-op, and a retry of a change whose revocation failed has to
+    // finish it. A refused change returned above and ended nothing.
+    let revoked = if sent_email.is_some() {
+        revoke_sessions(state, &ctx, user_id).await
+    } else {
+        Ok(())
+    };
+    // The sync still runs when the revocation failed: the address did change.
+    if new_email.is_some() || changed.email_verified != verified_before {
+        publish_sync(state, &ctx.project, user_id, None).await;
+    }
+    revoked?;
     info!(request_id = %principal.request_id, project_id = %ctx.project.id, %user_id, "app user changed");
     AppUser::from_identity(&changed).ok_or_else(ApiError::internal)
 }
@@ -902,12 +919,12 @@ where
     J: JobPort,
 {
     let ctx = ctx(state, principal, if active { ep::REACTIVATE_APP_USER } else { ep::DEACTIVATE_APP_USER }.policy.access, id).await?;
-    let identity = identity(state)?;
-    // Before the identity service is asked, so a deactivate that can't reach it still ends
-    // the user's refresh tokens.
+    // Before the identity service is asked, or even known to be there, so a deactivate that
+    // can't reach it still ends the user's refresh tokens.
     if !active {
         revoke_app_sessions(state, &ctx.project, user_id).await?;
     }
+    let identity = identity(state)?;
     let uid = user_id.to_string();
     // Already in the state asked for is a 409.
     let user = user_in_pool(identity, &ctx.pool, user_id).await?;
@@ -1005,7 +1022,7 @@ where
 {
     let result = async {
         let ctx = ctx(&state, &principal, ep::REVOKE_APP_USER_SESSIONS.policy.access, id).await?;
-        revoke_sessions(&state, identity(&state)?, &ctx, user_id).await
+        revoke_sessions(&state, &ctx, user_id).await
     }
     .await;
     match result {
@@ -1044,13 +1061,15 @@ where
 {
     let result = async {
         let ctx = ctx(&state, &principal, ep::DELETE_APP_USER.policy.access, id).await?;
-        let identity = identity(&state)?;
         revoke_app_sessions(&state, &ctx.project, user_id).await?;
-        identity
-            .delete_user(&ctx.pool, &user_id.to_string())
-            .await
-            .map_err(|err| identity_failed("delete user", &err))?;
-        publish_sync(&state, &ctx.project, user_id, None).await;
+        let deleted = identity(&state)?.delete_user(&ctx.pool, &user_id.to_string()).await;
+        // Not in the pool: an earlier delete may have lost its answer or its sync, and
+        // reconcile won't remove the row where most of the table would go. The job repairs
+        // that; for an id that never was a user it changes nothing.
+        if matches!(deleted, Ok(()) | Err(IdentityError::NotFound(Missing::User))) {
+            publish_sync(&state, &ctx.project, user_id, None).await;
+        }
+        deleted.map_err(|err| identity_failed("delete user", &err))?;
         info!(request_id = %principal.request_id, project_id = %ctx.project.id, %user_id, "app user deleted");
         Ok::<(), ApiError>(())
     }
