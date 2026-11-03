@@ -71,13 +71,13 @@ for s in orchestrator worker runner; do
     fail "$s gets the Docker socket"
   q ".services[\"$s\"].group_add[]?" | gq -x 973 || fail "$s joins the docker group"
 done
-for s in gateway auth rest studio zitadel mailpit metadata-db; do
+for s in gateway auth rest studio mailpit metadata-db; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/var/run/docker.sock\") | .source")" ]] ||
     fail "$s must not get the Docker socket"
 done
 
 # Which key and state files each service sees: compose-key-visibility.sh (U10). Only the runner
-# mounts the whole state dir (read-write, at its own path); the apps get single state files.
+# mounts the whole state dir (read-write, at its own path); the apps get none of it.
 for s in orchestrator worker gateway auth rest realtime studio; do
   [[ -z "$(q ".services[\"$s\"].volumes[]? | select(.source == \"/m/.chelabase/stacks/feat-x\") | .target")" ]] ||
     fail "$s must not mount the whole state dir"
@@ -85,20 +85,11 @@ done
 [[ "$(q '.services.runner.volumes[] | select(.source == "/m/.chelabase/stacks/feat-x") | "\(.target) \(.read_only // false)"')" == "/m/.chelabase/stacks/feat-x false" ]] ||
   fail "runner mounts the state dir read-write at its own path"
 
-[[ "$(q '.services.zitadel.volumes[] | select(.target == "/zitadel-bootstrap") | .source')" == /m/.chelabase/stacks/feat-x/zitadel ]] ||
-  fail "zitadel's PATs go to the stack's state dir"
-[[ "$(q '.services.zitadel.user // empty')" == 1000:1000 ]] ||
-  fail "zitadel runs as the stack's uid:gid, so the PATs it writes are the host user's"
-[[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALDOMAIN')" == auth.feat-x.chelabase.localhost ]] ||
-  fail "zitadel's domain is the stack's auth host"
-[[ "$(q '.services.zitadel.environment.ZITADEL_EXTERNALPORT')" == 8137 ]] ||
-  fail "zitadel's port is the stack's gateway port"
-[[ "$(q '.services.zitadel.environment.ZITADEL_OIDC_DEFAULTLOGINURLV2')" == "http://studio.feat-x.chelabase.localhost:8137/login?authRequest=" ]] ||
-  fail "zitadel sends sign-ins to the stack's Studio"
-for s in zitadel mailpit; do
-  [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
+for s in orchestrator worker gateway auth rest realtime studio; do
+  [[ -z "$(q ".services[\"$s\"].volumes[]? | select((.source // \"\") | startswith(\"/m/.chelabase/stacks/feat-x/\")) | .source")" ]] ||
+    fail "$s mounts nothing from the state dir (it opens no state file)"
 done
-for s in orchestrator worker gateway auth rest; do
+for s in mailpit identity orchestrator worker gateway auth rest; do
   [[ -n "$(q ".services[\"$s\"].healthcheck.test // empty")" ]] || fail "$s has a healthcheck"
 done
 
@@ -143,7 +134,7 @@ tls_mounts="$(q '[.services | to_entries[] | select(any(.value.volumes[]?; .sour
 # --- RT1 T1 (R11): the compute network (P4, W14) ---------------------------------------------
 # Computes join `<project>_compute` (+ control). On it: what a compute needs (pageserver,
 # safekeepers, the storage broker, the orchestrator's hooks listener) and the clients that dial
-# computes. Never NATS, Valkey, a database, Zitadel, Mailpit, SeaweedFS, the gateway or Studio.
+# computes. Never NATS, Valkey, a database, identity, Mailpit, SeaweedFS, the gateway or Studio.
 [[ "$(q '.networks | has("compute")')" == true ]] || fail "the stack defines a compute network"
 on_compute="$(q '[.services | to_entries[] | select(.value.networks // {} | has("compute")) | .key] | sort | join(" ")')"
 # Ruling (d): the storage broker isn't needed by computes (unauthenticated gRPC): not on it.
@@ -153,7 +144,7 @@ for s in auth orchestrator pageserver proxy realtime rest runner safekeeper1 saf
   [[ "$(q ".services[\"$s\"].networks | has(\"default\")")" == true ]] || fail "$s stays on the default network too"
 done
 [[ "$(q '.services.runner.networks | keys | sort | join(" ")')" == "compute control default" ]] || fail "the runner is on default, control and compute"
-for s in nats valkey metadata-db zitadel-db storcon-db zitadel mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
+for s in nats valkey metadata-db storcon-db identity mailpit seaweedfs gateway storage-controller storage-broker studio docs landing; do
   [[ "$(q ".services[\"$s\"].networks // {} | has(\"compute\")")" == false ]] || fail "$s must not be on the compute network"
 done
 # The orchestrator answers computes as `orchestrator` there (CHELABASE_CONTROL_PLANE_URI).
@@ -318,10 +309,8 @@ done
 [[ -z "$(q '.services.realtime.volumes[]? | select(.source == "/var/run/docker.sock") | .source')" ]] ||
   fail "realtime must not get the Docker socket"
 [[ -z "$(q '.services.realtime.ports // [] | .[]?')" ]] || fail "realtime publishes no port (the gateway is the way in)"
-for f in /m/.chelabase/stacks/feat-x/env/stack.env /m/.chelabase/stacks/feat-x/zitadel/demo.env; do
-  q '.services.realtime.env_file[]? | if type == "object" then .path else . end' | gq -x "$f" ||
-    fail "realtime reads $f (demo.env: the OIDC audiences, as the gateway)"
-done
+q '.services.realtime.env_file[]? | if type == "object" then .path else . end' |
+  gq -x /m/.chelabase/stacks/feat-x/env/stack.env || fail "realtime reads the stack env"
 grep -q '8088/health' <<<"$(q '.services.realtime.healthcheck.test // [] | join(" ")')" ||
   fail "realtime's healthcheck asks its internal listener's /health (8088)"
 for dep in nats valkey; do
