@@ -168,7 +168,7 @@ function Verification({ checked, onChange }: { checked: boolean; onChange: (v: b
 function OnDeleteSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   return (
     <label className="flex flex-col gap-1 text-sm">
-      <span>When a user is deleted in Zitadel</span>
+      <span>When a user is deleted in the identity service</span>
       <select value={value} onChange={(e) => onChange(e.target.value)} className={input}>
         <option value="delete">Delete the row</option>
         <option value="mark">Mark the row (keep it)</option>

@@ -138,10 +138,11 @@ describe("Dashboard", () => {
   });
 
   it("explains an organization with no tenant yet", async () => {
-    setup(ok({ ...bound, tenant: null }));
+    setup(ok({ ...bound, tenant: null, user: { sub: "u1", org_id: "" } }));
     expect(await screen.findByText(/isn't set up yet/)).toBeInTheDocument();
     expect(screen.getByText("docker compose logs init-bootstrap")).toBeInTheDocument();
-    expect(screen.getByText("just zitadel-bootstrap")).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(/zitadel/i);
+    expect(document.body.textContent).not.toContain("()");
   });
 
   it("shows load errors and retries", async () => {

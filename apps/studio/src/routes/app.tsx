@@ -146,6 +146,7 @@ function AppPage() {
 function SignedInLayout({ app }: { app: AppSession }) {
   const me = useGetMe();
   const profile = useMemo(() => ({ name: me.data?.name ?? undefined, email: me.data?.email ?? undefined }), [me.data?.name, me.data?.email]);
+  const withProfile = useMemo(() => ({ ...app, profile }), [app, profile]);
   // A valid token whose subject has no row in the tenant: nothing in Studio would work for them.
   if (me.data === undefined && me.error instanceof ApiError && me.error.status === 403) {
     return (
@@ -160,7 +161,6 @@ function SignedInLayout({ app }: { app: AppSession }) {
       </main>
     );
   }
-  const withProfile = useMemo(() => ({ ...app, profile }), [app, profile]);
   return (
     <AppSessionContext.Provider value={withProfile}>
       <SignedInApp profile={profile} onSignOut={app.onSignOut}>
