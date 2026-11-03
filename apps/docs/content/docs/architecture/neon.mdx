@@ -43,7 +43,7 @@ Each checkout's workbench stack runs in its own Docker network, and only two por
 
 | Service | Host port (main) | Notes |
 | --- | --- | --- |
-| Gateway | 8000 | HTTP front door (Pingora); reaches Studio, the API, Zitadel and the rest by host name |
+| Gateway | 8000 | HTTP front door (Pingora); reaches Studio, the API and the rest by host name |
 | Neon proxy | 4432 | Postgres wire (`<endpoint>.localtest.me:4432`) |
 
 Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4599); `just workbench status` lists them. Everything else is internal to the stack's network and reached by service name:
@@ -60,8 +60,7 @@ Another checkout's stack gets its own ports (gateway 8100–8199, proxy 4500–4
 | metadata Postgres | `metadata-db:5432` | Control-plane metadata |
 | NATS (with JetStream) | `nats:4222` (monitor 8222) | Provision queue, jobs and events; one credentialed user per service |
 | Realtime | `realtime:8087`, `realtime:8088` | Live rows and presence: the socket and tickets (via the gateway), and `/health` |
-| Zitadel | `zitadel:8080` | Console: `http://auth.chelabase.localhost:8000/ui/console` |
-| Zitadel Postgres | `zitadel-db:5432` | Zitadel's own database |
+| Identity | `identity:8080` | Accounts and sessions for members and app users; internal only, no host route ([Identity service](/docs/architecture/identity)) |
 | Mailpit | `mailpit:8025` | Local email inbox (verification codes, resets) |
 | Neon storage controller | `storage-controller:1234` | Tenants and timelines |
 | Neon pageserver | `pageserver:9898` | Pageserver HTTP API |
@@ -75,7 +74,7 @@ Run `just workbench psql`, `just workbench exec <service> <cmd>` and `just workb
 
 ## The compute network
 
-Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's and test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, Zitadel, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
+Each stack has a `<project>_compute` network, apart from the stack's default one. Computes join only it (and `control`, the orchestrator's and test runner's path to them), never the default network. On it, besides the computes: the pageserver and the three safekeepers, which computes read and stream to; the orchestrator, whose hooks listener computes call; and the clients that dial computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). Not on it: NATS, Valkey, every database container, the identity service, Mailpit, SeaweedFS, the storage broker and controller, the gateway and Studio. Every listener of a member of this network needs a credential or is public by design (health, OpenAPI); `scripts/compute-network-e2e.sh` probes each one.
 
 `compute_ctl`'s internal server on `compute:3081` listens on loopback only and needs a per-start secret, so other computes can't reach it. Tenant storage tokens for capable computes expire after 24 hours and the worker refreshes them hourly. The orchestrator's internal listener is reached by its service name (`http://orchestrator:8083`), so no address needs to be picked per Docker flavour.
 

@@ -30,14 +30,14 @@ Chelabase runs in one of two modes, set with `CHELABASE_MODE`.
 
 | Mode | What it is |
 |---|---|
-| `self-hosted` (default) | What runs today, and the dev mode. Email verification is off, everyone who signs up shares one organization, and some safety checks (such as password strength) are opt-in. |
+| `self-hosted` (default) | What runs today, and the dev mode. Email verification is off, everyone who signs up shares one tenant, and some safety checks (such as password strength) are opt-in. |
 | `platform` | The hosted cloud. Not built yet; where this page mentions it, it describes what the code already does when the mode is set. |
 
 ## Limits today
 
-- **The Management API takes only a Zitadel user token.** There are no API keys for it yet. Data API keys exist, but they open only the data API.
+- **The Management API takes only a member access token** (from Studio's sign-in, or `POST /auth/v1/token`). There are no API keys for it yet. Data API keys exist, but they open only the data API.
 - **The gateway does not terminate TLS.** It serves plain HTTP on `:8000` and rejects `https://` upstreams; put a TLS-terminating proxy in front of it for anything beyond local use. It keeps an `X-Forwarded-Proto` set by such a proxy.
-- **No organization per sign-up.** In self-hosted mode everyone who joins (by invite, or by sign-up when an admin opens it) is in the same organization and tenant, a shared team workspace.
+- **No tenant per sign-up.** In self-hosted mode everyone who joins (by invite, or by sign-up when an admin opens it) is in the same tenant, a shared team workspace.
 - **Postgres wire access is Neon's proxy.** Connections go through Neon's proxy (`<endpoint>.localtest.me:4432` in dev); Chelabase has no wire proxy of its own.
 
 ## Where to start

@@ -11,14 +11,12 @@ The same folder also holds brainstorm and research notes for some areas. They ar
 
 - [Control-plane skeleton](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-cheladb-scaffold-design.md): the local-only monorepo, with compiling service stubs and local infrastructure.
 - [Create-database vertical slice](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-create-database-vertical-slice-design.md): the first end-to-end path, from an API call to a provisioned database record.
-- [Orchestrator auth](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-orchestrator-auth-design.md): verifying Zitadel tokens against JWKS and binding an organization to a tenant.
 - [API gateway](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-gateway-design.md): the Pingora front door, its fixed request pipeline and the internal identity token.
 - [Product rename](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-04-product-rename-design.md): moving every name the product shows or uses to Chelabase.
 
 ## Identity and sign-in
 
-- [Studio sign-up, sign-in and project landing](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-27-studio-auth-design.md): how Studio authenticates against Zitadel and lands on the user's projects.
-- [Zitadel v4 and Studio's own login](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-09-28-zitadel-v4-and-own-login-design.md): moving to Zitadel v4 and serving the sign-in pages from Studio through the `auth` service.
+- [The identity service](https://github.com/chelabase/chelabase/pull/128): accounts in an internal service on Better Auth with a schema per pool, Studio signed in with auth's session cookie and short-lived member tokens, and access revoked inline. Designed in the epic's milestone issues rather than a spec.
 - [Projects and app users](https://github.com/chelabase/chelabase/blob/main/docs/superpowers/specs/2026-10-03-app-users-design.md): projects as a resource, and end-user sign-up and sign-in with tokens issued by Chelabase.
 
 ## Neon and databases

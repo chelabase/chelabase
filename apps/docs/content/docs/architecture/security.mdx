@@ -13,7 +13,9 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **Member logins.** Member roles (`cb_m_*`) log in to a compute only from the orchestrator's address, presenting the orchestrator's client certificate and the member's password. The address rule takes its list from `CHELABASE_MEMBER_LOGIN_CIDRS`; an empty value turns the rule off, and the certificates are then the only check. Workbench stacks also admit the test runner's address, next to the orchestrator's. Replication clients can't become synchronous standbys of a compute.
 
-**Management API.** Callers present a Zitadel access token, which the gateway verifies against Zitadel's keys. Another tenant's resources answer exactly like missing ones (404 `not_found`).
+**Management API.** Callers present a member access token: an EdDSA JWT that `auth` signs for at most 15 minutes (5 by default) from a live sign-in session, and that the gateway, the orchestrator and realtime verify locally with the member public key, never fetching keys. Every request still needs an active membership, so removing or suspending someone takes effect on their next request. Another tenant's resources answer exactly like missing ones (404 `not_found`). See [Identity service](/docs/architecture/identity).
+
+**The identity service is internal.** It holds every account and password hash, listens only on the stack's network (no gateway route, not on the compute network), takes a separate bearer from each caller with per-route allow lists, and connects to Postgres as a role that owns only its own pool schemas. Emailed codes are stored only as keyed hashes.
 
 **Data API keys.** Chelabase stores only the SHA-256 of a key and its first 12 characters. A secret key is shown once and Chelabase keeps no copy; the public key is also stored encrypted so Studio can show it again. Keys resolve to a role, and `rest` refuses to run a request as an owner-level role (one that is a superuser or has `CREATEROLE`, `CREATEDB` or `REPLICATION`, or belongs to `neon_superuser`). A role with `BYPASSRLS` alone is allowed: its key reads past row-level security, and the key list marks it. Revocation takes effect within 30 seconds. Unknown-key lookups are rate limited per client address.
 
@@ -23,7 +25,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **App users.** Access tokens are short-lived, signed by `auth` and checked by the gateway together with a session-liveness check. Refresh tokens rotate on every use, only their SHA-256 is stored, and presenting an old one after a short grace window revokes the session. See [App users](/docs/architecture/app-users).
 
-**Sign-in cookies.** The login API keeps step state in encrypted, `HttpOnly`, `SameSite=Strict` cookies scoped to `/auth/v1`. Its answers are padded to a minimum response time (1.5 s by default) and rate limited.
+**Sign-in cookies.** The login API keeps the session and the step state in encrypted, `HttpOnly`, `SameSite=Strict` cookies scoped to `/auth/v1` (`Secure` under https). Only Studio can turn the session into a token: `/auth/v1/token` requires Studio's `Origin` and `X-Chelabase-Studio: 1`. Answers are padded to a minimum response time (1.5 s by default) and rate limited; a wrong password, an unknown email and no active membership answer alike.
 
 **Errors don't leak internals.** A 503 carries fixed text; what happened goes to the log with the request id.
 
@@ -35,7 +37,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 **Storage services.** The pageserver, the safekeepers and the storage controller verify a NeonJWT on their page service, WAL service and HTTP APIs, with scoped tokens per caller (see [Neon](/docs/architecture/neon#storage-authentication)).
 
-**Generated secrets.** Every NATS and Valkey password, realtime's Postgres password, ticket key and internal token, and every internal bearer is a 0600 file under `.chelabase/`, created once with 32 random bytes and never rewritten. Each is mounted only into the services that read it, through a `_FILE` variable, so none appears in a container's configured environment or on a command line. The proxy reads its Valkey password and its control-plane token from files. The storage controller and the pageserver export theirs from the mounted files into their process environment; see [Realtime](/docs/architecture/realtime#known-gaps).
+**Generated secrets.** Every NATS and Valkey password, realtime's Postgres password, ticket key and internal token, the identity service's secret and database password, every internal bearer (the identity service's included) and the member and app-user token key pairs are 0600 files under `.chelabase/`, created once with 32 random bytes and never rewritten. Each is mounted only into the services that read it, through a `_FILE` variable, so none appears in a container's configured environment or on a command line. The proxy reads its Valkey password and its control-plane token from files. The storage controller and the pageserver export theirs from the mounted files into their process environment; see [Realtime](/docs/architecture/realtime#known-gaps).
 
 ## Compute and storage tokens
 
@@ -49,7 +51,7 @@ This page lists where Chelabase draws its trust boundaries and what is not a bou
 
 ## The compute network
 
-Computes run on their own `<project>_compute` network and not on the stack's default one. Only the pieces a compute needs share it (the pageserver, the safekeepers, the orchestrator's hooks listener) and the clients that connect to computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). NATS, Valkey, the metadata and storage-controller databases, Zitadel, Mailpit, SeaweedFS and the gateway aren't on it, so a compromised compute can't reach them. Every listener of a member of the network requires a credential or is public by design (health and OpenAPI routes); `scripts/compute-network-e2e.sh` probes each one. Gaps in that rule are named under [Realtime](/docs/architecture/realtime#known-gaps) and in [Neon](/docs/architecture/neon#the-compute-network).
+Computes run on their own `<project>_compute` network and not on the stack's default one. Only the pieces a compute needs share it (the pageserver, the safekeepers, the orchestrator's hooks listener) and the clients that connect to computes (the proxy, `rest`, `auth`, the worker, the orchestrator, the test runner and realtime). NATS, Valkey, the metadata and storage-controller databases, the identity service, Mailpit, SeaweedFS and the gateway aren't on it, so a compromised compute can't reach them. Every listener of a member of the network requires a credential or is public by design (health and OpenAPI routes); `scripts/compute-network-e2e.sh` probes each one. Gaps in that rule are named under [Realtime](/docs/architecture/realtime#known-gaps) and in [Neon](/docs/architecture/neon#the-compute-network).
 
 ## Realtime sends keys only
 
@@ -68,9 +70,8 @@ See [SQL editor](/docs/architecture/sql-editor) for the details.
 
 ## Local-only defaults
 
-- Email verification of sign-ups is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it); self-sign-up itself is off unless a tenant admin switches it on, except on a fresh install: while a tenant has no member at all, the first sign-up needs the setup code that `init-secrets` printed and becomes the tenant admin, so claim the instance before you expose it ([Install](/docs/self-hosting/install)). The code is a guard, not a substitute for keeping the host private until the claim; of two people racing for the claim only one wins (the other is admitted as `pending`). Sign-ups are limited per client IP. Behind a reverse proxy the gateway sees the proxy's address, so every client would share one bucket until you list the proxy in `CHELABASE_GATEWAY_TRUSTED_PROXIES`: the gateway then believes the forwarded client address only from those peers and ignores it from anyone else ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)). On a workbench stack (development), `zitadel/demo-sa.json` (`.chelabase/stacks/<slug>/zitadel/demo-sa.json`) is a tenant-admin credential: keep it private.
+- Email verification of sign-ups is off in self-hosted mode (`CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides it); self-sign-up itself is off unless a tenant admin switches it on, except on a fresh install: while a tenant has no member at all, the first sign-up needs the setup code that `init-secrets` printed and becomes the tenant admin, so claim the instance before you expose it ([Install](/docs/self-hosting/install)). The code is a guard, not a substitute for keeping the host private until the claim; of two people racing for the claim only one wins (the other is admitted as `pending`). Sign-ups are limited per client IP. Behind a reverse proxy the gateway sees the proxy's address, so every client would share one bucket until you list the proxy in `CHELABASE_GATEWAY_TRUSTED_PROXIES`: the gateway then believes the forwarded client address only from those peers and ignores it from anyone else ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)). On a workbench stack (development), `bootstrap/dev-member.json` (`.chelabase/stacks/<slug>/bootstrap/dev-member.json`) holds the dev member's password, a tenant-admin credential: keep it private.
 - Everyone who joins Studio shares one workspace.
-- The Zitadel Actions target needs Zitadel's HTTP client denylist relaxed so it can call the host.
 - Key material under `.chelabase/` is created once and never overwritten.
 
 ## The Scalar reference never phones home
