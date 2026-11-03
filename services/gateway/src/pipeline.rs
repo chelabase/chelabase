@@ -46,7 +46,7 @@ const STRIPPED_REQUEST_HEADERS: &[&str] = &[
     SERVER_KEY_HEADER,
     CLIENT_IP_HEADER,
 ];
-const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id";
+const CORS_ALLOW_HEADERS: &str = "authorization, content-type, x-request-id, x-chelabase-studio";
 const CORS_MAX_AGE_SECS: &str = "600";
 
 /// The parts of an incoming request the pipeline looks at.
@@ -1360,6 +1360,19 @@ mod tests {
             &[("origin", STUDIO), ("access-control-request-method", "POST")]).await.outcome);
         assert_eq!(resp.status, 204);
         assert_eq!(header(&resp.headers, "access-control-allow-credentials"), Some("true"));
+    }
+
+    /// auth-replacement m8: Studio's `/token` call carries `X-Chelabase-Studio`, which auth
+    /// requires as its CSRF guard, so the preflight must allow it.
+    #[tokio::test]
+    async fn token_preflight_allows_the_studio_header() {
+        let h = harness(&[API]).await;
+        let resp = expect_response(run(&h.pipeline, "OPTIONS", "/auth/v1/token", None,
+            &[("origin", STUDIO), ("access-control-request-method", "POST"),
+              ("access-control-request-headers", "x-chelabase-studio")]).await.outcome);
+        assert_eq!(resp.status, 204);
+        let allowed = header(&resp.headers, "access-control-allow-headers").unwrap_or_default();
+        assert!(allowed.split(", ").any(|h| h == "x-chelabase-studio"), "{allowed}");
     }
 
     // ---- data API keys (Task 4) ----
