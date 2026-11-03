@@ -172,7 +172,7 @@ CHELABASE_SMTP_PASSWORD_PATH=/etc/chelabase/smtp.password
 
 `CHELABASE_SMTP_TLS` says how the connection is secured: `starttls` (the default; the server must offer STARTTLS), `tls` (implicit TLS, the default on port 465) or `none` (plain text, only for a relay on the same host or network). `CHELABASE_SMTP_PORT` defaults to 587. `CHELABASE_SMTP_USER` and the password go together: set both or neither.
 
-The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into the `identity` service only. The service runs as uid 10001, so the file must be readable by it: owned by uid 10001 at mode 0600, or mode 0640 with group 10001.
+The password is never put in `.env`: it is read from the host file at `CHELABASE_SMTP_PASSWORD_PATH`, which is mounted into the `identity` service only. The service runs as uid 10001 and treats the file as a secret: it must be a regular file (not a symlink) owned by uid 10001 at mode 0600. A file its group or others can read or write is refused.
 
 ```bash
 sudo install -d /etc/chelabase
@@ -180,7 +180,7 @@ sudo install -m 0600 -o 10001 /dev/null /etc/chelabase/smtp.password
 sudo sh -c 'cat > /etc/chelabase/smtp.password'   # paste the password, then Ctrl-D
 ```
 
-A file uid 10001 can't read, `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM`, or an unknown `CHELABASE_SMTP_TLS` stops the identity service at start with an error naming the setting (`docker compose logs identity`), and `docker compose up --wait` fails. A changed SMTP setting or password is applied by the next `docker compose up`.
+A password file uid 10001 can't read, one with a looser mode than 0600, a symlink, `CHELABASE_SMTP_HOST` without `CHELABASE_SMTP_FROM`, or an unknown `CHELABASE_SMTP_TLS` stops the identity service at start with an error naming the setting (`docker compose logs identity`), and `docker compose up --wait` fails. A changed `CHELABASE_SMTP_*` setting in `.env` is applied by the next `docker compose up -d --wait`. The password file is read only at start, so after changing it run `docker compose restart identity`.
 
 ## Connect to databases
 
@@ -229,7 +229,7 @@ docker compose pull
 docker compose up -d --wait
 ```
 
-`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. The secrets, the database volumes and the claim carry over; `init-secrets` creates nothing that exists and `init-bootstrap` is a no-op when nothing changed. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
+`docker compose pull` alone fetches the same pinned digests again and upgrades nothing. `up` recreates the containers, not the volumes: `init-secrets` creates only the secrets that are missing and never replaces one, the orchestrator applies any new metadata migrations when it starts, and `init-bootstrap` can safely run again. Back up the volumes before an upgrade you can't afford to lose. If you built from source, run the build command again after `git pull`.
 
 `CHELABASE_IMAGE_TAG` (and `CHELABASE_IMAGE_REPO`) is not how you pick a release. Setting it replaces every pin with one tag for all the images, which Compose pulls by name with no digest check, so what runs is whatever that tag points to at pull time. Use it only to test images or to run ones you built yourself (`just images` makes `chelabase/<image>:latest`; set `CHELABASE_IMAGE_REPO=chelabase` and `CHELABASE_IMAGE_TAG=latest`).
 

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FakeWebSocket } from "@/test/fake-realtime";
 import { HIDDEN_LEAVE_MS, MAX_VIEW_KEYS, SUBPROTOCOL, backoffDelay, createRealtimeClient, socketUrl, tableChannelId } from "./client";
-import type { OidcEvents, TableHandlers, TableJoinParams } from "./types";
+import type { SessionEvents, TableHandlers, TableJoinParams } from "./types";
 
 const PARAMS: TableJoinParams = { database_id: "d1", branch_id: "b1", pg_database: "app", schema: "public", table: "invoices", role: null };
 const CHANNEL = '["d1","b1","app","public","invoices"]';
@@ -16,7 +16,7 @@ class FakeDocument extends EventTarget {
   }
 }
 
-class FakeOidcEvents implements OidcEvents {
+class FakeSessionEvents implements SessionEvents {
   loaded = new Set<(u: { access_token: string }) => void>();
   unloaded = new Set<() => void>();
   signedOut = new Set<() => void>();
@@ -276,7 +276,7 @@ describe("renewal and sign-out (R9, W32)", () => {
 
   it("every_userLoaded_sends_an_auth_frame_with_the_new_token", async () => {
     const s = setup();
-    const events = new FakeOidcEvents();
+    const events = new FakeSessionEvents();
     s.client.attachAuth(events);
     const { ws } = await joinOpen(s);
     events.load("tok-2");
@@ -286,7 +286,7 @@ describe("renewal and sign-out (R9, W32)", () => {
 
   it("the_next_ticket_uses_the_renewed_token", async () => {
     const s = setup();
-    const events = new FakeOidcEvents();
+    const events = new FakeSessionEvents();
     s.client.attachAuth(events);
     const { ws } = await joinOpen(s);
     events.load("tok-2");
@@ -301,7 +301,7 @@ describe("renewal and sign-out (R9, W32)", () => {
 
   it("a_detached_listener_hears_nothing", async () => {
     const s = setup();
-    const events = new FakeOidcEvents();
+    const events = new FakeSessionEvents();
     const detach = s.client.attachAuth(events);
     const { ws } = await joinOpen(s);
     detach();
@@ -312,7 +312,7 @@ describe("renewal and sign-out (R9, W32)", () => {
 
   it.each([["signed out"], ["unloaded"]])("%s_closes_the_socket_for_good", async (kind) => {
     const s = setup();
-    const events = new FakeOidcEvents();
+    const events = new FakeSessionEvents();
     s.client.attachAuth(events);
     const { ws } = await joinOpen(s);
     (kind === "unloaded" ? events.unloaded : events.signedOut).forEach((cb) => cb());

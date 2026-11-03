@@ -1,5 +1,5 @@
 import type {
-  OidcEvents,
+  SessionEvents,
   PresenceMember,
   PresenceState,
   ProjectHandlers,
@@ -98,7 +98,7 @@ export class FakeRealtime implements RealtimeClient {
   setToken(token: string) {
     this.tokens.push(token);
   }
-  attachAuth(_events: OidcEvents) {
+  attachAuth(_events: SessionEvents) {
     return () => {};
   }
   close() {

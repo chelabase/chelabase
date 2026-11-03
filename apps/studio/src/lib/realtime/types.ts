@@ -105,8 +105,11 @@ export interface ProjectSubscription {
   leave(): void;
 }
 
-/** The slice of oidc-client-ts's `UserManagerEvents` the client listens to. */
-export interface OidcEvents {
+/**
+ * The member-session events the client listens to (see `realtimeAuthEvents` in `lib/session.ts`):
+ * a renewed member token is `userLoaded`, sign-out is `userUnloaded` and `userSignedOut`.
+ */
+export interface SessionEvents {
   addUserLoaded(cb: (user: { access_token: string }) => void): void;
   removeUserLoaded(cb: (user: { access_token: string }) => void): void;
   addUserUnloaded(cb: () => void): void;
@@ -118,10 +121,10 @@ export interface OidcEvents {
 export interface RealtimeClient {
   joinTable(params: TableJoinParams, handlers: TableHandlers): TableSubscription;
   joinProject(projectId: string, handlers: ProjectHandlers): ProjectSubscription;
-  /** A renewed access token: an `auth` frame goes out at once on an open socket; later tickets and `auth` frames use it. */
+  /** A renewed member token: an `auth` frame goes out at once on an open socket; later tickets and `auth` frames use it. */
   setToken(token: string): void;
   /** Renewal on every `userLoaded`; sign-out on `userSignedOut` and `userUnloaded` (W32). Returns the detach function. */
-  attachAuth(events: OidcEvents): () => void;
+  attachAuth(events: SessionEvents): () => void;
   /** Closes the socket for good (sign-out): no reconnect, every subscription dropped. */
   close(): void;
 }
