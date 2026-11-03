@@ -36,7 +36,9 @@ use chelabase_secrets::{Purpose, open_credential, open_role_password};
 use chelabase_types::{BranchId, DatabaseId, ProjectId};
 use serde_json::{Value, json};
 use uuid::Uuid;
-use worker::app_users_sql::{USERS_SYNC_ROLE, gone_call_sql, upsert_call_sql, users_bootstrap_sql};
+use worker::app_users_sql::{
+    USERS_OUTDATED_SQL, USERS_SYNC_ROLE, gone_call_sql, upsert_call_sql, users_bootstrap_sql,
+};
 use worker::config::RealWorker;
 
 mod common;
@@ -189,6 +191,7 @@ impl Fx {
                     id,
                     email,
                     true,
+                    false,
                     chrono::Utc::now(),
                     data.as_ref(),
                 ))
@@ -585,6 +588,7 @@ async fn guard_refuses_the_owner_and_allows_sync() {
             ("email_verified", "false".to_string()),
             ("created_at", "now() - interval '1 day'".to_string()),
             ("deleted_at", "now()".to_string()),
+            ("banned_at", "now()".to_string()),
         ] {
             let err = fx
                 .owner_err(&format!("UPDATE users SET {col} = {value} WHERE id = '{a}'"))
@@ -623,6 +627,121 @@ async fn guard_refuses_the_owner_and_allows_sync() {
     .await;
 }
 
+/// AC 3: `banned_at` follows the ban: set once, cleared on reactivation, readable by the user's
+/// own session, and refused to the owner (`guard_refuses_the_owner_and_allows_sync`).
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn banned_at_follows_the_ban() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        let id = Uuid::new_v4();
+        let email = "ban@example.com";
+        let call = |banned: bool| upsert_call_sql(id, email, true, banned, chrono::Utc::now(), None);
+        let banned_at = format!("SELECT coalesce(banned_at::text, 'null') FROM public.users WHERE id = '{id}'");
+
+        fx.sql(&call(false)).await;
+        assert_eq!(fx.value(&banned_at).await, "null");
+        fx.sql(&call(true)).await;
+        let first = fx.value(&banned_at).await;
+        assert_ne!(first, "null");
+        fx.sql(&call(true)).await;
+        assert_eq!(fx.value(&banned_at).await, first, "the first ban's time is kept");
+
+        // The user reads it on their own row, as a policy would.
+        let own = format!(
+            "BEGIN; SET LOCAL ROLE authenticated; \
+             SELECT set_config('request.jwt.claims', '{{\"sub\":\"{id}\"}}', true); \
+             SELECT 'seen ' || (banned_at IS NOT NULL) FROM public.users; COMMIT;"
+        );
+        let out = fx.sql(&own).await;
+        assert!(out.lines().any(|l| l.trim() == "seen true"), "{out}");
+
+        fx.sql(&call(false)).await;
+        assert_eq!(fx.value(&banned_at).await, "null");
+
+        // A row first written for a banned user is marked from the start.
+        let late = Uuid::new_v4();
+        fx.sql(&upsert_call_sql(late, "late@example.com", true, true, chrono::Utc::now(), None))
+            .await;
+        assert_eq!(
+            fx.value(&format!("SELECT banned_at IS NOT NULL FROM public.users WHERE id = '{late}'"))
+                .await,
+            "t"
+        );
+
+        // Sign-up data can't set it.
+        let data = json!({"banned_at": "2020-01-01T00:00:00Z"});
+        let mine = Uuid::new_v4();
+        fx.upsert(mine, "mine@example.com", Some(data)).await;
+        assert_eq!(
+            fx.value(&format!("SELECT banned_at IS NULL FROM public.users WHERE id = '{mine}'"))
+                .await,
+            "t"
+        );
+    })
+    .await;
+}
+
+/// An existing branch, as a worker before `banned_at` left it: the check reports it, the
+/// bootstrap adds the column and replaces the upsert. An app column of another type is refused
+/// by name and rolls the whole script back.
+#[tokio::test]
+#[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
+async fn the_bootstrap_upgrades_an_existing_users_table() {
+    live(|fx| async move {
+        fx.bootstrap().await.expect("bootstrap");
+        let id = Uuid::new_v4();
+        fx.upsert(id, "old@example.com", None).await;
+        let old_upsert = "chelabase.app_users_upsert(uuid, text, boolean, timestamptz, jsonb)";
+        let new_upsert = "chelabase.app_users_upsert(uuid, text, boolean, boolean, timestamptz, jsonb)";
+        let old_args = "p_id uuid, p_email text, p_verified boolean, p_created timestamptz, p_data jsonb";
+        let downgrade = |column: &str| {
+            format!(
+                "BEGIN;
+                 DROP EVENT TRIGGER chelabase_users_protect_drop;
+                 DROP EVENT TRIGGER chelabase_users_protect_ddl;
+                 ALTER TABLE public.users DROP COLUMN banned_at;
+                 {column}
+                 DROP FUNCTION {new_upsert};
+                 CREATE FUNCTION chelabase.app_users_upsert({old_args}) RETURNS text LANGUAGE sql AS $$ SELECT 'old'::text $$;
+                 COMMIT;"
+            )
+        };
+        let says = |out: String, flag: &str| out.lines().any(|l| l.trim() == flag);
+        assert!(says(fx.sql(USERS_OUTDATED_SQL).await, "f"));
+
+        fx.sql(&downgrade("")).await;
+        assert!(says(fx.sql(USERS_OUTDATED_SQL).await, "t"));
+        fx.bootstrap().await.expect("the upgrade");
+        assert!(says(fx.sql(USERS_OUTDATED_SQL).await, "f"));
+        assert_eq!(
+            fx.value(&format!("SELECT to_regprocedure('{old_upsert}') IS NULL")).await,
+            "t",
+            "one upsert left"
+        );
+        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|6");
+        // The row survived and the new upsert marks it.
+        fx.sql(&upsert_call_sql(id, "old@example.com", true, true, chrono::Utc::now(), None))
+            .await;
+        assert_eq!(
+            fx.value(&format!("SELECT banned_at IS NOT NULL FROM public.users WHERE id = '{id}'"))
+                .await,
+            "t"
+        );
+
+        fx.sql(&downgrade("ALTER TABLE public.users ADD COLUMN banned_at text;")).await;
+        let err = fx.bootstrap().await.expect_err("a colliding column");
+        assert!(err.contains("column banned_at of"), "{err}");
+        assert!(err.contains("must be timestamptz"), "{err}");
+        assert_eq!(
+            fx.value(&format!("SELECT to_regprocedure('{old_upsert}') IS NOT NULL")).await,
+            "t",
+            "rolled back"
+        );
+    })
+    .await;
+}
+
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn protect_refuses_drop_rename_retype_disable() {
@@ -649,7 +768,7 @@ async fn protect_refuses_drop_rename_retype_disable() {
         let err = fx.owner_err("DROP SCHEMA public CASCADE").await;
         println!("DROP SCHEMA public CASCADE: {err}");
         assert!(err.contains("ERROR"), "{err}");
-        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|5");
+        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|6");
     })
     .await;
 }
@@ -659,7 +778,7 @@ const SNAPSHOT_TRIGGERS: &str = "SELECT (SELECT count(*) FROM pg_trigger WHERE t
      AND tgname LIKE 'chelabase_users_guard%' AND tgenabled IN ('O', 'A')) || '|' || \
      (to_regclass('public.users') IS NOT NULL) || '|' || \
      (SELECT count(*) FROM pg_attribute WHERE attrelid = to_regclass('public.users') AND NOT attisdropped \
-      AND attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at'));";
+      AND attname IN ('id', 'email', 'email_verified', 'created_at', 'deleted_at', 'banned_at'));";
 
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
@@ -672,7 +791,7 @@ async fn alter_index_rename_on_the_table_is_refused() {
         // The table's own indexes are the developer's.
         fx.owner_ok("ALTER INDEX users_pkey RENAME TO users_id_key")
             .await;
-        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|5");
+        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|6");
     })
     .await;
 }
@@ -697,7 +816,7 @@ async fn unrelated_ddl_works_when_the_users_table_is_fine_and_when_broken() {
         fx.owner_ok(&unrelated(2)).await;
         // The bootstrap repairs it.
         fx.bootstrap().await.expect("the bootstrap after the drop");
-        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|5");
+        assert_eq!(fx.value(SNAPSHOT_TRIGGERS).await, "2|true|6");
         fx.owner_ok(&unrelated(3)).await;
         let err = fx.owner_err("DROP TABLE users").await;
         assert!(managed_refusal(&err), "{err}");
@@ -769,7 +888,7 @@ async fn mark_deleted_email_can_sign_up_again() {
             .admin_sql(
                 &fx.ep,
                 &fx.database,
-                &upsert_call_sql(dup, "SAME@example.com", true, chrono::Utc::now(), None),
+                &upsert_call_sql(dup, "SAME@example.com", true, false, chrono::Utc::now(), None),
             )
             .await
             .expect_err("a second live row with the same email");
@@ -1039,7 +1158,7 @@ async fn app_users_live() {
         for ep in [&fx.ep, &dev_ep] {
             assert_eq!(
                 first_line(&fx.sql_in(ep, &fx.database, SNAPSHOT_TRIGGERS).await),
-                "2|true|5",
+                "2|true|6",
                 "{ep}"
             );
         }
@@ -1097,6 +1216,11 @@ async fn app_users_live() {
             fx.metadata.list_user_sessions(fx.project, user).await.unwrap().is_empty(),
             "the banned user's app sessions are revoked"
         );
+        // AC 3: the row says so on every branch, and the unban below clears it (reconcile).
+        let banned = format!("SELECT count(banned_at) FROM public.users WHERE id = '{user}'");
+        for ep in [&fx.ep, &dev_ep] {
+            assert_eq!(first_line(&fx.sql_in(ep, &fx.database, &banned).await), "1", "{ep}");
+        }
         admin.unban(&pool, &created.id).await.expect("unban the user");
 
         // AC 6: a stale row, a missing row and a ghost row; the reconcile makes both branches
@@ -1111,9 +1235,9 @@ async fn app_users_live() {
             .unwrap();
         let ghost = Uuid::new_v4();
         for ep in [&fx.ep, &dev_ep] {
-            fx.sql_in(ep, &fx.database, &upsert_call_sql(user, "stale@example.com", false, chrono::Utc::now(), None))
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(user, "stale@example.com", false, false, chrono::Utc::now(), None))
                 .await;
-            fx.sql_in(ep, &fx.database, &upsert_call_sql(ghost, "ghost@example.com", true, chrono::Utc::now(), None))
+            fx.sql_in(ep, &fx.database, &upsert_call_sql(ghost, "ghost@example.com", true, false, chrono::Utc::now(), None))
                 .await;
         }
         fx.worker.reconcile_app_users(fx.project).await.expect("reconcile");
@@ -1126,6 +1250,7 @@ async fn app_users_live() {
         };
         for ep in [&fx.ep, &dev_ep] {
             assert_eq!(first_line(&fx.sql_in(ep, &fx.database, table).await), want, "{ep}");
+            assert_eq!(first_line(&fx.sql_in(ep, &fx.database, &banned).await), "0", "{ep}");
         }
 
         // A new branch gets the rows (its create hook) and a fresh sync password.

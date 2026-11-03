@@ -462,12 +462,24 @@ impl MetadataClient {
         Ok(updated == 1)
     }
 
+    /// Deletes the row whatever its status: the project's delete, which then drops the pool.
     pub async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         sqlx::query("DELETE FROM project_auth WHERE project_id = $1")
             .bind(project.as_uuid())
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// The end of a disable: deletes the row only while it's `disabling`, so a duplicate job
+    /// can't take the row of an enable that started since. True when it did.
+    pub async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        let deleted = sqlx::query("DELETE FROM project_auth WHERE project_id = $1 AND status = 'disabling'")
+            .bind(project.as_uuid())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(deleted == 1)
     }
 
     pub async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

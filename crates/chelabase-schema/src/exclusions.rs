@@ -64,8 +64,8 @@ pub const USERS_SYNC_ROLE: &str = "chelabase_auth_sync";
 
 /// The users table's columns Chelabase manages (`services/worker/src/app_users_sql.rs`,
 /// `MANAGED_COLUMNS`); every other column of the users table merges.
-pub const USERS_MANAGED_COLUMNS: [&str; 5] =
-    ["id", "email", "email_verified", "created_at", "deleted_at"];
+pub const USERS_MANAGED_COLUMNS: [&str; 6] =
+    ["id", "email", "email_verified", "created_at", "deleted_at", "banned_at"];
 
 /// The users table's guard triggers (`app_users_sql.rs`).
 pub const USERS_GUARD_TRIGGERS: [&str; 2] =

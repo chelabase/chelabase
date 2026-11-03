@@ -316,7 +316,7 @@ export type AuthEvent = "signed_in" | "signed_out" | "refreshed";
 export type SignUpData<DB extends DatabaseShape> = DB extends {
   appUsers: { schema: infer S extends string; table: infer T extends string };
 }
-  ? Omit<DB["schemas"][S]["tables"][T]["Insert"], "id" | "email" | "email_verified" | "created_at" | "deleted_at">
+  ? Omit<DB["schemas"][S]["tables"][T]["Insert"], "id" | "email" | "email_verified" | "created_at" | "deleted_at" | "banned_at">
   : Record<string, Json>;
 
 /** `S` is what the session flows return: `Session`, or `BrowserSession` in the browser client. */

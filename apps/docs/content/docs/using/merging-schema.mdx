@@ -384,7 +384,7 @@ Some objects are Chelabase's own, or are kept in line by it. A merge never moves
 
 - **Chelabase's schemas:** `chelabase` (the data API's) and `chelabase_merge` (the merge's own recovery marker), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
 - **The app users table's managed parts:**
-  - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`);
+  - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`);
   - the guard triggers and the two own-row policies (`chelabase_users_select_own`, `chelabase_users_update_own`);
   - the email index (`chelabase_users_email_key`);
   - the table's grants to `authenticated` and `chelabase_auth_sync`.

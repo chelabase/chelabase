@@ -219,6 +219,9 @@ pub struct FakeState {
     /// A concurrent bootstrap that wins the next claim: `(pg_database, sealed)` is stored just
     /// before it.
     pub auth_sync_racer: Option<(String, String)>,
+    /// Applied once, just after the next `project_auth` read answers: the row moves to this
+    /// status, or goes (`None`), as a concurrent job would.
+    pub after_auth_read: Option<Option<AppUsersStatus>>,
     pub app_sessions: Vec<AppSession>,
     /// The schema merge base history, oldest first (E18); ids increase with each append.
     pub schema_bases: Vec<SchemaBase>,
@@ -2791,7 +2794,20 @@ impl WorkerMetadata for FakeMetadata {
     }
 
     async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
-        Ok(self.read("project_auth")?.project_auth.get(&project).cloned())
+        let mut state = self.write("project_auth")?;
+        let found = state.project_auth.get(&project).cloned();
+        match state.after_auth_read.take() {
+            Some(Some(status)) => {
+                if let Some(row) = state.project_auth.get_mut(&project) {
+                    row.status = status;
+                }
+            }
+            Some(None) => {
+                state.project_auth.remove(&project);
+            }
+            None => {}
+        }
+        Ok(found)
     }
 
     async fn app_auth_for_database(
@@ -2850,6 +2866,18 @@ impl WorkerMetadata for FakeMetadata {
     async fn delete_project_auth(&self, project: ProjectId) -> Result<(), MetadataError> {
         self.write("delete_project_auth")?.project_auth.remove(&project);
         Ok(())
+    }
+
+    async fn finish_disable_app_users(&self, project: ProjectId) -> Result<bool, MetadataError> {
+        let mut state = self.write("finish_disable_app_users")?;
+        let disabling = state
+            .project_auth
+            .get(&project)
+            .is_some_and(|a| a.status == AppUsersStatus::Disabling);
+        if disabling {
+            state.project_auth.remove(&project);
+        }
+        Ok(disabling)
     }
 
     async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {

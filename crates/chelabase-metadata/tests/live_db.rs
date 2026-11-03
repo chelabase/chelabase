@@ -5735,6 +5735,33 @@ async fn finish_project_delete_cleans_up() {
     assert_eq!(again.slug, slug, "the slug is free again");
 }
 
+/// S1 (#120): the end of a disable takes only a `disabling` row, so a duplicate disable can't
+/// delete the row of an enable that started since. The project's own delete takes any row.
+#[tokio::test]
+#[ignore]
+async fn finish_disable_takes_only_a_disabling_row() {
+    let _sealed = sealed_lock().await;
+    let client = client().await;
+    let project = new_project(&client, "disable").await;
+    let db = ready_database_in(&client, project).await;
+    let auth = new_auth(project, db);
+
+    client.begin_enable_app_users(&auth).await.unwrap();
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "enabling");
+    assert_eq!(auth_status(&client, project).await, Some(AppUsersStatus::Enabling));
+    assert!(client.finish_enable_app_users(project, Ok(())).await.unwrap());
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "enabled");
+
+    assert!(client.begin_disable_app_users(project).await.unwrap());
+    assert!(client.finish_disable_app_users(project).await.unwrap());
+    assert_eq!(auth_status(&client, project).await, None);
+    assert!(!client.finish_disable_app_users(project).await.unwrap(), "gone");
+
+    client.begin_enable_app_users(&auth).await.unwrap();
+    client.delete_project_auth(project).await.unwrap();
+    assert_eq!(auth_status(&client, project).await, None);
+}
+
 #[tokio::test]
 #[ignore]
 async fn enable_app_users_start_retry_exists() {

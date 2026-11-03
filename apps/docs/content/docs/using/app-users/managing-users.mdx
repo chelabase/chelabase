@@ -35,15 +35,17 @@ Each user has a `state`: `active` or `inactive` (deactivated: it can't sign in).
 
 `PATCH` takes `email` and `email_verified`, at least one. A password can't be changed here; sending `password` is a 422.
 
-
-- a new `email` is verified unless `email_verified` is `false`, and ends the user's sessions;
+- a new `email` is verified unless `email_verified` is `false`;
+- any `email`, even the address the user already has, ends the user's sessions;
 - `email_verified: true` alone marks the current address verified; `false` alone is refused for an address that is already verified.
 
 The users table follows through the sync.
 
+A 5xx for a new address can mean the address changed but the sessions didn't all end. Send the same request again: it ends them.
+
 ## Deactivate and sessions
 
-Deactivating a user bans them: sign-in stops and their sessions end. The sessions end first, so a 503 `identity_unavailable` from a deactivate or delete still ended them. Reactivating lets them sign in again. Listing sessions returns the live (not revoked) sessions, oldest first, with their creation, last-use and expiry times, never a token. **Sign out everywhere** revokes them all; the data API stops accepting the user's access tokens within 30 seconds.
+Deactivating a user bans them: sign-in stops and their sessions end. The sessions end first, so a 503 `identity_unavailable` from a deactivate or delete still ended them, even when the identity service isn't configured. The users table's `banned_at` is set on every branch, so your policies can read it, and cleared when they are reactivated. Reactivating lets them sign in again. Listing sessions returns the live (not revoked) sessions, oldest first, with their creation, last-use and expiry times, never a token. **Sign out everywhere** revokes them all; the data API stops accepting the user's access tokens within 30 seconds.
 
 ## Delete
 
