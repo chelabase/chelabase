@@ -1,7 +1,7 @@
 //! The storage sweep (object-storage m8): its rules on a hand-made source, the worker's
 //! reads through the fakes, and a model of random branch histories.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -12,8 +12,8 @@ use chelabase_types::{BranchId, DatabaseId};
 use uuid::Uuid;
 
 use crate::storage_sweep::{
-    DATABASES_SQL, SweepBranch, SweepDatabase, SweepReport, SweepSettings, SweepSource,
-    parse_databases, parse_references, references_sql, sweep_database,
+    BranchRead, DATABASES_SQL, ReadError, SweepBranch, SweepDatabase, SweepReport, SweepSettings,
+    SweepSource, parse_databases, parse_references, references_sql, sweep_database,
 };
 
 const GRACE: Duration = Duration::from_secs(1000);
@@ -44,6 +44,12 @@ struct State {
     expired: Vec<BranchId>,
     /// The databases' clock (Postgres `clock_timestamp()`); `pass` sets it to the store's.
     clock: Option<SystemTime>,
+    /// Each new timeline's branch point (missing: unknown).
+    points: HashMap<String, SystemTime>,
+    /// Upload ids live sessions name.
+    live_uploads: HashSet<String>,
+    /// Every read is refused (a closed database).
+    closed: bool,
 }
 
 fn branch(kind: BranchKind) -> SweepBranch {
@@ -70,6 +76,9 @@ impl Source {
                 during: None,
                 expired: Vec::new(),
                 clock: None,
+                points: HashMap::new(),
+                live_uploads: HashSet::new(),
+                closed: false,
             }),
         }
     }
@@ -94,7 +103,8 @@ impl SweepSource for Source {
         _db: DatabaseId,
         b: &SweepBranch,
         expire: bool,
-    ) -> Result<(HashSet<Uuid>, u64), String> {
+        _open: &[String],
+    ) -> Result<BranchRead, ReadError> {
         let mut st = self.st();
         if let Some(during) = st.during.take() {
             during(&mut st);
@@ -102,11 +112,31 @@ impl SweepSource for Source {
         if expire {
             st.expired.push(b.id);
         }
+        if st.closed {
+            return Err(ReadError::Refused(
+                "database \"x\" doesn't take connections".into(),
+            ));
+        }
         match st.branches.iter().find(|(x, _, _)| x.id == b.id) {
             Some((_, _, true)) => Err("compute unreachable".into()),
-            Some((_, refs, _)) => Ok((refs.clone(), 0)),
+            Some((x, refs, _)) => Ok(BranchRead {
+                versions: refs.clone(),
+                timelines: x.timeline.iter().cloned().collect(),
+                clock: st.clock,
+                live_uploads: st.live_uploads.clone(),
+                ..BranchRead::default()
+            }),
             None => Err("no such branch".into()),
         }
+    }
+
+    async fn branch_point(
+        &self,
+        _db: DatabaseId,
+        timeline: &str,
+        _recorded: &BTreeSet<String>,
+    ) -> Result<Option<SystemTime>, String> {
+        Ok(self.st().points.get(timeline).copied())
     }
 }
 
@@ -179,13 +209,235 @@ async fn audit_a_store_clock_jump_does_not_collapse_the_mark_wait() {
     // 100 s of the databases' time; two days of the store's.
     src.st().clock = Some(at(GRACE.as_secs() + 100));
     store.set_now(at(GRACE.as_secs() + 2 * 86_400));
-    let r = sweep_database(&src, &store, src.db, GRACE, false).await.unwrap();
+    let r = sweep_database(&src, &store, src.db, GRACE, false)
+        .await
+        .unwrap();
     assert_eq!(r.deleted, 0, "{r:?}");
     assert!(r.blocked.is_some(), "{r:?}");
     assert!(exists(&store, &orphan).await);
     // The same leap with the databases agreeing (and real time passing) is a normal pass.
     store.set_now(at(GRACE.as_secs()) + Duration::from_secs(5000));
     assert_eq!(pass(&src, &store).await.deleted, 1);
+}
+
+/// Audit S1: both clocks near each other now, but the store's ran far ahead of the databases'
+/// since the last pass.
+#[tokio::test]
+async fn sweep_refuses_a_store_clock_that_outran_the_databases() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    pass(&src, &store).await;
+    // Back in step only through a databases' clock jump of its own: 100 days of the store's
+    // since the last pass, against a recorded 10 days of the databases'.
+    let last = format!("_sweep/{}/last-pass", src.db);
+    let body = format!(
+        r#"{{"store":{},"databases":{}}}"#,
+        secs(at(0)),
+        secs(at(90 * 86_400))
+    );
+    store
+        .put(&last, body.into(), PutOptions::default())
+        .await
+        .unwrap();
+    store.set_now(at(100 * 86_400));
+    let r = pass(&src, &store).await;
+    assert!(
+        r.refused && r.blocked.as_deref().is_some_and(|w| w.contains("ran")),
+        "{r:?}"
+    );
+}
+
+fn secs(t: SystemTime) -> f64 {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
+
+/// Audit S2: a damaged record refuses the pass (no error to retry forever).
+#[tokio::test]
+async fn sweep_refuses_a_damaged_record() {
+    for record in ["timelines", "last-pass"] {
+        let store = MemoryStore::default();
+        let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+        store
+            .put(
+                &format!("_sweep/{}/{record}", src.db),
+                Bytes::from_static(b"{nope"),
+                PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let r = pass(&src, &store).await;
+        assert!(
+            r.refused && r.blocked.as_deref().is_some_and(|w| w.contains("damaged")),
+            "{r:?}"
+        );
+    }
+}
+
+/// Audit S7: a new timeline voids only the marks made after its branch point (less the skew
+/// margin): a branch at head voids nothing older, one at a past point voids what came after.
+#[tokio::test]
+async fn sweep_voids_only_the_marks_after_a_branch_point() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let k = blob(&store, src.db, Uuid::new_v4()).await;
+    store.set_now(at(10_000));
+    assert_eq!(pass(&src, &store).await.marked, 1);
+    // A branch at head, more than the skew margin after the mark.
+    let head = branch(BranchKind::Normal);
+    src.st()
+        .points
+        .insert(head.timeline.clone().unwrap(), at(13_700));
+    src.st().branches.push((head, HashSet::new(), false));
+    store.set_now(at(13_900));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.marks_cleared, r.waiting), (0, 1), "{r:?}");
+    // A branch at a point before the mark's margin ended: it may hold the version.
+    let past = branch(BranchKind::Normal);
+    src.st()
+        .points
+        .insert(past.timeline.clone().unwrap(), at(13_000));
+    src.st().branches.push((past, HashSet::new(), false));
+    store.set_now(at(13_950));
+    let r = pass(&src, &store).await;
+    assert_eq!((r.marks_cleared, r.marked, r.deleted), (1, 1, 0), "{r:?}");
+    assert!(exists(&store, &k).await);
+}
+
+/// m7: an open upload a live session names is never aborted, however old; the others are.
+#[tokio::test]
+async fn sweep_keeps_uploads_of_live_sessions() {
+    let store = MemoryStore::default();
+    let src = Source::new(vec![(branch(BranchKind::Normal), vec![])]);
+    store.set_now(at(0));
+    let live = store
+        .multipart_create(&format!("{}/16384/{}", src.db, Uuid::new_v4()), None)
+        .await
+        .unwrap();
+    store
+        .multipart_create(&format!("{}/16384/{}", src.db, Uuid::new_v4()), None)
+        .await
+        .unwrap();
+    src.st().live_uploads.insert(live.clone());
+    store.set_now(at(5 * GRACE.as_secs()));
+    assert_eq!(pass(&src, &store).await.uploads_aborted, 1);
+    let open = store.list_uploads("").await.unwrap();
+    assert_eq!(open.len(), 1);
+    assert_eq!(open[0].upload_id, live);
+}
+
+/// A store whose listing ignores the prefix, as audit S9 fears.
+struct LeakyStore(MemoryStore);
+
+#[async_trait::async_trait]
+impl ObjectStore for LeakyStore {
+    async fn multipart_part_copy(
+        &self,
+        k: &str,
+        u: &str,
+        n: u32,
+        s: &str,
+        r: std::ops::Range<u64>,
+    ) -> Result<String, chelabase_storage::StorageError> {
+        self.0.multipart_part_copy(k, u, n, s, r).await
+    }
+    async fn put(
+        &self,
+        k: &str,
+        b: Bytes,
+        o: PutOptions,
+    ) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.0.put(k, b, o).await
+    }
+    async fn get(
+        &self,
+        k: &str,
+        r: Option<chelabase_storage::ByteRange>,
+    ) -> Result<chelabase_storage::GetObject, chelabase_storage::StorageError> {
+        self.0.get(k, r).await
+    }
+    async fn head(
+        &self,
+        k: &str,
+    ) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.0.head(k).await
+    }
+    async fn delete(&self, k: &str) -> Result<(), chelabase_storage::StorageError> {
+        self.0.delete(k).await
+    }
+    async fn copy(
+        &self,
+        s: &str,
+        d: &str,
+    ) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.0.copy(s, d).await
+    }
+    async fn list(
+        &self,
+        _p: &str,
+    ) -> Result<Vec<chelabase_storage::ObjectMeta>, chelabase_storage::StorageError> {
+        self.0.list("").await
+    }
+    async fn multipart_create(
+        &self,
+        k: &str,
+        c: Option<&str>,
+    ) -> Result<String, chelabase_storage::StorageError> {
+        self.0.multipart_create(k, c).await
+    }
+    async fn multipart_part(
+        &self,
+        k: &str,
+        u: &str,
+        n: u32,
+        b: Bytes,
+    ) -> Result<String, chelabase_storage::StorageError> {
+        self.0.multipart_part(k, u, n, b).await
+    }
+    async fn multipart_complete(
+        &self,
+        k: &str,
+        u: &str,
+        p: Vec<chelabase_storage::CompletedPart>,
+    ) -> Result<chelabase_storage::ObjectMeta, chelabase_storage::StorageError> {
+        self.0.multipart_complete(k, u, p).await
+    }
+    async fn multipart_abort(
+        &self,
+        k: &str,
+        u: &str,
+    ) -> Result<(), chelabase_storage::StorageError> {
+        self.0.multipart_abort(k, u).await
+    }
+    async fn list_uploads(
+        &self,
+        _p: &str,
+    ) -> Result<Vec<chelabase_storage::OpenUpload>, chelabase_storage::StorageError> {
+        self.0.list_uploads("").await
+    }
+}
+
+/// Audit S9: a purge never touches a key outside its prefix, whatever a listing returns.
+#[tokio::test]
+async fn sweep_purge_stays_inside_its_prefix() {
+    let store = LeakyStore(MemoryStore::default());
+    let src = Source::new(vec![]);
+    let theirs = format!("{}/16384/{}", DatabaseId::new(), Uuid::new_v4());
+    store
+        .0
+        .put(&theirs, Bytes::new(), PutOptions::default())
+        .await
+        .unwrap();
+    src.st().status = DatabaseStatus::Deleted;
+    assert!(
+        sweep_database(&src, &store, src.db, GRACE, false)
+            .await
+            .is_err()
+    );
+    assert!(exists(&store.0, &theirs).await);
 }
 
 /// Audit N1: a mark older than its blob (a key written again) is not the blob's wait.
@@ -366,6 +618,7 @@ async fn sweep_dry_run_deletes_nothing() {
     let before = store.list("").await.unwrap();
     src.st().expired.clear();
     store.set_now(at(100_000));
+    src.st().clock = Some(store.now());
     let r = sweep_database(&src, &store, src.db, GRACE, true)
         .await
         .unwrap();
@@ -499,23 +752,59 @@ async fn sweep_leaves_unknown_keys_alone() {
 #[test]
 fn sweep_reads_parse_only_whole_answers() {
     let v = Uuid::new_v4();
-    let (refs, tickets) = parse_references(&format!("SET\nt|3\nv|{v}\nend\n")).unwrap();
-    assert_eq!((refs, tickets), ([v].into(), 3));
+    let read = parse_references(&format!(
+        "SET\ntl|abc\nt|3\nt|1\nv|{v}\nu|{}\nend\n",
+        hex::encode("up 1")
+    ))
+    .unwrap();
+    assert_eq!(read.versions, [v].into());
+    assert_eq!(read.deleted_rows, 4);
+    assert_eq!(read.timelines, ["abc".to_string()].into());
+    assert_eq!(read.live_uploads, ["up 1".to_string()].into());
+    // Audit S5: Chelabase's schema without a required table refuses the pass.
+    assert!(matches!(
+        parse_references("tl|abc\nmissing|upload_tickets\nend"),
+        Err(ReadError::Refused(e)) if e.contains("storage.upload_tickets")
+    ));
     assert!(parse_references(&format!("v|{v}\n")).is_err(), "cut off");
     assert!(parse_references("v|nope\nend").is_err());
+    let (dbs, clock) = parse_databases(&format!(
+        "d|{}|t\nd|{}|f\nc|1000000000.5\nend",
+        hex::encode("app"),
+        hex::encode("a|b\nc")
+    ))
+    .unwrap();
     assert_eq!(
-        parse_databases(&format!(
-            "d|{}\nd|{}\nend",
-            hex::encode("app"),
-            hex::encode("a|b\nc")
-        ))
-        .unwrap(),
-        ["app", "a|b\nc"]
+        dbs,
+        [("app".to_string(), true), ("a|b\nc".to_string(), false)]
+    );
+    assert_eq!(
+        clock,
+        SystemTime::UNIX_EPOCH + Duration::from_secs_f64(1_000_000_000.5)
     );
     assert!(parse_databases("").is_err());
-    assert!(references_sql(true).contains("DELETE FROM storage.upload_tickets"));
-    assert!(!references_sql(false).contains("DELETE"));
-    for sql in [references_sql(true), DATABASES_SQL.to_string()] {
+    assert!(parse_databases("d|61|t\nend").is_err(), "no clock");
+    // Audit B1: templates are read, only template0 is left out; closed ones are named.
+    assert!(DATABASES_SQL.contains("WHERE datname <> 'template0'"));
+    assert!(!DATABASES_SQL.contains("datistemplate"));
+    let open = ["u-1".to_string()];
+    let sql = references_sql(true, &open);
+    assert!(sql.contains("DELETE FROM storage.upload_tickets"));
+    // Audit S5 and m7: each table read only where it exists; expired sessions deleted as
+    // the storage role, never one whose upload is still open.
+    for needle in [
+        "\\if :cb_objects",
+        "\\if :cb_tickets",
+        "\\if :cb_sessions",
+        "SET LOCAL ROLE chelabase_storage;\nWITH d AS (DELETE FROM storage.upload_sessions s WHERE s.expires_at <= clock_timestamp()",
+        &format!("ARRAY['{}']::text[]", hex::encode("u-1")),
+        "SELECT 'tl|' || coalesce(current_setting('neon.timeline_id', true), '');",
+        "WHERE expires_at > clock_timestamp();",
+    ] {
+        assert!(sql.contains(needle), "{needle}");
+    }
+    assert!(!references_sql(false, &open).contains("DELETE"));
+    for sql in [references_sql(true, &[]), DATABASES_SQL.to_string()] {
         assert!(sql.starts_with("SET search_path = pg_catalog, pg_temp;"));
         assert!(sql.ends_with("SELECT 'end';"));
     }
@@ -568,19 +857,29 @@ mod worker_reads {
     use crate::fakes::{ready_branch, ready_database, restored_by_hand, worker};
     use chelabase_nats::BranchJob;
 
-    fn refs(vs: &[Uuid]) -> String {
-        let mut out: String = vs.iter().map(|v| format!("v|{v}\n")).collect();
+    fn refs(timeline: &str, vs: &[Uuid]) -> String {
+        let mut out = format!("tl|{timeline}\n");
+        out.extend(vs.iter().map(|v| format!("v|{v}\n")));
         out.push_str("end\n");
         out
     }
 
-    fn databases(names: &[&str]) -> String {
+    /// The databases answer, with the compute's clock at `now`.
+    fn databases(names: &[&str], now: SystemTime) -> String {
         let mut out: String = names
             .iter()
-            .map(|n| format!("d|{}\n", hex::encode(n)))
+            .map(|n| format!("d|{}|t\n", hex::encode(n)))
             .collect();
-        out.push_str("end\n");
+        let secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        out.push_str(&format!("c|{secs}\nend\n"));
         out
+    }
+
+    fn timeline(w: &crate::fakes::FakeWorker, b: BranchId) -> String {
+        w.metadata.branch(b).timeline_id.unwrap()
     }
 
     /// An object in the branch's second database survives, as does one only a backup (read
@@ -592,18 +891,32 @@ mod worker_reads {
         w.blob_store = Some(store.clone());
         let db = ready_database(&w).await;
         let main = w.metadata.main(db);
-        restored_by_hand(&w, main.id, "before");
+        let backup = restored_by_hand(&w, main.id, "before");
         let ep = w.metadata.main(db).endpoint_id.clone().unwrap();
+        let (main_tl, backup_tl) = (timeline(&w, main.id), timeline(&w, backup));
         let (in_other, in_backup, orphan) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        w.computes
-            .answer("datallowconn", &databases(&["app", "other"]));
-        w.computes
-            .answer_at(&ep, "chelabase_storage_here", &refs(&[]));
-        w.computes
-            .answer_in("other", "chelabase_storage_here", &refs(&[in_other]));
-        // Everything else (the backup's static compute) answers with the backup's references.
-        w.computes
-            .answer("chelabase_storage_here", &refs(&[in_backup]));
+        let answer = |now: SystemTime| {
+            w.computes.answers_at.lock().unwrap().clear();
+            w.computes.answers.lock().unwrap().clear();
+            w.computes.answers_in.lock().unwrap().clear();
+            w.computes
+                .answer_at(&ep, "datallowconn", &databases(&["app", "other"], now));
+            // Everything else (the backup's static compute) has its own database.
+            w.computes
+                .answer("datallowconn", &databases(&["kept"], now));
+            w.computes
+                .answer_in("app", "chelabase_storage_here", &refs(&main_tl, &[]));
+            w.computes.answer_in(
+                "other",
+                "chelabase_storage_here",
+                &refs(&main_tl, &[in_other]),
+            );
+            w.computes.answer_in(
+                "kept",
+                "chelabase_storage_here",
+                &refs(&backup_tl, &[in_backup]),
+            );
+        };
         store.set_now(at(0));
         let keys = [
             blob(&store, db, in_other).await,
@@ -611,6 +924,7 @@ mod worker_reads {
             blob(&store, db, orphan).await,
         ];
         store.set_now(at(86_400 * 40));
+        answer(at(86_400 * 40));
         w.computes.sql.lock().unwrap().clear();
         let grace = Duration::from_secs(60);
         let r = sweep_database(&w, store.as_ref(), db, grace, false)
@@ -637,8 +951,10 @@ mod worker_reads {
             w.metadata.endpoint_ids().iter().all(|e| *e == ep),
             "the static compute's row went"
         );
-        // A mark later (past the history window, 7 days by default), only the orphan goes.
+        // A mark later (past the history window, Neon's 7 days when unset), only the orphan
+        // goes.
         store.set_now(at(86_400 * 60));
+        answer(at(86_400 * 60));
         let r = sweep_database(&w, store.as_ref(), db, grace, false)
             .await
             .unwrap();
@@ -647,27 +963,85 @@ mod worker_reads {
         assert!(!exists(&store, &keys[2]).await);
     }
 
-    /// A branch whose compute doesn't answer stops the pass.
+    /// Audit B1: a database that doesn't take connections can't be read: the pass is refused
+    /// and counted.
     #[tokio::test]
-    async fn sweep_stops_on_a_compute_that_fails() {
+    async fn sweep_refuses_a_database_closed_to_connections() {
         let (mut w, _journal) = worker();
         let store = Arc::new(MemoryStore::default());
         w.blob_store = Some(store.clone());
         let db = ready_database(&w).await;
         let main = w.metadata.main(db);
-        let dev = ready_branch(&w, db, "dev", main.id).await;
-        w.computes.answer("datallowconn", &databases(&["app"]));
-        w.computes.answer("chelabase_storage_here", &refs(&[]));
-        let dev_ep = w.metadata.branch(dev).endpoint_id.unwrap();
-        w.computes.answer_at(&dev_ep, "chelabase_storage_here", "");
+        let now = SystemTime::now();
+        let secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        w.computes.answer(
+            "datallowconn",
+            &format!(
+                "d|{}|t\nd|{}|f\nc|{secs}\nend\n",
+                hex::encode("app"),
+                hex::encode("shut")
+            ),
+        );
+        w.computes
+            .answer("chelabase_storage_here", &refs(&timeline(&w, main.id), &[]));
         let r = sweep_database(&w, store.as_ref(), db, GRACE, false)
             .await
             .unwrap();
-        let why = r.blocked.expect("blocked");
-        assert!(
-            why.contains(&dev.to_string()) && why.contains("didn't finish"),
-            "{why}"
+        let why = r.blocked.clone().expect("refused");
+        assert!(why.contains("\"shut\"") && r.refused, "{r:?}");
+        w.handle_storage_sweep(db).await.unwrap();
+        assert_eq!(
+            w.storage_sweep_refusals
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
+    }
+
+    /// Audit S4: a compute serving another timeline than its branch's is refused.
+    #[tokio::test]
+    async fn sweep_refuses_a_compute_on_the_wrong_timeline() {
+        let (mut w, _journal) = worker();
+        let store = Arc::new(MemoryStore::default());
+        w.blob_store = Some(store.clone());
+        let db = ready_database(&w).await;
+        w.computes
+            .answer("datallowconn", &databases(&["app"], SystemTime::now()));
+        w.computes.answer(
+            "chelabase_storage_here",
+            &refs("0123456789abcdef0123456789abcdef", &[]),
+        );
+        let r = sweep_database(&w, store.as_ref(), db, GRACE, false)
+            .await
+            .unwrap();
+        let why = r.blocked.clone().expect("refused");
+        assert!(why.contains("serves timeline") && r.refused, "{r:?}");
+    }
+
+    /// Audit S7: a timeline branched from a recorded one at P voids only the marks made after
+    /// P (less the skew margin), read through Neon's ancestry and the point's time.
+    #[tokio::test]
+    async fn sweep_branch_points_come_from_neons_ancestry() {
+        let (w, _journal) = worker();
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db);
+        let dev = ready_branch(&w, db, "dev", main.id).await;
+        let (main_tl, dev_tl) = (timeline(&w, main.id), timeline(&w, dev));
+        let when = chrono::Utc::now() - chrono::Duration::days(3);
+        *w.storage.timestamp_at.lock().unwrap() = Some(when);
+        let recorded: BTreeSet<String> = [main_tl.clone()].into();
+        assert_eq!(
+            w.branch_point(db, &dev_tl, &recorded).await.unwrap(),
+            Some(SystemTime::from(when))
+        );
+        // No recorded ancestor: unknown.
+        assert_eq!(
+            w.branch_point(db, &dev_tl, &BTreeSet::new()).await.unwrap(),
+            None
+        );
+        assert_eq!(w.branch_point(db, &main_tl, &recorded).await.unwrap(), None);
     }
 
     /// A branch delete queues a sweep of its database; a database delete too.
@@ -700,8 +1074,10 @@ mod worker_reads {
         w.blob_store = Some(store.clone());
         let db = ready_database(&w).await;
         let main = w.metadata.main(db);
-        w.computes.answer("datallowconn", &databases(&["app"]));
-        w.computes.answer("chelabase_storage_here", &refs(&[]));
+        w.computes
+            .answer("datallowconn", &databases(&["app"], SystemTime::now()));
+        w.computes
+            .answer("chelabase_storage_here", &refs(&timeline(&w, main.id), &[]));
         w.handle_storage_sweep(db).await.unwrap();
         assert_eq!(w.storage_sweep_refusals.load(Relaxed), 0);
         w.metadata
@@ -727,12 +1103,66 @@ mod worker_reads {
         w.handle_delete(db).await.unwrap();
         assert_eq!(w.sweep_requests.sent(), [db]);
         w.queue_storage_sweeps().await.unwrap();
-        assert_eq!(w.sweep_requests.sent(), [db, db], "the periodic job forgot the deleted database");
+        assert_eq!(
+            w.sweep_requests.sent(),
+            [db, db],
+            "the periodic job forgot the deleted database"
+        );
         // Once purged, it isn't queued any more.
         w.handle_storage_sweep(db).await.unwrap();
         assert!(store.list(&format!("{db}/")).await.unwrap().is_empty());
         w.queue_storage_sweeps().await.unwrap();
         assert_eq!(w.sweep_requests.sent(), [db, db]);
+    }
+
+    /// Audit S2: a failing job is retried a few times, then dropped and counted.
+    #[tokio::test]
+    async fn sweep_jobs_stop_retrying_after_their_attempts() {
+        use crate::storage_sweep::SWEEP_ATTEMPTS;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut w, _journal) = worker();
+        w.blob_store = Some(Arc::new(MemoryStore::default()));
+        let db = ready_database(&w).await;
+        w.metadata
+            .state()
+            .databases
+            .get_mut(&db)
+            .unwrap()
+            .neon_tenant_id = None;
+        assert!(w.handle_storage_sweep_attempt(db, 1).await.is_err());
+        assert_eq!(w.storage_sweep_refusals.load(Relaxed), 0);
+        w.handle_storage_sweep_attempt(db, SWEEP_ATTEMPTS)
+            .await
+            .unwrap();
+        assert_eq!(w.storage_sweep_refusals.load(Relaxed), 1);
+    }
+
+    /// Audit B2: periodic ids name the period, a delete's request is a purge, an event's is
+    /// its own.
+    #[tokio::test]
+    async fn sweep_requests_carry_their_cause() {
+        use crate::storage_sweep::SweepCause;
+        let (w, _journal) = worker();
+        let db = ready_database(&w).await;
+        let main = w.metadata.main(db);
+        let dev = ready_branch(&w, db, "dev", main.id).await;
+        w.handle_branch_job(BranchJob::Delete { branch_id: dev })
+            .await
+            .unwrap();
+        w.queue_storage_sweeps().await.unwrap();
+        w.handle_delete(db).await.unwrap();
+        let causes = w.sweep_requests.causes();
+        assert!(
+            matches!(causes[0], (d, SweepCause::Event(_)) if d == db),
+            "{causes:?}"
+        );
+        assert!(
+            matches!(causes[1], (d, SweepCause::Period(_)) if d == db),
+            "{causes:?}"
+        );
+        assert_eq!(causes[2], (db, SweepCause::Purge));
+        assert_eq!(SweepCause::Purge.tag(), "purge");
+        assert_eq!(SweepCause::Period(7).tag(), "7");
     }
 
     /// Two sweeps of one database never overlap: the second waits for the lock.
@@ -742,7 +1172,8 @@ mod worker_reads {
         let store = Arc::new(MemoryStore::default());
         w.blob_store = Some(store.clone());
         let db = ready_database(&w).await;
-        w.computes.answer("datallowconn", &databases(&[]));
+        w.computes
+            .answer("datallowconn", &databases(&[], SystemTime::now()));
         use crate::ports::WorkerMetadata;
         let held = w
             .metadata
@@ -790,6 +1221,9 @@ struct Timeline {
     history: Vec<(u64, HashSet<Uuid>)>,
 }
 
+/// Each timeline ever made: the one it branched off and when (Neon's ancestry).
+type Ancestry = HashMap<String, Option<(String, u64)>>;
+
 impl Timeline {
     fn at(&self, t: u64) -> HashSet<Uuid> {
         self.history
@@ -816,10 +1250,12 @@ struct World {
     in_flight: Vec<(BranchId, Uuid, u64)>,
     db: DatabaseId,
     ops: Vec<String>,
+    ancestry: Ancestry,
 }
 
-const M_GRACE: u64 = 1000;
-const M_RETENTION: u64 = 3000;
+// Far above the sweep's one-hour skew margin, so marks older than a branch point survive.
+const M_GRACE: u64 = 20_000;
+const M_RETENTION: u64 = 60_000;
 /// A ticket's life: an upload's row comes within it of its blob.
 const M_TICKET: u64 = 300;
 
@@ -831,6 +1267,13 @@ fn new_timeline(now: u64, state: HashSet<Uuid>) -> Timeline {
 }
 
 impl World {
+    /// A new timeline holding `state`, branched off `parent` at a point.
+    fn fresh(&mut self, state: HashSet<Uuid>, parent: Option<(String, u64)>) -> Timeline {
+        let tl = new_timeline(self.now, state);
+        self.ancestry.insert(tl.id.clone(), parent);
+        tl
+    }
+
     fn set(&mut self, i: usize, f: impl FnOnce(&mut HashSet<Uuid>)) {
         let now = self.now;
         let tl = &mut self.branches[i].tl;
@@ -871,7 +1314,11 @@ impl World {
         let live = self.live();
         let pick = live[self.rng.below(live.len() as u64) as usize];
         let id = self.branches[pick].id;
-        let op = self.rng.below(if mid_pass { 6 } else { 10 });
+        let op = if mid_pass {
+            [0, 1, 2, 3, 4, 5, 8][self.rng.below(7) as usize]
+        } else {
+            self.rng.below(11)
+        };
         self.ops.push(format!("t={} op={op} on {pick}", self.now));
         match op {
             // An upload: the blob, then (later, within a ticket's life) its row.
@@ -901,11 +1348,11 @@ impl World {
             3 => {
                 let tl = self.branches[pick].tl.clone();
                 let t = self.point(&tl);
-                let state = tl.at(t);
+                let tl = self.fresh(tl.at(t), Some((tl.id.clone(), t)));
                 self.branches.push(ModelBranch {
                     id: BranchId::new(),
                     kind: BranchKind::Normal,
-                    tl: new_timeline(self.now, state),
+                    tl,
                 });
             }
             // A point-in-time restore: the old timeline becomes a backup.
@@ -917,7 +1364,7 @@ impl World {
                     kind: BranchKind::Backup,
                     tl: tl.clone(),
                 });
-                self.branches[pick].tl = new_timeline(self.now, tl.at(t));
+                self.branches[pick].tl = self.fresh(tl.at(t), Some((tl.id.clone(), t)));
             }
             // A restore from a backup.
             5 => {
@@ -927,7 +1374,8 @@ impl World {
                 if let Some(&b) = backups.get(self.rng.below(backups.len().max(1) as u64) as usize)
                 {
                     let state = self.branches[b].tl.history.last().unwrap().1.clone();
-                    self.branches[pick].tl = new_timeline(self.now, state);
+                    let parent = Some((self.branches[b].tl.id.clone(), self.now));
+                    self.branches[pick].tl = self.fresh(state, parent);
                 }
             }
             // A branch or a backup deleted (never the last live branch).
@@ -940,9 +1388,24 @@ impl World {
             }
             // A row moves to another bucket: same version, nothing changes for references.
             7 => {}
-            // Time passes.
+            // A branch at head (audit S7: it voids no older mark).
+            8 => {
+                let tl = self.branches[pick].tl.clone();
+                let state = tl.history.last().unwrap().1.clone();
+                let tl = self.fresh(state, Some((tl.id, self.now)));
+                self.branches.push(ModelBranch {
+                    id: BranchId::new(),
+                    kind: BranchKind::Normal,
+                    tl,
+                });
+            }
+            // Time passes: a little (uploads finish) or a lot.
             _ => {
-                self.now += self.rng.below(2 * M_GRACE);
+                self.now += if self.rng.below(2) == 0 {
+                    self.rng.below(M_TICKET)
+                } else {
+                    self.rng.below(2 * M_GRACE)
+                };
                 store.set_now(at(self.now));
             }
         }
@@ -1003,7 +1466,8 @@ impl SweepSource for Model {
         _db: DatabaseId,
         b: &SweepBranch,
         _expire: bool,
-    ) -> Result<(HashSet<Uuid>, u64), String> {
+        _open: &[String],
+    ) -> Result<BranchRead, ReadError> {
         let mut w = self.world.lock().await;
         if w.rng.below(1000) < self.interleave.load(std::sync::atomic::Ordering::Relaxed) {
             w.step(&self.store, true).await;
@@ -1016,7 +1480,29 @@ impl SweepSource for Model {
         if found.tl.id.as_str() != b.timeline.as_deref().unwrap_or_default() {
             return Err("the branch moved to another timeline".into());
         }
-        Ok((found.tl.history.last().unwrap().1.clone(), 0))
+        Ok(BranchRead {
+            versions: found.tl.history.last().unwrap().1.clone(),
+            timelines: [found.tl.id.clone()].into(),
+            clock: Some(at(w.now)),
+            ..BranchRead::default()
+        })
+    }
+
+    async fn branch_point(
+        &self,
+        _db: DatabaseId,
+        timeline: &str,
+        recorded: &BTreeSet<String>,
+    ) -> Result<Option<SystemTime>, String> {
+        let w = self.world.lock().await;
+        let mut at_tl = timeline.to_string();
+        loop {
+            match w.ancestry.get(&at_tl).cloned().flatten() {
+                None => return Ok(None),
+                Some((parent, t)) if recorded.contains(&parent) => return Ok(Some(at(t))),
+                Some((parent, _)) => at_tl = parent,
+            }
+        }
     }
 }
 
@@ -1035,18 +1521,24 @@ async fn sweep_model_never_deletes_a_reachable_blob() {
             world: tokio::sync::Mutex::new(World {
                 now: 0,
                 rng: Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1),
-                branches: vec![ModelBranch {
-                    id: BranchId::new(),
-                    kind: BranchKind::Normal,
-                    tl: new_timeline(0, HashSet::new()),
-                }],
+                branches: Vec::new(),
                 in_flight: Vec::new(),
                 db: DatabaseId::new(),
                 ops: Vec::new(),
+                ancestry: Ancestry::new(),
             }),
             store: store.clone(),
             interleave: (if seed % 3 == 0 { 150 } else { 0 }).into(),
         };
+        {
+            let mut w = model.world.lock().await;
+            let tl = w.fresh(HashSet::new(), None);
+            w.branches.push(ModelBranch {
+                id: BranchId::new(),
+                kind: BranchKind::Normal,
+                tl,
+            });
+        }
         let db = model.world.lock().await.db;
         let check = |label: String, reachable: HashSet<Uuid>, ops: Vec<String>| {
             let store = store.clone();

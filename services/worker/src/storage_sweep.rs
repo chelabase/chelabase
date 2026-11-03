@@ -323,11 +323,15 @@ fn age(now: SystemTime, then: SystemTime) -> Duration {
 }
 
 fn apart(a: SystemTime, b: SystemTime) -> Duration {
-    a.duration_since(b).or_else(|_| b.duration_since(a)).unwrap_or_default()
+    a.duration_since(b)
+        .or_else(|_| b.duration_since(a))
+        .unwrap_or_default()
 }
 
 fn secs(t: SystemTime) -> f64 {
-    t.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn store_err(what: &str) -> impl Fn(StorageError) -> String + '_ {
@@ -461,7 +465,11 @@ struct LastPass {
 
 /// Whether the store's clock can be trusted this pass: near every database's, and not run
 /// ahead of them since the last pass by more than twice (plus [`MAX_SKEW`]).
-fn clock_refusal(now: SystemTime, clocks: &[SystemTime], last: Option<&LastPass>) -> Option<String> {
+fn clock_refusal(
+    now: SystemTime,
+    clocks: &[SystemTime],
+    last: Option<&LastPass>,
+) -> Option<String> {
     let Some(databases) = clocks.iter().max().copied() else {
         return Some("no database clock was read".into());
     };
@@ -599,7 +607,12 @@ pub async fn sweep_database<S: SweepSource>(
         for key in voided {
             marks.remove(&key);
             if !dry_run {
-                delete_under(store, &mark_prefix(db), &format!("{}{key}", mark_prefix(db))).await?;
+                delete_under(
+                    store,
+                    &mark_prefix(db),
+                    &format!("{}{key}", mark_prefix(db)),
+                )
+                .await?;
             }
         }
         if !dry_run {
@@ -658,10 +671,24 @@ pub async fn sweep_database<S: SweepSource>(
     for key in marks.keys() {
         report.marks_cleared += 1;
         if !dry_run {
-            delete_under(store, &mark_prefix(db), &format!("{}{key}", mark_prefix(db))).await?;
+            delete_under(
+                store,
+                &mark_prefix(db),
+                &format!("{}{key}", mark_prefix(db)),
+            )
+            .await?;
         }
     }
-    abort_old_uploads(store, db, &uploads, &found.live_uploads, now, grace, &mut report).await?;
+    abort_old_uploads(
+        store,
+        db,
+        &uploads,
+        &found.live_uploads,
+        now,
+        grace,
+        &mut report,
+    )
+    .await?;
     if !dry_run && let Some(databases) = found.clocks.iter().max() {
         let pass = LastPass {
             store: secs(now),
@@ -677,7 +704,10 @@ pub async fn sweep_database<S: SweepSource>(
 }
 
 /// The objects under `prefix`, by the rest of their key, with their times.
-async fn dated(store: &dyn ObjectStore, prefix: &str) -> Result<BTreeMap<String, SystemTime>, String> {
+async fn dated(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> Result<BTreeMap<String, SystemTime>, String> {
     Ok(store
         .list_dated(prefix)
         .await
@@ -703,7 +733,10 @@ async fn abort_old_uploads(
 ) -> Result<(), String> {
     let prefix = format!("{}uploads/", sweep_prefix(db));
     let mut marks = dated(store, &prefix).await?;
-    for upload in uploads.iter().filter(|u| u.key.starts_with(&blob_prefix(db))) {
+    for upload in uploads
+        .iter()
+        .filter(|u| u.key.starts_with(&blob_prefix(db)))
+    {
         let id = hex::encode(&upload.upload_id);
         let mark = marks.remove(&id);
         if live.contains(&upload.upload_id) {
@@ -712,7 +745,11 @@ async fn abort_old_uploads(
         let Some(began) = upload.initiated.or(mark) else {
             if !report.dry_run {
                 store
-                    .put(&format!("{prefix}{id}"), Bytes::new(), PutOptions::default())
+                    .put(
+                        &format!("{prefix}{id}"),
+                        Bytes::new(),
+                        PutOptions::default(),
+                    )
                     .await
                     .map_err(store_err("marking an upload"))?;
             }
@@ -748,7 +785,9 @@ fn version_of(rest: &str) -> Option<Uuid> {
 /// reaches another database's keys).
 async fn delete_under(store: &dyn ObjectStore, prefix: &str, key: &str) -> Result<(), String> {
     if !key.starts_with(prefix) || prefix.is_empty() {
-        return Err(format!("refusing to delete {key:?}: it isn't under {prefix:?}"));
+        return Err(format!(
+            "refusing to delete {key:?}: it isn't under {prefix:?}"
+        ));
     }
     store
         .delete(key)
@@ -763,7 +802,10 @@ async fn abort_under(
     upload: &chelabase_storage::OpenUpload,
 ) -> Result<(), String> {
     if !upload.key.starts_with(prefix) || prefix.is_empty() {
-        return Err(format!("refusing to abort {:?}: it isn't under {prefix:?}", upload.key));
+        return Err(format!(
+            "refusing to abort {:?}: it isn't under {prefix:?}",
+            upload.key
+        ));
     }
     match store.multipart_abort(&upload.key, &upload.upload_id).await {
         Ok(()) | Err(StorageError::NotFound) => Ok(()),
@@ -852,7 +894,10 @@ pub const REQUIRED_TABLES: [&str; 2] = ["objects", "upload_tickets"];
 /// (`t|count`). Ends with `end`, so a cut-off answer is never taken for a whole one.
 pub fn references_sql(expire: bool, open: &[String]) -> String {
     let (tickets, sessions) = if expire {
-        let open: Vec<String> = open.iter().map(|id| format!("'{}'", hex::encode(id))).collect();
+        let open: Vec<String> = open
+            .iter()
+            .map(|id| format!("'{}'", hex::encode(id)))
+            .collect();
         (
             "WITH d AS (DELETE FROM storage.upload_tickets t WHERE t.expires_at <= clock_timestamp() OR t.timeline_id IS DISTINCT FROM current_setting('neon.timeline_id', true) RETURNING 1) SELECT 't|' || count(*) FROM d;\n".to_string(),
             format!(
@@ -945,7 +990,10 @@ pub fn parse_references(out: &str) -> Result<BranchRead, ReadError> {
     }
     let versions = tagged(out, "v|")?
         .into_iter()
-        .map(|v| v.parse().map_err(|_| format!("a version {v:?} isn't a uuid")))
+        .map(|v| {
+            v.parse()
+                .map_err(|_| format!("a version {v:?} isn't a uuid"))
+        })
         .collect::<Result<_, String>>()?;
     let deleted_rows = tagged(out, "t|")?
         .into_iter()
@@ -1034,7 +1082,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         let Some(tenant) = self.tenant_of(db).await? else {
             return Ok(None);
         };
-        let mut at: NeonId = timeline.parse().map_err(|e| format!("timeline {timeline:?}: {e}"))?;
+        let mut at: NeonId = timeline
+            .parse()
+            .map_err(|e| format!("timeline {timeline:?}: {e}"))?;
         // Bounded: Neon's ancestry has no cycles, but a damaged answer must not loop forever.
         for _ in 0..64 {
             let Some((parent, lsn)) = self
@@ -1083,7 +1133,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                     .map_err(|e| format!("reading {db}: {e:#}"))
             }
         };
-        let (names, clock) = parse_databases(&read("postgres".into(), DATABASES_SQL.into()).await?)?;
+        let (names, clock) =
+            parse_databases(&read("postgres".into(), DATABASES_SQL.into()).await?)?;
         if let Some((name, _)) = names.iter().find(|(_, allow)| !allow) {
             return Err(ReadError::Refused(format!(
                 "database {name:?} doesn't take connections, so its objects can't be read"
@@ -1157,7 +1208,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
     /// Delivery `attempt` (1-based) of a `chelabase.storage_sweep` job. A failure is retried
     /// [`SWEEP_ATTEMPTS`] times, then dropped (warned and counted): the next period queues the
     /// database again, so a permanent error doesn't spin the one consumer.
-    pub async fn handle_storage_sweep_attempt(&self, db: DatabaseId, attempt: u64) -> Result<(), String> {
+    pub async fn handle_storage_sweep_attempt(
+        &self,
+        db: DatabaseId,
+        attempt: u64,
+    ) -> Result<(), String> {
         match self.handle_storage_sweep(db).await {
             Err(e) if attempt >= SWEEP_ATTEMPTS => {
                 let refusals = self.count_refusal();
@@ -1200,9 +1255,9 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
         // clock): the database's storage only grows meanwhile, so it's counted and named.
         if report.refused {
             let refusals = self.count_refusal();
-            let (branch, status) = report
-                .blocked_branch
-                .map_or((None, None), |(b, s)| (Some(b.to_string()), Some(s.as_str())));
+            let (branch, status) = report.blocked_branch.map_or((None, None), |(b, s)| {
+                (Some(b.to_string()), Some(s.as_str()))
+            });
             warn!(
                 database_id = %db,
                 branch_id = ?branch,
@@ -1248,7 +1303,8 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
             .map_err(|e| e.to_string())?;
         let mut queued = 0;
         for d in live.iter().filter(|d| d.status == DatabaseStatus::Ready) {
-            self.sweep_requests.request(d.id, SweepCause::Period(period));
+            self.sweep_requests
+                .request(d.id, SweepCause::Period(period));
             queued += 1;
         }
         if let Some(store) = &self.blob_store {
@@ -1257,7 +1313,11 @@ impl<M: WorkerMetadata, S: Storage, C: ComputeBackend, N: CacheNotifier, P: Spec
                 .await
                 .map_err(store_err("listing the pending purges"))?
             {
-                if let Some(db) = o.key.strip_prefix(PURGE_PREFIX).and_then(|d| d.parse::<Uuid>().ok()) {
+                if let Some(db) = o
+                    .key
+                    .strip_prefix(PURGE_PREFIX)
+                    .and_then(|d| d.parse::<Uuid>().ok())
+                {
                     let db = DatabaseId::from(db);
                     self.sweep_requests.request(db, SweepCause::Purge);
                     queued += 1;
