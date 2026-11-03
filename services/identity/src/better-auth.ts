@@ -20,6 +20,22 @@ function plugins() {
   return [admin(), bearer(), codesSchemaPlugin()];
 }
 
+const DAY = 24 * 60 * 60;
+
+/**
+ * How long a session lives, in seconds. Neither caller ever slides one (both read sessions by
+ * id or token without refreshing them), so this is a session's absolute lifetime.
+ * - `members`: 30 days, the members' absolute lifetime (`/auth/v1/token`).
+ * - `app-*`: 90 days, the cap of the app session it backs (`APP_SESSION_CAP` in
+ *   `services/orchestrator/src/internal/config.rs`; `tests/session-lifetime.test.ts` reads it
+ *   from there). App-user refresh checks the identity session on every rotation, so a shorter
+ *   life here would end app sessions before their cap.
+ * - no schema (migrations only): the members' value; it is never read.
+ */
+export function sessionLifetime(schema: string | undefined): number {
+  return schema?.startsWith("identity_app_") ? 90 * DAY : 30 * DAY;
+}
+
 /**
  * Options for the pool whose tables live in `schema`.
  *
@@ -47,9 +63,7 @@ export function authOptions(pool: pg.Pool, secret: string, schema: string | unde
     plugins: plugins(),
     // Our Rust services rate-limit; Better Auth's limiter would key on a proxy address anyway.
     rateLimit: { enabled: false },
-    // 30 days: the members' absolute lifetime (`/auth/v1/token` reads a session without sliding
-    // it), and no shorter than the 30-day cap app-user refresh keeps on its own.
-    session: { cookieCache: { enabled: false }, expiresIn: 30 * 24 * 60 * 60 },
+    session: { cookieCache: { enabled: false }, expiresIn: sessionLifetime(schema) },
     advanced: {
       // No browser ever reaches this service: there are no cookies to protect.
       disableCSRFCheck: true,
