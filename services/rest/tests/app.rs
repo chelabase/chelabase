@@ -73,7 +73,6 @@ fn identity(kind: Option<DataKeyKind>, databases: Option<Vec<String>>) -> Identi
     let key_id = Uuid::new_v4();
     Identity {
         sub: key_id.to_string(),
-        org_id: String::new(),
         auth: if kind.is_some() {
             AuthMethod::DataKey
         } else {

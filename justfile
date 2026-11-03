@@ -22,33 +22,21 @@ workbench *args:
     cargo run -q -p chelabase -- workbench "$@"
 
 # Rerun this stack's bootstrap as `workbench up` does: `chelabase-init bootstrap --demo` inside the
-# stack (Zitadel objects, the tenant bind, the demo tenant admin), then the apps' env files
-zitadel-bootstrap admin_email="":
+# stack (the identity service's setup, the dev member on a fresh stack)
+stack-bootstrap admin_email="":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build -q -p init
-    # No address: the stack's own `zitadel-admin@zitadel.<auth host>` (or the pre-W1 name) is used.
+    # No address: dev@chelabase.localhost.
     cargo run -q -p chelabase -- dev bootstrap ${1:+--admin-email "$1"}
 
-# Wipe this stack's Zitadel volume only so FirstInstance rewrites admin.pat
-zitadel-reset:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    set -a
-    # shellcheck disable=SC1090
-    . "$(cargo run -q -p chelabase -- workbench env)"
-    set +a
-    ./scripts/zitadel-reset.sh
-
-# Mint a short-lived demo access token (stdout)
+# A short-lived member access token of this stack's dev member (stdout)
 auth-token:
     #!/usr/bin/env bash
     set -euo pipefail
     set -a
     # shellcheck disable=SC1090
     . "$(cargo run -q -p chelabase -- workbench env)"
-    # shellcheck disable=SC1091
-    [[ ! -f "$CHELABASE_ZITADEL_DIR/demo.env" ]] || . "$CHELABASE_ZITADEL_DIR/demo.env"
     set +a
     cargo run -q -p chelabase -- dev token
 
@@ -58,15 +46,13 @@ landing-visual *args:
 
 # --- Demo helpers ---
 
-# POST a demo database using seeded tenant/project IDs + minted JWT access token
+# POST a demo database using seeded tenant/project IDs and the dev member's access token
 create-db-demo name="demo1":
     #!/usr/bin/env bash
     set -euo pipefail
     set -a
     # shellcheck disable=SC1090
     . "$(cargo run -q -p chelabase -- workbench env)"
-    # shellcheck disable=SC1091
-    [[ ! -f "$CHELABASE_ZITADEL_DIR/demo.env" ]] || . "$CHELABASE_ZITADEL_DIR/demo.env"
     set +a
     TOKEN="$(cargo run -q -p chelabase -- dev token)"
     curl -sS -X POST "$CHELABASE_ENTRY_API_URL/v1/databases" \
@@ -115,10 +101,10 @@ check:
     scripts/tests/compose-secret-boundary.sh
     scripts/tests/compose-no-fixed-secrets.sh
     scripts/tests/compose-env-tunables.sh
-    scripts/tests/compose-zitadel-internal.sh
     scripts/tests/http-no-redirects.sh
     scripts/tests/workbench-recipes.sh
     scripts/tests/retired-names.sh
+    scripts/tests/no-zitadel.sh
     scripts/tests/compose-image-pins.sh
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
@@ -258,8 +244,8 @@ storage-leak-e2e:
     cargo run -q -p chelabase -- workbench run scripts/storage-leak-e2e.sh
 
 # Live projects and app users story: a project and its database, enable app users, SDK sign-up
-# with data, own-row RLS, a branch gets the rows, a Zitadel email change through the webhook,
-# refresh rotation and reuse, a user deleted, the project deleted with its org
+# with data, own-row RLS, a branch gets the rows, refresh rotation and reuse, a user deleted, the
+# project deleted
 app-users-e2e:
     cargo run -q -p chelabase -- workbench run scripts/app-users-e2e.sh
 
@@ -305,12 +291,12 @@ role-e2e:
 
 # Live members story: an email invite (link from Mailpit) and a link invite, a grant, the SQL editor
 # acting as a group role, revoke, open sign-up and approval (with
-# Mailpit as Zitadel's SMTP provider)
+# Mailpit as the identity service's SMTP server)
 members-e2e:
     cargo run -q -p chelabase -- workbench run scripts/members-e2e.sh
 
 # Live personal Postgres logins: create and connect through the proxy, a child branch, reset,
-# revocation on grant loss (compute suspended), suspend, revoke-now, Zitadel offboarding, expiry
+# revocation on grant loss (compute suspended), suspend, revoke-now, offboarding, expiry
 personal-logins-e2e:
     cargo run -q -p chelabase -- workbench run scripts/personal-logins-e2e.sh
 

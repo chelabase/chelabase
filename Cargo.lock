@@ -304,7 +304,6 @@ dependencies = [
  "chelabase-routes",
  "chelabase-secrets",
  "chelabase-types",
- "chelabase-zitadel",
  "chrono",
  "dotenvy",
  "hex",
@@ -722,7 +721,6 @@ dependencies = [
  "chelabase-secrets",
  "chelabase-typegen",
  "chelabase-types",
- "chelabase-zitadel",
  "chrono",
  "clap",
  "hex",
@@ -741,24 +739,17 @@ dependencies = [
 name = "chelabase-auth"
 version = "0.1.0"
 dependencies = [
- "aws-lc-rs",
- "axum",
  "base64 0.23.1",
  "chelabase-auth",
- "chelabase-http",
  "chelabase-types",
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
  "jsonwebtoken",
- "parking_lot",
- "reqwest",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.21",
- "tokio",
- "tracing",
  "uuid",
 ]
 
@@ -792,15 +783,16 @@ name = "chelabase-init"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.23.1",
  "bcrypt",
  "chelabase-auth",
  "chelabase-http",
+ "chelabase-identity",
  "chelabase-metadata",
  "chelabase-neon",
  "chelabase-secrets",
  "chelabase-types",
- "chelabase-zitadel",
  "getrandom 0.4.3",
  "hex",
  "libc",
@@ -981,26 +973,6 @@ dependencies = [
  "tower",
  "utoipa",
  "uuid",
-]
-
-[[package]]
-name = "chelabase-zitadel"
-version = "0.1.0"
-dependencies = [
- "axum",
- "chelabase-http",
- "chelabase-identity",
- "chelabase-zitadel",
- "chrono",
- "hex",
- "hmac",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "subtle",
- "thiserror 2.0.21",
- "tokio",
 ]
 
 [[package]]
@@ -2938,7 +2910,6 @@ dependencies = [
  "chelabase-schema",
  "chelabase-secrets",
  "chelabase-types",
- "chelabase-zitadel",
  "chrono",
  "deadpool-postgres",
  "dotenvy",
@@ -5850,7 +5821,6 @@ dependencies = [
  "chelabase-schema",
  "chelabase-secrets",
  "chelabase-types",
- "chelabase-zitadel",
  "chrono",
  "dotenvy",
  "futures-util",

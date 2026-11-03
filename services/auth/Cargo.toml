@@ -3,7 +3,7 @@ name = "auth"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Chelabase's login backend: holds Zitadel's login-client token for Studio's sign-in pages"
+description = "Chelabase's login backend: Studio's sign-in pages and member tokens, app users' auth"
 
 [lib]
 name = "auth"
@@ -24,7 +24,6 @@ chelabase-query = { workspace = true }
 chelabase-routes = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-types = { workspace = true, features = ["axum", "openapi"] }
-chelabase-zitadel = { workspace = true }
 chrono = { workspace = true }
 dotenvy = { workspace = true }
 hex = { workspace = true }
@@ -47,4 +46,3 @@ chelabase-auth = { workspace = true, features = ["keygen"] }
 chelabase-identity = { workspace = true, features = ["mock"] }
 tempfile = { workspace = true }
 proptest = { workspace = true }
-chelabase-zitadel = { workspace = true, features = ["mock"] }

@@ -6,4 +6,3 @@ pub mod guard;
 pub mod member_token;
 pub mod openapi;
 pub mod session;
-pub use chelabase_zitadel::client as zitadel;

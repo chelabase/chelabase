@@ -366,8 +366,8 @@ pub enum MemberFacts {
     Removed,
     /// Suspended by a tenant admin (P14): refused everywhere but the public routes.
     Suspended,
-    /// D7: the member's Zitadel user was deactivated, locked or removed (the webhook's or the
-    /// sweep's mark): refused everywhere but the public routes, like [`MemberFacts::Suspended`].
+    /// D7: the member was offboarded (the mark their removal sets): refused everywhere but the
+    /// public routes, like [`MemberFacts::Suspended`].
     Offboarded,
     Active {
         tenant_admin: bool,
@@ -379,7 +379,7 @@ pub enum MemberFacts {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CallerFacts {
     pub member: MemberFacts,
-    /// Platform mode: whether the caller belongs to `CHELABASE_OPERATOR_ORG_ID`.
+    /// Platform mode: whether the caller is an active member of `CHELABASE_OPERATOR_TENANT_ID`.
     pub in_operator_org: bool,
 }
 
@@ -864,7 +864,7 @@ mod tests {
         assert_eq!(cases, 30 * 2 * kinds.len() * 3 * REQUESTS.len());
     }
 
-    // D7 (final round A): an offboarded member (Zitadel user deactivated, locked or removed) is
+    // D7 (final round A): an offboarded member is
     // refused exactly where a suspended one is, with its own answer: every access but `Public`
     // and `DataKey`, `SignedIn` included (`GET /v1/me` doesn't come here), whatever grant,
     // protection, request or mode. Exhaustive over the matrix's inputs.

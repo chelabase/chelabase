@@ -182,7 +182,7 @@ struct AppJwk {
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "Invalid input (`invalid_request`), a weak password (`weak_password`), a `data` column sign-up can't set (`unknown_column`) or a table constraint (`constraint_violation`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel, the orchestrator or the database is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service, the orchestrator or the database is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_sign_up(
@@ -192,7 +192,7 @@ async fn app_sign_up(
 ) -> Response {
     let start = Instant::now();
     // Its own task: a client that disconnects mid-way would otherwise drop the future
-    // between Zitadel's create and the commit, leaving a Zitadel user with no row, no
+    // between identity's create and the commit, leaving an identity user with no row, no
     // cleanup delete and no sync.
     let state = s.clone();
     let task = tokio::spawn(async move {
@@ -225,7 +225,7 @@ async fn app_sign_up(
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_sign_in(
@@ -258,7 +258,7 @@ async fn app_sign_in(
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_refresh(
@@ -308,7 +308,7 @@ async fn app_sign_out(
         (status = 200, description = "The user", body = AppUserView),
         (status = 401, description = "No user token (`user_token_invalid`), or no valid public key (`unauthorized`)", body = ErrorEnvelope),
         (status = 409, description = "App users are off: `app_users_disabled`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_user(State(s): S, caller: AppCaller) -> Response {
@@ -333,7 +333,7 @@ async fn app_user(State(s): S, caller: AppCaller) -> Response {
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The code is wrong or expired (`invalid_code`), or the body has the wrong fields (`invalid_request`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_verify_email(
@@ -429,7 +429,7 @@ async fn app_password_reset(
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The code is wrong (`invalid_code`), the password is weak (`weak_password`), or the body has the wrong fields (`invalid_request`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_password_reset_confirm(
@@ -461,7 +461,7 @@ async fn app_password_reset_confirm(
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "Invalid input: `invalid_request`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_change_email(
@@ -490,7 +490,7 @@ async fn app_change_email(
         (status = 415, description = "The body is not JSON: `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The new password is weak (`weak_password`), or the body has the wrong fields (`invalid_request`)", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn app_change_password(

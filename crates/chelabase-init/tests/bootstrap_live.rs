@@ -2,7 +2,6 @@
 //! on the workbench stack's metadata server, dropped at the end. Run with
 //! `just workbench test --stack <stack> -p chelabase-init -- --run-ignored only -E 'test(bootstrap_live)'`.
 
-use chelabase_init::bootstrap::SEEDED_TENANT;
 use chelabase_init::bootstrap::retry::Check;
 use chelabase_init::bootstrap::tenant::{Metadata, SqlMetadata};
 use chelabase_metadata::{MetadataClient, MetadataConfig};
@@ -25,19 +24,10 @@ fn url_for(name: &str) -> String {
     format!("{head}/{name}{query}")
 }
 
-async fn org(pool: &sqlx::PgPool) -> Option<String> {
-    sqlx::query_scalar("SELECT zitadel_org_id FROM tenants WHERE id = $1")
-        .bind(SEEDED_TENANT)
-        .fetch_one(pool)
-        .await
-        .unwrap()
-}
-
-// S4: unmigrated waits; then the bind sets, keeps and refuses A -> B naming both; two
-// concurrent binds from NULL: exactly one wins and the other is refused or kept.
+// S4: an unmigrated database waits; a migrated one (this build's migrations) is ready.
 #[tokio::test]
 #[ignore = "needs the workbench stack's metadata Postgres"]
-async fn bootstrap_live_sql_bind() {
+async fn bootstrap_live_migrated() {
     let admin = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url())
@@ -62,57 +52,7 @@ async fn bootstrap_live_sql_bind() {
         .unwrap();
         client.migrate().await.unwrap();
         assert_eq!(meta.migrated().await.unwrap(), Check::Ready(()));
-        let pool = client.pool();
-
-        assert!(
-            meta.bind_org(SEEDED_TENANT, "org-A").await.unwrap(),
-            "NULL: bound"
-        );
-        assert!(
-            !meta.bind_org(SEEDED_TENANT, "org-A").await.unwrap(),
-            "equal: kept"
-        );
-        let err = meta
-            .bind_org(SEEDED_TENANT, "org-B")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("org-A") && err.contains("org-B"), "{err}");
-        assert_eq!(
-            org(pool).await.as_deref(),
-            Some("org-A"),
-            "a refusal writes nothing"
-        );
-
-        // Named once, after the org; a second name is ignored.
-        assert!(meta.fill_display_name(SEEDED_TENANT, "Acme").await.unwrap());
-        assert!(
-            !meta
-                .fill_display_name(SEEDED_TENANT, "Other")
-                .await
-                .unwrap()
-        );
-
-        sqlx::query("UPDATE tenants SET zitadel_org_id = NULL WHERE id = $1")
-            .bind(SEEDED_TENANT)
-            .execute(pool)
-            .await
-            .unwrap();
-        let other = SqlMetadata::new(&url_for(&scratch)).unwrap();
-        let (a, b) = tokio::join!(
-            meta.bind_org(SEEDED_TENANT, "org-X"),
-            other.bind_org(SEEDED_TENANT, "org-Y")
-        );
-        let wins = [&a, &b].iter().filter(|r| matches!(r, Ok(true))).count();
-        assert_eq!(wins, 1, "{a:?} {b:?}");
-        let bound = org(pool).await.unwrap();
-        let loser = if matches!(a, Ok(true)) { &b } else { &a };
-        let msg = loser.as_ref().unwrap_err().to_string();
-        assert!(
-            msg.contains(&bound),
-            "the loser names the winner's org: {msg}"
-        );
-        pool.close().await;
+        client.pool().close().await;
     };
     let outcome = tokio::spawn(result).await;
     sqlx::raw_sql(AssertSqlSafe(format!(

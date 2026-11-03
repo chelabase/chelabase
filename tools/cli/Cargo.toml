@@ -20,7 +20,6 @@ chelabase-neon = { workspace = true }
 chelabase-secrets = { workspace = true }
 chelabase-typegen = { workspace = true }
 chelabase-types = { workspace = true }
-chelabase-zitadel = { workspace = true }
 clap = { workspace = true }
 hex = { workspace = true }
 jsonwebtoken = { workspace = true }

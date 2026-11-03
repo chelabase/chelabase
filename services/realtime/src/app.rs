@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use uuid::Uuid;
 
-use crate::auth::{OidcVerifier, TokenVerifier};
+use crate::auth::{MemberVerifier, TokenVerifier};
 use crate::bus::{Bus, BusStream, NatsBus};
 use crate::channel::Scope;
 use crate::config::Config;
@@ -61,19 +61,19 @@ pub struct Deps {
 }
 
 impl Deps {
-    /// NATS (`config.nats`), Valkey (`config.valkey`), the OIDC verifier (`config.oidc`) and the
+    /// NATS (`config.nats`), Valkey (`config.valkey`), the member-token verifier and the
     /// change source, with `identity` as the identity verifier.
     pub async fn connect(config: &Config, identity: Arc<InternalVerifier>) -> anyhow::Result<Self> {
-        let oidc = config
-            .oidc
+        let issuer = config
+            .issuer
             .clone()
-            .context("the gateway's OIDC settings (CHELABASE_AUTH_HOST) are required")?;
-        // #119: auth's member tokens, with the OIDC settings' issuer (both the auth host).
+            .context("the member tokens' issuer (CHELABASE_AUTH_HOST) is required")?;
+        // #119: auth's member tokens, with the auth host's issuer.
         let members = config
             .member_jwt_public_key
             .as_deref()
             .map(|path| {
-                chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(path, &oidc.issuer)
+                chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(path, &issuer)
                     .map_err(|e| anyhow::anyhow!("CHELABASE_MEMBER_JWT_PUBLIC_KEY: {e}"))
             })
             .transpose()?;
@@ -125,7 +125,7 @@ impl Deps {
         .await?;
         Ok(Self {
             identity,
-            verifier: Arc::new(OidcVerifier::new(oidc).with_member(members)),
+            verifier: Arc::new(MemberVerifier::new(members)),
             tickets: valkey.clone(),
             counters: valkey,
             bus,

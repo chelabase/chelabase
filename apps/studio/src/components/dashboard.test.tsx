@@ -16,7 +16,7 @@ const bound: Me = {
   member: { id: "m-self", status: "active", tenant_admin: true },
   instance_admin: true, tenant_admins: [],
   projects: [{ project_id: "p1", platform_role: "admin", roles: "all", databases: [] }],
-  user: { sub: "u1", org_id: "org-1" },
+  user: { sub: "u1" },
   tenant: {
     id: "t1",
     slug: "demo",
@@ -132,16 +132,15 @@ describe("Dashboard", () => {
 
   it("doesn't reset the guard when getMe fails", async () => {
     const onLoaded = vi.fn();
-    setup(fail(403, "tenant_not_bound", "missing org claim"), { onLoaded });
-    expect(await screen.findByRole("alert")).toHaveTextContent("missing org claim");
+    setup(fail(403, "no_access_yet", "no member access yet"), { onLoaded });
+    expect(await screen.findByRole("alert")).toHaveTextContent("no member access yet");
     expect(onLoaded).not.toHaveBeenCalled();
   });
 
-  it("explains an organization with no tenant yet", async () => {
-    setup(ok({ ...bound, tenant: null, user: { sub: "u1", org_id: "" } }));
+  it("explains a workspace with no tenant yet", async () => {
+    setup(ok({ ...bound, tenant: null, user: { sub: "u1" } }));
     expect(await screen.findByText(/isn't set up yet/)).toBeInTheDocument();
     expect(screen.getByText("docker compose logs init-bootstrap")).toBeInTheDocument();
-    expect(document.body.textContent).not.toMatch(/zitadel/i);
     expect(document.body.textContent).not.toContain("()");
   });
 

@@ -15,7 +15,6 @@ pub struct AppBranchInfo {
     pub project_id: Uuid,
     /// `enabling`, `enabled`, `disabling` or `failed`.
     pub status: String,
-    pub zitadel_org_id: Option<String>,
     pub email_verification: bool,
     pub on_delete: String,
     pub auth_database_id: Uuid,
@@ -101,7 +100,7 @@ pub struct InviteDescription {
     pub tenant_name: String,
 }
 
-/// What the orchestrator stores about a Zitadel user's latest member invite
+/// What the orchestrator stores about an identity user's latest member invite
 /// (`POST /internal/invites/open`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct OpenInvite {
@@ -239,14 +238,10 @@ impl InternalClient {
             .map_err(|e| InternalError::Unavailable(format!("bad answer: {e}")))
     }
 
-    /// Whether the tenant of this Zitadel org lets a visitor create an account, with the setup
-    /// code they gave (a body, never a URL).
-    pub async fn signup_check(
-        &self,
-        org_id: &str,
-        setup_code: Option<&str>,
-    ) -> Result<SignUpAnswer, InternalError> {
-        let mut body = serde_json::json!({ "org": org_id });
+    /// Whether the instance's tenant lets a visitor create an account, with the setup code they
+    /// gave (a body, never a URL). The orchestrator knows the tenant.
+    pub async fn signup_check(&self, setup_code: Option<&str>) -> Result<SignUpAnswer, InternalError> {
+        let mut body = serde_json::json!({});
         if let Some(code) = setup_code {
             body["setup_code"] = Value::from(code);
         }
@@ -255,7 +250,7 @@ impl InternalClient {
 
     /// Writes the `pending` row of an open sign-up: `false` when the tenant doesn't take it.
     /// Anything but `true` leaves no row: the caller deletes the account.
-    pub async fn signup_joined(&self, org_id: &str, user_id: &str) -> Result<bool, InternalError> {
+    pub async fn signup_joined(&self, user_id: &str) -> Result<bool, InternalError> {
         #[derive(Deserialize)]
         struct Joined {
             joined: bool,
@@ -264,7 +259,7 @@ impl InternalClient {
             .json(
                 Method::POST,
                 "/internal/signup/joined",
-                Some(serde_json::json!({ "org": org_id, "user_id": user_id })),
+                Some(serde_json::json!({ "user_id": user_id })),
             )
             .await?;
         Ok(answer.joined)
@@ -285,7 +280,6 @@ impl InternalClient {
     /// pending member). Any error means no claim: the caller deletes the account.
     pub async fn signup_claimed(
         &self,
-        org_id: &str,
         user_id: &str,
         nonce: &ClaimNonce,
     ) -> Result<bool, InternalError> {
@@ -297,13 +291,13 @@ impl InternalClient {
             .json(
                 Method::POST,
                 "/internal/signup/claimed",
-                Some(serde_json::json!({ "org": org_id, "user_id": user_id, "nonce": nonce.0 })),
+                Some(serde_json::json!({ "user_id": user_id, "nonce": nonce.0 })),
             )
             .await?;
         Ok(answer.bound)
     }
 
-    /// The open invite of this Zitadel user whose token hashes to `token_hash` (hex SHA-256);
+    /// The open invite of this identity user whose token hashes to `token_hash` (hex SHA-256);
     /// `None` for anything else (the orchestrator answers every mismatch the same 404).
     pub async fn describe_invite(
         &self,
@@ -326,14 +320,13 @@ impl InternalClient {
     }
 
     /// Accepts the open member invite of `user` (an identity user id) whose link token hashes to
-    /// `token_hash` (hex SHA-256), in the tenant of `org`: the orchestrator activates the invited
+    /// `token_hash` (hex SHA-256), in the invite's tenant: the orchestrator activates the invited
     /// row, closes the invite and clears the offboarded mark. A row already active there is
     /// answered the same, so a retry finishes. The tenant's id. `Refused` 404 when no open
     /// invite matches and the person isn't a member, 403 `member_suspended`, 410 when the invite
     /// expired meanwhile.
     pub async fn accept_invite(
         &self,
-        org_id: &str,
         user: &str,
         token_hash: &str,
         email: &str,
@@ -348,7 +341,6 @@ impl InternalClient {
                 Method::POST,
                 "/internal/invites/accept",
                 Some(serde_json::json!({
-                    "org": org_id,
                     "user": user,
                     "token_hash": token_hash,
                     "email": email,
@@ -359,7 +351,7 @@ impl InternalClient {
         Ok(answer.tenant_id)
     }
 
-    /// Whether this Zitadel user has an open member invite, and its stored expiry. Any refusal
+    /// Whether this identity user has an open member invite, and its stored expiry. Any refusal
     /// (a wrong token, a 404) is an error, never "no invite".
     pub async fn open_invite(&self, user: &str) -> Result<OpenInvite, InternalError> {
         self.json(

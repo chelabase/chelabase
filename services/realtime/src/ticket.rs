@@ -30,9 +30,7 @@ const NONCE_LEN: usize = 12;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TicketIdentity {
     pub sub: String,
-    pub org_id: String,
-    /// The member's tenant when the gateway's identity came from a member token (#119); then
-    /// `org_id` is empty. Absent in tickets sealed before it existed.
+    /// The member's tenant when the gateway's identity came from a member token (#119).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<uuid::Uuid>,
     pub auth: AuthMethod,
@@ -55,7 +53,6 @@ impl TicketIdentity {
     pub fn from_claims(claims: &InternalClaims) -> Self {
         Self {
             sub: claims.sub.clone(),
-            org_id: claims.org_id.clone(),
             tenant_id: claims.tenant_id,
             auth: claims.auth,
             email: claims.email.clone(),

@@ -260,7 +260,8 @@ fn main_for(record: &DatabaseRecord) -> BranchRecord {
 }
 
 impl FakeMetadata {
-    /// Binds the org to the tenant; the default caller becomes an active tenant admin there.
+    /// Test-only: names `tenant_id` by a short label the request helpers take (`token_for`,
+    /// `send_as`); the default caller becomes an active tenant admin there.
     fn bind_org(&self, org_id: &str, tenant_id: TenantId) {
         self.tenants_by_org
             .lock()
@@ -617,14 +618,8 @@ fn sample_database(tenant_id: TenantId) -> Db {
 }
 
 impl MetadataPort for FakeMetadata {
-    async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        Ok(self.tenants_by_org.lock().unwrap().get(zitadel_org_id).copied())
-    }
 
-    /// #119: a tenant exists once it is bound to an org, has members or has an overview.
+    /// #119: a tenant exists once it has a label, has members or has an overview.
     async fn tenant_exists(&self, tenant: TenantId) -> Result<bool, MetadataError> {
         Ok(self.tenants_by_org.lock().unwrap().values().any(|t| *t == tenant)
             || self.members.lock().unwrap().iter().any(|m| m.tenant_id == tenant)
@@ -1463,7 +1458,6 @@ impl MetadataPort for FakeMetadata {
                 project_id: new.project_id,
                 status: AppUsersStatus::Enabling,
                 error: None,
-                zitadel_org_id: None,
                 database_id: new.database_id,
                 pg_database: new.pg_database.to_string(),
                 schema_name: new.schema_name.to_string(),
@@ -2613,16 +2607,6 @@ impl FakeCache {
     }
 }
 
-/// A verifier for apps that don't test realtime: its JWKS URL is the discard port.
-fn unused_oidc() -> chelabase_auth::ZitadelAuthConfig {
-    chelabase_auth::ZitadelAuthConfig {
-        issuer: "http://issuer.invalid".into(),
-        jwks_url: "http://127.0.0.1:9/oauth/v2/keys".into(),
-        jwks_host: None,
-        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
-    }
-}
-
 /// A running orchestrator plus the signer standing in for the gateway.
 struct TestApp {
     base: String,
@@ -2642,24 +2626,34 @@ struct TestApp {
 }
 
 impl TestApp {
-    /// An internal identity token for `org_id`, as the gateway would mint it.
+    /// An internal identity token for the default caller in the tenant labelled `org_id`, as
+    /// the gateway mints it from a member token.
     fn token_for_org(&self, org_id: &str) -> String {
-        self.signer
-            .sign(Service::Orchestrator.name(), &identity(org_id))
-            .unwrap()
+        self.token_for(DEFAULT_SUB, org_id)
     }
 
-    /// An internal identity token for person `sub` in `org_id`.
+    /// An internal identity token for person `sub` in the tenant labelled `org_id`
+    /// ([`FakeMetadata::bind_org`]); an unknown label names no tenant (the orchestrator answers
+    /// 401).
     fn token_for(&self, sub: &str, org_id: &str) -> String {
-        self.signer
-            .sign(Service::Orchestrator.name(), &identity_of(sub, org_id))
-            .unwrap()
+        let tenant = self.state.metadata.tenants_by_org.lock().unwrap().get(org_id).copied();
+        self.sign(&identity_of(sub), tenant)
     }
 
-    /// Sends a request with this identity.
+    /// The gateway's internal token for `identity` in `tenant` (`None`: no tenant).
+    fn sign(&self, identity: &Identity, tenant: Option<TenantId>) -> String {
+        match tenant {
+            Some(t) => self.signer.sign_for_tenant(Service::Orchestrator.name(), identity, t.as_uuid()),
+            None => self.signer.sign(Service::Orchestrator.name(), identity),
+        }
+        .unwrap()
+    }
+
+    /// Sends a request with this identity, in the tenant labelled `org_id`.
     #[allow(clippy::disallowed_methods, clippy::disallowed_types)] // test code: a plain client against the test app
-    async fn send_identity(&self, identity: &Identity, method: Method, path: &str) -> reqwest::Response {
-        let token = self.signer.sign(Service::Orchestrator.name(), identity).unwrap();
+    async fn send_identity(&self, identity: &Identity, org_id: &str, method: Method, path: &str) -> reqwest::Response {
+        let tenant = self.state.metadata.tenants_by_org.lock().unwrap().get(org_id).copied();
+        let token = self.sign(identity, tenant);
         reqwest::Client::new()
             .request(method, format!("{}{path}", self.base))
             .header(IDENTITY_HEADER, token)
@@ -2681,15 +2675,10 @@ impl TestApp {
     }
 }
 
-fn identity(org_id: &str) -> Identity {
-    identity_of(DEFAULT_SUB, org_id)
-}
-
-/// The identity of person `sub` in `org_id`, with an email and name claim.
-fn identity_of(sub: &str, org_id: &str) -> Identity {
+/// The identity of person `sub`, with an email and name claim.
+fn identity_of(sub: &str) -> Identity {
     Identity {
         sub: sub.into(),
-        org_id: org_id.into(),
         auth: AuthMethod::ManagementJwt,
         request_id: "test-rid".into(),
         data: None,
@@ -2722,7 +2711,6 @@ async fn spawn_app_full(metadata: FakeMetadata, jobs: FakeJobs, rest_url: &str, 
         rest_url,
         mode,
         cap,
-        None,
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
     )
     .await
@@ -2734,10 +2722,9 @@ async fn spawn_app_parts(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
 ) -> TestApp {
-    spawn_app_custom(metadata, jobs, rest_url, mode, cap, zitadel, users_db, None).await
+    spawn_app_custom(metadata, jobs, rest_url, mode, cap, users_db).await
 }
 
 /// The path of a probe route that only passes the `Instance` access check (no instance route
@@ -2748,20 +2735,16 @@ async fn instance_probe(principal: orchestrator::InstancePrincipal) -> String {
     principal.sub
 }
 
-/// Like [`spawn_app_parts`], with `CHELABASE_OPERATOR_ORG_ID` set and the instance probe route.
-#[allow(clippy::too_many_arguments)]
+/// Like [`spawn_app_parts`], with the instance probe route.
 async fn spawn_app_custom(
     metadata: FakeMetadata,
     jobs: FakeJobs,
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
 ) -> TestApp {
-    spawn_app_with_compute_tls(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, None)
-        .await
+    spawn_app_with_compute_tls(metadata, jobs, rest_url, mode, cap, users_db, None).await
 }
 
 /// Like [`spawn_app_custom`], with the orchestrator's compute client pair (`None`: plain
@@ -2773,13 +2756,10 @@ async fn spawn_app_with_compute_tls(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
 ) -> TestApp {
-    spawn_app_core(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, unused_oidc(), None)
-        .await
+    spawn_app_core(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None).await
 }
 
 /// An app whose app-user admin routes call `identity_service` (the fake's client, or `None`),
@@ -2798,37 +2778,9 @@ async fn spawn_app_identity(
         "http://127.0.0.1:9",
         Mode::SelfHosted,
         10,
-        None,
         users_db,
-        None,
         compute_tls,
-        unused_oidc(),
         identity_service,
-    )
-    .await
-}
-
-/// RT1 T6: an app whose realtime routes verify members' tokens against `oidc` (a mock JWKS).
-#[allow(dead_code)]
-async fn spawn_app_oidc(
-    metadata: FakeMetadata,
-    jobs: FakeJobs,
-    rest_url: &str,
-    mode: Mode,
-    oidc: chelabase_auth::ZitadelAuthConfig,
-) -> TestApp {
-    spawn_app_core(
-        metadata,
-        jobs,
-        rest_url,
-        mode,
-        10,
-        None,
-        Arc::new(chelabase_query::app_users::PgUsersDb::new()),
-        None,
-        None,
-        oidc,
-        None,
     )
     .await
 }
@@ -2840,35 +2792,41 @@ async fn spawn_app_core(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
-    oidc: chelabase_auth::ZitadelAuthConfig,
     identity_service: Option<chelabase_identity::Identity>,
 ) -> TestApp {
-    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, zitadel, users_db, operator_org, compute_tls, oidc, None, None, identity_service)
+    spawn_app_core_with(metadata, jobs, rest_url, mode, cap, users_db, compute_tls, None, None, identity_service)
         .await
 }
 
-/// #119: an app whose realtime routes also take member tokens checked by `members`.
+/// #119: an app whose realtime routes take member tokens checked by `members`.
 #[allow(dead_code)]
 async fn spawn_app_member_tokens(
     metadata: FakeMetadata,
     mode: Mode,
     members: chelabase_auth::member_token::MemberTokenVerifier,
 ) -> TestApp {
+    spawn_app_member_tokens_with(metadata, FakeJobs::default(), "http://127.0.0.1:9", mode, members).await
+}
+
+/// [`spawn_app_member_tokens`] with the jobs and rest given.
+#[allow(dead_code)]
+async fn spawn_app_member_tokens_with(
+    metadata: FakeMetadata,
+    jobs: FakeJobs,
+    rest_url: &str,
+    mode: Mode,
+    members: chelabase_auth::member_token::MemberTokenVerifier,
+) -> TestApp {
     spawn_app_core_with(
         metadata,
-        FakeJobs::default(),
-        "http://127.0.0.1:9",
+        jobs,
+        rest_url,
         mode,
         10,
-        None,
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
         None,
-        None,
-        unused_oidc(),
         None,
         Some(members),
         None,
@@ -2885,11 +2843,8 @@ async fn spawn_app_operator_tenant(metadata: FakeMetadata, mode: Mode, tenant: O
         "http://127.0.0.1:9",
         mode,
         10,
-        None,
         Arc::new(chelabase_query::app_users::PgUsersDb::new()),
         None,
-        None,
-        unused_oidc(),
         tenant,
         None,
         None,
@@ -2904,11 +2859,8 @@ async fn spawn_app_core_with(
     rest_url: &str,
     mode: Mode,
     cap: u32,
-    zitadel: Option<chelabase_zitadel::client::Zitadel>,
     users_db: Arc<dyn chelabase_query::app_users::UsersDb>,
-    operator_org: Option<&str>,
     compute_tls: Option<Arc<orchestrator::compute_tls::ComputeTls>>,
-    oidc: chelabase_auth::ZitadelAuthConfig,
     operator_tenant: Option<TenantId>,
     member_tokens: Option<chelabase_auth::member_token::MemberTokenVerifier>,
     identity_service: Option<chelabase_identity::Identity>,
@@ -2933,13 +2885,11 @@ async fn spawn_app_core_with(
             http: chelabase_http::client_builder().build().unwrap(),
         },
         policy: chelabase_types::mode_policy::ModePolicy::new(mode),
-        operator_org: operator_org.map(str::to_string),
         operator_tenant,
         proxy_ca_file: ".chelabase/neon/proxy-ca.crt".into(),
         data_api_database_cap: cap,
         locator: Arc::new(locator.clone()),
         console: Console::default(),
-        zitadel,
         identity_service,
         users_db,
         sql_editor: Default::default(),
@@ -2948,7 +2898,6 @@ async fn spawn_app_core_with(
         compute_tls,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: REALTIME_TOKEN.into(),
-            verifier: chelabase_auth::JwtVerifier::new(oidc),
             member: member_tokens,
         },
         rt_events: Arc::new(rt_events.clone()),
@@ -4964,4 +4913,22 @@ async fn api_add_to_team(app: &TestApp, team: uuid::Uuid, member: uuid::Uuid) {
     let status = resp.status().as_u16();
     let body: Value = resp.json().await.unwrap_or(Value::Null);
     assert_eq!(status, 200, "PUT {path}: {body}");
+}
+
+/// A member token (#119) of `sub` in `tenant` signed with `keys`, living `ttl` seconds from now
+/// (negative: expired that long ago), with an email and name claim.
+#[allow(dead_code)]
+fn signed_member_token(
+    keys: &chelabase_auth::test_support::MemberKeys,
+    sub: &str,
+    tenant: TenantId,
+    ttl: i64,
+) -> String {
+    let mut claims = keys.claims(sub, tenant.as_uuid(), 300);
+    let now = claims.iat;
+    claims.iat = if ttl < 0 { now - 300 } else { now };
+    claims.exp = (now as i64 + ttl) as u64;
+    claims.email = format!("{sub}@mail.test");
+    claims.name = format!("Name of {sub}");
+    keys.sign(&claims)
 }

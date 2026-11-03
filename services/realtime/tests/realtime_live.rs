@@ -27,7 +27,7 @@ use chelabase_auth::internal::{
 use chelabase_nats::rt::AccessEvent;
 use futures_util::{SinkExt, StreamExt};
 use realtime::app::{Deps, Realtime, build_with};
-use realtime::auth::{MemberToken, OidcVerifier, TokenVerifier};
+use realtime::auth::{MemberToken, MemberVerifier, TokenVerifier};
 use realtime::config::Config;
 use realtime::protocol::SUBPROTOCOL;
 use serde_json::{Value, json};
@@ -308,7 +308,11 @@ async fn live_one() -> Live {
 /// The member a token names, verified as realtime verifies it.
 async fn member_of(token: &str) -> MemberToken {
     let config = Config::from_env().unwrap();
-    OidcVerifier::new(config.oidc.expect("OIDC settings"))
+    let issuer = config.issuer.expect("the member tokens' issuer");
+    let key = config.member_jwt_public_key.expect("CHELABASE_MEMBER_JWT_PUBLIC_KEY");
+    let member = chelabase_auth::member_token::MemberTokenVerifier::from_pem_file(&key, &issuer)
+        .expect("the member verify key");
+    MemberVerifier::new(Some(member))
         .verify(token)
         .await
         .expect("the dev token verifies")
@@ -321,7 +325,6 @@ impl Live {
     async fn ticket(&self, member: &MemberToken) -> String {
         let identity = Identity {
             sub: member.sub.clone(),
-            org_id: member.org_id.clone(),
             auth: AuthMethod::ManagementJwt,
             request_id: format!("live-{}", Uuid::new_v4()),
             data: None,
@@ -332,7 +335,9 @@ impl Live {
             .post(format!("http://{}/v1/realtime/tickets", self.rt.addr()))
             .header(
                 IDENTITY_HEADER,
-                self.signer.sign("realtime", &identity).unwrap(),
+                self.signer
+                    .sign_for_tenant("realtime", &identity, member.tenant_id.expect("a tenant"))
+                    .unwrap(),
             )
             .send()
             .await

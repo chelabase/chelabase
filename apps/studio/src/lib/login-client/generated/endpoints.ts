@@ -1943,7 +1943,7 @@ export const getGetStudioConfigQueryKey = () => {
     }
 
 
-export const getGetStudioConfigQueryOptions = <TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
+export const getGetStudioConfigQueryOptions = <TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>( options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
 ) => {
 
 const {query: queryOptions, request: requestOptions} = options ?? {};
@@ -1962,10 +1962,10 @@ const {query: queryOptions, request: requestOptions} = options ?? {};
 }
 
 export type GetStudioConfigQueryResult = NonNullable<Awaited<ReturnType<typeof getStudioConfig>>>
-export type GetStudioConfigQueryError = ErrorType<ErrorEnvelope>
+export type GetStudioConfigQueryError = ErrorType<unknown>
 
 
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
         DefinedInitialDataOptions<
           Awaited<ReturnType<typeof getStudioConfig>>,
@@ -1975,7 +1975,7 @@ export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioCo
       >, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>> & Pick<
         UndefinedInitialDataOptions<
           Awaited<ReturnType<typeof getStudioConfig>>,
@@ -1985,12 +1985,12 @@ export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioCo
       >, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
   ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
 
-export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<ErrorEnvelope>>(
+export function useGetStudioConfig<TData = Awaited<ReturnType<typeof getStudioConfig>>, TError = ErrorType<unknown>>(
   options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getStudioConfig>>, TError, TData>>, request?: SecondParameter<typeof customFetch>}
  , queryClient?: QueryClient
  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {

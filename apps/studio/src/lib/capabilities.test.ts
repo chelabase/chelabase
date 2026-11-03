@@ -10,7 +10,7 @@ const base: Me = {
   member: { id: "m-self", status: "active", tenant_admin: false },
   instance_admin: false, tenant_admins: [],
   projects: [],
-  user: { sub: "u1", org_id: "org-1" },
+  user: { sub: "u1" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [] },
 };
 

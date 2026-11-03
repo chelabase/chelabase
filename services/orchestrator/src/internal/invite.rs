@@ -3,13 +3,13 @@
 //! on behalf of the accept page, before any code is spent. The hash travels in the body so no
 //! request log or trace span carries it.
 //!
-//! The open check (`POST /internal/invites/open {user}`, the same bearer): whether this Zitadel
+//! The open check (`POST /internal/invites/open {user}`, the same bearer): whether this identity
 //! user has an open member invite, and its stored expiry, for auth's accept-invite gate (#61).
 //!
-//! The accept (`POST /internal/invites/accept {org, user, token_hash, email, name}`, the same
+//! The accept (`POST /internal/invites/accept {user, token_hash, email, name}`, the same
 //! bearer): once auth has the invitee's proof (the invite code, or the account's own password),
 //! the member row is written here, because a member token never makes one (#124). The open
-//! invite whose stored hash equals `token_hash` activates its `invited` row in the org's tenant
+//! invite whose stored hash equals `token_hash` activates its `invited` row in its tenant
 //! (the invite closes, [`MetadataClient::admit_member`]) and the offboarded mark is cleared.
 //!
 //! [`MetadataClient::admit_member`]: chelabase_metadata::MetadataClient::admit_member
@@ -33,7 +33,7 @@ use super::{InternalState, NeonMetadataPort, constant_time_eq};
 
 #[derive(Deserialize)]
 pub(super) struct Describe {
-    /// The invitee's Zitadel user id.
+    /// The invitee's identity user id.
     user: String,
     /// Hex of the SHA-256 of the link's token.
     token_hash: String,
@@ -110,11 +110,11 @@ fn token_matches(found: Option<&InviteDescription>, presented: &[u8]) -> bool {
 
 #[derive(Deserialize)]
 pub(super) struct Open {
-    /// The invitee's Zitadel user id.
+    /// The invitee's identity user id.
     user: String,
 }
 
-/// `{open, expires_at}`: whether this Zitadel user's latest member invite that isn't revoked or
+/// `{open, expires_at}`: whether this identity user's latest member invite that isn't revoked or
 /// accepted (its member still invited) is open, i.e. not expired by the database clock (as
 /// `describe` decides), and its stored expiry (RFC 3339,
 /// `null` with no such invite). Nothing else about the invite or the member is returned. A body
@@ -147,8 +147,6 @@ where
 /// Missing fields are empty, so they are refused like wrong ones.
 #[derive(Deserialize)]
 pub(super) struct Accept {
-    #[serde(default)]
-    org: String,
     /// The invitee's identity user id.
     #[serde(default)]
     user: String,
@@ -166,16 +164,18 @@ fn accepted(tenant: TenantId) -> Response {
     Json(json!({ "tenant_id": tenant.as_uuid() })).into_response()
 }
 
-/// `{tenant_id}` once the user's row in the org's tenant is active: their open invite whose
+/// `{tenant_id}` once the user's row in the invite's tenant is active: their open invite whose
 /// stored hash is `token_hash` activated it now, or (a retry after a later step of auth's failed)
-/// it was active already. 404 `not_found` for anything else: no tenant owns the org, no open
-/// invite has that hash and the person isn't active there, a malformed body. 403
+/// their accepted invite with that hash names a tenant they are active in. 404 `not_found` for
+/// anything else: no open or accepted invite has that hash (or the person isn't active in an
+/// accepted one's tenant), a malformed body. 403
 /// `member_suspended` for a suspended row, 410 `invite_expired` when the invite expired before
 /// the write. Each success clears the offboarded mark (a removed member invited again; m9 clears
 /// it on the invite too), so the access check doesn't answer `member_offboarded`.
 ///
 /// The invite matched is the user's latest open one, as `describe` shows it; the row activated
-/// is the org's tenant's, which `admit_member` activates only while that row has an open invite.
+/// is in that invite's tenant, which `admit_member` activates only while the row has an open
+/// invite.
 pub(super) async fn accept<M, L>(
     State(state): State<Arc<InternalState<M, L>>>,
     body: Result<Json<Accept>, JsonRejection>,
@@ -190,35 +190,46 @@ where
     let Some(presented) = hex::decode(&b.token_hash).ok().filter(|h| h.len() == 32) else {
         return not_found();
     };
-    if b.user.is_empty() || b.org.is_empty() {
+    if b.user.is_empty() {
         return not_found();
     }
     let failed = |what: &str, e: &dyn std::fmt::Display| {
         error!("accept invite: {what}: {e}");
         ApiError::internal().into_response()
     };
-    let tenant = match state.metadata.tenant_by_org(&b.org).await {
-        Ok(Some(tenant)) => tenant,
-        Ok(None) => return not_found(),
-        Err(e) => return failed("the tenant", &e),
-    };
     let found = match state.metadata.open_invite_for_user(&b.user).await {
         Ok(found) => found,
         Err(e) => return failed("the open invite", &e),
     };
-    if !token_matches(found.as_ref(), &presented) {
-        return match state.metadata.member_tenants(&b.user).await {
+    let tenant = match found.as_ref() {
+        Some(invite) if token_matches(found.as_ref(), &presented) => invite.tenant_id,
+        _ => {
+            // A retry: the invite this hash names was accepted already. Every candidate is
+            // compared, in constant time, so the answer doesn't tell where the hash differs.
+            let earlier = match state.metadata.accepted_invites_for_user(&b.user).await {
+                Ok(rows) => rows,
+                Err(e) => return failed("the accepted invites", &e),
+            };
+            let tenant = earlier.iter().fold(None, |hit, (tenant, hash)| {
+                let same = hash.as_deref().is_some_and(|h| constant_time_eq(h, &presented));
+                hit.or(same.then_some(*tenant))
+            });
+            let Some(tenant) = tenant else {
+                return not_found();
+            };
+            return match state.metadata.member_tenants(&b.user).await {
             Ok(rows) if rows.contains(&(tenant, MemberStatus::Active)) => match state.metadata.clear_offboarded(tenant, &b.user).await {
                 Ok(_) => accepted(tenant),
                 Err(e) => failed("clearing the offboarded mark", &e),
             },
-            Ok(_) => not_found(),
-            Err(e) => failed("the memberships", &e),
-        };
-    }
+                Ok(_) => not_found(),
+                Err(e) => failed("the memberships", &e),
+            };
+        }
+    };
     match state
         .metadata
-        .admit_sign_up(&b.org, &b.user, &b.email, &b.name, Admission::Closed)
+        .admit_sign_up(tenant, &b.user, &b.email, &b.name, Admission::Closed)
         .await
     {
         Ok(Some(MemberStatus::Active)) => {}

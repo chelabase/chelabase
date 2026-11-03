@@ -77,7 +77,6 @@ mod tests {
         let verifier = InternalVerifier::from_pem_file(&paths.verify).unwrap();
         let identity = Identity {
             sub: "u".into(),
-            org_id: "o".into(),
             auth: AuthMethod::ManagementJwt,
             request_id: "r".into(),
             data: None,
@@ -85,7 +84,7 @@ mod tests {
             name: None,
         };
         let token = signer.sign("orchestrator", &identity).unwrap();
-        assert_eq!(verifier.verify(&token, "orchestrator").unwrap().org_id, "o");
+        assert_eq!(verifier.verify(&token, "orchestrator").unwrap().sub, "u");
     }
 
     #[cfg(unix)]

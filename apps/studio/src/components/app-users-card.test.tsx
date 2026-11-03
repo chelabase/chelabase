@@ -16,7 +16,7 @@ const dbs: DatabaseSummary[] = [
 ];
 const settings = (over: Partial<AppUsersSettings> = {}): AppUsersSettings => ({
   database_id: "d1", pg_database: "postgres", schema: "public", table: "users", email_verification: false,
-  on_delete: "delete", status: "enabled", error: null, zitadel_org_id: "org1", ...over,
+  on_delete: "delete", status: "enabled", error: null, ...over,
 });
 const mainBranch = {
   id: "b-main", name: "main", parent_branch_id: null, kind: "normal", status: "ready", host: "h", port: 1,
@@ -79,12 +79,12 @@ describe("AppUsersCard", () => {
   it("failed_shows_error_and_retry", async () => {
     const { fetch } = setup(
       {
-        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "failed", error: "zitadel org: boom" })),
+        "GET /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "failed", error: "identity pool: boom" })),
         "PUT /v1/projects/p1/app-users": () => jsonResponse(settings({ status: "enabling" }), 202),
       },
       { ...project, app_users: "failed" },
     );
-    expect(await screen.findByText("zitadel org: boom")).toBeInTheDocument();
+    expect(await screen.findByText("identity pool: boom")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Disable" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(fetch.calls.some((c) => c.method === "PUT")).toBe(true));

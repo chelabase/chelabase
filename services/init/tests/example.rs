@@ -1,5 +1,5 @@
 //! The example overlay as Compose renders it: `example-seed` mounts the setup code and nothing
-//! else from the secrets volume, and gets no Zitadel credential.
+//! else from the secrets volume, and gets no other credential.
 
 use serde_json::Value;
 use std::path::Path;
@@ -55,7 +55,7 @@ fn example_seed_mounts_exactly_one_secret() {
         v["target"]
     );
     let text = seed.to_string();
-    for forbidden in ["zitadel-pats", ".pat", "PAT_FILE", "docker.sock"] {
+    for forbidden in ["identity.token", ".pat", "PAT_FILE", "docker.sock"] {
         assert!(
             !text.contains(forbidden),
             "example-seed mentions {forbidden}: {text}"

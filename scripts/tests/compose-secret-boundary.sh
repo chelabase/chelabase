@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
 # Offline check of the per-service secret boundary of the self-hosted install (U10, epic
 # selfhost-install m8). In the base file every secret lives in one named volume, `secrets`
-# (chelabase-init's layout, plus the dirs the stack adds: zitadel-pats/, bootstrap/,
-# zitadel-config/), and each service mounts only its own files from it with `volume.subpath`.
+# (chelabase-init's layout, plus the dir the stack adds: bootstrap/), and each service mounts
+# only its own files from it with `volume.subpath`.
 #
 # Checks, from `docker compose config` of the base file (with .env.example) and of base +
 # workbench overlay (with the fixture stack.env):
 #   1. each base service's `secrets` mounts are exactly the table below (subpath and ro/rw);
 #   2. no other volume or bind of the base reaches a secret (nothing else names `secrets`, and
 #      only init-secrets mounts the volume's root);
-#   3. per service, the machine-part files and the Zitadel PATs a base service mounts are the
-#      ones the same service sees under the workbench (its key-dir files and state-dir PATs),
-#      with the same mode. Install-part files (database, S3, Zitadel, setup code, NATS/Valkey
-#      auth files, the bootstrap's outputs) have no keys-dir counterpart: the workbench keeps
-#      them in each stack's state dir or uses its fixed dev values.
+#   3. per service, the machine-part files a base service mounts are the ones the same service
+#      sees under the workbench (its key-dir files), with the same mode. Install-part files
+#      (database, S3, setup code, NATS/Valkey auth files, the bootstrap's outputs) have no
+#      keys-dir counterpart: the workbench keeps them in each stack's state dir or uses its
+#      fixed dev values.
 #   4. the identity service's boundary (auth-replacement m5), in both renders: only `identity`
 #      mounts `identity/*` (the bootstrap also reads `identity/db.password`, self-hosted: it sets
 #      the role's password); only `auth` mounts `auth/member-jwt.key`, and the member public key
@@ -52,15 +52,10 @@ compose chelabase-feat-x "$root/scripts/tests/fixtures/workbench-stack.env" \
 # service <TAB> subpath ("" is the volume's root) <TAB> ro|rw, one line per `secrets` mount.
 cat >"$tmp/want" <<'EOF'
 metadata-db	db/metadata.password	ro
-zitadel-db	db/zitadel-admin.password	ro
 storcon-db	db/storcon.password	ro
 nats	nats/auth.conf	ro
 valkey	valkey/users.acl	ro
 valkey	valkey/health.password	ro
-zitadel	zitadel/masterkey	ro
-zitadel	zitadel/steps.yaml	ro
-zitadel	zitadel-config/database.yaml	ro
-zitadel	zitadel-pats	rw
 seaweedfs	s3/access-key	ro
 seaweedfs	s3/secret-key	ro
 create-bucket	s3/access-key	ro
@@ -100,7 +95,6 @@ identity	tokens/auth-identity.token	ro
 identity	tokens/orchestrator-identity.token	ro
 identity	tokens/worker-identity.token	ro
 identity	tokens/bootstrap-identity.token	ro
-init-bootstrap	zitadel-pats/admin.pat	ro
 init-bootstrap	bootstrap	rw
 orchestrator	secrets/secrets.key	ro
 orchestrator	gateway/internal-verify.pem	ro
@@ -120,8 +114,6 @@ orchestrator	auth/member-jwt.pub	ro
 orchestrator	orchestrator-tls	ro
 orchestrator	db/metadata.password	ro
 orchestrator	setup/setup.code	ro
-orchestrator	zitadel-pats/admin.pat	ro
-orchestrator	bootstrap	ro
 worker	secrets/secrets.key	ro
 worker	neon/compute-jwt.pem	ro
 worker	neon/compute-jwt.pub	ro
@@ -133,13 +125,11 @@ worker	compute-ca	rw
 worker	orchestrator-tls	rw
 worker	realtime-tls	rw
 worker	db/metadata.password	ro
-worker	zitadel-pats/admin.pat	ro
 gateway	gateway/internal-signing.pem	ro
 gateway	auth/app-jwt.pub	ro
 gateway	auth/member-jwt.pub	ro
 gateway	tokens/data-keys.token	ro
 gateway	tokens/app-sessions.token	ro
-gateway	bootstrap/ids	ro
 auth	auth/cookie.key	ro
 auth	auth/app-jwt.key	ro
 auth	auth/app-jwt.pub	ro
@@ -149,9 +139,6 @@ auth	tokens/auth-identity.token	ro
 auth	gateway/internal-verify.pem	ro
 auth	compute-ca/ca.crt	ro
 auth	tokens/app-auth.token	ro
-auth	zitadel-pats/admin.pat	ro
-auth	zitadel-pats/login-client.pat	ro
-auth	bootstrap/ids	ro
 rest	gateway/internal-verify.pem	ro
 rest	compute-ca/ca.crt	ro
 rest	tokens/rest-internal.token	ro
@@ -164,7 +151,6 @@ realtime	realtime/ticket.key	ro
 realtime	realtime/internal.token	ro
 realtime	realtime-tls	ro
 realtime	auth/member-jwt.pub	ro
-realtime	bootstrap/ids	ro
 EOF
 
 # 1. The table.
@@ -192,15 +178,12 @@ others="$(jq -r '.services | to_entries[] | .key as $s
 # 3. The same files as under the workbench, service by service.
 keys="$(sed -n 's/^CHELABASE_KEYS_DIR=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
 state="$(sed -n 's/^CHELABASE_STACK_DIR=//p' "$root/scripts/tests/fixtures/workbench-stack.env")"
-jq -r --arg k "$keys/" --arg st "$state" --arg z "$state/zitadel" '.services | to_entries[] | .key as $s
+jq -r --arg k "$keys/" --arg st "$state" '.services | to_entries[] | .key as $s
   | (.value.volumes // [])[] | select(.type == "bind") | (if .read_only then "ro" else "rw" end) as $m
-  | if .source == $z then [$s, "zitadel-pats", $m]
-    elif (.source | startswith($z + "/")) and (.source | test("/(admin|login-client)\\.pat$"))
-      then [$s, "zitadel-pats/" + (.source | ltrimstr($z + "/")), $m]
-    elif (.source | startswith($st + "/")) then empty
+  | if (.source | startswith($st + "/")) then empty
     elif (.source | startswith($k)) then [$s, (.source | ltrimstr($k)), $m]
     else empty end | @tsv' "$tmp/wb.json" | sort >"$tmp/wb.have"
-install_part='(db/|s3/|zitadel/|zitadel-config/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
+install_part='(db/|s3/|setup/|bootstrap|nats/auth\.conf|valkey/users\.acl)'
 for svc in $(jq -r '.services | keys[]' "$tmp/base.json"); do
   jq -e --arg s "$svc" '.services[$s]' "$tmp/wb.json" >/dev/null || continue
   awk -F'\t' -v s="$svc" '$1 == s' "$tmp/have" | grep -Ev $'\t'"$install_part" >"$tmp/b" || true

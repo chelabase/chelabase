@@ -55,10 +55,9 @@ pub enum MemberTokenError {
     Expired,
 }
 
-/// Whether `token` claims to be a member token: its header parses and names EdDSA. Zitadel's
-/// tokens are RS256, so a verifier that routes on this sends every EdDSA token (an app token,
-/// an internal token, a forgery under another key) to the member verifier and refuses it
-/// there; it never falls through to a laxer path.
+/// Whether `token` claims to be a member token: its header parses and names EdDSA. Only a
+/// shape check: the member verifier still decides every such token (an app token, an internal
+/// token, a forgery under another key is refused there).
 pub fn member_shaped(token: &str) -> bool {
     decode_header(token.trim()).is_ok_and(|h| h.alg == Algorithm::EdDSA)
 }
@@ -138,7 +137,7 @@ impl MemberTokenVerifier {
 
     /// `CHELABASE_MEMBER_JWT_PUBLIC_KEY` (a path) with the issuer from `CHELABASE_AUTH_HOST`
     /// (and the public scheme). `None` when the key variable is unset or blank: member tokens
-    /// are then refused (they never reach the Zitadel path either).
+    /// are then refused.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, AuthError> {
         let Some(path) = get("CHELABASE_MEMBER_JWT_PUBLIC_KEY").filter(|v| !v.trim().is_empty())
         else {

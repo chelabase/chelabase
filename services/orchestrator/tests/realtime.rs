@@ -16,7 +16,7 @@
 
 include!("common/fakes.rs");
 
-use chelabase_auth::test_support::{BrokenJwks, MockJwks};
+use chelabase_auth::test_support::MemberKeys;
 use chelabase_nats::rt::{AccessEvent, ProjectEvent};
 use chelabase_identity::Pool;
 use chelabase_identity::mock::FakeIdentity;
@@ -40,7 +40,7 @@ struct Rt {
     app: TestApp,
     metadata: FakeMetadata,
     jobs: FakeJobs,
-    jwks: MockJwks,
+    jwks: MemberKeys,
     tenant: TenantId,
     project: ProjectId,
     db: DatabaseId,
@@ -50,20 +50,20 @@ struct Rt {
 }
 
 async fn rt() -> Rt {
-    rt_with(MockJwks::start().await).await
+    rt_with(MemberKeys::new()).await
 }
 
-async fn rt_with(jwks: MockJwks) -> Rt {
+async fn rt_with(jwks: MemberKeys) -> Rt {
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let app = spawn_app_oidc(
+    let app = spawn_app_member_tokens_with(
         metadata.clone(),
         jobs.clone(),
         "http://127.0.0.1:9",
         Mode::SelfHosted,
-        jwks.config(vec![]),
+        jwks.verifier(),
     )
     .await;
     let project = metadata.create_project(tenant, "Billing").await.unwrap().id;
@@ -131,21 +131,16 @@ impl Rt {
         BranchId::from(self.db)
     }
 
-    /// A member's OIDC token, as Zitadel would sign it (with email and name).
+    /// A member token, as auth signs it (with email and name).
     fn token(&self, sub: &str) -> String {
         self.token_in(sub, "org-1", 300)
     }
 
+    /// A member token naming the tenant labelled `org` (an unknown label: a tenant that
+    /// doesn't exist).
     fn token_in(&self, sub: &str, org: &str, ttl: i64) -> String {
-        self.jwks.sign(json!({
-            "sub": sub,
-            "iss": self.jwks.issuer(),
-            "iat": now(),
-            "exp": now() + ttl,
-            "email": format!("{sub}@mail.test"),
-            "name": format!("Name of {sub}"),
-            chelabase_auth::CLAIM_ORG_ID: org,
-        }))
+        let tenant = self.metadata.tenants_by_org.lock().unwrap().get(org).copied().unwrap_or_else(TenantId::new);
+        signed_member_token(&self.jwks, sub, tenant, ttl)
     }
 
     fn target(&self, branch: BranchId, pg_database: &str, role: Option<&str>) -> Value {
@@ -378,9 +373,9 @@ async fn a_token_that_does_not_verify_is_forbidden() {
             .await;
         assert_refused(&body, "forbidden");
     }
-    // Another issuer's token, even with a valid shape.
-    let other = MockJwks::start().await;
-    let foreign = other.token_for_org(DEFAULT_SUB, "org-1", 300);
+    // Another key's token, even with a valid shape.
+    let other = MemberKeys::new();
+    let foreign = signed_member_token(&other, DEFAULT_SUB, t.tenant, 300);
     let body = t
         .authorize_token(&foreign, t.target(t.main(), "web1", None))
         .await;
@@ -388,7 +383,7 @@ async fn a_token_that_does_not_verify_is_forbidden() {
 }
 
 // R10: the member is read, never made: an unknown person, a removed, pending or invited member
-// and an org no tenant has are refused, and nothing is written (no admission, no first-member
+// and a tenant that doesn't exist are refused, and nothing is written (no admission, no first-member
 // admin claim, no activation of an invite).
 #[tokio::test]
 async fn members_are_resolved_read_only() {
@@ -428,7 +423,7 @@ async fn members_are_resolved_read_only() {
     assert_eq!(
         *t.metadata.tenants_by_org.lock().unwrap(),
         orgs_before,
-        "no org bound"
+        "no tenant named"
     );
     assert_eq!(
         t.metadata.member(t.tenant, "inv").unwrap().status,
@@ -440,7 +435,7 @@ async fn members_are_resolved_read_only() {
 // R10: a fresh tenant with no member at all: the first person to call isn't made its admin.
 #[tokio::test]
 async fn no_first_member_claim() {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     // Bound without `bind_org`, which would add the default admin.
@@ -450,12 +445,12 @@ async fn no_first_member_claim() {
         .unwrap()
         .insert("org-1".into(), tenant);
     let jobs = FakeJobs::default();
-    let app = spawn_app_oidc(
+    let app = spawn_app_member_tokens_with(
         metadata.clone(),
         jobs.clone(),
         "http://127.0.0.1:9",
         Mode::SelfHosted,
-        jwks.config(vec![]),
+        jwks.verifier(),
     )
     .await;
     let t = Rt {
@@ -563,45 +558,6 @@ async fn an_expired_token_is_token_expired() {
         .authorize_token(&expired, t.target(t.main(), "web1", None))
         .await;
     assert_refused(&body, "token_expired");
-}
-
-// W19: the JWKS unreachable is `unavailable`, not `forbidden`.
-#[tokio::test]
-async fn jwks_down_is_unavailable() {
-    let broken = BrokenJwks::start().await;
-    let signer = MockJwks::start().await;
-    let metadata = FakeMetadata::default();
-    let tenant = TenantId::new();
-    metadata.bind_org("org-1", tenant);
-    let oidc = chelabase_auth::ZitadelAuthConfig {
-        issuer: signer.issuer().to_string(),
-        jwks_url: broken.jwks_url().to_string(),
-        jwks_host: None,
-        audiences: vec![chelabase_auth::test_support::MOCK_AUDIENCE.to_string()].into(),
-    };
-    let app = spawn_app_oidc(
-        metadata,
-        FakeJobs::default(),
-        "http://127.0.0.1:9",
-        Mode::SelfHosted,
-        oidc,
-    )
-    .await;
-    let token = signer.token_for_org(DEFAULT_SUB, "org-1", 300);
-    let body = json!({
-        "token": token,
-        "target": { "database_id": DatabaseId::new(), "branch_id": BranchId::new(), "pg_database": "web1", "role": null },
-    });
-    let resp = reqwest::Client::new()
-        .post(format!("{}{AUTHORIZE}", app.base))
-        .bearer_auth(REALTIME_TOKEN)
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_refused(&body, "unavailable");
 }
 
 // S13: an empty role is the caller's bug (400), not a refusal.
@@ -1107,7 +1063,7 @@ async fn a_reset_publishes_the_branch_status() {
 
 /// [`rt`] with the identity fake behind the orchestrator (the member API's removals and invites).
 async fn rt_z() -> (Rt, FakeIdentity) {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
@@ -1828,9 +1784,9 @@ async fn team_only_member_gets_realtime_projects() {
 }
 
 // D7, T8-1: realtime asks before it issues a Studio ticket. `/internal/realtime/member` (its
-// bearer only; `{sub, org_id}` from the gateway's identity) answers `{allowed: true}` for an
+// bearer only; `{sub, tenant_id}` from the gateway's identity) answers `{allowed: true}` for an
 // active member and `{allowed: false, reason: "forbidden"}` for a suspended or offboarded one,
-// a non-member, or another org; the project list refuses an offboarded member like a
+// a non-member, or another tenant; the project list refuses an offboarded member like a
 // suspended one.
 #[tokio::test]
 async fn realtime_refuses_suspended_and_offboarded_members() {
@@ -1839,16 +1795,17 @@ async fn realtime_refuses_suspended_and_offboarded_members() {
     t.metadata.set_member(t.tenant, "sus", |m| m.status = MemberStatus::Suspended);
     t.metadata.add_granted(t.tenant, "off", t.project, PlatformRole::Developer, &[]);
     t.metadata.set_member(t.tenant, "off", |m| m.offboarded = true);
-    let ask = |sub: &str, org: &str| json!({ "sub": sub, "org_id": org });
+    let ask = |sub: &str, tenant: TenantId| json!({ "sub": sub, "tenant_id": tenant });
 
-    let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask("dev1", "org-1")).await;
+    let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask("dev1", t.tenant)).await;
     assert_eq!((status, body["allowed"].clone()), (200, json!(true)), "{body}");
-    for (sub, org) in [("sus", "org-1"), ("off", "org-1"), ("stranger", "org-1"), ("dev1", "org-2")] {
-        let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask(sub, org)).await;
-        assert_eq!(status, 200, "{sub} {org}: {body}");
+    let other = TenantId::new();
+    for (sub, tenant) in [("sus", t.tenant), ("off", t.tenant), ("stranger", t.tenant), ("dev1", other)] {
+        let (status, body) = t.post(MEMBER, Some(REALTIME_TOKEN), ask(sub, tenant)).await;
+        assert_eq!(status, 200, "{sub} {tenant}: {body}");
         assert_refused(&body, "forbidden");
     }
-    let (status, _) = t.post(MEMBER, None, ask("dev1", "org-1")).await;
+    let (status, _) = t.post(MEMBER, None, ask("dev1", t.tenant)).await;
     assert_eq!(status, 401, "realtime's bearer only");
 
     let (status, _) = t

@@ -74,7 +74,7 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
         onClose();
         queryClient.removeQueries({ queryKey: getGetAppUserQueryKey(projectId, userId) });
         queryClient.removeQueries({ queryKey: getListAppUserSessionsQueryKey(projectId, userId) });
-        // Zitadel's list lags behind a delete: drop the user from every cached page now and only mark the lists stale
+        // The user list can lag behind a delete: drop the user from every cached page now and only mark the lists stale
         // (an immediate refetch could bring the deleted user back).
         queryClient.setQueriesData<AppUserPage>({ queryKey: ["/v1/projects/" + projectId + "/users"] }, (old) =>
           old && Array.isArray(old.users) ? { ...old, users: old.users.filter((x) => x.id !== userId) } : old,
@@ -114,7 +114,7 @@ export function UserDrawer({ projectId, userId, onClose }: UserDrawerProps) {
                     Save email
                   </Button>
                 </form>
-                {/* Zitadel can't take a verification back without a new address: once verified, it stays. */}
+                {/* A verification can't be taken back without a new address: once verified, it stays. */}
                 {u.email_verified ? (
                   <p className="flex items-center gap-1.5 text-sm">
                     <Check className="size-4 text-seafoam" aria-hidden="true" />

@@ -4,7 +4,6 @@ use auth::app::{AppState, router};
 use auth::app_users::AppUsers;
 use auth::config::{AppConfig, Config};
 use auth::guard::RateLimiter;
-use auth::zitadel::Zitadel;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -33,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
         Some(c) => {
             AppConfig::check_internal_token(config.mode, dev, &c.internal_token)?;
             info!("app users' flows are on (access tokens live {} s)", c.access_ttl.as_secs());
-            Some(AppUsers::from_config(&c, &config.zitadel)?)
+            Some(AppUsers::from_config(&c)?)
         }
         None => None,
     };
@@ -55,8 +54,6 @@ async fn main() -> anyhow::Result<()> {
         app,
         signup_gate: Some(signup_gate),
         used_tickets: Default::default(),
-        admin: AppConfig::admin_from_env(&config.zitadel)?,
-        zitadel: Zitadel::new(&config.zitadel.base, &config.token).with_host(config.zitadel.host.as_deref()),
         config,
         limiter: RateLimiter::default(),
         member_tokens,

@@ -4,7 +4,7 @@
 # by the unresolved target depth, so a badly placed mask hides the key mounts. This renders the
 # orchestrator's mounts from the real compose file, starts a plain alpine container with exactly
 # those mounts, and asserts every key file the orchestrator reads is readable and that nothing else
-# under the keys dir is visible (the stack's state dir, under it, included: only admin.pat). No
+# under the keys dir is visible (the stack's state dir, under it, included: none of it). No
 # stack is started.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -26,7 +26,7 @@ keys="$main/.chelabase"
 checkout="$main/.worktrees/x"
 state="$keys/stacks/x"
 mkdir -p "$keys"/{secrets,gateway,auth,neon/storage-tokens,compute-ca,orchestrator-tls/v1,nats,valkey,realtime,tokens,identity} \
-  "$state"/{env,nats,valkey,zitadel,neon,logs,test,runner} "$keys/stacks/other" "$checkout"
+  "$state"/{env,nats,valkey,bootstrap,neon,logs,test,runner} "$keys/stacks/other" "$checkout"
 # RT1 T1: the service secrets (S1, S27) and the storage auth files exist too; the orchestrator
 # reads its own NATS and Valkey passwords, realtime's internal token and the internal bearers.
 for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verify.pem auth/cookie.key \
@@ -46,10 +46,8 @@ for f in secrets/secrets.key gateway/internal-signing.pem gateway/internal-verif
   echo "content of $f" >"$keys/$f"
 done
 ln -s v1 "$keys/orchestrator-tls/current"
-# The stack's state dir lies under the masked keys dir too; the orchestrator sees only admin.pat
-# there (a single-file mount on top of the mask), none of its siblings.
-for f in env/stack.env zitadel/admin.pat zitadel/login-client.pat zitadel/demo-sa.json zitadel/demo.env \
-  zitadel/actions.env studio.env nats/auth.conf valkey/users.acl binaries.json neon/proxy-ca.crt \
+# The stack's state dir lies under the masked keys dir too; the orchestrator sees none of it.
+for f in env/stack.env bootstrap/dev-member.json bootstrap/dev-token.json studio.env nats/auth.conf valkey/users.acl binaries.json neon/proxy-ca.crt \
   runner/.curlrc logs/x test/archive.tar.zst; do
   echo "content of $f" >"$state/$f"
 done
@@ -70,21 +68,19 @@ mapfile -t mounts < <(jq -r '.services.orchestrator.volumes[] | select(.target !
 args=()
 for m in "${mounts[@]}"; do args+=(--mount "$m"); done
 
-# What the orchestrator reads (U10 table), as paths under the keys dir (its state file included).
+# What the orchestrator reads (U10 table), as paths under the keys dir.
 readable=(secrets/secrets.key gateway/internal-verify.pem neon/compute-jwt.pem neon/compute-jwt.pub
   orchestrator-tls/current/client.crt orchestrator-tls/current/client.key orchestrator-tls/current/ca.crt
   nats/orchestrator.password valkey/control.password realtime/internal.token
   tokens/rest-internal.token tokens/data-keys.token tokens/app-auth.token tokens/app-sessions.token
-  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub
-  stacks/x/zitadel/admin.pat)
+  tokens/proxy-api.token tokens/storcon-hook.token tokens/orchestrator-identity.token auth/member-jwt.pub)
 expected="$(printf '%s\n' "$keys/secrets/secrets.key" "$keys/gateway/internal-verify.pem" \
   "$keys/neon/compute-jwt.pem" "$keys/neon/compute-jwt.pub" "$keys/orchestrator-tls/current" \
   "$keys/orchestrator-tls/v1/client.crt" "$keys/orchestrator-tls/v1/client.key" "$keys/orchestrator-tls/v1/ca.crt" \
   "$keys/nats/orchestrator.password" "$keys/valkey/control.password" "$keys/realtime/internal.token" \
   "$keys/tokens/rest-internal.token" "$keys/tokens/data-keys.token" "$keys/tokens/app-auth.token" \
   "$keys/tokens/app-sessions.token" "$keys/tokens/proxy-api.token" "$keys/tokens/storcon-hook.token" \
-  "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" \
-  "$state/zitadel/admin.pat" | sort)"
+  "$keys/tokens/orchestrator-identity.token" "$keys/auth/member-jwt.pub" | sort)"
 
 script='set -e
 for f in "$@"; do cat "$f" >/dev/null || { echo "UNREADABLE $f"; exit 3; }; done

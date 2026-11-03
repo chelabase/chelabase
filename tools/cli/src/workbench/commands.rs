@@ -42,9 +42,6 @@ impl Site {
 /// The Rust apps the stack runs from `<checkout>/target/debug`.
 pub(super) const RUST_APPS: [&str; 6] =
     ["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
-/// The apps that read the bootstrap's `demo.env` (the OIDC audiences, the demo ids).
-pub(super) const DEMO_ENV_READERS: &[&str] =
-    &["orchestrator", "worker", "gateway", "auth", "rest", "realtime"];
 /// Every app container (the Rust apps, Studio and the identity service; the sites are added by
 /// `--with`).
 pub(super) const APPS: [&str; 8] = [
@@ -63,7 +60,6 @@ pub(super) const INFRA: &[&str] = &[
     "metadata-db",
     "nats",
     "valkey",
-    "zitadel-db",
     "seaweedfs",
     "storage-broker",
     "safekeeper1",
@@ -74,12 +70,13 @@ pub(super) const INFRA: &[&str] = &[
     "pageserver",
     "proxy",
 ];
-/// Started with the infra and waited on until healthy: the bootstrap reaches Zitadel through the
-/// gateway, and creates the identity service's members pool by calling `http://identity:8080`
-/// directly on the stack network (identity has no gateway route). Identity runs the checkout's
-/// TypeScript sources (no build); a change to them needs `workbench restart identity`.
-pub(super) const FRONT: &[&str] = &["zitadel", "mailpit", "gateway", "identity"];
-/// Started after the first bootstrap.
+/// Started with the infra and waited on until healthy: the bootstrap creates the identity
+/// service's members pool by calling `http://identity:8080` directly on the stack network
+/// (identity has no gateway route). Identity runs the checkout's TypeScript sources (no build);
+/// a change to them needs `workbench restart identity`.
+pub(super) const FRONT: &[&str] = &["mailpit", "gateway", "identity"];
+/// Started before the bootstrap, which waits on the orchestrator and (the dev member's sign-up)
+/// auth.
 pub(super) const LATE_APPS: &[&str] =
     &["orchestrator", "worker", "auth", "rest", "realtime", "studio"];
 /// A stack that took its slot this recently is alive even with no running container: `up` is
@@ -186,6 +183,11 @@ impl Stack {
         self.state.join("binaries.json")
     }
 
+    /// `chelabase-init bootstrap --demo`'s output dir: the dev member's password (`dev token`).
+    pub(crate) fn bootstrap_dir(&self) -> PathBuf {
+        self.state.join("bootstrap")
+    }
+
     fn runner_dir(&self) -> PathBuf {
         self.state.join("runner")
     }
@@ -286,49 +288,20 @@ pub fn stale_apps(recorded: &HashMap<String, u64>, current: &HashMap<String, u64
     stale
 }
 
-/// The apps the bootstrap waits on: the orchestrator (it applies the metadata migrations and
-/// is the Actions target's host). None of them may need a file only the bootstrap writes
-/// (the orchestrator starts without demo.env and actions.env), since they are waited on first.
-pub const BOOTSTRAP_DEPENDENCIES: &[&str] = &["orchestrator"];
-
-/// The apps `up` recreates before the bootstrap (B3, B4): on a running stack, those of
-/// [`BOOTSTRAP_DEPENDENCIES`] whose binary changed since they started, so the bootstrap never
-/// waits on an old build. No other app: one that reads the bootstrap's files (auth needs
-/// demo.env's org id) can't become healthy before it has run, so it is recreated after it
-/// ([`recreate_after_bootstrap`]). A stack that wasn't running starts every app on its current
-/// binary.
+/// The apps `up` recreates before the bootstrap (B3): on a running stack, every app whose binary
+/// changed since it started, so the bootstrap never waits on an old build, and the readers of an
+/// env file `up` changed (`env_changed`), sorted and deduped. A stack that wasn't running starts
+/// every app on its current binary and env files.
 pub fn recreate_before_bootstrap(
     was_running: bool,
     recorded: &HashMap<String, u64>,
     current: &HashMap<String, u64>,
+    env_changed: &[String],
 ) -> Vec<String> {
     if !was_running {
         return Vec::new();
     }
-    stale_apps(recorded, current)
-        .into_iter()
-        .filter(|a| BOOTSTRAP_DEPENDENCIES.contains(&a.as_str()))
-        .collect()
-}
-
-/// The apps `up` recreates after the bootstrap: on a running stack, every app whose binary
-/// changed and that wasn't recreated before it (`rebuilt`), and on any stack every reader of
-/// an env file the bootstrap changed (`env_changed`), sorted and deduped.
-pub fn recreate_after_bootstrap(
-    was_running: bool,
-    recorded: &HashMap<String, u64>,
-    current: &HashMap<String, u64>,
-    rebuilt: &[String],
-    env_changed: &[String],
-) -> Vec<String> {
-    let mut apps: Vec<String> = if was_running {
-        stale_apps(recorded, current)
-            .into_iter()
-            .filter(|a| !rebuilt.contains(a))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let mut apps = stale_apps(recorded, current);
     apps.extend(env_changed.iter().cloned());
     apps.sort();
     apps.dedup();
@@ -356,13 +329,13 @@ pub fn check_purge(slug: &str, named: Option<&str>, yes: bool) -> anyhow::Result
     if named.map(str::trim) != Some(MAIN) {
         bail!(
             "this checkout's stack is main; purging main deletes its data (every database, its \
-             Zitadel instance and its state), so it must be named: `just workbench purge --stack \
+             accounts and its state), so it must be named: `just workbench purge --stack \
              main --yes`"
         );
     }
     if !yes {
         bail!(
-            "purging main deletes its data (every database, its Zitadel instance and its state); \
+            "purging main deletes its data (every database, its accounts and its state); \
              run `just workbench purge --stack main --yes` if you mean it"
         );
     }
@@ -384,9 +357,9 @@ pub fn compose_command(env_file: &Path, args: Vec<String>) -> anyhow::Result<Com
     Ok(cmd)
 }
 
-/// Creates the stack's Zitadel dir private to the stack user (0700): Zitadel runs as that user
-/// and writes its PATs there. Idempotent.
-pub fn prepare_zitadel_dir(dir: &Path) -> anyhow::Result<()> {
+/// Creates the stack's bootstrap dir private to the stack user (0700): the bootstrap runs as that
+/// user and keeps the dev member's password there. Idempotent.
+pub fn prepare_bootstrap_dir(dir: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
@@ -396,7 +369,7 @@ pub fn prepare_zitadel_dir(dir: &Path) -> anyhow::Result<()> {
 /// `up`'s key phase, before any container mounts the files: every key, secret and auth file
 /// through `chelabase_init::ensure_secrets` (created once, never overwritten). The machine part
 /// goes to the shared keys dir (`<main>/.chelabase`), the stack's own part (the NATS and Valkey
-/// auth files, the database passwords, the Zitadel files, the setup code) to its state dir.
+/// auth files, the database passwords, the identity files, the setup code) to its state dir.
 /// Reports which auth file changed: a running NATS or Valkey must restart to read it (R9).
 pub fn ensure_stack_secrets(
     main: &Path,
@@ -414,16 +387,6 @@ pub fn ensure_stack_secrets(
         );
     }
     Ok(report.auth_files)
-}
-
-/// Sets each PAT file to 0600; a missing file is an error.
-pub fn secure_pats(paths: &[PathBuf]) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    for p in paths {
-        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("setting {} to 0600", p.display()))?;
-    }
-    Ok(())
 }
 
 /// `CHELABASE_NEXTEST_BIN` in `stack.env`: the host's cargo-nextest, else `/dev/null`, so the
@@ -570,22 +533,6 @@ pub(super) fn restart_targets(apps: &[String]) -> anyhow::Result<Vec<String>> {
         }
     }
     Ok(apps.to_vec())
-}
-
-/// The Zitadel PATs (under the stack's state dir `state`) that `apps` mount as Compose secrets,
-/// each once: admin.pat for the orchestrator, the worker and auth, login-client.pat for auth.
-fn pat_files(state: &Path, apps: &[String]) -> Vec<PathBuf> {
-    let reads = |file: &str| {
-        apps.iter().any(|a| match file {
-            "admin.pat" => matches!(a.as_str(), "orchestrator" | "worker" | "auth"),
-            _ => a == "auth",
-        })
-    };
-    ["admin.pat", "login-client.pat"]
-        .into_iter()
-        .filter(|f| reads(f))
-        .map(|f| state.join("zitadel").join(f))
-        .collect()
 }
 
 /// The services of `ps --format json` that failed: unhealthy, restarting, or exited non-zero.
@@ -907,7 +854,7 @@ fn start_stack(
             let d = stack.state.join(dir);
             std::fs::create_dir_all(&d).with_context(|| format!("creating {}", d.display()))?;
         }
-        prepare_zitadel_dir(&stack.state.join("zitadel"))?;
+        prepare_bootstrap_dir(&stack.bootstrap_dir())?;
         let input = StackEnvInput {
             slug: &stack.slug,
             project: &stack.project,
@@ -932,31 +879,17 @@ fn start_stack(
             &curlrc(&h, entry.gateway_port),
         )
     })?;
+    // Studio's build values (the workbench's Vite server reads them when it starts).
+    let studio_changed = phases.run("studio.env", || write_studio_env(stack))?;
 
     phases.run("cargo build", || cargo_build(stack, &RUST_APPS, true))?;
     touch_slot(&stack.stacks_dir, &stack.slug, now())?;
 
-    let auth_changed = phases.run("machine keys", || {
-        let auth_changed = ensure_stack_secrets(&stack.main, &stack.state)?;
-        // A demo.env from before still names the public bearers, which the apps would now
-        // refuse next to their <NAME>_FILE: drop them before the front tier is created.
-        let demo = stack.state.join("zitadel/demo.env");
-        if let Ok(text) = std::fs::read_to_string(&demo)
-            && let Some(scrubbed) = crate::dev::env_files::without_legacy_bearers(&text)
-        {
-            std::fs::write(&demo, scrubbed)
-                .with_context(|| format!("writing {}", demo.display()))?;
-        }
-        Ok(auth_changed)
-    })?;
-
-    // The env files the apps read at create time; recreated below when the bootstrap changed
-    // them (T4 review M3).
-    let before_bootstrap = app_env_files(stack);
+    let auth_changed = phases.run("machine keys", || ensure_stack_secrets(&stack.main, &stack.state))?;
 
     let mut front: Vec<&str> = INFRA.to_vec();
     front.extend_from_slice(FRONT);
-    phases.run("infra, Zitadel, Mailpit and the gateway", || {
+    phases.run("infra, Mailpit, the gateway and identity", || {
         compose_up(stack, &[], &front)
     })?;
     // R9: a running NATS reads its auth.conf, and a running Valkey its users.acl, through a
@@ -979,13 +912,6 @@ fn start_stack(
         })?;
     }
 
-    phases.run("Zitadel's PATs", || {
-        let zitadel = stack.state.join("zitadel");
-        let pats = [zitadel.join("admin.pat"), zitadel.join("login-client.pat")];
-        wait_for_files(&pats, Duration::from_secs(180))?;
-        secure_pats(&pats)
-    })?;
-
     let mut late: Vec<&str> = LATE_APPS.to_vec();
     let profiles: Vec<&str> = if with.is_empty() {
         Vec::new()
@@ -993,8 +919,6 @@ fn start_stack(
         late.extend(with.iter().map(|s| s.service()));
         vec!["--profile", "sites"]
     };
-    // Not waited on: on a fresh stack an app that needs the bootstrap's files (auth) restarts
-    // until it is recreated below with them.
     phases.run("apps", || compose_start(stack, &profiles, &late))?;
     // After the apps: the worker that would recreate a removed compute is now the one that
     // starts computes on the compute network.
@@ -1003,33 +927,20 @@ fn start_stack(
     })?;
 
     // What the bootstrap waits on must not run an old binary: an old orchestrator never
-    // applies a new migration (B3). Only that: the rest may need the bootstrap's files (B4).
+    // applies a new migration (B3). No app needs the bootstrap's files, so every stale one (and
+    // Studio when its studio.env changed) is recreated now.
     let (recorded, current) = (read_binaries(stack), current_binaries(stack, &RUST_APPS));
-    let rebuilt = recreate_before_bootstrap(was_running, &recorded, &current);
+    let env_changed: Vec<String> = if studio_changed { vec!["studio".to_string()] } else { Vec::new() };
+    let rebuilt = recreate_before_bootstrap(was_running, &recorded, &current, &env_changed);
     if !rebuilt.is_empty() {
-        phases.run(&format!("recreating {} (new binaries)", rebuilt.join(", ")), || {
+        phases.run(&format!("recreating {}", rebuilt.join(", ")), || {
             recreate(stack, &rebuilt)
         })?;
     }
 
-    // One run, after the apps: it waits for the orchestrator (the metadata migrations, the
-    // Actions target's host) itself.
+    // One run, after the apps: it waits for the orchestrator (the metadata migrations) and auth
+    // (the dev member's sign-up) itself.
     phases.run("bootstrap", || bootstrap(stack, None))?;
-
-    // Then every other app on a new binary, and the readers of the files the bootstrap changed
-    // (every app container predates them).
-    let stale = recreate_after_bootstrap(
-        was_running,
-        &recorded,
-        &current,
-        &rebuilt,
-        &changed_env_users(&before_bootstrap, &app_env_files(stack)),
-    );
-    if !stale.is_empty() {
-        phases.run(&format!("recreating {}", stale.join(", ")), || {
-            recreate(stack, &stale)
-        })?;
-    }
 
     phases.run("apps healthy", || compose_up(stack, &profiles, &late))?;
 
@@ -1061,40 +972,6 @@ fn write_file(path: &Path, contents: &str) -> anyhow::Result<()> {
     std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
 }
 
-/// An env file the apps read at create time: its path, its contents (if any) and its readers.
-type EnvFile = (PathBuf, Option<Vec<u8>>, &'static [&'static str]);
-
-/// The env files bootstrap writes and the services that read them at create time.
-fn app_env_files(stack: &Stack) -> Vec<EnvFile> {
-    const DEMO_USERS: &[&str] = DEMO_ENV_READERS;
-    const ACTIONS_USERS: &[&str] = &["orchestrator"];
-    const STUDIO_USERS: &[&str] = &["studio"];
-    [
-        (stack.state.join("zitadel/demo.env"), DEMO_USERS),
-        (stack.state.join("zitadel/actions.env"), ACTIONS_USERS),
-        (stack.state.join("studio.env"), STUDIO_USERS),
-    ]
-    .into_iter()
-    .map(|(path, users)| {
-        let contents = std::fs::read(&path).ok();
-        (path, contents, users)
-    })
-    .collect()
-}
-
-/// The services reading an env file whose contents changed, in [`APPS`] order.
-fn changed_env_users(before: &[EnvFile], after: &[EnvFile]) -> Vec<String> {
-    let mut users: Vec<&str> = Vec::new();
-    for ((_, old, list), (_, new, _)) in before.iter().zip(after) {
-        if old != new {
-            users.extend(list.iter());
-        }
-    }
-    APPS.iter()
-        .filter(|a| users.contains(a))
-        .map(|a| a.to_string())
-        .collect()
-}
 
 fn ensure_image(stack: &Stack) -> anyhow::Result<String> {
     let dir = stack.checkout.join("infra/workbench");
@@ -1211,15 +1088,8 @@ fn compose_start(stack: &Stack, profiles: &[&str], services: &[&str]) -> anyhow:
 }
 
 /// `compose up -d --force-recreate --no-deps --wait <apps>` (bounded by [`WAIT_SECS`]): env files are read when a container
-/// is created, so a restart would keep the old ones (T4 review M3). The Zitadel PATs are Compose
-/// secrets of the apps that read them: a missing one (Zitadel rewriting them after `just
-/// zitadel-reset`) would fail the create, so it first waits for them, as `up` does.
+/// is created, so a restart would keep the old ones (T4 review M3).
 fn recreate(stack: &Stack, apps: &[String]) -> anyhow::Result<()> {
-    let pats = pat_files(&stack.state, apps);
-    if !pats.is_empty() {
-        wait_for_files(&pats, Duration::from_secs(180))?;
-        secure_pats(&pats)?;
-    }
     run_waiting(stack, &recreate_args(apps))
 }
 
@@ -1245,42 +1115,15 @@ fn show_failure(stack: &Stack) {
     }
 }
 
-fn wait_for_files(files: &[PathBuf], timeout: Duration) -> anyhow::Result<()> {
-    let start = Instant::now();
-    loop {
-        let missing: Vec<&PathBuf> = files
-            .iter()
-            .filter(|f| std::fs::metadata(f).map_or(true, |m| m.len() == 0))
-            .collect();
-        if missing.is_empty() {
-            return Ok(());
-        }
-        if start.elapsed() >= timeout {
-            bail!(
-                "Zitadel hasn't written {} after {}: it writes them only on a fresh volume (`just \
-                 zitadel-reset`); its logs: `just workbench logs zitadel`",
-                missing
-                    .iter()
-                    .map(|f| f.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                fmt_duration(timeout)
-            );
-        }
-        std::thread::sleep(Duration::from_secs(1));
-    }
-}
-
 /// `chelabase-init bootstrap --demo` on the stack's network, as a one-shot container of the
-/// workbench image: the host can't reach the metadata database, and the bootstrap reaches
-/// Zitadel, the metadata database and the orchestrator by their service names. It mounts only
-/// its binary (read-only) and the output dir (the stack's `zitadel/`, where Zitadel writes the
-/// PATs); its env is the stack env's values of what it reads (`bootstrap::ENV_KEYS`). Then the
-/// apps' env files are rendered from its outputs.
+/// workbench image: the host can't reach the metadata database, and the bootstrap reaches the
+/// metadata database, the orchestrator, identity and auth by their service names. It mounts
+/// only its binary (read-only), the output dir (the stack's `bootstrap/`, where it keeps the dev
+/// member's password) and the files its steps read; its env is the stack env's values of what it
+/// reads (`bootstrap::ENV_KEYS`).
 fn bootstrap(stack: &Stack, admin_email: Option<&str>) -> anyhow::Result<()> {
     let env = crate::paths::load_dotenv_file(&stack.env_file);
-    let out = stack.state.join("zitadel");
-    crate::dev::bootstrap::adopt_actions_key(&out)?;
+    let out = stack.bootstrap_dir();
     let bin = stack.checkout.join("target/debug/chelabase-init");
     let bin = bin
         .canonicalize()
@@ -1289,8 +1132,20 @@ fn bootstrap(stack: &Stack, admin_email: Option<&str>) -> anyhow::Result<()> {
     cmd.args(bootstrap_args(&stack.project, &env, &bin, &out, admin_email)?)
         // The values reach the container through docker's own env, never its argv.
         .envs(bootstrap_env(&env, &out));
-    run(cmd)?;
-    crate::dev::bootstrap::render_workbench_files(&out, &stack.state.join("studio.env"), &env)
+    run(cmd)
+}
+
+/// Writes the stack's `studio.env` (Studio's build values) when it differs; whether it did.
+fn write_studio_env(stack: &Stack) -> anyhow::Result<bool> {
+    let env = crate::paths::load_dotenv_file(&stack.env_file);
+    let entry = chelabase_types::entry::Entry::from_lookup(|k| env.get(k).cloned())?;
+    let text = crate::dev::env_files::render_studio_env(&entry.api_base(), entry.studio_host());
+    let path = stack.state.join("studio.env");
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+        return Ok(false);
+    }
+    write_file(&path, &text)?;
+    Ok(true)
 }
 
 /// `docker run …` for [`bootstrap`]: see there.
@@ -1323,11 +1178,14 @@ pub fn bootstrap_args(
     ]
     .map(str::to_string)
     .to_vec();
-    // The identity step's two files, each alone and read-only (m5, #118).
+    // The identity step's two files, each alone and read-only (m5, #118), and the setup code
+    // the dev member signs up with.
     for file in IDENTITY_BOOTSTRAP_FILES {
         let path = format!("{keys}/{file}");
         args.extend(["-v".to_string(), format!("{path}:{path}:ro")]);
     }
+    let code = setup_code_file(env)?;
+    args.extend(["-v".to_string(), format!("{code}:{code}:ro")]);
     args.extend(["--entrypoint".to_string(), tool.to_string()]);
     for (k, _) in bootstrap_env(env, Path::new(&out)) {
         // `-e NAME`: docker takes the value from its own environment (see [`bootstrap`]), so
@@ -1349,26 +1207,35 @@ const IDENTITY_BOOTSTRAP_FILES: [&str; 2] = [
     "tokens/bootstrap-identity.token",
 ];
 
+/// The stack's setup code file (in its state dir): the dev member's sign-up needs it.
+fn setup_code_file(env: &HashMap<String, String>) -> anyhow::Result<String> {
+    let state = env
+        .get("CHELABASE_STACK_DIR")
+        .context("the stack env has no CHELABASE_STACK_DIR")?;
+    Ok(format!("{state}/setup/setup.code"))
+}
+
 /// The env [`bootstrap`]'s container gets: the stack env's values of what the bootstrap reads,
-/// the admin PAT's path in the output dir, and the identity step's service URL and file paths
-/// (set here, never in stack.env: no app reads them from there).
-pub fn bootstrap_env(env: &HashMap<String, String>, out: &Path) -> Vec<(String, String)> {
+/// and the identity step's and the dev member's service URLs and file paths (set here, never in
+/// stack.env: no app reads them from there).
+pub fn bootstrap_env(env: &HashMap<String, String>, _out: &Path) -> Vec<(String, String)> {
     let set_here = [
-        "CHELABASE_ZITADEL_ADMIN_PAT_FILE",
         "CHELABASE_IDENTITY_URL",
         "CHELABASE_IDENTITY_DB_PASSWORD_FILE",
         "CHELABASE_IDENTITY_TOKEN_FILE",
+        "CHELABASE_AUTH_URL",
+        "CHELABASE_SETUP_CODE_FILE",
     ];
     let mut pairs: Vec<(String, String)> = chelabase_init::bootstrap::ENV_KEYS
         .iter()
         .filter(|k| !set_here.contains(k))
         .filter_map(|k| env.get(*k).map(|v| (k.to_string(), v.clone())))
         .collect();
-    pairs.push((
-        "CHELABASE_ZITADEL_ADMIN_PAT_FILE".into(),
-        format!("{}/admin.pat", out.display()),
-    ));
     pairs.push(("CHELABASE_IDENTITY_URL".into(), "http://identity:8080".into()));
+    pairs.push(("CHELABASE_AUTH_URL".into(), "http://auth:8084".into()));
+    if let Ok(code) = setup_code_file(env) {
+        pairs.push(("CHELABASE_SETUP_CODE_FILE".into(), code));
+    }
     if let Some(keys) = env.get("CHELABASE_KEYS_DIR") {
         let [password, token] = IDENTITY_BOOTSTRAP_FILES;
         pairs.push((
@@ -1381,7 +1248,7 @@ pub fn bootstrap_env(env: &HashMap<String, String>, out: &Path) -> Vec<(String, 
 }
 
 /// `chelabase dev bootstrap [--admin-email e]`: the current checkout's stack's bootstrap, as
-/// `up` runs it (`just zitadel-bootstrap`). The stack must be up.
+/// `up` runs it. The stack must be up.
 pub fn dev_bootstrap(admin_email: Option<&str>) -> anyhow::Result<()> {
     let stack = current_stack()?;
     if !stack.env_file.is_file() {
@@ -1424,7 +1291,6 @@ fn print_urls(stack: &Stack, entry: &Entry, scheme: &str, with: &[Site]) {
     println!("=== Chelabase workbench stack {} ===", stack.slug);
     println!("Studio:          {}", url(&h.studio));
     println!("API:             {}", url(&h.api));
-    println!("Auth (Zitadel):  {}/ui/console", url(&h.auth));
     println!("Mail (Mailpit):  {}", url(&h.mail));
     if with.contains(&Site::Docs) {
         println!("Docs:            {}", url(&h.docs));
@@ -2108,130 +1974,28 @@ mod tests {
         assert!(restart_targets(&["blog".into()]).is_err());
     }
 
-    #[test]
-    fn recreate_waits_for_the_pats_of_the_apps_that_mount_them() {
-        let state = Path::new("/s");
-        let names = |apps: &[&str]| -> Vec<PathBuf> {
-            let apps: Vec<String> = apps.iter().map(|a| a.to_string()).collect();
-            pat_files(state, &apps)
-        };
-        assert!(names(&["gateway", "rest", "realtime", "studio", "docs"]).is_empty());
-        assert_eq!(names(&["worker"]), [state.join("zitadel/admin.pat")]);
-        // Each PAT once, whatever the order or the number of readers.
-        assert_eq!(
-            names(&["orchestrator", "auth", "worker"]),
-            [
-                state.join("zitadel/admin.pat"),
-                state.join("zitadel/login-client.pat")
-            ]
-        );
-        assert_eq!(names(&[]), Vec::<PathBuf>::new());
-
-        // The table matches the compose files (the base and the workbench overlay): every service
-        // listing a PAT secret, and only those.
-        let compose = concat!(
-            include_str!("../../../../infra/compose/docker-compose.yml"),
-            "\n",
-            include_str!("../../../../infra/compose/docker-compose.workbench.yml")
-        );
-        let mut mounted: Vec<(String, &str)> = Vec::new();
-        let mut service = None;
-        let mut in_services = false;
-        for line in compose.lines() {
-            if !line.starts_with(' ') && !line.is_empty() && !line.starts_with('#') {
-                in_services = line == "services:";
-                service = None;
-            } else if in_services
-                && let Some(name) = line.strip_prefix("  ").and_then(|l| l.strip_suffix(':'))
-                && !name.starts_with([' ', '#'])
-            {
-                service = Some(name.to_string());
-            }
-            for (secret, file) in [
-                ("zitadel-admin-pat", "admin.pat"),
-                ("zitadel-login-client-pat", "login-client.pat"),
-            ] {
-                if let Some(svc) = &service
-                    && line.contains(&format!("{{source: {secret}, "))
-                {
-                    mounted.push((svc.clone(), file));
-                }
-            }
-        }
-        mounted.sort();
-        // A service that mounts a PAT must be one `recreate()` can be asked to recreate, or its
-        // PAT wait is skipped and its create fails on the missing file after a zitadel reset.
-        let recreatable: Vec<&str> = APPS
-            .iter()
-            .copied()
-            .chain(["docs", "landing", "runner"])
-            .collect();
-        for (svc, _) in &mounted {
-            assert!(
-                recreatable.contains(&svc.as_str()),
-                "service `{svc}` mounts a Zitadel PAT but recreate() can't be asked for it"
-            );
-        }
-        let mut table: Vec<(String, &str)> = Vec::new();
-        for app in APPS.iter().chain(&["docs", "landing", "runner"]) {
-            for f in pat_files(Path::new(""), &[app.to_string()]) {
-                let file = if f.ends_with("admin.pat") {
-                    "admin.pat"
-                } else {
-                    "login-client.pat"
-                };
-                table.push((app.to_string(), file));
-            }
-        }
-        table.sort();
-        assert_eq!(mounted, table);
-        assert!(!table.is_empty());
-    }
-
     fn mode_of(p: &Path) -> u32 {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
     #[test]
-    fn the_zitadel_dir_is_private_to_the_stack_user() {
+    fn the_bootstrap_dir_is_private_to_the_stack_user() {
         use std::os::unix::fs::PermissionsExt as _;
         let tmp = tempfile::tempdir().unwrap();
         // Created fresh (parents included).
-        let fresh = tmp.path().join("state/zitadel");
-        prepare_zitadel_dir(&fresh).unwrap();
+        let fresh = tmp.path().join("state/bootstrap");
+        prepare_bootstrap_dir(&fresh).unwrap();
         assert_eq!(mode_of(&fresh), 0o700, "a new dir");
         // A dir left at 0777 by an older stack is tightened, and the call is idempotent.
         let old = tmp.path().join("old");
         std::fs::create_dir(&old).unwrap();
         std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o777)).unwrap();
-        std::fs::write(old.join("admin.pat"), "x").unwrap();
-        prepare_zitadel_dir(&old).unwrap();
-        prepare_zitadel_dir(&old).unwrap();
+        std::fs::write(old.join("dev-member.json"), "x").unwrap();
+        prepare_bootstrap_dir(&old).unwrap();
+        prepare_bootstrap_dir(&old).unwrap();
         assert_eq!(mode_of(&old), 0o700, "an existing 0777 dir");
-        assert!(old.join("admin.pat").exists(), "existing files are kept");
-    }
-
-    #[test]
-    fn secure_pats_makes_each_pat_0600() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let tmp = tempfile::tempdir().unwrap();
-        let admin = tmp.path().join("admin.pat");
-        let login = tmp.path().join("login-client.pat");
-        for f in [&admin, &login] {
-            std::fs::write(f, "token").unwrap();
-            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
-        }
-        secure_pats(&[admin.clone(), login.clone()]).unwrap();
-        assert_eq!(mode_of(&admin), 0o600);
-        assert_eq!(mode_of(&login), 0o600);
-        assert_eq!(std::fs::read_to_string(&admin).unwrap(), "token");
-        // Idempotent, and an empty list is fine (recreate() may wait for no PAT).
-        secure_pats(&[admin.clone(), login.clone()]).unwrap();
-        secure_pats(&[]).unwrap();
-        assert_eq!(mode_of(&admin), 0o600);
-        // A PAT that isn't there is an error, not a silent skip.
-        assert!(secure_pats(&[tmp.path().join("nope.pat")]).is_err());
+        assert!(old.join("dev-member.json").exists(), "existing files are kept");
     }
 
     #[test]
@@ -2245,67 +2009,26 @@ mod tests {
         assert_eq!(failed_services(array), ["auth"]);
     }
 
-    #[test]
-    fn changed_env_files_name_their_readers() {
-        const DEMO: &[&str] = &["gateway", "auth"];
-        const STUDIO: &[&str] = &["studio"];
-        let p = PathBuf::from;
-        let before = vec![
-            (p("demo.env"), Some(b"a".to_vec()), DEMO),
-            (p("studio.env"), None, STUDIO),
-        ];
-        let after = vec![
-            (p("demo.env"), Some(b"a".to_vec()), DEMO),
-            (p("studio.env"), Some(b"s".to_vec()), STUDIO),
-        ];
-        assert_eq!(changed_env_users(&before, &after), ["studio"]);
-        assert!(changed_env_users(&before, &before).is_empty());
-    }
-
     // The workbench's one bootstrap: `chelabase-init bootstrap --demo` on the stack network,
     // with its binary read-only and the output dir the only writable mount (no docker socket,
     // no keys dir), and the env it reads taken from the stack env.
-    // B3 (live, `up` on an existing stack): the app the bootstrap waits on is recreated on its
-    // new binary first; an orchestrator left on its old binary never applies a new migration.
-    // B4: and only that app. A fresh stack whose first `up` failed has no binaries.json, so
-    // every app is "stale"; recreating `auth` (it needs demo.env's org id) and waiting on it
-    // before the bootstrap writes demo.env never ends.
+    // B3 (live, `up` on an existing stack): every app on a new binary is recreated before the
+    // bootstrap (an orchestrator left on its old binary never applies a new migration), and so
+    // is Studio when its studio.env changed. #126: no app waits on a bootstrap file any more.
     #[test]
-    fn the_pre_bootstrap_recreate_waits_on_no_bootstrap_reader() {
-        let current: HashMap<String, u64> = RUST_APPS.iter().map(|a| (a.to_string(), 2)).collect();
-        let rebuilt = recreate_before_bootstrap(true, &HashMap::new(), &current);
-        assert_eq!(rebuilt, ["orchestrator"], "recreated and waited on before demo.env: {rebuilt:?}");
+    fn stale_apps_are_recreated_before_the_bootstrap() {
         let map = |pairs: &[(&str, u64)]| -> HashMap<String, u64> {
             pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
         };
         let recorded = map(&[("orchestrator", 1), ("worker", 1), ("auth", 1)]);
-        let changed = map(&[("orchestrator", 2), ("worker", 1), ("auth", 1), ("rest", 1)]);
-        assert_eq!(recreate_before_bootstrap(true, &recorded, &changed), ["orchestrator"]);
-        assert!(recreate_before_bootstrap(true, &map(&[("rest", 1)]), &map(&[("rest", 2)])).is_empty());
-        // A stack that wasn't running starts every app on its current binary.
-        assert!(recreate_before_bootstrap(false, &recorded, &changed).is_empty());
-    }
-
-    // B4: after the bootstrap, every other app on a new binary, and every reader of an env file
-    // the bootstrap changed (auth once demo.env appears), the orchestrator again only when its
-    // env changed.
-    #[test]
-    fn the_bootstrap_readers_are_recreated_after_it() {
-        let current: HashMap<String, u64> = RUST_APPS.iter().map(|a| (a.to_string(), 2)).collect();
-        let rebuilt = vec!["orchestrator".to_string()];
-        let demo_readers: Vec<String> = DEMO_ENV_READERS.iter().map(|a| a.to_string()).collect();
-        let after = recreate_after_bootstrap(true, &HashMap::new(), &current, &rebuilt, &demo_readers);
-        for app in RUST_APPS {
-            assert!(after.contains(&app.to_string()), "{app} not recreated: {after:?}");
-        }
-        let after = recreate_after_bootstrap(true, &HashMap::new(), &current, &rebuilt, &[]);
-        assert!(!after.contains(&"orchestrator".to_string()), "recreated twice: {after:?}");
-        assert!(after.contains(&"auth".to_string()));
-        // A fresh stack: only what the bootstrap's files changed.
+        let changed = map(&[("orchestrator", 2), ("worker", 1), ("auth", 2), ("rest", 1)]);
+        assert_eq!(recreate_before_bootstrap(true, &recorded, &changed, &[]), ["auth", "orchestrator", "rest"]);
         assert_eq!(
-            recreate_after_bootstrap(false, &HashMap::new(), &current, &[], &["studio".to_string()]),
+            recreate_before_bootstrap(true, &recorded, &recorded, &["studio".to_string()]),
             ["studio"]
         );
+        // A stack that wasn't running starts every app on its current binary and env files.
+        assert!(recreate_before_bootstrap(false, &recorded, &changed, &["studio".to_string()]).is_empty());
     }
 
     // B4: every wait in `up` has a deadline.
@@ -2336,6 +2059,7 @@ mod tests {
             ("CHELABASE_WORKBENCH_IMAGE", "chelabase-workbench:abc"),
             ("CHELABASE_METADATA_DATABASE_URL", "postgres://chelabase:s3cret@metadata-db:5432/m"),
             ("CHELABASE_KEYS_DIR", "/m/.chelabase"),
+            ("CHELABASE_STACK_DIR", "/s"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2344,7 +2068,7 @@ mod tests {
             "chelabase-x",
             &env,
             Path::new("/c/target/debug/chelabase-init"),
-            Path::new("/s/zitadel"),
+            Path::new("/s/bootstrap"),
             None,
         )
         .unwrap();
@@ -2361,9 +2085,9 @@ mod tests {
             ("CHELABASE_WORKBENCH_IMAGE", "chelabase-workbench:abc"),
             ("CHELABASE_AUTH_HOST", "auth.x.chelabase.localhost:8100"),
             ("CHELABASE_METADATA_DATABASE_URL", "postgres://chelabase:chelabase@metadata-db:5432/chelabase_metadata"),
-            ("CHELABASE_ZITADEL_UPSTREAM", "http://zitadel:8080"),
-            ("CHELABASE_ZITADEL_ADMIN_PAT_FILE", "/elsewhere/admin.pat"),
+            ("CHELABASE_AUTH_URL", "http://elsewhere:1"),
             ("CHELABASE_KEYS_DIR", "/m/.chelabase"),
+            ("CHELABASE_STACK_DIR", "/s"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -2372,7 +2096,7 @@ mod tests {
             "chelabase-x",
             &env,
             Path::new("/c/target/debug/chelabase-init"),
-            Path::new("/s/zitadel"),
+            Path::new("/s/bootstrap"),
             Some(" a@b.co "),
         )
         .unwrap();
@@ -2385,25 +2109,26 @@ mod tests {
             .collect();
         // m5 (#118): the identity step reads the role's password and its own identity token
         // (S1: the bootstrap's, not the worker's), each mounted alone, read-only, at its
-        // keys-dir path.
+        // keys-dir path; #126: the dev member's sign-up reads the stack's setup code.
         assert_eq!(
             volumes,
             [
                 "/c/target/debug/chelabase-init:/usr/local/bin/chelabase-init:ro",
-                "/s/zitadel:/s/zitadel",
+                "/s/bootstrap:/s/bootstrap",
                 "/m/.chelabase/identity/db.password:/m/.chelabase/identity/db.password:ro",
                 "/m/.chelabase/tokens/bootstrap-identity.token:/m/.chelabase/tokens/bootstrap-identity.token:ro",
+                "/s/setup/setup.code:/s/setup/setup.code:ro",
             ]
         );
         let names: Vec<&str> = args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
-        let envs: Vec<String> = bootstrap_env(&env, Path::new("/s/zitadel"))
+        let envs: Vec<String> = bootstrap_env(&env, Path::new("/s/bootstrap"))
             .into_iter()
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
         assert_eq!(names.len(), envs.len(), "every value is named on the argv: {names:?}");
-        assert!(envs.contains(&"CHELABASE_ZITADEL_ADMIN_PAT_FILE=/s/zitadel/admin.pat".to_string()), "{envs:?}");
-        assert!(envs.contains(&"CHELABASE_ZITADEL_UPSTREAM=http://zitadel:8080".to_string()), "{envs:?}");
         for e in [
+            "CHELABASE_AUTH_URL=http://auth:8084",
+            "CHELABASE_SETUP_CODE_FILE=/s/setup/setup.code",
             "CHELABASE_IDENTITY_URL=http://identity:8080",
             "CHELABASE_IDENTITY_DB_PASSWORD_FILE=/m/.chelabase/identity/db.password",
             "CHELABASE_IDENTITY_TOKEN_FILE=/m/.chelabase/tokens/bootstrap-identity.token",
@@ -2416,7 +2141,7 @@ mod tests {
         assert!(!envs.iter().any(|e| e.starts_with("CHELABASE_KEYS_DIR")), "{envs:?}");
         assert!(!joined.contains("docker.sock"));
         assert!(
-            joined.ends_with("chelabase-workbench:abc bootstrap --demo --out /s/zitadel --admin-email a@b.co"),
+            joined.ends_with("chelabase-workbench:abc bootstrap --demo --out /s/bootstrap --admin-email a@b.co"),
             "{joined}"
         );
     }
@@ -2514,11 +2239,8 @@ mod key_phase_tests {
         // The stack's own new files, with the fixed dev values its volumes were made with.
         let read = |p: &str| std::fs::read_to_string(state.join(p)).unwrap();
         assert_eq!(read("db/metadata.password"), "chelabase");
-        assert_eq!(read("db/zitadel-admin.password"), "postgres");
-        assert_eq!(read("db/zitadel-user.password"), "zitadel");
         assert_eq!(read("db/storcon.password"), "storcon");
         assert_eq!(read("s3/access-key"), "chelabase-dev");
-        assert_eq!(read("zitadel/masterkey"), "MasterkeyNeedsToHave32Characters");
         assert!(chelabase_init::read_setup_code(&state).is_ok());
 
         // And a second `up` changes nothing at all.

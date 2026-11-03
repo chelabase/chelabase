@@ -783,16 +783,12 @@ impl MetadataClient {
         Ok(())
     }
 
-    pub async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM tenants WHERE zitadel_org_id = $1")
-                .bind(zitadel_org_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(|(id,)| TenantId(id)))
+    /// Whether the tenant exists.
+    pub async fn tenant_exists(&self, tenant: TenantId) -> Result<bool, MetadataError> {
+        Ok(sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM tenants WHERE id = $1)")
+            .bind(tenant.as_uuid())
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn get_database(

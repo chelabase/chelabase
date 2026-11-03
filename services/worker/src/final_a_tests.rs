@@ -5,17 +5,15 @@ use std::collections::BTreeSet;
 
 use chelabase_metadata::RoleOrigin;
 use chelabase_metadata::members::{GrantRow, MemberBranchRole, MemberRecord, MemberStatus};
-use chelabase_metadata::personal_logins::{LoginEndpoint, PersonalLoginRecord};
+use chelabase_metadata::personal_logins::PersonalLoginRecord;
 use chelabase_secrets::{open_member_role_password, seal_member_role_password};
 use chelabase_types::access::PlatformRole;
 use chelabase_types::{BranchId, DatabaseId, TenantId};
-use chelabase_zitadel::client::Zitadel;
-use chelabase_zitadel::mock::{ADMIN_TOKEN, MockZitadel};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::OWNER_ROLE;
-use crate::fakes::{FakeLogin, FakeWorker, entries, ready_database, worker};
+use crate::fakes::{FakeLogin, FakeWorker, ready_database, worker};
 use crate::member_roles::{
     ActualMemberRole, DesiredMemberRole, RoleKind, member_catalog_sql, member_role_name,
     parse_member_catalog, plan_member_roles, render_step,
@@ -61,11 +59,11 @@ fn marked(name: &str, verifier: &str, until: DateTime<Utc>, memberships: &[&str]
     out
 }
 
-fn member(tenant: TenantId, zitadel: &str) -> MemberRecord {
+fn member(tenant: TenantId, identity_user: &str) -> MemberRecord {
     MemberRecord {
         id: Uuid::new_v4(),
         tenant_id: tenant,
-        identity_user_id: zitadel.to_string(),
+        identity_user_id: identity_user.to_string(),
         email: None,
         display_name: "m".into(),
         tenant_admin: false,
@@ -365,218 +363,4 @@ fn a_marked_logins_settings_are_read_and_reset_in_their_database() {
         !rendered.contains("ALTER ROLE alice RESET ALL"),
         "{rendered}"
     );
-}
-
-// ---- The identity sweep: EOS-4, EOS-H2, D7 -------------------------------------------------
-
-/// A ready database with a Zitadel mock behind the worker, and the database's tenant.
-async fn sweep_setup() -> (FakeWorker, MockZitadel, DatabaseId, BranchId, TenantId) {
-    let (mut w, journal) = worker();
-    let mock = MockZitadel::start().await;
-    w.zitadel = Some(Zitadel::new(&mock.base, ADMIN_TOKEN));
-    let db = ready_database(&w).await;
-    let main = w.metadata.main(db).id;
-    let tenant = w.metadata.database(db).tenant_id;
-    journal.lock().unwrap().clear();
-    (w, mock, db, main, tenant)
-}
-
-/// A member of `tenant` for an existing Zitadel user, holding one live login with a row on
-/// main.
-fn login_holder(
-    w: &FakeWorker,
-    db: DatabaseId,
-    main: BranchId,
-    tenant: TenantId,
-    zitadel: &str,
-) -> Uuid {
-    let m = member(tenant, zitadel);
-    let id = m.id;
-    let role = format!("login_{}", &id.simple().to_string()[..8]);
-    let ep = w.metadata.branch(main).endpoint_id.unwrap();
-    let mut state = w.metadata.state();
-    state.members.push(m);
-    state.personal_logins.push(PersonalLoginRecord {
-        member_id: id,
-        database_id: db.as_uuid(),
-        role_name: role.clone(),
-        scram_verifier: Some(scram("pw")),
-        valid_until: far(),
-        revoked: false,
-        qualifies: true,
-    });
-    state.login_endpoints.insert(
-        id,
-        vec![LoginEndpoint {
-            branch_id: main.as_uuid(),
-            endpoint_id: ep,
-            role_name: role,
-        }],
-    );
-    id
-}
-
-fn revoked(w: &FakeWorker, member: Uuid) -> bool {
-    w.metadata
-        .state()
-        .personal_logins
-        .iter()
-        .filter(|l| l.member_id == member)
-        .all(|l| l.revoked)
-}
-
-fn offboarded(w: &FakeWorker, member: Uuid) -> bool {
-    w.metadata
-        .state()
-        .members
-        .iter()
-        .find(|m| m.id == member)
-        .is_some_and(|m| m.offboarded)
-}
-
-/// Everything logged on this thread while the guard lives, as plain text.
-#[derive(Clone, Default)]
-struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Logs {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
-    type Writer = Logs;
-    fn make_writer(&'a self) -> Logs {
-        self.clone()
-    }
-}
-
-impl Logs {
-    fn capture() -> (Logs, tracing::subscriber::DefaultGuard) {
-        let logs = Logs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        (logs, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn lines_with(&self, needle: &str) -> usize {
-        String::from_utf8_lossy(&self.0.lock().unwrap())
-            .lines()
-            .filter(|l| l.contains(needle))
-            .count()
-    }
-}
-
-// EOS-4: without a Zitadel client the sweep can't read anything; it says so once (a warning
-// naming the identity sweep), not on every pass, and not never.
-#[tokio::test]
-async fn without_zitadel_the_sweep_says_so_once() {
-    let (w, _journal) = worker();
-    let (logs, _guard) = Logs::capture();
-    for _ in 0..3 {
-        assert_eq!(w.sweep_identities_once().await, (0, 0));
-    }
-    assert_eq!(
-        logs.lines_with("identity sweep"),
-        1,
-        "{}",
-        String::from_utf8_lossy(&logs.0.lock().unwrap())
-    );
-}
-
-// EOS-H2: a pass in which no lookup found any user (every answer a 404, or a 404 beside
-// failures) revokes nothing: Zitadel answering 404 for everyone is a misconfigured instance or
-// token, not every member deleted at once. A 404 counts once the same pass found a user.
-#[tokio::test]
-async fn a_pass_where_every_user_is_missing_revokes_nothing() {
-    let (w, mock, db, main, tenant) = sweep_setup().await;
-    let a = mock.add_user("a@example.test", "pw", true);
-    let b = mock.add_user("b@example.test", "pw", true);
-    let ma = login_holder(&w, db, main, tenant, &a);
-    let mb = login_holder(&w, db, main, tenant, &b);
-    mock.remove_user(&a);
-    mock.remove_user(&b);
-    let (_, revoked_count) = w.sweep_identities_once().await;
-    assert_eq!(revoked_count, 0, "a pass of nothing but 404s revoked");
-    assert!(!revoked(&w, ma) && !revoked(&w, mb));
-    assert!(
-        !entries(&w.metadata.journal)
-            .iter()
-            .any(|e| e.starts_with("metadata.revoke_logins_for_identity_user")),
-        "{:?}",
-        entries(&w.metadata.journal)
-    );
-
-    // A 404 beside a failure: still no user found, still nothing revoked.
-    let c = mock.add_user("c@example.test", "pw", true);
-    let mc = login_holder(&w, db, main, tenant, &c);
-    mock.fail(&format!("GET /v2/users/{c}"), 500, "Errors.Internal", 1);
-    w.sweep_identities_once().await;
-    assert!(!revoked(&w, ma) && !revoked(&w, mc));
-
-    // Once the pass finds a user, the 404s are believed.
-    let (_, revoked_count) = w.sweep_identities_once().await;
-    assert_eq!(revoked_count, 2);
-    assert!(revoked(&w, ma) && revoked(&w, mb) && !revoked(&w, mc));
-}
-
-// D7: the sweep marks the members it offboards (its write is the webhook's), and clears the
-// mark of a marked member whose Zitadel user it reads as active again (reactivated or unlocked
-// while no webhook arrived). A marked member still inactive, or unreadable, stays marked; the
-// logins stay revoked.
-#[tokio::test]
-async fn the_sweep_marks_and_clears_the_offboarded_mark() {
-    let (w, mock, db, main, tenant) = sweep_setup().await;
-    let gone = mock.add_user("gone@example.test", "pw", true);
-    let kept = mock.add_user("kept@example.test", "pw", true);
-    let m_gone = login_holder(&w, db, main, tenant, &gone);
-    login_holder(&w, db, main, tenant, &kept);
-    mock.set_inactive(&gone, true);
-    w.sweep_identities_once().await;
-    assert!(
-        offboarded(&w, m_gone),
-        "the sweep's revocation marks the member"
-    );
-
-    // Back to active in Zitadel: the next pass clears the mark (no live login is left, so
-    // only the mark brings the member into the pass).
-    mock.set_inactive(&gone, false);
-    w.sweep_identities_once().await;
-    assert!(
-        !offboarded(&w, m_gone),
-        "the mark outlived the user's reactivation"
-    );
-    assert!(revoked(&w, m_gone), "the logins stay revoked");
-
-    // Marked and still locked, or unreadable: the mark stays.
-    let locked = mock.add_user("locked@example.test", "pw", true);
-    let flaky = mock.add_user("flaky@example.test", "pw", true);
-    let (m_locked, m_flaky) = {
-        let mut state = w.metadata.state();
-        let mut l = member(tenant, &locked);
-        l.offboarded = true;
-        let mut f = member(tenant, &flaky);
-        f.offboarded = true;
-        let ids = (l.id, f.id);
-        state.members.push(l);
-        state.members.push(f);
-        ids
-    };
-    mock.lock(&locked);
-    mock.fail(&format!("GET /v2/users/{flaky}"), 500, "Errors.Internal", 1);
-    w.sweep_identities_once().await;
-    assert!(offboarded(&w, m_locked));
-    assert!(
-        offboarded(&w, m_flaky),
-        "an unreadable state cleared the mark"
-    );
-    w.sweep_identities_once().await;
-    assert!(!offboarded(&w, m_flaky), "the next pass reads it active");
 }

@@ -77,7 +77,6 @@ pub struct ProjectAuth {
     pub project_id: ProjectId,
     pub status: AppUsersStatus,
     pub error: Option<String>,
-    pub zitadel_org_id: Option<String>,
     pub database_id: DatabaseId,
     pub pg_database: String,
     pub schema_name: String,
@@ -221,7 +220,6 @@ fn auth_from_row(r: &PgRow) -> Result<ProjectAuth, MetadataError> {
         project_id: ProjectId(r.get("project_id")),
         status: AppUsersStatus::parse(r.get("status"))?,
         error: r.get("error"),
-        zitadel_org_id: r.get("zitadel_org_id"),
         database_id: DatabaseId(r.get("database_id")),
         pg_database: r.get("pg_database"),
         schema_name: r.get("schema_name"),
@@ -249,7 +247,7 @@ fn session_from_row(r: &PgRow) -> AppSession {
 impl MetadataClient {
     pub async fn project_auth(&self, project: ProjectId) -> Result<Option<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE project_id = $1",
         )
@@ -280,24 +278,10 @@ impl MetadataClient {
         .collect()
     }
 
-    pub async fn project_auth_by_org(&self, org_id: &str) -> Result<Option<ProjectAuth>, MetadataError> {
-        sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
-                    schema_name, table_name, email_verification, on_delete, created_at, updated_at
-             FROM project_auth WHERE zitadel_org_id = $1",
-        )
-        .bind(org_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .as_ref()
-        .map(auth_from_row)
-        .transpose()
-    }
-
     /// The `project_auth` row whose auth database is `db`, if any.
     pub async fn app_auth_for_database(&self, db: DatabaseId) -> Result<Option<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE database_id = $1",
         )
@@ -330,7 +314,7 @@ impl MetadataClient {
             Some(_) => return Err(MetadataError::ProjectDeleting(new.project_id)),
         }
         let existing = sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE project_id = $1 FOR UPDATE",
         )
@@ -395,7 +379,7 @@ impl MetadataClient {
              SET email_verification = COALESCE($2, email_verification),
                  on_delete = COALESCE($3, on_delete), updated_at = now()
              WHERE project_id = $1
-             RETURNING project_id, status, error, zitadel_org_id, database_id, pg_database,
+             RETURNING project_id, status, error, database_id, pg_database,
                        schema_name, table_name, email_verification, on_delete, created_at,
                        updated_at",
         )
@@ -407,23 +391,6 @@ impl MetadataClient {
         .as_ref()
         .map(auth_from_row)
         .transpose()
-    }
-
-    /// Records the project's Zitadel org (a second project claiming one org is a
-    /// [`MetadataError::Conflict`]).
-    pub async fn set_app_users_org(&self, project: ProjectId, org_id: &str) -> Result<(), MetadataError> {
-        let result = sqlx::query(
-            "UPDATE project_auth SET zitadel_org_id = $2, updated_at = now() WHERE project_id = $1",
-        )
-        .bind(project.as_uuid())
-        .bind(org_id)
-        .execute(&self.pool)
-        .await;
-        match result {
-            Ok(_) => Ok(()),
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => Err(MetadataError::Conflict),
-            Err(err) => Err(err.into()),
-        }
     }
 
     /// Ends enabling: `enabled`, or `failed` with the error. True when the row was `enabling`.
@@ -504,7 +471,7 @@ impl MetadataClient {
 
     pub async fn enabled_app_projects(&self) -> Result<Vec<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth WHERE status = 'enabled' ORDER BY created_at, project_id",
         )
@@ -521,7 +488,7 @@ impl MetadataClient {
         older_than: Duration,
     ) -> Result<Vec<ProjectAuth>, MetadataError> {
         sqlx::query(
-            "SELECT project_id, status, error, zitadel_org_id, database_id, pg_database,
+            "SELECT project_id, status, error, database_id, pg_database,
                     schema_name, table_name, email_verification, on_delete, created_at, updated_at
              FROM project_auth
              WHERE status IN ('enabling', 'disabling')

@@ -1,15 +1,13 @@
-//! App users (step 6b): the `auth` service's routes (branch info, sessions, sync), the
-//! gateway's session liveness, and Zitadel's Actions webhook (tenant members only: app users
-//! live in identity pools since #123).
+//! App users (step 6b): the `auth` service's routes (branch info, sessions, sync) and the
+//! gateway's session liveness.
 //!
 //! A refresh token is `"{session_id}.{secret}"`: 32 random bytes, base64url without padding.
 //! Only the SHA-256 of the whole token is stored.
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -27,9 +25,6 @@ use chelabase_secrets::{open, open_role_password, seal};
 use chelabase_types::api_error::{ApiError, ErrorCode};
 use chelabase_types::{BranchId, ProjectId};
 use chelabase_identity::{IdentityError, Missing, Pool};
-use chelabase_zitadel::actions::{
-    ActionEvent, SIGNATURE_HEADER, UserEventKind, user_event_kind, verify_signature,
-};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::json;
@@ -42,8 +37,6 @@ use super::{BoxFuture, InternalState, NeonMetadataPort, require_any_bearer, requ
 
 /// The role the `auth` service writes the users table as (P7).
 const SYNC_ROLE: &str = "chelabase_auth_sync";
-/// Zitadel's events are small; this is generous.
-const WEBHOOK_BODY_LIMIT: usize = 64 * 1024;
 
 /// Publishes app-user sync jobs (the worker writes the users table).
 pub trait AppJobPort: Send + Sync {
@@ -68,8 +61,7 @@ impl AppJobPort for crate::NatsPorts {
 
 type AppState<M, L> = State<Arc<InternalState<M, L>>>;
 
-/// The app routes: `auth`'s group, the liveness route `auth` and the gateway share (P31), and
-/// the webhook (its signature is its authentication).
+/// The app routes: `auth`'s group and the liveness route `auth` and the gateway share (P31).
 pub(super) fn routes<M, L>(state: &InternalState<M, L>) -> Router<Arc<InternalState<M, L>>>
 where
     M: NeonMetadataPort,
@@ -102,13 +94,7 @@ where
     let liveness = Router::new()
         .route("/internal/app/sessions/{id}", get(liveness::<M, L>))
         .route_layer(middleware::from_fn_with_state(either, require_any_bearer));
-    Router::new()
-        .route(
-            "/internal/zitadel/events",
-            post(webhook::<M, L>).layer(DefaultBodyLimit::max(WEBHOOK_BODY_LIMIT)),
-        )
-        .merge(auth)
-        .merge(liveness)
+    Router::new().merge(auth).merge(liveness)
 }
 
 fn internal(context: &str, err: impl std::fmt::Display) -> Response {
@@ -242,7 +228,6 @@ where
     Json(json!({
         "project_id": project,
         "status": auth.status.as_str(),
-        "zitadel_org_id": auth.zitadel_org_id,
         "email_verification": auth.email_verification,
         "on_delete": auth.on_delete.as_str(),
         "auth_database_id": auth.database_id,
@@ -566,128 +551,6 @@ where
             error!("publishing an app-users sync job: {err}");
             ApiError::new(503, ErrorCode::Unavailable, "the sync queue is unavailable")
                 .into_response()
-        }
-    }
-}
-
-// --- Zitadel Actions webhook -----------------------------------------------------------------
-
-/// Zitadel's user events (Actions v2). 401 for a bad signature, 503 without a signing key,
-/// otherwise 200 (events that aren't ours are ignored). The answer is decided first; the sync
-/// publish and the Zitadel session deletes run after it.
-async fn webhook<M, L>(State(state): AppState<M, L>, headers: HeaderMap, body: Bytes) -> Response
-where
-    M: NeonMetadataPort,
-    L: ComputeLocator,
-{
-    // No key (unset, or its file not written or refused) is 503: nothing is checked against
-    // an absent key, and nothing below runs.
-    let Some(key) = state.actions_signing_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let key = match key.get() {
-        Ok(key) => key,
-        Err(e) => {
-            match e {
-                chelabase_types::file_value::Unavailable::NotYet { .. } => {
-                    tracing::debug!("the Actions webhook waits for its signing key: {e}")
-                }
-                chelabase_types::file_value::Unavailable::Refused { .. } => {
-                    warn!("the Actions webhook can't use its signing key: {e}")
-                }
-            }
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-    };
-    let signature = headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if verify_signature(signature, &body, key, Utc::now().timestamp()).is_err() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let event: ActionEvent = match serde_json::from_slice(&body) {
-        Ok(event) => event,
-        Err(err) => {
-            warn!("ignoring a Zitadel event that doesn't parse: {err}");
-            return StatusCode::OK.into_response();
-        }
-    };
-    let Some(kind) = user_event_kind(&event.event_type) else {
-        return StatusCode::OK.into_response();
-    };
-    // W18: a tenant member's Zitadel user removed, deactivated or locked loses what realtime
-    // lets them watch: an access event naming them (`sub` = the Zitadel user id). Tenant orgs
-    // have no app users, so nothing below applies to them.
-    if matches!(kind, UserEventKind::Gone | UserEventKind::Deactivated) {
-        match state.metadata.tenant_by_org(&event.resource_owner).await {
-            Ok(Some(tenant)) => {
-                // D4, P17: the member's personal logins are revoked first; a failed write is
-                // 500, so Zitadel delivers the event again (nothing after it has run).
-                let rows = match state
-                    .metadata
-                    .revoke_logins_for_identity_user(tenant, &event.aggregate_id)
-                    .await
-                {
-                    Ok(rows) => rows,
-                    Err(e) => return internal("revoking an offboarded member's personal logins", e),
-                };
-                offboarded_logins_changed(&state, rows).await;
-                let event = chelabase_nats::rt::AccessEvent {
-                    tenant_id: tenant.as_uuid(),
-                    member_sub: Some(event.aggregate_id.clone()),
-                };
-                super::realtime::spawn_access(state.rt_events.clone(), event);
-                return StatusCode::OK.into_response();
-            }
-            Ok(None) => {}
-            // T8-2, P17: a 200 here would skip the revocation for good; Zitadel delivers a
-            // failed event again.
-            Err(e) => return internal("Zitadel event: the org's tenant lookup", e),
-        }
-    }
-    // D7: a tenant member's user reactivated or unlocked loses its offboarded mark (its logins
-    // stay revoked; it makes new ones). A failed clear is 500, so Zitadel delivers it again.
-    if kind == UserEventKind::Reactivated {
-        match state.metadata.tenant_by_org(&event.resource_owner).await {
-            Ok(Some(tenant)) => {
-                if let Err(e) = state
-                    .metadata
-                    .clear_offboarded(tenant, &event.aggregate_id)
-                    .await
-                {
-                    return internal("clearing a reactivated member's offboarded mark", e);
-                }
-                let event = chelabase_nats::rt::AccessEvent {
-                    tenant_id: tenant.as_uuid(),
-                    member_sub: Some(event.aggregate_id.clone()),
-                };
-                super::realtime::spawn_access(state.rt_events.clone(), event);
-                return StatusCode::OK.into_response();
-            }
-            Ok(None) => {}
-            Err(e) => return internal("Zitadel event: the org's tenant lookup", e),
-        }
-    }
-    // #123: app users live in identity pools. Every write to them goes through auth or the
-    // orchestrator, which revoke and sync inline, so an event for any other org is ignored.
-    StatusCode::OK.into_response()
-}
-
-/// After an offboarding revocation (D4): the proxies forget every personal row of the member
-/// (`rows` holds revoked ones from earlier deliveries too, so a redelivery still clears them),
-/// and each branch holding one reconciles its member roles, which drops the logins. Failures
-/// are logged: the verifier is already gone from the metadata, and the worker's sweep
-/// reconciles every branch anyway.
-async fn offboarded_logins_changed<M, L>(
-    state: &InternalState<M, L>,
-    rows: Vec<chelabase_metadata::personal_logins::LoginEndpoint>,
-) {
-    let branches: std::collections::BTreeSet<Uuid> = rows.iter().map(|r| r.branch_id).collect();
-    super::ddl::publish_login_rows(&state.cache, rows);
-    for branch in branches {
-        if let Err(e) = state.resync.reconcile_member_roles(BranchId(branch)).await {
-            warn!(branch_id = %branch, "Zitadel event: member-role reconcile not asked for: {e:#}");
         }
     }
 }

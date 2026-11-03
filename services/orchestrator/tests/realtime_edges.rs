@@ -8,7 +8,7 @@
 
 include!("common/fakes.rs");
 
-use chelabase_auth::test_support::MockJwks;
+use chelabase_auth::test_support::MemberKeys;
 
 const AUTHORIZE: &str = "/internal/realtime/authorize";
 const PROJECTS: &str = "/internal/realtime/projects";
@@ -26,7 +26,7 @@ fn now() -> i64 {
 struct World {
     app: TestApp,
     metadata: FakeMetadata,
-    jwks: MockJwks,
+    jwks: MemberKeys,
     jobs: FakeJobs,
     tenant: TenantId,
     project: ProjectId,
@@ -35,17 +35,17 @@ struct World {
 }
 
 async fn world() -> World {
-    let jwks = MockJwks::start().await;
+    let jwks = MemberKeys::new();
     let metadata = FakeMetadata::default();
     let tenant = TenantId::new();
     metadata.bind_org("org-1", tenant);
     let jobs = FakeJobs::default();
-    let app = spawn_app_oidc(
+    let app = spawn_app_member_tokens_with(
         metadata.clone(),
         jobs.clone(),
         "http://127.0.0.1:9",
         Mode::SelfHosted,
-        jwks.config(vec![]),
+        jwks.verifier(),
     )
     .await;
     let project = metadata.create_project(tenant, "P").await.unwrap().id;
@@ -89,12 +89,7 @@ impl World {
     }
 
     fn token(&self, sub: &str) -> String {
-        self.jwks.sign(json!({
-            "sub": sub,
-            "iss": self.jwks.issuer(),
-            "exp": now() + 300,
-            chelabase_auth::CLAIM_ORG_ID: "org-1",
-        }))
+        signed_member_token(&self.jwks, sub, self.tenant, 300)
     }
 
     async fn post(&self, path: &str, body: Value) -> (u16, Value) {
@@ -385,15 +380,9 @@ async fn projects_refusals() {
         let (status, _) = w.post(PROJECTS, json!({ "token": w.token(sub) })).await;
         assert_eq!(status, 403, "{sub}");
     }
-    let expired = w.jwks.sign(json!({
-        "sub": DEFAULT_SUB, "iss": w.jwks.issuer(), "exp": now() - 120,
-        chelabase_auth::CLAIM_ORG_ID: "org-1",
-    }));
+    let expired = signed_member_token(&w.jwks, DEFAULT_SUB, w.tenant, -120);
     assert_eq!(w.post(PROJECTS, json!({ "token": expired })).await.0, 401);
-    let unbound = w.jwks.sign(json!({
-        "sub": DEFAULT_SUB, "iss": w.jwks.issuer(), "exp": now() + 300,
-        chelabase_auth::CLAIM_ORG_ID: "org-elsewhere",
-    }));
+    let unbound = signed_member_token(&w.jwks, DEFAULT_SUB, TenantId::new(), 300);
     assert_eq!(w.post(PROJECTS, json!({ "token": unbound })).await.0, 403);
     // A project with no live database is listed with none.
     let (status, body) = w

@@ -99,7 +99,7 @@ function meFor(p: Persona): Me {
     sub: "u", email: "u@example.test", name: "U", tenant_id: "t1", instance_admin: tenantAdmin, tenant_admins: [],
     member: { id: "u", status: "active", tenant_admin: tenantAdmin },
     projects: [{ project_id: "p1", platform_role: role, roles: tenantAdmin ? "all" : ["reporting"], databases }],
-    user: { sub: "u", org_id: "o" },
+    user: { sub: "u" },
     tenant: { id: "t1", slug: "demo", display_name: null, projects: [{ id: "p1", slug: "default", name: "Default", status: "active", databases: [database] }] },
   };
 }

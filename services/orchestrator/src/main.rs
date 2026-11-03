@@ -49,17 +49,6 @@ async fn main() -> anyhow::Result<()> {
     if internal_config.dev_defaults.is_on() {
         tracing::warn!("CHELABASE_DEV_DEFAULTS=1: the development bearers are allowed (explicit opt-in)");
     }
-    // Readiness doesn't wait for the Actions key: the bootstrap needs the orchestrator up to
-    // make the Actions target, and writes the key after. The webhook answers 503 until then.
-    match &internal_config.actions_signing_key {
-        None => tracing::warn!(
-            "CHELABASE_ZITADEL_ACTIONS_SIGNING_KEY(_FILE) is not set: the Zitadel Actions webhook answers 503"
-        ),
-        Some(key) => match key.get() {
-            Ok(_) => tracing::info!("the Actions signing key is loaded from {}", key.var()),
-            Err(e) => tracing::info!("{e}; the Actions webhook answers 503 until it is"),
-        },
-    }
     let roles = RoleSettings::from_lookup(
         mode,
         |name| std::env::var(name).ok(),
@@ -130,8 +119,8 @@ async fn main() -> anyhow::Result<()> {
         app_auth_token: internal_config.app_auth_token.clone(),
         app_sessions_token: internal_config.app_sessions_token.clone(),
         app_refresh_ttl: internal_config.app_refresh_ttl,
-        actions_signing_key: internal_config.actions_signing_key.clone(),
-        zitadel: internal_config.load_zitadel(),
+        // Self-hosted runs one tenant, the seeded one: sign-up and the setup claim are its.
+        tenant: chelabase_types::TenantId(chelabase_metadata::DEMO_TENANT_ID),
         identity: identity_service(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
@@ -156,8 +145,6 @@ async fn main() -> anyhow::Result<()> {
         metadata,
         realtime: orchestrator::internal::realtime::RealtimeAuth {
             token: internal_config.realtime_token.clone(),
-            // The gateway's settings (issuer, JWKS URL), the same env names.
-            verifier: chelabase_auth::JwtVerifier::from_env()?,
             member: member_tokens.clone(),
         },
         rt_events,
@@ -168,10 +155,6 @@ async fn main() -> anyhow::Result<()> {
         proxy: ProxyAddress::from_lookup(|name| std::env::var(name).ok())?,
         rest,
         policy: ModePolicy::new(mode),
-        operator_org: std::env::var("CHELABASE_OPERATOR_ORG_ID")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty()),
         operator_tenant,
         proxy_ca_file: env_or("CHELABASE_PROXY_CA_FILE", ".chelabase/neon/proxy-ca.crt"),
         data_api_database_cap,
@@ -180,10 +163,6 @@ async fn main() -> anyhow::Result<()> {
             &internal_config.stack,
         )?),
         console: Console::default(),
-        zitadel: zitadel_admin(
-            &chelabase_types::entry::zitadel_at(|name| std::env::var(name).ok(), &entry.issuer())
-                .map_err(anyhow::Error::new)?,
-        ),
         identity_service: identity_service(),
         users_db: Arc::new(PgUsersDb::new()),
         sql_editor: Default::default(),
@@ -238,33 +217,6 @@ fn identity_service() -> Option<chelabase_identity::Identity> {
     chelabase_identity::Identity::from_env()
         .inspect_err(|err| warn!("{err}; app users can't be managed"))
         .ok()
-}
-
-/// Zitadel's admin API (at `at`: the in-network URL or the issuer, #24) with the admin PAT from
-/// `CHELABASE_ZITADEL_ADMIN_PAT_FILE`; `None` (warned) when that is unset or the file can't be
-/// read.
-fn zitadel_admin(at: &chelabase_types::entry::ZitadelAt) -> Option<chelabase_zitadel::client::Zitadel> {
-    let Some(file) = std::env::var("CHELABASE_ZITADEL_ADMIN_PAT_FILE")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    else {
-        warn!("CHELABASE_ZITADEL_ADMIN_PAT_FILE is not set; app users can't be enabled");
-        return None;
-    };
-    match std::fs::read_to_string(&file) {
-        Ok(pat) if !pat.trim().is_empty() => {
-            Some(chelabase_zitadel::client::Zitadel::new(&at.base, pat.trim()).with_host(at.host.as_deref()))
-        }
-        Ok(_) => {
-            warn!("{file} is empty; app users can't be enabled");
-            None
-        }
-        Err(err) => {
-            warn!("can't read {file}: {err}; app users can't be enabled");
-            None
-        }
-    }
 }
 
 /// The variable, or `default` when unset or blank.

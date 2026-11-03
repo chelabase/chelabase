@@ -43,7 +43,7 @@ const baseProps = (): SqlEditorProps => ({
 });
 function setup(opts: Opts = {}) {
   const f: FakeFetch = fakeFetch({
-    "GET /v1/me": () => jsonResponse({ tenant: null, user: { org_id: "o", sub: "u1" } }),
+    "GET /v1/me": () => jsonResponse({ tenant: null, user: { sub: "u1" } }),
     [`GET ${BR}/sql/schema`]: opts.schema ?? (() => jsonResponse({ schemas: [] })),
     [`POST ${BR}/sql`]: opts.run ?? (() => selectRun()),
     "GET /v1/databases/d1/sql-queries": () => jsonResponse([]),

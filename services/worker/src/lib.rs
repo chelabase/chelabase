@@ -39,7 +39,6 @@ mod f4_tests;
 mod fakes;
 #[cfg(test)]
 mod final_a_tests;
-pub mod identity_sweep;
 pub mod member_roles;
 pub mod schema_guard;
 pub mod merge;
@@ -115,10 +114,6 @@ pub struct Worker<M, S, C, N, P> {
     /// Endpoints whose last recreate left a compute that never got ready (reconcile skips them
     /// until their backoff ends).
     pub recreate_backoff: Mutex<std::collections::HashMap<String, reconcile::RecreateBackoff>>,
-    /// Zitadel with the admin PAT (`CHELABASE_ZITADEL_ADMIN_PAT_FILE`, `CHELABASE_AUTH_HOST`):
-    /// org create/delete, user reads and session deletes. `None` when either is unset; app
-    /// users jobs that need it then fail and are retried (P2).
-    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`):
     /// app-user pool create/drop and user reads. `None` when either is unset; app users and
     /// project delete jobs then fail and are retried.
@@ -127,10 +122,6 @@ pub struct Worker<M, S, C, N, P> {
     pub app_users_reconcile_every: Duration,
     /// How often the member-role sweep runs (`CHELABASE_MEMBER_ROLES_SWEEP_SECS`).
     pub member_roles_sweep_every: Duration,
-    /// How often the identity sweep runs (`CHELABASE_IDENTITY_SWEEP_SECS`).
-    pub identity_sweep_every: Duration,
-    /// EOS-4: the identity sweep said once that it can't run without a Zitadel client.
-    pub identity_sweep_warned: std::sync::atomic::AtomicBool,
     /// `CHELABASE_WORKER_REMOVE_ORPHANS`: whether reconcile removes compute containers that no
     /// endpoint row records (off: they're logged and kept).
     pub remove_orphans: bool,

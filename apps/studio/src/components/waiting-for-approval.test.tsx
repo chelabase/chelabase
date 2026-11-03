@@ -14,7 +14,7 @@ const pending: Me = {
   member: { id: "m-self", status: "pending", tenant_admin: false },
   instance_admin: false, tenant_admins: [],
   projects: [],
-  user: { sub: "u9", org_id: "org-1" },
+  user: { sub: "u9" },
   tenant: { id: "t1", slug: "demo", display_name: "Acme", projects: [] },
 };
 

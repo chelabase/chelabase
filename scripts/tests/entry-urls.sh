@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# W1 guard (spec §4, S2): nothing but the gateway addresses Studio, Zitadel, Mailpit, docs or
+# W1 guard (spec §4, S2): nothing but the gateway addresses Studio, Mailpit, docs or
 # landing by their loopback ports; everything else uses the entry hosts (CHELABASE_*_HOST).
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-pattern='(localhost|127\.0\.0\.1|\[::1\]):(3000|3001|3002|8080|8025)([^0-9]|$)'
+pattern='(localhost|127\.0\.0\.1|\[::1\]):(3000|3001|3002|8025)([^0-9]|$)'
 allowed=(
   ':!crates/chelabase-types/src/entry.rs' # the loopback upstream defaults (one place)
   ':!apps/docs/content/docs/self-hosting/hosts.mdx'  # documents those defaults

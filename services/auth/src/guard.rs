@@ -106,7 +106,7 @@ impl RateLimiter {
 /// One attempt reserved against a [`RateLimiter`] key (an address's, an invitee's, an email's).
 /// It fails closed: the attempt stays counted unless [`refund`](Self::refund) gives it back, so a
 /// slot that is dropped undecided (a new early return, or the request future dropped because the
-/// client hung up while Zitadel checked a code or password) spends budget. Only outcomes that
+/// client hung up while identity checked a code or password) spends budget. Only outcomes that
 /// must not count refund.
 pub struct Slot<'a> {
     limiter: &'a RateLimiter,
@@ -253,7 +253,7 @@ pub fn client_ip(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-pub use chelabase_zitadel::rules::normalize_email;
+pub use chelabase_identity::rules::normalize_email;
 
 /// A short, stable tag for logs, so emails never appear in them.
 pub fn email_tag(email: &str) -> String {

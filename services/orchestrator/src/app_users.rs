@@ -58,9 +58,6 @@ pub struct AppUsersSettings {
     pub table: String,
     pub email_verification: bool,
     pub on_delete: OnDelete,
-    /// Unused: always `null`. App users live in the identity pool `app-<project>`.
-    #[schema(required = true)]
-    pub zitadel_org_id: Option<String>,
 }
 
 impl From<ProjectAuth> for AppUsersSettings {
@@ -74,7 +71,6 @@ impl From<ProjectAuth> for AppUsersSettings {
             table: a.table_name,
             email_verification: a.email_verification,
             on_delete: a.on_delete,
-            zitadel_org_id: a.zitadel_org_id,
         }
     }
 }
@@ -183,7 +179,6 @@ fn schema_is_reserved(schema: &str) -> bool {
         (status = 200, description = "The settings and where enabling is", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users were never enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -405,7 +400,6 @@ where
         (status = 202, description = "Enabling started (or started again)", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON, or a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project, database or Postgres database (another tenant's answers the same)", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `database_not_ready`: the database isn't ready; `data_api_not_enabled`: the data API is off for the Postgres database on a branch; `app_users_table_exists`: the table exists already; `app_users_location_fixed`: the location can't change; `conflict`: app users are being disabled", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -537,7 +531,6 @@ where
         (status = 202, description = "Disabling started", body = AppUsersSettings),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: no such project (another tenant's answers the same); `app_users_disabled`: app users aren't enabled", body = ErrorEnvelope),
         (status = 409, description = "`project_deleting`; `app_users_has_users`: users exist; `conflict`: app users are being enabled", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),

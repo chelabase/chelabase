@@ -5788,8 +5788,6 @@ async fn enable_app_users_start_retry_exists() {
     let enabled = client.begin_enable_app_users(&changed).await.unwrap();
     let by_db = client.app_auth_for_database(db).await.unwrap();
     let listed = client.enabled_app_projects().await.unwrap();
-    client.set_app_users_org(project, "org-live-test").await.unwrap();
-    let by_org = client.project_auth_by_org("org-live-test").await.unwrap();
     let settings = client
         .update_app_users_settings(project, Some(false), None)
         .await
@@ -5806,7 +5804,6 @@ async fn enable_app_users_start_retry_exists() {
     assert!(matches!(enabled, BeginEnable::Exists(ref a) if a.status == AppUsersStatus::Enabled));
     assert_eq!(by_db.map(|a| a.project_id), Some(project));
     assert!(listed.iter().any(|a| a.project_id == project));
-    assert_eq!(by_org.map(|a| a.project_id), Some(project));
     assert!(!settings.email_verification && settings.on_delete == OnDelete::Mark);
 }
 
@@ -8476,14 +8473,16 @@ async fn identity_id_columns_renamed() {
         .unwrap();
         assert_eq!(found, 1, "{table}.{column} exists");
     }
-    let old: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'public' \
-         AND column_name IN ('zitadel_user_id', 'zitadel_session_id')",
+    // Every user or session id column is one of the store-neutral names.
+    let old: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name ~ '_(user|session)_id$' \
+         AND column_name NOT IN ('identity_user_id', 'identity_session_id', 'replaced_user_id')",
     )
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
     .unwrap();
-    assert_eq!(old, 0, "no column keeps the old name");
+    assert!(old.is_empty(), "no column keeps the old name: {old:?}");
     let constraints: Vec<String> = sqlx::query_scalar(
         "SELECT conname FROM pg_constraint WHERE conrelid IN ('public.members'::regclass, 'public.setup_claims'::regclass) \
          AND conname LIKE '%identity_user_id%' ORDER BY conname",
@@ -8493,12 +8492,48 @@ async fn identity_id_columns_renamed() {
     .unwrap();
     assert_eq!(constraints, ["members_tenant_id_identity_user_id_key", "setup_claims_identity_user_id_check"]);
     let stale: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM pg_constraint WHERE conname LIKE '%zitadel_user_id%' OR conname LIKE '%zitadel_session_id%'",
+        "SELECT count(*) FROM pg_constraint WHERE conname ~ '_(user|session)_id' \
+         AND conname !~ '(identity|replaced)_(user|session)_id'",
     )
     .fetch_one(pool)
     .await
     .unwrap();
     assert_eq!(stale, 0, "no constraint keeps the old name");
+}
+
+// #126 AC 4: the strict migrator applies the drop, and neither org column (nor any other
+// `*_org_id` column) is left.
+#[tokio::test]
+#[ignore]
+async fn org_columns_dropped() {
+    let client = client().await;
+    let pool = client.pool();
+    let applied: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 20261104000001 AND success)",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(applied, "the drop migration is applied");
+    let left: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name || '.' || column_name FROM information_schema.columns \
+         WHERE table_schema = 'public' AND column_name ~ 'org_id$' ORDER BY 1",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(left.is_empty(), "no org column is left: {left:?}");
+    // The tables themselves are intact.
+    for table in ["tenants", "project_auth"] {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name = $1",
+        )
+        .bind(table)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "{table} exists");
+    }
 }
 
 #[tokio::test]

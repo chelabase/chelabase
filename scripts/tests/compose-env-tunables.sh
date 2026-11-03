@@ -10,7 +10,7 @@
 # Not tunables of a self-hosted install, so checked differently:
 #   CHELABASE_MODE             always self-hosted: every service that has it says so, whatever
 #                              .env sets (the line is the workbench's)
-#   CHELABASE_OPERATOR_ORG_ID, CHELABASE_OPERATOR_TENANT_ID
+#   CHELABASE_OPERATOR_TENANT_ID
 #                              platform mode only: never passed
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -49,7 +49,7 @@ while read -r name; do
       modes="$(jq -r '[.services[] | .environment.CHELABASE_MODE // empty] | unique | join(",")' "$tmp/config.json")"
       [[ "$modes" == self-hosted ]] || err "CHELABASE_MODE in the services is '$modes' (wanted self-hosted only, whatever .env says)"
       ;;
-    CHELABASE_OPERATOR_ORG_ID | CHELABASE_OPERATOR_TENANT_ID)
+    CHELABASE_OPERATOR_TENANT_ID)
       [[ -z "$(jq -r --arg n "$name" '[.services[] | .environment[$n] // empty] | join(",")' "$tmp/config.json")" ]] ||
         err "$name is passed to a service (platform mode only)"
       ;;

@@ -20,7 +20,7 @@ describe("readEnv", () => {
 
   it("names the missing API URL", () => {
     expect(() => readEnv({ VITE_API_URL: undefined })).toThrow(/VITE_API_URL/);
-    expect(() => readEnv({ VITE_API_URL: "  " })).not.toThrow(/zitadel/i);
+    expect(() => readEnv({ VITE_API_URL: "  " })).toThrow(/VITE_API_URL/);
   });
 
   it("carries no identity-provider settings", () => {

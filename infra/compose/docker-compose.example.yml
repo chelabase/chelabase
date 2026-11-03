@@ -24,7 +24,7 @@
 # already claimed: start again with `down -v`. A seed that stopped part way is finished by the
 # next `up`. Its last write marks the demo complete (a comment on main's database); from then on
 # `up` skips the seed with 0 writes, so what you change in the demo stays changed. It mounts one
-# secret, the setup code, and no Zitadel credential.
+# secret, the setup code, and no other credential.
 
 services:
   example-seed:

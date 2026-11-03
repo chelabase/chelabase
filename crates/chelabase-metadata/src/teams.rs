@@ -91,7 +91,7 @@ impl TeamChange {
     }
 }
 
-/// What a committed team write reaches: each affected member as (id, Zitadel user), by id, and
+/// What a committed team write reaches: each affected member as (id, identity user), by id, and
 /// every project whose branches reconcile (the team's grant projects before and after), by id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TeamWrite {

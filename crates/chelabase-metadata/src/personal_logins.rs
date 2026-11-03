@@ -818,7 +818,7 @@ impl MetadataClient {
     /// (`after.rotated_branches`), then `personal_logins_revoked` when any was live. Grants are
     /// kept. Returns the touched projects (the `remove_member` union plus the projects of the
     /// member's personal logins). Already suspended: `Ok` with the touched projects and no
-    /// write (S7: a retry after a failed Zitadel lock). The caller themself, or an invited,
+    /// write (S7: a retry after a failed identity ban). The caller themself, or an invited,
     /// pending or removed member, is `Conflict`; the last active tenant admin is
     /// `LastTenantAdmin` (P15); a missing member `NotFound`.
     pub async fn suspend_member(
@@ -960,7 +960,7 @@ impl MetadataClient {
         Ok(touched)
     }
 
-    /// The webhook's and the sweep's write (D4): the member of `tenant` with this Zitadel user
+    /// The offboarding write (D4): the member of `tenant` with this identity user
     /// has every live login revoked (`identity_offboarded`; one event when any was live, by no
     /// actor). Returns every personal row of the member, revoked earlier ones included, so a
     /// retried delivery still clears the proxy cache. An unknown user: empty, no write.
@@ -989,8 +989,8 @@ impl MetadataClient {
         Ok(endpoints)
     }
 
-    /// D7: the member of `tenant` with this Zitadel user is no longer marked offboarded (the
-    /// webhook's `user.reactivated`/`user.unlocked`, or the sweep seeing the user active).
+    /// D7: the member of `tenant` with this identity user is no longer marked offboarded (an
+    /// accepted invite shows the user back).
     /// `true` when a mark was cleared; an unknown or unmarked member is `false` and nothing is
     /// written. Its logins stay revoked. Under the member's lock, so it orders with the
     /// offboarding write.
@@ -1013,43 +1013,6 @@ impl MetadataClient {
             .await?;
         tx.commit().await?;
         Ok(true)
-    }
-
-    /// D7: `(tenant, member, identity_user_id)` of every member marked offboarded (the sweep
-    /// looks them up to clear the mark once Zitadel shows the user active), by tenant then
-    /// member.
-    pub async fn offboarded_members(
-        &self,
-    ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT tenant_id, id, identity_user_id FROM members
-             WHERE offboarded_at IS NOT NULL ORDER BY tenant_id, id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(tenant, member, zitadel)| (TenantId(tenant), member, zitadel))
-            .collect())
-    }
-
-    /// `(tenant, member, identity_user_id)` of every member holding a login that isn't revoked
-    /// (expired ones included: a reset renews them), for the identity sweep.
-    pub async fn members_with_live_logins(
-        &self,
-    ) -> Result<Vec<(TenantId, Uuid, String)>, MetadataError> {
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-            "SELECT DISTINCT m.tenant_id, m.id, m.identity_user_id
-             FROM personal_logins l JOIN members m ON m.id = l.member_id
-             WHERE l.revoked_at IS NULL
-             ORDER BY m.tenant_id, m.id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|(tenant, member, zitadel)| (TenantId(tenant), member, zitadel))
-            .collect())
     }
 
     /// The roster's levels (MH-35, P13): for each (member, project) of the tenant's members on

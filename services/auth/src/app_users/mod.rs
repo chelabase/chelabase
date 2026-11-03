@@ -10,8 +10,6 @@ pub use identity::{AppCaller, AppUserClaims};
 pub use internal::{AppBranchInfo, InternalClient};
 
 use crate::config::AppConfig;
-use crate::zitadel::Zitadel;
-use anyhow::Context;
 use chelabase_auth::app_token::{APP_REFRESH_GRACE, AppTokenSigner};
 use chelabase_auth::internal::InternalVerifier;
 use chelabase_query::app_users::{PgUsersDb, UsersDb};
@@ -38,8 +36,6 @@ pub struct AppUsers {
     pub internal: InternalClient,
     pub signer: AppTokenSigner,
     pub users_db: Arc<dyn UsersDb>,
-    /// Unused since #123 (app users moved to identity pools); removed with Zitadel (m13).
-    pub zitadel_admin: Zitadel,
     pub access_ttl: Duration,
     pub branches: moka::future::Cache<Uuid, Arc<AppBranchInfo>>,
     /// [`REFRESH_USER_LOOKUP`]; shorter in tests.
@@ -52,7 +48,6 @@ impl AppUsers {
         internal: InternalClient,
         signer: AppTokenSigner,
         users_db: Arc<dyn UsersDb>,
-        zitadel_admin: Zitadel,
         access_ttl: Duration,
     ) -> Self {
         Self {
@@ -60,7 +55,6 @@ impl AppUsers {
             internal,
             signer,
             users_db,
-            zitadel_admin,
             access_ttl,
             branches: moka::future::Cache::builder()
                 .max_capacity(10_000)
@@ -70,14 +64,11 @@ impl AppUsers {
         }
     }
 
-    /// `zitadel`: where its admin calls go (see `Config::zitadel`).
-    pub fn from_config(c: &AppConfig, zitadel: &chelabase_types::entry::ZitadelAt) -> anyhow::Result<Self> {
+    pub fn from_config(c: &AppConfig) -> anyhow::Result<Self> {
         let verifier = InternalVerifier::from_pem_file(&c.verify_key)
             .map_err(|e| anyhow::anyhow!("CHELABASE_INTERNAL_VERIFY_KEY: {e}"))?;
         let signer = AppTokenSigner::from_pem_files(&c.private_key, &c.public_key)
             .map_err(|e| anyhow::anyhow!("app token keys: {e}"))?;
-        let admin_pat = std::fs::read_to_string(&c.admin_pat_file)
-            .with_context(|| format!("read {}", c.admin_pat_file.display()))?;
         // U15: the sync verifies every compute against the platform CA.
         let server_tls = ServerTls::from_ca_file(&c.compute_ca)
             .map_err(|e| anyhow::anyhow!("CHELABASE_COMPUTE_CA_FILE: {e}"))?;
@@ -86,7 +77,6 @@ impl AppUsers {
             InternalClient::new(&c.internal_url, &c.internal_token),
             signer,
             Arc::new(PgUsersDb::with_server_tls(server_tls)),
-            Zitadel::new(&zitadel.base, admin_pat.trim()).with_host(zitadel.host.as_deref()),
             c.access_ttl,
         ))
     }

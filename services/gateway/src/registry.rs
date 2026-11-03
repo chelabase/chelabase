@@ -12,7 +12,6 @@ use std::sync::Arc;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Site {
     Studio,
-    Auth,
     Docs,
     Landing,
     Mail,
@@ -22,7 +21,6 @@ impl Site {
     pub fn name(self) -> &'static str {
         match self {
             Site::Studio => "studio",
-            Site::Auth => "auth",
             Site::Docs => "docs",
             Site::Landing => "landing",
             Site::Mail => "mail",
@@ -63,7 +61,8 @@ impl Registry {
         self.with(host, Target::Site(site))
     }
 
-    /// Every host of the entry: the API, Studio, Zitadel, and docs, landing and Mailpit when set.
+    /// Every routed host of the entry: the API, Studio, and docs, landing and Mailpit when set.
+    /// The auth host only names the member tokens' issuer: nothing is served there.
     pub fn from_entry(entry: &Entry) -> Self {
         let optional = [
             (entry.docs_host(), Site::Docs),
@@ -72,8 +71,7 @@ impl Registry {
         ];
         optional.into_iter().fold(
             Self::new([entry.api_host()])
-                .with_site(entry.studio_host(), Site::Studio)
-                .with_site(entry.auth_host(), Site::Auth),
+                .with_site(entry.studio_host(), Site::Studio),
             |r, (host, site)| match host {
                 Some(host) => r.with_site(host, site),
                 None => r,
@@ -172,7 +170,8 @@ mod tests {
         for (host, target) in [
             ("studio.chelabase.localhost:8000", Some(Target::Site(Site::Studio))),
             ("api.chelabase.localhost:8000", Some(Target::Api)),
-            ("auth.chelabase.localhost:8000", Some(Target::Site(Site::Auth))),
+            // #126: the auth host is routed nowhere (no fall-through to another upstream).
+            ("auth.chelabase.localhost:8000", None),
             ("docs.chelabase.localhost:8000", Some(Target::Site(Site::Docs))),
             ("mail.chelabase.localhost:8000", Some(Target::Site(Site::Mail))),
             ("landing.chelabase.localhost:8000", None),

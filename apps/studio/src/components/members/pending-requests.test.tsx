@@ -7,7 +7,7 @@ import { usePendingRequestCount } from "./pending-requests";
 
 const me = (tenant_admin: boolean): Me => ({
   sub: "u1", email: "a@example.test", name: "A", tenant_id: "t1", member: { id: "m-self", status: "active", tenant_admin },
-  instance_admin: false, tenant_admins: [], projects: [], user: { sub: "u1", org_id: "o" },
+  instance_admin: false, tenant_admins: [], projects: [], user: { sub: "u1" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [] },
 });
 const m = (id: string, status: Member["status"]): Member => ({

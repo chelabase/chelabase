@@ -7,7 +7,7 @@ import { SignedInApp } from "./signed-in-app";
 
 const me = (status: "active" | "pending", tenant_admin: boolean): Me => ({
   sub: "u1", email: "a@example.test", name: "A", tenant_id: "t1", instance_admin: false, tenant_admins: [],
-  member: { id: "m1", status, tenant_admin }, projects: [], user: { sub: "u1", org_id: "o" },
+  member: { id: "m1", status, tenant_admin }, projects: [], user: { sub: "u1" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [] },
 });
 const pendingMember = {

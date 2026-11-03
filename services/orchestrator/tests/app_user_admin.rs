@@ -281,7 +281,6 @@ impl Au {
                 project_id: self.project.id,
                 status,
                 error: None,
-                zitadel_org_id: None,
                 database_id: self.db,
                 pg_database: "web1".into(),
                 schema_name: "public".into(),
@@ -464,8 +463,8 @@ async fn get_app_users_404_until_enabled_then_the_settings() {
         ),
         (Some(false), Some("delete"))
     );
-    // No org any more: app users live in the identity pool `app-<project>`.
-    assert!(body["zitadel_org_id"].is_null(), "{body}");
+    // No org field: app users live in the identity pool `app-<project>`.
+    assert!(body.as_object().unwrap().keys().all(|k| !k.ends_with("_org_id")), "{body}");
     assert!(body["error"].is_null());
 }
 
@@ -893,7 +892,6 @@ async fn list_projects_batches_the_auth_read() {
             project_id: ids[1],
             status: AppUsersStatus::Enabled,
             error: None,
-            zitadel_org_id: None,
             database_id: DatabaseId::new(),
             pg_database: "web1".into(),
             schema_name: "public".into(),

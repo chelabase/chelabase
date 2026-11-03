@@ -135,11 +135,6 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         }
     }
 
-    fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> impl Future<Output = Result<Option<TenantId>, MetadataError>> + Send;
-
     fn insert_database_pending(
         &self,
         database_id: DatabaseId,
@@ -601,7 +596,7 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
         branch: BranchId,
     ) -> impl Future<Output = Result<Option<chelabase_metadata::BranchBusy>, MetadataError>> + Send;
 
-    /// The tenant's member with this Zitadel user id, whatever its status.
+    /// The tenant's member with this identity user id, whatever its status.
     fn member_by_identity_user(
         &self,
         tenant: TenantId,
@@ -743,12 +738,6 @@ pub trait MetadataPort: members::MembersPort + Send + Sync + 'static {
 // the call site would silently make this resolve to the trait method instead,
 // recursing forever.
 impl MetadataPort for MetadataClient {
-    async fn get_tenant_by_zitadel_org_id(
-        &self,
-        zitadel_org_id: &str,
-    ) -> Result<Option<TenantId>, MetadataError> {
-        MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await
-    }
 
     async fn insert_database_pending(
         &self,
@@ -1793,9 +1782,6 @@ pub struct AppState<M, J> {
     pub rest: RestInternal,
     /// Every self-hosted/platform decision (the dev CA path is revealed only self-hosted).
     pub policy: ModePolicy,
-    /// `CHELABASE_OPERATOR_ORG_ID`: in platform mode, members of this Zitadel org are instance
-    /// admins. `None` (unset or blank) means nobody is.
-    pub operator_org: Option<String>,
     /// `CHELABASE_OPERATOR_TENANT_ID` (#119): in platform mode, members of this tenant who come
     /// with a member token are instance admins. `None` means nobody is that way.
     pub operator_tenant: Option<TenantId>,
@@ -1807,9 +1793,6 @@ pub struct AppState<M, J> {
     pub locator: Arc<dyn PostgresAddr>,
     /// Studio's console: owner pools, the owner's query caches, checked roles.
     pub console: Console,
-    /// Zitadel's admin API (admin PAT); `None` when `CHELABASE_ZITADEL_ADMIN_PAT_FILE` or
-    /// `CHELABASE_AUTH_HOST` isn't set.
-    pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
     /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`): app
     /// users' admin actions on the project's pool. `None` when either is unset or the token
     /// can't be read; those routes then answer 503 `identity_unavailable`.
@@ -1826,7 +1809,8 @@ pub struct AppState<M, J> {
     /// The orchestrator's client pair for TLS to computes (RT3-7); `None` connects without TLS
     /// (tests only: `main` always sets it).
     pub compute_tls: Option<Arc<compute_tls::ComputeTls>>,
-    /// Realtime's bearer and the OIDC verifier its `/internal/realtime/*` routes use (RT1 T6).
+    /// Realtime's bearer and the member-token verifier its `/internal/realtime/*` routes use
+    /// (RT1 T6).
     pub realtime: internal::realtime::RealtimeAuth,
     /// Publishes realtime's platform and access events after metadata writes (P10).
     pub rt_events: Arc<dyn internal::realtime::RtEvents>,
@@ -1888,14 +1872,12 @@ impl RestInternal {
     }
 }
 
-/// Caller verified from the gateway-minted internal identity token. Does not
-/// require the caller's org to be bound to a tenant.
+/// Caller verified from the gateway-minted internal identity token.
 #[derive(Debug, Clone)]
 struct Caller {
     sub: String,
-    org_id: String,
-    /// A member token's tenant (`tid`, #119); then `org_id` is empty. `None` on the Zitadel
-    /// path, which finds the tenant by org.
+    /// The member token's tenant (`tid`, #119). `None` only for an identity that names none
+    /// (not a member token), which nothing here accepts.
     tenant_id: Option<TenantId>,
     request_id: String,
     /// The token's email and name claims, when it carries them.
@@ -1929,7 +1911,6 @@ where
 
         Ok(Caller {
             sub: claims.sub,
-            org_id: claims.org_id,
             tenant_id: claims.tenant_id.map(TenantId),
             request_id: claims.rid,
             email: claims.email,
@@ -1939,37 +1920,25 @@ where
 }
 
 /// Caller with a Chelabase tenant, with their member row there: the tenant a member token's
-/// `tid` names, or the one a Zitadel token's org is bound to (soft-bind).
+/// `tid` names.
 #[derive(Debug, Clone)]
 pub struct AuthPrincipal {
     pub sub: String,
-    /// The Zitadel org; empty for a member token.
-    pub org_id: String,
     pub tenant_id: TenantId,
     pub request_id: String,
     /// The caller's member row in the tenant: `None` for anyone [`resolve_member`] finds no row
     /// for and doesn't admit, which includes every member token without one.
     /// [`access::authorize`] checks its status on every request.
     pub member: Option<MemberRecord>,
-    /// Whether the caller is an operator (platform instance routes): a Zitadel token's org is
-    /// `CHELABASE_OPERATOR_ORG_ID`, or a member token's subject is an active member of
-    /// `CHELABASE_OPERATOR_TENANT_ID`.
+    /// Whether the caller is an operator (platform instance routes): the member token's subject
+    /// is an active member of `CHELABASE_OPERATOR_TENANT_ID`.
     pub in_operator_org: bool,
 }
 
-/// The caller's member row in `tenant`, read once per request in the common case.
-///
-/// - Self-hosted (`ModePolicy::auto_create_members`), a person in the tenant's org who has no
-///   row yet is admitted on their first request (R39): the account a code-gated sign-up bound
-///   (`setup_claims`) claims the tenant admin while there is none; an invited one is
-///   activated; anyone else becomes `pending` when the tenant's open sign-up is on, and
-///   otherwise gets no row (`None`: 403 `no_access_yet`). Platform mode makes no members and
-///   only refreshes existing ones.
-/// - The email and name come from the token's claims. A claim the token lacks keeps the stored
-///   value; when there is none (a new member, or one with no email or name stored), the user is
-///   read once through the admin Zitadel client (ruling R18). A Zitadel failure isn't fatal:
-///   the value stays unknown and a warning is logged.
-/// - An active member whose stored values the token doesn't change isn't written.
+/// The caller's member row in `tenant`. #119: a member token's tenant only names where to look:
+/// the membership must already be there (no admission, no first-member admin claim, no invite
+/// activation, no claim refresh; those happen in auth's sign-up and accept flows). A tenant
+/// that is gone is 401 (the token is stale); no row is `None` (403 downstream).
 async fn resolve_member<M: MetadataPort, J>(
     state: &AppState<M, J>,
     tenant: TenantId,
@@ -1979,133 +1948,15 @@ async fn resolve_member<M: MetadataPort, J>(
         error!("resolve member: {err}");
         ApiError::internal()
     };
-    // #119: a member token's tenant only names where to look. The membership must already be
-    // there: no admission, no first-member admin claim, no invite activation, no claim refresh.
-    // A tenant that is gone is 401 (the token is stale); no row is `None` (403 downstream).
-    if caller.tenant_id.is_some() {
-        let member = state
-            .metadata
-            .member_by_identity_user(tenant, &caller.sub)
-            .await
-            .map_err(failed)?;
-        if member.is_none() && !state.metadata.tenant_exists(tenant).await.map_err(failed)? {
-            return Err(tenant_unknown());
-        }
-        return Ok(member);
-    }
-    let auto_create = state.policy.auto_create_members();
-    // Both claims at hand: `admit_member` reads, refreshes or makes the row in one go.
-    if auto_create && let (Some(email), Some(name)) = (&caller.email, &caller.name) {
-        return admit(state, tenant, &caller.sub, email, name).await.map_err(failed);
-    }
-    let existing = state
+    let member = state
         .metadata
         .member_by_identity_user(tenant, &caller.sub)
         .await
         .map_err(failed)?;
-    let existing = match existing {
-        None if !auto_create => return Ok(None),
-        // A removed, pending or suspended member is returned as is: none refreshes its claims,
-        // and a sign-in never reactivates a suspended one (S6).
-        Some(m)
-            if matches!(
-                m.status,
-                MemberStatus::Removed | MemberStatus::Pending | MemberStatus::Suspended
-            ) =>
-        {
-            return Ok(Some(m));
-        }
-        other => other,
-    };
-    let mut email = caller
-        .email
-        .clone()
-        .or_else(|| existing.as_ref().and_then(|m| m.email.clone()));
-    let mut name = caller.name.clone().or_else(|| {
-        existing
-            .as_ref()
-            .map(|m| m.display_name.clone())
-            .filter(|n| !n.is_empty())
-    });
-    if email.is_none() || name.is_none() {
-        let (z_email, z_name) = zitadel_claims(state, &caller.sub).await;
-        email = email.or(z_email);
-        name = name.or(z_name);
+    if member.is_none() && !state.metadata.tenant_exists(tenant).await.map_err(failed)? {
+        return Err(tenant_unknown());
     }
-    if let Some(m) = &existing
-        && m.status == MemberStatus::Active
-        && email.as_deref().map(chelabase_zitadel::rules::normalize_email) == m.email
-        && name.as_deref().unwrap_or("") == m.display_name
-    {
-        return Ok(existing);
-    }
-    admit(
-        state,
-        tenant,
-        &caller.sub,
-        email.as_deref().unwrap_or(""),
-        name.as_deref().unwrap_or(""),
-    )
-    .await
-    .map_err(failed)
-}
-
-/// How long after a tenant's admin claim a person with no row is still taken as the other half of
-/// the fresh-install race (R41, M7): the sign-up gate lets everyone with the setup code in while
-/// the tenant has no member, so two concurrent sign-ups both get accounts (only one binds the
-/// claim), and the second one's first request
-/// arrives after the first has claimed the admin. Long enough for an email verification.
-const FIRST_MEMBER_WINDOW: chrono::Duration = chrono::Duration::hours(1);
-
-/// [`MetadataPort::admit_member`] with the tenant's sign-up rule: asked with `Closed` first, so
-/// a member who already has a row costs no extra read; only a newcomer reads `open_signup`, and
-/// is then admitted as `pending` or not at all (`None`). M7: a newcomer is also `pending` while
-/// the tenant's admin claim is within [`FIRST_MEMBER_WINDOW`], so the loser of the fresh-install
-/// race isn't stranded with an account and no way in: the admin sees the request.
-async fn admit<M: MetadataPort, J>(
-    state: &AppState<M, J>,
-    tenant: TenantId,
-    sub: &str,
-    email: &str,
-    name: &str,
-) -> Result<Option<MemberRecord>, MetadataError> {
-    match state.metadata.admit_member(tenant, sub, email, name, Admission::Closed).await {
-        Err(MetadataError::NotAdmitted(_)) => {
-            let race = || state.metadata.admin_claimed_since(tenant, chrono::Utc::now() - FIRST_MEMBER_WINDOW);
-            if state.metadata.open_signup(tenant).await? || race().await? {
-                state.metadata.admit_member(tenant, sub, email, name, Admission::Pending).await.map(Some)
-            } else {
-                Ok(None)
-            }
-        }
-        other => other.map(Some),
-    }
-}
-
-/// The user's email and display name from Zitadel (`GET /v2/users/{id}`), each `None` when
-/// unknown. Failures are logged and give `None`s.
-async fn zitadel_claims<M, J>(state: &AppState<M, J>, user_id: &str) -> (Option<String>, Option<String>) {
-    let Some(zitadel) = state.zitadel.as_ref() else {
-        return (None, None);
-    };
-    match zitadel.get_user(user_id).await {
-        Ok(Some(user)) => {
-            let text = |s: String| Some(s).filter(|s| !s.trim().is_empty());
-            (text(user.email), text(user.display_name))
-        }
-        Ok(None) => {
-            tracing::warn!(user_id, "member claims: no such Zitadel user; email and name stay unknown");
-            (None, None)
-        }
-        Err(err) => {
-            tracing::warn!(user_id, "member claims: Zitadel lookup failed, email and name stay unknown: {err}");
-            (None, None)
-        }
-    }
-}
-
-fn in_operator_org<M, J>(state: &AppState<M, J>, org_id: &str) -> bool {
-    state.operator_org.as_deref().is_some_and(|org| !org.is_empty() && org == org_id)
+    Ok(member)
 }
 
 /// Whether `member`, the row a member token's `tid` led to, makes its caller an operator:
@@ -2114,25 +1965,18 @@ fn is_operator_member<M, J>(state: &AppState<M, J>, tenant: TenantId, member: Op
     state.operator_tenant == Some(tenant) && member.is_some_and(MemberRecord::in_good_standing)
 }
 
-/// Whether the caller is in the operator's tenant (member token, with `member`, its row there)
-/// or org (Zitadel token): each path reads only its own setting.
+/// Whether the caller is in the operator's tenant (with `member`, its row there).
 fn caller_is_operator<M, J>(state: &AppState<M, J>, caller: &Caller, member: Option<&MemberRecord>) -> bool {
-    match caller.tenant_id {
-        Some(tenant) => is_operator_member(state, tenant, member),
-        None => in_operator_org(state, &caller.org_id),
-    }
+    caller.tenant_id.is_some_and(|tenant| is_operator_member(state, tenant, member))
 }
 
-/// The caller's tenant: a member token's `tid` (whose membership [`resolve_member`] then
-/// requires), else the tenant bound to the Zitadel org.
+/// The caller's tenant: the member token's `tid`, whose membership [`resolve_member`] then
+/// requires.
 async fn caller_tenant<M: MetadataPort, J>(
-    state: &AppState<M, J>,
+    _state: &AppState<M, J>,
     caller: &Caller,
 ) -> Result<Option<TenantId>, ApiError> {
-    match caller.tenant_id {
-        Some(tenant) => Ok(Some(tenant)),
-        None => lookup_tenant(state, &caller.org_id).await.map_err(|_| ApiError::internal()),
-    }
+    Ok(caller.tenant_id)
 }
 
 /// #119: a member token's tenant no longer exists.
@@ -2140,16 +1984,14 @@ fn tenant_unknown() -> ApiError {
     ApiError::unauthorized("the token's tenant no longer exists; sign in again")
 }
 
-/// A caller allowed on an `Instance` route. Checked before the tenant binding (ruling R19): in
-/// platform mode a member of the operator org passes whether or not the org is a tenant's.
-/// Anyone else needs a bound org (else `tenant_not_bound`) and, self-hosted, to be an active
-/// tenant admin. Instance handlers take this instead of [`AuthPrincipal`].
+/// A caller allowed on an `Instance` route. Checked first (ruling R19): in platform mode an
+/// active member of the operator tenant passes. Anyone else needs a tenant and, self-hosted, to
+/// be an active tenant admin. Instance handlers take this instead of [`AuthPrincipal`].
 #[derive(Debug, Clone)]
 pub struct InstancePrincipal {
     pub sub: String,
-    pub org_id: String,
     pub request_id: String,
-    /// The caller's tenant; `None` for an operator whose org is no tenant's.
+    /// The caller's tenant; `None` for an operator.
     pub tenant_id: Option<TenantId>,
     pub member: Option<MemberRecord>,
 }
@@ -2176,13 +2018,12 @@ where
         if state.policy.instance_admin(false, operator) {
             return Ok(InstancePrincipal {
                 sub: caller.sub,
-                org_id: caller.org_id,
                 request_id: caller.request_id,
                 tenant_id: None,
                 member: None,
             });
         }
-        let tenant_id = caller_tenant(state, &caller).await?.ok_or_else(tenant_not_bound)?;
+        let tenant_id = caller_tenant(state, &caller).await?.ok_or_else(no_tenant)?;
         let member = match token_member {
             Some(member) => member,
             None => resolve_member(state, tenant_id, &caller).await?,
@@ -2191,7 +2032,6 @@ where
         decide(&state.policy, &facts, None, None, None, None, Access::Instance).map_err(access::deny_to_api)?;
         Ok(InstancePrincipal {
             sub: caller.sub,
-            org_id: caller.org_id,
             request_id: caller.request_id,
             tenant_id: Some(tenant_id),
             member,
@@ -2199,12 +2039,9 @@ where
     }
 }
 
-fn tenant_not_bound() -> ApiError {
-    ApiError::new(
-        403,
-        ErrorCode::TenantNotBound,
-        "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
-    )
+/// An identity that names no tenant: only a member token reaches the management API.
+fn no_tenant() -> ApiError {
+    ApiError::unauthorized("the identity names no tenant; sign in again")
 }
 
 impl<M, J> FromRequestParts<Arc<AppState<M, J>>> for AuthPrincipal
@@ -2219,21 +2056,12 @@ where
         state: &Arc<AppState<M, J>>,
     ) -> Result<Self, Self::Rejection> {
         let caller = Caller::from_request_parts(parts, state).await?;
-        let tenant_id = caller_tenant(state, &caller)
-            .await?
-            .ok_or_else(|| {
-                ApiError::new(
-                    403,
-                    ErrorCode::TenantNotBound,
-                    "no Chelabase tenant bound to this Zitadel org; self-hosted: see `docker compose logs init-bootstrap`, then `docker compose up -d`; workbench: run `just zitadel-bootstrap`",
-                )
-            })?;
+        let tenant_id = caller_tenant(state, &caller).await?.ok_or_else(no_tenant)?;
 
         let member = resolve_member(state, tenant_id, &caller).await?;
         Ok(AuthPrincipal {
             in_operator_org: caller_is_operator(state, &caller, member.as_ref()),
             sub: caller.sub,
-            org_id: caller.org_id,
             tenant_id,
             request_id: caller.request_id,
             member,
@@ -2241,30 +2069,10 @@ where
     }
 }
 
-/// RT1 R10: the principal for a member's verified OIDC claims, **read only**: the tenant bound to
-/// the token's org (`None` when there is none; nothing is bound) and the member row as it is
-/// (`None` for a person with no row: no admission, no first-member admin claim, no invite
-/// activation, no claim refresh). [`access::authorize`] then refuses anyone not active.
-pub(crate) async fn read_only_principal<M: MetadataPort, J>(
-    state: &AppState<M, J>,
-    claims: &chelabase_auth::VerifiedClaims,
-) -> Result<Option<AuthPrincipal>, MetadataError> {
-    let Some(tenant_id) = lookup_tenant(state, &claims.org_id).await? else {
-        return Ok(None);
-    };
-    let member = state.metadata.member_by_identity_user(tenant_id, &claims.sub).await?;
-    Ok(Some(AuthPrincipal {
-        sub: claims.sub.clone(),
-        org_id: claims.org_id.clone(),
-        tenant_id,
-        request_id: Uuid::new_v4().to_string(),
-        member,
-        in_operator_org: in_operator_org(state, &claims.org_id),
-    }))
-}
-
-/// #119: [`read_only_principal`] for a verified member token: the tenant its `tid` names, when
-/// it exists (`None` otherwise), and the member row as it is.
+/// RT1 R10, #119: the principal for a verified member token, **read only**: the tenant its
+/// `tid` names, when it exists (`None` otherwise), and the member row as it is (`None` for a
+/// person with no row: no admission, no first-member admin claim, no invite activation).
+/// [`access::authorize`] then refuses anyone not active.
 #[doc(hidden)] // `pub` for the realtime principal's test: no route shows its operator flag.
 pub async fn read_only_member_principal<M: MetadataPort, J>(
     state: &AppState<M, J>,
@@ -2277,24 +2085,11 @@ pub async fn read_only_member_principal<M: MetadataPort, J>(
     }
     Ok(Some(AuthPrincipal {
         sub: claims.sub.clone(),
-        org_id: String::new(),
         tenant_id,
         request_id: Uuid::new_v4().to_string(),
         in_operator_org: is_operator_member(state, tenant_id, member.as_ref()),
         member,
     }))
-}
-
-/// The tenant bound to `org_id`, if any (lookup failures are logged).
-async fn lookup_tenant<M: MetadataPort, J>(
-    state: &AppState<M, J>,
-    org_id: &str,
-) -> Result<Option<TenantId>, MetadataError> {
-    state
-        .metadata
-        .get_tenant_by_zitadel_org_id(org_id)
-        .await
-        .inspect_err(|err| error!("tenant lookup by zitadel org: {err}"))
 }
 
 /// The body of a JSON route that parses it by hand: the extractor only reads the bytes, so
@@ -2559,7 +2354,6 @@ pub(crate) enum AllRoles {
 #[derive(Debug, Serialize, ToSchema)]
 struct MeUser {
     sub: String,
-    org_id: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -2714,7 +2508,7 @@ async fn health() -> impl IntoResponse {
     tag = "me",
     summary = "The caller, their capabilities and their tenant",
     responses(
-        (status = 200, description = "The signed-in user, their membership and what they may use, and, once their org is bound, the tenant with the projects and databases they may use", body = MeResponse),
+        (status = 200, description = "The signed-in user, their membership and what they may use, and the tenant with the projects and databases they may use", body = MeResponse),
         (status = 401, description = "`unauthorized`: no credential, a bad token or internal identity, or a member token whose tenant no longer exists", body = ErrorEnvelope),
         (status = 403, description = "`no_access_yet` (self-hosted) or `not_available_in_platform_mode` (platform): a member token whose subject has no member row in the tenant it names", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
@@ -2865,7 +2659,7 @@ where
         member: member.as_ref().map(|m| MeMember { id: m.id, status: m.status.into(), tenant_admin: m.tenant_admin }),
         instance_admin,
         projects,
-        user: MeUser { sub: caller.sub, org_id: caller.org_id },
+        user: MeUser { sub: caller.sub },
         tenant,
         tenant_admins,
     })
@@ -2883,7 +2677,6 @@ where
         (status = 202, description = "Accepted; the database is provisioned in the background (poll it until `ready`)", body = CreateDatabaseAccepted),
         (status = 400, description = "`invalid_request`: the body isn't well-formed JSON", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "the project doesn't exist or is another tenant's", body = ErrorEnvelope),
         (status = 409, description = "`name_taken`: a database with this name exists in the project; `project_deleting`: the project is being deleted", body = ErrorEnvelope),
         (status = 413, description = "`too_large`: the body is over the 2 MB limit", body = ErrorEnvelope),
@@ -3001,7 +2794,6 @@ where
         (status = 200, description = "The database with its settings and main endpoint", body = Database),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),
     ),
@@ -3125,7 +2917,6 @@ const BACKUP_REFUSAL: &str =
         (status = 200, description = "The owner credentials; never cached", body = ConnectionDetails),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: its main isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
         (status = 500, description = "`credentials_unavailable`: the stored credentials can't be opened with the current secrets key; `internal`: unexpected", body = ErrorEnvelope),
@@ -3343,7 +3134,6 @@ where
         (status = 204, description = "The password was reset; read the new one from the connection details"),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`database_not_ready`: the database isn't ready; `branch_not_ready`: the branch isn't ready; `credentials_unavailable`: the owner credentials are missing", body = ErrorEnvelope),
         (status = 500, description = "`internal`: the worker failed to reset the password", body = ErrorEnvelope),
@@ -3463,7 +3253,6 @@ where
         (status = 202, description = "Accepted; the database moves to `deleting` and is removed in the background", body = OperationAccepted),
         (status = 400, description = "`invalid_request`: a path id isn't a valid UUID", body = ErrorEnvelope),
         (status = 401, description = "`unauthorized`: no credential, or a bad token or internal identity", body = ErrorEnvelope),
-        (status = 403, description = "`tenant_not_bound`: the caller's org isn't bound to a Chelabase tenant", body = ErrorEnvelope),
         (status = 404, description = "`not_found`: the database doesn't exist, or belongs to another tenant", body = ErrorEnvelope),
         (status = 409, description = "`already_deleting`: the database is already being deleted; `branch_protected`: a branch of the database is protected, unprotect it first; `conflict`: the database holds the project's app users, disable app users first", body = ErrorEnvelope),
         (status = 500, description = "`internal`: unexpected; details only in the logs", body = ErrorEnvelope),

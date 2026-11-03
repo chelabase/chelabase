@@ -11,7 +11,7 @@ import { Route } from "./app";
 
 const me: Me = {
   sub: "u1", email: "ada@example.test", name: "Ada", tenant_id: "t1", instance_admin: false, tenant_admins: [],
-  member: { id: "m1", status: "active", tenant_admin: false }, projects: [], user: { sub: "u1", org_id: "" },
+  member: { id: "m1", status: "active", tenant_admin: false }, projects: [], user: { sub: "u1" },
   tenant: { id: "t1", slug: "demo", display_name: null, projects: [] },
 };
 

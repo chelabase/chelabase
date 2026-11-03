@@ -405,7 +405,7 @@ async fn invite_accept_live() {
     .await;
 }
 
-/// Ported from the Zitadel era (#124): an invitee whose identity user was deleted gets 410
+/// #124: an invitee whose identity user was deleted gets 410
 /// `invite_revoked`.
 #[tokio::test]
 #[ignore = "needs the workbench stack and the identity service"]
@@ -444,8 +444,7 @@ async fn a_wrong_code_is_expired_only_when_the_stored_invite_expired() {
     .await;
 }
 
-/// Replaces `zitadel_policy_refusals_are_weak_passwords_in_accept_invite` (#124): a weak password
-/// is refused (`weak_password`) before the code is used, with no ticket, so the same code then
+/// #124: a weak password is refused (`weak_password`) before the code is used, with no ticket, so the same code then
 /// sets a strong one; and a reset's confirm refuses it before anything changes.
 #[tokio::test]
 #[ignore = "needs the workbench stack and the identity service"]
@@ -622,9 +621,8 @@ async fn app_as(key: &str, access: &str, path: &str, body: Value) -> (u16, Value
 
 /// #123: app users live in the project's identity pool. Sign-up, sign-in and refresh run there
 /// (refresh checks the identity session behind the app session), and a password change on one
-/// device ends the other's session at its next refresh. Retires
-/// `zitadel_policy_refusals_are_weak_passwords_for_app_users`: identity has no Zitadel policy,
-/// and auth's own password rule answers first.
+/// device ends the other's session at its next refresh. Auth's own password rule answers
+/// first.
 #[tokio::test]
 #[ignore = "needs the workbench stack and CHELABASE_COMPUTE_IMAGE"]
 async fn app_user_sessions_live_in_the_identity_pool() {
