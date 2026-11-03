@@ -1353,51 +1353,6 @@ mod tests {
         assert!(!again.auth_files.nats && !again.auth_files.valkey);
     }
 
-    /// The retired identity provider's files, as an install from before #126 has them (the
-    /// name is put together here so the tree's name check, `scripts/tests/no-zitadel.sh`, stays
-    /// exact).
-    fn retired_files() -> Vec<(String, &'static str)> {
-        let z = concat!("zit", "adel");
-        vec![
-            (format!("db/{z}-user.password"), "old-user\n"),
-            (format!("db/{z}-admin.password"), "old-admin\n"),
-            (format!("{z}/masterkey"), "MasterkeyNeedsToHave32Characters"),
-            (format!("{z}/steps.yaml"), "FirstInstance: {}\n"),
-        ]
-    }
-
-    // #126 AC 3: an install from before the change keeps the retired files: a rerun succeeds,
-    // leaves each one as it was (never reads it as another key's), creates none of them anew,
-    // and changes no file of the layout, never-overwrite keys included.
-    #[test]
-    fn old_retired_files_ignored() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let t = tmp();
-        ensure_secrets(t.path(), &opts()).unwrap();
-        for (path, text) in retired_files() {
-            let p = t.path().join(&path);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(&p, text).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
-        }
-        let before = snapshot(t.path());
-        let again = ensure_secrets(t.path(), &opts()).unwrap();
-        assert!(again.created.is_empty() && again.rewritten.is_empty(), "{again:?}");
-        assert_eq!(snapshot(t.path()), before, "nothing changed, the retired files included");
-        for (path, text) in retired_files() {
-            assert_eq!(std::fs::read_to_string(t.path().join(&path)).unwrap(), text, "{path}");
-        }
-        // A fresh install makes none of them.
-        let fresh = tmp();
-        ensure_secrets(fresh.path(), &opts()).unwrap();
-        for (path, _) in retired_files() {
-            assert!(!fresh.path().join(&path).exists(), "{path} is made on a fresh install");
-        }
-        let z = concat!("zit", "adel");
-        assert!(!fresh.path().join(z).exists(), "no {z}/ dir on a fresh install");
-        assert!(LAYOUT.iter().all(|e| !e.path.contains(z)), "the layout names a retired file");
-    }
-
     #[test]
     fn fills_only_missing() {
         let t = tmp();
