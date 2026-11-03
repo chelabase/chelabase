@@ -80,6 +80,24 @@ describe("session", () => {
     expect(mint).toHaveBeenCalledTimes(1);
   });
 
+  // Auth allows a TTL as short as 60 s: the lead is min(60 s, ttl/2), so such a token is reused
+  // for its first half instead of being re-minted on every call.
+  it("a_60s_token_is_reused_not_reminted_on_every_call", async () => {
+    const mint = minter(tok("t1", 60), tok("t2", 60));
+    const session = createSession({ mint });
+    await session.start();
+    expect(await session.getToken()).toBe("t1");
+    expect(await session.getToken()).toBe("t1");
+    expect(await session.getToken()).toBe("t1");
+    expect(mint).toHaveBeenCalledTimes(1);
+    // The timer renews it halfway through, not 5 s in.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(mint).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(mint).toHaveBeenCalledTimes(2);
+    expect(session.token()).toBe("t2");
+  });
+
   it("a_401_on_refresh_signs_out_and_tells_listeners_once", async () => {
     const session = createSession({ mint: minter(tok("t1", 120), unauthorized()) });
     const seen: (string | null)[] = [];

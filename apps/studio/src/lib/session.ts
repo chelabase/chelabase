@@ -16,7 +16,10 @@ export interface SessionSnapshot {
   token: string | undefined;
 }
 
-/** Refresh this long before the token expires. */
+/**
+ * Refresh this long before the token expires, at most: the lead is `min(REFRESH_LEAD_MS, ttl/2)`,
+ * so a short token (auth allows 60 s) is reused for half its life instead of re-minted per call.
+ */
 export const REFRESH_LEAD_MS = 60_000;
 /** After a failed refresh that wasn't a 401 (an outage), try again this much later. */
 export const RETRY_MS = 15_000;
@@ -50,11 +53,13 @@ const isUnauthorized = (err: unknown) => err instanceof ApiError && err.status =
 /**
  * The member token, held in memory only (never storage: a stolen token would outlive the tab).
  * The cookie session is what persists; the token is minted from it and renewed about a minute
- * before it expires, by one shared call however many callers ask.
+ * before it expires (half its life, for a short one), by one shared call however many callers ask.
  */
 export function createSession({ mint }: SessionOptions): Session {
   let snap: SessionSnapshot = { status: "unknown", token: undefined };
   let expiresAt = 0;
+  // The lead for the current token: min(REFRESH_LEAD_MS, ttl/2).
+  let leadMs = REFRESH_LEAD_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let inFlight: Promise<string> | undefined;
   // Bumped by `clear`, so a mint that lands after sign-out is dropped.
@@ -82,8 +87,10 @@ export function createSession({ mint }: SessionOptions): Session {
       try {
         const minted = await mint();
         if (mine !== epoch) throw new ApiError(401, "unauthorized", "Signed out");
-        expiresAt = Date.now() + minted.expires_in * 1000;
-        schedule(Math.max(minted.expires_in * 1000 - REFRESH_LEAD_MS, MIN_DELAY_MS));
+        const ttlMs = minted.expires_in * 1000;
+        expiresAt = Date.now() + ttlMs;
+        leadMs = Math.min(REFRESH_LEAD_MS, ttlMs / 2);
+        schedule(Math.max(ttlMs - leadMs, MIN_DELAY_MS));
         set({ status: "signed-in", token: minted.access_token });
         for (const cb of [...listeners]) cb(minted.access_token);
         return minted.access_token;
@@ -127,7 +134,7 @@ export function createSession({ mint }: SessionOptions): Session {
       }
     },
     getToken() {
-      if (snap.token !== undefined && expiresAt - Date.now() > REFRESH_LEAD_MS) return Promise.resolve(snap.token);
+      if (snap.token !== undefined && expiresAt - Date.now() > leadMs) return Promise.resolve(snap.token);
       return refresh();
     },
     refresh,
