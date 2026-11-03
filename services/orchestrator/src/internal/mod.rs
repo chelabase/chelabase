@@ -22,6 +22,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use chelabase_metadata::members::{Admission, MemberStatus};
 use chelabase_metadata::{
     AppSession, BranchAuthSync, BranchConnectionRow, BranchRecord, DataKeyLookup, MetadataClient,
     MetadataError, NeonDatabase, NeonEndpoint, NeonRole, NewAppSession, PeekOutcome, ProjectAuth,
@@ -236,6 +237,24 @@ pub trait NeonMetadataPort: Send + Sync + 'static {
     ) -> impl Future<Output = Result<Option<(DateTime<Utc>, bool)>, MetadataError>> + Send;
 
     /// The tenant bound to this Zitadel org, if any (the webhook's access events, RT1 T6).
+    /// The tenants this identity user is an active or pending member of.
+    fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> impl Future<Output = Result<Vec<(chelabase_types::TenantId, MemberStatus)>, MetadataError>> + Send;
+
+    /// [`MetadataClient::admit_member`] for the tenant of this org, for someone signing up
+    /// (a member token never makes a row): the row's status, or `None` when `Closed` turned
+    /// them away or no tenant owns the org.
+    fn admit_sign_up(
+        &self,
+        zitadel_org_id: &str,
+        identity_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+    ) -> impl Future<Output = Result<Option<MemberStatus>, MetadataError>> + Send;
+
     fn tenant_by_org(
         &self,
         zitadel_org_id: &str,
@@ -474,6 +493,29 @@ impl NeonMetadataPort for MetadataClient {
             .await
             .map(Some)
     }
+    async fn member_tenants(
+        &self,
+        identity_user_id: &str,
+    ) -> Result<Vec<(chelabase_types::TenantId, MemberStatus)>, MetadataError> {
+        MetadataClient::member_tenants(self, identity_user_id).await
+    }
+    async fn admit_sign_up(
+        &self,
+        zitadel_org_id: &str,
+        identity_user_id: &str,
+        email: &str,
+        name: &str,
+        admission: Admission,
+    ) -> Result<Option<MemberStatus>, MetadataError> {
+        let Some(tenant) = MetadataClient::get_tenant_by_zitadel_org_id(self, zitadel_org_id).await? else {
+            return Ok(None);
+        };
+        match MetadataClient::admit_member(self, tenant, identity_user_id, email, name, admission).await {
+            Ok(member) => Ok(Some(member.status)),
+            Err(MetadataError::NotAdmitted(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
     async fn tenant_by_org(
         &self,
         zitadel_org_id: &str,
@@ -539,6 +581,8 @@ pub struct InternalState<M, L> {
     pub actions_signing_key: Option<chelabase_types::file_value::FileValue>,
     /// Admin access to Zitadel, to delete its sessions (best effort); `None` skips that.
     pub zitadel: Option<chelabase_zitadel::client::Zitadel>,
+    /// The identity service: a fresh-install claim's user is checked there; `None` binds no claim.
+    pub identity: Option<chelabase_identity::Identity>,
     /// Publishes app-user sync jobs.
     pub app_jobs: Arc<dyn app::AppJobPort>,
     /// What the mode allows (the sign-up gate answers `platform` when it refuses).
@@ -599,6 +643,8 @@ where
     let signup = Router::new()
         .route("/internal/signup/check", post(signup::check::<M, L>))
         .route("/internal/signup/claimed", post(signup::claimed::<M, L>))
+        .route("/internal/signup/joined", post(signup::joined::<M, L>))
+        .route("/internal/members/active", post(signup::active::<M, L>))
         .route("/internal/invites/describe", post(invite::describe::<M, L>))
         .route("/internal/invites/open", post(invite::open::<M, L>))
         .route_layer(middleware::from_fn_with_state(signup_token, require_bearer));

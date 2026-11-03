@@ -82,7 +82,7 @@ mod tests {
             .collect();
         got.sort();
         let mut want: Vec<(String, String, String)> = [
-            ("/auth/v1/auth-request", "getAuthRequest"),
+            ("/auth/v1/token", "mintMemberToken"),
             ("/auth/v1/sign-in", "signIn"),
             ("/auth/v1/sign-up", "signUp"),
             ("/auth/v1/accept-invite", "acceptInvite"),

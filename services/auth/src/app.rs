@@ -4,10 +4,14 @@ use crate::config::Config;
 use crate::cookie::*;
 use crate::guard::{RateLimiter, Slot, UsedTickets, client_ip, email_tag, pad};
 use chelabase_zitadel::refusals;
+use chelabase_identity::{
+    CodeKind, CodeRequest, Delivery, Identity, IdentityError, Missing, NewUser, Pool, SignedIn,
+};
 use chelabase_zitadel::rules::{normalize_email, strong_password};
 use crate::app_users::internal::OpenInvite;
-use crate::zitadel::{NewUser, Session, UserState, ZError, ZUser, Zitadel};
-use axum::extract::{DefaultBodyLimit, State};
+use crate::session::{ABSOLUTE_LIFETIME, Choice, choose, may_issue_code};
+use crate::zitadel::{Session, UserState, ZError, ZUser, Zitadel};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{Json, Router};
@@ -20,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
@@ -45,6 +49,9 @@ pub mod messages {
     pub const NO_SUCH_INVITE: &str = "No open invite matches this link";
     pub const BAD_NAME: &str = "Enter a first and a last name, up to 200 characters each";
     pub const BAD_DETAILS: &str = "Check the details you entered";
+    pub const SIGN_IN_AGAIN: &str = "Your session has ended; sign in again";
+    pub const NOT_FROM_STUDIO: &str = "This request must come from Studio";
+    pub const CHOOSE_TENANT: &str = "Choose a workspace to sign in to";
     pub const MEMBER_SUSPENDED: &str =
         "Your access is suspended. Once an administrator reinstates you, sign in with this password";
 }
@@ -63,12 +70,13 @@ pub struct AppState {
     /// Zitadel with the admin token (from the admin PAT, independent of the app keys), which
     /// accept-invite needs; `None` makes it answer 503 before spending a code.
     pub admin: Option<Zitadel>,
-    /// #119: the member-token signer (`CHELABASE_MEMBER_JWT_*`); `None` signs none. m8's
-    /// `/auth/v1/token` mints with it.
-    pub member_tokens: Option<crate::member_token::MemberTokens>,
-    /// #119: the identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`);
-    /// later milestones move sign-in and sessions onto it.
-    pub identity: Option<chelabase_identity::Identity>,
+    /// The member-token signer (`CHELABASE_MEMBER_JWT_*`): `/auth/v1/token` mints with it.
+    pub member_tokens: crate::member_token::MemberTokens,
+    /// The identity service (`CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE`): members
+    /// sign in, up and out against it.
+    pub identity: Identity,
+    /// What `/auth/v1/token` measures a session's age with.
+    pub clock: crate::session::Clock,
 }
 
 type S = State<Arc<AppState>>;
@@ -81,11 +89,11 @@ pub(crate) fn api_router() -> OpenApiRouter<Arc<AppState>> {
 /// Studio's sign-in pages' routes.
 fn platform_router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
-        .routes(routes!(auth_request))
         .routes(routes!(instance))
         .routes(routes!(studio_config))
         .routes(routes!(sign_in))
         .routes(routes!(sign_up))
+        .routes(routes!(token))
         .routes(routes!(accept_invite))
         .routes(routes!(describe_invite))
         .routes(routes!(verify_email))
@@ -140,31 +148,31 @@ async fn forwarded_for(
     next.run(req).await
 }
 
-/// What the sign-in pages do next, as `{"next": "done", "redirect": …}` or `{"next": "verify"}`.
-#[derive(Serialize, ToSchema)]
-#[serde(tag = "next", rename_all = "lowercase")]
-enum NextStep {
-    /// Signed in: send the browser to `redirect` (Zitadel's callback for the pending sign-in).
-    Done { redirect: String },
-    /// The email isn't verified: show the code step.
+/// Where a sign-in or sign-up goes next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum SignInStep {
+    /// Signed in, with the session cookie set: `POST /auth/v1/token` works.
+    Studio,
+    /// The email isn't verified: show the code step (the step cookie is set).
     Verify,
+    /// The credentials are right, but an admin hasn't approved this person yet. No session.
+    Pending,
 }
 
-fn next_step(step: &NextStep) -> Value {
-    serde_json::to_value(step).expect("NextStep serialises")
-}
-
-// Documentation only: the handler answers through `finish`, which serialises `NextStep::Done`
-// to the same JSON.
-/// The signed-in answer: `next` is always `done`.
-#[allow(dead_code)]
+/// A sign-in's or sign-up's answer.
 #[derive(Serialize, ToSchema)]
-struct SignedIn {
+struct SignInAnswer {
+    next: SignInStep,
+}
+
+/// The signed-in answer of accept-invite and verify-email: `next` is always `done`.
+#[derive(Serialize, ToSchema)]
+struct SignedInRedirect {
     next: DoneTag,
     redirect: String,
 }
 
-#[allow(dead_code)]
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 enum DoneTag {
@@ -175,33 +183,11 @@ enum DoneTag {
 #[derive(Serialize, ToSchema)]
 struct EmptyResponse {}
 
-/// What the sign-in page needs to know about the pending sign-in.
-#[derive(Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct AuthRequestInfo {
-    /// The visitor asked to create an account (`prompt=create`) and this instance allows it:
-    /// Studio goes to its sign-up page. `false` for a refused sign-up request too, which then
-    /// lands on the plain sign-in page.
-    sign_up: bool,
-    /// This instance takes sign-ups (open sign-up is on, or the tenant has no member yet and a
-    /// setup code is configured): the sign-in page may offer "Create account". Always `false`
-    /// in platform mode.
-    sign_up_allowed: bool,
-}
-
-/// Studio's runtime config: the six public values it signs in with. Nothing else is here (no
-/// PAT, key or secret): it is public and cached.
+/// Studio's runtime config: the public values it starts with. Nothing else is here (no PAT, key
+/// or secret): it is public and cached.
 #[derive(Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct StudioConfig {
-    /// Zitadel's issuer URL (the OIDC authority).
-    issuer: String,
-    /// Studio's OIDC client id.
-    client_id: String,
-    /// The `chelabase` project id (the API audience Studio asks for).
-    project_id: String,
-    /// The platform org's id.
-    org_id: String,
     /// The public API base URL.
     api_url: String,
     /// Studio's public host.
@@ -243,7 +229,7 @@ async fn health(State(s): S) -> Response {
     path = "/auth/v1/studio-config",
     operation_id = "getStudioConfig",
     tag = "login",
-    description = "Studio's runtime config: the Zitadel issuer, Studio's client id, the project and org ids, the API URL and Studio's host. Public; cacheable for 60 s.",
+    description = "Studio's runtime config: the API URL and Studio's host. Public; cacheable for 60 s.",
     responses(
         (status = 200, description = "The config (`Cache-Control: public, max-age=60`)", body = StudioConfig),
         (status = 404, description = "Studio's ids aren't configured here (a dev Studio uses its build values): `not_found`", body = ErrorEnvelope),
@@ -265,17 +251,13 @@ async fn studio_config(State(s): S) -> Response {
         ));
     };
     let values = (s.config.org_id.get(), client_id.get(), project_id.get());
-    let (Ok(org_id), Ok(client_id), Ok(project_id)) = values else {
+    let (Ok(_), Ok(_), Ok(_)) = values else {
         for e in [values.0.err(), values.1.err(), values.2.err()].into_iter().flatten() {
             not_ready(&e);
         }
         return no_store(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
     };
     let body = StudioConfig {
-        issuer: s.config.issuer.clone(),
-        client_id: client_id.to_string(),
-        project_id: project_id.to_string(),
-        org_id: org_id.to_string(),
         api_url: studio.api_url.clone(),
         studio_host: studio.studio_host.clone(),
     };
@@ -298,8 +280,9 @@ struct InstanceInfo {
 }
 
 const MINUTE: Duration = Duration::from_secs(60);
-/// Sign-up may wait up to a second for Zitadel to see the new user (`new_user_session`), so its
-/// answers are padded this much beyond sign-in's, or a new email would answer slower than a taken one.
+/// Sign-up does more than sign-in (the new user, its row, its session, accept-invite waits for
+/// Zitadel to see a user), so its answers are padded this much beyond sign-in's, or a new email
+/// would answer slower than a taken one.
 pub(crate) const SIGN_UP_EXTRA: Duration = Duration::from_secs(1);
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -399,7 +382,7 @@ async fn finish(s: &AppState, auth_request: &str, session: Session) -> Response 
 
 /// The `done` answer with the session cookie set and the step cookie cleared.
 fn signed_in(s: &AppState, session: Session, redirect: String) -> Response {
-    let kept = SessionState {
+    let kept = SessionState::Zitadel {
         session_id: session.id,
         session_token: session.token,
         exp: now_secs() + SESSION_TTL_SECS,
@@ -407,7 +390,7 @@ fn signed_in(s: &AppState, session: Session, redirect: String) -> Response {
     let secure = s.config.secure_cookies;
     reply(
         StatusCode::OK,
-        next_step(&NextStep::Done { redirect }),
+        json!(SignedInRedirect { next: DoneTag::Done, redirect }),
         vec![
             set_cookie(
                 SESSION_COOKIE,
@@ -420,74 +403,22 @@ fn signed_in(s: &AppState, session: Session, redirect: String) -> Response {
     )
 }
 
-async fn verify_step(
-    s: &AppState,
-    auth_request: &str,
-    user_id: String,
-    session: Session,
-) -> Response {
+/// The code step: the identity session waits in the step cookie, and no session cookie is set.
+fn verify_step(s: &AppState, signed: SignedIn) -> Response {
     let state = LoginState {
-        auth_request: auth_request.to_string(),
-        user_id: Some(user_id),
-        session_id: Some(session.id),
-        session_token: Some(session.token),
+        auth_request: String::new(),
+        user_id: Some(signed.user.id),
+        session_id: Some(signed.session_id),
+        session_token: Some(signed.session_token),
         step: Step::Verify,
         decoy: false,
         exp: now_secs() + LOGIN_TTL_SECS,
     };
     reply(
         StatusCode::OK,
-        next_step(&NextStep::Verify),
+        json!(SignInAnswer { next: SignInStep::Verify }),
         vec![login_cookie(s, &state)],
     )
-}
-
-#[derive(Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-struct AuthRequestBody {
-    auth_request: String,
-}
-
-#[utoipa::path(
-    post,
-    path = "/auth/v1/auth-request",
-    operation_id = "getAuthRequest",
-    tag = "login",
-    description = "Looks up a pending sign-in and reports whether sign-up is asked for and allowed. Sets no cookie.",
-    request_body = AuthRequestBody,
-    responses(
-        (status = 200, description = "The pending sign-in is valid", body = AuthRequestInfo),
-        (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
-        (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
-        (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
-        (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
-        (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
-    ),
-)]
-async fn auth_request(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<AuthRequestBody>) -> Response {
-    let ip = client_ip(&headers);
-    if !allowed(&s, &[(format!("auth-request:ip:{ip}"), 60, MINUTE)]) {
-        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
-    }
-    if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
-    match s.zitadel.auth_request(&b.auth_request).await {
-        Ok(asked) => {
-            // A fresh install waiting for its code takes a sign-up (with the code).
-            let sign_up_allowed = gate(&s, None)
-                .await
-                .is_ok_and(|a| a.allowed || a.setup_required);
-            reply(
-                StatusCode::OK,
-                json!(AuthRequestInfo { sign_up: asked && sign_up_allowed, sign_up_allowed }),
-                Vec::new(),
-            )
-        }
-        Err(e) => pending_sign_in_error(e),
-    }
 }
 
 #[utoipa::path(
@@ -521,11 +452,18 @@ async fn instance(State(s): S, headers: HeaderMap) -> Response {
 }
 
 #[derive(Deserialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
 struct SignInBody {
-    auth_request: String,
     email: String,
     password: String,
+}
+
+/// The tenant asked for.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct TenantQuery {
+    /// The tenant's id. Needed to sign in to one of several; `/auth/v1/token` refuses any
+    /// but the session's. Never trusted: it is checked against the memberships.
+    tenant: Option<String>,
 }
 
 #[utoipa::path(
@@ -533,57 +471,54 @@ struct SignInBody {
     path = "/auth/v1/sign-in",
     operation_id = "signIn",
     tag = "login",
-    description = "Signs in with email and password. On success sets the HttpOnly session cookie, or, when the email still needs verifying, the HttpOnly step cookie that the code step reads.",
+    description = "Signs in with email and password. `studio` sets the HttpOnly session cookie, which seals the identity session and the tenant. `verify` sets the HttpOnly step cookie that the code step reads. `pending` sets no cookie: an admin hasn't approved this person yet. A wrong password, an unknown email and no active membership answer alike.",
+    params(TenantQuery),
     request_body = SignInBody,
     responses(
-        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
+        (status = 200, description = "`studio`, `verify` or `pending`", body = SignInAnswer),
         (status = 400, description = "The body is malformed: `invalid_request`", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
-        (status = 401, description = "Wrong email or password: `invalid_credentials`", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
+        (status = 401, description = "Wrong email or password, no active membership, or a `tenant` this person isn't a member of: `invalid_credentials`", body = ErrorEnvelope),
+        (status = 409, description = "The credentials are right and this person has several tenants: `tenant_required`, with their ids in `error.tenants`. Sign in again with `?tenant=`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
-async fn sign_in(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignInBody>) -> Response {
+async fn sign_in(
+    State(s): S,
+    Query(q): Query<TenantQuery>,
+    headers: HeaderMap,
+    ApiJson(b): ApiJson<SignInBody>,
+) -> Response {
     let start = Instant::now();
-    let answer = sign_in_inner(&s, &headers, b).await;
+    let answer = sign_in_inner(&s, q, &headers, b).await;
     pad(start, s.config.min_response).await;
     answer
 }
 
-async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Response {
+async fn sign_in_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap, b: SignInBody) -> Response {
     let email = normalize_email(&b.email);
     let ip = client_ip(headers);
     if !allowed(s, &[(format!("sign-in:ip:{ip}"), 10, MINUTE)]) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    // Per email, only failed password checks count: signing in as someone takes their password,
-    // so nobody can use up a known account's attempts. The attempt is reserved up front, so
+    // Per email, only refused sign-ins count: signing in as someone takes their password, so
+    // nobody can use up a known account's attempts. The attempt is reserved up front, so
     // concurrent requests can't all pass a check before any failure lands, and a client that
     // hangs up during the check still spends it. Only these outcomes give it back:
     //
     // | Outcome                                                        | Answer  | Email slot |
     // |----------------------------------------------------------------|---------|------------|
     // | the email's 5 a minute are used                                | 429     | none held  |
-    // | `authRequest` isn't an auth request id                         | 410     | refunded   |
-    // | no org yet (the bootstrap hasn't written it)                   | 503     | refunded   |
-    // | Zitadel refuses the auth request, or is unavailable            | 410/503 | refunded   |
-    // | the user lookup fails                                          | 503     | refunded   |
-    // | no user has this email                                         | 401     | counts     |
-    // | the password check is refused (any `Rejected`, see below)      | 401     | counts     |
-    // | the password check is unavailable (`Unavailable`)              | 503     | refunded   |
-    // | the password is right (refunded before anything else awaits)   | any     | refunded   |
+    // | wrong password, unknown email, banned, input identity refused  | 401     | counts     |
+    // | right password, but no tenant to land in                       | 401     | counts     |
+    // | identity or the orchestrator can't answer                      | 503     | refunded   |
+    // | right password, any other outcome                              | 200/409 | refunded   |
     // | the request is dropped undecided (the client hung up)          | none    | counts     |
     //
-    // A refused password check is any refusal of Zitadel's own: a wrong password
-    // (`refusals::PASSWORD_INVALID`), no such user (`SESSION_USER_NOT_FOUND`), a locked or
-    // inactive user (`SESSION_USER_LOCKED`, `SESSION_USER_NOT_ACTIVE`), or its request validation
-    // (`ZError::is_invalid_request`, e.g. a password over 200 characters: the caller's input).
-    // `Unavailable` is no answer, a 5xx, or a 4xx that isn't Zitadel's own error. An unknown
-    // email and a wrong password both count and answer the same 401, padded alike.
+    // "No tenant" counts so that it can't be told from a wrong password by when the 429 comes.
     let Some(slot) = Slot::reserve(
         &s.limiter,
         format!("sign-in:email:{}", email_tag(&email)),
@@ -594,56 +529,236 @@ async fn sign_in_inner(s: &AppState, headers: &HeaderMap, b: SignInBody) -> Resp
     };
     // Counts: the slot is dropped without a refund.
     let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::InvalidCredentials, BAD_CREDENTIALS);
-    if !is_auth_request_id(&b.auth_request) {
-        slot.refund();
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
-    let Some(org) = org_id(s) else {
-        slot.refund();
-        return no_org();
-    };
-    if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
-        slot.refund();
-        return pending_sign_in_error(e);
-    }
-    let user_id = match s.zitadel.find_user_by_email(org, &email).await {
-        Ok(Some(id)) => id,
-        Ok(None) => return refused(),
-        Err(e) => {
-            slot.refund();
-            return unavailable(&e);
-        }
-    };
-    let session = match s.zitadel.create_session(&user_id, &b.password).await {
-        Ok(session) => {
-            slot.refund();
-            session
-        }
-        Err(ZError::Rejected { .. }) => {
+    let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
+        Ok(signed) => signed,
+        Err(
+            IdentityError::BadCredentials
+            | IdentityError::Banned
+            | IdentityError::SessionRevoked
+            | IdentityError::Invalid { .. },
+        ) => {
             info!(email = %email_tag(&email), "sign-in refused");
             return refused();
         }
-        Err(e @ ZError::Unavailable(_)) => {
+        Err(e) => {
             slot.refund();
-            return unavailable(&e);
+            return identity_unavailable(&e);
         }
     };
-    match s.zitadel.email_verified(&user_id).await {
-        Ok(true) => finish(s, &b.auth_request, session).await,
-        Ok(false) => {
-            if let Err(e) = s.zitadel.resend_code(&user_id, &verify_template(s)).await {
-                warn!(error = %e, "resending the verification code failed");
-            }
-            verify_step(s, &b.auth_request, user_id, session).await
+    match conclude(s, signed, q.tenant.as_deref()).await {
+        Concluded::Answer(answer) => {
+            slot.refund();
+            answer
         }
-        Err(e) => unavailable(&e),
+        Concluded::Refused => {
+            info!(email = %email_tag(&email), "sign-in refused: no tenant");
+            refused()
+        }
+    }
+}
+
+fn identity_unavailable(e: &IdentityError) -> Response {
+    warn!(error = %e, "identity call failed");
+    error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE)
+}
+
+/// What a right password led to.
+enum Concluded {
+    Answer(Response),
+    /// No tenant to land in: the caller gives its generic refusal. The session is gone.
+    Refused,
+}
+
+/// A session nobody will use.
+async fn drop_session(s: &AppState, session_id: &str) {
+    if let Err(e) = s.identity.revoke_session(&Pool::Members, session_id).await {
+        warn!(error = %e, "revoking an unused session failed; it expires on its own");
+    }
+}
+
+/// From a new identity session to the sign-in's answer. Only `studio` and `verify` keep the
+/// session; `pending` and `tenant_required` revoke it (a retry signs in again).
+async fn conclude(s: &AppState, signed: SignedIn, wanted: Option<&str>) -> Concluded {
+    if !signed.user.email_verified {
+        send_code(s, &signed.user.id, CodeKind::Verify).await;
+        return Concluded::Answer(verify_step(s, signed));
+    }
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("sign-in needs the orchestrator's internal client");
+        drop_session(s, &signed.session_id).await;
+        return Concluded::Answer(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+    };
+    let tenants = match orchestrator.member_tenants(&signed.user.id).await {
+        Ok(tenants) => tenants,
+        Err(e) => {
+            warn!(error = %e, "sign-in: reading the memberships failed");
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE));
+        }
+    };
+    let tenant = match choose(&tenants, wanted) {
+        Choice::Tenant(tenant) => tenant,
+        Choice::Pending => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(reply(
+                StatusCode::OK,
+                json!(SignInAnswer { next: SignInStep::Pending }),
+                Vec::new(),
+            ));
+        }
+        Choice::Several(list) => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Answer(
+                ApiError::new(StatusCode::CONFLICT.as_u16(), ErrorCode::TenantRequired, CHOOSE_TENANT)
+                    .with_extra("tenants", json!(list))
+                    .into_response(),
+            );
+        }
+        Choice::Nowhere => {
+            drop_session(s, &signed.session_id).await;
+            return Concluded::Refused;
+        }
+    };
+    let kept = SessionState::Identity {
+        session_id: signed.session_id,
+        session_token: signed.session_token,
+        tenant,
+        exp: now_secs() + SESSION_TTL_SECS,
+    };
+    let secure = s.config.secure_cookies;
+    Concluded::Answer(reply(
+        StatusCode::OK,
+        json!(SignInAnswer { next: SignInStep::Studio }),
+        vec![
+            set_cookie(
+                SESSION_COOKIE,
+                &seal_session(&s.config.cookie_key, &kept),
+                SESSION_TTL_SECS,
+                secure,
+            ),
+            clear_cookie(LOGIN_COOKIE, secure),
+        ],
+    ))
+}
+
+/// Mails a code, within [`may_issue_code`]. The answer never says whether one went out.
+async fn send_code(s: &AppState, user_id: &str, kind: CodeKind) {
+    if !may_issue_code(&s.limiter, kind, user_id) {
+        info!(kind = kind.as_str(), "a user's code limit is used up; nothing sent");
+        return;
+    }
+    let link = format!("{}/verify", s.config.studio_url);
+    let mut request = CodeRequest::new(user_id, kind, Delivery::Email);
+    request.link = Some(&link);
+    if let Err(e) = s.identity.create_code(&Pool::Members, &request).await {
+        warn!(error = %e, "sending a code failed");
+    }
+}
+
+/// The answer to a call to `/auth/v1/token` that isn't Studio's: Studio sends both, and a form
+/// or another site can't. Neither says anything about the session.
+fn from_studio(s: &AppState, headers: &HeaderMap) -> bool {
+    let header_is = |name: &str, want: &str| headers.get(name).is_some_and(|v| v.as_bytes() == want.as_bytes());
+    header_is("x-chelabase-studio", "1") && header_is("origin", &s.config.studio_url)
+}
+
+/// A member's short-lived token.
+#[derive(Serialize, ToSchema)]
+struct MemberToken {
+    access_token: String,
+    /// Seconds until it expires.
+    expires_in: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/auth/v1/token",
+    operation_id = "mintMemberToken",
+    tag = "login",
+    description = "Mints a member access token from the HttpOnly session cookie, after checking that the identity session is live and younger than 30 days and that the membership is active. Takes no body. Studio must send `Origin` and `X-Chelabase-Studio: 1`. Never cached.",
+    params(TenantQuery),
+    responses(
+        (status = 200, description = "The token, for the tenant the session is bound to", body = MemberToken),
+        (status = 401, description = "No live session, an older one, another tenant, or no active membership there: `unauthorized`", body = ErrorEnvelope),
+        (status = 403, description = "Not from Studio: `forbidden`", body = ErrorEnvelope),
+        (status = 429, description = "Over 120 a minute for this session: `rate_limited`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the orchestrator is unavailable: `unavailable`", body = ErrorEnvelope),
+    ),
+)]
+async fn token(State(s): S, Query(q): Query<TenantQuery>, headers: HeaderMap) -> Response {
+    let mut answer = token_inner(&s, q, &headers).await;
+    answer
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, header::HeaderValue::from_static("no-store"));
+    answer
+}
+
+async fn token_inner(s: &AppState, q: TenantQuery, headers: &HeaderMap) -> Response {
+    if !from_studio(s, headers) {
+        return error(StatusCode::FORBIDDEN, ErrorCode::Forbidden, NOT_FROM_STUDIO);
+    }
+    let refused = || error(StatusCode::UNAUTHORIZED, ErrorCode::Unauthorized, SIGN_IN_AGAIN);
+    let down = || error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
+    let Some(SessionState::Identity { session_id, tenant, .. }) = read_cookie(headers, SESSION_COOKIE)
+        .and_then(|raw| open_session(&s.config.cookie_key, raw, now_secs()))
+    else {
+        return refused();
+    };
+    if !allowed(s, &[(format!("token:session:{session_id}"), 120, MINUTE)]) {
+        return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
+    }
+    // The session is sealed to its tenant: asking for another never moves it.
+    if q.tenant.as_deref().is_some_and(|t| t.parse() != Ok(tenant)) {
+        return refused();
+    }
+    // By id, never by token: identity's lookup by token slides the expiry.
+    let live = match s.identity.session_by_id(&Pool::Members, &session_id).await {
+        Ok(live) => live,
+        Err(IdentityError::NotFound(Missing::Session)) => return refused(),
+        Err(e) => {
+            warn!(error = %e, "identity call failed");
+            return down();
+        }
+    };
+    if s.clock.now() - live.session.created_at > ABSOLUTE_LIFETIME {
+        drop_session(s, &session_id).await;
+        return refused();
+    }
+    let Some(orchestrator) = &s.signup_gate else {
+        warn!("/auth/v1/token needs the orchestrator's internal client");
+        return down();
+    };
+    match orchestrator.member_tenants(&live.user.id).await {
+        Ok(tenants) if tenants.active.contains(&tenant) => {}
+        Ok(_) => return refused(),
+        Err(e) => {
+            warn!(error = %e, "/auth/v1/token: reading the memberships failed");
+            return down();
+        }
+    }
+    let minted = s.member_tokens.mint(&crate::member_token::MemberSubject {
+        user_id: &live.user.id,
+        tenant,
+        session_id: &session_id,
+        email: &live.user.email,
+        name: &live.user.name,
+    });
+    match minted {
+        Ok((access_token, _)) => reply(
+            StatusCode::OK,
+            json!(MemberToken { access_token, expires_in: s.member_tokens.ttl().as_secs() }),
+            Vec::new(),
+        ),
+        Err(e) => {
+            warn!(error = %e, "minting a member token failed");
+            down()
+        }
     }
 }
 
 #[derive(Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 struct SignUpBody {
-    auth_request: String,
     email: String,
     password: String,
     given_name: String,
@@ -659,19 +774,18 @@ struct SignUpBody {
     path = "/auth/v1/sign-up",
     operation_id = "signUp",
     tag = "login",
-    description = "Creates an account. Sets the HttpOnly session cookie when email verification is off, otherwise the HttpOnly step cookie that the code step reads.",
+    description = "Creates an account: the fresh-install admin with the setup code, otherwise a person waiting for an admin's approval. With email verification off it signs them in, so the answer is `studio` (the session cookie) or `pending` (no cookie). With it on, `verify` and the HttpOnly step cookie that the code step reads.",
     request_body = SignUpBody,
     responses(
-        (status = 200, description = "Signed in (`done`, with the session cookie set and the step cookie cleared) or waiting for the email code (`verify`, with the step cookie set)", body = NextStep),
-        (status = 400, description = "The body is malformed, a name is blank or over 200 characters, or Zitadel's validation refuses a field (`invalid_request`), or the password is too weak (`weak_password`)", body = ErrorEnvelope),
+        (status = 200, description = "`studio`, `verify` or `pending`", body = SignInAnswer),
+        (status = 400, description = "The body is malformed, a name is blank or over 200 characters, or the identity service refuses a field (`invalid_request`), or the password is too weak (`weak_password`)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
         (status = 403, description = "Sign-up is closed for this instance (`sign_up_closed`), the unclaimed instance needs its setup code and it is missing or wrong (`setup_code_invalid`; no account is created), or not available in platform mode (`not_available_in_platform_mode`)", body = ErrorEnvelope),
         (status = 409, description = "An account with this email exists (`email_taken`); only when email verification is off", body = ErrorEnvelope),
-        (status = 410, description = "This sign-in has expired or is unknown: `sign_in_expired`", body = ErrorEnvelope),
         (status = 429, description = "Too many attempts: `rate_limited`", body = ErrorEnvelope),
-        (status = 503, description = "Zitadel or the sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service or the sign-up gate is unavailable: `unavailable`", body = ErrorEnvelope),
     ),
 )]
 async fn sign_up(State(s): S, headers: HeaderMap, ApiJson(b): ApiJson<SignUpBody>) -> Response {
@@ -696,14 +810,11 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     ) {
         return error(StatusCode::TOO_MANY_REQUESTS, ErrorCode::RateLimited, TOO_MANY);
     }
-    if !is_auth_request_id(&b.auth_request) {
-        return error(StatusCode::GONE, ErrorCode::SignInExpired, GONE);
-    }
     if !usable_password(&b.password) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
     }
-    // Zitadel's own limit on a name (1–200 runes after trimming), checked here so a bad name
-    // never reaches it and is never answered as a password problem.
+    // A name is 1–200 runes after trimming, checked here so a bad name is never answered as a
+    // password problem.
     let usable_name = |n: &str| (1..=200).contains(&n.trim().chars().count());
     if !usable_name(&b.given_name) || !usable_name(&b.family_name) {
         return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_NAME);
@@ -711,68 +822,40 @@ async fn sign_up_inner(s: &Arc<AppState>, headers: &HeaderMap, b: SignUpBody) ->
     let Some(org) = org_id(s) else {
         return no_org();
     };
-    if let Err(e) = s.zitadel.auth_request(&b.auth_request).await {
-        return pending_sign_in_error(e);
-    }
     let nonce = match sign_up_gate(s, setup_code).await {
         Ok(nonce) => nonce,
         Err(refused) => return refused.response(),
     };
-    // A claim that fails after the account exists is undone by deleting it, which needs the
-    // admin client (the login client can't delete users): without it, no claim is attempted.
-    if nonce.is_some() && s.admin.is_none() {
-        warn!("a setup-code sign-up needs the admin Zitadel client (CHELABASE_ZITADEL_ADMIN_PAT_FILE)");
-        return error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE);
-    }
-    // Zitadel checks usernames, not emails, for uniqueness: never make a second account
-    // for an email that already has one.
-    // Two accounts already sharing the email (made outside this check) count as taken too.
-    match s.zitadel.find_user_in_org(org, &email).await {
-        Ok(crate::zitadel::EmailMatch::None) => {}
-        Ok(_) => return taken(s, &email, b.auth_request),
-        Err(e) => return unavailable(&e),
-    }
-    let template = verify_template(s);
+    let name = format!("{} {}", b.given_name.trim(), b.family_name.trim());
     let new = NewUser {
-        org_id: org,
         email: &email,
-        given_name: b.given_name.trim(),
-        family_name: b.family_name.trim(),
         password: Some(&b.password),
-        user_id: None,
-        username: None,
-        send_code: true,
-        verified: s.config.skip_email_verification,
-        url_template: &template,
+        name: Some(&name),
+        email_verified: s.config.skip_email_verification,
     };
-    let user_id = match s.zitadel.create_user(&new).await {
-        Ok(id) => id,
-        Err(e) if e.is(refusals::USER_ALREADY_EXISTS) => return taken(s, &email, b.auth_request),
-        // Only Zitadel's policy, by its captured create-path ids, is the visitor's password (#79).
-        Err(e) if e.is_any(&CREATE_PASSWORD_POLICY) => {
+    let user = match s.identity.create_user(&Pool::Members, &new).await {
+        Ok(user) => user,
+        Err(IdentityError::Conflict(_)) => return taken(s, &email),
+        Err(IdentityError::Invalid { code, .. }) if code == "weak_password" => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::WeakPassword, WEAK_PASSWORD);
         }
-        // Its validation of a field (code 3, no id) is still the visitor's input, but no field
-        // in particular: the name and password checks above catch the known ones first.
-        Err(e) if e.is_invalid_request() => {
+        Err(IdentityError::Invalid { .. }) => {
             return error(StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest, BAD_DETAILS);
         }
-        // Any other refusal (a missing org: the instance is misconfigured) isn't the visitor's.
-        Err(e) => return unavailable(&e),
+        Err(e) => return identity_unavailable(&e),
     };
-    if let Some(nonce) = &nonce
-        && let Some(refused) = bind_claim(s, org, &user_id, nonce).await
-    {
+    if let Some(refused) = enroll(s, org, &user.id, nonce.as_ref()).await {
         return refused.response();
     }
-    let session = match new_user_session(s, &user_id, &b.password).await {
-        Ok(session) => session,
-        Err(e) => return unavailable(&e),
+    let signed = match s.identity.sign_in(&Pool::Members, &email, &b.password).await {
+        Ok(signed) => signed,
+        Err(e) => return identity_unavailable(&e),
     };
-    if s.config.skip_email_verification {
-        return finish(s, &b.auth_request, session).await;
+    match conclude(s, signed, None).await {
+        Concluded::Answer(answer) => answer,
+        // Enrolled a moment ago, and already out of the tenant.
+        Concluded::Refused => error(StatusCode::SERVICE_UNAVAILABLE, ErrorCode::Unavailable, UNAVAILABLE),
     }
-    verify_step(s, &b.auth_request, user_id, session).await
 }
 
 /// Why the sign-up gate refused; [`Refusal::response`] is its answer.
@@ -855,36 +938,41 @@ async fn sign_up_gate(
     })
 }
 
-/// Binds the fresh-install claim to the account just created. `None` when bound, or when the
-/// instance was claimed meanwhile (the account stays and waits as a newcomer). On any
-/// failure the account is deleted, so a retry with the same email can succeed, and the
-/// answer is `setup_code_invalid` (refused) or `unavailable`.
-async fn bind_claim(
+/// Gives the account just created its place: the fresh-install claim with a nonce, otherwise
+/// a `pending` row (a member token never makes one). `None` when that's done, the loser of the
+/// claim race included (they wait as pending). On any failure the account is deleted, so a
+/// retry with the same email can succeed, and the answer is why.
+async fn enroll(
     s: &AppState,
     org: &str,
     user_id: &str,
-    nonce: &crate::app_users::internal::ClaimNonce,
+    nonce: Option<&crate::app_users::internal::ClaimNonce>,
 ) -> Option<Refusal> {
-    let failed = match &s.signup_gate {
-        Some(gate) => match gate.signup_claimed(org, user_id, nonce).await {
-            Ok(bound) => {
-                info!(user_id, bound, "fresh-install claim");
-                return None;
+    use crate::app_users::internal::InternalError;
+    let done = match (&s.signup_gate, nonce) {
+        (Some(gate), Some(nonce)) => gate.signup_claimed(org, user_id, nonce).await.map(|bound| {
+            info!(user_id, bound, "fresh-install claim");
+        }),
+        (Some(gate), None) => gate.signup_joined(org, user_id).await.and_then(|joined| {
+            if joined {
+                Ok(())
+            } else {
+                Err(InternalError::Refused { status: 403, code: "sign_up_closed".into() })
             }
-            Err(e) => e,
-        },
-        None => crate::app_users::internal::InternalError::Unavailable("no sign-up gate".into()),
+        }),
+        (None, _) => Err(InternalError::Unavailable("no sign-up gate".into())),
     };
-    warn!(user_id, error = %failed, "binding the fresh-install claim failed; deleting the new account");
-    // `sign_up_inner` checked the admin client before creating the account.
-    if let Some(admin) = &s.admin
-        && let Err(e) = admin.delete_user(user_id).await
-    {
-        warn!(user_id, error = %e, "deleting the unclaimed account failed");
+    let Err(failed) = done else {
+        return None;
+    };
+    warn!(user_id, error = %failed, "enrolling the new account failed; deleting it");
+    if let Err(e) = s.identity.delete_user(&Pool::Members, user_id).await {
+        warn!(user_id, error = %e, "deleting the unenrolled account failed");
     }
     Some(match failed {
-        crate::app_users::internal::InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
-        crate::app_users::internal::InternalError::Unavailable(_) => Refusal::Unavailable,
+        InternalError::Refused { code, .. } if code == "sign_up_closed" => Refusal::Closed,
+        InternalError::Refused { .. } => Refusal::SetupCodeInvalid,
+        InternalError::Unavailable(_) => Refusal::Unavailable,
     })
 }
 
@@ -996,7 +1084,7 @@ struct AcceptInviteBody {
     description = "Accepts a member invite: checks the emailed code (with `reset`, a password-reset code, which sets the password itself), sets the password, marks the email verified and signs in. Sets the HttpOnly session cookie. If a step after the code check fails, the error is `invite_incomplete` (or `weak_password`) with `error.accept_ticket`: send it back in place of `code` to finish. A pending sign-in that has expired doesn't fail the accept: `redirect` is then Studio's address.",
     request_body = AcceptInviteBody,
     responses(
-        (status = 200, description = "Signed in: `next` is `done`, the session cookie is set", body = SignedIn),
+        (status = 200, description = "Signed in: `next` is `done`, the session cookie is set", body = SignedInRedirect),
         (status = 400, description = "The body is malformed, the code or ticket is wrong, or the user is inactive with no open invite (`invalid_request`), or the password is refused (`weak_password`, with `accept_ticket` once the code was spent)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
@@ -1307,22 +1395,23 @@ async fn finish_accept(
 /// A sign-up for a taken email. With verification on (platform), it's answered exactly like a
 /// new one, with a cookie that can't verify. With it off (self-hosted), a new sign-up has no
 /// code step to hide behind, so the user is told and Studio sends them to sign in.
-fn taken(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
+fn taken(s: &Arc<AppState>, email: &str) -> Response {
     if s.config.skip_email_verification {
         info!(email = %email_tag(email), "sign-up for a taken email");
         return error(StatusCode::CONFLICT, ErrorCode::EmailTaken, ACCOUNT_EXISTS);
     }
-    decoy(s, email, auth_request)
+    decoy(s, email)
 }
 
 /// Answer a sign-up for a taken email exactly like a new one, with a cookie that can't verify.
 /// The account's owner gets a password-reset email instead, so a real owner who forgot they
 /// signed up has a way back in.
-fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
+fn decoy(s: &Arc<AppState>, email: &str) -> Response {
     info!(email = %email_tag(email), "sign-up for a taken email (decoy)");
     spawn_reset_email(s, email.to_string());
     let decoy = LoginState {
-        auth_request,
+        // Only a limit key here ([`step_key`]): a decoy has no user.
+        auth_request: uuid::Uuid::new_v4().to_string(),
         user_id: None,
         session_id: None,
         session_token: None,
@@ -1332,7 +1421,7 @@ fn decoy(s: &Arc<AppState>, email: &str, auth_request: String) -> Response {
     };
     reply(
         StatusCode::OK,
-        next_step(&NextStep::Verify),
+        json!(SignInAnswer { next: SignInStep::Verify }),
         vec![login_cookie(s, &decoy)],
     )
 }
@@ -1351,8 +1440,8 @@ async fn new_user_session(s: &AppState, user_id: &str, password: &str) -> Result
     }
 }
 
-/// The rate-limit key for a pending code step: the user, or for a decoy its pending sign-in,
-/// so real and decoy cookies are limited alike.
+/// The rate-limit key for a pending code step: the user, or a decoy's own id, so real and decoy
+/// cookies are limited alike.
 fn step_key(state: &LoginState) -> String {
     state
         .user_id
@@ -1378,7 +1467,7 @@ struct CodeBody {
     description = "Checks the emailed code. Reads the HttpOnly step cookie; on success sets the HttpOnly session cookie and clears the step cookie.",
     request_body = CodeBody,
     responses(
-        (status = 200, description = "Email verified and signed in: `next` is `done`, the session cookie is set and the step cookie cleared", body = SignedIn),
+        (status = 200, description = "Email verified and signed in: `next` is `done`, the session cookie is set and the step cookie cleared", body = SignedInRedirect),
         (status = 400, description = "The body is malformed (`invalid_request`) or the code is wrong (`invalid_code`)", body = ErrorEnvelope),
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
@@ -1613,7 +1702,7 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
     path = "/auth/v1/logout",
     operation_id = "logout",
     tag = "login",
-    description = "Ends the session and clears the HttpOnly session and step cookies.",
+    description = "Revokes the session and clears the HttpOnly session and step cookies. If the identity service can't be reached the cookies stay, so the client can try again.",
     request_body = EmptyRequest,
     responses(
         (status = 200, description = "Done", body = EmptyResponse),
@@ -1621,20 +1710,26 @@ async fn confirm_inner(s: &AppState, headers: &HeaderMap, b: ConfirmBody) -> Res
         (status = 415, description = "The body is not JSON (wrong content type): `invalid_request`", body = ErrorEnvelope),
         (status = 422, description = "The body is JSON but has the wrong fields: `invalid_request`", body = ErrorEnvelope),
         (status = 413, description = "The body is over 8 KiB: `too_large`", body = ErrorEnvelope),
+        (status = 503, description = "The identity service is unavailable: `unavailable`; the session is still live", body = ErrorEnvelope),
     ),
 )]
 async fn logout(State(s): S, headers: HeaderMap, ApiJson(_): ApiJson<EmptyRequest>) -> Response {
-    if let Some(kept) = read_cookie(&headers, SESSION_COOKIE)
+    match read_cookie(&headers, SESSION_COOKIE)
         .and_then(|raw| open_session(&s.config.cookie_key, raw, now_secs()))
-        && let Err(e) = s
-            .zitadel
-            .delete_session(&Session {
-                id: kept.session_id,
-                token: kept.session_token,
-            })
-            .await
     {
-        warn!(error = %e, "ending the Zitadel session failed");
+        Some(SessionState::Identity { session_id, .. }) => {
+            match s.identity.revoke_session(&Pool::Members, &session_id).await {
+                Ok(()) | Err(IdentityError::NotFound(Missing::Session)) => {}
+                Err(e) => return identity_unavailable(&e),
+            }
+        }
+        Some(SessionState::Zitadel { session_id, session_token, .. }) => {
+            let session = Session { id: session_id, token: session_token };
+            if let Err(e) = s.zitadel.delete_session(&session).await {
+                warn!(error = %e, "ending the Zitadel session failed");
+            }
+        }
+        None => {}
     }
     let secure = s.config.secure_cookies;
     reply(

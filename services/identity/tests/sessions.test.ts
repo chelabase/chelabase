@@ -40,6 +40,18 @@ describeDb("sessions", () => {
     expect((await lookup((await signIn("all@x.io", "password-all-1")).session_token)).status).toBe(200);
   });
 
+  // #121: reading a session never moves its expiry, 30 days from creation.
+  it("session_expires_thirty_days_after_creation", async () => {
+    await call(h, "POST", `${base()}/users`, { body: { email: "life@x.io", password: "password-life-1" } });
+    const a = await signIn("life@x.io", "password-life-1");
+    const got = await call(h, "GET", `${base()}/sessions/${a.session_id}`);
+    const { created_at, expires_at } = got.body.session as { created_at: string; expires_at: string };
+    expect(Date.parse(expires_at) - Date.parse(created_at)).toBeGreaterThan(29.99 * 24 * 3600 * 1000);
+    expect(Date.parse(expires_at) - Date.parse(created_at)).toBeLessThanOrEqual(30 * 24 * 3600 * 1000);
+    const again = await call(h, "GET", `${base()}/sessions/${a.session_id}`);
+    expect(again.body.session.expires_at).toBe(expires_at);
+  });
+
   it("get_and_revoke_one", async () => {
     await call(h, "POST", `${base()}/users`, { body: { email: "one@x.io", password: "password-one-1" } });
     const a = await signIn("one@x.io", "password-one-1");

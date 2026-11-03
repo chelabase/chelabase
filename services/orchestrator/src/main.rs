@@ -132,6 +132,7 @@ async fn main() -> anyhow::Result<()> {
         app_refresh_ttl: internal_config.app_refresh_ttl,
         actions_signing_key: internal_config.actions_signing_key.clone(),
         zitadel: internal_config.load_zitadel(),
+        identity: identity_service(),
         app_jobs: Arc::new(NatsPorts { js: js.clone(), client: nats.clone() }),
         policy: ModePolicy::new(mode),
         setup_code: orchestrator::internal::load_setup_code(

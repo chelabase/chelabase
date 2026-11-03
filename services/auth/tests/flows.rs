@@ -13,11 +13,20 @@ use auth::app::{AppState, messages, router};
 use auth::config::Config;
 use auth::guard::RateLimiter;
 use auth::zitadel::Zitadel;
+use chelabase_auth::member_token::{MemberClaims, MemberTokenVerifier};
+use chelabase_identity::Pool;
+use chelabase_identity::mock::FakeIdentity;
+use uuid::Uuid;
 
 pub struct Harness {
     pub internal: support::internal::FakeInternal,
     pub cookie_key: SecretKey,
     pub mock: MockZitadel,
+    pub identity: FakeIdentity,
+    pub clock: auth::session::Clock,
+    /// The member tokens' public key.
+    pub member_public: String,
+    pub _keys: tempfile::TempDir,
     pub base: String,
     pub http: reqwest::Client,
 }
@@ -49,7 +58,37 @@ pub async fn harness_tweaked(
     admin: bool,
     tweak: impl FnOnce(&mut Config),
 ) -> Harness {
+    harness_on_identity(skip, min_ms, mode, admin, tweak, None).await
+}
+
+/// [`harness_tweaked`], talking to the identity service at `identity_base` when given (a stub
+/// of a test's own) instead of its [`FakeIdentity`].
+pub async fn harness_on_identity(
+    skip: bool,
+    min_ms: u64,
+    mode: auth::config::Mode,
+    admin: bool,
+    tweak: impl FnOnce(&mut Config),
+    identity_base: Option<String>,
+) -> Harness {
     let internal = support::internal::FakeInternal::start().await;
+    let identity = FakeIdentity::start().await;
+    identity.with_pool(&Pool::Members);
+    internal.set_signup_tenant(T1);
+    let client = match identity_base {
+        Some(base) => chelabase_identity::Identity::new(&base, chelabase_identity::mock::TOKEN),
+        None => identity.client(),
+    };
+    let clock = auth::session::Clock::default();
+    let keys = tempfile::tempdir().unwrap();
+    let (private, member_public) = chelabase_auth::internal::generate_keypair_pem();
+    let member_config = auth::config::MemberTokenConfig {
+        private_key: keys.path().join("member-jwt.key"),
+        public_key: keys.path().join("member-jwt.pub"),
+        ttl: Duration::from_secs(300),
+    };
+    std::fs::write(&member_config.private_key, &private).unwrap();
+    std::fs::write(&member_config.public_key, &member_public).unwrap();
     let mock = MockZitadel::start().await;
     mock.set_strict_login(true);
     let cookie_key = SecretKey::generate();
@@ -70,6 +109,7 @@ pub async fn harness_tweaked(
         trusted_proxies: auth::guard::TrustedProxies::parse("127.0.0.1,::1").unwrap(),
     };
     tweak(&mut config);
+    let tokens = auth::member_token::MemberTokens::from_config(&member_config, &config.issuer).unwrap();
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
@@ -81,8 +121,9 @@ pub async fn harness_tweaked(
         )),
         used_tickets: Default::default(),
         admin: admin.then(|| Zitadel::new(&mock.base, ADMIN_TOKEN)),
-        member_tokens: None,
-        identity: None,
+        member_tokens: tokens,
+        identity: client,
+        clock: clock.clone(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -98,6 +139,10 @@ pub async fn harness_tweaked(
         internal,
         cookie_key,
         mock,
+        identity,
+        clock,
+        member_public,
+        _keys: keys,
         base: format!("http://{addr}"),
         http: reqwest::Client::new(),
     }
@@ -172,210 +217,36 @@ fn err(code: &str, message: &str) -> Value {
     json!({"error": {"code": code, "message": message}})
 }
 
-fn signin(ar: &str, email: &str, pw: &str) -> Value {
-    json!({"authRequest": ar, "email": email, "password": pw})
+fn signin(email: &str, pw: &str) -> Value {
+    json!({"email": email, "password": pw})
 }
-fn signup(ar: &str, email: &str, pw: &str) -> Value {
-    json!({"authRequest": ar, "email": email, "password": pw, "givenName": "A", "familyName": "B"})
-}
-
-#[tokio::test]
-async fn auth_request_says_whether_to_show_sign_up() {
-    let h = harness().await;
-    let yes = h
-        .post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": h.mock.add_auth_request(true)}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (yes.status, yes.body.clone()),
-        (StatusCode::OK, json!({"signUp": true, "signUpAllowed": true}))
-    );
-    let plain = h
-        .post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": h.mock.add_auth_request(false)}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(plain.body, json!({"signUp": false, "signUpAllowed": true}));
-    let gone = h
-        .post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": "V2_nope"}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (gone.status, gone.body),
-        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
-    );
+fn signup(email: &str, pw: &str) -> Value {
+    json!({"email": email, "password": pw, "givenName": "A", "familyName": "B"})
 }
 
 // R37: a closed instance never offers sign-up, even to a request that asked for it.
+// Until m11, verify-email still finishes a Zitadel step (an identity user's code is refused).
 #[tokio::test]
-async fn auth_request_never_offers_a_closed_sign_up() {
-    let h = harness().await;
-    h.internal.set_signup(false, "closed");
-    let asked = h
-        .post("/auth/v1/auth-request", json!({"authRequest": h.mock.add_auth_request(true)}), None, "1.1.1.1")
-        .await;
-    assert_eq!(asked.body, json!({"signUp": false, "signUpAllowed": false}));
-    // A gate that can't answer is closed too, and doesn't fail the sign-in page.
-    h.internal.set_signup_status(Some(503));
-    let unsure = h
-        .post("/auth/v1/auth-request", json!({"authRequest": h.mock.add_auth_request(true)}), None, "1.1.1.2")
-        .await;
-    assert_eq!((unsure.status, unsure.body), (StatusCode::OK, json!({"signUp": false, "signUpAllowed": false})));
-    // Platform mode: closed without asking.
-    let p = harness_mode(false, 1, auth::config::Mode::Platform).await;
-    let platform = p
-        .post("/auth/v1/auth-request", json!({"authRequest": p.mock.add_auth_request(true)}), None, "1.1.1.1")
-        .await;
-    assert_eq!(platform.body, json!({"signUp": false, "signUpAllowed": false}));
-    assert!(p.internal.bodies("POST /internal/signup/check").is_empty());
-}
-
-#[tokio::test]
-async fn sign_in_finishes_and_sets_the_session_cookie() {
-    let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let ar = h.mock.add_auth_request(false);
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin(&ar, " ADA@example.com ", "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::OK);
-    assert_eq!(a.body["next"], "done");
-    assert!(
-        a.body["redirect"]
-            .as_str()
-            .unwrap()
-            .starts_with("http://studio.chelabase.localhost:8000/callback?code=")
-    );
-    assert!(a.cookie("chelabase_session").is_some());
-    assert!(a.cookies.iter().any(|c| c.starts_with("chelabase_session=")
-        && c.contains("HttpOnly; SameSite=Strict; Path=/auth/v1")));
-}
-
-#[tokio::test]
-async fn unknown_user_wrong_password_and_locked_give_identical_401s() {
-    let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let locked = h.mock.add_user("lee@example.com", "Secret-pass1", true);
-    h.mock.lock(&locked);
-    let mut bodies = Vec::new();
-    for (email, pw) in [
-        ("nobody@example.com", "x"),
-        ("ada@example.com", "wrong"),
-        ("lee@example.com", "Secret-pass1"),
-    ] {
-        let a = h
-            .post(
-                "/auth/v1/sign-in",
-                signin(&h.mock.add_auth_request(false), email, pw),
-                None,
-                "1.1.1.1",
-            )
-            .await;
-        assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{email}");
-        assert!(a.cookies.is_empty(), "{email}");
-        bodies.push(serde_json::to_string(&a.body).unwrap());
-    }
-    assert!(
-        bodies
-            .iter()
-            .all(|b| *b == serde_json::to_string(&err("invalid_credentials", messages::BAD_CREDENTIALS)).unwrap()),
-        "{bodies:?}"
-    );
-}
-
-#[tokio::test]
-async fn sign_in_with_an_unverified_email_asks_for_the_code() {
+async fn verify_email_finishes_a_zitadel_step() {
     let h = harness().await;
     let id = h.mock.add_user("ada@example.com", "Secret-pass1", false);
-    let ar = h.mock.add_auth_request(false);
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin(&ar, "ada@example.com", "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body.clone()),
-        (StatusCode::OK, json!({"next": "verify"}))
-    );
-    assert_eq!(h.mock.emails(), vec![(id, "verify".to_string())]);
-    let login = a.cookie("chelabase_login").unwrap();
-    let done = h
-        .post(
-            "/auth/v1/verify-email",
-            json!({"code": EMAIL_CODE}),
-            Some(&login),
-            "1.1.1.1",
-        )
-        .await;
+    let session = Zitadel::new(&h.mock.base, TOKEN).create_session(&id, "Secret-pass1").await.unwrap();
+    let state = auth::cookie::LoginState {
+        auth_request: h.mock.add_auth_request(false),
+        user_id: Some(id),
+        session_id: Some(session.id),
+        session_token: Some(session.token),
+        step: auth::cookie::Step::Verify,
+        decoy: false,
+        exp: auth::cookie::now_secs() + 60,
+    };
+    let login = format!("chelabase_login={}", auth::cookie::seal_login(&h.cookie_key, &state));
+    let bad = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&login), "1.1.1.1").await;
+    assert_eq!((bad.status, bad.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
+    let done = h.post("/auth/v1/verify-email", json!({"code": EMAIL_CODE}), Some(&login), "1.1.1.1").await;
     assert_eq!(done.body["next"], "done");
-    assert!(
-        done.cookies
-            .iter()
-            .any(|c| c.starts_with("chelabase_login=;") && c.contains("Max-Age=0"))
-    );
-}
-
-#[tokio::test]
-async fn sign_up_then_verify_finishes() {
-    let h = harness().await;
-    let ar = h.mock.add_auth_request(true);
-    let a = h
-        .post(
-            "/auth/v1/sign-up",
-            signup(&ar, "new@example.com", "Secret-pass1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body.clone()),
-        (StatusCode::OK, json!({"next": "verify"}))
-    );
-    let login = a.cookie("chelabase_login").unwrap();
-    let bad = h
-        .post(
-            "/auth/v1/verify-email",
-            json!({"code": "000000"}),
-            Some(&login),
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (bad.status, bad.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("invalid_code", messages::BAD_CODE)
-        )
-    );
-    let done = h
-        .post(
-            "/auth/v1/verify-email",
-            json!({"code": EMAIL_CODE}),
-            Some(&login),
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(done.body["next"], "done");
-    assert!(h.mock.user("new@example.com").unwrap().verified);
+    assert!(done.cookies.iter().any(|c| c.starts_with("chelabase_login=;") && c.contains("Max-Age=0")));
+    assert!(h.mock.user("ada@example.com").unwrap().verified);
 }
 
 // #79: only Zitadel's password-policy refusals on create are `weak_password`; another 400 (a
@@ -383,55 +254,46 @@ async fn sign_up_then_verify_finishes() {
 #[tokio::test]
 async fn sign_up_answers_weak_password_only_for_a_policy_refusal() {
     let h = harness().await;
-    for (key, status, code) in [
-        ("Errors.User.PasswordComplexityPolicy.HasSymbol", StatusCode::BAD_REQUEST, "weak_password"),
-        ("Errors.User.PasswordComplexityPolicy.MinLength", StatusCode::BAD_REQUEST, "weak_password"),
-        ("Errors.Org.NotFound", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-        ("Errors.Test.Uncaptured", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+    for (status_in, key, status, code) in [
+        (400, "weak_password", StatusCode::BAD_REQUEST, "weak_password"),
+        (400, "invalid_email", StatusCode::BAD_REQUEST, "invalid_request"),
+        (404, "pool_not_found", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        (500, "internal", StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
     ] {
-        h.mock.fail("POST /v2/users/new", 400, key, 1);
-        let a = h
-            .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.1")
-            .await;
+        h.identity.fail("POST /internal/v1/pools/members/users", status_in, key, 1);
+        let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
         assert_eq!((a.status, a.body["error"]["code"].as_str()), (status, Some(code)), "{key}: {}", a.body);
     }
-    assert!(h.mock.user("new@example.com").is_none());
+    assert_eq!(h.users_with("new@example.com").await, 0);
 }
 
 /// A name Zitadel would refuse is refused before it is called, and a validation refusal that
 /// still comes back (code 3, no id) is the visitor's input, never a weak password (#79).
+/// A bad name is refused before identity is called, and a refusal that still comes back is the
+/// visitor's input, never a weak password (#79).
 #[tokio::test]
 async fn sign_up_never_blames_the_password_for_a_bad_name() {
     let h = harness().await;
     for given in ["   ", &"x".repeat(201)] {
-        let mut body = signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1");
+        let mut body = signup("new@example.com", "Secret-pass1");
         body["givenName"] = json!(given);
         let a = h.post("/auth/v1/sign-up", body, None, "1.1.1.1").await;
         assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "{given:?}: {}", a.body);
     }
-    assert!(h.mock.calls().iter().all(|c| c != "POST /v2/users/new"), "a bad name never reaches Zitadel");
-    h.mock.answer_raw(
-        "POST /v2/users/new",
-        400,
-        r#"{"code":3,"message":"invalid AddHumanUserRequest.Profile: embedded message failed validation","details":[]}"#,
-        1,
-    );
-    let a = h
-        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "2.2.2.2")
-        .await;
+    assert!(h.identity.calls().iter().all(|c| c != "POST /internal/v1/pools/members/users"), "a bad name never reaches identity");
+    h.identity.fail("POST /internal/v1/pools/members/users", 400, "invalid_request", 1);
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "2.2.2.2").await;
     assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("invalid_request")), "{}", a.body);
 }
 
 #[tokio::test]
 async fn a_taken_email_looks_the_same_and_its_code_never_works() {
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     let fresh = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "new@example.com",
+            signup("new@example.com",
                 "Secret-pass1",
             ),
             None,
@@ -441,9 +303,7 @@ async fn a_taken_email_looks_the_same_and_its_code_never_works() {
     let taken = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "ada@example.com",
+            signup("ada@example.com",
                 "Secret-pass1",
             ),
             None,
@@ -479,7 +339,7 @@ async fn a_weak_password_at_sign_up_says_so() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "short"),
+            signup("new@example.com", "short"),
             None,
             "1.1.1.1",
         )
@@ -499,18 +359,17 @@ async fn the_dev_flag_signs_up_already_verified() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "dev@example.com",
+            signup("dev@example.com",
                 "Secret-pass1",
             ),
             None,
             "1.1.1.1",
         )
         .await;
-    assert_eq!(a.body["next"], "done");
-    assert!(h.mock.user("dev@example.com").unwrap().verified);
-    assert!(h.mock.emails().is_empty());
+    assert_eq!(a.body["next"], "pending");
+    let user = h.identity.client().search_users(&Pool::Members, "dev@example.com", 10, 0).await.unwrap().users.remove(0);
+    assert!(user.email_verified);
+    assert!(h.identity.codes_sent().is_empty());
 }
 
 #[tokio::test]
@@ -528,7 +387,7 @@ async fn sign_in_answers_take_the_minimum_time() {
     let start = Instant::now();
     h.post(
         "/auth/v1/sign-in",
-        signin(&h.mock.add_auth_request(false), "nobody@example.com", "x"),
+        signin("nobody@example.com", "x"),
         None,
         "1.1.1.1",
     )
@@ -543,7 +402,7 @@ async fn the_sixth_sign_in_per_email_per_minute_is_refused_even_from_new_ips() {
         let a = h
             .post(
                 "/auth/v1/sign-in",
-                signin(&h.mock.add_auth_request(false), "ada@example.com", "x"),
+                signin("ada@example.com", "x"),
                 None,
                 &format!("1.1.1.{i}"),
             )
@@ -553,7 +412,7 @@ async fn the_sixth_sign_in_per_email_per_minute_is_refused_even_from_new_ips() {
     let a = h
         .post(
             "/auth/v1/sign-in",
-            signin(&h.mock.add_auth_request(false), "ada@example.com", "x"),
+            signin("ada@example.com", "x"),
             None,
             "7.7.7.7",
         )
@@ -574,9 +433,7 @@ async fn verify_email_is_rate_limited() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "new@example.com",
+            signup("new@example.com",
                 "Secret-pass1",
             ),
             None,
@@ -602,39 +459,6 @@ async fn verify_email_is_rate_limited() {
         )
         .await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
-}
-
-#[tokio::test]
-async fn zitadel_down_is_503_and_an_expired_sign_in_is_410() {
-    let h = harness().await;
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin("V2_nope", "ada@example.com", "x"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
-    );
-    h.mock.set_down(true);
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin("V2_1", "ada@example.com", "x"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            err("unavailable", messages::UNAVAILABLE)
-        )
-    );
 }
 
 #[tokio::test]
@@ -732,10 +556,10 @@ async fn platform_sign_up_and_confirm_refuse_a_password_over_72_bytes_before_zit
     let max = format!("Aa1!{}", "é".repeat(34));
     assert_eq!((long.chars().count(), long.len(), max.len()), (39, 74, 72));
     let a = h
-        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", &long), None, "1.1.1.1")
+        .post("/auth/v1/sign-up", signup("new@example.com", &long), None, "1.1.1.1")
         .await;
     assert_eq!((a.status, a.body), (StatusCode::BAD_REQUEST, err("weak_password", messages::WEAK_PASSWORD)));
-    assert!(!h.mock.calls().iter().any(|c| c == "POST /v2/users/new"), "{:?}", h.mock.calls());
+    assert!(!h.identity.calls().iter().any(|c| *c == "POST /internal/v1/pools/members/users"), "{:?}", h.identity.calls());
     let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
     let a = h
         .post("/auth/v1/password-reset/confirm", json!({"userId": id, "code": RESET_CODE, "password": long}), None, "1.1.1.1")
@@ -745,7 +569,7 @@ async fn platform_sign_up_and_confirm_refuse_a_password_over_72_bytes_before_zit
     assert_eq!(h.mock.user("ada@example.com").unwrap().password, "Old-pass-1");
     // 72 bytes is fine on both.
     let a = h
-        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "max@example.com", &max), None, "1.1.1.1")
+        .post("/auth/v1/sign-up", signup("max@example.com", &max), None, "1.1.1.1")
         .await;
     assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
     let a = h
@@ -780,37 +604,14 @@ async fn confirm_with_a_weak_password_says_so() {
 #[tokio::test]
 async fn logout_ends_the_session_and_clears_both_cookies() {
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let a = h
-        .post(
-            "/auth/v1/sign-in",
-            signin(
-                &h.mock.add_auth_request(false),
-                "ada@example.com",
-                "Secret-pass1",
-            ),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(h.mock.session_count(), 1);
-    let out = h
-        .post(
-            "/auth/v1/logout",
-            json!({}),
-            Some(&a.cookie("chelabase_session").unwrap()),
-            "1.1.1.1",
-        )
-        .await;
+    h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    assert_eq!(h.sessions(), 1);
+    let out = h.post("/auth/v1/logout", json!({}), Some(&cookie), "1.1.1.1").await;
     assert_eq!((out.status, out.body), (StatusCode::OK, json!({})));
-    assert_eq!(h.mock.session_count(), 0);
+    assert_eq!(h.sessions(), 0);
     for name in ["chelabase_login=;", "chelabase_session=;"] {
-        assert!(
-            out.cookies
-                .iter()
-                .any(|c| c.starts_with(name) && c.contains("Max-Age=0")),
-            "{name}"
-        );
+        assert!(out.cookies.iter().any(|c| c.starts_with(name) && c.contains("Max-Age=0")), "{name}");
     }
     let again = h.post("/auth/v1/logout", json!({}), None, "1.1.1.1").await;
     assert_eq!(again.status, StatusCode::OK);
@@ -819,73 +620,21 @@ async fn logout_ends_the_session_and_clears_both_cookies() {
 // --- Security review fixes -------------------------------------------------------------
 
 // Live finding: Zitadel's session API can't see a user for a moment after CreateUser.
-#[tokio::test]
-async fn sign_up_waits_for_zitadel_to_see_the_new_user() {
-    let h = harness().await;
-    h.mock.set_new_user_lag(2);
-    let a = h
-        .post(
-            "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "new@example.com",
-                "Secret-pass1",
-            ),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (StatusCode::OK, json!({"next": "verify"}))
-    );
-}
-
 // C1: ids go into Zitadel URL paths, so only Zitadel-shaped ids are accepted.
 #[tokio::test]
 async fn ids_that_are_not_zitadel_ids_never_reach_zitadel() {
     let h = harness().await;
     let id = h.mock.add_user("ada@example.com", "Old-pass-1", true);
-    let probe = h
-        .post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": format!("../../users/{id}")}),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (probe.status, probe.body),
-        (StatusCode::GONE, err("sign_in_expired", messages::GONE))
-    );
-    let sign_in = h
-        .post(
-            "/auth/v1/sign-in",
-            signin("V2_1/../../users", "ada@example.com", "Old-pass-1"),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(sign_in.status, StatusCode::GONE);
     let confirm = h.post("/auth/v1/password-reset/confirm", json!({"userId": format!("{id}/lock?x="), "code": RESET_CODE, "password": "New-pass-12"}), None, "1.1.1.1").await;
-    assert_eq!(
-        (confirm.status, confirm.body),
-        (
-            StatusCode::BAD_REQUEST,
-            err("invalid_code", messages::BAD_CODE)
-        )
-    );
-    assert_eq!(
-        h.mock.user("ada@example.com").unwrap().password,
-        "Old-pass-1"
-    );
+    assert_eq!((confirm.status, confirm.body), (StatusCode::BAD_REQUEST, err("invalid_code", messages::BAD_CODE)));
+    assert_eq!(h.mock.user("ada@example.com").unwrap().password, "Old-pass-1");
 }
 
 // I1: a cookieless resend must not share a rate-limit bucket with decoy cookies.
 #[tokio::test]
 async fn resend_limits_do_not_reveal_a_decoy() {
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     for _ in 0..5 {
         h.post("/auth/v1/resend-code", json!({}), None, "4.4.4.4")
             .await;
@@ -893,9 +642,7 @@ async fn resend_limits_do_not_reveal_a_decoy() {
     let taken = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "ada@example.com",
+            signup("ada@example.com",
                 "Secret-pass1",
             ),
             None,
@@ -917,13 +664,11 @@ async fn resend_limits_do_not_reveal_a_decoy() {
 #[tokio::test]
 async fn code_endpoints_take_the_minimum_time() {
     let h = harness_with(false, 300).await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     let taken = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "ada@example.com",
+            signup("ada@example.com",
                 "Secret-pass1",
             ),
             None,
@@ -957,9 +702,7 @@ async fn an_ip_over_its_limit_does_not_use_up_an_email_bucket() {
     for i in 0..10 {
         h.post(
             "/auth/v1/sign-in",
-            signin(
-                &h.mock.add_auth_request(false),
-                &format!("x{i}@example.com"),
+            signin(&format!("x{i}@example.com"),
                 "x",
             ),
             None,
@@ -971,7 +714,7 @@ async fn an_ip_over_its_limit_does_not_use_up_an_email_bucket() {
         let a = h
             .post(
                 "/auth/v1/sign-in",
-                signin(&h.mock.add_auth_request(false), "z@example.com", "x"),
+                signin("z@example.com", "x"),
                 None,
                 "6.6.6.6",
             )
@@ -981,7 +724,7 @@ async fn an_ip_over_its_limit_does_not_use_up_an_email_bucket() {
     let a = h
         .post(
             "/auth/v1/sign-in",
-            signin(&h.mock.add_auth_request(false), "z@example.com", "x"),
+            signin("z@example.com", "x"),
             None,
             "6.6.6.7",
         )
@@ -997,7 +740,7 @@ async fn oversized_bodies_are_refused() {
     let a = h
         .post(
             "/auth/v1/sign-in",
-            signin("V2_1", &email, "x"),
+            signin(&email, "x"),
             None,
             "1.1.1.1",
         )
@@ -1010,14 +753,11 @@ async fn oversized_bodies_are_refused() {
 #[tokio::test]
 async fn sign_up_never_duplicates_an_existing_email() {
     let h = harness().await;
-    h.mock.allow_duplicate_emails();
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "Ada@Example.com",
+            signup("Ada@Example.com",
                 "Secret-pass1",
             ),
             None,
@@ -1028,35 +768,10 @@ async fn sign_up_never_duplicates_an_existing_email() {
         (a.status, a.body),
         (StatusCode::OK, json!({"next": "verify"}))
     );
-    assert_eq!(h.mock.users_with_email("ada@example.com"), 1);
+    assert_eq!(h.users_with("ada@example.com").await, 1);
 }
 
 // N2: two accounts already sharing an email (made outside these checks) still mean "taken".
-#[tokio::test]
-async fn sign_up_never_adds_to_an_ambiguous_email() {
-    let h = harness().await;
-    h.mock.allow_duplicate_emails();
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    h.mock.add_user("ADA@example.com", "Secret-pass1", true);
-    let a = h
-        .post(
-            "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "ada@example.com",
-                "Secret-pass1",
-            ),
-            None,
-            "1.1.1.1",
-        )
-        .await;
-    assert_eq!(
-        (a.status, a.body),
-        (StatusCode::OK, json!({"next": "verify"}))
-    );
-    assert_eq!(h.mock.users_with_email("ada@example.com"), 2);
-}
-
 // I5: the weak-password answer doesn't depend on whether the user id exists.
 #[tokio::test]
 async fn a_weak_password_is_refused_before_the_user_is_looked_up() {
@@ -1079,9 +794,7 @@ async fn a_weak_password_is_refused_before_the_user_is_looked_up() {
     let b = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "new@example.com",
+            signup("new@example.com",
                 "NoSymbol123",
             ),
             None,
@@ -1126,13 +839,11 @@ async fn confirm_is_limited_per_user_across_ips() {
 #[tokio::test]
 async fn a_taken_email_without_verification_says_it_exists() {
     let h = harness_with(true, 1).await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(
-                &h.mock.add_auth_request(true),
-                "Ada@Example.com",
+            signup("Ada@Example.com",
                 "Secret-pass1",
             ),
             None,
@@ -1147,11 +858,7 @@ async fn a_taken_email_without_verification_says_it_exists() {
         )
     );
     assert!(a.cookies.is_empty());
-    assert_eq!(
-        h.mock.session_count(),
-        0,
-        "no sign-in from the sign-up form"
-    );
+    assert_eq!(h.sessions(), 0, "no sign-in from the sign-up form");
 }
 
 // --- Minor findings -----------------------------------------------------------------
@@ -1174,42 +881,17 @@ async fn verify_without_a_step_cookie_is_gone() {
     );
 }
 
-#[tokio::test]
-async fn auth_request_is_rate_limited_per_ip() {
-    let h = harness().await;
-    for _ in 0..60 {
-        h.post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": "V2_1"}),
-            None,
-            "2.3.4.5",
-        )
-        .await;
-    }
-    let a = h
-        .post(
-            "/auth/v1/auth-request",
-            json!({"authRequest": "V2_1"}),
-            None,
-            "2.3.4.5",
-        )
-        .await;
-    assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
-}
-
 // Successful sign-ins don't use up the per-email limit, so nobody can lock a known account
 // out by signing in as it... they'd need its password.
 #[tokio::test]
 async fn only_failed_sign_ins_count_against_an_email() {
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.member("ada@example.com", &[T1]);
     for i in 0..7 {
         let a = h
             .post(
                 "/auth/v1/sign-in",
-                signin(
-                    &h.mock.add_auth_request(false),
-                    "ada@example.com",
+                signin("ada@example.com",
                     "Secret-pass1",
                 ),
                 None,
@@ -1227,9 +909,7 @@ async fn sign_up_answers_take_the_longer_minimum() {
     let start = Instant::now();
     h.post(
         "/auth/v1/sign-up",
-        signup(
-            &h.mock.add_auth_request(true),
-            "new@example.com",
+        signup("new@example.com",
             "Secret-pass1",
         ),
         None,
@@ -1243,12 +923,12 @@ async fn sign_up_answers_take_the_longer_minimum() {
 #[tokio::test]
 async fn a_decoy_sign_up_emails_the_owner_a_reset_link() {
     let h = harness().await;
+    // The reset stays on Zitadel until m11.
     let id = h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.identity.with_user(&Pool::Members, "ada@example.com", "Secret-pass1");
     h.post(
         "/auth/v1/sign-up",
-        signup(
-            &h.mock.add_auth_request(true),
-            "ada@example.com",
+        signup("ada@example.com",
             "Secret-pass1",
         ),
         None,
@@ -1273,14 +953,14 @@ async fn sign_up_refused_when_closed() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"),
+            signup("new@example.com", "Secret-pass1"),
             None,
             "1.1.1.1",
         )
         .await;
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "sign_up_closed");
-    assert_eq!(h.mock.users_with_email("new@example.com"), 0);
+    assert_eq!(h.users_with("new@example.com").await, 0);
     let asked = h.internal.bodies(SIGN_UP_CALL);
     assert_eq!(asked, vec![json!({"org": "o1"})]);
 }
@@ -1292,13 +972,13 @@ async fn sign_up_allowed_when_open() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"),
+            signup("new@example.com", "Secret-pass1"),
             None,
             "1.1.1.1",
         )
         .await;
     assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
-    assert_eq!(h.mock.users_with_email("new@example.com"), 1);
+    assert_eq!(h.users_with("new@example.com").await, 1);
 }
 
 #[tokio::test]
@@ -1308,13 +988,13 @@ async fn first_member_may_sign_up() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "first@example.com", "Secret-pass1"),
+            signup("first@example.com", "Secret-pass1"),
             None,
             "1.1.1.1",
         )
         .await;
     assert_eq!(a.status, StatusCode::OK);
-    assert_eq!(h.mock.users_with_email("first@example.com"), 1);
+    assert_eq!(h.users_with("first@example.com").await, 1);
 }
 
 #[tokio::test]
@@ -1324,13 +1004,13 @@ async fn sign_up_fails_closed_when_the_gate_is_unreachable() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"),
+            signup("new@example.com", "Secret-pass1"),
             None,
             "1.1.1.1",
         )
         .await;
     assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(h.mock.users_with_email("new@example.com"), 0);
+    assert_eq!(h.users_with("new@example.com").await, 0);
 }
 
 #[tokio::test]
@@ -1339,14 +1019,14 @@ async fn platform_sign_up_refused() {
     let a = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"),
+            signup("new@example.com", "Secret-pass1"),
             None,
             "1.1.1.1",
         )
         .await;
     assert_eq!(a.status, StatusCode::FORBIDDEN);
     assert_eq!(a.body["error"]["code"], "not_available_in_platform_mode");
-    assert_eq!(h.mock.users_with_email("new@example.com"), 0);
+    assert_eq!(h.users_with("new@example.com").await, 0);
     assert!(h.internal.bodies(SIGN_UP_CALL).is_empty());
 }
 
@@ -2286,22 +1966,22 @@ async fn only_failed_codes_count_against_an_invitee() {
 #[tokio::test]
 async fn the_gate_refuses_what_it_does_not_clearly_allow() {
     let h = harness().await;
-    let body = |h: &Harness| signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1");
+    let body = || signup("new@example.com", "Secret-pass1");
     // An odd reason with allowed:true is still allowed.
     h.internal.set_signup(true, "something_new");
     assert_eq!(
-        h.post("/auth/v1/sign-up", body(&h), None, "1.1.1.1").await.status,
+        h.post("/auth/v1/sign-up", body(), None, "1.1.1.1").await.status,
         StatusCode::OK
     );
     // The orchestrator saying "platform" is the platform error.
     h.internal.set_signup(false, "platform");
-    let a = h.post("/auth/v1/sign-up", body(&h), None, "1.1.1.2").await;
+    let a = h.post("/auth/v1/sign-up", body(), None, "1.1.1.2").await;
     assert_eq!(a.body["error"]["code"], "not_available_in_platform_mode");
     // A 4xx from the gate (a wrong token) is unavailability, not an open door.
     h.internal.set_signup_status(Some(401));
-    let b = h.post("/auth/v1/sign-up", body(&h), None, "1.1.1.3").await;
+    let b = h.post("/auth/v1/sign-up", body(), None, "1.1.1.3").await;
     assert_eq!(b.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(h.mock.users_with_email("new@example.com"), 1);
+    assert_eq!(h.users_with("new@example.com").await, 1);
 }
 
 #[tokio::test]
@@ -2388,7 +2068,7 @@ async fn tickets_and_cookies_are_not_interchangeable() {
     let up = h
         .post(
             "/auth/v1/sign-up",
-            signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"),
+            signup("new@example.com", "Secret-pass1"),
             None,
             "1.1.1.2",
         )
@@ -2586,8 +2266,8 @@ async fn describe_invite_is_rate_limited_and_fails_closed() {
 const SETUP_CODE: &str = "ABCD-EFGH-JKMN-PQRS-TUVW";
 const CLAIMED_CALL: &str = "POST /internal/signup/claimed";
 
-fn signup_with_code(ar: &str, email: &str, code: Option<&str>) -> Value {
-    let mut body = signup(ar, email, "Secret-pass1");
+fn signup_with_code(email: &str, code: Option<&str>) -> Value {
+    let mut body = signup(email, "Secret-pass1");
     if let Some(code) = code {
         body["setupCode"] = json!(code);
     }
@@ -2601,7 +2281,7 @@ async fn sign_up_with_bad_code_creates_no_user() {
     h.internal.set_setup_code(SETUP_CODE);
     for (i, code) in [None, Some(""), Some("WRONG-CODE")].into_iter().enumerate() {
         let a = h
-            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", code), None, &format!("1.1.1.{i}"))
+            .post("/auth/v1/sign-up", signup_with_code("first@example.com", code), None, &format!("1.1.1.{i}"))
             .await;
         assert_eq!(
             (a.status, a.body),
@@ -2609,8 +2289,8 @@ async fn sign_up_with_bad_code_creates_no_user() {
             "{code:?}"
         );
     }
-    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
-    assert!(h.mock.calls().iter().all(|c| !c.contains("/v2/users/new")), "no create call");
+    assert_eq!(h.users_with("first@example.com").await, 0);
+    assert!(h.identity.calls().iter().all(|c| c != "POST /internal/v1/pools/members/users"), "no create call");
     assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
     // The code goes in the gate's body; a blank one is not sent at all.
     let asked = h.internal.bodies(SIGN_UP_CALL);
@@ -2626,15 +2306,11 @@ async fn sign_up_with_bad_code_creates_no_user() {
 async fn sign_up_with_the_code_binds_the_claim() {
     let h = harness().await;
     h.internal.set_setup_code(SETUP_CODE);
-    let page = h
-        .post("/auth/v1/auth-request", json!({"authRequest": h.mock.add_auth_request(true)}), None, "1.1.1.1")
-        .await;
-    assert_eq!(page.body, json!({"signUp": true, "signUpAllowed": true}));
     let a = h
-        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .post("/auth/v1/sign-up", signup_with_code("first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
         .await;
     assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
-    let user = h.mock.user("first@example.com").expect("created");
+    let user = h.identity.client().search_users(&Pool::Members, "first@example.com", 10, 0).await.unwrap().users.remove(0);
     assert_eq!(
         h.internal.bodies(CLAIMED_CALL),
         vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
@@ -2648,52 +2324,15 @@ async fn an_unbound_claim_keeps_the_account() {
     h.internal.set_setup_code(SETUP_CODE);
     h.internal.set_claimed_unbound();
     let a = h
-        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "second@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        .post("/auth/v1/sign-up", signup_with_code("second@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
         .await;
     assert_eq!(a.status, StatusCode::OK);
-    assert_eq!(h.mock.users_with_email("second@example.com"), 1);
+    assert_eq!(h.users_with("second@example.com").await, 1);
 }
 
 // AC 10: `claimed` fails after the account was created: the account is deleted, and a retry
 // with the same email succeeds.
-#[tokio::test]
-async fn claimed_failure_deletes_user() {
-    let h = harness_with(true, 1).await;
-    h.internal.set_setup_code(SETUP_CODE);
-    for (status, want, code) in [
-        (500, StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
-        (403, StatusCode::FORBIDDEN, "setup_code_invalid"),
-    ] {
-        h.internal.set_claimed_status(Some(status));
-        let a = h
-            .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, &format!("2.2.2.{status}"))
-            .await;
-        assert_eq!((a.status, a.body["error"]["code"].as_str()), (want, Some(code)), "{status}");
-        assert_eq!(h.mock.users_with_email("first@example.com"), 0, "deleted after a {status}");
-    }
-    h.internal.set_claimed_status(None);
-    let ar = h.mock.add_auth_request(true);
-    let a = h
-        .post("/auth/v1/sign-up", signup_with_code(&ar, "first@example.com", Some(SETUP_CODE)), None, "2.2.2.9")
-        .await;
-    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
-    assert_eq!(h.mock.users_with_email("first@example.com"), 1);
-    assert_eq!(h.internal.bodies(CLAIMED_CALL).len(), 3);
-}
-
 // Without the admin client a failed claim couldn't be undone: no setup-code sign-up at all.
-#[tokio::test]
-async fn a_setup_sign_up_needs_the_admin_client() {
-    let h = harness_full(false, 1, auth::config::Mode::SelfHosted, false).await;
-    h.internal.set_setup_code(SETUP_CODE);
-    let a = h
-        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "first@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
-        .await;
-    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(h.mock.users_with_email("first@example.com"), 0);
-    assert!(h.internal.bodies(CLAIMED_CALL).is_empty());
-}
-
 // The register page's question: `setupRequired` while the instance waits for its code.
 #[tokio::test]
 async fn instance_says_whether_setup_is_required() {
@@ -2731,8 +2370,7 @@ async fn junk_setup_sign_ups_never_lock_out_the_code() {
     let mut set = tokio::task::JoinSet::new();
     for i in 0..300 {
         let (http, base) = (h.http.clone(), h.base.clone());
-        let ar = if i % 2 == 0 { "junk".to_string() } else { h.mock.add_auth_request(true) };
-        let body = signup_with_code(&ar, &format!("junk{i}@example.com"), Some("X"));
+        let body = signup_with_code(&format!("junk{i}@example.com"), Some("X"));
         set.spawn(async move {
             http.post(format!("{base}/auth/v1/sign-up"))
                 .json(&body)
@@ -2746,17 +2384,15 @@ async fn junk_setup_sign_ups_never_lock_out_the_code() {
     let statuses = set.join_all().await;
     assert!(statuses.iter().all(|s| *s != StatusCode::TOO_MANY_REQUESTS), "{statuses:?}");
     let a = h
-        .post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "owner@example.com", Some(SETUP_CODE)), None, "7.7.7.7")
+        .post("/auth/v1/sign-up", signup_with_code("owner@example.com", Some(SETUP_CODE)), None, "7.7.7.7")
         .await;
     assert_eq!(a.status, StatusCode::OK, "the operator's right-code sign-up: {}", a.body);
     // The per-address limit still holds for code guesses.
     for i in 0..20 {
-        let ar = h.mock.add_auth_request(true);
-        let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, &format!("g{i}@example.com"), Some("X")), None, "8.8.8.8").await;
+        let a = h.post("/auth/v1/sign-up", signup_with_code(&format!("g{i}@example.com"), Some("X")), None, "8.8.8.8").await;
         assert_eq!(a.status, StatusCode::FORBIDDEN, "{i}");
     }
-    let ar = h.mock.add_auth_request(true);
-    let a = h.post("/auth/v1/sign-up", signup_with_code(&ar, "g20@example.com", Some("X")), None, "8.8.8.8").await;
+    let a = h.post("/auth/v1/sign-up", signup_with_code("g20@example.com", Some("X")), None, "8.8.8.8").await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS);
 }
 
@@ -2792,20 +2428,20 @@ async fn log_and_error_scrub() {
     let mut bodies = Vec::new();
     for (i, code) in [wrong, SETUP_CODE].into_iter().enumerate() {
         bodies.push(
-            h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), &format!("u{i}@example.com"), Some(code)), None, "1.1.1.1")
+            h.post("/auth/v1/sign-up", signup_with_code(&format!("u{i}@example.com"), Some(code)), None, "1.1.1.1")
                 .await
                 .body,
         );
     }
     h.internal.set_claimed_status(Some(403));
     bodies.push(
-        h.post("/auth/v1/sign-up", signup_with_code(&h.mock.add_auth_request(true), "u9@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
+        h.post("/auth/v1/sign-up", signup_with_code("u9@example.com", Some(SETUP_CODE)), None, "1.1.1.1")
             .await
             .body,
     );
     bodies.push(h.get("/auth/v1/instance", "1.1.1.1").await.body);
     let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    assert!(logs.contains("binding the fresh-install claim failed"), "{logs}");
+    assert!(logs.contains("enrolling the new account failed"), "{logs}");
     for secret in [SETUP_CODE, wrong, support::internal::CLAIM_NONCE, "ABCDEFGHJKMNPQRSTUVW"] {
         assert!(!logs.to_lowercase().contains(&secret.to_lowercase()), "{secret} in the logs");
         for body in &bodies {
@@ -2835,7 +2471,7 @@ fn org_file(path: &std::path::Path) -> chelabase_types::file_value::FileValue {
 // 503 `unavailable`, and the health check reports not-ready. Once the file appears the next
 // request succeeds, without a restart.
 #[tokio::test]
-async fn sign_in_503_until_org_file() {
+async fn sign_up_503_until_org_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("org-id");
     let p = path.clone();
@@ -2843,7 +2479,6 @@ async fn sign_in_503_until_org_file() {
         c.org_id = org_file(&p)
     })
     .await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
     h.internal.set_signup(true, "open");
     let unavailable = || err("unavailable", messages::UNAVAILABLE);
     for round in ["absent", "empty"] {
@@ -2851,27 +2486,20 @@ async fn sign_in_503_until_org_file() {
             write_id(&path, "\n");
         }
         assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
-        let ar = h.mock.add_auth_request(true);
-        let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
-        assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
-        assert!(a.cookies.is_empty(), "{round}: no session without the org");
-        let a = h.post("/auth/v1/sign-up", signup(&ar, "new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
+        let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
         assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
         let a = h.get("/auth/v1/instance", "1.1.1.3").await;
         assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{round}");
         let a = h.post("/auth/v1/password-reset", json!({"email": "ada@example.com"}), None, "1.1.1.4").await;
         assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, unavailable()), "{round}");
     }
-    assert_eq!(h.mock.users_with_email("new@example.com"), 0, "no account was made");
+    assert_eq!(h.users_with("new@example.com").await, 0, "no account was made");
     assert!(h.internal.bodies(SIGN_UP_CALL).is_empty(), "the gate was never asked");
 
     write_id(&path, "o1\n");
     assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::OK);
-    let ar = h.mock.add_auth_request(false);
-    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
-    assert_eq!((a.status, a.body["next"].clone()), (StatusCode::OK, json!("done")));
     let a = h
-        .post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.2")
+        .post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2")
         .await;
     assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "verify"})));
     assert_eq!(h.internal.bodies(SIGN_UP_CALL), vec![json!({"org": "o1"})]);
@@ -2889,9 +2517,7 @@ async fn a_refused_org_file_is_503() {
         c.org_id = org_file(&link)
     })
     .await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let ar = h.mock.add_auth_request(false);
-    let a = h.post("/auth/v1/sign-in", signin(&ar, "ada@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
     assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(h.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
 }
@@ -2918,10 +2544,6 @@ async fn studio_config_shape() {
     assert_eq!(
         a.body,
         json!({
-            "issuer": h.mock.base,
-            "clientId": "c-studio",
-            "projectId": "p1",
-            "orgId": "o1",
             "apiUrl": "http://api.chelabase.localhost:8000",
             "studioHost": "studio.chelabase.localhost:8000",
         })
@@ -2953,7 +2575,7 @@ async fn studio_config_shape() {
     assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::SERVICE_UNAVAILABLE);
     write_id(&path, "c-late\n");
     let a = late.get("/auth/v1/studio-config", "1.1.1.1").await;
-    assert_eq!((a.status, a.body["clientId"].clone()), (StatusCode::OK, json!("c-late")));
+    assert_eq!((a.status, a.body["apiUrl"].clone()), (StatusCode::OK, json!("http://api.chelabase.localhost:8000")));
     assert_eq!(late.get("/health", "1.1.1.1").await.status, StatusCode::OK);
 }
 
@@ -3097,25 +2719,56 @@ async fn accept_invite_unconfigured_503s_do_not_count() {
 
 // ---- #74: the sign-in email limit under concurrency and hang-ups ------------------------------
 
-/// How many password checks (`POST /v2/sessions`, not its `/search`) reached Zitadel.
-fn password_checks(h: &Harness) -> usize {
-    h.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count()
+/// An identity service whose every password check is refused, slowly: after `delay`, or
+/// never without one (the check is still running when the client hangs up).
+struct PasswordStub {
+    base: String,
+    checks: Arc<std::sync::atomic::AtomicUsize>,
+    started: Arc<tokio::sync::Notify>,
 }
 
-/// Sends a sign-in from `ip` and hangs up once Zitadel holds its password check (`hold`), then
-/// lets the check go on.
-async fn hang_up_sign_in(h: &Harness, hold: &mut Hold, body: Value, ip: &str) {
+impl PasswordStub {
+    async fn start(delay: Option<Duration>) -> Self {
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (c, n) = (checks.clone(), started.clone());
+        let app = axum::Router::new().route(
+            "/internal/v1/pools/members/sessions",
+            axum::routing::post(move || {
+                let (c, n) = (c.clone(), n.clone());
+                async move {
+                    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    n.notify_one();
+                    match delay {
+                        Some(delay) => tokio::time::sleep(delay).await,
+                        None => std::future::pending().await,
+                    }
+                    (axum::http::StatusCode::UNAUTHORIZED, axum::Json(json!({"error": "bad_credentials", "message": "no"})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self { base: format!("http://{addr}"), checks, started }
+    }
+
+    fn checks(&self) -> usize {
+        self.checks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Sends a sign-in from `ip` and hangs up once identity is checking the password.
+async fn hang_up_sign_in(h: &Harness, stub: &PasswordStub, body: Value, ip: &str) {
     let send = reqwest::Client::new()
         .post(format!("{}/auth/v1/sign-in", h.base))
         .json(&body)
         .header("x-forwarded-for", format!("9.9.9.9, {ip}"))
         .send();
     tokio::select! {
-        r = send => panic!("{ip}: answered before the password check reached Zitadel: {r:?}"),
-        () = hold.started() => {}
+        r = send => panic!("{ip}: answered before the password check reached identity: {r:?}"),
+        () = stub.started.notified() => {}
     }
-    // The request was dropped with the select: the client has hung up mid-check.
-    hold.release();
 }
 
 /// Sends `n` wrong-password sign-ins for ada one at a time, each from its own address, and
@@ -3123,7 +2776,7 @@ async fn hang_up_sign_in(h: &Harness, hold: &mut Hold, body: Value, ip: &str) {
 async fn wrong_sign_ins(h: &Harness, n: usize, tag: &str) -> Vec<StatusCode> {
     let mut out = Vec::new();
     for i in 0..n {
-        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+        let body = signin("ada@example.com", "Wrong-pass1");
         out.push(h.post("/auth/v1/sign-in", body, None, &format!("6.{tag}.{i}.1")).await.status);
     }
     out
@@ -3137,17 +2790,17 @@ async fn assert_budget_unspent(h: &Harness, tag: &str) {
 }
 
 // AC 1: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
+// AC 1: 30 wrong passwords at once from 30 addresses get at most 5 password checks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 64)]
 async fn sign_in_email_limit_holds_under_concurrency() {
-    let h = Arc::new(harness().await);
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
     // A slow password check, so every request is in flight before the first answer.
-    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(300)));
+    let stub = PasswordStub::start(Some(Duration::from_millis(300))).await;
+    let h = Arc::new(harness_on_identity(false, 1, auth::config::Mode::SelfHosted, true, |_| {}, Some(stub.base.clone())).await);
     let mut tasks = Vec::new();
     for i in 0..30 {
         let h = h.clone();
         tasks.push(tokio::spawn(async move {
-            let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
+            let body = signin("ada@example.com", "Wrong-pass1");
             h.post("/auth/v1/sign-in", body, None, &format!("1.2.{i}.1")).await.status
         }));
     }
@@ -3159,44 +2812,38 @@ async fn sign_in_email_limit_holds_under_concurrency() {
             other => panic!("unexpected {other}"),
         }
     }
-    h.mock.clear_on_request();
-    let checks = password_checks(&h);
-    assert!(checks <= 5, "{checks} password checks reached Zitadel ({refused} got 401, {limited} got 429)");
+    let checks = stub.checks();
+    assert!(checks <= 5, "{checks} password checks reached identity ({refused} got 401, {limited} got 429)");
     assert_eq!((refused, limited), (5, 25));
 }
 
 // AC 3: a client that hangs up while Zitadel checks the password still spends the attempt.
+// AC 3: a client that hangs up while identity checks the password still spends the attempt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn sign_in_cancelled_password_checks_still_count() {
-    let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    // Zitadel holds each password check until the client has hung up.
-    let mut hold = h.mock.hold("POST /v2/sessions");
+    // Identity holds each password check, so each client hangs up in the middle of it.
+    let stub = PasswordStub::start(None).await;
+    let h = harness_on_identity(false, 1, auth::config::Mode::SelfHosted, true, |_| {}, Some(stub.base.clone())).await;
     for i in 0..5 {
-        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
-        hang_up_sign_in(&h, &mut hold, body, &format!("1.3.{i}.1")).await;
+        hang_up_sign_in(&h, &stub, signin("ada@example.com", "Wrong-pass1"), &format!("1.3.{i}.1")).await;
     }
-    drop(hold);
-    h.mock.clear_on_request();
     // A patient client (no timeout).
-    let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Wrong-pass1");
-    let a = h.post("/auth/v1/sign-in", body, None, "1.3.9.1").await;
+    let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "Wrong-pass1"), None, "1.3.9.1").await;
     assert_eq!(a.status, StatusCode::TOO_MANY_REQUESTS, "{}", a.body);
-    assert_eq!(password_checks(&h), 5);
+    assert_eq!(stub.checks(), 5);
 }
 
+// AC 7: correct passwords at once all sign in and spend nothing.
 // AC 7: correct passwords at once all sign in and spend nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
 async fn concurrent_correct_sign_ins_do_not_spend_the_email_budget() {
     let h = Arc::new(harness().await);
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    h.mock.on_request("POST /v2/sessions", || std::thread::sleep(Duration::from_millis(200)));
+    h.member("ada@example.com", &[T1]);
     let mut tasks = Vec::new();
     for i in 0..5 {
         let h = h.clone();
         tasks.push(tokio::spawn(async move {
-            let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Secret-pass1");
-            let a = h.post("/auth/v1/sign-in", body, None, &format!("1.4.{i}.1")).await;
+            let a = h.post("/auth/v1/sign-in", signin("ada@example.com", "Secret-pass1"), None, &format!("1.4.{i}.1")).await;
             (a.status, a.body)
         }));
     }
@@ -3204,68 +2851,49 @@ async fn concurrent_correct_sign_ins_do_not_spend_the_email_budget() {
         let (status, body) = t.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
     }
-    h.mock.clear_on_request();
     assert_budget_unspent(&h, "1").await;
 }
 
 // AC 8: outages and sign-ins that are dead before the password check spend nothing; Zitadel's
 // own refusals of the input (its request validation) count like a wrong password.
+// AC 8: outages spend nothing; identity's own refusals of the input count like a wrong password.
 #[tokio::test]
 async fn sign_in_outages_do_not_spend_the_email_budget() {
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
+    h.member("ada@example.com", &[T1]);
     let mut ip = 0;
-    let mut sign_in = async |ar: &str, expect: StatusCode, why: &str| {
+    let mut sign_in = async |password: &str, why: &str| {
         ip += 1;
-        let body = signin(ar, "ada@example.com", "Wrong-pass1");
-        let a = h.post("/auth/v1/sign-in", body, None, &format!("2.4.{ip}.1")).await;
-        assert_eq!(a.status, expect, "{why}: {}", a.body);
+        let a = h.post("/auth/v1/sign-in", signin("ada@example.com", password), None, &format!("2.4.{ip}.1")).await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{why}: {}", a.body);
     };
-    h.mock.set_down(true);
+    h.identity.set_down(true);
     for _ in 0..6 {
-        sign_in("V2_1", StatusCode::SERVICE_UNAVAILABLE, "down").await;
+        sign_in("Wrong-pass1", "down").await;
     }
-    h.mock.set_down(false);
-    // The password check itself fails: a 5xx, and a 4xx that isn't Zitadel's own answer.
-    h.mock.fail("POST /v2/sessions", 503, "Errors.Internal", 3);
-    h.mock.answer_raw("POST /v2/sessions", 404, "<html>not found</html>", 3);
+    h.identity.set_down(false);
+    // The password check fails: a 5xx, and a 4xx that isn't the service's own answer.
+    h.identity.fail("POST /internal/v1/pools/members/sessions", 503, "internal", 3);
+    h.identity.fail("POST /internal/v1/pools/members/sessions", 404, "pool_not_found", 3);
     for _ in 0..6 {
-        sign_in(&h.mock.add_auth_request(false), StatusCode::SERVICE_UNAVAILABLE, "check down").await;
+        sign_in("Wrong-pass1", "check down").await;
     }
-    // The user lookup fails.
-    h.mock.fail("/v2/users", 503, "Errors.Internal", 6);
+    // The memberships can't be read.
+    h.internal.set_members_status(Some(500));
     for _ in 0..6 {
-        sign_in(&h.mock.add_auth_request(false), StatusCode::SERVICE_UNAVAILABLE, "lookup down").await;
+        sign_in("Secret-pass1", "orchestrator down").await;
     }
-    // A sign-in Zitadel doesn't know, and one that isn't an id at all.
-    for ar in ["V2_999999", "V2_999998", "V2_999997", "nope", "nope", "nope"] {
-        sign_in(ar, StatusCode::GONE, "dead sign-in").await;
-    }
+    h.internal.set_members_status(None);
+    assert_eq!(h.sessions(), 0, "no session outlives an outage");
     assert_budget_unspent(&h, "2").await;
 
-    // Zitadel's request validation (a password over 200 characters): the caller's input counts.
+    // Identity's validation (a password over its cap): the caller's input counts.
     let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    h.mock.answer_raw(
-        "POST /v2/sessions",
-        400,
-        r#"{"code":3,"message":"invalid CreateSessionRequest.Checks: embedded message failed validation","details":[]}"#,
-        5,
-    );
+    h.member("ada@example.com", &[T1]);
+    h.identity.fail("POST /internal/v1/pools/members/sessions", 400, "invalid_request", 5);
     let got = wrong_sign_ins(&h, 6, "3").await;
     assert!(got[..5].iter().all(|s| *s == StatusCode::UNAUTHORIZED), "{got:?}");
     assert_eq!(got[5], StatusCode::TOO_MANY_REQUESTS, "{got:?}");
-
-    // No org yet: 503 before any Zitadel call, and free.
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("org-id");
-    let p = path.clone();
-    let h = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, move |c| c.org_id = org_file(&p)).await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let got = wrong_sign_ins(&h, 6, "4").await;
-    assert!(got.iter().all(|s| *s == StatusCode::SERVICE_UNAVAILABLE), "{got:?}");
-    write_id(&path, "o1\n");
-    assert_budget_unspent(&h, "5").await;
 }
 
 fn reset_accept(ar: &str, user: &str, code: &str, pw: &str) -> Value {
@@ -3484,28 +3112,6 @@ async fn accept_invite_refuses_a_password_over_72_bytes_before_zitadel() {
 
 // Epic review (10): only Zitadel's captured "no such auth request" (`QUERY-Thee9` on the read,
 // `COMMAND-jae5P` on finishing) is an expired sign-in; any other refusal is unavailability.
-#[tokio::test]
-async fn only_an_unknown_auth_request_is_an_expired_sign_in() {
-    let h = harness().await;
-    h.mock.add_user("ada@example.com", "Secret-pass1", true);
-    let sign_in = async |ip: &str| {
-        let body = signin(&h.mock.add_auth_request(false), "ada@example.com", "Secret-pass1");
-        h.post("/auth/v1/sign-in", body, None, ip).await
-    };
-    h.mock.fail("GET /v2/oidc/auth_requests/", 400, "Errors.Something.Else", 1);
-    let a = sign_in("3.1.0.1").await;
-    assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)), "read refused");
-    h.mock.fail("GET /v2/oidc/auth_requests/", 404, "Errors.AuthRequest.NotFound", 1);
-    let a = sign_in("3.1.0.2").await;
-    assert_eq!((a.status, a.body), (StatusCode::GONE, err("sign_in_expired", messages::GONE)), "read: not found");
-    h.mock.fail("POST /v2/oidc/auth_requests/", 403, "Errors.Something.Else", 1);
-    let a = sign_in("3.1.0.3").await;
-    assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)), "finish refused");
-    h.mock.fail("POST /v2/oidc/auth_requests/", 404, "Errors.AuthRequest.NotFound", 1);
-    let a = sign_in("3.1.0.4").await;
-    assert_eq!((a.status, a.body), (StatusCode::GONE, err("sign_in_expired", messages::GONE)), "finish: not found");
-}
-
 // Epic review (10): after the code is spent, a refusal of finishing the sign-in that isn't the
 // captured "no such auth request" is a step to retry (a ticket), not a finished sign-in.
 #[tokio::test]
@@ -3525,16 +3131,16 @@ async fn accept_invite_finish_refused_otherwise_hands_back_a_ticket() {
     assert_eq!(ok.body["next"], "done");
 }
 
-// Epic review (9): only Zitadel's captured "username taken" (`V3-DKcYh`) is a taken email at
-// sign-up; another 409 is unavailability.
+// Epic review (9): only identity's `conflict` is a taken email at sign-up; another 409 is
+// unavailability.
 #[tokio::test]
 async fn sign_up_reads_only_the_captured_conflict_as_taken() {
     let h = harness_with(true, 0).await;
-    h.mock.fail("POST /v2/users/new", 409, "Errors.User.AlreadyExists", 1);
-    let a = h.post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
+    h.identity.fail("POST /internal/v1/pools/members/users", 409, "conflict", 1);
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.1").await;
     assert_eq!((a.status, a.body["error"]["code"].clone()), (StatusCode::CONFLICT, json!("email_taken")), "{}", a.body);
-    h.mock.fail("POST /v2/users/new", 409, "Errors.Something.Else", 1);
-    let a = h.post("/auth/v1/sign-up", signup(&h.mock.add_auth_request(true), "new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
+    h.identity.fail("POST /internal/v1/pools/members/users", 409, "something_else", 1);
+    let a = h.post("/auth/v1/sign-up", signup("new@example.com", "Secret-pass1"), None, "1.1.1.2").await;
     assert_eq!((a.status, a.body), (StatusCode::SERVICE_UNAVAILABLE, err("unavailable", messages::UNAVAILABLE)));
 }
 
@@ -3550,5 +3156,472 @@ async fn accept_invite_retries_only_the_captured_missing_user() {
         .await;
     assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE, "{}", a.body);
     assert_eq!(a.body["error"]["code"], "invite_incomplete");
-    assert_eq!(password_checks(&h), 1);
+    assert_eq!(h.mock.calls().iter().filter(|c| *c == "POST /v2/sessions").count(), 1);
+}
+
+// ---- #121: members sign in, up and out against the identity service --------------------------
+
+const PW: &str = "Secret-pass1";
+const STUDIO_ORIGIN: &str = "http://studio.chelabase.localhost:8000";
+const T1: Uuid = Uuid::from_u128(0xa1);
+const T2: Uuid = Uuid::from_u128(0xa2);
+const T3: Uuid = Uuid::from_u128(0xa3);
+
+impl Harness {
+    /// A verified member of `tenants`.
+    fn member(&self, email: &str, tenants: &[Uuid]) -> String {
+        let id = self.identity.with_user(&Pool::Members, email, PW);
+        self.internal.set_memberships(&id, tenants, &[]);
+        id
+    }
+
+    async fn sign_in(&self, query: &str, email: &str, password: &str, ip: &str) -> Answer {
+        self.post(&format!("/auth/v1/sign-in{query}"), json!({"email": email, "password": password}), None, ip).await
+    }
+
+    /// A sign-in that has to work: the `chelabase_session` cookie.
+    async fn session(&self, query: &str, email: &str, ip: &str) -> String {
+        let a = self.sign_in(query, email, PW, ip).await;
+        assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})), "sign-in");
+        a.cookie("chelabase_session").expect("the session cookie")
+    }
+
+    async fn token_as(&self, path: &str, cookie: Option<&str>, headers: &[(&str, &str)]) -> Answer {
+        let mut req = self.http.post(format!("{}{path}", self.base));
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req.send().await.unwrap();
+        let status = resp.status();
+        let cookies = resp.headers().get_all("set-cookie").iter().map(|v| v.to_str().unwrap().to_string()).collect();
+        let cache = resp.headers().get("cache-control").map(|v| v.to_str().unwrap().to_string());
+        let mut body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap_or(Value::Null);
+        if let (Some(cache), Value::Object(map)) = (cache, &mut body) {
+            map.insert("_cache_control".into(), json!(cache));
+        }
+        Answer { status, body, cookies }
+    }
+
+    /// `/auth/v1/token` as Studio calls it.
+    async fn token(&self, cookie: &str) -> Answer {
+        self.token_as("/auth/v1/token", Some(cookie), &[("origin", STUDIO_ORIGIN), ("x-chelabase-studio", "1")]).await
+    }
+
+    fn claims(&self, a: &Answer) -> MemberClaims {
+        assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+        MemberTokenVerifier::from_pem(self.member_public.as_bytes(), &self.mock.base)
+            .unwrap()
+            .verify(a.body["access_token"].as_str().unwrap())
+            .expect("the gateway's verifier accepts it")
+    }
+
+    fn sessions(&self) -> usize {
+        self.identity.session_count(&Pool::Members)
+    }
+
+    async fn users_with(&self, email: &str) -> u64 {
+        self.identity.client().search_users(&Pool::Members, email, 10, 0).await.unwrap().total
+    }
+}
+
+// AC 1.
+#[tokio::test]
+async fn member_sign_in_token_roundtrip() {
+    let h = harness().await;
+    let id = h.member("ada@example.com", &[T1]);
+    let a = h.sign_in("", " ADA@example.com ", PW, "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})));
+    let set = a.cookies.iter().find(|c| c.starts_with("chelabase_session=")).expect("set");
+    assert!(set.contains("HttpOnly; SameSite=Strict; Path=/auth/v1"), "{set}");
+    let t = h.token(&a.cookie("chelabase_session").unwrap()).await;
+    let claims = h.claims(&t);
+    assert_eq!((claims.sub.as_str(), claims.tid, claims.email.as_str()), (id.as_str(), T1, "ada@example.com"));
+    assert_eq!(t.body["expires_in"], 300);
+    assert_eq!(t.body["_cache_control"], "no-store");
+    let token = h.identity.client().sign_in(&Pool::Members, "ada@example.com", PW).await.unwrap().session_token;
+    assert!(a.cookies.iter().all(|c| !c.contains(&token)), "the session token is sealed");
+    // Without identity's Secure flag in dev; on for HTTPS deployments.
+    let secure = harness_tweaked(false, 1, auth::config::Mode::SelfHosted, true, |c| c.secure_cookies = true).await;
+    secure.member("ada@example.com", &[T1]);
+    let a = secure.sign_in("", "ada@example.com", PW, "1.1.1.1").await;
+    assert!(a.cookies.iter().any(|c| c.starts_with("chelabase_session=") && c.contains("; Secure")));
+}
+
+// AC 2, with the padding bound measured: a refused sign-in looks the same whichever way it
+// failed, and leaves no session behind.
+#[tokio::test]
+async fn sign_in_failures_indistinguishable() {
+    const PAD_MS: u64 = 300;
+    let h = harness_with(false, PAD_MS).await;
+    h.member("ada@example.com", &[T1]);
+    h.member("none@example.com", &[]);
+    let banned = h.member("banned@example.com", &[T1]);
+    h.identity.ban(&Pool::Members, &banned);
+    let mut seen = Vec::new();
+    for (i, (query, email, pw)) in [
+        ("", "ada@example.com", "Wrong-pass1"),
+        ("", "nobody@example.com", PW),
+        ("", "none@example.com", PW),
+        ("", "banned@example.com", PW),
+        ("?tenant=not-a-uuid", "ada@example.com", PW),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let start = Instant::now();
+        let a = h.sign_in(query, email, pw, &format!("3.3.3.{i}")).await;
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(PAD_MS), "{email}: {took:?}");
+        assert!(took < Duration::from_millis(PAD_MS + 250), "{email}: {took:?}");
+        assert!(a.cookies.is_empty(), "{email}: {:?}", a.cookies);
+        seen.push((a.status, a.body));
+    }
+    let want = (StatusCode::UNAUTHORIZED, err("invalid_credentials", messages::BAD_CREDENTIALS));
+    assert!(seen.iter().all(|s| *s == want), "{seen:?}");
+    assert_eq!(h.sessions(), 0, "a refused sign-in leaves no session");
+}
+
+// AC 3.
+#[tokio::test]
+async fn logout_kills_token_minting() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    let out = h.post("/auth/v1/logout", json!({}), Some(&cookie), "1.1.1.1").await;
+    assert_eq!(out.status, StatusCode::OK);
+    assert_eq!(h.sessions(), 0);
+    assert!(out.cookies.iter().any(|c| c.starts_with("chelabase_session=;")));
+    // The same cookie bytes, replayed.
+    let replay = h.token(&cookie).await;
+    assert_eq!(replay.status, StatusCode::UNAUTHORIZED);
+    assert!(replay.body.get("access_token").is_none());
+}
+
+// A logout that couldn't reach identity must not claim the session ended: the cookie stays so
+// the client can try again.
+#[tokio::test]
+async fn logout_outage_is_not_a_logout() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    h.identity.set_down(true);
+    let out = h.post("/auth/v1/logout", json!({}), Some(&cookie), "1.1.1.1").await;
+    assert_eq!(out.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(out.cookies.is_empty());
+    h.identity.set_down(false);
+    let out = h.post("/auth/v1/logout", json!({}), Some(&cookie), "1.1.1.1").await;
+    assert_eq!(out.status, StatusCode::OK);
+    // Already gone is still a logout.
+    let out = h.post("/auth/v1/logout", json!({}), Some(&cookie), "1.1.1.1").await;
+    assert_eq!(out.status, StatusCode::OK);
+}
+
+// AC 4, and the session being revoked out of band answers at once.
+#[tokio::test]
+async fn suspended_member_no_token() {
+    let h = harness().await;
+    let id = h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    // Suspended: no longer active in T1.
+    h.internal.set_memberships(&id, &[], &[]);
+    let a = h.token(&cookie).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "{}", a.body);
+    assert!(a.body.get("access_token").is_none());
+    // Can't tell: no token either.
+    h.internal.set_members_status(Some(500));
+    assert_eq!(h.token(&cookie).await.status, StatusCode::SERVICE_UNAVAILABLE);
+    h.internal.set_members_status(None);
+    // Reinstated, then the identity session is revoked.
+    h.internal.set_memberships(&id, &[T1], &[]);
+    assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    h.identity.client().revoke_user_sessions(&Pool::Members, &id).await.unwrap();
+    assert_eq!(h.token(&cookie).await.status, StatusCode::UNAUTHORIZED);
+}
+
+// AC 5.
+#[tokio::test]
+async fn token_csrf_guards() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    for headers in [
+        vec![("origin", STUDIO_ORIGIN)],
+        vec![("origin", STUDIO_ORIGIN), ("x-chelabase-studio", "0")],
+        vec![("x-chelabase-studio", "1")],
+        vec![("origin", "http://evil.example"), ("x-chelabase-studio", "1")],
+        vec![("origin", "http://studio.chelabase.localhost:8000.evil.example"), ("x-chelabase-studio", "1")],
+        vec![("origin", "null"), ("x-chelabase-studio", "1")],
+    ] {
+        let a = h.token_as("/auth/v1/token", Some(&cookie), &headers).await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("forbidden")), "{headers:?}");
+    }
+    // GET has no route.
+    let got = h.http.get(format!("{}/auth/v1/token", h.base)).header("cookie", &cookie).send().await.unwrap();
+    assert_eq!(got.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+    // No or a junk cookie.
+    let studio = [("origin", STUDIO_ORIGIN), ("x-chelabase-studio", "1")];
+    assert_eq!(h.token_as("/auth/v1/token", None, &studio).await.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.token_as("/auth/v1/token", Some("chelabase_session=junk"), &studio).await.status, StatusCode::UNAUTHORIZED);
+}
+
+// The route's own limit: 120 a minute per session.
+#[tokio::test]
+async fn token_is_limited_per_session() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    h.member("bob@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    for _ in 0..120 {
+        assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    }
+    assert_eq!(h.token(&cookie).await.status, StatusCode::TOO_MANY_REQUESTS);
+    let other = h.session("", "bob@example.com", "1.1.1.1").await;
+    assert_eq!(h.token(&other).await.status, StatusCode::OK);
+}
+
+// AC 6.
+#[tokio::test]
+async fn tenant_choice_validated() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1, T2]);
+    let cookie = h.session(&format!("?tenant={T2}"), "ada@example.com", "1.1.1.1").await;
+    assert_eq!(h.claims(&h.token(&cookie).await).tid, T2);
+    let a = h.sign_in(&format!("?tenant={T3}"), "ada@example.com", PW, "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::UNAUTHORIZED, err("invalid_credentials", messages::BAD_CREDENTIALS)));
+    assert!(a.cookies.is_empty());
+    assert_eq!(h.sessions(), 1, "only the T2 session lives");
+}
+
+// Several memberships and no choice: which ones, only to whoever has the password; no session.
+#[tokio::test]
+async fn several_tenants_need_a_choice() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1, T2]);
+    let a = h.sign_in("", "ada@example.com", PW, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::CONFLICT);
+    assert_eq!(a.body["error"]["code"], "tenant_required");
+    assert_eq!(a.body["error"]["tenants"], json!([T1, T2]));
+    assert!(a.cookies.is_empty());
+    assert_eq!(h.sessions(), 0, "the retry with ?tenant= makes its own session");
+    let wrong = h.sign_in("", "ada@example.com", "Wrong-pass1", "1.1.1.1").await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    assert!(wrong.body["error"].get("tenants").is_none());
+}
+
+// A pending person is told so, once their password is right, and gets no session.
+#[tokio::test]
+async fn pending_member_is_told_so() {
+    let h = harness().await;
+    let id = h.member("ada@example.com", &[]);
+    h.internal.set_memberships(&id, &[], &[T1]);
+    let a = h.sign_in("", "ada@example.com", PW, "1.1.1.1").await;
+    assert_eq!((a.status, a.body), (StatusCode::OK, json!({"next": "pending"})));
+    assert!(a.cookies.is_empty());
+    assert_eq!(h.sessions(), 0);
+    let wrong = h.sign_in("", "ada@example.com", "Wrong-pass1", "1.1.1.1").await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    // Pending elsewhere is no reason to tell a person with an active tenant so.
+    h.internal.set_memberships(&id, &[T2], &[T1]);
+    assert_eq!(h.claims(&h.token(&h.session("", "ada@example.com", "1.1.1.2").await).await).tid, T2);
+}
+
+// An unverified member gets a code and the step cookie, never a session cookie.
+#[tokio::test]
+async fn unverified_sign_in_sends_a_code() {
+    let h = harness().await;
+    h.internal.set_signup_tenant(T1);
+    let a = h.post("/auth/v1/sign-up", json!({"email": "new@example.com", "password": PW, "givenName": "A", "familyName": "B"}), None, "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "verify"})));
+    assert!(a.cookie("chelabase_login").is_some() && a.cookie("chelabase_session").is_none());
+    let b = h.sign_in("", "new@example.com", PW, "1.1.1.1").await;
+    assert_eq!((b.status, &b.body), (StatusCode::OK, &json!({"next": "verify"})));
+    assert!(b.cookie("chelabase_login").is_some() && b.cookie("chelabase_session").is_none());
+    // Until m11 the code step is Zitadel's, so it refuses an identity user: never a session.
+    let done = h.post("/auth/v1/verify-email", json!({"code": "000000"}), Some(&b.cookie("chelabase_login").unwrap()), "1.1.1.1").await;
+    assert_eq!(done.status, StatusCode::BAD_REQUEST);
+    assert!(done.cookies.is_empty());
+    let sent = h.identity.codes_sent();
+    assert_eq!(sent.len(), 2);
+    assert!(sent.iter().all(|c| c.kind == chelabase_identity::CodeKind::Verify && c.email == "new@example.com"));
+}
+
+// m2's audit: a new code resets the guess counter, so issuing has to be capped per user and
+// kind, however many addresses ask. 5 codes × 5 guesses = at most 25 guesses an hour.
+#[tokio::test]
+async fn code_issuance_is_limited_per_user_and_kind() {
+    let h = harness().await;
+    h.internal.set_signup_tenant(T1);
+    let a = h.post("/auth/v1/sign-up", json!({"email": "new@example.com", "password": PW, "givenName": "A", "familyName": "B"}), None, "1.1.1.1").await;
+    assert_eq!(a.status, StatusCode::OK);
+    for i in 0..9 {
+        let b = h.sign_in("", "new@example.com", PW, &format!("4.4.4.{i}")).await;
+        assert_eq!((b.status, b.body), (StatusCode::OK, json!({"next": "verify"})), "same answer once capped");
+    }
+    assert_eq!(h.identity.codes_sent().len(), 5, "capped whatever the address");
+}
+
+// AC 7.
+#[tokio::test]
+async fn setup_claim_binds_identity_user() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_signup_tenant(T1);
+    let body = json!({"email": "first@example.com", "password": PW, "givenName": "Ann", "familyName": "Lee", "setupCode": SETUP_CODE});
+    let a = h.post("/auth/v1/sign-up", body, None, "1.1.1.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "studio"})));
+    let user = h.identity.client().search_users(&Pool::Members, "first@example.com", 10, 0).await.unwrap().users.remove(0);
+    assert_eq!(user.name, "Ann Lee");
+    assert!(user.email_verified, "verification is off here");
+    assert_eq!(
+        h.internal.bodies(CLAIMED_CALL),
+        vec![json!({"org": "o1", "user_id": user.id, "nonce": support::internal::CLAIM_NONCE})]
+    );
+    let claims = h.claims(&h.token(&a.cookie("chelabase_session").unwrap()).await);
+    assert_eq!((claims.sub, claims.tid), (user.id, T1));
+}
+
+// AC 7: a failed bind deletes the identity user, and a retry with the same email works.
+#[tokio::test]
+async fn setup_claim_bind_failure_deletes_user() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_signup_tenant(T1);
+    let body = json!({"email": "first@example.com", "password": PW, "givenName": "A", "familyName": "B", "setupCode": SETUP_CODE});
+    for (status, want, code) in [
+        (500, StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        (403, StatusCode::FORBIDDEN, "setup_code_invalid"),
+    ] {
+        h.internal.set_claimed_status(Some(status));
+        let a = h.post("/auth/v1/sign-up", body.clone(), None, &format!("2.2.2.{status}")).await;
+        assert_eq!((a.status, a.body["error"]["code"].as_str()), (want, Some(code)), "{status}");
+        assert_eq!(h.users_with("first@example.com").await, 0, "deleted after a {status}");
+        assert_eq!(h.sessions(), 0);
+    }
+    h.internal.set_claimed_status(None);
+    let a = h.post("/auth/v1/sign-up", body, None, "2.2.2.9").await;
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
+    assert_eq!(h.users_with("first@example.com").await, 1);
+}
+
+// The loser of the claim race, and an open sign-up, wait as pending: the row is written at
+// sign-up, because a member token never makes one.
+#[tokio::test]
+async fn sign_ups_without_the_claim_wait_as_pending() {
+    let h = harness_with(true, 1).await;
+    h.internal.set_signup_tenant(T1);
+    h.internal.set_setup_code(SETUP_CODE);
+    h.internal.set_claimed_unbound();
+    let body = json!({"email": "second@example.com", "password": PW, "givenName": "A", "familyName": "B", "setupCode": SETUP_CODE});
+    let a = h.post("/auth/v1/sign-up", body, None, "2.2.2.1").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "pending"})), "race loser");
+    assert!(a.cookies.iter().all(|c| !c.starts_with("chelabase_session=v")));
+
+    let h = harness_with(true, 1).await;
+    h.internal.set_signup_tenant(T1);
+    let body = json!({"email": "open@example.com", "password": PW, "givenName": "A", "familyName": "B"});
+    let a = h.post("/auth/v1/sign-up", body, None, "2.2.2.2").await;
+    assert_eq!((a.status, &a.body), (StatusCode::OK, &json!({"next": "pending"})), "open sign-up");
+    let user = h.identity.client().search_users(&Pool::Members, "open@example.com", 10, 0).await.unwrap().users.remove(0);
+    assert_eq!(h.internal.bodies("POST /internal/signup/joined"), vec![json!({"org": "o1", "user_id": user.id})]);
+    assert_eq!(h.sessions(), 0);
+}
+
+// A join that didn't happen undoes the account, as a failed bind does.
+#[tokio::test]
+async fn a_failed_join_deletes_the_user() {
+    let h = harness_with(true, 1).await;
+    let body = json!({"email": "open@example.com", "password": PW, "givenName": "A", "familyName": "B"});
+    h.internal.set_joined_status(Some(500));
+    let a = h.post("/auth/v1/sign-up", body.clone(), None, "2.2.2.1").await;
+    assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(h.users_with("open@example.com").await, 0);
+    h.internal.set_joined_status(None);
+    h.internal.set_joined_closed();
+    let a = h.post("/auth/v1/sign-up", body, None, "2.2.2.2").await;
+    assert_eq!((a.status, a.body["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("sign_up_closed")));
+    assert_eq!(h.users_with("open@example.com").await, 0);
+}
+
+// AC 8.
+#[tokio::test]
+async fn sign_in_rate_limits_kept() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    for i in 0..10 {
+        let a = h.sign_in("", &format!("u{i}@example.com"), "Wrong-pass1", "5.5.5.5").await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    }
+    let a = h.sign_in("", "ada@example.com", PW, "5.5.5.5").await;
+    assert_eq!((a.status, a.body), (StatusCode::TOO_MANY_REQUESTS, err("rate_limited", messages::TOO_MANY)));
+    // Per email, across addresses; a no-membership sign-in counts like a wrong password.
+    h.member("none@example.com", &[]);
+    for i in 0..5 {
+        let a = h.sign_in("", "none@example.com", PW, &format!("5.5.6.{i}")).await;
+        assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(h.sign_in("", "none@example.com", PW, "5.5.6.9").await.status, StatusCode::TOO_MANY_REQUESTS);
+    // Right passwords spend nothing, and neither does an outage.
+    h.member("bob@example.com", &[T1]);
+    for i in 0..6 {
+        assert_eq!(h.sign_in("", "bob@example.com", PW, &format!("5.5.7.{i}")).await.status, StatusCode::OK);
+    }
+    h.identity.set_down(true);
+    for i in 0..6 {
+        let a = h.sign_in("", "cat@example.com", "Wrong-pass1", &format!("5.5.8.{i}")).await;
+        assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    h.identity.set_down(false);
+    assert_eq!(h.sign_in("", "cat@example.com", "Wrong-pass1", "5.5.9.1").await.status, StatusCode::UNAUTHORIZED);
+}
+
+// AC 9, on auth's clock: identity's session is still live, but older than the lifetime.
+#[tokio::test]
+async fn token_refused_after_absolute_lifetime() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1]);
+    let cookie = h.session("", "ada@example.com", "1.1.1.1").await;
+    h.clock.advance(Duration::from_secs(29 * 24 * 3600));
+    assert_eq!(h.token(&cookie).await.status, StatusCode::OK);
+    h.clock.advance(Duration::from_secs(2 * 24 * 3600));
+    let a = h.token(&cookie).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(h.sessions(), 0, "revoked once found too old");
+    // `/token` reads the session without extending it: by id, never by token.
+    let calls = h.identity.calls();
+    assert!(calls.iter().any(|c| c.starts_with("GET /internal/v1/pools/members/sessions/")), "{calls:?}");
+    assert!(!calls.iter().any(|c| c.ends_with("/sessions/lookup")), "{calls:?}");
+}
+
+// AC 10.
+#[tokio::test]
+async fn token_tid_bound_to_sealed_tenant() {
+    let h = harness().await;
+    h.member("ada@example.com", &[T1, T2]);
+    let cookie = h.session(&format!("?tenant={T1}"), "ada@example.com", "1.1.1.1").await;
+    let studio = [("origin", STUDIO_ORIGIN), ("x-chelabase-studio", "1")];
+    let a = h.token_as(&format!("/auth/v1/token?tenant={T2}"), Some(&cookie), &studio).await;
+    assert_eq!(a.status, StatusCode::UNAUTHORIZED, "another tenant, though a member of it");
+    assert!(a.body.get("access_token").is_none());
+    let same = h.token_as(&format!("/auth/v1/token?tenant={T1}"), Some(&cookie), &studio).await;
+    assert_eq!(h.claims(&same).tid, T1);
+}
+
+// The Zitadel-era session (accept-invite, until m11) mints nothing.
+#[tokio::test]
+async fn a_zitadel_session_cookie_mints_nothing() {
+    let h = harness().await;
+    let sealed = auth::cookie::seal_session(
+        &h.cookie_key,
+        &auth::cookie::SessionState::Zitadel {
+            session_id: "1".into(),
+            session_token: "t".into(),
+            exp: auth::cookie::now_secs() + 60,
+        },
+    );
+    assert_eq!(h.token(&format!("chelabase_session={sealed}")).await.status, StatusCode::UNAUTHORIZED);
 }

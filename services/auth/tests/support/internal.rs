@@ -62,6 +62,17 @@ pub struct FakeState {
     pub open_invites: HashMap<String, Value>,
     /// Answer the open check with this status instead.
     pub open_status: Option<u16>,
+    /// User id → the tenants of `/internal/members/active`: `(active, pending)`.
+    pub memberships: HashMap<String, (Vec<Uuid>, Vec<Uuid>)>,
+    /// Answer the membership read with this status instead.
+    pub members_status: Option<u16>,
+    /// The bootstrapped tenant: a bound claim makes its user active here, and an unbound claim
+    /// or a join makes them pending, as the orchestrator does.
+    pub signup_tenant: Option<Uuid>,
+    /// Answer `joined` with this status instead.
+    pub joined_status: Option<u16>,
+    /// `joined`'s `joined` is `false`.
+    pub joined_closed: bool,
 }
 
 #[derive(Clone)]
@@ -261,13 +272,39 @@ async fn signup_check(State(s): S, Json(b): Json<Value>) -> Response {
     Json(answer).into_response()
 }
 
-async fn signup_claimed(State(s): S) -> Response {
-    let st = s.lock().unwrap();
+async fn signup_claimed(State(s): S, Json(b): Json<Value>) -> Response {
+    let mut st = s.lock().unwrap();
     if let Some(status) = st.claimed_status {
         let code = if status == 403 { "setup_code_invalid" } else { "unavailable" };
         return error(StatusCode::from_u16(status).unwrap(), code);
     }
-    Json(json!({"bound": !st.claimed_unbound})).into_response()
+    let bound = !st.claimed_unbound;
+    if let Some(tenant) = st.signup_tenant {
+        let row = st.memberships.entry(b["user_id"].as_str().unwrap().to_string()).or_default();
+        if bound { row.0.push(tenant) } else { row.1.push(tenant) }
+    }
+    Json(json!({"bound": bound})).into_response()
+}
+
+async fn signup_joined(State(s): S, Json(b): Json<Value>) -> Response {
+    let mut st = s.lock().unwrap();
+    if let Some(status) = st.joined_status {
+        return error(StatusCode::from_u16(status).unwrap(), "unavailable");
+    }
+    let joined = !st.joined_closed;
+    if joined && let Some(tenant) = st.signup_tenant {
+        st.memberships.entry(b["user_id"].as_str().unwrap().to_string()).or_default().1.push(tenant);
+    }
+    Json(json!({"joined": joined})).into_response()
+}
+
+async fn members_active(State(s): S, Json(b): Json<Value>) -> Response {
+    let st = s.lock().unwrap();
+    if let Some(status) = st.members_status {
+        return error(StatusCode::from_u16(status).unwrap(), "unavailable");
+    }
+    let (active, pending) = st.memberships.get(b["user_id"].as_str().unwrap_or("")).cloned().unwrap_or_default();
+    Json(json!({"active": active, "pending": pending})).into_response()
 }
 
 async fn describe_invite(State(s): S, Json(q): Json<HashMap<String, String>>) -> Response {
@@ -321,6 +358,8 @@ impl FakeInternal {
             .route("/internal/app/sync", post(sync))
             .route("/internal/signup/check", post(signup_check))
             .route("/internal/signup/claimed", post(signup_claimed))
+            .route("/internal/signup/joined", post(signup_joined))
+            .route("/internal/members/active", post(members_active))
             .route("/internal/invites/describe", post(describe_invite))
             .route("/internal/invites/open", post(open_invite))
             .layer(middleware::from_fn_with_state(inner.clone(), journal))
@@ -332,6 +371,27 @@ impl FakeInternal {
             base: format!("http://{addr}"),
             inner,
         }
+    }
+
+    /// The tenants `user` is an active and a pending member of.
+    pub fn set_memberships(&self, user: &str, active: &[Uuid], pending: &[Uuid]) {
+        self.inner.lock().unwrap().memberships.insert(user.into(), (active.to_vec(), pending.to_vec()));
+    }
+
+    pub fn set_members_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().members_status = status;
+    }
+
+    pub fn set_signup_tenant(&self, tenant: Uuid) {
+        self.inner.lock().unwrap().signup_tenant = Some(tenant);
+    }
+
+    pub fn set_joined_status(&self, status: Option<u16>) {
+        self.inner.lock().unwrap().joined_status = status;
+    }
+
+    pub fn set_joined_closed(&self) {
+        self.inner.lock().unwrap().joined_closed = true;
     }
 
     pub fn set_signup(&self, allowed: bool, reason: &str) {

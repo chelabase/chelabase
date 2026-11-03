@@ -7,9 +7,9 @@
 import type { DoneTag } from './doneTag.ts';
 
 /**
- * The signed-in answer: `next` is always `done`.
+ * The signed-in answer of accept-invite and verify-email: `next` is always `done`.
  */
-export interface SignedIn {
+export interface SignedInRedirect {
   next: DoneTag;
   redirect: string;
 }

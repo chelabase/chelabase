@@ -15,6 +15,7 @@ export const ErrorCode = {
   unauthorized: 'unauthorized',
   forbidden: 'forbidden',
   tenant_not_bound: 'tenant_not_bound',
+  tenant_required: 'tenant_required',
   not_found: 'not_found',
   method_not_allowed: 'method_not_allowed',
   invalid_request: 'invalid_request',

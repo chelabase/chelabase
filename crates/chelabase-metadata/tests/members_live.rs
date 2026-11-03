@@ -231,6 +231,29 @@ fn new_invite<'a>(identity_user_id: &'a str, email: &'a str, grants: &'a [(Uuid,
     NewInvite { identity_user_id, email, expires_at: week(), token_hash: TOKEN, grants, teams: &[] }
 }
 
+// #121: what sign-in and `/auth/v1/token` read: active and pending rows of every tenant.
+#[tokio::test]
+#[ignore = "needs the workbench stack's metadata Postgres"]
+async fn member_tenants_lists_active_and_pending() {
+    let s = Scratch::new().await;
+    let (a, b, c) = (s.tenant().await, s.tenant().await, s.tenant().await);
+    let who = format!("mt-{}", Uuid::new_v4());
+    let join = async |t, user: &str, admission| {
+        s.client.ensure_member_first_comer_for_tests(t, user, "", "N", admission).await.unwrap()
+    };
+    join(a, &who, Admission::Active).await;
+    join(b, "admin-b", Admission::Active).await;
+    join(b, &who, Admission::Pending).await;
+    join(c, "admin-c", Admission::Active).await;
+    let gone = join(c, &who, Admission::Active).await;
+    sqlx::query("UPDATE members SET status = 'suspended' WHERE id = $1").bind(gone.id).execute(s.client.pool()).await.unwrap();
+    let mut want = vec![(a, MemberStatus::Active), (b, MemberStatus::Pending)];
+    want.sort_by_key(|(t, _)| t.as_uuid());
+    assert_eq!(s.client.member_tenants(&who).await.unwrap(), want);
+    assert!(s.client.member_tenants("stranger").await.unwrap().is_empty());
+    s.finish().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs the workbench stack's metadata Postgres"]
 async fn first_claim_is_atomic() {

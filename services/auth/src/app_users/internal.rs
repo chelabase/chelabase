@@ -121,6 +121,13 @@ pub struct SignUpAnswer {
     pub claim_nonce: Option<ClaimNonce>,
 }
 
+/// The tenants a person is a member of (`POST /internal/members/active`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MemberTenants {
+    pub active: Vec<Uuid>,
+    pub pending: Vec<Uuid>,
+}
+
 /// A one-time claim nonce. `Debug` shows nothing.
 #[derive(Clone, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
@@ -241,9 +248,36 @@ impl InternalClient {
         self.json(Method::POST, "/internal/signup/check", Some(body)).await
     }
 
-    /// Binds the fresh-install claim to the account just created: `true` when bound, `false`
-    /// when the tenant was already claimed (the account stays, as a newcomer). Any error means
-    /// no claim: the caller deletes the account.
+    /// Writes the `pending` row of an open sign-up: `false` when the tenant doesn't take it.
+    /// Anything but `true` leaves no row: the caller deletes the account.
+    pub async fn signup_joined(&self, org_id: &str, user_id: &str) -> Result<bool, InternalError> {
+        #[derive(Deserialize)]
+        struct Joined {
+            joined: bool,
+        }
+        let answer: Joined = self
+            .json(
+                Method::POST,
+                "/internal/signup/joined",
+                Some(serde_json::json!({ "org": org_id, "user_id": user_id })),
+            )
+            .await?;
+        Ok(answer.joined)
+    }
+
+    /// The tenants this identity user is an active or pending member of.
+    pub async fn member_tenants(&self, user_id: &str) -> Result<MemberTenants, InternalError> {
+        self.json(
+            Method::POST,
+            "/internal/members/active",
+            Some(serde_json::json!({ "user_id": user_id })),
+        )
+        .await
+    }
+
+    /// Binds the fresh-install claim to the account just created: `true` when bound (they are
+    /// the tenant admin), `false` when the tenant was already claimed (the account stays, as a
+    /// pending member). Any error means no claim: the caller deletes the account.
     pub async fn signup_claimed(
         &self,
         org_id: &str,

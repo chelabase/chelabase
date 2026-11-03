@@ -212,6 +212,16 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         // The test client connects from loopback: it stands in for the gateway.
         trusted_proxies: auth::guard::TrustedProxies::parse("127.0.0.1,::1").unwrap(),
     };
+    let keys = tempfile::tempdir().unwrap();
+    let (private, public) = chelabase_auth::internal::generate_keypair_pem();
+    let member_config = auth::config::MemberTokenConfig {
+        private_key: keys.path().join("member-jwt.key"),
+        public_key: keys.path().join("member-jwt.pub"),
+        ttl: Duration::from_secs(300),
+    };
+    std::fs::write(&member_config.private_key, &private).unwrap();
+    std::fs::write(&member_config.public_key, &public).unwrap();
+    let member_tokens = auth::member_token::MemberTokens::from_config(&member_config, &config.issuer).unwrap();
     let state = Arc::new(AppState {
         zitadel: Zitadel::new(&mock.base, TOKEN),
         config,
@@ -220,8 +230,9 @@ async fn harness_full(verification: bool, min_ms: u64, app_on: bool, lookup: Dur
         signup_gate: None,
         used_tickets: Default::default(),
         admin: None,
-        member_tokens: None,
-        identity: None,
+        member_tokens,
+        identity: chelabase_identity::Identity::new("http://127.0.0.1:9", "unused"),
+        clock: Default::default(),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1901,14 +1912,9 @@ async fn app_routes_503_without_keys() {
     assert_eq!(a.status, StatusCode::SERVICE_UNAVAILABLE);
     // The platform flows still answer.
     let a = h
-        .send(
-            h.http
-                .post(format!("{}/auth/v1/auth-request", h.base))
-                .json(&json!({"authRequest": "V2_1"})),
-            None,
-        )
+        .send(h.http.post(format!("{}/auth/v1/logout", h.base)).json(&json!({})), None)
         .await;
-    assert_eq!(a.status, StatusCode::GONE, "{}", a.body);
+    assert_eq!(a.status, StatusCode::OK, "{}", a.body);
 }
 
 #[tokio::test]

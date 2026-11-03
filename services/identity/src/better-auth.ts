@@ -47,7 +47,9 @@ export function authOptions(pool: pg.Pool, secret: string, schema: string | unde
     plugins: plugins(),
     // Our Rust services rate-limit; Better Auth's limiter would key on a proxy address anyway.
     rateLimit: { enabled: false },
-    session: { cookieCache: { enabled: false } },
+    // 30 days: the members' absolute lifetime (`/auth/v1/token` reads a session without sliding
+    // it), and no shorter than the 30-day cap app-user refresh keeps on its own.
+    session: { cookieCache: { enabled: false }, expiresIn: 30 * 24 * 60 * 60 },
     advanced: {
       // No browser ever reaches this service: there are no cookies to protect.
       disableCSRFCheck: true,

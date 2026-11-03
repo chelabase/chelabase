@@ -6,7 +6,6 @@
  */
 
 export interface SignUpBody {
-  authRequest: string;
   email: string;
   familyName: string;
   givenName: string;
