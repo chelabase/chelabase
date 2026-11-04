@@ -2041,16 +2041,17 @@ async fn refresh_of_a_current_token_rotated_and_past_its_grace_during_the_lookup
 }
 
 /// #59 audit B1: a session lookup slower than the refresh bound is a fault: 503, and the
-/// token the client holds is still current.
+/// token the client holds is still current. The bound leaves room for a loaded CI runner: at
+/// 100 ms the undelayed refresh at the end timed out there too.
 #[tokio::test]
 async fn refresh_session_lookup_slower_than_the_bound_is_unavailable() {
-    let h = harness_lookup(Duration::from_millis(100)).await;
+    let h = harness_lookup(Duration::from_secs(1)).await;
     h.add_user("ada@example.com", true).await;
     let s = h.sign_in("ada@example.com", PW).await;
     let sid = h.session_id(&s);
     let token = s.body["refresh_token"].clone();
     let held = h.internal.session(sid).unwrap().token;
-    h.proxy.delay(&format!("GET {}/sessions/", h.pool_path()), Duration::from_millis(400));
+    h.proxy.delay(&format!("GET {}/sessions/", h.pool_path()), Duration::from_secs(3));
     let a = h
         .post("refresh", json!({"refresh_token": token}), None)
         .await;
