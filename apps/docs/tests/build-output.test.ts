@@ -93,7 +93,7 @@ describe('the built docs site', () => {
 
   // Headings (Spectral 700) and body text (Atkinson), latin subsets only, are fetched with the HTML.
   it('preloads_the_first_screen_fonts', () => {
-    const fonts = [...read('docs/index.html').matchAll(/<link[^>]*rel="preload"[^>]*as="font"[^>]*>/g)].map((m) => m[0]);
+    const fonts = [...read('index.html').matchAll(/<link[^>]*rel="preload"[^>]*as="font"[^>]*>/g)].map((m) => m[0]);
     const files = fonts.map((l) => /href="\/assets\/([^"]+)"/.exec(l)?.[1]);
     expect(files.map((f) => f?.replace(/-[\w-]{8}\.woff2$/, '')).sort()).toEqual(
       ['atkinson-hyperlegible-next-latin-wght-normal', 'spectral-latin-700-normal'],
