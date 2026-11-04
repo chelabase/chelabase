@@ -108,7 +108,7 @@ function Edge() {
   );
 }
 
-function Band({ id, labelledby, children }: { id?: string; labelledby: string; children: ReactNode }) {
+function Band({ id, labelledby, className = "", children }: { id?: string; labelledby: string; className?: string; children: ReactNode }) {
   const { tone } = useContext(BandTone);
   // --band is this band's ground; the edge above it is drawn in the same colour.
   const ground = tone === "raised" ? "[--band:var(--deep)]" : "[--band:var(--ink)]";
@@ -116,7 +116,7 @@ function Band({ id, labelledby, children }: { id?: string; labelledby: string; c
     <section
       id={id}
       aria-labelledby={labelledby}
-      className={`relative px-gutter py-section scroll-mt-16 bg-(--band) [--claw-gap:var(--band)] ${ground}`}
+      className={`relative px-gutter py-section scroll-mt-16 bg-(--band) [--claw-gap:var(--band)] ${ground} ${className}`}
     >
       <Edge />
       {children}
@@ -883,9 +883,12 @@ function Compare() {
 
 function Landfall({ docsUrl }: SectionProps) {
   return (
-    <Band labelledby="landfall-title">
-      <div className="max-w-250 mx-auto grid grid-cols-[minmax(160px,0.7fr)_minmax(0,1.3fr)] gap-14 items-center max-[900px]:grid-cols-1 max-[900px]:justify-items-start">
-        <svg className="w-full h-auto max-w-80 max-[900px]:max-w-50" viewBox="0 0 240 190" aria-hidden="true">
+    // Stacked on a phone, the crab, the call and the footer sit close: the last band needs less air
+    // than a section between sections.
+    <Band labelledby="landfall-title" className="max-[900px]:pt-10 max-[900px]:pb-10">
+      <div className="max-w-250 mx-auto grid grid-cols-[minmax(160px,0.7fr)_minmax(0,1.3fr)] gap-14 items-center max-[900px]:grid-cols-1 max-[900px]:justify-items-start max-[900px]:gap-5">
+        {/* cropped to the drawing (it fills x 23-223, y 29-172 of its 240 x 190 box), the box scaled to match */}
+        <svg className="w-full h-auto max-w-72 max-[900px]:max-w-44" viewBox="16 22 214 157" aria-hidden="true">
           <CrabFigure />
         </svg>
         <div className="min-w-0 w-full">
