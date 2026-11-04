@@ -1152,7 +1152,7 @@ services:
   # No settings and no secrets: the image fetches /auth/v1/studio-config through the gateway, on
   # Studio's host.
   studio:
-    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-67156a233a43@sha256:eb2fc305c668cf1c2e479f9886d256340a96351aef5a8c6fc40111ddc892a067}
+    image: ${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/studio:${CHELABASE_IMAGE_TAG:-7379bf77435a@sha256:d0cc116a80b3df9697bf821587d29af6bd45b9a6b294d06bc178003a40e7ebc1}
     restart: unless-stopped
     environment:
       CHELABASE_STUDIO_PORT: "3000"
