@@ -53,8 +53,8 @@ rust_reads=(
 # The same for the web packages (their tests and builds read these; not checked by a guard).
 web_reads=(
   'openapi/management.json                                   @chelabase/management-client @chelabase/studio @chelabase/docs'
-  'openapi/data.json                                         @chelabase/studio'
-  'openapi/login.json                                        @chelabase/studio'
+  'openapi/data.json                                         @chelabase/studio @chelabase/docs'
+  'openapi/login.json                                        @chelabase/studio @chelabase/docs'
   'infra/compose/.env.example                                @chelabase/studio @chelabase/docs @chelabase/landing'
   'apps/docs/content/docs/reference/access.mdx               @chelabase/studio'
   'crates/chelabase-query/tests/fixtures/text_keys.json      @chelabase/studio'

@@ -68,7 +68,9 @@ expect 'apps/docs/content/docs/architecture/gateway.mdx' $'rust=none\nweb=@chela
 expect 'apps/docs/content/docs/reference/access.mdx' $'rust=chelabase-routes\nweb=@chelabase/studio @chelabase/docs'
 expect 'packages/client/fixtures/gen/db.ts' $'rust=chelabase-query chelabase-typegen chelabase\nweb=@chelabase/client @chelabase/docs'
 expect 'openapi/management.json' $'rust=orchestrator\nweb=@chelabase/management-client @chelabase/studio @chelabase/docs'
-expect 'openapi/data.json' $'rust=chelabase-query rest\nweb=@chelabase/studio'
+expect 'openapi/data.json' $'rust=chelabase-query rest\nweb=@chelabase/studio @chelabase/docs'
+# The docs build renders all three documents as its API reference (api-source.server.ts).
+expect_has 'openapi/login.json' web= @chelabase/docs
 expect 'infra/compose/.env.example' $'rust=realtime chelabase\nweb=@chelabase/studio @chelabase/docs @chelabase/landing'
 expect 'infra/compose/nats/nats.conf' $'rust=none\nweb=none'
 expect 'scripts/neon-images.sh' $'rust=chelabase-neon chelabase\nweb=none'
