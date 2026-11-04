@@ -78,7 +78,7 @@ grep -q 'CHELABASE_PROXY_HOSTADDR' scripts/neon-e2e.sh || fail "neon-e2e dials t
 for f in packages/neon-e2e/check.mjs packages/client/scripts/e2e.mjs; do
   grep -q 'CHELABASE_PROXY_HOSTADDR' "$f" || fail "$f dials the proxy's address"
 done
-just --show check | gq 'scripts/tests/workbench-recipes.sh' || fail "just check runs this file"
+just --show check-scripts | gq 'scripts/tests/workbench-recipes.sh' || fail "just check-scripts runs this file"
 
 # T6 review fix round.
 # C1: a curl to the proxy's serverless endpoint (<ep>.localtest.me:4444) must be routed to the
@@ -126,7 +126,7 @@ grep -q 'CHELABASE_PROXY_PORT' scripts/neon-e2e.sh ||
 just --show stack-bootstrap | gq 'cargo build -q -p init' || fail "stack-bootstrap builds chelabase-init first"
 just --show stack-bootstrap | gq -- '-p chelabase -- dev bootstrap' ||
   fail "stack-bootstrap runs the CLI's dev bootstrap"
-just --show check | gq 'scripts/tests/retired-names.sh' || fail "just check runs retired-names.sh"
+just --show check-scripts | gq 'scripts/tests/retired-names.sh' || fail "just check-scripts runs retired-names.sh"
 # W2 live: the worker's live tests share the stack (branch_live restarts its pageserver, roles_live
 # recreates its orchestrator, caps count every database), so they run one at a time, as the
 # retired worker-live recipe's --test-threads=1 did; a nextest test group holds them to one.
@@ -147,5 +147,5 @@ grep -B3 -A3 'test-group = "stack-serial"' "$nextest" | gq -F 'package(chelabase
 dev_hits="$(grep -nE 'chelabase-dev-[a-z]' "${scripts[@]}" | grep -v '^scripts/compute-network-e2e\.sh:' || true)"
 [[ -z "$dev_hits" ]] || fail "scripts fall back to a public development bearer:
 $dev_hits"
-just --show check | gq 'scripts/tests/compose-secret-argv.sh' || fail "just check runs compose-secret-argv.sh"
+just --show check-scripts | gq 'scripts/tests/compose-secret-argv.sh' || fail "just check-scripts runs compose-secret-argv.sh"
 echo "workbench-recipes: ok"

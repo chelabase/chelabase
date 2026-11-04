@@ -93,7 +93,12 @@ deny-install:
 deny:
     cargo deny check advisories
 
-check:
+# Everything CI checks offline: the shell script tests, the Rust checks and the web checks.
+# CI runs the same recipes, each limited to what a pull request affects (scripts/ci-affected.sh).
+check: check-scripts check-rust check-web
+
+# The shell script tests (offline; they need docker compose, cargo and an installed pnpm workspace)
+check-scripts:
     scripts/tests/entry-urls.sh
     scripts/tests/entry-sh.sh
     scripts/tests/stack-urls.sh
@@ -113,27 +118,74 @@ check:
     scripts/tests/compose-image-pins.sh
     scripts/tests/image-inputs.sh
     scripts/image-inputs.sh copies
+    scripts/tests/ci-affected.sh
+
+# cargo-deny, check, clippy, nextest and doctests: the whole workspace, or only the given packages
+# (`just check-rust gateway chelabase-routes`)
+check-rust *packages:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ $# -eq 0 ]]; then
+      sel=(--workspace) doc=(--workspace) no_tests=()
+    else
+      sel=() doc=() no_tests=(--no-tests=warn)
+      libs=" $(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(any(.targets[].kind[]; . == "lib" or . == "proc-macro")) | .name' | tr '\n' ' ') "
+      for p in "$@"; do
+        sel+=(-p "$p")
+        # `cargo test --doc -p` fails on a package without a library (init, the CLI).
+        if [[ "$libs" == *" $p "* ]]; then doc+=(-p "$p"); fi
+      done
+    fi
+    set -x
     just deny
-    cargo check --workspace
-    cargo clippy --workspace --all-targets -- -D warnings
-    cargo nextest run --workspace
-    pnpm --filter @chelabase/management-client generate
-    pnpm --filter @chelabase/studio generate:login
-    test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
-    pnpm --filter @chelabase/management-client typecheck
-    pnpm --filter @chelabase/management-client test
-    pnpm --filter @chelabase/studio typecheck
-    pnpm --filter @chelabase/studio test
-    pnpm --filter @chelabase/client typecheck
-    pnpm --filter @chelabase/client test
-    pnpm --filter @chelabase/design typecheck
-    pnpm --filter @chelabase/design test
-    pnpm --filter @chelabase/docs typecheck
-    pnpm --filter @chelabase/docs build
-    pnpm --filter @chelabase/docs test
-    pnpm --filter @chelabase/landing typecheck
-    pnpm --filter @chelabase/landing build
-    pnpm --filter @chelabase/landing test
+    cargo check "${sel[@]}"
+    cargo clippy "${sel[@]}" --all-targets -- -D warnings
+    cargo nextest run "${sel[@]}" "${no_tests[@]}"
+    if [[ ${#doc[@]} -gt 0 ]]; then cargo test "${doc[@]}" --doc; fi
+
+# The generated-code check and each web package's typecheck, tests and build: all of them, or only
+# the given pnpm packages (`just check-web @chelabase/design`), always in this order
+check-web *packages:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    all=(@chelabase/management-client @chelabase/studio @chelabase/client @chelabase/design @chelabase/docs @chelabase/landing)
+    want=" ${*:-${all[*]}} "
+    for p in $want; do
+      [[ " ${all[*]} " == *" $p "* ]] || { echo "check-web: $p is not one of: ${all[*]}" >&2; exit 1; }
+    done
+    on() { [[ "$want" == *" $1 "* ]]; }
+    set -x
+    if on @chelabase/management-client || on @chelabase/studio; then
+      pnpm --filter @chelabase/management-client generate
+      pnpm --filter @chelabase/studio generate:login
+      test -z "$(git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi)" || { git status --porcelain -- packages/management-client/src/generated apps/studio/src/lib/login-client/generated openapi; echo "generated code is stale: run just api-gen and commit"; exit 1; }
+    fi
+    if on @chelabase/management-client; then
+      pnpm --filter @chelabase/management-client typecheck
+      pnpm --filter @chelabase/management-client test
+    fi
+    if on @chelabase/studio; then
+      pnpm --filter @chelabase/studio typecheck
+      pnpm --filter @chelabase/studio test
+    fi
+    if on @chelabase/client; then
+      pnpm --filter @chelabase/client typecheck
+      pnpm --filter @chelabase/client test
+    fi
+    if on @chelabase/design; then
+      pnpm --filter @chelabase/design typecheck
+      pnpm --filter @chelabase/design test
+    fi
+    if on @chelabase/docs; then
+      pnpm --filter @chelabase/docs typecheck
+      pnpm --filter @chelabase/docs build
+      pnpm --filter @chelabase/docs test
+    fi
+    if on @chelabase/landing; then
+      pnpm --filter @chelabase/landing typecheck
+      pnpm --filter @chelabase/landing build
+      pnpm --filter @chelabase/landing test
+    fi
 
 # Rust tests (nextest, one process per test) plus doctests, which nextest does not run.
 # The ignored live tests run on the stack with `just workbench test`.

@@ -113,7 +113,7 @@ Run `just` to list them all. Each checkout (the main one and every worktree) has
 
 | Command | What it does |
 | --- | --- |
-| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, the identity image's licences against `THIRD_PARTY_NOTICES.md`, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too) |
+| `just check` | The offline script checks in `scripts/tests/` (entry URLs, the compose files and their secrets, the image pins, retired names, the identity image's licences against `THIRD_PARTY_NOTICES.md`, …), `just deny`, `cargo check`, `cargo clippy -D warnings`, `cargo nextest run`, the doctests, the generated-code freshness check (`just api-gen` if it fails), and typecheck plus tests for the TypeScript packages, Studio, the docs site and the landing page (the sites are built too). It runs `just check-scripts`, `just check-rust` and `just check-web`; the last two also take packages (`just check-rust gateway`, `just check-web @chelabase/design`) |
 | `just test` | Rust tests with nextest, then doctests |
 | `just api-gen` | Regenerate `openapi/*.json` and the generated clients. Never edit those by hand |
 | `just deny` / `just deny-install` | RustSec advisories and yanked crates against `Cargo.lock`; install the pinned cargo-deny |
@@ -300,17 +300,17 @@ Some Rust tests are `#[ignore]`d because they need the stack. Run them on your c
 
 ## CI (GitHub Actions)
 
-Four workflows in `.github/workflows/`, each also runnable by hand (`workflow_dispatch`): `ci.yml` on every pull request and push to `main`; `live.yml` nightly and on a pull request labelled `run-live`; the two deploy workflows on a merge to `main` that touches their site. None uses `pull_request_target`, and all have `permissions: contents: read`. `ci.yml` and `live.yml` use no secret; the two deploy workflows read `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the `production` environment and run on `main` only. Actions are pinned to commit SHAs.
+Four workflows in `.github/workflows/`, each also runnable by hand (`workflow_dispatch`): `ci.yml` on every pull request and push to `main` and nightly; `live.yml` nightly and on a pull request labelled `run-live`; the two deploy workflows on a merge to `main` that touches their site. None uses `pull_request_target`, and all have `permissions: contents: read`. `ci.yml` and `live.yml` use no secret; the two deploy workflows read `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the `production` environment and run on `main` only. Actions are pinned to commit SHAs.
 
 | Workflow | What it runs |
 | --- | --- |
-| `ci.yml` | On ubuntu-latest: the toolchain from `.prototools` (via `moonrepo/setup-toolchain`), the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2, then `just check` and the doctests (`cargo test --workspace --doc`, all `just test` adds) |
+| `ci.yml` | On ubuntu-latest, with the toolchain from `.prototools` (via `moonrepo/setup-toolchain`): `just check-scripts` always; `just check-rust` (with the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2) and `just check-web` for what the change affects, as `scripts/ci-affected.sh` decides from the diff (a pull request against its base, a push to `main` against the commit before it); the nightly and manual runs check everything. The three recipes are what `just check` runs. The `ci` job passes when every check that ran passed |
 | `live.yml` | `just workbench up`, every recipe in *Live recipes on the workbench* except `bench-data-api`; the self-hosted e2e and the live Rust tests (`--run-ignored`) are not run (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
 | `landing-deploy.yml`, `docs-deploy.yml` | `scripts/deploy-site.sh landing` or `docs`: builds the site and deploys it to Cloudflare (see *Deploying the landing page and docs*) |
 
 The deploy workflows need the `production` environment's two secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (the token as in *Deploying the landing page and docs*). Security reports arrive through private vulnerability reporting (Security → Advisories), which `SECURITY.md` points reporters at.
 
-`main` is protected by a repository ruleset: every change lands as a squash-merged pull request whose `just check, doctests` job passed. No approval is required, force pushes and deletion are refused, and an admin can bypass only through a pull request.
+`main` is protected by a repository ruleset: every change lands as a squash-merged pull request whose `ci` job passed. No approval is required, force pushes and deletion are refused, and an admin can bypass only through a pull request.
 
 **Checking a workflow without Actions minutes:** `actionlint` for syntax and expressions, and `act` to run it in Docker (both are single binaries from their GitHub releases; install them outside the repo):
 
