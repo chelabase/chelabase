@@ -1,6 +1,6 @@
 # Draft: report to Neon, event-trigger privilege escalation (not yet sent)
 
-**Not sent: decided by the user on 2026-10-03 (upstream Neon is frozen and has no disclosure process). The fix is public in chelabase/neon-pre-replay PR #14 (with a second gap closed: the check no longer depends on `neon.event_triggers`).**
+**Not sent: decided by the user on 2026-10-03 (upstream Neon is frozen and has no disclosure process). The fix is in the `chelabase/neon` fork, landed before its 2026-10-04 history replay (with a second gap closed: the check no longer depends on `neon.event_triggers`).**
 
 **Status:** draft for the user to send. Private; keep it out of the public fork repos until the embargo ends (see the fork plan's Status block).
 **Send to:** `security@neon.tech`, or through Neon's HackerOne program (`https://hackerone.com/neon_bbp`), per `https://neon.com/security`. GitHub private vulnerability reporting is disabled on `neondatabase/neon`.
