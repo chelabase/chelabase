@@ -79,7 +79,7 @@ describe("LandingPage", () => {
   it("the_platform_cards_lead_with_databases_studio_auth_and_realtime_and_link_to_their_docs", () => {
     renderPage();
     const section = screen.getByRole("region", { name: "Everything in one place." });
-    const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace("Coming soon", ""));
+    const names = within(section).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace(/Coming soon|Soon/g, ""));
     expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
     expect(names.slice(-2)).toEqual(["CLI", "Object storage"]);
     const gateway = within(section).getByRole("link", { name: /^Gateway/ });

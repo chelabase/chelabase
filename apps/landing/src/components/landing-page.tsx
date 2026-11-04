@@ -427,8 +427,14 @@ function PieceBody({ piece: p }: { piece: Piece }) {
       <h3 className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5 mt-2 font-serif font-semibold leading-[1.3] text-[1.25rem] max-[560px]:mt-0 max-[560px]:text-[1.1rem]">
         {p.title}
         {p.soon && (
-          <span className="inline-block px-2.25 py-px border-[1.5px] border-dashed border-coral rounded-full font-sans text-[0.8rem] font-semibold text-coral whitespace-nowrap">
-            Coming soon
+          // On a phone tile the chip takes the corner a linked tile gives its arrow, so the name
+          // keeps its line and every tile stays the same height. Under 400px it says only "Soon"
+          // beside the icon; screen readers still hear "Coming soon".
+          <span className="inline-block px-2.25 py-px border-[1.5px] border-dashed border-coral rounded-full font-sans text-[0.8rem] font-semibold text-coral whitespace-nowrap max-[560px]:absolute max-[560px]:top-4 max-[560px]:right-4 max-[560px]:px-1.75 max-[560px]:border max-[560px]:text-[0.7rem] max-[560px]:leading-[1.5]">
+            <span className="max-[400px]:sr-only">Coming soon</span>
+            <span className="hidden max-[400px]:inline" aria-hidden="true">
+              Soon
+            </span>
           </span>
         )}
         {p.to && (
