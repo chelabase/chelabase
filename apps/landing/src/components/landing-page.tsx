@@ -1,4 +1,5 @@
 import { createContext, useContext, useRef, type ReactNode } from "react";
+import { useScrollHint } from "./scroll-hint";
 import {
   Archive,
   ArrowUpRight,
@@ -269,9 +270,8 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
             Manage, collaborate, iterate. On Postgres.
           </p>
           <p className="mt-2.5 max-w-160 text-chalk-dim text-[1.125rem] text-pretty">
-            An open-source Postgres platform you run yourself. Branch, merge and restore databases, give your team access
-            Postgres itself enforces, and query from your app with a typed client. Chelabase's own services are written in
-            Rust.
+            An open-source Postgres platform you can run yourself. Branch, merge and restore databases, give your team access
+            Postgres itself enforces, and query from your app with a typed client. Its core services are written in Rust.
           </p>
           <Actions docsUrl={docsUrl} className="mt-6 short:mt-4.5" />
           {/* the same notice the README, docs and Studio carry */}
@@ -358,7 +358,7 @@ const PIECES: Piece[] = [
     id: "realtime",
     icon: Radio,
     title: "Realtime",
-    body: "Pushes changed rows and presence over a WebSocket as keys only, so each row is read again as the viewer's role.",
+    body: "Pushes changed rows and presence to Studio over a WebSocket as keys only, so each row is read again as the viewer's role.",
     to: "architecture/realtime",
   },
   {
@@ -393,7 +393,7 @@ const PIECES: Piece[] = [
     id: "cli",
     icon: SquareTerminal,
     title: "CLI",
-    body: "A script you install for quick setup and management from the terminal: generate types, run migrations and more. Not available yet.",
+    body: "A command-line tool for setup and management from the terminal: generate types, run migrations and more. Not available yet.",
     soon: true,
   },
   {
@@ -453,8 +453,8 @@ function Pieces({ docsUrl }: SectionProps) {
           Everything in one place.
         </h2>
         <p className={`${SECTION_LEDE} text-chalk-dim`}>
-          Every Chelabase backend service is built in Rust, and so is Neon's storage engine under Postgres: small
-          native services that run together on one machine.
+          Chelabase's core services are built in Rust, and so is Neon's storage engine under Postgres. Accounts live in a
+          small internal Identity service on Better Auth. It all runs together on one machine.
         </p>
         <ul className="mt-11 grid grid-cols-2 gap-4 max-[900px]:grid-cols-1 max-[560px]:grid-cols-2 max-[560px]:gap-3 max-[560px]:mt-8">
           {PIECES.map((p) => (
@@ -486,7 +486,7 @@ const MANAGE_NOTES = [
   },
   {
     title: "A SQL editor with a guard",
-    body: "It asks before risky statements, runs as the owner or as a role you pick, and keeps saved queries and history for the project.",
+    body: "It asks before risky statements, runs as the owner or as a role you pick, and keeps saved queries per database, shared with the project, with your run history in your browser.",
   },
   {
     title: "Credentials you can see again",
@@ -627,8 +627,9 @@ function YourApp() {
             Build your app on a typed API.
           </h2>
           <p className={`${SECTION_LEDE} text-chalk-dim ${CODE_ON_INK}`}>
-            One endpoint, <code>POST /data/v1/query</code>, and a client with types fetched from your schema. Queries run
-            as <code>anon</code> or <code>authenticated</code>, so row-level security decides what each user sees.
+            One endpoint, <code>POST /data/v1/query</code>, and a client with types fetched from your schema. Public-key
+            queries run as <code>anon</code> or <code>authenticated</code>, so row-level security decides what each user sees.
+            The client isn't on npm yet: use it from the repository.
           </p>
           <Notes notes={APP_NOTES} />
         </div>
@@ -672,7 +673,7 @@ const INSTALL_STEPS: Array<{ title: string; body: ReactNode }> = [
     title: "Start it",
     body: (
       <>
-        <code>docker compose up -d --wait</code>. You need Docker Engine 26 and Compose 2.30 or newer, nothing else.
+        <code>docker compose up -d --wait</code>. You need Docker Engine 26 and Compose 2.30 or newer, and room for about 26 containers.
       </>
     ),
   },
@@ -685,14 +686,16 @@ const INSTALL_STEPS: Array<{ title: string; body: ReactNode }> = [
 
 function InstallTerminal({ className = "" }: { className?: string }) {
   return (
-    <CodeInset label="Your terminal" note="from the README" className={className}>
+    <CodeInset label="Your terminal" note="Install" className={className}>
       <F>git</F> clone https://github.com/chelabase/chelabase.git{"\n"}
       <F>cd</F> chelabase/infra/compose{"\n"}
       <F>cp</F> .env.example .env{"\n"}
       <F>docker</F> compose up -d --wait{"\n"}
       <F>docker</F> compose logs init-secrets <C># your setup code</C>
       {"\n\n"}
-      <C># want a populated demo? add -f docker-compose.example.yml</C>
+      <C># want a populated demo instead? on a fresh stack:</C>
+      {"\n"}
+      <C># docker compose -f docker-compose.yml -f docker-compose.example.yml up -d --wait</C>
       {"\n"}
       <C># then open http://studio.chelabase.localhost:8000</C>
     </CodeInset>
@@ -731,52 +734,71 @@ function Install() {
 
 /* ---------- Compare ---------- */
 
-type Mark = "yes" | "partial" | "soon" | "no" | "other" | "unknown";
+type Mark = "yes" | "partial" | "soon" | "no";
+/** A cell: a mark, or a product that solves it another way, named in a short note. */
+type Cell = Mark | { other: string };
 
 const MARK_TEXT: Record<Mark, string> = {
   yes: "Yes",
   partial: "Partly",
   soon: "Coming soon",
   no: "No",
-  other: "Different model",
-  unknown: "To survey",
 };
 
-/** The mark's colour; its glyph (`.mark--*::before`) is drawn in landing.css. */
-const MARK_CLASS: Record<Mark, string> = {
+/** The mark's colour; its glyph (`.mark--*::before`) is drawn in landing.css. A note is chalk, not
+ *  chalk-dim, so another approach never reads as "No". */
+const MARK_CLASS: Record<Mark | "other", string> = {
   yes: "text-seafoam",
   partial: "text-sand",
   soon: "text-coral",
   no: "text-chalk-dim",
-  other: "text-chalk-dim",
-  unknown: "text-chalk-dim italic font-serif",
+  other: "text-chalk",
 };
 
 const CELL = "p-3.5 text-left";
-/** The row names stay in view while a phone scrolls the products sideways. */
-const ROW_HEAD = "sticky left-0 z-1 bg-ink min-w-36 max-[560px]:pl-0";
-const HEAD = "pb-3 border-b-2 border-line-strong font-serif font-semibold text-[1.1rem]";
+/** The row names stay in view while a phone scrolls the products sideways: opaque, unlike the
+ *  products' cells, with an inset edge since a collapsed border doesn't stick with the cell. */
+const ROW_HEAD = "sticky left-0 z-1 min-w-36 min-[561px]:min-w-48 shadow-[inset_-1px_0_0_var(--line)] max-[560px]:pl-2.5";
+/** Zebra rows; the sticky row name takes its row's ground. */
+const STRIPE = ["bg-ink", "bg-channel"] as const;
+/** Rules between columns only: the stripes separate the rows. */
+const COLUMN_RULE = "border-l border-line";
+/** Chelabase's column: a sand band edged in sand, from the header down. */
+const BAND = "bg-sand/8 border-x border-sand/40";
+const HEAD = "pb-3 border-b-2 border-b-line-strong font-serif font-semibold text-[1.1rem]";
 
 const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"] as const;
 
-type Marks = [Mark, Mark, Mark, Mark, Mark, Mark];
+type Cells = [Cell, Cell, Cell, Cell, Cell, Cell];
 
-const ROWS: Array<{ label: string; marks: Marks }> = [
-  { label: "Postgres", marks: ["yes", "yes", "other", "yes", "yes", "other"] },
-  { label: "Copy-on-write branches", marks: ["yes", "other", "no", "yes", "no", "no"] },
-  { label: "Schema merge between branches", marks: ["yes", "partial", "no", "no", "no", "yes"] },
-  { label: "Point-in-time restore", marks: ["yes", "yes", "yes", "yes", "yes", "no"] },
-  { label: "Protected branches", marks: ["yes", "no", "no", "yes", "partial", "yes"] },
-  { label: "Self-hostable", marks: ["yes", "partial", "no", "no", "no", "no"] },
-  { label: "Typed query API", marks: ["yes", "yes", "other", "yes", "no", "no"] },
-  { label: "App-user auth, server rendering included", marks: ["yes", "yes", "yes", "yes", "no", "no"] },
-  { label: "Team access through Postgres roles", marks: ["yes", "other", "other", "other", "other", "other"] },
-  { label: "Table and SQL editors", marks: ["yes", "yes", "partial", "yes", "partial", "partial"] },
-  { label: "Live rows", marks: ["yes", "yes", "yes", "partial", "no", "no"] },
-  { label: "Object storage", marks: ["soon", "yes", "yes", "yes", "no", "no"] },
+const ROWS: Array<{ label: string; cells: Cells }> = [
+  { label: "Postgres", cells: ["yes", "yes", "yes", "yes", "yes", { other: "MySQL" }] },
+  { label: "Copy-on-write branches", cells: ["yes", { other: "Schema-only branches" }, "no", "yes", "no", "no"] },
+  { label: "Schema merge between branches", cells: ["yes", "partial", "no", "no", "no", "yes"] },
+  { label: "Protected branches", cells: ["yes", "no", "no", "yes", "partial", "yes"] },
+  { label: "Point-in-time restore", cells: ["yes", "yes", "yes", "yes", "yes", "no"] },
+  { label: "Self-hostable", cells: ["yes", "partial", "no", "partial", "no", "no"] },
+  {
+    label: "Team access enforced by Postgres",
+    cells: ["yes", { other: "Dashboard roles" }, { other: "Cloud IAM" }, { other: "Org roles" }, { other: "Org roles" }, { other: "Org roles" }],
+  },
+  { label: "Typed query API", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "App-user auth, with SSR", cells: ["yes", "yes", "yes", "yes", "no", "no"] },
+  { label: "Table and SQL editors", cells: ["yes", "yes", "partial", "yes", "partial", "partial"] },
+  { label: "Live rows in the editor", cells: ["yes", "no", "yes", "no", "no", "no"] },
+  { label: "Realtime for your app", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
+  { label: "Object storage", cells: ["soon", "yes", "yes", "yes", "no", "no"] },
 ];
 
+function CompareCell({ cell }: { cell: Cell }) {
+  const kind = typeof cell === "string" ? cell : "other";
+  const text = typeof cell === "string" ? MARK_TEXT[cell] : cell.other;
+  return <span className={`mark mark--${kind} flex items-center gap-2 whitespace-nowrap ${MARK_CLASS[kind]}`}>{text}</span>;
+}
+
 function Compare() {
+  const scroller = useRef<HTMLDivElement>(null);
+  const { scrollable, more } = useScrollHint(scroller);
   return (
     <Band labelledby="compare-title">
       <div className={SECTION_INNER}>
@@ -791,43 +813,59 @@ function Compare() {
           <p className="inline-block mb-5.5 px-3.5 py-1.5 border-2 border-coral rounded-md text-coral font-serif font-bold text-[0.95rem] -rotate-[1.5deg]">
             Comparison preview — benchmarks coming later
           </p>
-          {/* focusable so a keyboard can scroll the columns a phone cuts off */}
-          <div className={`overflow-x-auto ${FOCUS}`} tabIndex={0} role="region" aria-label="Comparison table">
-            <table className="w-full min-w-200 border-collapse text-[0.97rem]" aria-label="Comparison preview">
-              <thead>
-                <tr>
-                  <td className={`${CELL} ${ROW_HEAD} align-middle`} />
-                  {COLUMNS.map((c) => (
-                    <th key={c} scope="col" className={`${CELL} ${HEAD} align-bottom`}>
-                      {/* Chelabase's own column is set in the wordmark, which is taller; the names align on the bottom. */}
-                      {c === "Chelabase" ? <Wordmark visualClassName="translate-y-[0.24em]" clawClassName={`h-[1.32em] ${CLAW}`} /> : c}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody>
-                {ROWS.map((r, row) => {
-                  const rule = `align-middle ${row > 0 ? "border-t border-line" : ""}`;
-                  return (
-                    <tr key={r.label}>
-                      <th scope="row" className={`${CELL} ${rule} ${ROW_HEAD} w-[20%] font-semibold text-chalk`}>
-                        {r.label}
+          <div className="relative">
+            {/* focusable while it scrolls, so a keyboard can reach the columns a phone cuts off */}
+            <div
+              ref={scroller}
+              className={`compare-scroll overflow-x-auto ${FOCUS}`}
+              tabIndex={scrollable ? 0 : undefined}
+              role="region"
+              aria-label="Comparison table"
+            >
+              <table className="w-full min-w-200 border-collapse text-[0.97rem]">
+                <caption className="sr-only">Comparison preview</caption>
+                <thead>
+                  <tr>
+                    <td className={`${CELL} ${ROW_HEAD} bg-ink align-middle`} />
+                    {COLUMNS.map((c, i) => (
+                      <th key={c} scope="col" className={`${CELL} ${HEAD} ${i === 0 ? `${BAND} border-t` : COLUMN_RULE} align-bottom`}>
+                        {/* Chelabase's own column is set in the wordmark, which is taller; the names align on the bottom. */}
+                        {c === "Chelabase" ? <Wordmark visualClassName="translate-y-[0.24em]" clawClassName={`h-[1.32em] ${CLAW}`} /> : c}
                       </th>
-                      {r.marks.map((m, i) => (
-                        <td key={COLUMNS[i]} className={`${CELL} ${rule} ${i === 0 ? "bg-sand/5" : ""}`}>
-                          <span className={`mark mark--${m} flex items-center gap-2 ${MARK_CLASS[m]}`}>{MARK_TEXT[m]}</span>
-                        </td>
-                      ))}
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {ROWS.map((r, row) => {
+                    const stripe = STRIPE[row % 2];
+                    return (
+                      <tr key={r.label} className={stripe}>
+                        <th scope="row" className={`${CELL} ${ROW_HEAD} ${stripe} align-middle w-[20%] font-semibold text-chalk`}>
+                          {r.label}
+                        </th>
+                        {r.cells.map((cell, i) => (
+                          <td key={COLUMNS[i]} className={`${CELL} align-middle ${i === 0 ? BAND : COLUMN_RULE}`}>
+                            <CompareCell cell={cell} />
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {/* more columns to the right: a fade over the cut edge, gone once scrolled to the end */}
+            <div
+              aria-hidden="true"
+              className={`pointer-events-none absolute inset-y-0 right-0 w-14 bg-linear-to-l from-ink to-transparent transition-opacity duration-200 ${more ? "opacity-100" : "opacity-0"}`}
+            />
           </div>
           <p className="mt-4.5 max-w-[70ch] text-chalk-dim text-[0.95rem]">
-            From each product's docs, October 2026. Supabase's merge requests and Neon's realtime are in beta; Neon's
-            schema diff compares branches but doesn't merge them. PlanetScale merges schema through deploy requests on
-            MySQL (Vitess) only.
+            From each product's docs, November 2026. Neon's realtime and object storage are in beta; Neon's schema diff
+            compares branches but doesn't merge them. Supabase merges a branch into production through a schema diff,
+            and self-hosted Supabase runs one project without branching or point-in-time restore. PlanetScale merges
+            schema through deploy requests on MySQL (Vitess) only. Firebase's Postgres is SQL Connect (Cloud SQL for
+            PostgreSQL, with typed SDKs). Neon's storage engine is open source, but its control plane isn't.
           </p>
         </div>
       </div>

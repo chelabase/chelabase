@@ -12,11 +12,11 @@ This section describes how the parts fit together. For how to use them, start wi
 ```
 apps/studio          the web app (the only user-facing app)
 apps/docs            this documentation site
-services/            gateway, orchestrator, worker, rest, auth, realtime, identity
+services/            gateway, orchestrator, worker, rest, auth, realtime, identity, init
 tools/cli            the `chelabase` binary (dev bootstrap, token minting, type generation)
 tools/bench-data-api the data API benchmark harness
 crates/              shared Rust libraries
-packages/            shared TypeScript packages (client, management-client, neon-e2e)
+packages/            shared TypeScript packages (client, management-client, design, neon-e2e)
 openapi/             the generated OpenAPI documents
 infra/compose/       Docker Compose: metadata Postgres, NATS JetStream, Valkey, the identity service, Mailpit, Neon storage
 infra/neon/          Neon image pins and build scripts
@@ -46,7 +46,7 @@ NATS JetStream carries the jobs, a metadata Postgres holds the control plane's o
 All API traffic enters through the gateway. It checks the credential (a member access token for the Management API, a data API key for the data API), then calls the owning service with a short-lived internal identity token. Services never see the client's own credential, and they trust only the gateway's token. Postgres connections do not go through the gateway: they reach each database through Neon's proxy.
 
 ```
-client ──HTTP──▶ gateway ──identity token──▶ orchestrator | auth | rest
+client ──HTTP──▶ gateway ──identity token──▶ orchestrator | auth | rest | realtime
 client ──Postgres wire / SQL over HTTP──▶ Neon proxy ──▶ compute ◀── pageserver, safekeepers
 ```
 

@@ -8,7 +8,7 @@ This page starts a local stack with a demo organisation already in place: a proj
 <Callout type="warn">
 **Local demo only.** Every account in the demo uses one published password, `Acme-Demo-2026!`. Anyone who can reach the stack can sign in as any of them. Run it on your own machine and do not expose it.
 
-The seed refuses to run unless the three hosts are `localhost` or `*.localhost` and the gateway listens only on loopback (`127.0.0.1`). It also refuses an instance that someone else has already claimed.
+The seed refuses to run unless the three hosts are `localhost` or `*.localhost` and both the gateway and the Postgres proxy are published only on loopback. It also refuses a stack that requires email verification, and an instance that someone else has already claimed.
 </Callout>
 
 ## Start it

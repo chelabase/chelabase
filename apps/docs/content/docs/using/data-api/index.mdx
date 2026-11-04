@@ -11,8 +11,9 @@ Apps read and write a branch's tables over `POST /data/v1/query` with per-branch
 |---|---|
 | `POST /data/v1/query` | Runs one operation (or a batch) from a JSON tree. See [Query language](/docs/using/data-api/query-language). |
 | `GET /data/v1/schema` | Describes what the key's role can reach. `?database=<name>` picks another served database; the response's `databases` lists the served databases the key reaches. |
+| `GET /data/v1/types` | The generated `db.ts` (or JSON with `format=json`) for the key's schema. See [Generated types](/docs/using/client/types). |
 
-Both take the key in the `Authorization: Bearer <key>` header. Requests go to the gateway (`http://api.chelabase.localhost:8000` in development).
+All three take the key in the `Authorization: Bearer <key>` header. `GET /data/v1/schema` and `GET /data/v1/types` need a secret key: a public key gets 401 `unauthorized`. Requests go to the gateway (`http://api.chelabase.localhost:8000` in development).
 
 ```bash
 curl -s http://api.chelabase.localhost:8000/data/v1/query \

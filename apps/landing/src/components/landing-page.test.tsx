@@ -115,7 +115,7 @@ describe("LandingPage", () => {
       .map((h) => h.querySelector(".sr-only")?.textContent ?? h.textContent);
     expect(headers).toEqual(COLUMNS);
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows).toHaveLength(12);
+    expect(rows).toHaveLength(13);
     for (const r of rows) expect(within(r).getAllByRole("cell")).toHaveLength(COLUMNS.length);
     expect(table.textContent).not.toMatch(/to survey/i);
     const merge = rows.find((r) => within(r).getByRole("rowheader").textContent === "Schema merge between branches")!;

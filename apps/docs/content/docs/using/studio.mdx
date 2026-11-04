@@ -3,7 +3,7 @@ title: Studio tour
 description: What each Studio screen does, from signing in to the Table editor and the SQL editor.
 ---
 
-Studio is Chelabase's web app. In a local stack it runs at `http://studio.chelabase.localhost:8000` (`just workbench up` starts it). Everything it does goes through the gateway on `:8000` with your member access token, so anything you can click you can also do through the Management API (the reference is in Studio's **API** page and under Reference in these docs).
+Studio is Chelabase's web app. In a local stack it runs at `http://studio.chelabase.localhost:8000` (`just workbench up` starts it). Everything it does goes through the gateway on `:8000` with your member access token, so anything you can click you can also do through the Management API (the reference is in Studio's **API reference** page and under Reference in these docs).
 
 <Callout type="info">
 Open Studio at `studio.chelabase.localhost:8000`, not an IP address: the gateway routes by host name, and the sign-in redirect and the gateway's CORS origin are registered for that host.
@@ -20,25 +20,28 @@ Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/ver
 
 ## Projects
 
-The dashboard lists your tenant's projects, with **New project**. Opening a project shows three tabs:
+The dashboard lists your tenant's projects, with **New project**. Opening a project shows up to four tabs:
 
 - **Databases**: the project's databases and a form to create one.
 - **Users**: the project's [app users](/docs/using/app-users). It appears once app users are enabled.
+- **Access**: who has which role on the project, **Add people**, per-database narrowing and **Access changes**.
 - **Settings**: the project name, [App users](/docs/using/app-users) (enable, change or disable) and a danger zone that deletes the project and every database in it.
 
 ## Databases
 
-The **Databases** tab lists each database with its status and endpoint. **Connection details** shows the owner's host, port, user, password and URI; **Reset password** sets a new owner password; **Delete** destroys the database with all its branches and data (you type its name to confirm). The five buttons on a row open a panel under it, once the database is `ready`:
+The **Databases** tab lists each database with its status and endpoint. Each row has **Reset password** and **Delete** (Admin), and **Branches**, **Merges**, **Connect** and **Open**. **Reset password** sets a new owner password; **Delete** destroys the database with all its branches and data (you type its name to confirm). **Open** goes to the [Table editor](/docs/using/table-editor). The other three open a panel under the row, once the database is `ready`:
 
-- **Branches**: the branch tree with each branch's status and endpoint, a form for a new branch, and the database's settings (history window, branch limit, max rows, statement timeout, max connections). Each branch has **Connection details**, **Reset password**, **Protect** or **Unprotect**, **Reset to parent**, **Restore**, **Delete branch**, **Roles** and, with a parent, **Merge into** and **Update from** it (see [Merging schema](/docs/using/merging-schema#in-studio)). A disabled action says why next to the buttons; while a schema merge holds the branch, a link opens the merge. See [Branches](/docs/using/branches) and [Login roles](/docs/using/login-roles).
+- **Branches**: the branch tree with each branch's status and endpoint, a form for a new branch, and the database's settings (history window, branch limit, max rows, statement timeout, max connections). Each branch has **Connection details**, **Reset password**, **Protect** (or, once protected, **Protection** and **Unprotect**), **Reset to parent**, **Restore**, **Delete branch**, **Roles** and, with a parent, **Merge into** and **Update from** it (see [Merging schema](/docs/using/merging-schema#in-studio)). A disabled action says why next to the buttons; while a schema merge holds the branch, a link opens the merge. See [Branches](/docs/using/branches) and [Login roles](/docs/using/login-roles).
 - **Merges**: the database's schema merges, newest first, each opening its [merge page](/docs/using/merging-schema#in-studio).
-- **Data API**: the endpoint, the public key (with **Rotate public key**), secret keys, and per-database access. See [Data API](/docs/using/data-api).
-- **Tables**: opens the [Table editor](/docs/using/table-editor).
-- **SQL**: the [SQL editor](/docs/using/sql-editor).
+- **Connect**: the owner's connection (Admin), a link to your personal Postgres login, and the Data API endpoint and public key, with **Manage Data API**.
+
+## Data API
+
+The **Data API** page in the left rail has the endpoint and public key (with **Rotate public key**), the Postgres databases it serves, secret keys, row-level security and generated types. See [Data API](/docs/using/data-api).
 
 ### RLS warning
 
-The Data API panel lists every table, view or foreign table that `anon` or `authenticated` can reach without row-level security protecting it, with a button to copy the SQL that fixes it:
+The Data API page's **Row-level security** card lists every table, view or foreign table that `anon` or `authenticated` can reach without row-level security protecting it, with a button to copy the SQL that fixes it:
 
 - a table with RLS off: `ALTER TABLE … ENABLE ROW LEVEL SECURITY`;
 - a view that runs with its owner's rights: `ALTER VIEW … SET (security_invoker = true)`;
@@ -65,7 +68,7 @@ Over the API, the console is `POST /v1/databases/{id}/branches/{branch_id}/conso
 
 ## API reference
 
-The **API** link in the header opens the Management API reference, with a **Try it out** that uses your signed-in token. Nothing on that page calls an outside service.
+The **API reference** item in the left rail opens the Management, Data and Auth API references, each with **Try it out**; only the Management reference fills in your signed-in token. Nothing on that page calls an outside service.
 
 ## How Studio behaves
 
@@ -73,4 +76,4 @@ The **API** link in the header opens the Management API reference, with a **Try 
 - A write refreshes exactly the data it changes.
 - Secrets (connection details, passwords, created or rotated API keys) never enter Studio's query or mutation cache or any stored state. They live in the open panel and disappear when it closes. Keys are shown once, at creation or rotation.
 - The SQL editor keeps its run history, open buffer and timeout in your browser's `localStorage`.
-- Studio is English-only and light-only today.
+- Studio is English-only and dark-only today.

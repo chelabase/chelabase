@@ -11,6 +11,8 @@ set -euo pipefail
 
 WRANGLER_VERSION=4.156.0
 DOCS_URL=https://docs.chelabase.com
+# Cloudflare Web Analytics site token: public (it ships in every page), set only on the published build.
+ANALYTICS_TOKEN=88dc7f88f5f147d8a963a328db550e04
 
 app="${1:-}"
 mode="${2:-deploy}"
@@ -39,9 +41,9 @@ fi
 
 if [[ "${app}" == landing ]]; then
   # Docs links point at the live docs site instead of GitHub.
-  VITE_DOCS_URL="${DOCS_URL}" pnpm --filter @chelabase/landing build
+  VITE_DOCS_URL="${DOCS_URL}" VITE_CF_ANALYTICS_TOKEN="${ANALYTICS_TOKEN}" pnpm --filter @chelabase/landing build
 else
-  pnpm --filter @chelabase/docs build
+  VITE_CF_ANALYTICS_TOKEN="${ANALYTICS_TOKEN}" pnpm --filter @chelabase/docs build
 fi
 
 cd "apps/${app}"

@@ -72,7 +72,7 @@ The flows live under `/auth/v1/app/` on the gateway and take a **public** key as
 
 `jwks` is public: your own servers can verify access tokens with it. The credential flows are rate limited, and sign-up and sign-in answer after a minimum response time, so they don't give away whether an account exists. With email verification on, sign-up and `resend-code` answer the same for a taken address; with verification off, sign-up for a taken email is 409 `email_taken`.
 
-Passwords need at least 8 characters, with a lowercase letter, an uppercase letter, a digit and a symbol (422 `weak_password` otherwise).
+Passwords need at least 8 characters, with a lowercase letter, an uppercase letter, a digit and a symbol, and at most 72 bytes (422 `weak_password` otherwise).
 
 ## Access token
 
@@ -83,6 +83,7 @@ An EdDSA-signed JWT with these claims:
 | `iss` | `chelabase-auth` |
 | `aud` | `chelabase-project:<project id>` |
 | `sub` | the user's id |
+| `project` | the project id |
 | `sid` | the session id |
 | `email`, `email_verified` | the user's address and its state |
 | `role` | `authenticated` |

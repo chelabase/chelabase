@@ -17,7 +17,7 @@ const MODES: Array<{ value: Mode; label: string }> = [
 /** What each verb does, in general; the caption below it says what it did in the drawing. */
 const DEFINITIONS: Record<Mode, string> = {
   branch:
-    "Copy any branch as it is now, or as it was at any point in its history window (seven days by default). The copy is copy-on-write, so it's ready at once, with its own endpoint and password.",
+    "Copy any branch as it is now, or as it was at any point in its history window (seven days by default). The copy is copy-on-write, so no data is copied: it's ready as soon as its compute starts, with its own endpoint and password.",
   reset: "Bring a branch back in line with its parent's latest state, keeping its connection string.",
   restore: "Take a branch back to a point in time. The old timeline is kept as a backup branch, in case you want it back.",
   merge:

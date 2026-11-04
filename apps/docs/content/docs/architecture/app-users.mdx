@@ -7,7 +7,7 @@ Apps sign their own end users up and in through `db.auth`, and the data API runs
 
 ## Who holds what
 
-- **The identity service holds the identities**, in one pool per project (`app-<project id>`, its own Postgres schema; see [Identity service](/docs/architecture/identity#pools)). It checks passwords and is the source of truth for who exists. The worker creates the pool when app users are enabled and drops it when the project is deleted.
+- **The identity service holds the identities**, in one pool per project (`app-<project id>`, its own Postgres schema; see [Identity service](/docs/architecture/identity#pools)). It checks passwords and is the source of truth for who exists. The worker creates the pool when app users are enabled and drops it when app users are disabled (unless it still holds users) or the project is deleted.
 - **Chelabase issues the tokens.** The `auth` service checks the password against the project's pool, which opens an identity session (90 days), then signs a short-lived EdDSA access token (`iss` is `chelabase-auth`, `aud` is `chelabase-project:<project id>`) and a rotating refresh token bound to that identity session. The flows live under `/auth/v1/app/` and take a public key.
 - **Your database holds a users table** that you own, in one chosen auth database of the project: one row per user, on every branch of that database.
 - **The orchestrator keeps the sessions.** Sessions live in the metadata database, which stores only the SHA-256 of each refresh token. The orchestrator rotates refresh tokens, detects reuse and revokes sessions.
@@ -33,8 +33,9 @@ The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses 
 
 | Variable | Default | Read by |
 | --- | --- | --- |
-| `CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE` | `http://identity:8080`; each caller's `tokens/<caller>-identity.token` | orchestrator, worker, auth (pool and user operations; when the identity service can't be reached, app-user routes answer 503 `identity_unavailable` and jobs wait) |
+| `CHELABASE_IDENTITY_URL`, `CHELABASE_IDENTITY_TOKEN_FILE` | none (both or neither); Compose sets `http://identity:8080` and each caller's `tokens/<caller>-identity.token` | orchestrator, worker, auth (pool and user operations). Auth won't start without them. When the identity service can't be reached, the management API's app-user routes answer 503 `identity_unavailable`, the `/auth/v1/app/*` flows answer 503 `unavailable`, and the worker's jobs wait. |
 | `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | self-hosted: `auth/app-jwt.key` / `.pub` in the `secrets` volume; workbench: the stack's `stack.env` (`.chelabase/auth/app-jwt.key` / `.pub`) | auth signs, the gateway verifies |
+| `CHELABASE_INTERNAL_VERIFY_KEY`, `CHELABASE_COMPUTE_CA_FILE` | set by Compose | auth. Without them, as without the app-JWT keys, app users are off. |
 | `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to session liveness |
 | `CHELABASE_APP_ACCESS_TTL_SECS` | `900` (60 to 86400) | auth |
@@ -42,7 +43,7 @@ The sync writes rows as the `chelabase_auth_sync` role. A guard trigger refuses 
 | `CHELABASE_APP_USERS_RECONCILE_SECS` | `300` (30 to 86400) | worker |
 | `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | auth (the orchestrator's internal listener) |
 
-The default internal tokens are for local development only.
+The default internal tokens are public development values: every service refuses them unless `CHELABASE_DEV_DEFAULTS=1` (the workbench sets it). A Compose install reads generated tokens from `tokens/app-auth.token` and `tokens/app-sessions.token`.
 
 ## Tests
 

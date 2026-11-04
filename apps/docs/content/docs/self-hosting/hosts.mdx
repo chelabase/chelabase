@@ -81,6 +81,8 @@ An invalid entry stops the gateway at startup with a message naming `CHELABASE_G
 | `CHELABASE_LANDING_UPSTREAM` | `http://127.0.0.1:3002` | The landing page (used only with a landing host) |
 | `CHELABASE_MAIL_UPSTREAM` | `http://127.0.0.1:8025` | Mailpit (used only with a mail host) |
 
+These are the services' own defaults. The Compose install differs: it defaults the scheme to `http`, sets the gateway's listen address and the Studio upstream itself, and doesn't pass the optional docs, landing and mail hosts, so setting those in `.env` has no effect there.
+
 The gateway also reaches the orchestrator, auth, the data API engine and realtime through `CHELABASE_ORCHESTRATOR_URL`, `CHELABASE_AUTH_URL`, `CHELABASE_REST_URL` and `CHELABASE_REALTIME_URL`.
 
 ## Rules checked at startup

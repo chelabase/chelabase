@@ -79,7 +79,7 @@ After the claim, a second sign-up is refused with `sign_up_closed` unless you sw
 
 ## Choose your own secrets (optional)
 
-By default `init-secrets` generates every secret. To pick values yourself, uncomment the `CHELABASE_SEED_*` lines in `.env` and fill them in **before the first `docker compose up`**. The full list is the commented block at the end of `.env.example` (database passwords, the S3 keys, the NATS and Valkey passwords, and the internal tokens).
+By default `init-secrets` generates every secret. To pick values yourself, uncomment the `CHELABASE_SEED_*` lines in `.env` and fill them in **before the first `docker compose up`**. The full list is the commented `CHELABASE_SEED_*` block in `.env.example` (database passwords, the S3 keys, the NATS and Valkey passwords, and the internal tokens).
 
 - **First run only.** A seed is written as its secret file when that file does not exist yet. Once the file exists, a different value in `.env` makes `init-secrets` fail and name the key. Changing a secret later is not supported yet (rotation is [chelabase/chelabase#6](https://github.com/chelabase/chelabase/issues/6)). To keep a value you chose, leave the line as it is.
 - **Allowed values.** Printable ASCII with no spaces, quotes (`"` and `'`), backslash, backtick or `$`; at most 1024 characters. Passwords and tokens need at least 16 characters. Three third-party services receive a secret inside a quoted string in their own config, which is why the quote characters are excluded.
@@ -95,7 +95,7 @@ Everything `init-secrets` makes lives in the `secrets` volume, each file mounted
 | `auth/member-jwt.key`, `auth/member-jwt.pub` | `auth` signs; the gateway, the orchestrator and realtime verify | The member access token pair (EdDSA) |
 | `auth/app-jwt.key`, `auth/app-jwt.pub` | `auth` signs; the gateway verifies | The app-user token pair |
 | `auth/cookie.key` | `auth` | Encrypts the sign-in session and step cookies |
-| `identity/secret` | `identity` | Keys the hashes of emailed codes |
+| `identity/secret` | `identity` | Better Auth's signing secret; it also keys the hashes of emailed codes |
 | `identity/db.password` | `identity`, `init-bootstrap` | The identity service's database password |
 | `tokens/auth-identity.token`, `tokens/orchestrator-identity.token`, `tokens/worker-identity.token`, `tokens/bootstrap-identity.token` | `identity` and each caller | One bearer per caller of the identity service |
 | `setup/setup.code` | `init-secrets`, the orchestrator | The setup code |

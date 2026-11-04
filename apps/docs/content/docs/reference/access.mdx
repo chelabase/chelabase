@@ -24,7 +24,7 @@ How a refusal answers:
 | Case | Status | Code |
 |---|---|---|
 | No grant on the project (its existence isn't revealed) | 404 | `not_found` |
-| Grant too low, or the role isn't allowed | 403 | `forbidden`, with `error.required` (the level needed, `owner`, or `role:<name>`) |
+| Grant too low, or the role isn't allowed | 403 | `forbidden`, with `error.required` (the level needed, `owner`, `role:<name>`, or `connect`) |
 | A member with no grants anywhere | 403 | `no_access_yet` |
 | A sign-up waiting for approval | 403 | `pending_approval` |
 | A feature not designed for platform mode | 403 | `not_available_in_platform_mode` |

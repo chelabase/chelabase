@@ -3,7 +3,7 @@ title: Table editor
 description: Browse and edit rows, and change table structure without writing SQL, from Studio's Table editor.
 ---
 
-Studio's **Table editor** reads and edits rows and changes table structure. Structure changes are staged, shown as the exact SQL with a dry run, and applied together in one transaction. Open it from **Table editor** in the left rail, or from the **Tables** button on a database in the project's **Databases** tab. The rail link returns to the last place you worked: the same project, database, branch, Postgres database and schema, as long as each still exists.
+Studio's **Table editor** reads and edits rows and changes table structure. Structure changes are staged, shown as the exact SQL with a dry run, and applied together in one transaction. Open it from **Table editor** in the left rail, or from **Open** on a database in the project's **Databases** tab. The rail link returns to the last place you worked: the same project, database, branch, Postgres database and schema, as long as each still exists.
 
 The address holds the whole position: `/app/tables/{project}/{database}/{branch}/{postgres database}/{schema}/{table}`. A level you leave out gets a default, and the address is rewritten. While the levels above it are the ones you last worked in, a missing level takes your last value (when it still exists); otherwise the defaults are the first project, the project's first database, the root branch, the branch's main Postgres database and the `public` schema (else the first). No table is picked for you. The **Types** and **New table** views aren't part of the address: a reload, or another schema, returns to the table view. An id that doesn't exist shows a not-found message with the pickers still usable.
 
