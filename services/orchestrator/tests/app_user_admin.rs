@@ -885,12 +885,12 @@ async fn data_api_disable_refused_on_auth_database() {
     assert!(au.jobs.data_api_calls.lock().unwrap().is_empty());
     // Another Postgres database of the same Chelabase database is free to go.
     au.metadata
-        .add_branch_db(au.main, "web3", "owner", DatabaseOrigin::Sql);
+        .add_branch_db(au.main, "shop", "owner", DatabaseOrigin::Sql);
     let resp = send(
         &au.app,
         Method::DELETE,
         &format!(
-            "/v1/databases/{}/branches/{}/pg-databases/web3/data-api",
+            "/v1/databases/{}/branches/{}/pg-databases/shop/data-api",
             au.db, au.main
         ),
         "org-1",

@@ -300,14 +300,20 @@ Some Rust tests are `#[ignore]`d because they need the stack. Run them on your c
 
 ## CI (GitHub Actions)
 
-Two workflows in `.github/workflows/`. Until the repo is public (Actions minutes are billed on a private repo) both run **by hand only** (`workflow_dispatch`). Neither uses `pull_request_target` or any secret, and both have `permissions: contents: read`. Actions are pinned to commit SHAs.
+Four workflows in `.github/workflows/`. Until the repo is public (Actions minutes are billed on a private repo) all four run **by hand only** (`workflow_dispatch`). None uses `pull_request_target`, and all have `permissions: contents: read`. `ci.yml` and `live.yml` use no secret; the two deploy workflows read `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the `production` environment and run on `main` only. Actions are pinned to commit SHAs.
 
 | Workflow | What it runs |
 | --- | --- |
 | `ci.yml` | On ubuntu-latest: the toolchain from `.prototools` (via `moonrepo/setup-toolchain`), the apt packages from Prerequisites, `cargo-nextest` and `cargo-deny` 0.20.2, then `just check` and the doctests (`cargo test --workspace --doc`, all `just test` adds) |
 | `live.yml` | `just workbench up`, every recipe in *Live recipes on the workbench* except `bench-data-api`; the self-hosted e2e and the live Rust tests (`--run-ignored`) are not run (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
+| `landing-deploy.yml`, `docs-deploy.yml` | `scripts/deploy-site.sh landing` or `docs`: builds the site and deploys it to Cloudflare (see *Deploying the landing page and docs*) |
 
-**At launch**, enable the triggers (one change per workflow, each marked `# enable at launch`):
+**At launch**, in the repository settings:
+
+- Create the `production` environment with two secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (the token as in *Deploying the landing page and docs*).
+- Enable private vulnerability reporting (Security → Advisories); `SECURITY.md` points reporters at it.
+
+Then enable the triggers (one change per workflow, each marked `# enable at launch`):
 
 - `ci.yml`: uncomment `pull_request:` and `push: { branches: [main] }`.
 - `live.yml`: uncomment the nightly `schedule:`. For a `run-live` PR label, uncomment the `pull_request:` block and the job's `if:` line too.
