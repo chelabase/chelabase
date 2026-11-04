@@ -5,7 +5,7 @@ description: "The services, the front door and the shared stack that Chelabase r
 
 Chelabase is a control plane for Postgres databases, built on Neon's storage stack. Every database runs as a Neon compute backed by a shared pageserver, safekeeper and object store; the control plane creates, branches, resets and deletes them, and gives apps a typed data API in front of them.
 
-This section describes how the parts fit together. For how to use them, start with the [Introduction](/docs).
+This section describes how the parts fit together. For how to use them, start with the [Introduction](/).
 
 ## Repository layout
 
@@ -30,14 +30,14 @@ The Rust workspace holds the control plane; a pnpm workspace holds Studio, this 
 
 | Service | Role | Page |
 | --- | --- | --- |
-| Gateway | Pingora front door on `:8000`: authenticates every request and routes it | [Gateway](/docs/architecture/gateway) |
-| Orchestrator | The Management API (`/v1`), the metadata store and the internal listener | [Orchestrator and worker](/docs/architecture/orchestrator) |
-| Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Orchestrator and worker](/docs/architecture/orchestrator) |
-| Rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/docs/architecture/data-api) |
-| Auth | Sign-in backend for Studio and for app users; signs member and app-user tokens | [Studio](/docs/architecture/studio), [App users](/docs/architecture/app-users) |
-| Identity | Holds every account (Studio members and each project's app users), internal only | [Identity service](/docs/architecture/identity) |
-| Realtime | Live rows and presence over a WebSocket | [Realtime](/docs/architecture/realtime) |
-| Studio | The web app | [Studio](/docs/architecture/studio) |
+| Gateway | Pingora front door on `:8000`: authenticates every request and routes it | [Gateway](/architecture/gateway) |
+| Orchestrator | The Management API (`/v1`), the metadata store and the internal listener | [Orchestrator and worker](/architecture/orchestrator) |
+| Worker | Runs the jobs: provisions computes, resets, bootstraps the data API, reconciles | [Orchestrator and worker](/architecture/orchestrator) |
+| Rest | The data API engine: turns a JSON query into SQL and runs it | [Data API](/architecture/data-api) |
+| Auth | Sign-in backend for Studio and for app users; signs member and app-user tokens | [Studio](/architecture/studio), [App users](/architecture/app-users) |
+| Identity | Holds every account (Studio members and each project's app users), internal only | [Identity service](/architecture/identity) |
+| Realtime | Live rows and presence over a WebSocket | [Realtime](/architecture/realtime) |
+| Studio | The web app | [Studio](/architecture/studio) |
 
 NATS JetStream carries the jobs, a metadata Postgres holds the control plane's own state, Valkey backs the proxy's cache invalidation and realtime's tickets, and Mailpit catches local email.
 
@@ -52,21 +52,21 @@ client ──Postgres wire / SQL over HTTP──▶ Neon proxy ──▶ compute
 
 ## The docs app
 
-This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, prerendered to static files. The API reference pages are generated from the OpenAPI documents in `openapi/` (see [API generation](/docs/architecture/api-generation)), and TypeScript samples are type-checked at build time with twoslash. `just workbench up --with docs` serves it on the stack's docs host (`http://docs.chelabase.localhost:8000` on main), reached through the gateway.
+This site is `apps/docs` in the same repository: Fumadocs on TanStack Start, prerendered to static files. The API reference pages are generated from the OpenAPI documents in `openapi/` (see [API generation](/architecture/api-generation)), and TypeScript samples are type-checked at build time with twoslash. `just workbench up --with docs` serves it on the stack's docs host (`http://docs.chelabase.localhost:8000` on main), reached through the gateway.
 
 ## Pages in this section
 
 <Cards>
-  <Card title="Gateway" href="/docs/architecture/gateway">Authentication, routing, limits and the internal identity token.</Card>
-  <Card title="Orchestrator and worker" href="/docs/architecture/orchestrator">The Management API, access decisions, jobs and reconcile.</Card>
-  <Card title="Studio" href="/docs/architecture/studio">Sign-in, data fetching and how the bootstrap wires it up.</Card>
-  <Card title="Identity service" href="/docs/architecture/identity">Pools, the boundary, member tokens and revocation.</Card>
-  <Card title="Data API" href="/docs/architecture/data-api">The request flow, the schema model and the benchmark.</Card>
-  <Card title="App users" href="/docs/architecture/app-users">Identity, tokens and how users are synced.</Card>
-  <Card title="SQL editor" href="/docs/architecture/sql-editor">Execution, the guard, limits and audit.</Card>
-  <Card title="Realtime" href="/docs/architecture/realtime">Live rows, presence, ports, settings and secrets.</Card>
-  <Card title="Neon" href="/docs/architecture/neon">The storage stack, the proxy and local ports.</Card>
-  <Card title="API generation" href="/docs/architecture/api-generation">OpenAPI documents, generated clients and the reference UI.</Card>
-  <Card title="Security" href="/docs/architecture/security">Trust boundaries and security notes.</Card>
-  <Card title="Design history" href="/docs/architecture/design-history">The design specs, by area.</Card>
+  <Card title="Gateway" href="/architecture/gateway">Authentication, routing, limits and the internal identity token.</Card>
+  <Card title="Orchestrator and worker" href="/architecture/orchestrator">The Management API, access decisions, jobs and reconcile.</Card>
+  <Card title="Studio" href="/architecture/studio">Sign-in, data fetching and how the bootstrap wires it up.</Card>
+  <Card title="Identity service" href="/architecture/identity">Pools, the boundary, member tokens and revocation.</Card>
+  <Card title="Data API" href="/architecture/data-api">The request flow, the schema model and the benchmark.</Card>
+  <Card title="App users" href="/architecture/app-users">Identity, tokens and how users are synced.</Card>
+  <Card title="SQL editor" href="/architecture/sql-editor">Execution, the guard, limits and audit.</Card>
+  <Card title="Realtime" href="/architecture/realtime">Live rows, presence, ports, settings and secrets.</Card>
+  <Card title="Neon" href="/architecture/neon">The storage stack, the proxy and local ports.</Card>
+  <Card title="API generation" href="/architecture/api-generation">OpenAPI documents, generated clients and the reference UI.</Card>
+  <Card title="Security" href="/architecture/security">Trust boundaries and security notes.</Card>
+  <Card title="Design history" href="/architecture/design-history">The design specs, by area.</Card>
 </Cards>

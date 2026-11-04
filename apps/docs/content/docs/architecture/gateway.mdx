@@ -7,7 +7,7 @@ The gateway is a Pingora proxy on `127.0.0.1:8000` by default (`CHELABASE_GATEWA
 
 ## One declaration per endpoint
 
-Every public endpoint is declared once, in the `chelabase-routes` crate: method, path, owning service, who may call it and which origins may use it from a browser. The gateway routes and applies policy from that list; the owning service builds its axum routes from the same list, so the two cannot drift. The OpenAPI tests also check each document against it (see [API generation](/docs/architecture/api-generation)).
+Every public endpoint is declared once, in the `chelabase-routes` crate: method, path, owning service, who may call it and which origins may use it from a browser. The gateway routes and applies policy from that list; the owning service builds its axum routes from the same list, so the two cannot drift. The OpenAPI tests also check each document against it (see [API generation](/architecture/api-generation)).
 
 Each request goes through a fixed pipeline: request id, host scope, route, CORS, authentication, internal identity. Nothing is configurable per route except the declared policy.
 
@@ -21,7 +21,7 @@ Each request goes through a fixed pipeline: request id, host scope, route, CORS,
 
 ## Management API requests
 
-Management endpoints require `Authorization: Bearer <member access token>`, the EdDSA JWT that `auth` signs at `POST /auth/v1/token` (see [Identity service](/docs/architecture/identity#member-sign-in-and-tokens)). The gateway verifies it locally with the member public key (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`): the algorithm, key id, issuer (derived from `CHELABASE_AUTH_HOST` and `CHELABASE_PUBLIC_SCHEME`; see [Hosts](/docs/self-hosting/hosts)), audience `chelabase-member`, claim set and lifetime are all pinned. Without a verify key every bearer is a 401 and the gateway reports itself not ready. It then forwards the request with an **internal identity token** in the `x-chelabase-identity` header:
+Management endpoints require `Authorization: Bearer <member access token>`, the EdDSA JWT that `auth` signs at `POST /auth/v1/token` (see [Identity service](/architecture/identity#member-sign-in-and-tokens)). The gateway verifies it locally with the member public key (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`): the algorithm, key id, issuer (derived from `CHELABASE_AUTH_HOST` and `CHELABASE_PUBLIC_SCHEME`; see [Hosts](/self-hosting/hosts)), audience `chelabase-member`, claim set and lifetime are all pinned. Without a verify key every bearer is a 401 and the gateway reports itself not ready. It then forwards the request with an **internal identity token** in the `x-chelabase-identity` header:
 
 - an EdDSA JWT, valid for 60 seconds, signed for exactly one target service (its `aud` is `orchestrator`, `auth`, `rest` or `realtime`);
 - the gateway never forwards `Authorization`, the `Chelabase-User` header or a client-supplied `x-chelabase-identity`.

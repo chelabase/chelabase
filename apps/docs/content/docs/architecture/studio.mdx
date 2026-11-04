@@ -3,11 +3,11 @@ title: "Studio"
 description: "How Studio signs people in, fetches data and gets configured by the dev bootstrap."
 ---
 
-Studio is the web app (`apps/studio`: React, TanStack Router and TanStack Query). For what it does, see the [Studio tour](/docs/using/studio). This page covers how it is wired.
+Studio is the web app (`apps/studio`: React, TanStack Router and TanStack Query). For what it does, see the [Studio tour](/using/studio). This page covers how it is wired.
 
 ## Sign-in
 
-Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset`, `/pending` and `/logout`. They call the `auth` service through the gateway (`/auth/v1/*`), which checks people against the [identity service](/docs/architecture/identity)'s `members` pool. The login API is documented from its own OpenAPI document (`openapi/login.json`, published as the [login API](/docs/architecture/login-api/login/signIn) reference); it is for Studio only.
+Studio has its own sign-in pages: `/login`, `/register`, `/accept-invite`, `/verify`, `/password-reset`, `/pending` and `/logout`. They call the `auth` service through the gateway (`/auth/v1/*`), which checks people against the [identity service](/architecture/identity)'s `members` pool. The login API is documented from its own OpenAPI document (`openapi/login.json`, published as the [login API](/architecture/login-api/login/signIn) reference); it is for Studio only.
 
 A sign-in sets auth's `chelabase_session` cookie (encrypted, `HttpOnly`, `SameSite=Strict`, scoped to `/auth/v1`). Studio never reads it: it calls `POST /auth/v1/token` with the cookie, its `Origin` and `X-Chelabase-Studio: 1`, and gets a short-lived member access token, which every Management API call carries. Studio keeps the token in memory only, asks for a new one before it expires (one refresh at a time), and returns to `/login` when the session has ended.
 
@@ -29,7 +29,7 @@ In self-hosted mode everyone who joins (by invite, or by sign-up when it is open
 
 ## Local sign-in flow
 
-1. Install Chelabase ([Install](/docs/self-hosting/install)), open Studio (`http://studio.chelabase.localhost:8000` by default), choose **Sign in** and then **Create account**, and enter the setup code from `docker compose logs init-secrets`. The first account claims the instance and is the tenant admin. (On a workbench stack, `just workbench up` signs up a dev member for you; see below.)
+1. Install Chelabase ([Install](/self-hosting/install)), open Studio (`http://studio.chelabase.localhost:8000` by default), choose **Sign in** and then **Create account**, and enter the setup code from `docker compose logs init-secrets`. The first account claims the instance and is the tenant admin. (On a workbench stack, `just workbench up` signs up a dev member for you; see below.)
 2. Emails such as invites and password resets go out through the SMTP server you configured (Mailpit at `http://mail.chelabase.localhost:8000` on a workbench stack). Without SMTP, invite by link instead.
 3. Studio opens on your projects and their databases; everything goes through the gateway on `:8000` with your member token.
 
@@ -46,7 +46,7 @@ It never makes a key or a secret: `chelabase-init secrets` (`init-secrets`) does
 
 ## Data fetching
 
-Studio uses TanStack Query for all data fetching, through the generated Management API client (see [API generation](/docs/architecture/api-generation)).
+Studio uses TanStack Query for all data fetching, through the generated Management API client (see [API generation](/architecture/api-generation)).
 
 - **Polling.** Lists poll every 2 seconds while a database or branch is pending, provisioning, resetting or deleting; polling stops when the status settles.
 - **Invalidation.** Writes invalidate exactly the queries they change, not whole cache keys.

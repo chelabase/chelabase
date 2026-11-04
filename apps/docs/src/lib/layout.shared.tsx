@@ -7,8 +7,7 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       // The text name in Spectral until the claw-C wordmark arrives with apps/landing.
       title: <span className="font-serif font-bold">{appName}</span>,
-      // `/` only redirects here.
-      url: '/docs',
+      url: '/',
     },
     themeSwitch: { enabled: false },
   };

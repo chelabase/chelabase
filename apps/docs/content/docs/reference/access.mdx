@@ -29,11 +29,11 @@ How a refusal answers:
 | A sign-up waiting for approval | 403 | `pending_approval` |
 | A feature not designed for platform mode | 403 | `not_available_in_platform_mode` |
 
-`GET /v1/me` returns the caller's capabilities: tenant admin, instance admin, and per project the platform role, the Postgres roles they may act as and (`projects[].databases`) the databases a grant override narrows. It answers 200 for a pending sign-up too, with `member.status: "pending"`. Studio only hides what you can't do; the API decides. See [Members and invites](/docs/using/members-and-invites) and [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+`GET /v1/me` returns the caller's capabilities: tenant admin, instance admin, and per project the platform role, the Postgres roles they may act as and (`projects[].databases`) the databases a grant override narrows. It answers 200 for a pending sign-up too, with `member.status: "pending"`. Studio only hides what you can't do; the API decides. See [Members and invites](/using/members-and-invites) and [Roles and schema isolation](/using/roles-and-schema-isolation).
 
 ## Effective access
 
-A member's effective access on a project combines their own grant with the grants of their teams (see [Teams](/docs/using/members-and-invites#teams)), then narrows it by their per-database overrides:
+A member's effective access on a project combines their own grant with the grants of their teams (see [Teams](/using/members-and-invites#teams)), then narrows it by their per-database overrides:
 
 - **Union of sources.** The platform role is the best level among the own grant and the team grants. Admin from any source is Admin, holding every Postgres role.
 - **Per-role levels.** Each Postgres role keeps the highest level among the sources that name it. An *Act as* route needs the platform level the route asks for **and** the role held at that level or above: a role held only at Viewer can't be used on `POST …/sql`.
@@ -45,7 +45,7 @@ A member's effective access on a project combines their own grant with the grant
 
 ## Every route
 
-Sorted by path. Credentials: *Member token* is a member access token from `POST /auth/v1/token` (Studio's sign-in); the data API's keys are described under [Data API](/docs/using/data-api).
+Sorted by path. Credentials: *Member token* is a member access token from `POST /auth/v1/token` (Studio's sign-in); the data API's keys are described under [Data API](/using/data-api).
 
 {/* BEGIN GENERATED access-table */}
 

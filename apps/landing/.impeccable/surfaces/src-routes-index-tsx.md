@@ -13,7 +13,7 @@ Mode: **Persuade**. The public landing page; Studio is the console it links to.
 
 - Developers choosing a Postgres platform they can run themselves.
 - Theme: **Manage, collaborate, iterate**: Postgres made easy to manage, shared with a team through roles Postgres enforces, and changed safely with branches and merges; built in Rust, end to end.
-- Job: know what Chelabase is, see what it offers against the alternatives, then **Get started** (the docs Quickstart: `${VITE_DOCS_URL}/docs/using/quickstart`, falling back to `quickstart.mdx` on GitHub) or **Visit GitHub** (`https://github.com/chelabase/chelabase`). No Studio links, no auth state.
+- Job: know what Chelabase is, see what it offers against the alternatives, then **Get started** (the docs Quickstart: `${VITE_DOCS_URL}/using/quickstart`, falling back to `quickstart.mdx` on GitHub) or **Visit GitHub** (`https://github.com/chelabase/chelabase`). No Studio links, no auth state.
 - Proof is demonstration and sourced fact only: the hero animation, the real Docker Compose install, real `@chelabase/client` code, the service map, and a comparison drawn from each product's docs (dated, caveats in its footnote). Synthetic illustrations are labelled. No customers, logos, benchmark numbers or invented claims; platform mode is not pitched. The CLI (an installable setup and management script) and S3-compatible object storage (SeaweedFS) are **Coming soon**.
 
 ## Sections

@@ -45,12 +45,11 @@ export default defineConfig({
       prerender: { enabled: true, crawlLinks: true },
       pages: [
         { path: '/' },
-        { path: '/docs' },
         // The sidebar shows one root folder (tab) at a time, so the crawler reaches only that
         // tab's pages from a page in it. One seed per root; the crawl finds the rest.
-        { path: '/docs/using/quickstart' },
-        { path: '/docs/reference/errors' },
-        { path: '/docs/architecture' },
+        { path: '/using/quickstart' },
+        { path: '/reference/errors' },
+        { path: '/architecture' },
         { path: '/api/search' },
         { path: '/llms.txt' },
         { path: '/llms-full.txt' },

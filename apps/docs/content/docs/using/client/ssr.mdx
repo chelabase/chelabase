@@ -252,7 +252,7 @@ createServerClient({
 
 Vercel overwrites these headers with the address it saw, so they only name your user when nothing else sits in front of Vercel. A raw `X-Forwarded-For` is not on the list: a client can send its own, and a proxy that appends to it keeps the forged part. Take a value from it only if your proxy replaces it.
 
-If your app runs from fixed addresses, there is an alternative: add them to `CHELABASE_GATEWAY_TRUSTED_PROXIES` on the gateway (see [Hosts](/docs/self-hosting/hosts)) and forward the user's address in `X-Forwarded-For`.
+If your app runs from fixed addresses, there is an alternative: add them to `CHELABASE_GATEWAY_TRUSTED_PROXIES` on the gateway (see [Hosts](/self-hosting/hosts)) and forward the user's address in `X-Forwarded-For`.
 
 ## Without a framework
 

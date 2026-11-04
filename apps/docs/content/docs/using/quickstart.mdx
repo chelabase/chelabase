@@ -9,7 +9,7 @@ This takes you from a running stack to a database your app reads and writes thro
 
 ## 1. Start the stack and sign in
 
-1. Install Chelabase with Docker Compose by following [Install](/docs/self-hosting/install): `cp .env.example .env && docker compose up -d --wait` in `infra/compose`. (To work on Chelabase itself, `just workbench up` is the development loop instead; it is not how you run it.)
+1. Install Chelabase with Docker Compose by following [Install](/self-hosting/install): `cp .env.example .env && docker compose up -d --wait` in `infra/compose`. (To work on Chelabase itself, `just workbench up` is the development loop instead; it is not how you run it.)
 2. Read the setup code with `docker compose logs init-secrets`, open [http://studio.chelabase.localhost:8000](http://studio.chelabase.localhost:8000), choose **Sign in**, then **Create account**, and enter the code. The first account with the code claims the instance and becomes the admin. Don't expose the host before you have claimed it.
 3. On `/app` you see your projects. Open your project to see its databases and a form to create one.
 
@@ -37,11 +37,11 @@ create table todos (
 );
 ```
 
-Tables the owner creates in the default schema are open to the data API's roles at once: `authenticated` (behind a secret key) may read and write them, `anon` (behind the public key) only read ([default privileges](/docs/architecture/data-api#default-privileges)). Studio warns that `todos` has no row-level security; add a policy before a public key reaches it from a browser.
+Tables the owner creates in the default schema are open to the data API's roles at once: `authenticated` (behind a secret key) may read and write them, `anon` (behind the public key) only read ([default privileges](/architecture/data-api#default-privileges)). Studio warns that `todos` has no row-level security; add a policy before a public key reaches it from a browser.
 
 ## 4. Create a key
 
-On the database, open **Data API**, then under **Secret keys** choose **Create key**. Give it a name and keep the role `authenticated`. The key (`chk_sec_…`) is shown once: save it. The same panel shows the branch's public key (`chk_pub_…`, role `anon`, safe in a browser). See [Keys](/docs/using/data-api/keys), including the API calls that do the same.
+On the database, open **Data API**, then under **Secret keys** choose **Create key**. Give it a name and keep the role `authenticated`. The key (`chk_sec_…`) is shown once: save it. The same panel shows the branch's public key (`chk_pub_…`, role `anon`, safe in a browser). See [Keys](/using/data-api/keys), including the API calls that do the same.
 
 ## 5. Query it from your app
 
@@ -83,7 +83,7 @@ const key = process.env.CHELABASE_DATA_KEY!;
 const db = createClient<Database>({ url, key, types: await fetchTypes({ url, key }) });
 ```
 
-A secret key stays on a server; in a browser use the public key, with row-level security on the tables it reaches. The [TypeScript client](/docs/using/client) covers filters, writes, functions, batches and [generated types](/docs/using/client/types); the [data API](/docs/using/data-api) is the HTTP endpoint underneath, for any other language:
+A secret key stays on a server; in a browser use the public key, with row-level security on the tables it reaches. The [TypeScript client](/using/client) covers filters, writes, functions, batches and [generated types](/using/client/types); the [data API](/using/data-api) is the HTTP endpoint underneath, for any other language:
 
 ```bash
 curl -s http://api.chelabase.localhost:8000/data/v1/query \
@@ -107,7 +107,7 @@ docker compose cp proxy:/tls/ca.crt proxy-ca.crt
 psql "<uri>&sslrootcert=proxy-ca.crt"
 ```
 
-`localtest.me` resolves to the machine itself, where the proxy is published (`127.0.0.1:5432` by default). If it resolves to `::1` first and that fails, add `&hostaddr=127.0.0.1`. For another host, port or a real domain, see [Install: connect to databases](/docs/self-hosting/install#connect-to-databases). On a workbench stack, `just workbench status` shows the proxy's port (4432 for the main stack), and the CA is at `.chelabase/stacks/<stack>/neon/proxy-ca.crt`. You can show the connection details as often as you like.
+`localtest.me` resolves to the machine itself, where the proxy is published (`127.0.0.1:5432` by default). If it resolves to `::1` first and that fails, add `&hostaddr=127.0.0.1`. For another host, port or a real domain, see [Install: connect to databases](/self-hosting/install#connect-to-databases). On a workbench stack, `just workbench status` shows the proxy's port (4432 for the main stack), and the CA is at `.chelabase/stacks/<stack>/neon/proxy-ca.crt`. You can show the connection details as often as you like.
 
 ## 6. Remove it
 
@@ -115,6 +115,6 @@ Delete the database in Studio (it asks you to type the name) or with `DELETE /v1
 
 ## Next
 
-- Query the database from your app with the [data API](/docs/using/data-api) and its [TypeScript client](/docs/using/client).
-- Bring in your team with [members and invites](/docs/using/members-and-invites), and scope what each person can reach with [roles and schema isolation](/docs/using/roles-and-schema-isolation).
-- Learn how [projects and databases](/docs/using/projects-and-databases) and [branches](/docs/using/branches) work.
+- Query the database from your app with the [data API](/using/data-api) and its [TypeScript client](/using/client).
+- Bring in your team with [members and invites](/using/members-and-invites), and scope what each person can reach with [roles and schema isolation](/using/roles-and-schema-isolation).
+- Learn how [projects and databases](/using/projects-and-databases) and [branches](/using/branches) work.

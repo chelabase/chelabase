@@ -80,7 +80,7 @@ Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootst
 The docs site runs in the stack too, reached through the gateway:
 
 ```bash
-just workbench up --with docs     # then open http://docs.chelabase.localhost:8000/docs
+just workbench up --with docs     # then open http://docs.chelabase.localhost:8000
 ```
 
 Stop the stack with `just workbench down` (volumes and state stay). `just` lists every recipe.

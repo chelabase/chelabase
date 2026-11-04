@@ -49,7 +49,7 @@ A restore right after a storage restart can wait up to 30 seconds per ancestor l
 
 Delete, reset-to-parent and restore are refused (`has_children`) while the branch has live normal child branches. Each child's timeline branches from its parent's, and Neon refuses to delete a timeline that others branch from, so the children go first. Backup branches never count as children. Main can't be deleted or reset.
 
-They are also refused (409 `branch_merge_busy`) while a [schema merge](/docs/using/merging-schema#while-a-merge-runs) holds the branch as its source or target: it is rehearsing or applying, or it failed half applied and waits to be retried or abandoned.
+They are also refused (409 `branch_merge_busy`) while a [schema merge](/using/merging-schema#while-a-merge-runs) holds the branch as its source or target: it is rehearsing or applying, or it failed half applied and waits to be retried or abandoned.
 
 ## Passwords on a new branch
 
@@ -57,7 +57,7 @@ They are also refused (409 `branch_merge_busy`) while a [schema merge](/docs/usi
 - Every other role keeps the parent branch's password, unless the parent is **protected**.
 - From a protected branch, a child gives every role in its own database that has a password a fresh generated, revealable one. That covers roles made in Studio, through the API or in SQL, MD5 ones and roles without `LOGIN` included, and also a role the parent has dropped since the child's point in time.
 
-For roles in general, see [Login roles](/docs/using/login-roles).
+For roles in general, see [Login roles](/using/login-roles).
 
 ## Protected branches
 
@@ -124,4 +124,4 @@ All routes are under `/v1/databases/{id}/branches/{branch_id}`. Reads need the D
 | `PUT /guard-exemptions/{role}` | Admin | Exempts a role name on this branch. |
 | `DELETE /guard-exemptions/{role}` | Admin | Removes an exemption. |
 
-Each write that changes the switch or the exemptions updates the branch's member roles. The errors that matter here are `review_changed` (409, with `error.review`), `has_dependents` (409, on a drop), `lock_timeout` (409, retry) and `schema_change_failed` (400, with `sqlstate`). See the [error reference](/docs/reference/errors) for the full list.
+Each write that changes the switch or the exemptions updates the branch's member roles. The errors that matter here are `review_changed` (409, with `error.review`), `has_dependents` (409, on a drop), `lock_timeout` (409, retry) and `schema_change_failed` (400, with `sqlstate`). See the [error reference](/reference/errors) for the full list.
