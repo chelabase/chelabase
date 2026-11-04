@@ -1,13 +1,11 @@
 # The offline checks: `just check` (nextest included) and the doctests `just test` adds, the same
 # commands a contributor runs.
-# Until the repo is public this runs by hand only (Actions minutes are billed on a private repo).
 name: ci
 
 on:
   workflow_dispatch:
-  # enable at launch: uncomment these two lines (the whole change for this workflow)
-  # pull_request:
-  # push: { branches: [main] }
+  pull_request:
+  push: { branches: [main] }
 
 permissions:
   contents: read

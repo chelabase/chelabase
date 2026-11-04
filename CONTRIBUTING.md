@@ -300,7 +300,7 @@ Some Rust tests are `#[ignore]`d because they need the stack. Run them on your c
 
 ## CI (GitHub Actions)
 
-Four workflows in `.github/workflows/`. Until the repo is public (Actions minutes are billed on a private repo) all four run **by hand only** (`workflow_dispatch`). None uses `pull_request_target`, and all have `permissions: contents: read`. `ci.yml` and `live.yml` use no secret; the two deploy workflows read `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the `production` environment and run on `main` only. Actions are pinned to commit SHAs.
+Four workflows in `.github/workflows/`, each also runnable by hand (`workflow_dispatch`): `ci.yml` on every pull request and push to `main`; `live.yml` nightly and on a pull request labelled `run-live`; the two deploy workflows on a merge to `main` that touches their site. None uses `pull_request_target`, and all have `permissions: contents: read`. `ci.yml` and `live.yml` use no secret; the two deploy workflows read `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` from the `production` environment and run on `main` only. Actions are pinned to commit SHAs.
 
 | Workflow | What it runs |
 | --- | --- |
@@ -308,16 +308,7 @@ Four workflows in `.github/workflows/`. Until the repo is public (Actions minute
 | `live.yml` | `just workbench up`, every recipe in *Live recipes on the workbench* except `bench-data-api`; the self-hosted e2e and the live Rust tests (`--run-ignored`) are not run (a suite failure doesn't stop the rest; the run fails at the end), then `just workbench down`; the status and Compose logs are uploaded as the `live-logs` artifact |
 | `landing-deploy.yml`, `docs-deploy.yml` | `scripts/deploy-site.sh landing` or `docs`: builds the site and deploys it to Cloudflare (see *Deploying the landing page and docs*) |
 
-**At launch**, in the repository settings:
-
-- Create the `production` environment with two secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (the token as in *Deploying the landing page and docs*).
-- Enable private vulnerability reporting (Security → Advisories); `SECURITY.md` points reporters at it.
-
-Then enable the triggers (one change per workflow, each marked `# enable at launch`):
-
-- `ci.yml`: uncomment `pull_request:` and `push: { branches: [main] }`.
-- `live.yml`: uncomment the nightly `schedule:`. For a `run-live` PR label, uncomment the `pull_request:` block and the job's `if:` line too.
-- `landing-deploy.yml` and `docs-deploy.yml`: uncomment the `push:` block (a merge to `main` that touches the site deploys it).
+The deploy workflows need the `production` environment's two secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (the token as in *Deploying the landing page and docs*). Security reports arrive through private vulnerability reporting (Security → Advisories), which `SECURITY.md` points reporters at.
 
 **Checking a workflow without Actions minutes:** `actionlint` for syntax and expressions, and `act` to run it in Docker (both are single binaries from their GitHub releases; install them outside the repo):
 
@@ -329,7 +320,7 @@ act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /v
 
 `act` needs a runner image (`-P ubuntu-latest=catthehacker/ubuntu:act-24.04`; the `full` image is about 75 GB) and a GitHub token (`-s GITHUB_TOKEN=…`, a fine-grained token with no access is enough): `proto` resolves the Rust, just and moon versions through the GitHub API, and without a token it fails with "Failed to resolve … to a valid supported version". Don't pass `--bind`: the runner's user (uid 1001) takes ownership of the bound checkout. Neither workflow has been run under `act` yet.
 
-`act` can't prove: that its runner image matches ubuntu-latest (the packages, the Docker and Compose versions: the workbench needs Compose 2.30 or newer), how `actions/cache` and `rust-cache` behave on GitHub's cache service, timing and disk limits on the hosted runner, and the `workflow_dispatch` UI. The first real run at launch checks these.
+`act` can't prove: that its runner image matches ubuntu-latest (the packages, the Docker and Compose versions: the workbench needs Compose 2.30 or newer), how `actions/cache` and `rust-cache` behave on GitHub's cache service, timing and disk limits on the hosted runner, and the `workflow_dispatch` UI. The first real runs on GitHub check these.
 
 ## Deploying the landing page and docs
 

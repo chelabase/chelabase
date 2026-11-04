@@ -1,20 +1,19 @@
 # Builds the landing page and deploys it to Cloudflare (scripts/deploy-site.sh landing), apart from ci.yml
 # so a release never waits on the Rust gate. ci.yml still runs the site's tests before a merge.
-# Until the repo is public this runs by hand only; `just site-deploy landing` does the same locally.
+# Runs on a merge to main that touches the site; `just site-deploy landing` does the same locally.
 name: landing-deploy
 
 on:
   workflow_dispatch:
-  # enable at launch: uncomment the push block (the whole change for this workflow)
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - apps/landing/**
-  #     - packages/design/**
-  #     - infra/compose/.env.example
-  #     - pnpm-lock.yaml
-  #     - scripts/deploy-site.sh
-  #     - .github/workflows/landing-deploy.yml
+  push:
+    branches: [main]
+    paths:
+      - apps/landing/**
+      - packages/design/**
+      - infra/compose/.env.example
+      - pnpm-lock.yaml
+      - scripts/deploy-site.sh
+      - .github/workflows/landing-deploy.yml
 
 permissions:
   contents: read
