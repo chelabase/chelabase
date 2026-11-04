@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Offline tests of the image release tooling on a scratch git repo: a small cargo and pnpm
-# workspace with all eight images pinned at its first commit, and a stub `docker` that only logs.
+# workspace with all nine images pinned at its first commit, and a stub `docker` that only logs.
 #   - scripts/image-inputs.sh changed: which images changed since their pins
 #   - scripts/publish-images.sh: --service / --all / no flag, and --push-only on the selection
 #   - scripts/pin-images.sh + scripts/tests/compose-image-pins.sh: a partial digests file
@@ -34,6 +34,7 @@ cat >Cargo.toml <<'EOF'
 [workspace]
 resolver = "3"
 members = ["services/*", "crates/*", "tools/cli"]
+exclude = ["services/identity"]
 EOF
 cp "$src/rust-toolchain.toml" .
 crate crates/http http lib
@@ -55,22 +56,23 @@ pkg() { # pkg <dir> <name> [<workspace dep>...]
   echo "{\"name\":\"$2\",\"dependencies\":{$deps}}" >"$1/package.json"
 }
 echo '{"name":"root","private":true}' >package.json
-printf 'packages:\n  - "apps/*"\n  - "packages/*"\n' >pnpm-workspace.yaml
+printf 'packages:\n  - "apps/*"\n  - "packages/*"\n  - "services/identity"\n' >pnpm-workspace.yaml
 echo 'lockfileVersion: 9.0' >pnpm-lock.yaml
 pkg apps/studio @x/studio @x/ui
 pkg apps/docs @x/docs @x/client
 pkg packages/ui @x/ui
 pkg packages/client @x/client
+pkg services/identity @x/identity
 mkdir -p openapi docs
 echo '{}' >openapi/management.json
 echo 'docs' >docs/readme.md
 
 mkdir -p infra/images infra/compose scripts/tests
-cp "$src"/infra/images/{docker-bake.hcl,server.Dockerfile,studio.Dockerfile,studio.Caddyfile} infra/images/
+cp "$src"/infra/images/{docker-bake.hcl,server.Dockerfile,studio.Dockerfile,studio.Caddyfile,identity.Dockerfile} infra/images/
 cp "$src/.dockerignore" .
 cp "$src"/scripts/{image-inputs.sh,publish-images.sh,pin-images.sh} scripts/ 2>/dev/null || true
 cp "$src/scripts/tests/compose-image-pins.sh" scripts/tests/
-images=(gateway orchestrator worker rest auth realtime init studio)
+images=(gateway orchestrator worker rest auth realtime init studio identity)
 digest() { printf 'sha256:%064d' "$1"; }
 write_pins() { # write_pins <sha12>: every image pinned at <sha12>
   local i n=0
@@ -147,13 +149,21 @@ for f in apps/docs/x.ts packages/client/x.ts docs/readme.md; do
   case_ edit "$f"
   expect "$f -> nothing" "" "$(changed)"
 done
-for f in pnpm-lock.yaml package.json pnpm-workspace.yaml infra/images/studio.Dockerfile infra/images/studio.Caddyfile openapi/management.json; do
+for f in infra/images/studio.Dockerfile infra/images/studio.Caddyfile openapi/management.json; do
   case_ edit "$f"
   expect "$f -> studio" "studio" "$(changed)"
 done
+for f in pnpm-lock.yaml package.json pnpm-workspace.yaml; do
+  case_ edit "$f"
+  expect "$f -> studio and identity" "studio identity" "$(changed)"
+done
+for f in services/identity/src.ts infra/images/identity.Dockerfile; do
+  case_ edit "$f"
+  expect "$f -> identity" "identity" "$(changed)"
+done
 case_ sed -i 's/8000/9000/' infra/compose/.env.example
 expect ".env.example outside the pin block -> studio" "studio" "$(changed)"
-all="gateway orchestrator worker rest auth realtime init studio"
+all="gateway orchestrator worker rest auth realtime init studio identity"
 for f in infra/images/server.Dockerfile infra/images/docker-bake.hcl .dockerignore; do
   case_ edit "$f"
   expect "$f -> every image" "$all" "$(changed)"
@@ -220,6 +230,17 @@ if scripts/pin-images.sh "$work/digests" >/dev/null; then
     bad "compose-image-pins.sh fails on the partial digests"
 else
   bad "pin-images.sh refused a partial digests file"
+fi
+case_ true
+printf 'pin identity %s %s\n' "$sha" "$(digest 97)" >"$work/digests"
+if scripts/pin-images.sh "$work/digests" >/dev/null; then
+  expect "identity digests -> only identity's lines change" \
+    "$(printf '%s\n' "+# ghcr.io/chelabase/identity:$sha@$(digest 97)" "+    image: \${CHELABASE_IMAGE_REPO:-ghcr.io/chelabase}/identity:\${CHELABASE_IMAGE_TAG:-$sha@$(digest 97)}")" \
+    "$(g diff -U0 | grep '^+[^+]')"
+  scripts/tests/compose-image-pins.sh "$work/digests" >/dev/null && ok "compose-image-pins.sh passes on the identity digests" ||
+    bad "compose-image-pins.sh fails on the identity digests"
+else
+  bad "pin-images.sh refused an identity digests file"
 fi
 case_ true
 printf 'pin studio %s %s\npin nosuch %s %s\n' "$sha" "$(digest 99)" "$sha" "$(digest 98)" >"$work/digests"

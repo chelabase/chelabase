@@ -198,7 +198,6 @@ write_env() {
     if [[ "${SELFHOST_E2E_IMAGES:-}" == local ]]; then
       echo "CHELABASE_IMAGE_REPO=${CHELABASE_IMAGE_REPO:-chelabase}"
       echo "CHELABASE_IMAGE_TAG=${CHELABASE_IMAGE_TAG:-latest}"
-      echo "CHELABASE_IDENTITY_IMAGE_TAG=${CHELABASE_IMAGE_TAG_IDENTITY:-${CHELABASE_IMAGE_TAG:-latest}}"
     fi
     for line in "$@"; do echo "$line"; done
   } >"$tmp/$p.env"
