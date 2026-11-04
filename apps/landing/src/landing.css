@@ -5,6 +5,11 @@
   color-scheme: dark;
 }
 
+/* A zoomed screenshot holds the page still behind it. */
+:root:has(.landing dialog[open]) {
+  overflow: hidden;
+}
+
 /* ---------- Motion pieces used by the gauge ---------- */
 
 .survey {

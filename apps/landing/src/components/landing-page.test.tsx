@@ -1,8 +1,9 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import { renderToString } from "react-dom/server";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LandingPage } from "./landing-page";
-import { forkCount } from "./shore-scene";
+import { buildScene, CAPTION_PX, forkCount, ShoreScene } from "./shore-scene";
 import { TideGauge } from "./tide-gauge";
 import { GITHUB_URL } from "@/site-urls";
 
@@ -15,7 +16,7 @@ describe("LandingPage", () => {
   it("each_studio_section_shows_its_screenshots_with_alt_text", () => {
     renderPage();
     for (const [id, srcs] of [
-      ["manage", ["manage-table-editor", "manage-rls-warning"]],
+      ["manage", ["manage-table-editor"]],
       ["collaborate", ["collaborate-team-access"]],
       ["iterate", ["iterate-branches"]],
     ] as const) {
@@ -29,6 +30,13 @@ describe("LandingPage", () => {
         expect(img!.closest("figure")!.querySelector("figcaption")!.textContent!.trim()).not.toBe("");
       }
     }
+  });
+
+  it("says_it_is_alpha_in_the_hero_and_the_footer", () => {
+    renderPage();
+    const hero = screen.getByRole("banner");
+    expect(hero).toHaveTextContent(/Alpha\s*Not ready for production data yet/);
+    expect(screen.getByRole("contentinfo")).toHaveTextContent(/self-hosted alpha/);
   });
 
   it("leads_with_the_chelabase_name", () => {
@@ -166,6 +174,74 @@ describe("LandingPage", () => {
   });
 });
 
+// jsdom has no modal dialogs; open and close them the way a browser does, minus the top layer.
+function stubDialogs() {
+  Object.assign(HTMLDialogElement.prototype, {
+    showModal(this: HTMLDialogElement) {
+      this.setAttribute("open", "");
+    },
+    close(this: HTMLDialogElement) {
+      if (!this.hasAttribute("open")) return;
+      this.removeAttribute("open");
+      this.dispatchEvent(new Event("close"));
+    },
+  });
+}
+
+describe("a Studio screenshot's zoom", () => {
+
+  const openZoom = async () => {
+    stubDialogs();
+    renderPage();
+    const section = document.getElementById("manage")!;
+    await userEvent.click(within(section).getByRole("button", { name: /enlarge.*table editor/i }));
+    const dialog = screen.getByRole("dialog", { name: /table editor/i });
+    expect(dialog).toHaveAttribute("open");
+    return dialog;
+  };
+
+  it("opens_in_place_without_leaving_the_page", async () => {
+    stubDialogs();
+    renderPage();
+    const section = document.getElementById("manage")!;
+    // the shot is a button, not a link to the raw file
+    expect(within(section).queryAllByRole("link").filter((a) => a.getAttribute("href")?.startsWith("/screens/"))).toHaveLength(0);
+    await openZoom();
+  });
+
+  it("closes_with_the_close_button", async () => {
+    const dialog = await openZoom();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Close" }));
+    expect(dialog).not.toHaveAttribute("open");
+  });
+
+  it("closes_with_a_click_outside_the_image", async () => {
+    const dialog = await openZoom();
+    // a click on the dialog itself is a click on the dimmed backdrop around the image
+    fireEvent.click(dialog);
+    expect(dialog).not.toHaveAttribute("open");
+  });
+
+  it("closes_with_a_click_on_the_image", async () => {
+    const dialog = await openZoom();
+    fireEvent.click(within(dialog).getByRole("img"));
+    expect(dialog).not.toHaveAttribute("open");
+  });
+});
+
+describe("the hero before it is measured", () => {
+  it("server_render_hides_the_scene_so_it_never_shows_at_the_wrong_width", () => {
+    // the server can't know the viewport; a drawing laid out for a guessed width must not paint
+    const html = renderToString(<ShoreScene />);
+    expect(html).toMatch(/<svg[^>]*class="[^"]*\binvisible\b/);
+  });
+
+  it("shows_the_scene_once_it_has_measured_its_box", () => {
+    render(<ShoreScene />);
+    expect(screen.getByRole("img", { name: /illustration/i })).not.toHaveClass("invisible");
+  });
+});
+
 describe("the hero with reduced motion", () => {
   afterEach(() => vi.unstubAllGlobals());
 
@@ -198,10 +274,10 @@ describe("the hero with reduced motion", () => {
 describe("the hero at phone width", () => {
   afterEach(() => vi.unstubAllGlobals());
 
-  it("names_the_second_branch_staging_and_merges_it", () => {
-    // jsdom has no layout: report a 390px-wide scene so the scene draws two branches
+  it("draws_one_branch_staging_that_resets_then_merges", () => {
+    // jsdom has no layout: report a 390px-wide scene so the scene draws the phone's single branch
     const w = vi.spyOn(Element.prototype, "clientWidth", "get").mockReturnValue(390);
-    const h = vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(360);
+    const h = vi.spyOn(Element.prototype, "clientHeight", "get").mockReturnValue(400);
     vi.stubGlobal(
       "matchMedia",
       (query: string) => ({ matches: query.includes("reduce"), media: query, addEventListener() {}, removeEventListener() {} }),
@@ -210,15 +286,53 @@ describe("the hero at phone width", () => {
       renderPage();
       const scene = screen.getByRole("img", { name: /crab walks main/i });
       const names = [...scene.querySelectorAll(":scope > text")].map((t) => t.textContent);
-      expect(names).toEqual(expect.arrayContaining(["main", "preview", "staging"]));
+      expect(names).toEqual(expect.arrayContaining(["main", "staging", "reset"]));
+      expect(names).not.toContain("preview");
       expect(names).not.toContain("search");
-      expect(names).toContain("staging's schema merged into main");
-      // main + two branches
-      expect(scene.querySelectorAll(":scope > g[transform^='translate']")).toHaveLength(3);
+      // the full note doesn't fit a phone; the short one stays on screen
+      expect(names).toContain("merged into main");
+      // main + the one branch
+      expect(scene.querySelectorAll(":scope > g[transform^='translate']")).toHaveLength(2);
+      expect(scene).toHaveAccessibleName(/forks off down one branch, staging/);
       expect(scene.querySelectorAll(":scope > ellipse")).toHaveLength(1);
     } finally {
       w.mockRestore();
       h.mockRestore();
+    }
+  });
+
+  it("every_trail_and_label_stays_on_the_sand_and_on_screen_at_every_phone_width", () => {
+    for (let W = 360; W <= 430; W += 5) {
+      const s = buildScene(W, 400);
+      const ceiling = s.beachTop + 12;
+      const floor = s.H - CAPTION_PX;
+      for (const t of s.trails) {
+        for (const [x, y] of t.pts) {
+          expect(x, `${W}: ${t.name} x`).toBeLessThanOrEqual(W - 8);
+          expect(y, `${W}: ${t.name} y`).toBeGreaterThanOrEqual(ceiling);
+          expect(y, `${W}: ${t.name} y`).toBeLessThanOrEqual(floor);
+        }
+      }
+      for (const l of [s.labels.main, ...s.labels.branches, s.labels.reset, s.labels.merged]) {
+        // a label is placed by its anchor; its estimated extent must stay inside the screen
+        const left = l.anchor === "end" ? l.x - l.width : l.anchor === "middle" ? l.x - l.width / 2 : l.x;
+        const right = left + l.width;
+        expect(left, `${W}: ${l.text}`).toBeGreaterThanOrEqual(4);
+        expect(right, `${W}: ${l.text}`).toBeLessThanOrEqual(W - 4);
+        expect(l.y, `${W}: ${l.text}`).toBeLessThanOrEqual(floor);
+      }
+      // no two names overlap (a box per name: its extent by the line height)
+      const all = [s.labels.main, ...s.labels.branches, s.labels.reset, s.labels.merged].map((l) => {
+        const left = l.anchor === "end" ? l.x - l.width : l.anchor === "middle" ? l.x - l.width / 2 : l.x;
+        return { text: l.text, left, right: left + l.width, top: l.y - 14, bottom: l.y + 4 };
+      });
+      for (const a of all) {
+        for (const b of all) {
+          if (a === b) continue;
+          const overlap = a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+          expect(overlap, `${W}: ${a.text} overlaps ${b.text}`).toBe(false);
+        }
+      }
     }
   });
 
@@ -238,8 +352,8 @@ describe("the hero at phone width", () => {
 });
 
 describe("forkCount", () => {
-  it("fits_two_branches_on_phones_and_three_in_the_desktop_column", () => {
-    expect(forkCount(390)).toBe(2);
+  it("fits_one_branch_on_phones_and_three_in_the_desktop_column", () => {
+    expect(forkCount(342)).toBe(1);
     expect(forkCount(1240)).toBe(3);
   });
 });
@@ -267,6 +381,22 @@ describe("TideGauge", () => {
     // back on branch, the pick made before the merge clamp stays
     await userEvent.click(screen.getByRole("radio", { name: "Branch" }));
     expect(slider).toHaveAttribute("aria-valuetext", "2 days ago");
+  });
+
+  it("each_tab_shows_its_verbs_definition_in_place_of_a_separate_list", async () => {
+    render(<TideGauge />);
+    const definition = () => screen.getByRole("heading", { level: 3 }).parentElement!;
+    expect(within(definition()).getByRole("heading", { name: "Branch" })).toBeInTheDocument();
+    expect(definition()).toHaveTextContent(/history window \(seven days by default\)/);
+    for (const [tab, text] of [
+      ["Reset", /keeping its connection string/],
+      ["Restore", /kept as a backup branch/],
+      ["Merge", /three-way merge/],
+    ] as const) {
+      await userEvent.click(screen.getByRole("radio", { name: tab }));
+      expect(within(definition()).getByRole("heading", { name: tab })).toBeInTheDocument();
+      expect(definition()).toHaveTextContent(text);
+    }
   });
 
   it("switches_between_branch_reset_and_restore", async () => {

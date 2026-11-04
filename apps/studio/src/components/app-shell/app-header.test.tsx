@@ -5,6 +5,13 @@ import { renderWithRouter } from "@/test/render-router";
 import { AppHeader } from "./app-header";
 
 describe("AppHeader", () => {
+  it("marks Studio as alpha, not for production data", async () => {
+    renderWithRouter(<AppHeader profile={{ name: "Ada" }} onSignOut={() => {}} />);
+    const tag = await screen.findByText("Alpha");
+    expect(tag.closest("[title]")).toHaveAttribute("title", expect.stringMatching(/not ready for production data/));
+    expect(screen.getByText(/not ready for production data/, { selector: ".sr-only" })).toBeInTheDocument();
+  });
+
   it("shows the name in the trigger", async () => {
     renderWithRouter(<AppHeader profile={{ name: "Ada", email: "ada@x.dev" }} onSignOut={() => {}} />);
     expect(await screen.findByRole("button", { name: "Ada" })).toBeInTheDocument();

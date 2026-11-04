@@ -2,12 +2,17 @@
 
 Chelabase is an open-source Postgres platform: databases with copy-on-write branches, a typed data API, login roles, auth for your app's users and a web console, built on Neon's storage engine. You can self-host it today with Docker Compose; a hosted version is planned.
 
+> [!WARNING]
+> **Alpha.** Chelabase is early, pre-release software and not ready for production data. Expect
+> breaking changes between versions, rough edges and security issues no one has found yet. Run it on
+> data you can afford to lose, and [report what breaks](https://github.com/chelabase/chelabase/issues).
+
 <!-- Static badges: the repo is private and has no release or CI yet. When the repo is public, the
 first release is cut and CI (#7) exists, swap in dynamic release and CI badges. -->
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](infra/neon/README.md)
 [![Self-hosted: Docker Compose ≥ 2.30](https://img.shields.io/badge/self--hosted-Docker%20Compose%20%E2%89%A5%202.30-2496ed)](apps/docs/content/docs/self-hosting/install.mdx)
-[![Status: pre-release](https://img.shields.io/badge/status-pre--release-orange)](SECURITY.md#supported-versions)
+[![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](SECURITY.md#supported-versions)
 
 ## How it works
 
@@ -15,34 +20,16 @@ Chelabase is a set of open-source services behind one gateway. Each database is 
 compute on Neon's storage engine, so branches are copy-on-write and can be made or restored at a
 point in time.
 
-```mermaid
-flowchart LR
-  app["Your app<br/>@chelabase/client"] -- HTTPS --> gateway
-  browser["Studio<br/>(web console)"] -- HTTPS --> gateway
-  tools["psql, ORMs,<br/>migration tools"] -- Postgres --> proxy["Neon proxy"]
-
-  gateway["Gateway"] --> orchestrator["Orchestrator<br/>Management API"]
-  gateway --> rest["Rest<br/>data API"]
-  gateway --> auth["Auth<br/>sign-in, app users"]
-  gateway --> realtime["Realtime<br/>live rows, presence"]
-  orchestrator -- jobs --> worker["Worker"]
-
-  subgraph neon ["Neon storage engine"]
-    compute["Postgres compute<br/>(one per branch)"]
-    storage["Pageserver, safekeepers,<br/>object store"]
-    compute --- storage
-  end
-
-  rest --> compute
-  proxy --> compute
-  worker -- provisions --> compute
-```
+<p align="center">
+  <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator and Rest; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; psql and ORMs connect over Postgres through the Neon proxy.">
+</p>
 
 - **[Gateway](apps/docs/content/docs/architecture/gateway.mdx)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.
 - **[Studio](apps/docs/content/docs/using/studio.mdx)** is the web console: projects, databases, branches, the table and SQL editors, keys, members and app users.
 - **[Orchestrator](apps/docs/content/docs/architecture/orchestrator.mdx)** serves the Management API (`/v1`), decides who may do what and keeps the platform's own state. The **Worker** runs its jobs: creating, branching, resetting and deleting databases.
 - **[Rest](apps/docs/content/docs/architecture/data-api.mdx)** is the data API. It turns a JSON query into SQL and runs it as the key's role, so Postgres row-level security decides what each caller sees.
 - **[Auth](apps/docs/content/docs/architecture/app-users.mdx)** signs in Studio members and your app's own users (sign-up, sign-in, sessions), with helpers for RLS policies.
+- **[Identity](apps/docs/content/docs/architecture/identity.mdx)** holds every account, Studio members and each project's app users, on [Better Auth](https://www.better-auth.com). It is internal only: nothing outside the stack reaches it.
 - **[Realtime](apps/docs/content/docs/architecture/realtime.mdx)** pushes live rows and presence to Studio over a WebSocket.
 - **[Neon](apps/docs/content/docs/architecture/neon.mdx)** stores the data. Postgres clients connect through its proxy with [login roles](apps/docs/content/docs/using/login-roles.mdx), whose credentials are encrypted and can be shown again.
 
@@ -151,6 +138,10 @@ To work on Chelabase itself, see [CONTRIBUTING.md](CONTRIBUTING.md).
 ## Security
 
 Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
+
+## Contact
+
+[hello@chelabase.com](mailto:hello@chelabase.com). For bugs and feature requests, open a GitHub issue.
 
 ## License
 

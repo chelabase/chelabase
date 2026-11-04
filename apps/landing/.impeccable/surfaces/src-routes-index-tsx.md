@@ -38,6 +38,17 @@ Hero → Run it on your machine (`git clone` → `cd chelabase/infra/compose` �
 - The comparison was re-surveyed from each product's docs on 2026-10-30; PlanetScale is split because only its MySQL (Vitess) databases merge schema (deploy requests).
 - Mobile polish is deferred.
 
+## Decisions (user, 2026-11-02)
+
+- Manage and Bring your team in open with their notes in two columns, then the Studio screenshot at column width; their illustrative SQL insets are gone (the screenshots show the real SQL and grant). Text-left, code-right stays the rule for the split sections.
+- Manage drops the RLS-warning strip; the Security in plain view note carries it. Every Studio screenshot is a whole 1152×800 window (Team scrolls to its project access), retaken with `pnpm capture-studio` whenever Studio's shell changes.
+- Branch it leads with one wide tide gauge that holds the definitions: tabs on top, drawing and slider on the left, the picked verb's definition and what it did on the right. The separate definition list is gone; the branches screenshot follows at full width.
+- A screenshot opens larger in a dialog over the page; Esc, a close button or a click anywhere closes it. It never navigates to the raw file.
+- The hero scene stays hidden until it has measured its box, so a wide screen never paints the server's guessed width first.
+- Public contact is hello@chelabase.com, in the footer.
+- Alpha everywhere: a tag and line under the hero actions (and "self-hosted alpha" in the footer), worded as the README, docs and Studio's top bar say it.
+- Mobile polish: below a 700px column the hero tells a one-branch story (user, 2026-11-02): a single smaller crab forks off down staging, resets, then merges and burrows; smaller crabs, sun and palms, narrower trails, everything above the Replay row and on screen, the merge note shortened to "merged into main", the comparison's row names stay put while the products scroll, and the tide gauge sets its text larger.
+
 ## Direction contract
 
 THESIS: A crab walks the shore and every branch is a trail it splits off. Branching is shown as something alive (crabs forking off main and coming back on reset), not a git graph, not a nautical chart. Refuses the dark-SaaS split hero and the feature-card grid.

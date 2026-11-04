@@ -1,6 +1,9 @@
 import { type CSSProperties, useId, useState } from "react";
 
-/** The Branching section's instrument: pick branch, reset, restore or merge, and a point in main's history. */
+/**
+ * The Branching section's instrument: pick branch, reset, restore or merge, and a point in main's history. Beside the
+ * drawing it defines the picked verb and says what it just did.
+ */
 
 type Mode = "branch" | "reset" | "restore" | "merge";
 
@@ -10,6 +13,16 @@ const MODES: Array<{ value: Mode; label: string }> = [
   { value: "restore", label: "Restore" },
   { value: "merge", label: "Merge" },
 ];
+
+/** What each verb does, in general; the caption below it says what it did in the drawing. */
+const DEFINITIONS: Record<Mode, string> = {
+  branch:
+    "Copy any branch as it is now, or as it was at any point in its history window (seven days by default). The copy is copy-on-write, so it's ready at once, with its own endpoint and password.",
+  reset: "Bring a branch back in line with its parent's latest state, keeping its connection string.",
+  restore: "Take a branch back to a point in time. The old timeline is kept as a backup branch, in case you want it back.",
+  merge:
+    "Move schema changes from a branch into its parent with a three-way merge. Resolve conflicts, rehearse on a copy of the target, then apply. Rows never move.",
+};
 
 const WINDOW_HOURS = 168; // the default 7-day history window
 /** A merge needs preview to have branched at least this long ago, so its way back into main has room. */
@@ -30,6 +43,10 @@ function describeHoursAgo(h: number): string {
   const d = days === 1 ? "1 day" : `${days} days`;
   return hours === 0 ? `${d} ago` : `${d} ${hours} hours ago`;
 }
+
+/** On a phone the drawing is about half size: its text is set larger, in the drawing's own units, to stay readable. */
+const PHONE_TICK = "max-[560px]:text-[22px]";
+const PHONE_NAME = "max-[560px]:text-[27px]";
 
 const style = (vars: Record<string, string | number>) => vars as CSSProperties;
 
@@ -98,151 +115,160 @@ export function TideGauge() {
         ))}
       </fieldset>
 
-      <svg className="block w-full h-auto" viewBox="0 0 640 300" aria-hidden="true">
-        <defs>
-          <pattern id={`${id.replace(/:/g, "")}-hazard`} width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
-            <line x1="0" y1="0" x2="0" y2="8" stroke="var(--coral)" strokeWidth="1.2" opacity="0.5" />
-          </pattern>
-        </defs>
-        {/* main's dredged water */}
-        <path d={`M${LEFT} ${MAIN_Y} L ${RIGHT} ${MAIN_Y}`} stroke="var(--seafoam)" strokeOpacity={0.12} strokeWidth={30} fill="none" />
-        {/* Day ticks */}
-        {Array.from({ length: 8 }, (_, d) => {
-          const x = xAt(d * 24);
-          return (
-            <g key={d}>
-              <line x1={x} y1={MAIN_Y + 10} x2={x} y2={MAIN_Y + 18} stroke="var(--line-strong)" />
-              <text x={x} y={MAIN_Y + 40} textAnchor="middle" className="font-serif italic" fontSize="13" fill="var(--chalk-dim)">
-                {d === 0 ? "now" : `${d}d`}
-              </text>
-            </g>
-          );
-        })}
+      {/* the drawing and its slider; beside it (below it under 900px), the picked verb */}
+      <div className="grid grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)] max-[900px]:grid-cols-1">
+        <div className="min-w-0">
+          <svg className="block w-full h-auto" viewBox="0 0 640 300" aria-hidden="true">
+            <defs>
+              <pattern id={`${id.replace(/:/g, "")}-hazard`} width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+                <line x1="0" y1="0" x2="0" y2="8" stroke="var(--coral)" strokeWidth="1.2" opacity="0.5" />
+              </pattern>
+            </defs>
+            {/* main's dredged water */}
+            <path d={`M${LEFT} ${MAIN_Y} L ${RIGHT} ${MAIN_Y}`} stroke="var(--seafoam)" strokeOpacity={0.12} strokeWidth={30} fill="none" />
+            {/* Day ticks */}
+            {Array.from({ length: 8 }, (_, d) => {
+              const x = xAt(d * 24);
+              return (
+                <g key={d}>
+                  <line x1={x} y1={MAIN_Y + 10} x2={x} y2={MAIN_Y + 18} stroke="var(--line-strong)" />
+                  <text x={x} y={MAIN_Y + 40} textAnchor="middle" className={`font-serif italic ${PHONE_TICK}`} fontSize="13" fill="var(--chalk-dim)">
+                    {d === 0 ? "now" : `${d}d`}
+                  </text>
+                </g>
+              );
+            })}
 
-        {/* main */}
-        {mode === "restore" ? (
-          <>
-            <path d={`M${LEFT} ${MAIN_Y} L ${oldForkX} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={3} fill="none" />
-            <rect x={oldForkX} y={MAIN_Y - 15} width={Math.max(0, NOW - oldForkX)} height={30} fill={`url(#${id.replace(/:/g, "")}-hazard)`} />
-            <path d={`M${oldForkX} ${MAIN_Y} L ${NOW} ${MAIN_Y}`} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 5" fill="none" />
-            <text x={NOW} y={MAIN_Y - 22} textAnchor="end" className="font-serif italic" fontSize="14" fill="var(--coral)">
-              main-before-restore-… (backup)
-            </text>
-            <path
-              d={`M${oldForkX} ${MAIN_Y} C ${oldForkX + 30} ${MAIN_Y} ${oldForkX + 30} 250 ${oldForkX + 60} 250 L ${RIGHT} 250`}
-              stroke="var(--seafoam)"
-              strokeOpacity={0.14}
-              strokeWidth={24}
+            {/* main */}
+            {mode === "restore" ? (
+              <>
+                <path d={`M${LEFT} ${MAIN_Y} L ${oldForkX} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={3} fill="none" />
+                <rect x={oldForkX} y={MAIN_Y - 15} width={Math.max(0, NOW - oldForkX)} height={30} fill={`url(#${id.replace(/:/g, "")}-hazard)`} />
+                <path d={`M${oldForkX} ${MAIN_Y} L ${NOW} ${MAIN_Y}`} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 5" fill="none" />
+                <text x={NOW} y={MAIN_Y - 22} textAnchor="end" className={`font-serif italic ${PHONE_NAME}`} fontSize="14" fill="var(--coral)">
+                  main-before-restore-… (backup)
+                </text>
+                <path
+                  d={`M${oldForkX} ${MAIN_Y} C ${oldForkX + 30} ${MAIN_Y} ${oldForkX + 30} 250 ${oldForkX + 60} 250 L ${RIGHT} 250`}
+                  stroke="var(--seafoam)"
+                  strokeOpacity={0.14}
+                  strokeWidth={24}
+                  fill="none"
+                />
+                <path
+                  key="restore"
+                  d={`M${oldForkX} ${MAIN_Y} C ${oldForkX + 30} ${MAIN_Y} ${oldForkX + 30} 250 ${oldForkX + 60} 250 L ${RIGHT} 250`}
+                  stroke="var(--seafoam)"
+                  strokeWidth={3}
+                  fill="none"
+                  pathLength={1}
+                  className="survey"
+                  style={style({ "--len": 1 })}
+                />
+                <text x={RIGHT - 4} y={240} textAnchor="end" className={`font-serif italic ${PHONE_NAME}`} fontSize="17" fill="var(--seafoam)">
+                  main
+                </text>
+              </>
+            ) : (
+              <>
+                <path d={`M${LEFT} ${MAIN_Y} L ${NOW} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={3} fill="none" />
+                <path d={`M${NOW} ${MAIN_Y} L ${RIGHT} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={1.5} strokeDasharray="2 6" fill="none" />
+                <text x={LEFT} y={MAIN_Y - 12} className={`font-serif italic ${PHONE_NAME}`} fontSize="17" fill="var(--seafoam)">
+                  main
+                </text>
+              </>
+            )}
+
+            {/* preview */}
+            {mode === "reset" && (
+              <path d={channel(oldForkX, PREVIEW_Y)} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 6" fill="none" opacity={0.45} />
+            )}
+            {mode !== "restore" && (
+              <>
+                <path d={channel(forkX, PREVIEW_Y)} stroke="var(--seafoam)" strokeOpacity={0.14} strokeWidth={24} fill="none" />
+                <path
+                  key={mode}
+                  d={channel(forkX, PREVIEW_Y)}
+                  stroke="var(--coral)"
+                  strokeWidth={2.5}
+                  strokeLinecap="round"
+                  fill="none"
+                  pathLength={1}
+                  className="survey"
+                  style={style({ "--len": 1 })}
+                />
+                <text x={RIGHT - 4} y={88} textAnchor="end" className={`font-serif italic ${PHONE_NAME}`} fontSize="17" fill="var(--coral)">
+                  preview
+                </text>
+              </>
+            )}
+
+            {/* a merge: preview's schema flows back into main now, in preview's colour (sand is the picked point) */}
+            {mode === "merge" && (
+              <>
+                <path
+                  key={`merge-${hoursAgo}`}
+                  d={`M${NOW - 70} ${PREVIEW_Y} C ${NOW - 35} ${PREVIEW_Y} ${NOW - 35} ${MAIN_Y} ${NOW} ${MAIN_Y}`}
+                  stroke="var(--coral)"
+                  strokeWidth={2.5}
+                  strokeLinecap="round"
+                  fill="none"
+                  pathLength={1}
+                  className="survey"
+                  style={style({ "--len": 1, "--delay": "700ms" })}
+                />
+                <text x={NOW - 44} y={(PREVIEW_Y + MAIN_Y) / 2 + 5} textAnchor="end" className="font-serif italic max-[560px]:hidden" fontSize="15" fill="var(--coral)">
+                  schema
+                </text>
+                <circle cx={NOW} cy={MAIN_Y} r={4} fill="var(--ink)" stroke="var(--coral)" strokeWidth={2} />
+              </>
+            )}
+
+            {/* the fork point */}
+            <circle
+              key={`${mode}-${hoursAgo}`}
+              cx={forkX}
+              cy={MAIN_Y}
+              r={18}
               fill="none"
+              stroke="var(--sand)"
+              strokeWidth={1.5}
+              className="ripple"
             />
-            <path
-              key="restore"
-              d={`M${oldForkX} ${MAIN_Y} C ${oldForkX + 30} ${MAIN_Y} ${oldForkX + 30} 250 ${oldForkX + 60} 250 L ${RIGHT} 250`}
-              stroke="var(--seafoam)"
-              strokeWidth={3}
-              fill="none"
-              pathLength={1}
-              className="survey"
-              style={style({ "--len": 1 })}
+            <circle cx={forkX} cy={MAIN_Y} r={5} fill="var(--ink)" stroke="var(--sand)" strokeWidth={2} />
+          </svg>
+
+          <div className="grid gap-2 px-5 pt-4 pb-5 border-t border-line">
+            <label htmlFor={`${id}-when`} className="flex justify-between gap-3 text-[0.95rem] text-chalk-dim">
+              <span>Point in time</span>
+              <output htmlFor={`${id}-when`} className="font-serif italic text-sand">
+                {mode === "reset" ? "main's latest" : when}
+              </output>
+            </label>
+            <input
+              id={`${id}-when`}
+              className={`tide-staff appearance-none w-full h-7 m-0 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${FOCUS}`}
+              type="range"
+              min={0}
+              max={WINDOW_HOURS}
+              step={6}
+              value={hoursAgo}
+              disabled={mode === "reset"}
+              aria-valuetext={when}
+              style={{ direction: "rtl" }}
+              // the staff draws all seven days, so a merge clamps the pick rather than narrowing the range
+              onChange={(e) => setHoursAgo(Math.max(Number(e.target.value), minHours))}
             />
-            <text x={RIGHT - 4} y={240} textAnchor="end" className="font-serif italic" fontSize="17" fill="var(--seafoam)">
-              main
-            </text>
-          </>
-        ) : (
-          <>
-            <path d={`M${LEFT} ${MAIN_Y} L ${NOW} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={3} fill="none" />
-            <path d={`M${NOW} ${MAIN_Y} L ${RIGHT} ${MAIN_Y}`} stroke="var(--seafoam)" strokeWidth={1.5} strokeDasharray="2 6" fill="none" />
-            <text x={LEFT} y={MAIN_Y - 12} className="font-serif italic" fontSize="17" fill="var(--seafoam)">
-              main
-            </text>
-          </>
-        )}
-
-        {/* preview */}
-        {mode === "reset" && (
-          <path d={channel(oldForkX, PREVIEW_Y)} stroke="var(--coral)" strokeWidth={1.5} strokeDasharray="3 6" fill="none" opacity={0.45} />
-        )}
-        {mode !== "restore" && (
-          <>
-            <path d={channel(forkX, PREVIEW_Y)} stroke="var(--seafoam)" strokeOpacity={0.14} strokeWidth={24} fill="none" />
-            <path
-              key={mode}
-              d={channel(forkX, PREVIEW_Y)}
-              stroke="var(--coral)"
-              strokeWidth={2.5}
-              strokeLinecap="round"
-              fill="none"
-              pathLength={1}
-              className="survey"
-              style={style({ "--len": 1 })}
-            />
-            <text x={RIGHT - 4} y={88} textAnchor="end" className="font-serif italic" fontSize="17" fill="var(--coral)">
-              preview
-            </text>
-          </>
-        )}
-
-        {/* a merge: preview's schema flows back into main now, in preview's colour (sand is the picked point) */}
-        {mode === "merge" && (
-          <>
-            <path
-              key={`merge-${hoursAgo}`}
-              d={`M${NOW - 70} ${PREVIEW_Y} C ${NOW - 35} ${PREVIEW_Y} ${NOW - 35} ${MAIN_Y} ${NOW} ${MAIN_Y}`}
-              stroke="var(--coral)"
-              strokeWidth={2.5}
-              strokeLinecap="round"
-              fill="none"
-              pathLength={1}
-              className="survey"
-              style={style({ "--len": 1, "--delay": "700ms" })}
-            />
-            <text x={NOW - 44} y={(PREVIEW_Y + MAIN_Y) / 2 + 5} textAnchor="end" className="font-serif italic max-[560px]:hidden" fontSize="15" fill="var(--coral)">
-              schema
-            </text>
-            <circle cx={NOW} cy={MAIN_Y} r={4} fill="var(--ink)" stroke="var(--coral)" strokeWidth={2} />
-          </>
-        )}
-
-        {/* the fork point */}
-        <circle
-          key={`${mode}-${hoursAgo}`}
-          cx={forkX}
-          cy={MAIN_Y}
-          r={18}
-          fill="none"
-          stroke="var(--sand)"
-          strokeWidth={1.5}
-          className="ripple"
-        />
-        <circle cx={forkX} cy={MAIN_Y} r={5} fill="var(--ink)" stroke="var(--sand)" strokeWidth={2} />
-      </svg>
-
-      <div className="grid gap-2 px-5 pt-4 pb-5 border-t border-line">
-        <label htmlFor={`${id}-when`} className="flex justify-between gap-3 text-[0.95rem] text-chalk-dim">
-          <span>Point in time</span>
-          <output htmlFor={`${id}-when`} className="font-serif italic text-sand">
-            {mode === "reset" ? "main's latest" : when}
-          </output>
-        </label>
-        <input
-          id={`${id}-when`}
-          className={`tide-staff appearance-none w-full h-7 m-0 cursor-pointer disabled:cursor-not-allowed disabled:opacity-40 ${FOCUS}`}
-          type="range"
-          min={0}
-          max={WINDOW_HOURS}
-          step={6}
-          value={hoursAgo}
-          disabled={mode === "reset"}
-          aria-valuetext={when}
-          style={{ direction: "rtl" }}
-          // the staff draws all seven days, so a merge clamps the pick rather than narrowing the range
-          onChange={(e) => setHoursAgo(Math.max(Number(e.target.value), minHours))}
-        />
+          </div>
+        </div>
+        <div className="flex flex-col gap-3 px-6 pt-6 pb-6.5 border-l border-line max-[900px]:border-l-0 max-[900px]:border-t max-[900px]:px-5 max-[900px]:pt-5">
+          <h3 className="m-0 font-serif font-semibold text-[1.4rem] leading-[1.2]">{MODES.find((m) => m.value === mode)!.label}</h3>
+          <p className="m-0 text-chalk-dim">{DEFINITIONS[mode]}</p>
+          <p className="mt-auto mb-0 pt-4 border-t border-line text-chalk text-[0.98rem]" aria-live="polite">
+            {caption}
+          </p>
+        </div>
       </div>
-      <p className="m-0 px-5 pb-4.5 min-h-[3.2em] text-chalk text-[0.98rem]" aria-live="polite">
-        {caption}
-      </p>
     </figure>
   );
 }

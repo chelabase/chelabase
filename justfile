@@ -44,6 +44,11 @@ auth-token:
 landing-visual *args:
     pnpm --filter @chelabase/landing build && pnpm --filter @chelabase/landing visual "$@"
 
+# Build and deploy the landing page or the docs to Cloudflare from a clean main; `--dry-run` checks
+# the build and upload on any branch without deploying
+site-deploy app *args:
+    scripts/deploy-site.sh {{app}} {{args}}
+
 # --- Demo helpers ---
 
 # POST a demo database using seeded tenant/project IDs and the dev member's access token

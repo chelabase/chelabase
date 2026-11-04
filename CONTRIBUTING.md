@@ -311,6 +311,7 @@ Two workflows in `.github/workflows/`. Until the repo is public (Actions minutes
 
 - `ci.yml`: uncomment `pull_request:` and `push: { branches: [main] }`.
 - `live.yml`: uncomment the nightly `schedule:`. For a `run-live` PR label, uncomment the `pull_request:` block and the job's `if:` line too.
+- `landing-deploy.yml` and `docs-deploy.yml`: uncomment the `push:` block (a merge to `main` that touches the site deploys it).
 
 **Checking a workflow without Actions minutes:** `actionlint` for syntax and expressions, and `act` to run it in Docker (both are single binaries from their GitHub releases; install them outside the repo):
 
@@ -323,6 +324,17 @@ act workflow_dispatch -W .github/workflows/live.yml --container-daemon-socket /v
 `act` needs a runner image (`-P ubuntu-latest=catthehacker/ubuntu:act-24.04`; the `full` image is about 75 GB) and a GitHub token (`-s GITHUB_TOKEN=…`, a fine-grained token with no access is enough): `proto` resolves the Rust, just and moon versions through the GitHub API, and without a token it fails with "Failed to resolve … to a valid supported version". Don't pass `--bind`: the runner's user (uid 1001) takes ownership of the bound checkout. Neither workflow has been run under `act` yet.
 
 `act` can't prove: that its runner image matches ubuntu-latest (the packages, the Docker and Compose versions: the workbench needs Compose 2.30 or newer), how `actions/cache` and `rust-cache` behave on GitHub's cache service, timing and disk limits on the hosted runner, and the `workflow_dispatch` UI. The first real run at launch checks these.
+
+## Deploying the landing page and docs
+
+Both sites are prerendered static files, served by Cloudflare as static-only Workers (no Worker script): the landing page at `chelabase.com` and the docs at `docs.chelabase.com`. Each app's `wrangler.jsonc` names its Worker and domain.
+
+```bash
+just site-deploy landing             # or docs: build, then deploy from a clean main
+just site-deploy docs --dry-run      # build and check the upload on any branch; deploys nothing
+```
+
+A deploy builds locally and needs no Actions minutes. It refuses unless the tree is clean and HEAD is on `origin/main`, so a site only ever carries merged changes. Sign in once with `pnpm dlx wrangler@4.156.0 login`, or set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`. `landing-deploy.yml` and `docs-deploy.yml` run the same script from the Actions tab, with the token in the `production` environment's secrets: Cloudflare's "Edit Cloudflare Workers" token template, scoped to the Chelabase account and the `chelabase.com` zone.
 
 ## Releasing images
 

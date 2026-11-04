@@ -91,6 +91,13 @@ describe('the built docs site', () => {
     expect(read('docs/index.html')).toContain('Introduction');
   });
 
+  it('the_alpha_notice_is_on_every_entry_page', () => {
+    // where someone decides to run Chelabase: the docs home, Install and the Quickstart
+    for (const page of ['docs/index.html', 'docs/self-hosting/install/index.html', 'docs/using/quickstart/index.html']) {
+      expect(read(page), page).toContain('not ready for production data');
+    }
+  });
+
   it('prerenders_every_management_operation', () => {
     const doc = JSON.parse(readFileSync(join(repoRoot, 'openapi/management.json'), 'utf8'));
     const methods = ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace'];
@@ -246,6 +253,28 @@ describe('the built docs site', () => {
     expect(html).toMatch(/<meta[^>]*http-equiv="refresh"[^>]*content="0; url=\/docs"/);
     // No canonical link until the docs host is decided (spec D4): a relative one is wrong.
     expect(html).not.toMatch(/rel="canonical"/);
+  });
+
+  it('an_api_page_shows_its_description_once_as_markdown_not_raw', () => {
+    // fumadocs-openapi renders the operation's description itself; the raw markdown must not lead
+    // the page as well
+    const html = read('docs/reference/management/merges/finishMerge/index.html');
+    // what's shown: the body without its scripts (the serialized loader data keeps the raw text)
+    const body = html.slice(html.indexOf('<body')).replace(/<script[\s\S]*?<\/script>/g, '');
+    expect(body).toContain('<code>applied_with_drift</code>');
+    expect(body).not.toContain('`applied_with_drift`');
+    // the meta description is plain text
+    expect(/<meta name="description" content="([^"]*)"/.exec(html)?.[1]).not.toContain('`');
+  });
+
+  it('each_sidebar_operation_shows_its_method_once', () => {
+    // one loader plugin labels every OpenAPI page, whichever document it came from; a plugin per
+    // document labelled each operation once per document
+    const sidebar = sidebarOf(read('docs/reference/management/merges/finishMerge/index.html'));
+    const links = [...sidebar.matchAll(/<a\s[^>]*>[\s\S]*?<\/a>/g)].map((m) => m[0]);
+    const labelled = links.filter((a) => badges(a).length > 0);
+    expect(labelled.length).toBeGreaterThan(5);
+    for (const a of labelled) expect(badges(a).map((b) => b.text), a.slice(0, 120)).toHaveLength(1);
   });
 
   it('badge_signature_is_on_operation_and_sidebar_badges', () => {
