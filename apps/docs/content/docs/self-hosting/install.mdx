@@ -40,14 +40,14 @@ Two one-shot containers do the setup, and both must exit 0:
 | `studio` | The web app |
 | `orchestrator`, `worker` | The Management API and the jobs that create, branch and delete databases |
 | `auth` | The login API: sign-in, sign-up, invites, password reset, and member and app-user tokens |
-| `identity` | Every account (Studio's members and each project's app users) and the emails with codes; internal only, see [Identity service](/docs/architecture/identity) |
+| `identity` | Every account (Studio's members and each project's app users) and the emails with codes; internal only, see [Identity service](/architecture/identity) |
 | `rest`, `realtime` | The data API and live rows |
 | `metadata-db`, `nats`, `valkey` | The control plane's database (the identity service's schemas live there too), jobs, and caches |
 | `storage-*`, `pageserver`, `safekeeper*`, `proxy`, `seaweedfs` | Neon's storage and the Postgres proxy |
 
 Running `docker compose up` again with nothing changed recreates nothing and prints no new code. `docker compose down` followed by `up` keeps the secrets.
 
-To try Chelabase with a demo organisation already set up, see [Example organisation](/docs/self-hosting/example).
+To try Chelabase with a demo organisation already set up, see [Example organisation](/self-hosting/example).
 
 ## Read the setup code
 
@@ -75,7 +75,7 @@ Still local only? Check before you go on: the claim is the moment the instance i
 2. Fill in the form and enter the setup code. An instance that is still unclaimed shows the code field (`GET /auth/v1/instance` answers `{"setupRequired":true}`).
 3. You become the instance's admin. The code stops mattering: from now on sign-up follows the normal rules.
 
-After the claim, a second sign-up is refused with `sign_up_closed` unless you switch open sign-up on in Studio; people who then sign up wait as pending members for your approval. A sign-up with a missing or wrong code on an unclaimed instance is refused with `setup_code_invalid` and creates no account. If two people claim at the same moment, one becomes the admin and the other is admitted as pending. See [Members and invites](/docs/using/members-and-invites).
+After the claim, a second sign-up is refused with `sign_up_closed` unless you switch open sign-up on in Studio; people who then sign up wait as pending members for your approval. A sign-up with a missing or wrong code on an unclaimed instance is refused with `setup_code_invalid` and creates no account. If two people claim at the same moment, one becomes the admin and the other is admitted as pending. See [Members and invites](/using/members-and-invites).
 
 ## Choose your own secrets (optional)
 
@@ -110,7 +110,7 @@ Every setting is in `.env.example` with a comment. The ones you are most likely 
 
 | Setting | Default | What it does |
 |---|---|---|
-| `CHELABASE_STUDIO_HOST`, `CHELABASE_API_HOST`, `CHELABASE_AUTH_HOST` | `*.chelabase.localhost:8000` | The three public host names (see [Hosts](/docs/self-hosting/hosts)) |
+| `CHELABASE_STUDIO_HOST`, `CHELABASE_API_HOST`, `CHELABASE_AUTH_HOST` | `*.chelabase.localhost:8000` | The three public host names (see [Hosts](/self-hosting/hosts)) |
 | `CHELABASE_STUDIO_HOST_NAME`, `CHELABASE_API_HOST_NAME`, `CHELABASE_AUTH_HOST_NAME` | the localhost names | The same three names without the port |
 | `CHELABASE_PUBLIC_PORT` | `8000` | The port in the hosts (80 for `http`, 443 for `https` when the hosts carry none) |
 | `CHELABASE_PUBLIC_SCHEME` | `http` | `http` or `https`: the scheme of every public URL |
@@ -156,9 +156,9 @@ CHELABASE_HTTP_ADDR=127.0.0.1
 CHELABASE_HTTP_PORT=8000
 ```
 
-Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network (see [Hosts](/docs/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
+Point the proxy at the gateway's published port (`8000` here) in plain HTTP, passing the `Host` header through. `CHELABASE_HTTP_ADDR=127.0.0.1` keeps that plain-HTTP port off your network when the proxy runs on the same host; set it to an address the proxy can reach (or `0.0.0.0` behind a firewall) only when the proxy runs elsewhere. The gateway listens on 443 inside its container, but in plain HTTP: the services never call the public `https://` URLs from inside the network (see [Hosts](/self-hosting/hosts#tls), including what to set when a reverse proxy is in front).
 
-Set `CHELABASE_GATEWAY_TRUSTED_PROXIES` to your proxy's address too, so per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
+Set `CHELABASE_GATEWAY_TRUSTED_PROXIES` to your proxy's address too, so per-IP sign-in and sign-up limits see each client's own address ([Behind a reverse proxy](/self-hosting/hosts#behind-a-reverse-proxy)).
 
 ### Email
 
@@ -187,7 +187,7 @@ A password file uid 10001 can't read, one with a looser mode than 0600, a symlin
 
 ## Connect to databases
 
-Apps use the [data API](/docs/using/data-api) through the gateway. Postgres clients (migrations, ORMs, admin tools, `psql`) connect through Neon's proxy, which the install publishes on `CHELABASE_PROXY_ADDR` (default `127.0.0.1`): Postgres on `CHELABASE_PROXY_PORT` (default `5432`, the Postgres default, so clients need no port; change it if the host runs its own Postgres) and SQL over HTTP on `CHELABASE_PROXY_HTTP_PORT` (default `4444`). Connection details in Studio and the API name the same host and ports.
+Apps use the [data API](/using/data-api) through the gateway. Postgres clients (migrations, ORMs, admin tools, `psql`) connect through Neon's proxy, which the install publishes on `CHELABASE_PROXY_ADDR` (default `127.0.0.1`): Postgres on `CHELABASE_PROXY_PORT` (default `5432`, the Postgres default, so clients need no port; change it if the host runs its own Postgres) and SQL over HTTP on `CHELABASE_PROXY_HTTP_PORT` (default `4444`). Connection details in Studio and the API name the same host and ports.
 
 The proxy picks the database by the host name a client connects to (its TLS server name): `<endpoint>.CHELABASE_PROXY_DOMAIN`. So every such name must reach the proxy:
 

@@ -5,7 +5,7 @@ description: Run SQL scripts against a branch from Studio, with a confirmation g
 
 Studio's **SQL editor** runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. Open it from **SQL editor** in the left rail, or as a drawer under a table in the Table editor (**Full editor** switches to the full page; **Quick view** goes back).
 
-Running as the owner (the default for an Admin) uses the database owner's credentials. A Developer, who may not act as the owner, runs as one of the Postgres roles their grant lists, through a login role of their own that can only switch into those roles: see [Roles and schema isolation](/docs/using/roles-and-schema-isolation). Saved queries are shared within the project. Everything below is also available over the API:
+Running as the owner (the default for an Admin) uses the database owner's credentials. A Developer, who may not act as the owner, runs as one of the Postgres roles their grant lists, through a login role of their own that can only switch into those roles: see [Roles and schema isolation](/using/roles-and-schema-isolation). Saved queries are shared within the project. Everything below is also available over the API:
 
 | Request | What it does |
 |---|---|
@@ -14,7 +14,7 @@ Running as the owner (the default for an Admin) uses the database owner's creden
 | `GET /v1/databases/{id}/branches/{branch_id}/sql/schema?database=` | The schema document that feeds completion. |
 | `/v1/databases/{id}/sql-queries` and `…/{query_id}` | Saved queries. |
 
-For how the run engine, guard and schema read work inside, see [SQL editor internals](/docs/architecture/sql-editor).
+For how the run engine, guard and schema read work inside, see [SQL editor internals](/architecture/sql-editor).
 
 ## Using the editor
 
@@ -28,7 +28,7 @@ While you run as the owner, the editor says so: row-level security is bypassed. 
 
 - A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` and `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
 - `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block, so they are accepted only as the script's single statement.
-- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use `psql` with a [login role](/docs/using/login-roles) for it.
+- `COPY … FROM STDIN` isn't supported in the editor (there is no way to send the data). Use `psql` with a [login role](/using/login-roles) for it.
 - Row values come back as text (or `null`).
 
 ### Limits
@@ -66,7 +66,7 @@ Closing the stream, or the cancel route, sends Postgres's cancel request.
 Before running, the script is parsed (with pg_query, Postgres's own parser) and each statement is classified.
 
 - On a normal branch the guard holds back **risky** statements: `DROP` of an object, database, role, owned objects, subscription or tablespace, `TRUNCATE`, `DELETE` and `UPDATE` without a `WHERE`, and `ALTER TABLE` that drops a column or a constraint. `EXPLAIN ANALYZE` (it runs its statement) and `PREPARE` of a risky statement count as risky.
-- On a **protected** branch every statement that isn't a read is held, with reason `protected`. Reads are `SELECT` (without `INTO` or a locking clause, and without a data-modifying `WITH`), `SHOW`, and plain `EXPLAIN` of a read. Even `BEGIN`, `SET` and `COMMIT` are held. See [Branches](/docs/using/branches) for protecting a branch.
+- On a **protected** branch every statement that isn't a read is held, with reason `protected`. Reads are `SELECT` (without `INTO` or a locking clause, and without a data-modifying `WITH`), `SHOW`, and plain `EXPLAIN` of a read. Even `BEGIN`, `SET` and `COMMIT` are held. See [Branches](/using/branches) for protecting a branch.
 - A script that doesn't parse is held as `unparsed`.
 
 A held run answers 409 `sql_confirm_required` and nothing runs. The body lists the held statements (`index`, `kind`, `text_preview` of up to 200 characters, `reason` of `risky` or `protected`). Studio shows them in a dialog; **Confirm** sends the run again with `confirm: true`, which runs the whole script, held statements included.

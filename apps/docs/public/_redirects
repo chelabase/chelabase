@@ -1,0 +1,5 @@
+# The docs moved from /docs/… to the site root on 2026-11-04. Cloudflare's static assets apply
+# these rules before serving files (the file itself is not served). /docs/x/ → /x/; a bare /x then
+# gets the usual trailing-slash redirect from html_handling.
+/docs / 301
+/docs/* /:splat 301

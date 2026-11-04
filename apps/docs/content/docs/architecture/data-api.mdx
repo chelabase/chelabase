@@ -3,7 +3,7 @@ title: "Data API"
 description: "How a data API request becomes SQL: the request flow, pooling, caches, the schema model and the benchmark."
 ---
 
-Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it on the branch's compute. For how to use it, see the [data API guide](/docs/using/data-api).
+Apps read and write a branch's tables over `POST /data/v1/query` with per-branch keys. The gateway checks the key; the `rest` service (`services/rest`, `just rest`) turns the request into SQL and runs it on the branch's compute. For how to use it, see the [data API guide](/using/data-api).
 
 ## Request flow
 
@@ -25,7 +25,7 @@ POST /data/v1/query, Authorization: Bearer <key>  →  gateway
   ↓ JSON response
 ```
 
-Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it. The gateway's caching and rate limit are described on the [Gateway](/docs/architecture/gateway) page.
+Keys authenticate with the `Authorization: Bearer` header. The gateway resolves the key and mints an internal token that `rest` verifies; the token carries the key's database allow-list, and `rest` enforces it. The gateway's caching and rate limit are described on the [Gateway](/architecture/gateway) page.
 
 `rest` has two listeners:
 

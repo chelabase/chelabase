@@ -9,9 +9,9 @@ Apps read and write a branch's tables over `POST /data/v1/query` with per-branch
 
 | Endpoint | Does |
 |---|---|
-| `POST /data/v1/query` | Runs one operation (or a batch) from a JSON tree. See [Query language](/docs/using/data-api/query-language). |
+| `POST /data/v1/query` | Runs one operation (or a batch) from a JSON tree. See [Query language](/using/data-api/query-language). |
 | `GET /data/v1/schema` | Describes what the key's role can reach. `?database=<name>` picks another served database; the response's `databases` lists the served databases the key reaches. |
-| `GET /data/v1/types` | The generated `db.ts` (or JSON with `format=json`) for the key's schema. See [Generated types](/docs/using/client/types). |
+| `GET /data/v1/types` | The generated `db.ts` (or JSON with `format=json`) for the key's schema. See [Generated types](/using/client/types). |
 
 All three take the key in the `Authorization: Bearer <key>` header. `GET /data/v1/schema` and `GET /data/v1/types` need a secret key: a public key gets 401 `unauthorized`. Requests go to the gateway (`http://api.chelabase.localhost:8000` in development).
 
@@ -22,14 +22,14 @@ curl -s http://api.chelabase.localhost:8000/data/v1/query \
   -d '{ "v": 1, "op": "select", "from": "orders", "limit": 10 }'
 ```
 
-The body is limited to 1 MiB. A failed request answers `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}`; every status and code is listed once, on [Error codes](/docs/reference/errors).
+The body is limited to 1 MiB. A failed request answers `{"error": {"code", "message", "detail"?, "hint"?, "sqlstate"?}}`; every status and code is listed once, on [Error codes](/reference/errors).
 
 ## Where to go next
 
-- [Keys](/docs/using/data-api/keys): public and secret keys, roles, rotation and revocation.
-- [Serving more databases](/docs/using/data-api/databases): enable other Postgres databases of a branch.
-- [Allow-lists](/docs/using/data-api/allow-lists): limit a key to some databases.
-- [Query language](/docs/using/data-api/query-language): the operations and filters.
-- [Settings](/docs/using/data-api/settings) and [Limits](/docs/using/data-api/limits).
-- [TypeScript client](/docs/using/client): a typed SDK over this endpoint.
-- [How a request flows, and which objects a key can reach](/docs/architecture/data-api).
+- [Keys](/using/data-api/keys): public and secret keys, roles, rotation and revocation.
+- [Serving more databases](/using/data-api/databases): enable other Postgres databases of a branch.
+- [Allow-lists](/using/data-api/allow-lists): limit a key to some databases.
+- [Query language](/using/data-api/query-language): the operations and filters.
+- [Settings](/using/data-api/settings) and [Limits](/using/data-api/limits).
+- [TypeScript client](/using/client): a typed SDK over this endpoint.
+- [How a request flows, and which objects a key can reach](/architecture/data-api).

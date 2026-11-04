@@ -5,7 +5,7 @@ description: Enable the data API on other Postgres databases of a branch, set th
 
 A branch's data API serves its main database, and any other Postgres database of the branch you enable. A database made in SQL (`CREATE DATABASE analytics`) is listed with the branch's databases, but not served.
 
-A request names its database with the top-level `"database"` field (see [Query language](/docs/using/data-api/query-language)). `GET /data/v1/schema?database=<name>` reads that database's schema, and the response's `databases` lists the served databases the key reaches. To limit a key to some databases, see [Allow-lists](/docs/using/data-api/allow-lists).
+A request names its database with the top-level `"database"` field (see [Query language](/using/data-api/query-language)). `GET /data/v1/schema?database=<name>` reads that database's schema, and the response's `databases` lists the served databases the key reaches. To limit a key to some databases, see [Allow-lists](/using/data-api/allow-lists).
 
 ## Enable
 
@@ -47,4 +47,4 @@ A child branch serves what its parent serves: states and default schemas are cop
 
 ## Studio's console
 
-Studio's Tables view browses and edits rows in any served database and schema through the data API's own query language. See [Studio](/docs/using/studio).
+Studio's Tables view browses and edits rows in any served database and schema through the data API's own query language. See [Studio](/using/studio).

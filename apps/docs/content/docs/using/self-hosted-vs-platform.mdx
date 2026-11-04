@@ -7,12 +7,12 @@ description: Every rule that differs between self-hosted mode and platform mode,
 
 ## In practice
 
-- **Sign-up.** Self-hosted has no self-sign-up unless a tenant admin turns on open sign-up. People who sign up then wait as pending members for an admin to approve them. Platform mode refuses self-sign-up until it is designed. See [Members and invites](/docs/using/members-and-invites#how-people-join).
+- **Sign-up.** Self-hosted has no self-sign-up unless a tenant admin turns on open sign-up. People who sign up then wait as pending members for an admin to approve them. Platform mode refuses self-sign-up until it is designed. See [Members and invites](/using/members-and-invites#how-people-join).
 - **Instance settings** (`/v1/instance/settings`, open sign-up) are for the active tenant admin when self-hosted; in platform mode they are for members of the operator tenant (`CHELABASE_OPERATOR_TENANT_ID`), and nobody passes while it is unset. The open sign-up switch exists only when self-hosted.
-- **How members are made.** Only explicitly, in both modes: by an accepted invite, an approved sign-up, or (self-hosted) the claim of a fresh install, whose first sign-up needs the setup code that `init-secrets` printed (see [Install](/docs/self-hosting/install#read-the-setup-code); claim before exposing Studio; the loser of a simultaneous race is admitted as pending). A signed-in account with no member row is refused.
+- **How members are made.** Only explicitly, in both modes: by an accepted invite, an approved sign-up, or (self-hosted) the claim of a fresh install, whose first sign-up needs the setup code that `init-secrets` printed (see [Install](/self-hosting/install#read-the-setup-code); claim before exposing Studio; the loser of a simultaneous race is admitted as pending). A signed-in account with no member row is refused.
 - **Safety defaults** (email verification, password strength, owner superuser, pre-hashed passwords, the CA file on reveal) are relaxed for local use in self-hosted mode and strict in platform mode. `CHELABASE_REQUIRE_EMAIL_VERIFICATION` overrides email verification in either mode. Secure cookies follow the public scheme in both modes (Secure with `https`), and platform mode requires `https`.
 
-Correctness and safety checks are the same in both modes: the access rules in [Access per route](/docs/reference/access) apply identically.
+Correctness and safety checks are the same in both modes: the access rules in [Access per route](/reference/access) apply identically.
 
 ## Every rule
 

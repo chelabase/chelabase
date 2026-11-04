@@ -38,7 +38,7 @@ These come from the management API, the login API (the dashboard sign-in and app
 
 ### Members, access and invites
 
-Any project route can answer the first four rows. See [Access per route](/docs/reference/access) for which level each route needs.
+Any project route can answer the first four rows. See [Access per route](/reference/access) for which level each route needs.
 
 | Status | Code | Meaning |
 |---|---|---|
@@ -112,7 +112,7 @@ Two more refusals use general codes. A grant or override below Admin that lists 
 
 ### Schema merges
 
-Merge routes also answer the general codes above: `not_found` for an unknown merge (or another tenant's, or one of another database), `branch_not_ready` on a start, rehearse, apply and retry (a branch of the merge isn't ready), `backup_branch` and `invalid_request` on a start (a step id with `:`, `.`, a control character or `phase1` is a 422 `invalid_request` on a save), and `conflict` with 409 when the merge is in a state that can't take the request (for example editing a merge that is applying, or exporting a plan before there is one). See [Merging schema between branches](/docs/using/merging-schema).
+Merge routes also answer the general codes above: `not_found` for an unknown merge (or another tenant's, or one of another database), `branch_not_ready` on a start, rehearse, apply and retry (a branch of the merge isn't ready), `backup_branch` and `invalid_request` on a start (a step id with `:`, `.`, a control character or `phase1` is a 422 `invalid_request` on a save), and `conflict` with 409 when the merge is in a state that can't take the request (for example editing a merge that is applying, or exporting a plan before there is one). See [Merging schema between branches](/using/merging-schema).
 
 | Status | Code | Meaning |
 |---|---|---|
@@ -127,7 +127,7 @@ Merge routes also answer the general codes above: `not_found` for an unknown mer
 | 409 | `branch_merge_busy` | See [Branches](#branches). |
 | none | `merge_base_unavailable` | Not an HTTP error. It is the start of the `error` of a merge left as a `draft` with no analysis because its base can't be read (outside the history window and not a branch point the storage layer keeps, or stored by another model version): the text is `merge_base_unavailable: ` followed by the reason. Recompute with `rebaseline: true`. |
 
-A merge that fails while running (`failed`, `stale`) shows its reason in the merge's own `error` and `failed_phase`, not as an HTTP error. The worker starts the `error` with a code where it knows the cause: `merge_stale:` (the target changed; nothing of the plan's transaction was applied), `merge_target_changed:` and `merge_target_gone:` (the plan's transaction is no longer on the target, or the target is gone: `failed` with no phase), `merge_half_applied:` (a recompute found the plan's transaction on the target: `failed` in `online`), and `merge_resolution_refused:` (a saved choice was refused: a `draft`). An apply interrupted before its transaction committed returns to `rehearsed` with an `error` that starts "interrupted before the plan's transaction committed". [Merging schema](/docs/using/merging-schema#error-texts) lists them.
+A merge that fails while running (`failed`, `stale`) shows its reason in the merge's own `error` and `failed_phase`, not as an HTTP error. The worker starts the `error` with a code where it knows the cause: `merge_stale:` (the target changed; nothing of the plan's transaction was applied), `merge_target_changed:` and `merge_target_gone:` (the plan's transaction is no longer on the target, or the target is gone: `failed` with no phase), `merge_half_applied:` (a recompute found the plan's transaction on the target: `failed` in `online`), and `merge_resolution_refused:` (a saved choice was refused: a `draft`). An apply interrupted before its transaction committed returns to `rehearsed` with an `error` that starts "interrupted before the plan's transaction committed". [Merging schema](/using/merging-schema#error-texts) lists them.
 
 ### Login roles and data API keys
 
@@ -259,4 +259,4 @@ The 503 message is fixed text.
 A response that didn't come from the data API (a proxy error page) has no error body from it. The gateway then builds one from the failure: 502 is `unavailable`, 504 and 408 are `timeout`, 400 is `invalid_request`, 413 is `too_large`, anything else is `internal`.
 </Callout>
 
-For how to send queries and handle these errors, see the [Data API guide](/docs/using/data-api).
+For how to send queries and handle these errors, see the [Data API guide](/using/data-api).

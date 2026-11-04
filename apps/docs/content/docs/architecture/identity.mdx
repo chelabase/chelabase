@@ -36,7 +36,7 @@ Email verification, password reset and invites use six-digit codes:
 
 These limits, like `auth`'s other sign-in limits, are kept in each process's memory: they apply per replica, not across replicas, and start again when the service restarts.
 
-With SMTP configured (`CHELABASE_SMTP_*`, see [Install](/docs/self-hosting/install#email)), the identity service mails the code. Without it, nothing is mailed: an admin invites by link instead, and the link carries the code.
+With SMTP configured (`CHELABASE_SMTP_*`, see [Install](/self-hosting/install#email)), the identity service mails the code. Without it, nothing is mailed: an admin invites by link instead, and the link carries the code.
 
 ## Member sign-in and tokens
 
@@ -60,7 +60,7 @@ The membership is checked on every request, so removing or suspending someone ta
 
 ## App users
 
-A project's app users sign in through `/auth/v1/app/*` with the project's public key. `auth` runs the same pool operations against `app-<project id>` and signs app tokens with `auth/app-jwt.key` (a different key and audience from member tokens). The worker keeps each branch's `users` table in step with the pool. See [App users](/docs/architecture/app-users).
+A project's app users sign in through `/auth/v1/app/*` with the project's public key. `auth` runs the same pool operations against `app-<project id>` and signs app tokens with `auth/app-jwt.key` (a different key and audience from member tokens). The worker keeps each branch's `users` table in step with the pool. See [App users](/architecture/app-users).
 
 ## Settings
 
@@ -69,5 +69,5 @@ A project's app users sign in through `/auth/v1/app/*` with the project's public
 | `CHELABASE_IDENTITY_URL` | none; Compose sets `http://identity:8080` | Where `auth`, the orchestrator, the worker and the bootstrap reach it |
 | `CHELABASE_IDENTITY_TOKEN_FILE` | per caller | The caller's bearer (`tokens/<caller>-identity.token`) |
 | `CHELABASE_IDENTITY_POOL_CACHE_SIZE` | `256` | Pools kept open in memory |
-| `CHELABASE_SMTP_HOST`, `_PORT`, `_TLS`, `_FROM`, `_USER`, `CHELABASE_SMTP_PASSWORD_PATH` | unset | Outgoing mail; see [Install](/docs/self-hosting/install#email) |
+| `CHELABASE_SMTP_HOST`, `_PORT`, `_TLS`, `_FROM`, `_USER`, `CHELABASE_SMTP_PASSWORD_PATH` | unset | Outgoing mail; see [Install](/self-hosting/install#email) |
 | `CHELABASE_MEMBER_ACCESS_TTL_SECS` | `300` | Member token lifetime (`auth`), 60 to 900 |

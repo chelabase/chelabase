@@ -50,7 +50,7 @@ describe("LandingPage", () => {
     const githubs = screen.getAllByRole("link", { name: "GitHub" });
     expect(starts.length).toBeGreaterThanOrEqual(3);
     expect(githubs.length).toBeGreaterThanOrEqual(3);
-    for (const a of starts) expect(a.getAttribute("href")).toBe(`${DOCS}/docs/using/quickstart`);
+    for (const a of starts) expect(a.getAttribute("href")).toBe(`${DOCS}/using/quickstart`);
     for (const a of githubs) expect(a.getAttribute("href")).toBe(GITHUB_URL);
   });
 
@@ -83,7 +83,7 @@ describe("LandingPage", () => {
     expect(names.slice(0, 4)).toEqual(["Databases", "Studio", "Auth", "Realtime"]);
     expect(names.slice(-2)).toEqual(["CLI", "Object storage"]);
     const gateway = within(section).getByRole("link", { name: /^Gateway/ });
-    expect(gateway.getAttribute("href")).toBe(`${DOCS}/docs/architecture/gateway`);
+    expect(gateway.getAttribute("href")).toBe(`${DOCS}/architecture/gateway`);
     expect(within(section).getAllByRole("link")).toHaveLength(names.length - 2);
   });
 

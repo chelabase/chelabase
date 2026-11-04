@@ -3,18 +3,18 @@ title: "App users"
 description: "How app users are stored, authenticated and kept in sync between the identity service and your database."
 ---
 
-Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. For how to enable and use app users, see the [app users guide](/docs/using/app-users). This page covers the moving parts.
+Apps sign their own end users up and in through `db.auth`, and the data API runs their requests as `authenticated` with the user's claims. For how to enable and use app users, see the [app users guide](/using/app-users). This page covers the moving parts.
 
 ## Who holds what
 
-- **The identity service holds the identities**, in one pool per project (`app-<project id>`, its own Postgres schema; see [Identity service](/docs/architecture/identity#pools)). It checks passwords and is the source of truth for who exists. The worker creates the pool when app users are enabled and drops it when app users are disabled (unless it still holds users) or the project is deleted.
+- **The identity service holds the identities**, in one pool per project (`app-<project id>`, its own Postgres schema; see [Identity service](/architecture/identity#pools)). It checks passwords and is the source of truth for who exists. The worker creates the pool when app users are enabled and drops it when app users are disabled (unless it still holds users) or the project is deleted.
 - **Chelabase issues the tokens.** The `auth` service checks the password against the project's pool, which opens an identity session (90 days), then signs a short-lived EdDSA access token (`iss` is `chelabase-auth`, `aud` is `chelabase-project:<project id>`) and a rotating refresh token bound to that identity session. The flows live under `/auth/v1/app/` and take a public key.
 - **Your database holds a users table** that you own, in one chosen auth database of the project: one row per user, on every branch of that database.
 - **The orchestrator keeps the sessions.** Sessions live in the metadata database, which stores only the SHA-256 of each refresh token. The orchestrator rotates refresh tokens, detects reuse and revokes sessions.
 
 ## Request path
 
-An app request carries `Authorization: Bearer <public key>` plus `Chelabase-User: <access token>`. The gateway verifies the token with the app-user public key and checks that its session is still live (cached 30 seconds, so a revocation lands within 30 seconds). It then mints the identity token for `rest` with the user's claims, and `rest` runs the request as `authenticated` with `request.jwt.claims` set. Policies read the claims through the `chelabase.claims()`, `chelabase.user_id()` and `chelabase.user_email()` helpers. See [Gateway](/docs/architecture/gateway) for the full check.
+An app request carries `Authorization: Bearer <public key>` plus `Chelabase-User: <access token>`. The gateway verifies the token with the app-user public key and checks that its session is still live (cached 30 seconds, so a revocation lands within 30 seconds). It then mints the identity token for `rest` with the user's claims, and `rest` runs the request as `authenticated` with `request.jwt.claims` set. Policies read the claims through the `chelabase.claims()`, `chelabase.user_id()` and `chelabase.user_email()` helpers. See [Gateway](/architecture/gateway) for the full check.
 
 The token key pair is made once by `init-secrets` (`auth/app-jwt.key` and `app-jwt.pub` in the `secrets` volume; `.chelabase/auth/` on a workbench stack), never overwritten, and separate from the member-token pair: `auth` signs, the gateway verifies. A public JWKS endpoint (`GET /auth/v1/app/jwks`) lets your own servers verify tokens too.
 

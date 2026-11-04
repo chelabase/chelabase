@@ -7,11 +7,13 @@ Chelabase is an open-source Postgres platform: databases with copy-on-write bran
 > breaking changes between versions, rough edges and security issues no one has found yet. Run it on
 > data you can afford to lose, and [report what breaks](https://github.com/chelabase/chelabase/issues).
 
-<!-- Static badges: the repo is private and has no release or CI yet. When the repo is public, the
-first release is cut and CI (#7) exists, swap in dynamic release and CI badges. -->
-[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+<!-- Add a release badge (https://img.shields.io/github/v/release/chelabase/chelabase?include_prereleases)
+once the first release is cut. -->
+[![CI](https://img.shields.io/github/actions/workflow/status/chelabase/chelabase/ci.yml?branch=main&label=ci)](https://github.com/chelabase/chelabase/actions/workflows/ci.yml?query=branch%3Amain)
+[![Docs](https://img.shields.io/badge/docs-docs.chelabase.com-0a7ea4)](https://docs.chelabase.com/)
+[![License](https://img.shields.io/github/license/chelabase/chelabase)](LICENSE)
 [![PostgreSQL 17](https://img.shields.io/badge/PostgreSQL-17-336791)](infra/neon/README.md)
-[![Self-hosted: Docker Compose ≥ 2.30](https://img.shields.io/badge/self--hosted-Docker%20Compose%20%E2%89%A5%202.30-2496ed)](apps/docs/content/docs/self-hosting/install.mdx)
+[![Self-hosted: Docker Compose ≥ 2.30](https://img.shields.io/badge/self--hosted-Docker%20Compose%20%E2%89%A5%202.30-2496ed)](https://docs.chelabase.com/self-hosting/install/)
 [![Status: alpha](https://img.shields.io/badge/status-alpha-orange)](SECURITY.md#supported-versions)
 
 ## How it works
@@ -24,16 +26,16 @@ point in time.
   <img src="docs/architecture.svg" width="520" alt="Chelabase architecture: your app and Studio reach the Gateway over HTTPS, which forwards to Realtime, Auth, the Orchestrator and Rest; Auth keeps accounts in the internal Identity service; the Orchestrator's Worker provisions Postgres computes, one per branch, on Neon's storage; psql and ORMs connect over Postgres through the Neon proxy.">
 </p>
 
-- **[Gateway](apps/docs/content/docs/architecture/gateway.mdx)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.
-- **[Studio](apps/docs/content/docs/using/studio.mdx)** is the web console: projects, databases, branches, the table and SQL editors, keys, members and app users.
-- **[Orchestrator](apps/docs/content/docs/architecture/orchestrator.mdx)** serves the Management API (`/v1`), decides who may do what and keeps the platform's own state. The **Worker** runs its jobs: creating, branching, resetting, restoring, merging and deleting databases.
-- **[Rest](apps/docs/content/docs/architecture/data-api.mdx)** is the data API. It turns a JSON query into SQL and runs it as the key's role, so Postgres row-level security decides what each caller sees.
-- **[Auth](apps/docs/content/docs/architecture/app-users.mdx)** signs in Studio members and your app's own users (sign-up, sign-in, sessions), with helpers for RLS policies.
-- **[Identity](apps/docs/content/docs/architecture/identity.mdx)** holds every account, Studio members and each project's app users, on [Better Auth](https://www.better-auth.com). It is internal only: nothing outside the stack reaches it.
-- **[Realtime](apps/docs/content/docs/architecture/realtime.mdx)** pushes live rows and presence to Studio over a WebSocket.
-- **[Neon](apps/docs/content/docs/architecture/neon.mdx)** stores the data. Postgres clients connect through its proxy with [login roles](apps/docs/content/docs/using/login-roles.mdx), whose credentials are encrypted and can be shown again.
+- **[Gateway](https://docs.chelabase.com/architecture/gateway/)** is the single front door. It checks every request's credential (a member's token or a data API key) and forwards it to the right service.
+- **[Studio](https://docs.chelabase.com/using/studio/)** is the web console: projects, databases, branches, the table and SQL editors, keys, members and app users.
+- **[Orchestrator](https://docs.chelabase.com/architecture/orchestrator/)** serves the Management API (`/v1`), decides who may do what and keeps the platform's own state. The **Worker** runs its jobs: creating, branching, resetting, restoring, merging and deleting databases.
+- **[Rest](https://docs.chelabase.com/architecture/data-api/)** is the data API. It turns a JSON query into SQL and runs it as the key's role, so Postgres row-level security decides what each caller sees.
+- **[Auth](https://docs.chelabase.com/architecture/app-users/)** signs in Studio members and your app's own users (sign-up, sign-in, sessions), with helpers for RLS policies.
+- **[Identity](https://docs.chelabase.com/architecture/identity/)** holds every account, Studio members and each project's app users, on [Better Auth](https://www.better-auth.com). It is internal only: nothing outside the stack reaches it.
+- **[Realtime](https://docs.chelabase.com/architecture/realtime/)** pushes live rows and presence to Studio over a WebSocket.
+- **[Neon](https://docs.chelabase.com/architecture/neon/)** stores the data. Postgres clients connect through its proxy with [login roles](https://docs.chelabase.com/using/login-roles/), whose credentials are encrypted and can be shown again.
 
-The [architecture docs](apps/docs/content/docs/architecture/index.mdx) go deeper.
+The [architecture docs](https://docs.chelabase.com/architecture/) go deeper.
 
 ### Client libraries
 
@@ -42,7 +44,7 @@ The [architecture docs](apps/docs/content/docs/architecture/index.mdx) go deeper
 | TypeScript | [`@chelabase/client`](packages/client) | Data API queries with generated types, and app-user auth (`db.auth`) | In this repository; not on npm yet |
 | TypeScript | [`@chelabase/management-client`](packages/management-client) | The Management API, as TanStack Query hooks (what Studio uses) | In this repository; not on npm yet |
 | Any | Your Postgres driver | Direct SQL over the Postgres protocol | Works today |
-| Any | HTTP | The [data API](apps/docs/content/docs/using/data-api/index.mdx) and Management API, described in [`openapi/`](openapi/) | Works today |
+| Any | HTTP | The [data API](https://docs.chelabase.com/using/data-api/) and Management API, described in [`openapi/`](openapi/) | Works today |
 
 ## Self-hosting
 
@@ -54,7 +56,7 @@ Self-hosted Chelabase runs on one machine with Docker Compose.
 - Docker Compose 2.30 or newer. Check with `docker compose version`.
 - A checkout of this repository, for `infra/compose`.
 
-Running Chelabase needs nothing else on the host. The [Install](apps/docs/content/docs/self-hosting/install.mdx#requirements) page lists what the machine needs.
+Running Chelabase needs nothing else on the host. The [Install](https://docs.chelabase.com/self-hosting/install/#requirements) page lists what the machine needs.
 
 ### Install
 
@@ -80,7 +82,7 @@ The defaults run on one machine and serve Studio at <http://studio.chelabase.loc
 
 After the claim, sign-up is closed: you invite everyone else, or switch open sign-up on and approve requests.
 
-The [Install](apps/docs/content/docs/self-hosting/install.mdx) page covers the rest: the settings, choosing your own secrets, your own domain with TLS behind a reverse proxy ([Hosts](apps/docs/content/docs/self-hosting/hosts.mdx)), email (SMTP), upgrades, and stopping or uninstalling.
+The [Install](https://docs.chelabase.com/self-hosting/install/) page covers the rest: the settings, choosing your own secrets, your own domain with TLS behind a reverse proxy ([Hosts](https://docs.chelabase.com/self-hosting/hosts/)), email (SMTP), upgrades, and stopping or uninstalling.
 
 ## First database
 
@@ -120,16 +122,16 @@ That's it. A few things to know:
 - **`@chelabase/client` isn't on npm yet.** Add it from this repository as `"@chelabase/client": "workspace:*"`. The types are optional: `createClient({ url, key })` works untyped.
 - **Using Postgres directly?** Migrations, ORMs and `psql` connect with the credentials in the database's **Connection details**.
 
-The [Quickstart](apps/docs/content/docs/using/quickstart.mdx) covers each step in more detail, including fetching types in a build step and connecting over Postgres.
+The [Quickstart](https://docs.chelabase.com/using/quickstart/) covers each step in more detail, including fetching types in a build step and connecting over Postgres.
 
 ## Documentation
 
-The docs are in this repository, under [`apps/docs/content/docs/`](apps/docs/content/docs/). Start with the [Introduction](apps/docs/content/docs/index.mdx).
+The docs are at [docs.chelabase.com](https://docs.chelabase.com/); their source is in [`apps/docs/content/docs/`](apps/docs/content/docs/). Start with the [Introduction](https://docs.chelabase.com/).
 
-- **Using:** the [Quickstart](apps/docs/content/docs/using/quickstart.mdx), [projects and databases](apps/docs/content/docs/using/projects-and-databases.mdx), [branches](apps/docs/content/docs/using/branches.mdx), [login roles](apps/docs/content/docs/using/login-roles.mdx), the [data API](apps/docs/content/docs/using/data-api/index.mdx), the [TypeScript client](apps/docs/content/docs/using/client/index.mdx), [app users](apps/docs/content/docs/using/app-users/index.mdx), [members and invites](apps/docs/content/docs/using/members-and-invites.mdx) and [Studio](apps/docs/content/docs/using/studio.mdx). The rest is in [`using/`](apps/docs/content/docs/using/).
-- **Self-hosting:** [Install](apps/docs/content/docs/self-hosting/install.mdx) and [Hosts](apps/docs/content/docs/self-hosting/hosts.mdx).
-- **Reference:** the [error codes](apps/docs/content/docs/reference/errors.mdx) and the [access per route](apps/docs/content/docs/reference/access.mdx). The management and data API references are generated from the OpenAPI documents in [`openapi/`](openapi/).
-- **Architecture:** [how the parts fit together](apps/docs/content/docs/architecture/index.mdx): the gateway, Studio, the data API, Neon storage and [security](apps/docs/content/docs/architecture/security.mdx).
+- **Using:** the [Quickstart](https://docs.chelabase.com/using/quickstart/), [projects and databases](https://docs.chelabase.com/using/projects-and-databases/), [branches](https://docs.chelabase.com/using/branches/), [login roles](https://docs.chelabase.com/using/login-roles/), the [data API](https://docs.chelabase.com/using/data-api/), the [TypeScript client](https://docs.chelabase.com/using/client/), [app users](https://docs.chelabase.com/using/app-users/), [members and invites](https://docs.chelabase.com/using/members-and-invites/) and [Studio](https://docs.chelabase.com/using/studio/). The rest is in [`using/`](apps/docs/content/docs/using/).
+- **Self-hosting:** [Install](https://docs.chelabase.com/self-hosting/install/) and [Hosts](https://docs.chelabase.com/self-hosting/hosts/).
+- **Reference:** the [error codes](https://docs.chelabase.com/reference/errors/) and the [access per route](https://docs.chelabase.com/reference/access/). The management and data API references are generated from the OpenAPI documents in [`openapi/`](openapi/).
+- **Architecture:** [how the parts fit together](https://docs.chelabase.com/architecture/): the gateway, Studio, the data API, Neon storage and [security](https://docs.chelabase.com/architecture/security/).
 
 ## Contributing
 

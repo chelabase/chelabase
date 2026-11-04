@@ -3,7 +3,7 @@ title: Members and invites
 description: Who can do what in a tenant, how people join (invites, open sign-up and approval), project grants and per-database overrides, and the access log.
 ---
 
-A tenant is one team's workspace. Everyone in it is a **member**, and what a member can do is decided by two things: the tenant-admin flag, and **grants** on projects. Studio's **Members** page (last in the rail) shows and edits all of it; every action is also an API route, listed in [Access per route](/docs/reference/access).
+A tenant is one team's workspace. Everyone in it is a **member**, and what a member can do is decided by two things: the tenant-admin flag, and **grants** on projects. Studio's **Members** page (last in the rail) shows and edits all of it; every action is also an API route, listed in [Access per route](/reference/access).
 
 ## Roles
 
@@ -17,7 +17,7 @@ A grant gives a member a **platform role** on one project:
 | Developer | Everything a Viewer can, plus: create branches; change unprotected branches (reset, restore, delete); run SQL as an allowed Postgres role; start and run schema merges (merges don't run as a Postgres role); create and block app users; save and run queries; create data keys bound to an allowed role. |
 | Admin | Everything on the project: protected branches, connection strings and passwords, login roles, the Data API settings, grants and invites, and acting as the database owner. |
 
-A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/docs/using/roles-and-schema-isolation). The rules, in short:
+A grant also lists the **Postgres roles** the member may act as in the SQL editor and the console. See [Roles and schema isolation](/using/roles-and-schema-isolation). The rules, in short:
 
 - **Admin holds every role.** An Admin on a project may act as the database owner and every other role of the project's branches, login roles included; the grant lists no roles (`GET /v1/projects/{id}/grants` and `GET /v1/me` answer `"all"`). Roles named when granting Admin are checked, then dropped. To give an Admin fewer roles on one database, narrow it there (below). Developers and Viewers can't act as the owner, and `owner` is never listed in a grant.
 - **The data API's roles only when named.** `anon` and `authenticated` aren't part of an Admin's every role: Act as offers them only to a member whose grant (or a narrowing) names them, Admins included.
@@ -43,7 +43,7 @@ A **team** is a named set of members that holds grants of its own. Studio's **Me
 - **Visibility.** Any member reads `GET /v1/teams` and `GET /v1/teams/{team_id}`. A tenant admin sees every project of a team; anyone else sees only the projects where they have access. A team's Postgres roles on a project are shown only to tenant admins and to Admins of that project; others get `pg_roles: null`.
 - **Removing a member** from the tenant takes them out of their teams in the same transaction, and the log's `member_removed` event records the teams they were in.
 
-The routes (all `tenant admin` to write, any member to read; see [Access per route](/docs/reference/access)):
+The routes (all `tenant admin` to write, any member to read; see [Access per route](/reference/access)):
 
 | Route | Does |
 |---|---|
@@ -84,7 +84,7 @@ A member with no grants anywhere gets 403 `no_access_yet` on project routes, and
 
 ## How people join
 
-Self-hosted mode has three ways in. Platform mode has no self-sign-up yet: see [Self-hosted vs platform](/docs/using/self-hosted-vs-platform).
+Self-hosted mode has three ways in. Platform mode has no self-sign-up yet: see [Self-hosted vs platform](/using/self-hosted-vs-platform).
 
 ### Invites
 
@@ -108,7 +108,7 @@ Off by default. A tenant admin turns it on on the Members page's Instance tab (`
 Pending sign-ups appear under Members › People › **Requests**, with a badge on Members. A tenant admin **approves** one with its first project access (`POST /v1/members/{id}/approve`) or **declines** it (`POST /v1/members/{id}/decline`: removed, and their account banned and signed out unless another tenant holds them). Both are logged. With open sign-up off, a sign-up is refused with 403 `sign_up_closed`. Once approved, they sign in as usual.
 
 <Callout type="warn">
-**The fresh-install window.** While a tenant has no member at all, the instance is unclaimed. The first sign-up needs the setup code that `init-secrets` printed (`docker compose logs init-secrets`; see [Install](/docs/self-hosting/install#read-the-setup-code) to print it again), and that account claims the tenant admin. A sign-up with a missing or wrong code is refused (`setup_code_invalid`) and creates no account. If two people race for it with the code, only one claims the admin and the other is admitted as `pending`. Claim the instance before you expose Studio to anyone. After the claim, sign-up follows open sign-up as above. On a workbench stack (development), the bootstrap claims the instance for a dev member and keeps its password in `.chelabase/stacks/<slug>/bootstrap/dev-member.json`, a tenant-admin credential: keep it private.
+**The fresh-install window.** While a tenant has no member at all, the instance is unclaimed. The first sign-up needs the setup code that `init-secrets` printed (`docker compose logs init-secrets`; see [Install](/self-hosting/install#read-the-setup-code) to print it again), and that account claims the tenant admin. A sign-up with a missing or wrong code is refused (`setup_code_invalid`) and creates no account. If two people race for it with the code, only one claims the admin and the other is admitted as `pending`. Claim the instance before you expose Studio to anyone. After the claim, sign-up follows open sign-up as above. On a workbench stack (development), the bootstrap claims the instance for a dev member and keeps its password in `.chelabase/stacks/<slug>/bootstrap/dev-member.json`, a tenant-admin credential: keep it private.
 </Callout>
 
 ### Removing a member

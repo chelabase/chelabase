@@ -14,6 +14,6 @@ Change them with `PATCH /v1/databases/{id}`, or in Studio's database settings. T
 - `max_rows` caps the rows a `select` returns (a `limit` above it is clamped), and the rows a write's `returning` returns.
 - `statement_timeout_ms` also sets Postgres's `transaction_timeout`, so it bounds the whole request: a batch of 50 operations shares one timeout, not 50. A request past it answers 504 `timeout`.
 - `max_connections` is per branch: one budget shared by that branch's database pools.
-- `default_schema` is per Postgres database (`public` by default). See [Serving more databases](/docs/using/data-api/databases).
+- `default_schema` is per Postgres database (`public` by default). See [Serving more databases](/using/data-api/databases).
 
 Every setting takes up to 60 seconds to take effect (the connection-info cache).

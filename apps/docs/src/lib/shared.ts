@@ -1,13 +1,14 @@
 import { createGetUrl } from 'fumadocs-core/source';
 
 export const appName = 'Chelabase';
-export const docsRoute = '/docs';
+/** The docs pages are served from the site root: `/` is the introduction. */
+export const docsRoute = '/';
 
 /** The published docs site. Canonical links, social cards and the sitemap name it, so a copy
  *  served elsewhere (a self-hosted stack's docs host) still points search engines here. */
 export const siteUrl = 'https://docs.chelabase.com';
 
-/** A path's canonical URL. The static host serves every page as a directory (`/docs/x/`) and
+/** A path's canonical URL. The static host serves every page as a directory (`/x/`) and
  *  redirects the bare path there, so the canonical form ends in a slash. */
 export function canonicalUrl(path: string): string {
   return `${siteUrl}${path.endsWith('/') ? path : `${path}/`}`;
