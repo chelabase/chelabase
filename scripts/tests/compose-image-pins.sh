@@ -12,8 +12,7 @@
 # It also renders the base file with docker-compose.build.yml (the self-hosted build from a
 # clone) and checks that every service the base file runs from a ghcr.io/chelabase image gets a
 # local chelabase/*:local image there, built or reused: a service the overlay misses would pull
-# a release image, which for an unpublished one (the identity service until the auth-replacement
-# epic's images are published from main) doesn't exist.
+# a release image instead of building the clone.
 #
 # Part of `just check` (offline, with no digests file).
 set -euo pipefail
@@ -25,7 +24,7 @@ for f in "$root/infra/compose/docker-compose.example.yml"; do
   if [[ -f "$f" ]]; then overlays+=("$f"); fi
 done
 digests="${1:-}"
-images=(gateway orchestrator worker rest auth realtime init studio)
+images=(gateway orchestrator worker rest auth realtime init studio identity)
 re='^ghcr\.io/chelabase/([a-z]+):([0-9a-f]{12})@sha256:([0-9a-f]{64})$'
 fail=0
 err() { echo "compose-image-pins: $*" >&2; fail=1; }
@@ -80,7 +79,7 @@ done
 build="$root/infra/compose/docker-compose.build.yml"
 render_images() { # render_images <-f args…>: "service image built" per line
   env -u NEON_IMAGE -u COMPUTE_NODE_IMAGE -u CHELABASE_IMAGE_REPO -u CHELABASE_IMAGE_TAG \
-    -u CHELABASE_IDENTITY_IMAGE_TAG docker compose -p chelabase-image-pins \
+    docker compose -p chelabase-image-pins \
     --project-directory "$root/infra/compose" "$@" --env-file "$envex" config --format json |
     jq -r '.services | to_entries[]
       | "\(.key) \(.value.image // "-") \(.value.build != null and .value.pull_policy == "build")"'

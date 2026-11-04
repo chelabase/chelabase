@@ -19,7 +19,7 @@ packages/              TypeScript packages: client, management-client, design (d
 openapi/               generated OpenAPI documents (management, login, data)
 infra/compose/         the self-hosted install (docker-compose.yml, .env.example,
                        docker-compose.build.yml) and the workbench overlay (docker-compose.workbench.yml)
-infra/images/          the release images: server.Dockerfile, studio.Dockerfile, docker-bake.hcl
+infra/images/          the release images: server.Dockerfile, studio.Dockerfile, identity.Dockerfile, docker-bake.hcl
 infra/neon/            Neon image pins and build notes
 infra/workbench/       the workbench image
 tools/cli              the `chelabase` binary (workbench, dev bootstrap, type generation)
@@ -338,7 +338,7 @@ A deploy builds locally and needs no Actions minutes. It refuses unless the tree
 
 ## Releasing images
 
-The install pulls the per-app images and Studio from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Each pin has its own commit, so a release ships only the images it names. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
+The install pulls the per-app images, Studio and the identity service from `ghcr.io/chelabase`, each pinned by digest in `infra/compose/docker-compose.yml`. Each pin has its own commit, so a release ships only the images it names. Build once, test those exact images, push them as they are. Never rebuild between the test and the push.
 
 Publish only from `main`. Merge the change first (merges are squash-only, which drops a branch's commits), then build, test, push and pin from a clean `main` checkout, and land the pins in their own small PR (`chore(infra): pin images at <sha12>`). `--push` and `--push-only` refuse unless HEAD is on `origin/main`; a push to `PUBLISH_IMAGES_REPO` (a local registry or test prefix) is exempt.
 
@@ -348,7 +348,7 @@ Every `publish-images.sh` run selects its images:
 - `--all` takes the images whose inputs changed since their pins. If none did, it says so and builds nothing.
 - With neither, it refuses and prints the changed set. Naming every image with `--service` rebuilds them all.
 
-`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block). `server.Dockerfile`, `docker-bake.hcl` and `.dockerignore` are inputs of every image; the release scripts aren't, since they only select, push and pin. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
+`scripts/image-inputs.sh` works out each image's inputs from the build graphs: for a Rust image, its closure of workspace crates from `cargo metadata` plus the manifests of every crate in the shared cargo build, `Cargo.toml`, `Cargo.lock` and `rust-toolchain*`; for Studio, `apps/studio` and its `workspace:` packages, the pnpm lockfile and workspace files, `openapi/` and `.env.example` (outside its pin block); for the identity service, `services/identity` and its `workspace:` packages, the pnpm lockfile and workspace files and `identity.Dockerfile`. `server.Dockerfile`, `docker-bake.hcl` and `.dockerignore` are inputs of every image; the release scripts aren't, since they only select, push and pin. A pin whose commit isn't in your history counts as changed. `just check` fails when a Dockerfile `COPY` brings in a path outside its images' inputs.
 
 ```bash
 # 1. On main, after the merge: build and tag ghcr.io/chelabase/<image>:<sha12> locally, at a
