@@ -35,12 +35,17 @@ export const Route = createFileRoute('/docs/$')({
       ? [
           { title: `${loaderData.title} · ${appName}` },
           ...(loaderData.description
-            ? [{ name: 'description', content: loaderData.description }]
+            ? [{ name: 'description', content: plainText(loaderData.description) }]
             : []),
         ]
       : [],
   }),
 });
+
+/** A description as plain text for <meta>: an API operation's is markdown, and its code spans keep their backticks. */
+function plainText(markdown: string): string {
+  return markdown.replace(/`([^`]*)`/g, '$1');
+}
 
 // The only place the server-only source (and so fumadocs-openapi/server) is reached from a route:
 // the handler is compiled out of the client bundle, and `staticFunctionMiddleware` caches its
@@ -119,7 +124,7 @@ function Page() {
       ) : (
         <DocsPage toc={data.toc}>
           <DocsTitle>{data.title}</DocsTitle>
-          <DocsDescription>{data.description}</DocsDescription>
+          {/* No DocsDescription: the description is markdown, and OpenAPIPage renders it itself. */}
           <DocsBody>
             <OpenAPIPage {...(data.props as unknown as ComponentProps<typeof OpenAPIPage>)} />
           </DocsBody>

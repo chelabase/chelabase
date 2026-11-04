@@ -1,0 +1,61 @@
+# Builds the landing page and deploys it to Cloudflare (scripts/deploy-site.sh landing), apart from ci.yml
+# so a release never waits on the Rust gate. ci.yml still runs the site's tests before a merge.
+# Until the repo is public this runs by hand only; `just site-deploy landing` does the same locally.
+name: landing-deploy
+
+on:
+  workflow_dispatch:
+  # enable at launch: uncomment the push block (the whole change for this workflow)
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - apps/landing/**
+  #     - packages/design/**
+  #     - infra/compose/.env.example
+  #     - pnpm-lock.yaml
+  #     - scripts/deploy-site.sh
+  #     - .github/workflows/landing-deploy.yml
+
+permissions:
+  contents: read
+
+# One deploy at a time; a newer push replaces a queued one.
+concurrency:
+  group: landing-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy the landing page
+    # A deploy ships main only (the script checks HEAD is on origin/main too).
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # proto reads .prototools: node and pnpm are the ones this job uses.
+      - uses: moonrepo/setup-toolchain@261c62cb5b0f580c7be7c8cd0f023a2e96756095 # v0.6.4
+        with:
+          auto-install: true
+
+      - name: pnpm store path
+        id: pnpm-store
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: pnpm-store-${{ runner.os }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pnpm-store-${{ runner.os }}-
+
+      - run: pnpm install --frozen-lockfile --filter "@chelabase/landing..."
+
+      - run: scripts/deploy-site.sh landing
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

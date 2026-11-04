@@ -29,8 +29,7 @@ const SCALE = 2;
 const WEBP_QUALITY = 0.8;
 
 async function signIn(page: Page): Promise<void> {
-  await page.goto(`${studio}/`);
-  await page.getByRole("button", { name: "Sign in" }).click();
+  await page.goto(`${studio}/login`);
   await page.getByRole("textbox", { name: "Email" }).fill(email);
   await page.getByRole("textbox", { name: "Password" }).fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
@@ -62,13 +61,13 @@ async function save(encoder: Page, name: string, png: Buffer): Promise<void> {
   console.log(`${name}.webp  ${(webp.length / 1024).toFixed(0)} KB`);
 }
 
-/** The acme database's table editor URL, from the project page's Tables link. */
+/** The acme database's table editor URL, from its row's Open link on the project page. */
 async function tablesUrl(page: Page): Promise<string> {
   await page.getByRole("link", { name: "Acme", exact: true }).click();
-  const link = page.getByRole("link", { name: "Tables" }).last();
+  const link = page.getByRole("row", { name: /^acme/ }).getByRole("link", { name: "Open" });
   await link.waitFor();
   const href = await link.getAttribute("href");
-  if (href === null) throw new Error("no Tables link on the Acme project page");
+  if (href === null) throw new Error("no Open link on the Acme project page");
   return href;
 }
 
@@ -106,21 +105,15 @@ async function main(): Promise<void> {
   await page.getByText(/Dry run passed/).waitFor();
   await save(encoder, "manage-table-editor", await page.screenshot());
 
-  // Manage: the RLS warning on the Data API panel, cropped to the warning.
-  await page.goto(projectUrl);
-  await page.getByRole("button", { name: "Data API" }).click();
-  const warning = page.getByRole("region", { name: "RLS warning" });
-  await warning.getByText("public.employees").waitFor();
-  await save(encoder, "manage-rls-warning", await warning.screenshot());
-
   // Collaborate: the Finance team's project access (Developer on Acme, acting as finance). On the
-  // team page it sits below the member list, so the shot crops the access section.
+  // team page it sits below the member list, so the page is scrolled to it; the shot is the whole
+  // window, Studio's shell included, like the others.
   await page.goto(`${studio}/app/members?tab=teams`);
   await page.getByRole("row", { name: /Finance/ }).getByText("Finance").click();
   const access = page.locator("section").filter({ has: page.getByText("Project access", { exact: true }) }).last();
   await access.getByText("Developer · finance").waitFor();
-  await access.scrollIntoViewIfNeeded();
-  await save(encoder, "collaborate-team-access", await access.screenshot());
+  await access.evaluate((el) => el.scrollIntoView({ block: "start" }));
+  await save(encoder, "collaborate-team-access", await page.screenshot());
 
   // Iterate: the branches list, with protected main and feature-discounts.
   await page.setViewportSize(TALL);

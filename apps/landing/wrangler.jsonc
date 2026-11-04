@@ -1,0 +1,19 @@
+// The landing page as a static-only Worker: Cloudflare serves the prerendered build as it is, with
+// no Worker script. Deploy with `just site-deploy landing` (scripts/deploy-site.sh), never by hand.
+{
+  "$schema": "https://unpkg.com/wrangler@4.156.0/config-schema.json",
+  "name": "chelabase-landing",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": "./dist/client",
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "none"
+  },
+  // www.chelabase.com is attached too; a zone redirect rule sends it to the apex.
+  "routes": [
+    { "pattern": "chelabase.com", "custom_domain": true },
+    { "pattern": "www.chelabase.com", "custom_domain": true }
+  ],
+  "workers_dev": false,
+  "preview_urls": false
+}

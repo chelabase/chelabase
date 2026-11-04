@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useRef, type ReactNode } from "react";
 import {
   Archive,
   ArrowUpRight,
@@ -8,9 +8,11 @@ import {
   DoorOpen,
   KeyRound,
   LayoutDashboard,
+  Maximize2,
   Radio,
   SquareTerminal,
   Waypoints,
+  X,
   type LucideIcon,
 } from "lucide-react";
 import { ClawMark, CrabFigure, Wordmark } from "@chelabase/design/crab-marks";
@@ -126,11 +128,12 @@ const SETTLE = "translate-y-0.5";
 /** Landing-only nudges of the wordmark's claw: it sits a little low and may overflow its box. */
 const CLAW = "-mb-[0.1em] overflow-visible";
 
-/** A claw-marked list of short notes, on ink or on seafoam. */
-function Notes({ notes, ground = "ink" }: { notes: Array<{ title: string; body: ReactNode }>; ground?: "ink" | "seafoam" }) {
-  const body = ground === "ink" ? `text-chalk-dim ${CODE_ON_INK}` : `text-chalk-dim ${CODE_ON_INK}`;
+/** A claw-marked list of short notes, in one column or, above a screenshot, two (one below 900px). */
+function Notes({ notes, columns = 1 }: { notes: Array<{ title: string; body: ReactNode }>; columns?: 1 | 2 }) {
+  const body = `text-chalk-dim ${CODE_ON_INK}`;
+  const grid = columns === 2 ? "mt-10 grid grid-cols-2 gap-x-14 gap-y-8 max-[900px]:grid-cols-1 max-[900px]:gap-y-6.5" : "mt-9 grid gap-6.5";
   return (
-    <ul className="mt-9 grid gap-6.5">
+    <ul className={grid}>
       {notes.map((n) => (
         <li key={n.title} className="grid grid-cols-[38px_minmax(0,1fr)] gap-x-3.5 gap-y-1">
           <ClawMark size={30} className="row-span-2 mt-0.5" />
@@ -157,11 +160,35 @@ function CodeInset({ label, note, children, className = "" }: { label: ReactNode
   );
 }
 
-/** A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport, and a link to the full-size file. */
-function StudioShot({ src, width, height, alt, caption }: { src: string; width: number; height: number; alt: string; caption: string }) {
+/**
+ * A Studio screenshot (made by `pnpm capture-studio`): rounded, captioned, loaded when it nears the viewport. Clicking
+ * it opens it larger over the page; Esc, the close button or a click anywhere closes it again.
+ */
+function StudioShot({
+  src,
+  width,
+  height,
+  alt,
+  caption,
+  className = "",
+}: {
+  src: string;
+  width: number;
+  height: number;
+  alt: string;
+  caption: string;
+  className?: string;
+}) {
+  const zoom = useRef<HTMLDialogElement>(null);
+  const close = () => zoom.current?.close();
   return (
-    <figure className="m-0 min-w-0">
-      <a href={src} className={`block rounded-xl ${FOCUS}`}>
+    <figure className={`m-0 min-w-0 ${className}`}>
+      <button
+        type="button"
+        aria-label={`Enlarge: ${alt}`}
+        onClick={() => zoom.current?.showModal()}
+        className={`group relative block w-full p-0 border-0 rounded-xl bg-transparent cursor-zoom-in ${FOCUS}`}
+      >
         <img
           src={src}
           width={width}
@@ -169,10 +196,41 @@ function StudioShot({ src, width, height, alt, caption }: { src: string; width: 
           alt={alt}
           loading="lazy"
           decoding="async"
-          className="block w-full h-auto rounded-xl border border-line-strong bg-ink"
+          className="block w-full h-auto rounded-xl border border-line-strong bg-ink transition-[border-color] duration-200 ease-design group-hover:border-sand/45"
         />
-      </a>
+        <span
+          className="absolute top-3 right-3 grid place-items-center size-8 rounded-full bg-ink/85 text-chalk opacity-0 transition-opacity duration-200 ease-design group-hover:opacity-100 group-focus-visible:opacity-100"
+          aria-hidden="true"
+        >
+          <Maximize2 size={15} strokeWidth={1.8} />
+        </span>
+      </button>
       <figcaption className="mt-2.5 text-[0.9rem] leading-snug text-chalk-dim">{caption}</figcaption>
+      {/* Every click inside closes it: there is nothing to do in here but look. */}
+      <dialog
+        ref={zoom}
+        aria-label={alt}
+        onClick={close}
+        className="m-auto p-0 border-0 bg-transparent max-w-[calc(100vw-2*var(--spacing-gutter))] max-h-none overflow-visible cursor-zoom-out backdrop:bg-ink/88"
+      >
+        <img
+          src={src}
+          width={width}
+          height={height}
+          alt={alt}
+          loading="lazy"
+          decoding="async"
+          className="block w-auto h-auto max-w-full max-h-[calc(100svh-7rem)] rounded-xl border border-line-strong bg-ink shadow-[0_30px_80px_-30px] shadow-black/80"
+        />
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={close}
+          className={`fixed top-4 right-4 grid place-items-center size-10 border-[1.5px] border-chalk rounded-full bg-ink text-chalk cursor-pointer hover:bg-ink-lit ${FOCUS}`}
+        >
+          <X size={18} strokeWidth={1.8} aria-hidden="true" />
+        </button>
+      </dialog>
     </figure>
   );
 }
@@ -216,6 +274,19 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
             Rust.
           </p>
           <Actions docsUrl={docsUrl} className="mt-6 short:mt-4.5" />
+          {/* the same notice the README, docs and Studio carry */}
+          <p className="mt-4 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-[0.95rem] text-chalk-dim short:mt-3">
+            <span className="px-1.5 py-px border border-sand/60 rounded-sm text-sand text-xs font-semibold uppercase tracking-wide">
+              Alpha
+            </span>
+            <span>
+              Not ready for production data yet: expect breaking changes, and{" "}
+              <a href={`${GITHUB_URL}/issues`} className={`text-chalk underline underline-offset-3 decoration-sand/60 hover:decoration-sand ${FOCUS}`}>
+                report what breaks
+              </a>
+              .
+            </span>
+          </p>
         </div>
         <ShoreScene />
       </header>
@@ -231,9 +302,14 @@ export function LandingPage({ docsUrl }: LandingPageProps) {
       <footer className={`${COLUMN} flex flex-wrap items-center justify-between gap-x-8 gap-y-4 pt-5.5 pb-7 text-chalk-dim text-[0.92rem]`}>
         <div className="flex items-center gap-2">
           <Wordmark className="text-[1.15rem]" visualClassName={SETTLE} clawClassName={`h-[1.32em] ${CLAW}`} />
-          <span>· self-hosted preview</span>
+          <span>· self-hosted alpha</span>
         </div>
-        <span>A hosted version is planned. Drawings on this page are illustrations.</span>
+        <span>
+          A hosted version is planned. Drawings on this page are illustrations.{" "}
+          <a href="mailto:hello@chelabase.com" className={`text-chalk underline underline-offset-3 decoration-sand/60 hover:decoration-sand ${FOCUS}`}>
+            hello@chelabase.com
+          </a>
+        </span>
       </footer>
     </div>
   );
@@ -425,44 +501,23 @@ const MANAGE_NOTES = [
 function Manage() {
   return (
     <Band id="manage" labelledby="manage-title">
-      <div className={`${SECTION_INNER} ${SPLIT}`}>
-        <div>
-          <h2 id="manage-title" className={SECTION_TITLE}>
-            Manage it from one console.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Studio holds the whole database: tables, SQL, roles, keys and your app's users. A change shows as the SQL it
-            will run, before it runs.
-          </p>
-          <Notes notes={MANAGE_NOTES} />
-          <div className="mt-10 grid gap-6">
-            <StudioShot
-              src="/screens/manage-table-editor.webp"
-              width={1152}
-              height={800}
-              alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
-              caption="A staged change shows its SQL and a dry run before anything runs."
-            />
-            <StudioShot
-              src="/screens/manage-rls-warning.webp"
-              width={806}
-              height={126}
-              alt="Studio's RLS warning on the Data API panel: anyone with your public key can read the rows of public.employees, with the ALTER TABLE statement that enables row-level security."
-              caption="Studio flags public.employees, reachable by the data API without row-level security."
-            />
-          </div>
-        </div>
-        <CodeInset label="Table editor · review changes" note="illustration" className="sticky top-22 max-[900px]:static">
-          <C>-- 2 changes to sales.orders, applied in one transaction</C>
-          {"\n"}
-          <K>alter table</K> sales.orders{"\n"}
-          {"  "}
-          <K>add column</K> shipped_at <T>timestamptz</T>;{"\n"}
-          <K>create index</K> orders_customer_idx{"\n"}
-          {"  "}
-          <K>on</K> sales.orders (customer_id);{"\n\n"}
-          <C>-- dry run: ok</C>
-        </CodeInset>
+      <div className={SECTION_INNER}>
+        <h2 id="manage-title" className={SECTION_TITLE}>
+          Manage it from one console.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Studio holds the whole database: tables, SQL, roles, keys and your app's users. A change shows as the SQL it
+          will run, before it runs.
+        </p>
+        <Notes notes={MANAGE_NOTES} columns={2} />
+        <StudioShot
+          className="mt-12"
+          src="/screens/manage-table-editor.webp"
+          width={1152}
+          height={800}
+          alt="Studio's table editor on sales.orders, Structure tab. A new column, shipped_at timestamptz, is staged in the Pending changes panel with its ALTER TABLE statement and a passed dry run."
+          caption="A staged change shows its SQL and a dry run before anything runs."
+        />
       </div>
     </Band>
   );
@@ -492,39 +547,23 @@ const COLLABORATE_NOTES = [
 function Collaborate() {
   return (
     <Band id="collaborate" labelledby="collaborate-title">
-      <div className={`${SECTION_INNER} ${SPLIT} grid-cols-[minmax(0,1.05fr)_minmax(0,1fr)]`}>
-        <div>
-          <h2 id="collaborate-title" className={SECTION_TITLE}>
-            Bring your team in.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Invite people, group them into teams, and grant each team the Postgres roles it may act as. Postgres' own
-            privileges decide the rest, so a schema can belong to one team.
-          </p>
-          <Notes notes={COLLABORATE_NOTES} />
-          <div className="mt-10 grid gap-6">
-            <StudioShot
-              src="/screens/collaborate-team-access.webp"
-              width={832}
-              height={542}
-              alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
-              caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
-            />
-          </div>
-        </div>
-        <CodeInset
-          label="SQL editor · Acme, a schema per team"
-          note="from the docs"
-          className="sticky top-22 order-first max-[900px]:static max-[900px]:order-none"
-        >
-          <K>create role</K> finance <K>nologin</K>;{"\n"}
-          <K>alter schema</K> finance <K>owner to</K> finance;{"\n\n"}
-          <C>-- Members › Teams › Finance:</C>
-          {"\n"}
-          <C>-- Developer on the project, acting as finance.</C>
-          {"\n"}
-          <C>-- Its members change finance.invoices; sales can't.</C>
-        </CodeInset>
+      <div className={SECTION_INNER}>
+        <h2 id="collaborate-title" className={SECTION_TITLE}>
+          Bring your team in.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Invite people, group them into teams, and grant each team the Postgres roles it may act as. Postgres' own
+          privileges decide the rest, so a schema can belong to one team.
+        </p>
+        <Notes notes={COLLABORATE_NOTES} columns={2} />
+        <StudioShot
+          className="mt-12"
+          src="/screens/collaborate-team-access.webp"
+          width={1152}
+          height={800}
+          alt="Studio's Finance team page, Project access card for Acme: platform role Developer, acting as the Postgres role finance, with engineering, sales and support left unchecked."
+          caption="The Finance team holds Developer on Acme, acting as finance: one grant for all its members."
+        />
       </div>
     </Band>
   );
@@ -532,60 +571,27 @@ function Collaborate() {
 
 /* ---------- Iterate ---------- */
 
-const TERM = "font-serif font-semibold text-[1.25rem]";
-const DEFINITION = "mt-1 max-w-[52ch] text-chalk-dim";
-
 function Iterate() {
   return (
     <Band id="iterate" labelledby="branch-title">
-      <div
-        className={`${SECTION_INNER} grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)] gap-16 items-start max-[900px]:grid-cols-1`}
-      >
-        <div>
-          <h2 id="branch-title" className={SECTION_TITLE}>
-            Branch it. Reset it. Restore it. Merge it.
-          </h2>
-          <p className={`${SECTION_LEDE} text-chalk-dim`}>
-            Every database starts with one branch, main. Try a change on a copy of real data, then bring it home.
-          </p>
-          <dl className="mt-8 grid gap-5">
-            <div>
-              <dt className={TERM}>Branch</dt>
-              <dd className={DEFINITION}>
-                Copy any branch as it is now, or as it was at any point in its history window (seven days by default).
-                The copy is copy-on-write, so it's ready at once, with its own endpoint and password.
-              </dd>
-            </div>
-            <div>
-              <dt className={TERM}>Reset</dt>
-              <dd className={DEFINITION}>Bring a branch back in line with its parent's latest state, keeping its connection string.</dd>
-            </div>
-            <div>
-              <dt className={TERM}>Restore</dt>
-              <dd className={DEFINITION}>
-                Take a branch back to a point in time. The old timeline is kept as a backup branch, in case you want it
-                back.
-              </dd>
-            </div>
-            <div>
-              <dt className={TERM}>Merge</dt>
-              <dd className={DEFINITION}>
-                Move schema changes from a branch into its parent with a three-way merge. Resolve conflicts, rehearse
-                on a copy of the target, then apply. Rows never move.
-              </dd>
-            </div>
-          </dl>
-        </div>
-        <div className="grid gap-6 min-w-0">
+      <div className={SECTION_INNER}>
+        <h2 id="branch-title" className={SECTION_TITLE}>
+          Branch it. Reset it. Restore it. Merge it.
+        </h2>
+        <p className={`${SECTION_LEDE} text-chalk-dim`}>
+          Every database starts with one branch, main. Try a change on a copy of real data, then bring it home.
+        </p>
+        <div className="mt-10">
           <TideGauge />
-          <StudioShot
-            src="/screens/iterate-branches.webp"
-            width={1152}
-            height={934}
-            alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
-            caption="Protected main, and feature-discounts branched from it, ready to merge."
-          />
         </div>
+        <StudioShot
+          className="mt-12"
+          src="/screens/iterate-branches.webp"
+          width={1152}
+          height={790}
+          alt="Studio's branches list for the Acme database: main, protected, and feature-discounts, branched from main, each with its endpoint and actions such as Reset to parent, Restore and Merge into main."
+          caption="Protected main, and feature-discounts branched from it, ready to merge."
+        />
       </div>
     </Band>
   );
@@ -747,6 +753,8 @@ const MARK_CLASS: Record<Mark, string> = {
 };
 
 const CELL = "p-3.5 text-left";
+/** The row names stay in view while a phone scrolls the products sideways. */
+const ROW_HEAD = "sticky left-0 z-1 bg-ink min-w-36 max-[560px]:pl-0";
 const HEAD = "pb-3 border-b-2 border-line-strong font-serif font-semibold text-[1.1rem]";
 
 const COLUMNS = ["Chelabase", "Supabase", "Firebase", "Neon", "PlanetScale Postgres", "PlanetScale MySQL"] as const;
@@ -779,7 +787,7 @@ function Compare() {
           What each platform offers today, from its own docs. Benchmarks come later.
         </p>
         {/* a wireframe, not a result */}
-        <div className="mt-10 p-7 border-2 border-dashed border-line-strong rounded-2xl bg-ink">
+        <div className="mt-10 p-7 border-2 border-dashed border-line-strong rounded-2xl bg-ink max-[560px]:p-4">
           <p className="inline-block mb-5.5 px-3.5 py-1.5 border-2 border-coral rounded-md text-coral font-serif font-bold text-[0.95rem] -rotate-[1.5deg]">
             Comparison preview — benchmarks coming later
           </p>
@@ -788,7 +796,7 @@ function Compare() {
             <table className="w-full min-w-200 border-collapse text-[0.97rem]" aria-label="Comparison preview">
               <thead>
                 <tr>
-                  <td className={`${CELL} align-middle`} />
+                  <td className={`${CELL} ${ROW_HEAD} align-middle`} />
                   {COLUMNS.map((c) => (
                     <th key={c} scope="col" className={`${CELL} ${HEAD} align-bottom`}>
                       {/* Chelabase's own column is set in the wordmark, which is taller; the names align on the bottom. */}
@@ -802,7 +810,7 @@ function Compare() {
                   const rule = `align-middle ${row > 0 ? "border-t border-line" : ""}`;
                   return (
                     <tr key={r.label}>
-                      <th scope="row" className={`${CELL} ${rule} w-[20%] font-semibold text-chalk`}>
+                      <th scope="row" className={`${CELL} ${rule} ${ROW_HEAD} w-[20%] font-semibold text-chalk`}>
                         {r.label}
                       </th>
                       {r.marks.map((m, i) => (
