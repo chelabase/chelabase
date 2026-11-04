@@ -1,13 +1,11 @@
 # The offline checks: `just check` (nextest included) and the doctests `just test` adds, the same
 # commands a contributor runs.
-# Until the repo is public this runs by hand only (Actions minutes are billed on a private repo).
 name: ci
 
 on:
   workflow_dispatch:
-  # enable at launch: uncomment these two lines (the whole change for this workflow)
-  # pull_request:
-  # push: { branches: [main] }
+  pull_request:
+  push: { branches: [main] }
 
 permissions:
   contents: read
@@ -29,6 +27,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # compose-overlay-equiv.sh compares against an older commit.
+          fetch-depth: 0
 
       - name: System packages
         run: |
@@ -47,6 +47,14 @@ jobs:
 
       - name: Compose version (just check's compose scripts need 2.30 or newer)
         run: docker compose version
+
+      # proto's Rust install leaves the toolchain without rustc on the hosted runner, so let
+      # rustup install rust-toolchain.toml's channel and components itself.
+      - name: Rust toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain uninstall "$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" || true
+          rustup toolchain install
+          rustc -vV
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
