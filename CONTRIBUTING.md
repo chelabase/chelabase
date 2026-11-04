@@ -310,6 +310,8 @@ Four workflows in `.github/workflows/`, each also runnable by hand (`workflow_di
 
 The deploy workflows need the `production` environment's two secrets, `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` (the token as in *Deploying the landing page and docs*). Security reports arrive through private vulnerability reporting (Security → Advisories), which `SECURITY.md` points reporters at.
 
+`main` is protected by a repository ruleset: every change lands as a squash-merged pull request whose `just check, doctests` job passed. No approval is required, force pushes and deletion are refused, and an admin can bypass only through a pull request.
+
 **Checking a workflow without Actions minutes:** `actionlint` for syntax and expressions, and `act` to run it in Docker (both are single binaries from their GitHub releases; install them outside the repo):
 
 ```bash
