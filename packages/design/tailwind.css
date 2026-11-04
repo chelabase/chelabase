@@ -32,7 +32,7 @@
 /* The font stacks, as literal values (no var(), so nothing can cycle). Not inline: Tailwind emits
    --font-* on :root, so `var(--font-sans)` works in plain CSS too. Both themes share them. */
 @theme {
-  --font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif;
-  --font-serif: Spectral, "Iowan Old Style", Georgia, serif;
-  --font-mono: "JetBrains Mono Variable", ui-monospace, monospace;
+  --font-sans: "Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible Next Fallback", "Atkinson Hyperlegible", system-ui, sans-serif;
+  --font-serif: Spectral, "Spectral Fallback", "Iowan Old Style", Georgia, serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono Fallback", ui-monospace, monospace;
 }

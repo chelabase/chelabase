@@ -42,6 +42,28 @@ describe('the built landing page', () => {
     expect(html).not.toContain(RENDER_ERROR_MARKER);
   });
 
+  // The hero's fonts are fetched with the HTML rather than after the CSS: the latin subsets of
+  // Spectral 600 and 700 (tagline, wordmark) and Atkinson (body, buttons). Nothing else.
+  it('preloads_the_hero_fonts', () => {
+    const links = [...html.matchAll(/<link[^>]*rel="preload"[^>]*>/g)].map((m) => m[0]);
+    const fonts = links.filter((l) => /as="font"/.test(l));
+    const files = fonts.map((l) => /href="\/assets\/([^"]+)"/.exec(l)?.[1]);
+    expect(files.map((f) => f?.replace(/-[\w-]{8}\.woff2$/, '')).sort()).toEqual(
+      ['atkinson-hyperlegible-next-latin-wght-normal', 'spectral-latin-600-normal', 'spectral-latin-700-normal'].sort(),
+    );
+    for (const [i, l] of fonts.entries()) {
+      expect(l).toContain('type="font/woff2"');
+      expect(l).toContain('crossorigin="anonymous"');
+      expect(existsSync(join(dist, 'assets', files[i]!)), files[i]).toBe(true);
+    }
+    // The stylesheet references the same hashed files, so the preload is the one the page uses.
+    const css = readdirSync(join(dist, 'assets'))
+      .filter((f) => f.endsWith('.css'))
+      .map((f) => readFileSync(join(dist, 'assets', f), 'utf8'))
+      .join('\n');
+    for (const f of files) expect(css).toContain(`/assets/${f}`);
+  });
+
   it('short_screen_rules_are_built', () => {
     const assets = join(dist, 'assets');
     const css = readdirSync(assets)

@@ -8,6 +8,75 @@
 @import "@fontsource-variable/atkinson-hyperlegible-next";
 @import "@fontsource-variable/jetbrains-mono";
 
+/* Metric-matched fallbacks. The web fonts load with `font-display: swap`, so text first paints in
+   a local font; each stack in tailwind.css names one of these right after its web font, scaled so
+   the swap moves nothing. The local fonts are Times New Roman, Arial and Courier New (Windows,
+   macOS) or their metric-compatible Liberation and Croscore twins (Linux, ChromeOS), so one set of
+   numbers fits them all. size-adjust is the web font's width over the local font's on English
+   text (measured in Chromium at the weight each face serves); the overrides are the web font's
+   hhea ascent, descent and line gap over its em, divided by size-adjust. Remeasure on a font
+   change. */
+@font-face {
+  font-family: "Spectral Fallback";
+  font-style: normal;
+  font-weight: 100 500;
+  src: local("Times New Roman"), local("TimesNewRomanPSMT"), local("Liberation Serif"), local("LiberationSerif"), local("Tinos");
+  size-adjust: 109.21%;
+  ascent-override: 96.97%;
+  descent-override: 42.4%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Spectral Fallback";
+  font-style: normal;
+  font-weight: 501 650;
+  src: local("Times New Roman Bold"), local("TimesNewRomanPS-BoldMT"), local("Liberation Serif Bold"), local("LiberationSerif-Bold"), local("Tinos Bold");
+  size-adjust: 105.27%;
+  ascent-override: 100.6%;
+  descent-override: 43.98%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Spectral Fallback";
+  font-style: normal;
+  font-weight: 651 900;
+  src: local("Times New Roman Bold"), local("TimesNewRomanPS-BoldMT"), local("Liberation Serif Bold"), local("LiberationSerif-Bold"), local("Tinos Bold");
+  size-adjust: 107.51%;
+  ascent-override: 98.51%;
+  descent-override: 43.07%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible Next Fallback";
+  font-style: normal;
+  font-weight: 100 500;
+  src: local("Arial"), local("ArialMT"), local("Liberation Sans"), local("LiberationSans"), local("Arimo");
+  size-adjust: 98.46%;
+  ascent-override: 99.93%;
+  descent-override: 32.09%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "Atkinson Hyperlegible Next Fallback";
+  font-style: normal;
+  font-weight: 501 900;
+  src: local("Arial Bold"), local("Arial-BoldMT"), local("Liberation Sans Bold"), local("LiberationSans-Bold"), local("Arimo Bold");
+  size-adjust: 96.68%;
+  ascent-override: 101.78%;
+  descent-override: 32.69%;
+  line-gap-override: 0%;
+}
+@font-face {
+  font-family: "JetBrains Mono Fallback";
+  font-style: normal;
+  font-weight: 100 900;
+  src: local("Courier New"), local("CourierNewPSMT"), local("Liberation Mono"), local("LiberationMono"), local("Cousine");
+  size-adjust: 100%;
+  ascent-override: 102%;
+  descent-override: 30%;
+  line-gap-override: 0%;
+}
+
 :root {
   /* THEME: Basalt, the default. This bare :root block is the Basalt theme; the Lagoon theme below
      overrides its neutrals under :root[data-theme="lagoon"], so a future picker only sets that attribute. */
