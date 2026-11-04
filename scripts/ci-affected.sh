@@ -25,31 +25,44 @@ web_full=(package.json pnpm-lock.yaml pnpm-workspace.yaml .npmrc 'tsconfig*.json
   '.eslintrc*' 'eslint.config.*' '.prettierrc*' 'prettier.config.*'
   justfile .prototools .github/workflows/ci.yml scripts/ci-affected.sh)
 
-# Files outside a package's directory that its tests read: pattern, then packages.
+# Files outside a package's directory that it reads: pattern, mode, packages. Mode `self` selects
+# just the packages: the read is in their tests or a binary, which no dependent builds. Mode
+# `closure` also selects their dependents: the read is in library code. Name the files read, not
+# their directory. scripts/tests/ci-affected.sh checks every row against the Rust sources.
 rust_reads=(
-  'openapi/*                       orchestrator rest auth chelabase-query'
-  'apps/studio/*                   orchestrator chelabase'
-  'apps/docs/*                     chelabase-routes'
-  'packages/client/*               chelabase-query chelabase-typegen chelabase'
-  'infra/compose/*                 chelabase-init init realtime chelabase'
-  'infra/workbench/*               chelabase'
-  'infra/neon/*                    bench-data-api'
-  'scripts/compute-network-e2e.sh  orchestrator'
-  'scripts/neon-images.sh          chelabase-neon chelabase'
-  'scripts/neon-e2e.sh             chelabase'
-  'services/identity/*             chelabase-identity'
+  'openapi/management.json                                   self     orchestrator'
+  'openapi/data.json                                         self     rest chelabase-query'
+  'openapi/login.json                                        self     auth'
+  'apps/studio/package.json                                  self     orchestrator'
+  'apps/studio/src/lib/role-rules.fixtures.json              self     orchestrator'
+  'apps/docs/content/docs/reference/access.mdx               self     chelabase-routes'
+  'apps/docs/content/docs/reference/errors.mdx               self     chelabase-routes'
+  'apps/docs/content/docs/using/self-hosted-vs-platform.mdx  self     chelabase-routes'
+  'packages/client/fixtures/*                                self     chelabase-query chelabase-typegen chelabase'
+  'infra/compose/.env.example                                self     realtime chelabase'
+  'infra/compose/docker-compose.yml                          self     chelabase-init init chelabase'
+  'infra/compose/docker-compose.workbench.yml                self     chelabase-init chelabase'
+  'infra/compose/docker-compose.example.yml                  self     init'
+  'infra/workbench/*                                         self     chelabase'
+  'infra/neon/NEON_REF                                       closure  bench-data-api'
+  'scripts/compute-network-e2e.sh                            self     orchestrator'
+  'scripts/neon-images.sh                                    self     chelabase-neon chelabase'
+  'scripts/neon-e2e.sh                                       self     chelabase'
+  'services/identity/openapi.json                            self     chelabase-identity'
 )
-# The same for the web packages (their tests and builds; not checked by a guard).
+# The same for the web packages (their tests and builds read these; not checked by a guard).
 web_reads=(
-  'openapi/*                                    @chelabase/management-client @chelabase/studio @chelabase/docs'
-  'infra/compose/*                              @chelabase/studio @chelabase/docs @chelabase/landing'
-  'apps/docs/*                                  @chelabase/studio'
-  'crates/chelabase-query/tests/fixtures/*      @chelabase/studio'
+  'openapi/management.json                                   @chelabase/management-client @chelabase/studio @chelabase/docs'
+  'openapi/data.json                                         @chelabase/studio'
+  'openapi/login.json                                        @chelabase/studio'
+  'infra/compose/.env.example                                @chelabase/studio @chelabase/docs @chelabase/landing'
+  'apps/docs/content/docs/reference/access.mdx               @chelabase/studio'
+  'crates/chelabase-query/tests/fixtures/text_keys.json      @chelabase/studio'
 )
 
 # Paths no Rust or web check reads.
 no_checks=('*.md' 'docs/*' '.github/*' '.claude/*' '.cursor/*' .mcp.json 'LICENSE*' .gitignore
-  .dockerignore 'infra/images/*' 'infra/neon/*' 'scripts/*')
+  .dockerignore 'infra/images/*' 'infra/neon/*' 'infra/compose/*' 'infra/workbench/*' 'scripts/*')
 
 # The packages `just check-web` checks, in its order.
 web_checked=(@chelabase/management-client @chelabase/studio @chelabase/client @chelabase/design
@@ -80,7 +93,11 @@ done
 
 # Every rule's package must exist.
 for row in "${rust_reads[@]}"; do
-  read -r _ pkgs <<<"$row"
+  read -r _ mode pkgs <<<"$row"
+  [[ "$mode" == self || "$mode" == closure ]] || {
+    echo "ci-affected: rust_reads row '$row' has mode $mode, not self or closure" >&2
+    exit 1
+  }
   for p in $pkgs; do jq -e --arg p "$p" 'has($p)' <<<"$rust_graph" >/dev/null || {
     echo "ci-affected: rust_reads names $p, not a workspace member" >&2
     exit 1
@@ -113,7 +130,7 @@ matches() { # <path> <pattern>...
 }
 
 rust_all=0 web_all=0
-rust_seeds=() web_seeds=()
+rust_seeds=() rust_self=() web_seeds=()
 while IFS= read -r f; do
   [[ -n "$f" ]] || continue
   hit=0
@@ -128,9 +145,11 @@ while IFS= read -r f; do
     if [[ "$f" == "$d"/* ]]; then web_seeds+=("$n") hit=1; fi
   done
   for row in "${rust_reads[@]}"; do
-    read -r pat pkgs <<<"$row"
+    read -r pat mode pkgs <<<"$row"
+    matches "$f" "$pat" || continue
+    hit=1
     # shellcheck disable=SC2206
-    if matches "$f" "$pat"; then rust_seeds+=($pkgs) hit=1; fi
+    if [[ "$mode" == closure ]]; then rust_seeds+=($pkgs); else rust_self+=($pkgs); fi
   done
   for row in "${web_reads[@]}"; do
     read -r pat pkgs <<<"$row"
@@ -151,7 +170,12 @@ closure() { # <graph> <seed>...
 }
 
 rust_sel=()
-if ((rust_all == 0 && ${#rust_seeds[@]})); then mapfile -t rust_sel < <(closure "$rust_graph" "${rust_seeds[@]}"); fi
+if ((rust_all == 0 && ${#rust_seeds[@]} + ${#rust_self[@]})); then
+  # The closure of the seeds, plus the `self` packages alone, in the graph's order.
+  mapfile -t rust_sel < <(jq -r --argjson self "$(jq -nc '$ARGS.positional' --args "${rust_self[@]}")" \
+    --argjson sel "$(jq -nc '$ARGS.positional' --args $( ((${#rust_seeds[@]})) && closure "$rust_graph" "${rust_seeds[@]}"))" \
+    'keys_unsorted[] | select(. as $n | any($self[], $sel[]; . == $n))' <<<"$rust_graph")
+fi
 if ((rust_all == 1 || ${#rust_sel[@]} == $(jq length <<<"$rust_graph"))); then
   echo "rust=full"
 elif ((${#rust_sel[@]} == 0)); then
