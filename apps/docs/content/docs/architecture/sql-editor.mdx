@@ -3,7 +3,7 @@ title: "SQL editor"
 description: "How the SQL view runs scripts: execution, limits, the guard, run as, saved queries and audit."
 ---
 
-Studio's SQL view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. It uses the owner's credentials, so it is for people who already own the database. For how to use it, see the [SQL editor guide](/docs/using/sql-editor).
+Studio's SQL view runs scripts against a branch's Postgres databases (the main one and any made with `CREATE DATABASE`) and streams the results back. With no role it runs as the database's owner (Admin only); with a role, it runs through the caller's own member login. For how to use it, see the [SQL editor guide](/docs/using/sql-editor).
 
 The API (all under `/v1/databases/{id}`):
 
@@ -19,7 +19,7 @@ The API (all under `/v1/databases/{id}`):
 - A script is sent as **one simple query**: Postgres runs its statements in order inside an implicit transaction, so an error rolls the whole script back. `BEGIN` and `COMMIT` in the script are honoured and end that implicit transaction as you wrote it.
 - `VACUUM`, `CREATE INDEX CONCURRENTLY` and `CREATE DATABASE` can't run in a transaction block, so they are accepted only as the script's single statement.
 - `COPY … FROM STDIN` isn't supported in the editor, because there is no way to send the data. Use psql through the proxy for it.
-- The run opens a fresh connection as the database's owner, so it needs the owner's password to be known (otherwise 409 `owner_password_unknown` until a reset).
+- With no `role` (Admin only), the run opens a fresh connection as the database's owner, so the owner's password must be known (otherwise 409 `owner_password_unknown` until a reset). With a `role`, it logs in as the caller's hidden member login.
 
 ### Limits
 
@@ -63,9 +63,9 @@ Before running, the script is parsed (pg_query, Postgres's own parser) and each 
 
 ## Run as
 
-The run's role picker (`role` in the request) does `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. It is a **preview, not a security boundary**: the connection is the owner's.
+The run's role picker (`role` in the request) does `SET ROLE` first, to preview what `anon`, `authenticated` or a custom role would see under row-level security. With a role, the connection logs in as the caller's hidden member login and runs `SET ROLE`, so a `RESET ROLE` lands on the member login, never the owner. An Admin acting as a role a member login can't hold (a login or owner-level role) uses the owner's connection and `SET ROLE`: only that case is a preview, not a security boundary.
 
-For `anon` and `authenticated` (offered where the data API was set up), the worker grants the role to the owner `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the owner inheriting the role's privileges. The orchestrator re-checks that grant at most every 5 minutes per branch. Other roles of the branch need no grant: roles the owner created are already its own (Postgres's `createrole_self_grant`).
+The worker grants each member login the roles in that member's grant `WITH INHERIT FALSE, SET TRUE`, so `SET ROLE` works without the login inheriting the role's privileges.
 
 ### The hidden member role
 

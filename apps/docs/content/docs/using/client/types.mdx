@@ -84,7 +84,7 @@ The types follow the key you generate with: what the key's role can't reach isn'
 
 A branch can serve more than its main database (see [Serving more databases](/docs/using/data-api/databases)). `db.database("analytics")` returns a client bound to that database: every request it sends carries the top-level `database` field (a batch carries it once; an operation inside a batch never names one). It keeps the `bigint` mode, and in that mode `db.database(name, types)` needs the `types` (they decode `int8`), which the type system enforces. `database()` siblings share the same [app user session](/docs/using/client/auth).
 
-`all_databases=true` (or `--all-databases`) writes every database the key reaches: `Databases` (a key per database), `Database` (`= Databases["main"]`) and a `types` map keyed alike. Main is always under the key `main`, whatever its real name, and the key must reach main, since the list of databases comes from main's schema response.
+`all_databases=true` (or `--all-databases`) writes every database the key reaches: `Databases` (a key per database), `Database` (`= Databases["main"]`) and a `types` map keyed alike. Main is always under the key `main`, whatever its real name, and the key must reach main, since the list of databases comes from main's schema response. When the key reaches only main, it writes the usual one-database module instead.
 
 ```ts twoslash
 import { createClient, type TypeMap } from "@chelabase/client";

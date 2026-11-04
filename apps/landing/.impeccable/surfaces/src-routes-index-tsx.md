@@ -29,6 +29,7 @@ Hero → Run it on your machine (`git clone` → `cd chelabase/infra/compose` �
 - Hero motion: scuttle and fork. The crab walks main; at each fork a smaller crab splits off down its branch, leaving a footprint trail; one branch then resets (its crab walks back to the fork and out again).
 - Hero must scale: lagoon, sun and palms visible on 24" (1920–2560 wide) and 34" ultrawide (3440 wide) screens, and on phones.
 - Compare keeps the wireframe idea but loses the grid lines.
+- Superseded (user, 2026-11-04): Compare has column rules and zebra rows (ink/channel), no row rules, one continuous zebra (no group subheads: the user rejected them); Chelabase's column is a sand band; a competitor's other approach is a short note, not "Different model"; a right-edge fade shows while columns are hidden.
 
 ## Decisions (user, 2026-10-30)
 

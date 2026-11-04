@@ -22,7 +22,7 @@ The three reads use the database owner's connection and need Viewer on the proje
 
 - With no `role`, as the database owner. That needs Admin.
 - With `role`, as that Postgres role. You log in with your own member role and `SET ROLE` to it, as in the [SQL editor](/docs/using/sql-editor), so the role must be in your grant's set (403 `forbidden` with `required: "role:<name>"` otherwise) and Postgres checks every statement against what that role may do (403 `permission_denied`). See [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
-- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`) and an empty `role` are refused (422).
+- System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`, `chelabase_realtime`) and an empty `role` are refused (422).
 
 Schema changes need Developer on an unprotected branch and Admin on a protected one (see [Protected branches](#protected-branches)). The per-route levels are in [Access per route](/docs/reference/access).
 

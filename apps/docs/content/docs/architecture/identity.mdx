@@ -66,7 +66,7 @@ A project's app users sign in through `/auth/v1/app/*` with the project's public
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `CHELABASE_IDENTITY_URL` | `http://identity:8080` | Where `auth`, the orchestrator, the worker and the bootstrap reach it |
+| `CHELABASE_IDENTITY_URL` | none; Compose sets `http://identity:8080` | Where `auth`, the orchestrator, the worker and the bootstrap reach it |
 | `CHELABASE_IDENTITY_TOKEN_FILE` | per caller | The caller's bearer (`tokens/<caller>-identity.token`) |
 | `CHELABASE_IDENTITY_POOL_CACHE_SIZE` | `256` | Pools kept open in memory |
 | `CHELABASE_SMTP_HOST`, `_PORT`, `_TLS`, `_FROM`, `_USER`, `CHELABASE_SMTP_PASSWORD_PATH` | unset | Outgoing mail; see [Install](/docs/self-hosting/install#email) |

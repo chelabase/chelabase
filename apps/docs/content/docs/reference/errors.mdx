@@ -42,7 +42,7 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 
 | Status | Code | Meaning |
 |---|---|---|
-| 403 | `forbidden` | The caller's grant is too low, or the Postgres role asked for isn't in their effective set. `error.required` names what is needed: a tenant, project or branch level (`tenant admin`, `developer`, `admin`), `instance admin`, `owner`, or `role:<name>`. A project the caller has no grant on answers 404 `not_found` instead. |
+| 403 | `forbidden` | The caller's grant is too low, or the Postgres role asked for isn't in their effective set. `error.required` names what is needed: a tenant, project or branch level (`tenant admin`, `developer`, `admin`), `instance admin`, `owner`, `role:<name>`, or `connect` (the member's database role may not connect to that Postgres database). A project the caller has no grant on answers 404 `not_found` instead. |
 | 403 | `no_access_yet` | The caller is a member with no grants anywhere. A tenant admin must grant them a project. |
 | 403 | `pending_approval` | The caller signed up and waits for a tenant admin to approve them. |
 | 403 | `member_suspended` | A tenant admin suspended the caller's membership. Every route refuses them except `GET /v1/me`; a tenant admin can reinstate them. |
@@ -52,7 +52,7 @@ Any project route can answer the first four rows. See [Access per route](/docs/r
 | 403 | `sign_up_closed` | Open sign-up is off and the tenant already has members. |
 | 403 | `setup_code_invalid` | The instance has no member yet and its first sign-up needs the setup code that `chelabase-init secrets` printed; it was missing or wrong. No account is created. |
 | 409 | `last_tenant_admin` | The change would leave the tenant without an active tenant admin (demoting or removing the last one). |
-| 409 | `link_not_allowed` | A link invite (`delivery: "link"`) for someone who already has a way to sign in (a password, passkey, OTP or identity-provider link). Send it by email instead; `error.email_available` says whether email delivery works now. |
+| 409 | `link_not_allowed` | A link invite (`delivery: "link"`) for someone who already has a password or a verified email, or whom another tenant holds. Send it by email instead; `error.email_available` says whether email delivery works now. |
 | 409 | `signup_pending` | The person signed up and waits for approval. Approve or decline the sign-up instead of inviting them; `error.member_id` names the member. |
 | 409 | `invite_closed` | The invite was revoked, accepted or replaced since. Reload the list. |
 | 410 | `invite_expired` | The invite's code has expired. Ask for a new invite. |
@@ -164,7 +164,7 @@ A merge that fails while running (`failed`, `stale`) shows its reason in the mer
 | 401 | `user_token_invalid` | No user token, or an invalid one. |
 | 403 | `email_not_verified` | The email isn't verified. |
 | 403 | `user_inactive` | The user is deactivated or locked. |
-| 410 | `sign_in_expired` | The sign-in has expired or is unknown. |
+| 410 | `sign_in_expired` | Studio's sign-in (not an app-user flow): the sign-in has expired or is unknown. |
 | 400, 422 | `invalid_code` | The verification or reset code is wrong or expired. The dashboard login API answers 400; the app-user API answers 422. |
 | 400, 422 | `weak_password` | The password doesn't meet the policy. Same split: 400 on the dashboard login API, 422 on the app-user API and the management API. |
 | 422 | `unknown_column` | Sign-up `data` names a column the users table doesn't have or sign-up can't set. |

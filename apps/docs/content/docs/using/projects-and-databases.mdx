@@ -20,7 +20,7 @@ Another tenant's project answers 404.
 
 Delete is refused with 409 while a database is still provisioning (`database_not_ready`), a branch is protected (`branch_protected`), or app users are being enabled or disabled (`conflict`). A wrong `confirm` is 422. A `deleting` project refuses every change with 409 `project_deleting`, and `POST /v1/databases` refuses it too.
 
-In Studio, the dashboard lists your projects and has **New project**. The project page has **Databases** and **Settings** tabs; Settings holds rename, app users and the danger zone, where deleting asks for the slug and lists the databases that go with it.
+In Studio, the dashboard lists your projects and has **New project**. The project page has **Databases**, **Access** and **Settings** tabs (and **Users** once app users are on); Settings holds rename, app users and the danger zone, where deleting asks for the slug and lists the databases that go with it.
 
 ## What a database is
 
@@ -39,7 +39,7 @@ Every database has the data API roles `anon` (`NOLOGIN`), `authenticated` (`NOLO
 
 ## Connection details
 
-`GET /v1/databases/{id}/connection` (Studio: **Connection details**) returns the owner credentials and the connection URI, and can be called any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key in the file named by `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by the dev bootstrap).
+`GET /v1/databases/{id}/connection` (Studio: the database's **Connect** panel) returns the owner credentials and the connection URI, and can be called any number of times. Passwords are stored encrypted (AES-256-GCM, bound to the database id) with the key in the file named by `CHELABASE_SECRETS_KEY` (`.chelabase/secrets/secrets.key`, created by the dev bootstrap).
 
 <Callout type="warn">
 Keep the secrets key file. Without it the stored passwords can't be decrypted. The orchestrator and worker check it at startup and refuse to run with a different key while encrypted credentials exist. After `just sweep-dbs` a new key is simply adopted.

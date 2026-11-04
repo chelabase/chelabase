@@ -3,7 +3,7 @@ title: "Gateway"
 description: "The front door: authentication, routing, CORS, limits and the internal identity token."
 ---
 
-The gateway is a Pingora proxy on `127.0.0.1:8000` (and `[::1]:8000`). It routes by host name: the API host serves the APIs, and the Studio, docs, landing and mail hosts are passed through to their apps. The auth host serves nothing (every path is 404): it only names the issuer of member tokens. All API traffic goes through it: the Management API (`/v1/*`), the login API (`/auth/v1/*`) and the data API (`/data/v1/*`). It never reads request bodies.
+The gateway is a Pingora proxy on `127.0.0.1:8000` by default (`CHELABASE_GATEWAY_LISTEN` takes a list, e.g. `127.0.0.1:8000,[::1]:8000`). It routes by host name: the API host serves the APIs, and the Studio, docs, landing and mail hosts are passed through to their apps. The auth host serves nothing (every path is 404): it only names the issuer of member tokens. All API traffic goes through it: the Management API (`/v1/*`), the login API (`/auth/v1/*`) and the data API (`/data/v1/*`). It never reads request bodies.
 
 ## One declaration per endpoint
 
@@ -23,7 +23,7 @@ Each request goes through a fixed pipeline: request id, host scope, route, CORS,
 
 Management endpoints require `Authorization: Bearer <member access token>`, the EdDSA JWT that `auth` signs at `POST /auth/v1/token` (see [Identity service](/docs/architecture/identity#member-sign-in-and-tokens)). The gateway verifies it locally with the member public key (`CHELABASE_MEMBER_JWT_PUBLIC_KEY`): the algorithm, key id, issuer (derived from `CHELABASE_AUTH_HOST` and `CHELABASE_PUBLIC_SCHEME`; see [Hosts](/docs/self-hosting/hosts)), audience `chelabase-member`, claim set and lifetime are all pinned. Without a verify key every bearer is a 401 and the gateway reports itself not ready. It then forwards the request with an **internal identity token** in the `x-chelabase-identity` header:
 
-- an EdDSA JWT, valid for 60 seconds, signed for exactly one target service (its `aud` is `orchestrator`, `auth` or `rest`);
+- an EdDSA JWT, valid for 60 seconds, signed for exactly one target service (its `aud` is `orchestrator`, `auth`, `rest` or `realtime`);
 - the gateway never forwards `Authorization`, the `Chelabase-User` header or a client-supplied `x-chelabase-identity`.
 
 The internal token carries the member's tenant (the member token's `tid`). The orchestrator trusts only that token (it holds the verify key, `CHELABASE_INTERNAL_VERIFY_KEY`) and still requires an active membership in that tenant on every request. Calling the orchestrator's port `:8081` directly returns `401`.
@@ -41,7 +41,7 @@ A data API request carries `Authorization: Bearer <key>`. The gateway:
 
 `rest` enforces the allow-list, because the gateway never reads bodies. A revoked key stops working within 30 seconds, the cache lifetime.
 
-Cache misses are rate limited to 20 per second per client address, and a request over the limit gets 429 `rate_limited`. The limiter keys on the connection's own address, never on `X-Forwarded-For`, and groups IPv6 clients by their `/64` prefix. It remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds); past that it evicts entries, and an evicted address starts again with a full allowance. Behind a load balancer every client shares one address.
+Cache misses are rate limited to 20 per second per client address, and a request over the limit gets 429 `rate_limited`. The limiter keys on the connection's address, or on the client address forwarded by a proxy listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES`; it ignores `X-Forwarded-For` from anyone else, and groups IPv6 clients by their `/64` prefix. It remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds); past that it evicts entries, and an evicted address starts again with a full allowance. Behind a load balancer every client shares one address.
 
 The gateway answers its own 404 and 405 under `/data/` with the data API's error body (code `invalid_query`), so a client sees one error shape for the whole prefix.
 
@@ -68,6 +68,7 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 | `CHELABASE_API_HOST`, `CHELABASE_STUDIO_HOST`, `CHELABASE_AUTH_HOST` | none (required) | The hosts that serve the API and Studio, and the one that names the member tokens' issuer |
 | `CHELABASE_DOCS_HOST`, `CHELABASE_LANDING_HOST`, `CHELABASE_MAIL_HOST` | unset | Optional hosts for the docs site, the landing page and Mailpit |
 | `CHELABASE_PUBLIC_SCHEME` | `https` | The scheme clients use; derives Studio's origin and the issuer |
+| `CHELABASE_GATEWAY_TRUSTED_PROXIES` | none | Reverse proxies whose forwarded client address is believed: CIDRs or addresses, comma-separated |
 | `CHELABASE_GATEWAY_UPSTREAM_TIMEOUT_SECS` | `60` | Upstream read timeout |
 | `CHELABASE_INTERNAL_URL` | `http://127.0.0.1:8083` | The orchestrator's internal listener, for key lookups |
 | `CHELABASE_DATA_KEYS_TOKEN` | `chelabase-dev-data-keys` | Bearer for key lookups |
@@ -76,4 +77,4 @@ The gateway answers its own 404 and 405 under `/data/` with the data API's error
 | `CHELABASE_APP_JWT_PUBLIC_KEY` | unset | App-user token verify key (a PEM file); unset, every `Chelabase-User` header is refused |
 | `CHELABASE_INTERNAL_SIGNING_KEY` | none (required) | The key that signs identity tokens (`gateway/internal-signing.pem`) |
 
-The default bearer values are for local development only.
+The development bearer values (`chelabase-dev-…`) are used only with `CHELABASE_DEV_DEFAULTS=1` (the workbench); otherwise an unset or development bearer stops the service at start-up. Each bearer can also be given as a file through `<NAME>_FILE`.

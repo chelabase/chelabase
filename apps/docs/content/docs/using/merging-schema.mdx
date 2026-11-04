@@ -382,7 +382,7 @@ POST /v1/databases/{id}/merges/{merge_id}/finish
 
 Some objects are Chelabase's own, or are kept in line by it. A merge never moves them, even when you change them by hand, and never reports them as differences.
 
-- **Chelabase's schemas:** `chelabase` (the data API's) and `chelabase_merge` (the merge's own recovery marker), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
+- **Chelabase's schemas:** `chelabase` (the data API's), `chelabase_merge` (the merge's own recovery marker) and `chelabase_guard` (the protected-branch DDL guard), along with Postgres's `pg_catalog`, `information_schema` and `pg_toast`.
 - **The app users table's managed parts:**
   - the columns Chelabase owns (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`);
   - the guard triggers and the two own-row policies (`chelabase_users_select_own`, `chelabase_users_update_own`);
@@ -390,7 +390,7 @@ Some objects are Chelabase's own, or are kept in line by it. A merge never moves
   - the table's grants to `authenticated` and `chelabase_auth_sync`.
 
   Columns you add to the users table do merge.
-- **Chelabase's roles:** `authenticator`, `anon`, `authenticated`, every `chelabase_*` role, `cloud_admin`, `neon_superuser`, and every `pg_*` role. A role's membership in one of them (for example owner-level, which is membership of `neon_superuser`) stays on the member.
+- **Chelabase's roles:** `authenticator`, `anon`, `authenticated`, every `chelabase_*` role, `cloud_admin`, `neon_superuser`, the hidden member logins (`cb_m_*`), and every `pg_*` role. A role's membership in one of them (for example owner-level, which is membership of `neon_superuser`) stays on the member.
 - **Extension members.** The extension itself is reported; what it installs isn't.
 - **The data API's default privileges.** These are the per-schema defaults that grant new tables in a served schema to `anon` and `authenticated`, and one database-wide row: the owner's `ALTER DEFAULT PRIVILEGES … REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`, which the data API writes. Each branch with the data API on already has them, so merging them would only show a difference between a branch that has the data API on and one that doesn't. The exclusion is exact: the database-wide function row of the owner whose privileges are the owner's own `EXECUTE`, and per-schema grants to `anon` and `authenticated` by the owner. A default privilege of yours for another role, or with another grant, merges as usual.
 - **Role changes the roles path can't make,** and the owner role's own attributes: reported as "apply by hand" (see [Roles](#roles)).

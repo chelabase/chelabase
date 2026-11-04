@@ -10,7 +10,7 @@ import {
   MarkdownCopyButton,
 } from 'fumadocs-ui/layouts/docs/page';
 import { baseOptions } from '@/lib/layout.shared';
-import { appName, getPageMarkdownUrl } from '@/lib/shared';
+import { appName, canonicalUrl, docsRoute, getPageMarkdownUrl, socialMeta } from '@/lib/shared';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
 import type { TOCItemType } from 'fumadocs-core/toc';
@@ -30,16 +30,20 @@ export const Route = createFileRoute('/docs/$')({
     return data;
   },
   // The root route's title ("Chelabase") is the fallback; a page's own title replaces it.
-  head: ({ loaderData }) => ({
-    meta: loaderData
-      ? [
-          { title: `${loaderData.title} · ${appName}` },
-          ...(loaderData.description
-            ? [{ name: 'description', content: plainText(loaderData.description) }]
-            : []),
-        ]
-      : [],
-  }),
+  head: ({ loaderData, params }) => {
+    if (!loaderData) return {};
+    const title = `${loaderData.title} · ${appName}`;
+    const description = loaderData.description ? plainText(loaderData.description) : undefined;
+    const url = canonicalUrl(`${docsRoute}/${params._splat ?? ''}`);
+    return {
+      meta: [
+        { title },
+        ...(description ? [{ name: 'description', content: description }] : []),
+        ...socialMeta(title, description, url),
+      ],
+      links: [{ rel: 'canonical', href: url }],
+    };
+  },
 });
 
 /** A description as plain text for <meta>: an API operation's is markdown, and its code spans keep their backticks. */

@@ -51,6 +51,6 @@ Studio uses TanStack Query for all data fetching, through the generated Manageme
 - **Polling.** Lists poll every 2 seconds while a database or branch is pending, provisioning, resetting or deleting; polling stops when the status settles.
 - **Invalidation.** Writes invalidate exactly the queries they change, not whole cache keys.
 - **Secrets stay out of the cache.** Connection details, passwords and created or rotated API keys never enter the query or mutation cache. They live in component state and disappear when the panel closes.
-- **Retries.** A request is retried at most twice, and only for network failures and 5xx answers; a 4xx answer is never retried.
+- **Retries.** A query is retried at most twice, only for network failures and 5xx answers; writes are never retried, and a 4xx answer is never retried.
 - **Errors.** Errors are thrown as `ApiError { status, code, message, extra }`, and Studio switches on the stable `code`. A 401 restarts sign-in once; if the fresh token is refused too, the dashboard shows the gateway's error instead of looping.
 - **Devtools.** In dev builds, the TanStack Router and Query devtools are available.

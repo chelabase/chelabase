@@ -251,8 +251,17 @@ describe('the built docs site', () => {
     // A static host has no server redirect: the prerendered page must carry the meta refresh.
     const html = read('index.html');
     expect(html).toMatch(/<meta[^>]*http-equiv="refresh"[^>]*content="0; url=\/docs"/);
-    // No canonical link until the docs host is decided (spec D4): a relative one is wrong.
-    expect(html).not.toMatch(/rel="canonical"/);
+    // The canonical link is absolute, on the published docs host: a relative one is wrong.
+    expect(html).toContain('<link rel="canonical" href="https://docs.chelabase.com/docs/"/>');
+  });
+
+  it('every_page_has_an_absolute_canonical_link_and_is_in_the_sitemap', () => {
+    const page = read('docs/using/quickstart/index.html');
+    expect(page).toContain('<link rel="canonical" href="https://docs.chelabase.com/docs/using/quickstart/"/>');
+    expect(page).toContain('<meta property="og:image" content="https://docs.chelabase.com/og.png"/>');
+    const sitemap = read('sitemap.xml');
+    expect(sitemap).toContain('<loc>https://docs.chelabase.com/docs/using/quickstart/</loc>');
+    expect(sitemap).toContain('<loc>https://docs.chelabase.com/docs/reference/errors/</loc>');
   });
 
   it('an_api_page_shows_its_description_once_as_markdown_not_raw', () => {

@@ -54,6 +54,7 @@ export default defineConfig({
         { path: '/api/search' },
         { path: '/llms.txt' },
         { path: '/llms-full.txt' },
+        { path: '/sitemap.xml' },
       ],
     }),
     react(),

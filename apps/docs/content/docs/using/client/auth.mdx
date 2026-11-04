@@ -40,7 +40,7 @@ if (user) console.log(user.email);
 
 ## Sign-up data
 
-`signUp`'s `data` fills the app's own columns of the users table. With a generated `Database` it is typed from that table's insertable columns, without the managed ones (`id`, `email`, `email_verified`, `created_at`, `deleted_at`). `session` is `null` while email verification is pending (`verificationRequired`).
+`signUp`'s `data` fills the app's own columns of the users table. With a generated `Database` it is typed from that table's insertable columns, without the managed ones (`id`, `email`, `email_verified`, `created_at`, `deleted_at`, `banned_at`). `session` is `null` while email verification is pending (`verificationRequired`).
 
 ## Where the session is kept
 
