@@ -3,14 +3,14 @@ title: Table API
 description: List a branch's tables, read a table's structure and the type catalog, change the schema with structured operations (dry runs, drops with dependents, concurrent indexes), insert a row of defaults and fetch a full cell.
 ---
 
-The table API is what Studio's table editor is built on. It reads the structure of a branch's Postgres databases and changes it with structured operations instead of SQL text: you send `create_table`, `add_column` or `drop_index`, and the server renders the statements, runs them in one transaction and answers with what ran. Two small row helpers (a row of all defaults, one cell's full value) sit beside them. For how it works inside, see [Table API internals](/docs/architecture/table-api).
+The table API is what Studio's table editor is built on. It reads the structure of a branch's Postgres databases and changes it with structured operations instead of SQL text: you send `create_table`, `add_column` or `drop_index`, and the server renders the statements, runs them in one transaction and answers with what ran. Two small row helpers (a row of all defaults, one cell's full value) sit beside them. For how it works inside, see [Table API internals](/architecture/table-api).
 
 All routes are under `/v1/databases/{id}/branches/{branch_id}`. The Postgres database defaults to the branch's main one; pick another with `?database=` (reads) or `database` in the body.
 
 | Request | What it is for | Minimum access |
 |---|---|---|
 | `GET /objects` | The object list: every table, view, materialized view and foreign table with its kind, owner, comment, row estimate, size, row-level security flags, whether the data API can reach it (`data_api_exposed`) and whether the table API edits it (`editable`: ordinary tables only). System schemas and Chelabase's own objects are left out. | Viewer |
-| `GET /tables/{schema}/{table}` | The table structure: columns (with type oid, default, identity, generated expression, collation, comment), constraints, indexes, triggers, policies, privileges and the comment, as the [schema merge](/docs/using/merging-schema) reads them. Only ordinary tables; a view, a partition child or a missing table is 404. | Viewer |
+| `GET /tables/{schema}/{table}` | The table structure: columns (with type oid, default, identity, generated expression, collation, comment), constraints, indexes, triggers, policies, privileges and the comment, as the [schema merge](/using/merging-schema) reads them. Only ordinary tables; a view, a partition child or a missing table is 404. | Viewer |
 | `GET /types` | The type catalog: base, enum (with `labels`), domain, composite, range and multirange types with their oids, array oids and whether they take modifiers. For a type picker, and to join a column's `type_oid`. | Viewer |
 | `POST /schema-changes` | Schema changes: tables, columns, constraints, indexes, row-level security, policies, grants and enums. A dry run previews them. | Developer on an unprotected branch, Admin on a protected one |
 | `POST /tables/{schema}/{table}/rows/default` | Inserts a row of all defaults (`INSERT … DEFAULT VALUES`) and returns it as JSON. Ordinary tables only (404 otherwise). | Developer |
@@ -18,13 +18,13 @@ All routes are under `/v1/databases/{id}/branches/{branch_id}`. The Postgres dat
 
 ## Who may call
 
-The three reads use the database owner's connection and need Viewer on the project. They also need your own Postgres login (`cb_m_…`, the one the [SQL editor](/docs/using/sql-editor) connects as) to hold `CONNECT` on the database, checked at the time of the read, as Postgres decides it when you log in. PUBLIC's default `CONNECT` is enough. After `REVOKE CONNECT … FROM PUBLIC`, an Admin grants `CONNECT` to your login, exactly as for the SQL editor; a group's `CONNECT` doesn't reach it. Without it, or with no login on the branch yet, the read is 403 `permission_denied` ("your login may not connect to this database"). An Admin, a member with every role, or a tenant admin is checked as the database owner, who may connect unless its `CONNECT` was revoked. The other three run SQL as you:
+The three reads use the database owner's connection and need Viewer on the project. They also need your own Postgres login (`cb_m_…`, the one the [SQL editor](/using/sql-editor) connects as) to hold `CONNECT` on the database, checked at the time of the read, as Postgres decides it when you log in. PUBLIC's default `CONNECT` is enough. After `REVOKE CONNECT … FROM PUBLIC`, an Admin grants `CONNECT` to your login, exactly as for the SQL editor; a group's `CONNECT` doesn't reach it. Without it, or with no login on the branch yet, the read is 403 `permission_denied` ("your login may not connect to this database"). An Admin, a member with every role, or a tenant admin is checked as the database owner, who may connect unless its `CONNECT` was revoked. The other three run SQL as you:
 
 - With no `role`, as the database owner. That needs Admin.
-- With `role`, as that Postgres role. You log in with your own member role and `SET ROLE` to it, as in the [SQL editor](/docs/using/sql-editor), so the role must be in your grant's set (403 `forbidden` with `required: "role:<name>"` otherwise) and Postgres checks every statement against what that role may do (403 `permission_denied`). See [Roles and schema isolation](/docs/using/roles-and-schema-isolation).
+- With `role`, as that Postgres role. You log in with your own member role and `SET ROLE` to it, as in the [SQL editor](/using/sql-editor), so the role must be in your grant's set (403 `forbidden` with `required: "role:<name>"` otherwise) and Postgres checks every statement against what that role may do (403 `permission_denied`). See [Roles and schema isolation](/using/roles-and-schema-isolation).
 - System roles (`pg_*`, `cloud_admin`, `neon_superuser`, `authenticator`, `chelabase_admin`, `chelabase_auth_sync`, `chelabase_realtime`) and an empty `role` are refused (422).
 
-Schema changes need Developer on an unprotected branch and Admin on a protected one (see [Protected branches](#protected-branches)). The per-route levels are in [Access per route](/docs/reference/access).
+Schema changes need Developer on an unprotected branch and Admin on a protected one (see [Protected branches](#protected-branches)). The per-route levels are in [Access per route](/reference/access).
 
 ## A schema change
 
@@ -122,9 +122,9 @@ Only those three drops are refused this way. A `drop_constraint` or `drop_index`
 
 ## Protected branches
 
-A [protected branch](/docs/using/branches) allows schema changes only by an Admin. The API enforces that (Developer is not enough to call the route), and a Postgres guard enforces it for members' own sessions that reach the database another way, such as the SQL editor.
+A [protected branch](/using/branches) allows schema changes only by an Admin. The API enforces that (Developer is not enough to call the route), and a Postgres guard enforces it for members' own sessions that reach the database another way, such as the SQL editor.
 
-The guard applies to every session logged in as a member role (`cb_m_*`) of a non-Admin, and only to those. A session that logs in directly as another Postgres [login role](/docs/using/login-roles), with that role's password, isn't a member session and isn't guarded: anyone holding such a login can change the schema as far as the role's own privileges allow.
+The guard applies to every session logged in as a member role (`cb_m_*`) of a non-Admin, and only to those. A session that logs in directly as another Postgres [login role](/using/login-roles), with that role's password, isn't a member session and isn't guarded: anyone holding such a login can change the schema as far as the role's own privileges allow.
 
 In a member session, the guard refuses (409 `branch_protected` from the table API; Postgres error 42501 with hint `chelabase:branch_protected` elsewhere) any DDL that touches a permanent object, whatever role the session `SET ROLE`s to: `CREATE`, `ALTER` and `DROP` of tables, indexes, views, functions, schemas and the rest, `GRANT` and `REVOKE`, `COMMENT`, and `DROP OWNED`.
 
@@ -154,6 +154,6 @@ A failed Postgres statement is classified by its SQLSTATE:
 | 400 | `constraint_violation` | 23502, 23514, class 22: rows break NOT NULL or a check, or a value is out of range. |
 | 400 | `schema_change_failed` | Any other Postgres refusal. |
 
-Besides these: 409 `has_dependents`, 409 `dependents_changed`, 409 `index_build_failed`, 413 `too_large` (cell), and the access codes of every project route. Every code is in the [error reference](/docs/reference/errors).
+Besides these: 409 `has_dependents`, 409 `dependents_changed`, 409 `index_build_failed`, 413 `too_large` (cell), and the access codes of every project route. Every code is in the [error reference](/reference/errors).
 
 Each schema change that ran writes one audit log line (`orchestrator::table_api::audit`): who, where, as which role, how many operations, dry run or not, committed or not. Never the SQL or any value.

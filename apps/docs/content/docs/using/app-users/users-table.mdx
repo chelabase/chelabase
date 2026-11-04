@@ -47,7 +47,7 @@ On a new table:
 - row-level security is on;
 - `authenticated` can select and update, narrowed by two own-row policies: `chelabase_users_select_own` (`USING (id = chelabase.user_id())`) and `chelabase_users_update_own`. (It holds a `DELETE` grant too, but the guard refuses every delete.)
 
-The policies aren't protected: change or drop them like any policy. Studio's [RLS warning](/docs/using/studio) names the users table while RLS is off.
+The policies aren't protected: change or drop them like any policy. Studio's [RLS warning](/using/studio) names the users table while RLS is off.
 
 ## Sign-up data is opt-in per column
 

@@ -39,8 +39,8 @@ Member roles are created, updated and dropped by a reconciler on the branch when
 - **Grant `NOLOGIN` group roles.** A role that can log in is an application's identity, so acting as it is Admin-only. Make a group that owns or is granted the privileges, and grant that.
 - **A role carries its chain.** Granting `billing_admin` that can `SET ROLE billing` lets the member act as `billing` too. If any role in the chain is owner-level (superuser, `CREATEROLE`, `CREATEDB`, `REPLICATION`, `BYPASSRLS`), a `LOGIN` role, a reserved role, it can be held only with the Admin platform role: a grant below Admin that includes it is refused (422), and a member role never receives that part of a chain. A chain that holds `ADMIN` on another role is different: it is refused with 422 at grant time at every level, Admin included.
 - **Data keys follow the same rule.** A Developer creates a data key for a role they may act as; a key bound to an owner-level, `LOGIN` or reserved role (or a chain reaching one) needs an Admin.
-- **Narrow per database with Postgres privileges**, or with a grant override on a single Chelabase database. Overrides only narrow. See [Members and invites](/docs/using/members-and-invites#per-database-overrides).
+- **Narrow per database with Postgres privileges**, or with a grant override on a single Chelabase database. Overrides only narrow. See [Members and invites](/using/members-and-invites#per-database-overrides).
 
 `anon` and `authenticated`, the Data API's own roles, can be granted like any other role; the console and SQL editor run as them without a special case.
 
-For the roles the Roles API manages, see [Login roles](/docs/using/login-roles). Every route's required level is in [Access per route](/docs/reference/access).
+For the roles the Roles API manages, see [Login roles](/using/login-roles). Every route's required level is in [Access per route](/reference/access).

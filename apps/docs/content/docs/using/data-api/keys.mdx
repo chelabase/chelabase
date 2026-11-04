@@ -15,7 +15,7 @@ The branch gets its public key when it first becomes ready. It can't be revoked 
 
 ## Secret keys
 
-Create one with `POST /v1/databases/{id}/branches/{bid}/keys`, or in Studio's Data API view. The body takes a `name` (1 to 63 characters), optionally a `role` (default `authenticated`) and a [`databases` allow-list](/docs/using/data-api/allow-lists).
+Create one with `POST /v1/databases/{id}/branches/{bid}/keys`, or in Studio's Data API view. The body takes a `name` (1 to 63 characters), optionally a `role` (default `authenticated`) and a [`databases` allow-list](/using/data-api/allow-lists).
 
 The role is checked and granted to `authenticator` when the key is created. A refused role is a 422 `role_refused` whose message says why. A role is refused when it:
 
@@ -40,7 +40,7 @@ SQL can't drop a key's role (or drop and create it again in one transaction) unt
 
 ## Revocation
 
-Revoking a key takes effect within 30 seconds, the gateway's cache lifetime. A key that was never valid is cached for 30 seconds too. Cache misses (lookups that reach the orchestrator) are limited per client IP address; see [Limits](/docs/using/data-api/limits).
+Revoking a key takes effect within 30 seconds, the gateway's cache lifetime. A key that was never valid is cached for 30 seconds too. Cache misses (lookups that reach the orchestrator) are limited per client IP address; see [Limits](/using/data-api/limits).
 
 ## Lifecycle
 

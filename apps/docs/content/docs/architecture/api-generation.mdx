@@ -15,7 +15,7 @@ OpenAPI documents are generated from the Rust route handlers with utoipa 6 and u
 | `openapi/login.json` | The login API: auth's `/auth/v1`, Studio's sign-in pages and app users' sign-in flows (`/auth/v1/app/*`) | `services/auth/src/openapi.rs` |
 | `openapi/data.json` | The data API: `rest`'s `/data/v1` | `services/rest/src/openapi.rs` |
 
-The [management](/docs/reference/management/databases/createDatabase) and [data](/docs/reference/data/runQuery) references are published under `/docs/reference/` and the [login API](/docs/architecture/login-api/login/signIn) under `/docs/architecture/login-api`; each page is generated from its document when the site is built.
+The [management](/reference/management/databases/createDatabase) and [data](/reference/data/runQuery) references are published under `/reference/` and the [login API](/architecture/login-api/login/signIn) under `/architecture/login-api`; each page is generated from its document when the site is built.
 
 ### Tests that keep them honest
 
@@ -73,7 +73,7 @@ All management, login and gateway errors use one shape:
 { "error": { "code": "<code>", "message": "<sentence>" } }
 ```
 
-Some codes add extra keys (for example `keys` on `role_in_use`). The `code` is stable snake_case (for example `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is the `ErrorCode` enum in `crates/chelabase-types/src/api_error.rs` and the OpenAPI documents; see also [Error codes](/docs/reference/errors). Another tenant's database answers 404 `not_found`, exactly like a missing one.
+Some codes add extra keys (for example `keys` on `role_in_use`). The `code` is stable snake_case (for example `not_found`, `branch_not_ready`, `has_children`, `name_taken`, `invalid_request`, `too_large`, `rate_limited`, `unavailable`, `worker_unavailable`, `not_applied`, `sign_in_expired`, `invalid_credentials`). The full list is the `ErrorCode` enum in `crates/chelabase-types/src/api_error.rs` and the OpenAPI documents; see also [Error codes](/reference/errors). Another tenant's database answers 404 `not_found`, exactly like a missing one.
 
 The data API keeps its own codes and extra fields (`detail`, `hint`, `sqlstate`).
 

@@ -7,7 +7,7 @@ These are service settings for a self-hosted stack. A Compose install sets them 
 
 | Variable | Default | Read by |
 |---|---|---|
-| `CHELABASE_IDENTITY_URL` / `CHELABASE_IDENTITY_TOKEN_FILE` | `http://identity:8080`; self-hosted: each caller's `tokens/<caller>-identity.token` in the `secrets` volume | orchestrator, worker, auth. Pool and user administration in the [identity service](/docs/architecture/identity). When it can't be reached the app-user routes answer 503 `identity_unavailable` and the worker's jobs wait. |
+| `CHELABASE_IDENTITY_URL` / `CHELABASE_IDENTITY_TOKEN_FILE` | `http://identity:8080`; self-hosted: each caller's `tokens/<caller>-identity.token` in the `secrets` volume | orchestrator, worker, auth. Pool and user administration in the [identity service](/architecture/identity). When it can't be reached the app-user routes answer 503 `identity_unavailable` and the worker's jobs wait. |
 | `CHELABASE_APP_JWT_PRIVATE_KEY` / `CHELABASE_APP_JWT_PUBLIC_KEY` | self-hosted: `auth/app-jwt.{key,pub}` in the `secrets` volume, made once by `init-secrets` and never overwritten; workbench: the stack's `stack.env` (`.chelabase/auth/app-jwt.{key,pub}`, made once by `just workbench up`) | auth signs, the gateway verifies. Without them app users are off. |
 | `CHELABASE_APP_AUTH_INTERNAL_TOKEN` | `chelabase-dev-app-auth` | auth to the orchestrator's internal app routes |
 | `CHELABASE_APP_SESSIONS_INTERNAL_TOKEN` | `chelabase-dev-app-sessions` | gateway to the orchestrator, for session liveness |

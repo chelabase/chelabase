@@ -12,7 +12,7 @@ description: Request and response limits, and the known limits of the data API.
 | Operations per batch | 50 |
 | Alias (`{"col", "as"}`) | 1 to 63 bytes |
 | Database name (`"database"`) | 1 to 63 bytes |
-| Rows | The branch's `max_rows` [setting](/docs/using/data-api/settings) |
+| Rows | The branch's `max_rows` [setting](/using/data-api/settings) |
 | Gateway key lookups that miss the cache | 20 per second per client IP address (429 `rate_limited`) |
 | Databases a key may list | 20 |
 | Databases served per branch | `CHELABASE_BRANCH_DATA_API_DATABASE_CAP` (default 10) |
@@ -23,5 +23,5 @@ description: Request and response limits, and the known limits of the data API.
 - **Settings and schema changes** take up to 60 seconds to take effect (the connection-info cache lifetime). A disable, a `default_schema` change and a narrowed allow-list are pushed to `rest` at once.
 - **One database per request:** a request (a batch included) runs in one database. To join data, keep it in one database under several schemas.
 - **Revocation lag:** up to 30 seconds per gateway instance.
-- **IPv6 rate limiting:** the limiter groups IPv6 clients by `/64` prefix. A load balancer in front collapses all clients into one address unless it is listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES` (see [Hosts](/docs/self-hosting/hosts#behind-a-reverse-proxy)).
+- **IPv6 rate limiting:** the limiter groups IPv6 clients by `/64` prefix. A load balancer in front collapses all clients into one address unless it is listed in `CHELABASE_GATEWAY_TRUSTED_PROXIES` (see [Hosts](/self-hosting/hosts#behind-a-reverse-proxy)).
 - **Limiter size:** it remembers at most 100,000 addresses (idle ones are forgotten after 60 seconds). Past that it evicts entries, and an evicted address starts again with a full allowance.

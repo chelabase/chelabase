@@ -3,13 +3,13 @@ title: Query language
 description: The JSON tree one data API request carries, operation by operation.
 ---
 
-One request is one operation: a JSON tree sent to `POST /data/v1/query`. The [TypeScript client](/docs/using/client) builds these trees for you (`toTree()` shows the one it sends); the examples here follow the contract fixtures in `packages/client/fixtures`, which the client's tests and the server's parser both run.
+One request is one operation: a JSON tree sent to `POST /data/v1/query`. The [TypeScript client](/using/client) builds these trees for you (`toTree()` shows the one it sends); the examples here follow the contract fixtures in `packages/client/fixtures`, which the client's tests and the server's parser both run.
 
 - `"v": 1` is required at the top, and unknown fields are rejected anywhere.
 - A table or function name is `"name"` (in the database's `default_schema`) or `"schema.name"`. It is matched exactly, with no case folding.
-- An optional top-level `"database": "<name>"` picks a served database (the main one when omitted; 1 to 63 bytes). Inside a `batch` only the top level may name it, so a batch runs in one database. See [Serving more databases](/docs/using/data-api/databases).
+- An optional top-level `"database": "<name>"` picks a served database (the main one when omitted; 1 to 63 bytes). Inside a `batch` only the top level may name it, so a batch runs in one database. See [Serving more databases](/using/data-api/databases).
 - A request that breaks a rule here answers 400 `invalid_query`.
-- The full request schema is on the [`runQuery`](/docs/reference/data/runQuery) reference page, and the endpoint that lists a database's tables and columns is [`getDataSchema`](/docs/reference/data/getDataSchema). The schema can't express every rule: the server also rejects an insert whose rows have different keys, an alias or `database` over 63 bytes (the schema counts characters), `"v": 1.0` or `"limit": 1.0` (write integers), and a `limit` or `offset` above 9223372036854775807. A client that validates only against the schema can still get a 400.
+- The full request schema is on the [`runQuery`](/reference/data/runQuery) reference page, and the endpoint that lists a database's tables and columns is [`getDataSchema`](/reference/data/getDataSchema). The schema can't express every rule: the server also rejects an insert whose rows have different keys, an alias or `database` over 63 bytes (the schema counts characters), `"v": 1.0` or `"limit": 1.0` (write integers), and a `limit` or `offset` above 9223372036854775807. A client that validates only against the schema can still get a 400.
 - Two inputs are accepted that you might not expect: an empty batch (`"ops": []`), and an update or delete that carries both `where` and `"all": true`.
 
 ## select
@@ -30,7 +30,7 @@ One request is one operation: a JSON tree sent to `POST /data/v1/query`. The [Ty
 
 - `dir` is `asc` or `desc`, `nulls` is `first` or `last`; both are optional.
 - `select` can't be empty (leave it out for every column). An alias is 1 to 63 bytes.
-- `limit` and `offset` can't be negative. The server also clamps the result to the branch's `max_rows` [setting](/docs/using/data-api/settings).
+- `limit` and `offset` can't be negative. The server also clamps the result to the branch's `max_rows` [setting](/using/data-api/settings).
 
 ## count
 
@@ -118,8 +118,8 @@ Combine conditions with `{ "and": [...] }`, `{ "or": [...] }` (both need at leas
 
 ## Numbers keep every digit
 
-A big JSON number in a request body (say a 30-digit `numeric`) reaches Postgres exactly. Responses carry `int8` and `numeric` values with every digit too; the TypeScript client reads them exactly (see [Big numbers](/docs/using/client/big-numbers)).
+A big JSON number in a request body (say a 30-digit `numeric`) reaches Postgres exactly. Responses carry `int8` and `numeric` values with every digit too; the TypeScript client reads them exactly (see [Big numbers](/using/client/big-numbers)).
 
 ## Errors
 
-Every status and code a request can answer is on [Error codes](/docs/reference/errors).
+Every status and code a request can answer is on [Error codes](/reference/errors).

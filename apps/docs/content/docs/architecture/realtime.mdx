@@ -3,9 +3,9 @@ title: "Realtime"
 description: "The realtime service behind Studio's live rows and presence: how a socket is opened, how changes are found and filtered, its ports, settings, secrets and limits."
 ---
 
-The realtime service (`services/realtime`) pushes changes to Studio over a WebSocket: the rows of the table you are looking at, who else is looking at it, and project events (a branch changing status, a database appearing). Studio's side is described in [Table editor](/docs/using/table-editor#live-rows-and-presence).
+The realtime service (`services/realtime`) pushes changes to Studio over a WebSocket: the rows of the table you are looking at, who else is looking at it, and project events (a branch changing status, a database appearing). Studio's side is described in [Table editor](/using/table-editor#live-rows-and-presence).
 
-Realtime sends **keys, not rows**. A change reaches a viewer as the primary key of a row that was inserted, updated or deleted, and Studio reads the row again as the role the viewer acts as. Row-level security and grants therefore decide what each viewer sees, in Postgres, on every read. See [Security](/docs/architecture/security#realtime-sends-keys-only).
+Realtime sends **keys, not rows**. A change reaches a viewer as the primary key of a row that was inserted, updated or deleted, and Studio reads the row again as the role the viewer acts as. Row-level security and grants therefore decide what each viewer sees, in Postgres, on every read. See [Security](/architecture/security#realtime-sends-keys-only).
 
 ## How a socket is opened
 
@@ -37,7 +37,7 @@ Realtime listens on two ports inside the stack's network. Neither is published o
 | `realtime:8087` | `CHELABASE_REALTIME_ADDR` | The ticket route and the socket, reached through the gateway (`CHELABASE_REALTIME_URL`). A socket needs a ticket. |
 | `realtime:8088` | `CHELABASE_REALTIME_INTERNAL_ADDR` | `/health` only, without authentication. |
 
-Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`; the stack binds `0.0.0.0` inside its network. Realtime is on both the default and the [compute network](/docs/architecture/neon#the-compute-network), because it dials computes.
+Outside a workbench stack the defaults are `127.0.0.1:8087` and `127.0.0.1:8088`; the stack binds `0.0.0.0` inside its network. Realtime is on both the default and the [compute network](/architecture/neon#the-compute-network), because it dials computes.
 
 ## Settings
 
@@ -114,4 +114,4 @@ On the next `just workbench up` of a stack that predates realtime:
 ## Known gaps
 
 - The storage controller and the pageserver take their keys and tokens from environment variables that their entrypoints export from mounted files, so those values are in the process environment (not in the container's configured environment or on a command line).
-- Platform mode's `pg_hba` rule that limits logins by address is keyed to member roles and does not cover `chelabase_realtime`. In self-hosted mode, logins as `chelabase_realtime` are limited by address and client certificate (see [Security](/docs/architecture/security#realtime-sends-keys-only)).
+- Platform mode's `pg_hba` rule that limits logins by address is keyed to member roles and does not cover `chelabase_realtime`. In self-hosted mode, logins as `chelabase_realtime` are limited by address and client certificate (see [Security](/architecture/security#realtime-sends-keys-only)).

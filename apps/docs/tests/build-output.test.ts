@@ -87,13 +87,13 @@ describe('the built docs site', () => {
   });
 
   it('prerenders_the_docs_index', () => {
-    expect(existsSync(join(dist, 'docs/index.html'))).toBe(true);
-    expect(read('docs/index.html')).toContain('Introduction');
+    expect(existsSync(join(dist, 'index.html'))).toBe(true);
+    expect(read('index.html')).toContain('Introduction');
   });
 
   it('the_alpha_notice_is_on_every_entry_page', () => {
     // where someone decides to run Chelabase: the docs home, Install and the Quickstart
-    for (const page of ['docs/index.html', 'docs/self-hosting/install/index.html', 'docs/using/quickstart/index.html']) {
+    for (const page of ['index.html', 'self-hosting/install/index.html', 'using/quickstart/index.html']) {
       expect(read(page), page).toContain('not ready for production data');
     }
   });
@@ -106,7 +106,7 @@ describe('the built docs site', () => {
     ).length;
     expect(operations).toBeGreaterThan(0);
 
-    const pages = walk(join(dist, 'docs/reference/management')).filter((file) =>
+    const pages = walk(join(dist, 'reference/management')).filter((file) =>
       file.endsWith('/index.html'),
     );
     expect(pages.length).toBe(operations);
@@ -119,7 +119,7 @@ describe('the built docs site', () => {
   it('prerenders_every_data_operation', () => {
     const operations = countOperations('data.json');
     expect(operations).toBe(3);
-    const pages = indexPages('docs/reference/data');
+    const pages = indexPages('reference/data');
     expect(pages.length).toBe(operations);
 
     const run = pages.find((file) => file.includes('runQuery'));
@@ -137,7 +137,7 @@ describe('the built docs site', () => {
   it('prerenders_every_login_operation', () => {
     const operations = countOperations('login.json');
     expect(operations).toBeGreaterThan(0);
-    const pages = indexPages('docs/architecture/login-api');
+    const pages = indexPages('architecture/login-api');
     expect(pages.length).toBe(operations);
   });
 
@@ -187,7 +187,7 @@ describe('the built docs site', () => {
     expect(pages.length).toBeGreaterThan(0);
     const missing = pages
       .map((file) => relative(content, file).replace(/\.mdx$/, '').replace(/(^|\/)index$/, ''))
-      .filter((slug) => !existsSync(join(dist, 'docs', slug, 'index.html')))
+      .filter((slug) => !existsSync(join(dist, slug, 'index.html')))
       .sort();
     expect(missing).toEqual([]);
   });
@@ -198,15 +198,15 @@ describe('the built docs site', () => {
     expect(roots.length).toBeGreaterThan(0);
     const empty = roots
       .map((file) => relative(content, join(file, '..')))
-      .filter((folder) => indexPages(join('docs', folder)).length === 0);
+      .filter((folder) => indexPages(folder).length === 0);
     expect(empty).toEqual([]);
   });
 
   it('every_page_has_its_own_title', () => {
     const title = (path: string) => /<title>([^<]*)<\/title>/.exec(read(path))?.[1];
-    expect(title('docs/index.html')).toBe('Introduction · Chelabase');
-    expect(title('docs/using/quickstart/index.html')).toBe('Quickstart · Chelabase');
-    const api = indexPages('docs/reference/data').find((file) => file.includes('runQuery'));
+    expect(title('index.html')).toBe('Introduction · Chelabase');
+    expect(title('using/quickstart/index.html')).toBe('Quickstart · Chelabase');
+    const api = indexPages('reference/data').find((file) => file.includes('runQuery'));
     expect(api, 'a runQuery page').toBeDefined();
     expect(title(relative(dist, api!))).toMatch(/^.+ · Chelabase$/);
     expect(title(relative(dist, api!))).not.toBe('Chelabase');
@@ -214,7 +214,7 @@ describe('the built docs site', () => {
 
   it('html_is_dark_without_javascript', () => {
     // No light flash on a static host: the class is in the prerendered HTML, not set by a script.
-    for (const page of ['docs/index.html', 'docs/reference/data/runQuery/index.html']) {
+    for (const page of ['index.html', 'reference/data/runQuery/index.html']) {
       const html = /<html[^>]*>/.exec(read(page))?.[0];
       expect(html, page).toMatch(/\sclass="([^"]*\s)?dark(\s[^"]*)?"/);
     }
@@ -240,34 +240,69 @@ describe('the built docs site', () => {
     );
     expect(source).toContain('Toggle Theme');
     expect(source).toContain('data-theme-toggle');
-    for (const page of ['docs/index.html', 'docs/reference/data/runQuery/index.html']) {
+    for (const page of ['index.html', 'reference/data/runQuery/index.html']) {
       const html = read(page);
       expect(html, page).not.toContain('aria-label="Toggle Theme"');
       expect(html, page).not.toContain('data-theme-toggle');
     }
   });
 
-  it('root_redirects_to_docs', () => {
-    // A static host has no server redirect: the prerendered page must carry the meta refresh.
+  it('root_is_the_introduction_with_no_redirect', () => {
+    // `/` is the introduction itself: no meta refresh, no stub page that flashes first.
     const html = read('index.html');
-    expect(html).toMatch(/<meta[^>]*http-equiv="refresh"[^>]*content="0; url=\/docs"/);
+    expect(html).not.toContain('http-equiv="refresh"');
+    expect(html).toContain('<title>Introduction · Chelabase</title>');
+    expect(html).toContain('<article id="nd-page"');
     // The canonical link is absolute, on the published docs host: a relative one is wrong.
-    expect(html).toContain('<link rel="canonical" href="https://docs.chelabase.com/docs/"/>');
+    expect(html).toContain('<link rel="canonical" href="https://docs.chelabase.com/"/>');
+  });
+
+  it('no_page_is_left_under_docs', () => {
+    // The pages moved from /docs/… to the root; only _redirects sends the old URLs on.
+    expect(existsSync(join(dist, 'docs'))).toBe(false);
+    const offenders = walk(dist)
+      .filter((file) => file.endsWith('.html'))
+      .filter((file) => /\shref="\/docs(\/|")/.test(readFileSync(file, 'utf8')))
+      .map((file) => relative(dist, file));
+    expect(offenders).toEqual([]);
+  });
+
+  it('old_docs_urls_redirect_permanently', () => {
+    // Cloudflare's static assets read _redirects from the assets directory (and do not serve it).
+    const rules = read('_redirects')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith('#'))
+      .map((line) => line.split(/\s+/));
+    expect(rules).toEqual([
+      ['/docs', '/', '301'],
+      ['/docs/*', '/:splat', '301'],
+    ]);
+  });
+
+  it('llms_and_markdown_use_root_urls', () => {
+    expect(read('llms.txt')).toContain('(/using/quickstart)');
+    expect(read('llms.txt')).not.toContain('(/docs/');
+    expect(read('llms-full.txt')).not.toMatch(/^# .* \(\/docs[/)]/m);
+    expect(read('sitemap.xml')).toContain('<loc>https://docs.chelabase.com/</loc>');
+    expect(read('sitemap.xml')).not.toContain('chelabase.com/docs');
+    expect(existsSync(join(dist, 'using/quickstart.md'))).toBe(true);
+    expect(existsSync(join(dist, 'index.md'))).toBe(true);
   });
 
   it('every_page_has_an_absolute_canonical_link_and_is_in_the_sitemap', () => {
-    const page = read('docs/using/quickstart/index.html');
-    expect(page).toContain('<link rel="canonical" href="https://docs.chelabase.com/docs/using/quickstart/"/>');
+    const page = read('using/quickstart/index.html');
+    expect(page).toContain('<link rel="canonical" href="https://docs.chelabase.com/using/quickstart/"/>');
     expect(page).toContain('<meta property="og:image" content="https://docs.chelabase.com/og.png"/>');
     const sitemap = read('sitemap.xml');
-    expect(sitemap).toContain('<loc>https://docs.chelabase.com/docs/using/quickstart/</loc>');
-    expect(sitemap).toContain('<loc>https://docs.chelabase.com/docs/reference/errors/</loc>');
+    expect(sitemap).toContain('<loc>https://docs.chelabase.com/using/quickstart/</loc>');
+    expect(sitemap).toContain('<loc>https://docs.chelabase.com/reference/errors/</loc>');
   });
 
   it('an_api_page_shows_its_description_once_as_markdown_not_raw', () => {
     // fumadocs-openapi renders the operation's description itself; the raw markdown must not lead
     // the page as well
-    const html = read('docs/reference/management/merges/finishMerge/index.html');
+    const html = read('reference/management/merges/finishMerge/index.html');
     // what's shown: the body without its scripts (the serialized loader data keeps the raw text)
     const body = html.slice(html.indexOf('<body')).replace(/<script[\s\S]*?<\/script>/g, '');
     expect(body).toContain('<code>applied_with_drift</code>');
@@ -279,7 +314,7 @@ describe('the built docs site', () => {
   it('each_sidebar_operation_shows_its_method_once', () => {
     // one loader plugin labels every OpenAPI page, whichever document it came from; a plugin per
     // document labelled each operation once per document
-    const sidebar = sidebarOf(read('docs/reference/management/merges/finishMerge/index.html'));
+    const sidebar = sidebarOf(read('reference/management/merges/finishMerge/index.html'));
     const links = [...sidebar.matchAll(/<a\s[^>]*>[\s\S]*?<\/a>/g)].map((m) => m[0]);
     const labelled = links.filter((a) => badges(a).length > 0);
     expect(labelled.length).toBeGreaterThan(5);
@@ -289,7 +324,7 @@ describe('the built docs site', () => {
   it('badge_signature_is_on_operation_and_sidebar_badges', () => {
     // packages/design/fumadocs.css remaps the badge tones on `.font-mono.font-medium.dark\:text-
     // <colour>-400`, fumadocs-openapi's Badge. If Fumadocs changes those classes, this fails.
-    const operationHtml = read('docs/reference/data/runQuery/index.html');
+    const operationHtml = read('reference/data/runQuery/index.html');
     // The operation's own badge, and the open folder of its sidebar.
     expect(badges(operationHtml).map((b) => b.text)).toContain('POST');
     expect(badges(sidebarOf(operationHtml)).map((b) => b.text)).toEqual(
@@ -299,7 +334,7 @@ describe('the built docs site', () => {
     // rendered; its sidebar folders are collapsed in the HTML and rendered by the client from the
     // serialized page tree, which carries the same Badge markup. Access sits between data and
     // errors in the reference meta.json, so its previous neighbour is the last operation of data.
-    const contentHtml = read('docs/reference/access/index.html');
+    const contentHtml = read('reference/access/index.html');
     expect(badges(contentHtml).length).toBeGreaterThan(0);
     const tree = treeBadges(contentHtml);
     for (const method of ['GET', 'POST', 'PATCH', 'PUT', 'DELETE']) {
@@ -334,7 +369,7 @@ describe('the built docs site', () => {
   it('page_headings_are_inside_nd_page_and_not_not_prose', () => {
     // fumadocs.css sets Spectral 700 on `#nd-page :is(h1, …, h6):not(.not-prose)`. The title and
     // section headings of an operation page and a content page must match that selector.
-    for (const page of ['docs/reference/data/runQuery/index.html', 'docs/using/quickstart/index.html']) {
+    for (const page of ['reference/data/runQuery/index.html', 'using/quickstart/index.html']) {
       const html = read(page);
       const start = html.indexOf('<article id="nd-page"');
       expect(start, page).toBeGreaterThan(-1);
@@ -346,14 +381,14 @@ describe('the built docs site', () => {
         expect(classesOf(h[0]), `${page}: ${h[0]}`).not.toContain('not-prose');
       }
     }
-    const operation = read('docs/reference/data/runQuery/index.html');
+    const operation = read('reference/data/runQuery/index.html');
     for (const id of ['authorization', 'request-body', 'response-body']) {
       expect(operation, id).toMatch(new RegExp(`<h2 id="${id}"`));
     }
   });
 
   it('data_reference_pages_have_flat_urls', () => {
-    expect(existsSync(join(dist, 'docs/reference/data/runQuery/index.html'))).toBe(true);
-    expect(existsSync(join(dist, 'docs/reference/data/getDataSchema/index.html'))).toBe(true);
+    expect(existsSync(join(dist, 'reference/data/runQuery/index.html'))).toBe(true);
+    expect(existsSync(join(dist, 'reference/data/getDataSchema/index.html'))).toBe(true);
   });
 });

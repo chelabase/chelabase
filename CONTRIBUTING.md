@@ -2,7 +2,7 @@
 
 How to set up a machine, run the development stack, test, release images and commit.
 
-**The workbench is the development loop; the Compose install is what users run.** `just workbench up` builds the Rust services on your machine and runs them, with dev-only extras (Mailpit, a demo admin, a test runner), in an isolated stack per checkout. Self-hosters never use it: they follow the [Install](apps/docs/content/docs/self-hosting/install.mdx) page, which runs the release images from `infra/compose`. The [README](README.md) is for them.
+**The workbench is the development loop; the Compose install is what users run.** `just workbench up` builds the Rust services on your machine and runs them, with dev-only extras (Mailpit, a demo admin, a test runner), in an isolated stack per checkout. Self-hosters never use it: they follow the [Install](https://docs.chelabase.com/self-hosting/install/) page, which runs the release images from `infra/compose`. The [README](README.md) is for them.
 
 Agent workflow (epics, issues, white-room audits): see [AGENTS.md](AGENTS.md).
 
@@ -80,7 +80,7 @@ Open http://studio.chelabase.localhost:8000 and choose **Sign in** as the bootst
 The docs site runs in the stack too, reached through the gateway:
 
 ```bash
-just workbench up --with docs     # then open http://docs.chelabase.localhost:8000/docs
+just workbench up --with docs     # then open http://docs.chelabase.localhost:8000
 ```
 
 Stop the stack with `just workbench down` (volumes and state stay). `just` lists every recipe.
@@ -167,7 +167,7 @@ Everything a browser or a script reaches goes through the stack's gateway, by ho
 | http://landing.chelabase.localhost:8000 | The landing page (`just workbench up --with landing`) |
 | http://mail.chelabase.localhost:8000 | Mailpit (workbench only) |
 
-`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack; the rules are on the docs page [Hosts](apps/docs/content/docs/self-hosting/hosts.mdx).
+`chelabase.localhost` is deliberate: `*.localhost` resolves to loopback without any setup, and a stack's hosts share one registrable parent, so Studio and the API count as the same site and the `SameSite=Strict` sign-in cookies work. (Studio on `127.0.0.1` and the API on `localhost` would be cross-site.) Different stacks have different hosts, so cookies and sessions never mix between them. The hosts come from `CHELABASE_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_HOST`, `CHELABASE_PUBLIC_SCHEME` and `CHELABASE_GATEWAY_LISTEN`, which `just workbench up` renders per stack; the rules are on the docs page [Hosts](https://docs.chelabase.com/self-hosting/hosts/).
 
 `scripts/lib/entry.sh` is the one place scripts and recipes get these URLs: `source` it and use `CHELABASE_ENTRY_{STUDIO,API,AUTH,DOCS,LANDING,MAIL}_URL` (and the derived `CHELABASE_AUTH_HOST_NAME`, `CHELABASE_PUBLIC_PORT`, `CHELABASE_PUBLIC_SECURE`). Never write a URL literal in a script; `scripts/tests/entry-urls.sh` (run by `just check`) fails on them.
 
@@ -180,7 +180,7 @@ On the host, a workbench stack publishes only two ports, on loopback (`127.0.0.1
 | Gateway | 8000 | 8100–8199 | HTTP front door (Pingora); the only port to open in a browser |
 | Neon proxy (Postgres wire) | 4432 | 4500–4599 | `<ep>.localtest.me:<port>` for `psql` and drivers |
 
-A worktree's ports are allocated on its first `up` (the lowest free in the range) and kept until `purge`. The registry is `.chelabase/stacks/registry.json`, and `just workbench status` lists it. What a self-hosted install publishes is on the [Install](apps/docs/content/docs/self-hosting/install.mdx) page.
+A worktree's ports are allocated on its first `up` (the lowest free in the range) and kept until `purge`. The registry is `.chelabase/stacks/registry.json`, and `just workbench status` lists it. What a self-hosted install publishes is on the [Install](https://docs.chelabase.com/self-hosting/install/) page.
 
 Docker's Compose project is `chelabase` for main and `chelabase-<slug>` for a worktree. Computes are labelled `chelabase.dev/stack=<slug>`, so a stack's worker never touches another's.
 

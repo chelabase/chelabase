@@ -10,7 +10,7 @@ import {
   MarkdownCopyButton,
 } from 'fumadocs-ui/layouts/docs/page';
 import { baseOptions } from '@/lib/layout.shared';
-import { appName, canonicalUrl, docsRoute, getPageMarkdownUrl, socialMeta } from '@/lib/shared';
+import { appName, canonicalUrl, getPageMarkdownUrl, socialMeta } from '@/lib/shared';
 import { staticFunctionMiddleware } from '@tanstack/start-static-server-functions';
 import { useFumadocsLoader } from 'fumadocs-core/source/client';
 import type { TOCItemType } from 'fumadocs-core/toc';
@@ -21,7 +21,7 @@ import type { ComponentProps } from 'react';
 
 type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
 
-export const Route = createFileRoute('/docs/$')({
+export const Route = createFileRoute('/$')({
   component: Page,
   loader: async ({ params }) => {
     const slugs = params._splat?.split('/') ?? [];
@@ -34,7 +34,7 @@ export const Route = createFileRoute('/docs/$')({
     if (!loaderData) return {};
     const title = `${loaderData.title} · ${appName}`;
     const description = loaderData.description ? plainText(loaderData.description) : undefined;
-    const url = canonicalUrl(`${docsRoute}/${params._splat ?? ''}`);
+    const url = canonicalUrl(`/${params._splat ?? ''}`);
     return {
       meta: [
         { title },
