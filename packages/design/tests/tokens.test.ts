@@ -70,9 +70,9 @@ describe("design tokens", () => {
 
   test("tailwind_defines_the_font_stacks", () => {
     const tw = customProperties(readCss("tailwind.css"));
-    expect(tw.get("--font-sans")).toBe('"Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif');
-    expect(tw.get("--font-serif")).toBe('Spectral, "Iowan Old Style", Georgia, serif');
-    expect(tw.get("--font-mono")).toBe('"JetBrains Mono Variable", ui-monospace, monospace');
+    expect(tw.get("--font-sans")).toBe('"Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible Next Fallback", "Atkinson Hyperlegible", system-ui, sans-serif');
+    expect(tw.get("--font-serif")).toBe('Spectral, "Spectral Fallback", "Iowan Old Style", Georgia, serif');
+    expect(tw.get("--font-mono")).toBe('"JetBrains Mono Variable", "JetBrains Mono Fallback", ui-monospace, monospace');
     expect(tw.get("--color-ink")).toBe("var(--ink)");
     expect(tw.get("--color-input")).toBe("var(--input)");
     expect(tw.get("--ease-design")).toBe("cubic-bezier(0.16, 1, 0.3, 1)");

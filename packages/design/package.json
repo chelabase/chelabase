@@ -10,7 +10,8 @@
     "./tailwind.css": "./tailwind.css",
     "./scalar.css": "./scalar.css",
     "./fumadocs.css": "./fumadocs.css",
-    "./crab-marks": "./src/crab-marks.tsx"
+    "./crab-marks": "./src/crab-marks.tsx",
+    "./font-preloads": "./src/font-preloads.ts"
   },
   "peerDependencies": {
     "react": "^19.3.0"

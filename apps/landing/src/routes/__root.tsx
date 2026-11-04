@@ -1,4 +1,5 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router';
+import { fontPreload } from '@chelabase/design/font-preloads';
 import appCss from '@/styles.css?url';
 
 const TITLE = 'Chelabase — Manage, collaborate, iterate on Postgres';
@@ -49,6 +50,10 @@ export const Route = createRootRoute({
     ],
     links: [
       { rel: 'stylesheet', href: appCss },
+      // The hero's fonts (wordmark, tagline, body) start with the HTML, not after the stylesheet.
+      fontPreload.spectral700,
+      fontPreload.spectral600,
+      fontPreload.atkinson,
       { rel: 'canonical', href: SITE_URL },
       { rel: 'icon', href: '/favicon.svg', type: 'image/svg+xml' },
       { rel: 'icon', href: '/favicon-32.png', type: 'image/png', sizes: '32x32' },

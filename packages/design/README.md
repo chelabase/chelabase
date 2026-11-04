@@ -4,8 +4,9 @@ The single source of the Chelabase design system: tokens, both themes, fonts, th
 
 ## Files
 
-- `tokens.css`: the font imports and the two themes, which share the same unprefixed tokens. **Basalt** is the default, the bare `:root` block; **Lagoon** is the alternate, a `:root[data-theme="lagoon"]` block that redeclares only the neutrals, kept for a future theme picker (nothing sets it today). The tokens: the palette (`--ink`, `--deep`, `--channel`, `--shallows`, `--sand`, `--sand-lit`, `--wet-sand`, `--ink-lit`, `--seafoam`, `--coral`, `--palm`, `--chalk`, `--chalk-dim`, `--line`, `--line-strong`, `--input`), the claw colours (including `--claw-eye`), the HTTP method tones (`--method-get/put/patch`), `--radius` and `color-scheme: dark`. No font stacks: those live in `tailwind.css`.
+- `tokens.css`: the font imports, the metric-matched fallback faces (`Spectral Fallback`, `Atkinson Hyperlegible Next Fallback`, `JetBrains Mono Fallback`: local Times New Roman, Arial and Courier New or their Liberation/Croscore twins, scaled to the web font so the `swap` moves nothing) and the two themes, which share the same unprefixed tokens. **Basalt** is the default, the bare `:root` block; **Lagoon** is the alternate, a `:root[data-theme="lagoon"]` block that redeclares only the neutrals, kept for a future theme picker (nothing sets it today). The tokens: the palette (`--ink`, `--deep`, `--channel`, `--shallows`, `--sand`, `--sand-lit`, `--wet-sand`, `--ink-lit`, `--seafoam`, `--coral`, `--palm`, `--chalk`, `--chalk-dim`, `--line`, `--line-strong`, `--input`), the claw colours (including `--claw-eye`), the HTTP method tones (`--method-get/put/patch`), `--radius` and `color-scheme: dark`. No font stacks: those live in `tailwind.css`.
 - `src/crab-marks.tsx` (export `@chelabase/design/crab-marks`): the claw `ClawMark`, `Wordmark`, `CrabFigure` and `PalmTree` as React components, eye whites on `--claw-eye`. They use Tailwind utilities; the preset's `@source "./src"` makes any app that imports it generate them. `Wordmark` carries only the styling both apps share (serif, bold, tight, chalk; claw `h-[1.32em]`); apps add nudges through `className`, `visualClassName` and `clawClassName`. Needs `react` (peer).
+- `src/font-preloads.ts` (export `@chelabase/design/font-preloads`): `fontPreload.{spectral600,spectral700,atkinson}`, `<link rel="preload">` descriptors with the hashed latin woff2 URLs, for a route's `head().links`. Apps preload only the faces their first screen shows.
 - `base.css`: box-sizing, scrollbars, `body` colours and font, `::selection`.
 - `tailwind.css`: Tailwind v4 mapping: `--color-*` for the palette, `--ease-design`, radii, and the font stacks as Tailwind's `--font-sans/serif/mono` (literal values in a non-inline `@theme`, so Tailwind also emits them on `:root`).
 - `scalar.css`: the Scalar API reference skin, every rule under `.design-scalar` (the wrapper) or `body > .scalar-app` (Scalar's teleported popovers).
@@ -17,7 +18,7 @@ Coral is hazard, seafoam is yes, sand is action and focus, palm is reserved. The
 
 ## Fonts (D8)
 
-Only this package imports fonts or defines font stacks. Apps use `var(--font-sans|serif|mono)` or Tailwind's `font-sans|serif|mono`. The stacks are defined once, in `tailwind.css`'s `@theme`; never define font properties in `tokens.css` or alias `--font-*` through another variable.
+Only this package imports fonts or defines font stacks. Apps use `var(--font-sans|serif|mono)` or Tailwind's `font-sans|serif|mono`. The stacks are defined once, in `tailwind.css`'s `@theme`; never define font properties in `tokens.css` or alias `--font-*` through another variable. Each stack names its fallback face right after the web font; remeasure the fallback numbers (the comment in `tokens.css` says how) when a font changes.
 
 ## Consuming
 
@@ -40,5 +41,6 @@ Studio then imports `@chelabase/design/scalar.css?inline` for the API page. The 
 - `fumadocs.test.ts`: the Fumadocs skin maps every colour onto tokens, with the badge remaps (including the sand Deprecated override), hairline popovers and serif/mono fonts.
 - `fonts-single-source.test.ts`: only the package imports fonts or defines font stacks, across every app (D8).
 - `fonts-matcher.test.ts`: the matcher behind that guard.
+- `font-fallbacks.test.ts`: each stack names its fallback face right after the web font, and every fallback is a `local()` face with all four metric overrides (sans and serif with a bold face).
 - `crab-marks.test.tsx`: the wordmark's accessible name and shared classes, eye whites on `--claw-eye`, no hex, `rgb(` or `hsl(` literal in any `src` file.
 - `duplicates.test.ts`: no custom property is declared twice in one block.

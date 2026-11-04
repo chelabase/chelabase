@@ -1,4 +1,5 @@
 import { createRootRoute, HeadContent, Outlet, Scripts } from '@tanstack/react-router';
+import { fontPreload } from '@chelabase/design/font-preloads';
 import appCss from '@/styles/app.css?url';
 import { RootProvider } from 'fumadocs-ui/provider/tanstack';
 import SearchDialog from '@/components/search';
@@ -25,7 +26,8 @@ export const Route = createRootRoute({
         title: 'Chelabase',
       },
     ],
-    links: [{ rel: 'stylesheet', href: appCss }, ...iconLinks],
+    // Headings (Spectral 700) and body text (Atkinson) start with the HTML, not after the stylesheet.
+    links: [{ rel: 'stylesheet', href: appCss }, fontPreload.spectral700, fontPreload.atkinson, ...iconLinks],
     scripts: analyticsScripts,
   }),
   component: RootComponent,

@@ -79,9 +79,9 @@ describe("one font source (D8)", () => {
     );
     const props = customProperties(readCss("tailwind.css"));
     expect(props.get("--font-sans")).toBe(
-      '"Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible", system-ui, sans-serif',
+      '"Atkinson Hyperlegible Next Variable", "Atkinson Hyperlegible Next Fallback", "Atkinson Hyperlegible", system-ui, sans-serif',
     );
-    expect(props.get("--font-serif")).toBe('Spectral, "Iowan Old Style", Georgia, serif');
-    expect(props.get("--font-mono")).toBe('"JetBrains Mono Variable", ui-monospace, monospace');
+    expect(props.get("--font-serif")).toBe('Spectral, "Spectral Fallback", "Iowan Old Style", Georgia, serif');
+    expect(props.get("--font-mono")).toBe('"JetBrains Mono Variable", "JetBrains Mono Fallback", ui-monospace, monospace');
   });
 });

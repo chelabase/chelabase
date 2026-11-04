@@ -91,6 +91,20 @@ describe('the built docs site', () => {
     expect(read('docs/index.html')).toContain('Introduction');
   });
 
+  // Headings (Spectral 700) and body text (Atkinson), latin subsets only, are fetched with the HTML.
+  it('preloads_the_first_screen_fonts', () => {
+    const fonts = [...read('docs/index.html').matchAll(/<link[^>]*rel="preload"[^>]*as="font"[^>]*>/g)].map((m) => m[0]);
+    const files = fonts.map((l) => /href="\/assets\/([^"]+)"/.exec(l)?.[1]);
+    expect(files.map((f) => f?.replace(/-[\w-]{8}\.woff2$/, '')).sort()).toEqual(
+      ['atkinson-hyperlegible-next-latin-wght-normal', 'spectral-latin-700-normal'],
+    );
+    for (const [i, l] of fonts.entries()) {
+      expect(l).toContain('type="font/woff2"');
+      expect(l).toContain('crossorigin="anonymous"');
+      expect(existsSync(join(dist, 'assets', files[i]!)), files[i]).toBe(true);
+    }
+  });
+
   it('the_alpha_notice_is_on_every_entry_page', () => {
     // where someone decides to run Chelabase: the docs home, Install and the Quickstart
     for (const page of ['docs/index.html', 'docs/self-hosting/install/index.html', 'docs/using/quickstart/index.html']) {
