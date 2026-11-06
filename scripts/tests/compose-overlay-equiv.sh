@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline check that the workbench stack doesn't change by accident: base file plus
 # docker-compose.workbench.yml must render the stack recorded in
-# scripts/tests/fixtures/compose-workbench.{json,hash}. A change to the workbench shape on purpose
+# scripts/tests/fixtures/compose-workbench.json. A change to the workbench shape on purpose
 # re-records it in the same commit, and the snapshot's diff shows in review:
 #
 #   CHELABASE_BLESS=1 scripts/tests/compose-overlay-equiv.sh
@@ -21,9 +21,11 @@
 #     where they live changes; Compose never applies them to a container. `--no-env-resolution`
 #     keeps the env_file lists as lists (compared exactly) instead of inlining the files' values,
 #     so a stack's secrets never reach the output.
-#   - `docker compose config --hash '*'`: each service's config hash, the value `up` compares to
-#     decide whether a running container must be recreated. Equal hashes mean an existing stack's
-#     containers stay as they are.
+#   - with --rev only, `docker compose config --hash '*'`: each service's config hash, the value
+#     `up` compares to decide whether a running container must be recreated. Equal hashes mean an
+#     existing stack's containers stay as they are. Compose versions hash the same config
+#     differently (v5.1.3 and v5.7.0 do), so the snapshot holds the config alone: both sides of a
+#     --rev check are hashed by the same Compose.
 # The Neon images render as fixed placeholders (NEON_IMAGE, COMPUTE_NODE_IMAGE), so a Neon pin
 # bump (`NEON_REF`) never changes the snapshot. The app images the release pins in the base file
 # are all replaced by the workbench image, so those pins don't reach it either.
@@ -69,10 +71,10 @@ hashes() { # hashes <-f args…>
 }
 
 render -f "$base" -f "$overlay" >"$tmp/split.json" || fail "rendering base + overlay failed"
-hashes -f "$base" -f "$overlay" >"$tmp/split.hash" || fail "hashing base + overlay failed"
-[[ "$(wc -l <"$tmp/split.hash")" -gt 20 ]] || fail "expected a hash per service, got: $(cat "$tmp/split.hash")"
 
 if [[ -n "$rev" ]]; then
+  hashes -f "$base" -f "$overlay" >"$tmp/split.hash" || fail "hashing base + overlay failed"
+  [[ "$(wc -l <"$tmp/split.hash")" -gt 20 ]] || fail "expected a hash per service, got: $(cat "$tmp/split.hash")"
   git -C "$root" cat-file -e "$rev:infra/compose/docker-compose.yml" 2>/dev/null ||
     fail "git has no infra/compose/docker-compose.yml at $rev (a shallow clone? fetch the history)"
   git -C "$root" show "$rev:infra/compose/docker-compose.yml" >"$tmp/ref-base.yml"
@@ -88,18 +90,18 @@ else
   label="the snapshot"
   if [[ -n "${CHELABASE_BLESS:-}" ]]; then
     cp "$tmp/split.json" "$snap.json"
-    cp "$tmp/split.hash" "$snap.hash"
-    echo "compose-overlay-equiv: recorded $(jq '.services | length' "$snap.json") services in ${snap#"$root/"}.{json,hash}"
+    echo "compose-overlay-equiv: recorded $(jq '.services | length' "$snap.json") services in ${snap#"$root/"}.json"
     exit 0
   fi
-  [[ -f "$snap.json" && -f "$snap.hash" ]] || fail "no snapshot at ${snap#"$root/"}.{json,hash}"
+  [[ -f "$snap.json" ]] || fail "no snapshot at ${snap#"$root/"}.json"
   cp "$snap.json" "$tmp/ref.json"
-  cp "$snap.hash" "$tmp/ref.hash"
 fi
 bless="change it on purpose? re-record: CHELABASE_BLESS=1 $0"
 diff -u --label "$label" --label "base + overlay" "$tmp/ref.json" "$tmp/split.json" >&2 ||
   fail "base + overlay renders a different config than $label ($bless)"
-diff -u --label "$label" --label "base + overlay" "$tmp/ref.hash" "$tmp/split.hash" >&2 ||
-  fail "a service's config hash differs from $label: up would recreate its container ($bless)"
+if [[ -n "$rev" ]]; then
+  diff -u --label "$label" --label "base + overlay" "$tmp/ref.hash" "$tmp/split.hash" >&2 ||
+    fail "a service's config hash differs from $label: up would recreate its container"
+fi
 
 echo "compose-overlay-equiv: ok ($(jq '.services | length' "$tmp/split.json") services, $(basename "$env_file"))"
