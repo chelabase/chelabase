@@ -6,6 +6,7 @@
 
 pub mod app;
 pub mod buckets;
+pub mod cache;
 pub mod config;
 pub mod control;
 pub mod engine;

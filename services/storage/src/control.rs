@@ -15,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::cache::Fenced;
 use crate::error::Failure;
 use crate::token::UrlKey;
 
@@ -89,7 +90,7 @@ pub trait Control: Send + Sync + 'static {
 pub struct Urls {
     control: Arc<dyn Control>,
     key: tokio::sync::OnceCell<UrlKey>,
-    live: moka::future::Cache<(Uuid, Uuid, bool), Option<LiveKey>>,
+    live: Fenced<(Uuid, Uuid, bool), Option<LiveKey>>,
 }
 
 impl Urls {
@@ -97,11 +98,7 @@ impl Urls {
         Urls {
             control,
             key: tokio::sync::OnceCell::new(),
-            live: moka::future::Cache::builder()
-                .max_capacity(100_000)
-                .time_to_live(LIVENESS_TTL)
-                .support_invalidation_closures()
-                .build(),
+            live: Fenced::new(100_000, LIVENESS_TTL),
         }
     }
 
@@ -119,19 +116,16 @@ impl Urls {
     /// Forgets `key_id`'s cached liveness on every branch (m9: it was revoked, rotated or its
     /// databases changed): its URLs are checked again on their next use.
     pub fn forget_key(&self, key_id: Uuid) {
-        if let Err(e) = self.live.invalidate_entries_if(move |k, _| k.0 == key_id) {
-            tracing::warn!(%key_id, "dropping a key's liveness: {e}");
-            self.live.invalidate_all();
-        }
+        self.live.forget_if(move |k, _| k.0 == key_id);
     }
 
     /// Forgets every key's cached liveness (m9: a member's access changed).
     pub fn forget_all(&self) {
-        self.live.invalidate_all();
+        self.live.forget_all();
     }
 
     /// The key while it is live for a URL signed on `branch` (cached, a miss asks the control
-    /// plane).
+    /// plane; a forget during the lookup leaves its answer uncached: [`Fenced`]).
     pub async fn live_key(
         &self,
         key_id: Uuid,
@@ -139,16 +133,14 @@ impl Urls {
         owner: bool,
         rid: &str,
     ) -> Result<Option<LiveKey>, Failure> {
-        if let Some(hit) = self.live.get(&(key_id, branch, owner)).await {
-            return Ok(hit);
-        }
-        let live = self
-            .control
-            .live_key(key_id, branch, owner)
+        self.live
+            .get_or_lookup((key_id, branch, owner), async {
+                self.control
+                    .live_key(key_id, branch, owner)
+                    .await
+                    .map_err(|e| unreachable(e, rid))
+            })
             .await
-            .map_err(|e| unreachable(e, rid))?;
-        self.live.insert((key_id, branch, owner), live.clone()).await;
-        Ok(live)
     }
 }
 
@@ -356,5 +348,70 @@ mod tests {
         urls.forget_all();
         urls.live_key(k2, b1, false, "r").await.unwrap();
         assert_eq!(lookups(), 6);
+    }
+
+    /// Lets the test fire a forget while a liveness lookup is in flight: the first lookup says
+    /// it started, then waits to be let go.
+    #[derive(Default)]
+    struct Gated {
+        lookups: AtomicUsize,
+        started: tokio::sync::Notify,
+        go_on: tokio::sync::Notify,
+    }
+
+    impl Control for Gated {
+        fn url_key(&self) -> BoxFuture<'_, Result<UrlKey, Unreachable>> {
+            Box::pin(async { Err(Unreachable("unused".into())) })
+        }
+        fn live_key(&self, key_id: Uuid, branch: Uuid, _owner: bool) -> BoxFuture<'_, Result<Option<LiveKey>, Unreachable>> {
+            let first = self.lookups.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move {
+                if first {
+                    self.started.notify_one();
+                    self.go_on.notified().await;
+                }
+                Ok(Some(LiveKey {
+                    key_id,
+                    branch_id: branch,
+                    kind: DataKeyKind::Secret,
+                    role: "authenticated".into(),
+                    databases: None,
+                    role_oid: None,
+                }))
+            })
+        }
+        fn record_upload<'a>(&'a self, _: Uuid, _: Uuid, _: &'a Value, _: u64) -> BoxFuture<'a, Result<Option<u64>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn consume_upload(&self, _: Uuid) -> BoxFuture<'_, Result<Option<(LiveKey, Value)>, Unreachable>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    /// S1 (m9's audit): a forget that lands while a lookup is in flight wins: the answer from
+    /// before it isn't cached, so the next use asks the control plane again.
+    #[tokio::test]
+    async fn a_forget_during_a_lookup_is_not_lost() {
+        for forget_all in [false, true] {
+            let control = Arc::new(Gated::default());
+            let urls = Arc::new(Urls::new(control.clone()));
+            let (k, b) = (Uuid::new_v4(), Uuid::new_v4());
+            let in_flight = tokio::spawn({
+                let urls = urls.clone();
+                async move { urls.live_key(k, b, false, "r").await.unwrap() }
+            });
+            control.started.notified().await;
+            if forget_all {
+                urls.forget_all();
+            } else {
+                urls.forget_key(k);
+            }
+            control.go_on.notify_one();
+            in_flight.await.unwrap();
+            urls.live_key(k, b, false, "r").await.unwrap();
+            assert_eq!(control.lookups.load(Ordering::SeqCst), 2, "forget_all: {forget_all}");
+            urls.live_key(k, b, false, "r").await.unwrap();
+            assert_eq!(control.lookups.load(Ordering::SeqCst), 2, "cached again after");
+        }
     }
 }

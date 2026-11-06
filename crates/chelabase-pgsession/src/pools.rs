@@ -20,7 +20,7 @@
 
 use std::fmt;
 use std::future::Future;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -720,8 +720,14 @@ fn idle_to_close(target: &PoolLoad, others: &[PoolLoad], max: u32) -> Vec<(usize
 
 pub struct Pools<S> {
     source: S,
-    /// Each branch's info and when it was fetched.
-    infos: moka::future::Cache<Uuid, (Arc<ConnInfo>, tokio::time::Instant)>,
+    /// Each branch's info, when it was fetched and the [`Self::epoch`] its fetch started at.
+    infos: moka::future::Cache<Uuid, (Arc<ConnInfo>, tokio::time::Instant, u64)>,
+    /// Bumped by every [`Self::invalidate`] before it drops anything.
+    epoch: AtomicU64,
+    /// The epoch each branch was last invalidated at, kept twice as long as an info lives: an
+    /// info whose fetch started before it raced the invalidate and is never used (S1,
+    /// object-storage m9's audit).
+    invalidated: moka::sync::Cache<Uuid, u64>,
     /// Shared with the reaper, which holds it weakly.
     pools: Arc<PoolCache>,
     slots: moka::future::Cache<Uuid, Arc<BranchSlots>>,
@@ -777,6 +783,11 @@ impl<S: ConnSource> Pools<S> {
                 .max_capacity(MAX_POOLS)
                 .time_to_live(INFO_TTL)
                 .build(),
+            epoch: AtomicU64::new(0),
+            invalidated: moka::sync::Cache::builder()
+                .max_capacity(MAX_POOLS)
+                .time_to_live(INFO_TTL * 2)
+                .build(),
             pools,
             slots: moka::future::Cache::builder()
                 .max_capacity(MAX_POOLS)
@@ -827,17 +838,30 @@ impl<S: ConnSource> Pools<S> {
         }
     }
 
-    /// The branch's connection info (cached; concurrent misses share one fetch).
+    /// The branch's connection info (cached; concurrent misses share one fetch). An info
+    /// fetched across an [`Self::invalidate`] is dropped and fetched again: the invalidate
+    /// wins over a fetch in flight.
     pub async fn info(&self, branch: Uuid) -> Result<Arc<ConnInfo>, ConnError> {
+        let (info, started) = self.cached_info(branch).await?;
+        if self.invalidated.get(&branch).is_some_and(|at| started < at) {
+            self.infos.invalidate(&branch).await;
+            return self.cached_info(branch).await.map(|(info, _)| info);
+        }
+        Ok(info)
+    }
+
+    /// The cached info and the epoch its fetch started at, fetched on a miss.
+    async fn cached_info(&self, branch: Uuid) -> Result<(Arc<ConnInfo>, u64), ConnError> {
         self.infos
             .try_get_with(branch, async {
+                let started = self.epoch.load(Ordering::SeqCst);
                 self.source
                     .fetch(branch)
                     .await
-                    .map(|info| (Arc::new(info), tokio::time::Instant::now()))
+                    .map(|info| (Arc::new(info), tokio::time::Instant::now(), started))
             })
             .await
-            .map(|(info, _)| info)
+            .map(|(info, _, started)| (info, started))
             .map_err(|e| (*e).clone())
     }
 
@@ -845,7 +869,7 @@ impl<S: ConnSource> Pools<S> {
     /// older; `None` when it's newer (or there's none: the next [`Self::info`] fetches).
     pub async fn refresh_stale(&self, branch: Uuid) -> Result<Option<Arc<ConnInfo>>, ConnError> {
         match self.infos.get(&branch).await {
-            Some((_, fetched)) if fetched.elapsed() >= INFO_REFRESH_AFTER => {
+            Some((_, fetched, _)) if fetched.elapsed() >= INFO_REFRESH_AFTER => {
                 self.infos.invalidate(&branch).await;
                 self.info(branch).await.map(Some)
             }
@@ -857,6 +881,8 @@ impl<S: ConnSource> Pools<S> {
     /// info and its pools (closed at once; connections in use close as they come back). Its slots stay, so
     /// connections still held count against the branch; the next info resizes them.
     pub async fn invalidate(&self, branch: Uuid) {
+        let at = self.epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        self.invalidated.insert(branch, at);
         self.infos.invalidate(&branch).await;
         let keys: Vec<_> = self
             .pools
@@ -1223,6 +1249,47 @@ mod tests {
         async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
             Err(ConnError::NotReady("test".into()))
         }
+    }
+
+    /// S1 (object-storage m9's audit): an invalidate that lands while the branch's info is
+    /// being fetched wins: the info from before it is never served from the cache (the
+    /// request in flight fetches again itself). Another branch's info stays cached.
+    #[tokio::test]
+    async fn an_invalidate_during_a_fetch_is_not_lost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Default)]
+        struct Gated {
+            fetches: AtomicUsize,
+            started: tokio::sync::Notify,
+            go_on: tokio::sync::Notify,
+        }
+        impl ConnSource for Arc<Gated> {
+            async fn fetch(&self, _branch: Uuid) -> Result<ConnInfo, ConnError> {
+                if self.fetches.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.go_on.notified().await;
+                }
+                Ok(super::test_support::two_databases())
+            }
+        }
+        let source = Arc::new(Gated::default());
+        let pools = Arc::new(Pools::new(source.clone(), 4));
+        let (branch, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let fetches = || source.fetches.load(Ordering::SeqCst);
+        let in_flight = tokio::spawn({
+            let pools = pools.clone();
+            async move { pools.info(branch).await.unwrap() }
+        });
+        source.started.notified().await;
+        pools.info(other).await.unwrap();
+        pools.invalidate(branch).await;
+        source.go_on.notify_one();
+        in_flight.await.unwrap();
+        pools.info(branch).await.unwrap();
+        assert_eq!(fetches(), 3, "fetched again after the invalidate");
+        pools.info(branch).await.unwrap();
+        pools.info(other).await.unwrap();
+        assert_eq!(fetches(), 3, "both cached after");
     }
 
     /// One branch with slow queries and a queue of waiters can't take every global slot:
