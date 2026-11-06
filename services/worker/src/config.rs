@@ -552,6 +552,7 @@ pub fn build_with(
         storage_sweep: Default::default(),
         sweep_requests: Default::default(),
         storage_sweep_refusals: Default::default(),
+        storage_sweep_restore_voids: Default::default(),
     })
 }
 

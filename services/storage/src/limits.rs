@@ -9,6 +9,8 @@
 //! `image/png` is refused, and a real PNG declared as `image/png` passes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
@@ -17,8 +19,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::error::Failure;
 
-/// How many leading bytes [`sniff`] looks at.
-pub const SNIFF_BYTES: usize = 512;
+/// How many leading bytes [`sniff`] looks at: a browser's whole sniffing window (the WHATWG
+/// resource header), leading whitespace and BOM included.
+pub const SNIFF_BYTES: usize = 1445;
 
 /// A bucket's id and limits.
 #[derive(Debug, Clone)]
@@ -50,10 +53,13 @@ impl Limits {
         }
     }
 
-    /// 415 unless the type `head` (the first bytes) is sniffed as matches the list.
+    /// 415 unless the type `head` (the body's first bytes, any number: only the first
+    /// [`SNIFF_BYTES`] count, so every route sniffs alike) is sniffed as matches the list.
     pub fn check_sniffed(&self, head: &[u8]) -> Result<(), Failure> {
-        match (&self.allowed_mime_types, sniff(head)) {
-            (Some(list), Some(sniffed)) if !type_allowed(list, sniffed) => {
+        let head = &head[..head.len().min(SNIFF_BYTES)];
+        match &self.allowed_mime_types {
+            // Every reading counts: the bytes as sent and past their padding.
+            Some(list) if sniffed(head).any(|t| !type_allowed(list, t)) => {
                 Err(Failure::mime_not_allowed())
             }
             _ => Ok(()),
@@ -98,15 +104,35 @@ pub fn type_allowed(list: &[String], content_type: &str) -> bool {
 /// executables, documents: the `infer` crate), HTML or XML by the WHATWG sniffing rules, or an
 /// SVG document; `None` when nothing matches.
 pub fn sniff(head: &[u8]) -> Option<&'static str> {
-    if let Some(t) = infer::get(head) {
-        return Some(t.mime_type());
-    }
+    sniffed(head).next()
+}
+
+/// Every type `head` reads as: its signature as sent, and its markup past leading whitespace
+/// and UTF-8 BOMs (which a browser's sniffer skips).
+fn sniffed(head: &[u8]) -> impl Iterator<Item = &'static str> {
+    let text = past_padding(head);
     // `infer` has no SVG matcher: an SVG document without an XML declaration.
-    let text = head.trim_ascii_start();
     let svg = text.len() > 4
         && text[..4].eq_ignore_ascii_case(b"<svg")
         && matches!(text[4], b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r');
-    svg.then_some("image/svg+xml")
+    [
+        infer::get(head).map(|t| t.mime_type()),
+        infer::get(text).map(|t| t.mime_type()),
+        svg.then_some("image/svg+xml"),
+    ]
+    .into_iter()
+    .flatten()
+}
+
+/// `head` past its leading whitespace (tab, LF, FF, CR, space) and UTF-8 BOMs.
+fn past_padding(mut head: &[u8]) -> &[u8] {
+    loop {
+        let text = head.trim_ascii_start();
+        match text.strip_prefix(b"\xef\xbb\xbf") {
+            Some(rest) => head = rest,
+            None => return text,
+        }
+    }
 }
 
 /// `body`'s first [`SNIFF_BYTES`] bytes (fewer if it is shorter), and the whole body again.
@@ -130,13 +156,75 @@ pub async fn peek<E: Send + 'static>(
     Ok((head.slice(..head.len().min(SNIFF_BYTES)), again))
 }
 
+/// How long an upload's body may deliver nothing before the request fails
+/// (`CHELABASE_STORAGE_BODY_IDLE_SECS`).
+pub const DEFAULT_BODY_IDLE: Duration = Duration::from_secs(60);
+
+/// A request body's failure: the client's own, or no bytes for the idle period.
+#[derive(Debug)]
+pub enum BodyError {
+    Stalled(Duration),
+    Client(String),
+}
+
+impl std::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyError::Stalled(idle) => write!(f, "no bytes for {} s", idle.as_secs_f64()),
+            BodyError::Client(e) => f.write_str(e),
+        }
+    }
+}
+
+impl BodyError {
+    /// 408 `request_timeout` for a stalled body, else 400 `invalid_request`.
+    pub fn failure(&self) -> Failure {
+        match self {
+            BodyError::Stalled(idle) => Failure::body_stalled(*idle),
+            BodyError::Client(e) => Failure::invalid_request(format!("the request body: {e}")),
+        }
+    }
+}
+
+/// `body`, failing with [`BodyError::Stalled`] (and ending) once it delivers nothing for
+/// `idle` while it is being read. Only the wait for the client counts: the clock starts when
+/// the reader asks for the next chunk, so time the reader spends elsewhere (sending a part to
+/// the store) never does. The flag says whether it stalled.
+pub fn until_idle<E: std::fmt::Display + Send + 'static>(
+    body: impl futures_util::Stream<Item = Result<Bytes, E>> + Send + 'static,
+    idle: Duration,
+) -> (BoxStream<'static, Result<Bytes, BodyError>>, Arc<AtomicBool>) {
+    let stalled = Arc::new(AtomicBool::new(false));
+    let flag = stalled.clone();
+    let stream = futures_util::stream::unfold(Some(body.boxed()), move |body| {
+        let flag = flag.clone();
+        async move {
+            let mut body = body?;
+            match tokio::time::timeout(idle, body.next()).await {
+                Ok(Some(Ok(chunk))) => Some((Ok(chunk), Some(body))),
+                Ok(Some(Err(e))) => Some((Err(BodyError::Client(e.to_string())), None)),
+                Ok(None) => None,
+                Err(_) => {
+                    flag.store(true, Ordering::SeqCst);
+                    Some((Err(BodyError::Stalled(idle)), None))
+                }
+            }
+        }
+    })
+    .boxed();
+    (stream, stalled)
+}
+
 /// The per-process cap on upload buffers (`CHELABASE_STORAGE_MAX_INFLIGHT_BYTES`): a part is
 /// held whole in memory while it goes to the store, and a single upload holds up to one
-/// stream part. Past the cap a request is 503 `busy` at once, before its body is read.
+/// stream part. Past the cap a request is 503 `busy` at once, before its body is read. A
+/// reservation lasts as long as its request, and a request whose body delivers nothing for
+/// [`InFlight::body_idle`] fails ([`until_idle`]): an idle client can't hold the cap.
 #[derive(Clone)]
 pub struct InFlight {
     permits: Arc<Semaphore>,
     capacity: usize,
+    body_idle: Duration,
 }
 
 impl InFlight {
@@ -145,7 +233,19 @@ impl InFlight {
         InFlight {
             permits: Arc::new(Semaphore::new(capacity)),
             capacity,
+            body_idle: DEFAULT_BODY_IDLE,
         }
+    }
+
+    /// With bodies failing after `idle` without a byte ([`DEFAULT_BODY_IDLE`] otherwise).
+    pub fn with_body_idle(mut self, idle: Duration) -> Self {
+        self.body_idle = idle;
+        self
+    }
+
+    /// How long an upload's body may deliver nothing.
+    pub fn body_idle(&self) -> Duration {
+        self.body_idle
     }
 
     /// Holds `bytes` of the cap until the permit drops; 503 `busy` when they aren't free.
@@ -277,10 +377,10 @@ mod tests {
     /// The peek hands back the first bytes and then the whole body, however it was chunked.
     #[tokio::test]
     async fn peek_returns_the_head_and_the_whole_body() {
-        let chunks: Vec<Result<Bytes, ()>> = (0..300u16)
+        let chunks: Vec<Result<Bytes, ()>> = (0..600u16)
             .map(|i| Ok(Bytes::from(vec![(i % 251) as u8; 3])))
             .collect();
-        let want: Vec<u8> = (0..300u16).flat_map(|i| vec![(i % 251) as u8; 3]).collect();
+        let want: Vec<u8> = (0..600u16).flat_map(|i| vec![(i % 251) as u8; 3]).collect();
         let (head, body) = peek(futures_util::stream::iter(chunks).boxed())
             .await
             .unwrap();
@@ -296,6 +396,108 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(&head[..], b"ab");
+    }
+
+    /// The audit's padded cases: HTML after 600 spaces, and after a UTF-8 BOM and spaces.
+    fn padded_html() -> [Vec<u8>; 2] {
+        let html: &[u8] = b"<!DOCTYPE html><html><script>alert(1)</script></html>";
+        let mut spaces = vec![b' '; 600];
+        spaces.extend_from_slice(html);
+        let mut bom = b"\xef\xbb\xbf".to_vec();
+        bom.extend(std::iter::repeat_n(b' ', 600));
+        bom.extend_from_slice(b"\r\n\t\x0c");
+        bom.extend_from_slice(html);
+        [spaces, bom]
+    }
+
+    /// B1: a single upload's head and part 1 are sniffed alike, over a browser's whole
+    /// sniffing window (1445 bytes), past leading whitespace and a BOM: padded HTML declared
+    /// as `image/png` is 415 either way, however the body is chunked; a real PNG still passes.
+    #[tokio::test]
+    async fn padded_html_is_still_html() {
+        let images = Limits {
+            id: uuid::Uuid::nil(),
+            file_size_limit: None,
+            allowed_mime_types: Some(list(&["image/*"])),
+        };
+        for (i, padded) in padded_html().into_iter().enumerate() {
+            // Part 1: the whole buffered part.
+            let part = images.check_sniffed(&padded).unwrap_err();
+            assert_eq!((part.0.status.as_u16(), i), (415, i));
+            // A single upload: the peeked head, in 7-byte chunks.
+            let chunks: Vec<Result<Bytes, ()>> = padded
+                .chunks(7)
+                .map(|c| Ok(Bytes::copy_from_slice(c)))
+                .collect();
+            let (head, _) = peek(futures_util::stream::iter(chunks).boxed())
+                .await
+                .unwrap();
+            assert_eq!(head.len(), padded.len(), "case {i}");
+            let single = images.check_sniffed(&head).unwrap_err();
+            assert_eq!((single.0.status.as_u16(), i), (415, i));
+        }
+        assert!(images.check_sniffed(PNG).is_ok());
+        const { assert!(SNIFF_BYTES >= 1445) };
+        // Past the window a browser sniffs nothing either: whitespace only, the declared type
+        // decides.
+        let mut far = vec![b' '; SNIFF_BYTES];
+        far.extend_from_slice(b"<html><script>x</script></html>");
+        assert!(images.check_sniffed(&far).is_ok());
+    }
+
+    /// The bytes a stream sends once, then nothing, never ending.
+    fn stalls_after(first: &'static [u8]) -> BoxStream<'static, Result<Bytes, &'static str>> {
+        futures_util::stream::once(async move { Ok(Bytes::from_static(first)) })
+            .chain(futures_util::stream::pending())
+            .boxed()
+    }
+
+    /// S2: a body that delivers nothing for the idle period fails (408 `request_timeout`) and
+    /// ends, instead of waiting forever.
+    #[tokio::test]
+    async fn a_stalled_body_fails() {
+        let idle = Duration::from_millis(100);
+        let (mut body, stalled) = until_idle(stalls_after(b"first"), idle);
+        assert_eq!(&body.next().await.unwrap().unwrap()[..], b"first");
+        let next = tokio::time::timeout(idle * 20, body.next())
+            .await
+            .expect("the stalled body was still waited on");
+        let f = next.unwrap().unwrap_err().failure();
+        assert_eq!((f.0.status.as_u16(), f.0.code), (408, "request_timeout"));
+        assert!(stalled.load(Ordering::SeqCst));
+        assert!(body.next().await.is_none());
+        // The client's own error is still 400.
+        let (mut failing, flag) = until_idle(
+            futures_util::stream::iter([Err::<Bytes, _>("reset")]),
+            idle,
+        );
+        let f = failing.next().await.unwrap().unwrap_err().failure();
+        assert_eq!(f.0.status.as_u16(), 400);
+        assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    /// S2: a slow but live body is never cut: chunks each within the idle period pass whole
+    /// though the upload takes many periods, and time the reader spends between chunks (a part
+    /// going to the store) doesn't count.
+    #[tokio::test]
+    async fn a_slow_body_is_never_cut() {
+        let idle = Duration::from_millis(200);
+        let slow = futures_util::stream::unfold(0u8, move |n| async move {
+            if n == 8 {
+                return None;
+            }
+            tokio::time::sleep(idle / 2).await;
+            Some((Ok::<_, &str>(Bytes::from(vec![n; 3])), n + 1))
+        });
+        let (mut body, stalled) = until_idle(slow, idle);
+        let mut got = Vec::new();
+        while let Some(chunk) = body.next().await {
+            got.extend_from_slice(&chunk.unwrap());
+            // The reader busy for longer than the idle period between reads.
+            tokio::time::sleep(idle * 2).await;
+        }
+        assert_eq!(got.len(), 24);
+        assert!(!stalled.load(Ordering::SeqCst));
     }
 
     /// AC 6: the cap holds concurrent buffers to its bytes; past it is 503 `busy` at once,

@@ -76,17 +76,23 @@ pub struct CreateBucket {
     /// Bytes; above 0.
     pub file_size_limit: Option<i64>,
     pub allowed_mime_types: Option<Vec<String>>,
+    /// Default false. Write-once: an object is uploaded once and never overwritten, moved,
+    /// renamed or deleted, by anyone (409 `write_once`), so its public URL is permanent. Once
+    /// true, never false again; holding objects, the bucket is neither deleted nor renamed.
+    pub write_once: Option<bool>,
 }
 
 /// A bucket's changes; a field left out stays as it is.
 #[derive(Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateBucket {
-    /// A new name.
+    /// A new name (not of a write-once bucket holding objects).
     pub name: Option<String>,
     pub public: Option<bool>,
     pub file_size_limit: Option<i64>,
     pub allowed_mime_types: Option<Vec<String>>,
+    /// Turned on at any time, never off again (409 `write_once`).
+    pub write_once: Option<bool>,
 }
 
 /// A bucket as created.
@@ -97,11 +103,12 @@ pub struct Bucket {
     pub public: bool,
     pub file_size_limit: Option<i64>,
     pub allowed_mime_types: Option<Vec<String>>,
+    pub write_once: bool,
 }
 
-pub(crate) fn pg(request_id: &str) -> impl Fn(tokio_postgres::Error) -> QueryFailure + '_ {
-    move |e| QueryFailure::from_pg(&e, request_id)
-}
+/// [`crate::objects::pg`]: a statement's failure, the schema's own codes kept (`CB005`, a
+/// write-once refusal, is 409 `write_once`).
+pub(crate) use crate::objects::pg;
 
 pub(crate) fn body<T>(json: Result<Json<T>, JsonRejection>) -> Result<T, Failure> {
     json.map(|Json(t)| t).map_err(|e| {
@@ -190,13 +197,14 @@ pub async fn create<S: ConnSource, M: ConnSource>(
         public: new.public.unwrap_or(false),
         file_size_limit: new.file_size_limit,
         allowed_mime_types: new.allowed_mime_types,
+        write_once: new.write_once.unwrap_or(false),
     };
     state
         .engine
         .as_caller(&data, q.database.as_deref(), &rid, async |c, _| {
             c.execute(
-                "INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types) VALUES ($1, $2, $3, $4, $5)",
-                &[&bucket.id, &bucket.name, &bucket.public, &bucket.file_size_limit, &bucket.allowed_mime_types],
+                "INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types, write_once) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&bucket.id, &bucket.name, &bucket.public, &bucket.file_size_limit, &bucket.allowed_mime_types, &bucket.write_once],
             )
             .await
             .map_err(pg(&rid))
@@ -220,7 +228,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
         (status = 400, description = "`invalid_request`, `invalid_value`, `reserved_bucket_name`", body = StorageErrorEnvelope),
         (status = 403, description = "`permission_denied`, `database_not_allowed`, `role_not_allowed`", body = StorageErrorEnvelope),
         (status = 404, description = "`bucket_not_found`: missing, or hidden from the caller", body = StorageErrorEnvelope),
-        (status = 409, description = "`conflict`: the new name is taken", body = StorageErrorEnvelope),
+        (status = 409, description = "`conflict`: the new name is taken; `write_once`: turned off, or a write-once bucket holding objects renamed", body = StorageErrorEnvelope),
         (status = 503, description = "`storage_unavailable`, `unavailable`", body = StorageErrorEnvelope),
     ),
 )]
@@ -241,8 +249,8 @@ pub async fn update<S: ConnSource, M: ConnSource>(
         .engine
         .as_caller(&data, q.database.as_deref(), &rid, async |c, _| {
             c.execute(
-                "UPDATE storage.buckets SET name = coalesce($2, name), public = coalesce($3, public), file_size_limit = coalesce($4, file_size_limit), allowed_mime_types = coalesce($5, allowed_mime_types) WHERE name = $1",
-                &[&name, &change.name, &change.public, &change.file_size_limit, &change.allowed_mime_types],
+                "UPDATE storage.buckets SET name = coalesce($2, name), public = coalesce($3, public), file_size_limit = coalesce($4, file_size_limit), allowed_mime_types = coalesce($5, allowed_mime_types), write_once = coalesce($6, write_once) WHERE name = $1",
+                &[&name, &change.name, &change.public, &change.file_size_limit, &change.allowed_mime_types, &change.write_once],
             )
             .await
             .map_err(pg(&rid))
@@ -260,7 +268,7 @@ pub async fn update<S: ConnSource, M: ConnSource>(
     operation_id = "deleteBucket",
     tag = "storage",
     summary = "Delete an empty bucket",
-    description = "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused with their count.",
+    description = "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused (a write-once one holding objects, for good: its objects can't be deleted).",
     params(("name" = String, Path, description = "The bucket"), DatabaseParam),
     security(("bearer" = [])),
     responses(

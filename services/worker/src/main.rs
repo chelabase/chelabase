@@ -79,7 +79,10 @@ async fn main() -> anyhow::Result<()> {
         warn!("CHELABASE_STORAGE_BACKEND is unset: the storage sweep doesn't run");
     }
     let worker = Arc::new(built);
-    worker.sweep_requests.connect(js.clone());
+    // Only with a store: without one, no consumer would take the jobs.
+    if worker.blob_store.is_some() {
+        worker.sweep_requests.connect(js.clone());
+    }
     worker.resync_requests.connect(nats.clone());
     worker.member_role_requests.connect(nats.clone());
     // E33a: the secret keys' BYPASSRLS marks, right from the start.
@@ -157,9 +160,13 @@ async fn main() -> anyhow::Result<()> {
         let sweep_worker = worker.clone();
         let sweep_js = js.clone();
         tokio::spawn(async move {
-            let result = run_storage_sweep_consumer(sweep_js, move |job| {
+            let result = run_storage_sweep_consumer(sweep_js, move |job, attempt| {
                 let worker = sweep_worker.clone();
-                async move { worker.handle_storage_sweep(job.payload.database_id).await }
+                async move {
+                    worker
+                        .handle_storage_sweep_attempt(job.payload.database_id, attempt)
+                        .await
+                }
             })
             .await;
             if let Err(err) = result {
@@ -792,11 +799,16 @@ async fn identity_sweep_loop(worker: Arc<RealWorker>) {
     }
 }
 
+/// How soon after start the first storage sweep is queued (audit N4): a worker restarted more
+/// often than the period still sweeps.
+const STORAGE_SWEEP_FIRST: Duration = Duration::from_secs(600);
+
 /// object-storage m8: every `CHELABASE_STORAGE_SWEEP_SECS`, a sweep of every ready database is
 /// queued (one job per database; the consumer runs them one at a time).
 async fn storage_sweep_loop(worker: Arc<RealWorker>) {
     let every = worker.storage_sweep.every;
-    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+    let first = every.min(STORAGE_SWEEP_FIRST);
+    let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + first, every);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         ticks.tick().await;

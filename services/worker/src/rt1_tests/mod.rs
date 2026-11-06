@@ -182,6 +182,7 @@ pub(crate) fn rt_worker() -> Rt {
         storage_sweep: w.storage_sweep,
         sweep_requests: w.sweep_requests,
         storage_sweep_refusals: w.storage_sweep_refusals,
+        storage_sweep_restore_voids: w.storage_sweep_restore_voids,
     };
     Rt {
         w,

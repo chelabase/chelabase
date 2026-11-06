@@ -42,7 +42,7 @@ use crate::token::{self, Claims, Purpose, TokenError};
 
 /// A URL's default lifetime, and the longest one.
 pub const DEFAULT_TTL: i64 = 3600;
-pub const MAX_TTL: i64 = 7 * 24 * 3600;
+pub const MAX_TTL: i64 = chelabase_storage::MAX_SIGNED_URL_TTL.as_secs() as i64;
 
 /// The database's OID and whether a row of the name still exists in the bucket (storage's own
 /// read: the token's minter could read it, so no policy is asked again).
@@ -361,6 +361,7 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
         (status = 401, description = "`invalid_token`, `token_expired`", body = StorageErrorEnvelope),
         (status = 403, description = "`token_not_valid`: used already, another object's, or its key was revoked; `not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`", body = StorageErrorEnvelope),
+        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
     ),
 )]

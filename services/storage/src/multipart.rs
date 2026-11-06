@@ -17,9 +17,12 @@
 //! - **Abort** (`DELETE /upload/session/{id}`) and **list** (`GET`).
 //!
 //! A session is the caller's only: another role, `sub` or data key, another timeline (a branch copies
-//! the row) or another database answers 404 `upload_not_found`, as a missing one. After 24 hours
-//! it answers 410 and its S3 upload is aborted; m8's sweeper deletes the expired rows and any
-//! multipart upload no live session names.
+//! the row) or another database answers 404 `upload_not_found`, as a missing one. Anonymous
+//! callers of one publishable key (role `anon`, no `sub`) share a binding, so only the
+//! session id's secrecy keeps one's upload from another's. The database owner can read and
+//! delete any session (see the worker's `storage_schema`): that cancels the upload, nothing
+//! more. After 24 hours it answers 410 and its S3 upload is aborted; m8's sweeper deletes the
+//! expired rows and any multipart upload no live session names.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -43,7 +46,7 @@ use uuid::Uuid;
 use crate::app::{AppState, identity};
 use crate::engine::{Located, datoid_of};
 use crate::error::Failure;
-use crate::limits::{Limits, SNIFF_BYTES};
+use crate::limits::{Limits, until_idle};
 use crate::names::{self, check_object_name};
 use crate::objects::{ObjectParams, Row, owner_of};
 use crate::openapi::StorageErrorEnvelope;
@@ -251,6 +254,22 @@ fn completion_failure(e: &StorageError, rid: &str) -> Failure {
     }
 }
 
+/// A part the store took that `record_part` didn't record (it updates only a live row):
+/// past its expiry the session is 410; otherwise its row is gone, a completion or an abort
+/// having won meanwhile, and the session is 404 like any finished one.
+fn unrecorded(expires_at: u64, now: u64) -> Failure {
+    if now >= expires_at {
+        Failure::upload_expired()
+    } else {
+        Failure::upload_not_found()
+    }
+}
+
+/// A refusal no retry of the same session can change (403, 413, 415).
+fn terminal(f: &Failure) -> bool {
+    matches!(f.0.status.as_u16(), 403 | 413 | 415)
+}
+
 /// A session as the routes use it.
 struct Loaded {
     id: Uuid,
@@ -345,6 +364,22 @@ impl<S: ConnSource, M: ConnSource> AppState<S, M> {
         }
     }
 
+    /// A completion's refusal `f`: a [`terminal`] one ends `s` (AC 2, 5: the S3 upload is
+    /// aborted and the row deleted); anything else leaves it to retry.
+    async fn refuse(
+        &self,
+        data: &DataIdentity,
+        at: &Located,
+        s: &Loaded,
+        f: Failure,
+        rid: &str,
+    ) -> Failure {
+        if terminal(&f) {
+            self.close(data, at, s, rid).await;
+        }
+        f
+    }
+
     /// Ends `s`: its S3 upload aborted and its row deleted.
     async fn close(&self, data: &DataIdentity, at: &Located, s: &Loaded, rid: &str) {
         self.abort_upload(s, rid).await;
@@ -389,7 +424,7 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
     responses(
         (status = 200, description = "`id` (the session), `bucket`, `name`, `expires_at` (Unix seconds), `min_part_size`, `max_part_size`", body = Value),
         (status = 403, description = "`not_allowed`: no policy allows the write, or the caller can't see the bucket", body = StorageErrorEnvelope),
-        (status = 409, description = "`conflict`: the name is taken (no upsert)", body = StorageErrorEnvelope),
+        (status = 409, description = "`conflict`: the name is taken (no upsert); `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
         (status = 503, description = "`storage_unavailable`, `unavailable`", body = StorageErrorEnvelope),
     ),
@@ -483,6 +518,7 @@ pub async fn create<S: ConnSource, M: ConnSource>(
     responses(
         (status = 200, description = "`part_number`, `size`, `etag`", body = Value),
         (status = 404, description = "`upload_not_found`: missing, finished, or another caller's", body = StorageErrorEnvelope),
+        (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
         (status = 410, description = "`upload_expired`", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`: over 100 MiB or the bucket's limit", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
@@ -517,17 +553,17 @@ pub async fn upload_part<S: ConnSource, M: ConnSource>(
         .inflight
         .reserve(declared.unwrap_or(budget).min(budget))?;
     let mut buf = BytesMut::new();
-    let mut body = request.into_data_stream();
+    // A body that stalls fails the part (408), which frees the reservation.
+    let (mut body, _) = until_idle(request.into_data_stream(), state.inflight.body_idle());
     while let Some(chunk) = body.next().await {
-        let chunk =
-            chunk.map_err(|e| Failure::invalid_request(format!("the request body: {e}")))?;
+        let chunk = chunk.map_err(|e| e.failure())?;
         if (buf.len() + chunk.len()) as u64 > budget {
             return Err(over(budget, limit));
         }
         buf.extend_from_slice(&chunk);
     }
     if part == 1 {
-        s.limits.check_sniffed(&buf[..buf.len().min(SNIFF_BYTES)])?;
+        s.limits.check_sniffed(&buf)?;
     }
     let size = buf.len() as u64;
     let etag = state
@@ -556,7 +592,7 @@ pub async fn upload_part<S: ConnSource, M: ConnSource>(
         )
         .await?;
     if recorded.first().and_then(|r| r.get::<_, Option<bool>>(0)) != Some(true) {
-        return Err(Failure::upload_expired());
+        return Err(unrecorded(s.session.expires_at, now()));
     }
     Ok(Json(json!({ "part_number": part, "size": size, "etag": etag })).into_response())
 }
@@ -640,7 +676,7 @@ pub async fn abort<S: ConnSource, M: ConnSource>(
         (status = 400, description = "`invalid_parts`: a gap, or a part under 5 MiB that isn't the last", body = StorageErrorEnvelope),
         (status = 403, description = "`not_allowed`: the policies no longer allow it", body = StorageErrorEnvelope),
         (status = 404, description = "`upload_not_found`", body = StorageErrorEnvelope),
-        (status = 409, description = "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won", body = StorageErrorEnvelope),
+        (status = 409, description = "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won; `write_once`: an upsert over an object of a write-once bucket", body = StorageErrorEnvelope),
         (status = 410, description = "`upload_expired`", body = StorageErrorEnvelope),
         (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
         (status = 415, description = "`mime_not_allowed`", body = StorageErrorEnvelope),
@@ -660,19 +696,13 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
     let s = state.session(&data, &at, &id, &rid).await?;
     state.admit(&s, &rid).await?;
     // A refusal that no retry of this session can change ends it.
-    let terminal = |f: &Failure| matches!(f.0.status.as_u16(), 403 | 413 | 415);
     let checked = s
         .limits
         .check_declared(&s.content_type)
         .and_then(|()| s.session.plan(s.limits.max_bytes(), now()));
     let (parts, total) = match checked {
         Ok(plan) => plan,
-        Err(f) => {
-            if terminal(&f) {
-                state.close(&data, &at, &s, &rid).await;
-            }
-            return Err(f);
-        }
+        Err(f) => return Err(state.refuse(&data, &at, &s, f, &rid).await),
     };
     let mut row = Row {
         bucket: s.limits.id,
@@ -691,12 +721,7 @@ pub async fn complete<S: ConnSource, M: ConnSource>(
     };
     let expected = match expected {
         Ok(e) => e,
-        Err(f) => {
-            if terminal(&f) {
-                state.close(&data, &at, &s, &rid).await;
-            }
-            return Err(f);
-        }
+        Err(f) => return Err(state.refuse(&data, &at, &s, f, &rid).await),
     };
     // Exactly one completion claims the session (its row deleted); a losing concurrent one is
     // 409 and never reaches S3, so it can't delete the winner's blob. From here a failure
@@ -912,6 +937,83 @@ mod tests {
                 .starts_with("DELETE FROM storage.upload_sessions")
                 && CLAIM.sql().ends_with("RETURNING id")
         );
+    }
+
+    /// N3: a part the session no longer records is 410 once expired; before that its row is
+    /// gone (a completion or an abort won), which is 404 as for any finished session.
+    #[test]
+    fn an_unrecorded_part_is_404_unless_expired() {
+        let gone = unrecorded(100, 99);
+        assert_eq!((gone.0.status.as_u16(), gone.0.code), (404, "upload_not_found"));
+        for now in [100, 101] {
+            let expired = unrecorded(100, now);
+            assert_eq!((expired.0.status.as_u16(), expired.0.code), (410, "upload_expired"));
+        }
+    }
+
+    /// S3, AC 5 (and 2) over `MemoryStore`: a completion refused for good (the caller lost
+    /// INSERT: 403; over the limit: 413; a type no longer allowed: 415) aborts the session's
+    /// upload in the store; a refusal a retry may get past (409, 503) keeps it.
+    #[tokio::test]
+    async fn a_refused_completion_aborts_the_upload() {
+        use chelabase_storage::ObjectStore;
+        let store = Arc::new(chelabase_storage::MemoryStore::default());
+        let (_, public) = chelabase_auth::internal::generate_keypair_pem();
+        let state = AppState {
+            engine: crate::engine::Engine::new(
+                chelabase_pgsession::Pools::new(chelabase_pgsession::test_support::RefusedSource, 1),
+                chelabase_pgsession::test_support::RefusedSource,
+            ),
+            verifier: chelabase_auth::internal::InternalVerifier::from_pem(public.as_bytes())
+                .unwrap(),
+            store: store.clone(),
+            urls: crate::control::Urls::new(Arc::new(crate::control::Orchestrator::new(
+                "http://127.0.0.1:9",
+                "t",
+            ))),
+            inflight: crate::limits::InFlight::new(1 << 20),
+        };
+        let data = identity("authenticated", Some(Uuid::new_v4()), Uuid::new_v4());
+        let at = Located {
+            database: "app".into(),
+            database_id: Uuid::new_v4(),
+        };
+        for (f, ends) in [
+            (Failure::not_allowed(), true),
+            (Failure::too_large(1), true),
+            (Failure::mime_not_allowed(), true),
+            (Failure::object_conflict(), false),
+            (Failure::storage_unavailable(), false),
+        ] {
+            let status = f.0.status.as_u16();
+            let key = format!("db/{}", Uuid::new_v4());
+            let upload_id = store.multipart_create(&key, None).await.unwrap();
+            store
+                .multipart_part(&key, &upload_id, 1, bytes::Bytes::from_static(b"part"))
+                .await
+                .unwrap();
+            let s = Loaded {
+                id: Uuid::new_v4(),
+                session: session(),
+                bucket: "files".into(),
+                limits: Limits {
+                    id: Uuid::new_v4(),
+                    file_size_limit: None,
+                    allowed_mime_types: None,
+                },
+                name: "a.bin".into(),
+                version: Uuid::new_v4(),
+                upload_id: upload_id.clone(),
+                content_type: "application/octet-stream".into(),
+                upsert: false,
+                datoid: 16384,
+                key: key.clone(),
+            };
+            let got = state.refuse(&data, &at, &s, f, "r").await;
+            assert_eq!(got.0.status.as_u16(), status);
+            let open = store.list_uploads(&key).await.unwrap();
+            assert_eq!(open.is_empty(), ends, "{status}: {open:?}");
+        }
     }
 
     #[derive(Debug, Clone)]

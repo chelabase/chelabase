@@ -168,7 +168,7 @@
           "storage"
         ],
         "summary": "Delete an empty bucket",
-        "description": "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused with their count.",
+        "description": "Runs as the key's role: the delete policy on `storage.buckets` decides. A bucket that still holds objects is refused (a write-once one holding objects, for good: its objects can't be deleted).",
         "operationId": "deleteBucket",
         "parameters": [
           {
@@ -313,7 +313,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the new name is taken",
+            "description": "`conflict`: the new name is taken; `write_once`: turned off, or a write-once bucket holding objects renamed",
             "content": {
               "application/json": {
                 "schema": {
@@ -578,7 +578,7 @@
             }
           },
           "409": {
-            "description": "The destination exists",
+            "description": "`conflict`: the destination exists; `write_once`: the source's bucket is write-once",
             "content": {
               "application/json": {
                 "schema": {
@@ -1014,6 +1014,16 @@
               }
             }
           },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "409": {
             "description": "`conflict`",
             "content": {
@@ -1195,6 +1205,16 @@
             "content": {
               "application/json": {
                 "schema": {}
+              }
+            }
+          },
+          "409": {
+            "description": "`write_once`: the bucket is write-once; nothing is deleted",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
               }
             }
           }
@@ -1487,8 +1507,18 @@
               }
             }
           },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
           "409": {
-            "description": "`conflict`: the name is taken (no upsert), or another upload changed it first",
+            "description": "`conflict`: the name is taken (no upsert), or another upload changed it first; `write_once`: an upsert over an object of a write-once bucket",
             "content": {
               "application/json": {
                 "schema": {
@@ -1601,6 +1631,16 @@
           },
           "404": {
             "description": "`object_not_found`: missing, or hidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`write_once`: the bucket is write-once",
             "content": {
               "application/json": {
                 "schema": {
@@ -1858,7 +1898,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won",
+            "description": "`conflict`: the name was taken, the object changed meanwhile, or another completion of this upload won; `write_once`: an upsert over an object of a write-once bucket",
             "content": {
               "application/json": {
                 "schema": {
@@ -1968,6 +2008,16 @@
           },
           "404": {
             "description": "`upload_not_found`: missing, finished, or another caller's",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2098,7 +2148,7 @@
             }
           },
           "409": {
-            "description": "`conflict`: the name is taken (no upsert)",
+            "description": "`conflict`: the name is taken (no upsert); `write_once`: an upsert over an object of a write-once bucket",
             "content": {
               "application/json": {
                 "schema": {
@@ -2144,7 +2194,8 @@
         "required": [
           "id",
           "name",
-          "public"
+          "public",
+          "write_once"
         ],
         "properties": {
           "allowed_mime_types": {
@@ -2171,6 +2222,9 @@
             "type": "string"
           },
           "public": {
+            "type": "boolean"
+          },
+          "write_once": {
             "type": "boolean"
           }
         }
@@ -2208,6 +2262,13 @@
               "null"
             ],
             "description": "Default false."
+          },
+          "write_once": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Default false. Write-once: an object is uploaded once and never overwritten, moved,\nrenamed or deleted, by anyone (409 `write_once`), so its public URL is permanent. Once\ntrue, never false again; holding objects, the bucket is neither deleted nor renamed."
           }
         },
         "additionalProperties": false
@@ -2395,13 +2456,20 @@
               "string",
               "null"
             ],
-            "description": "A new name."
+            "description": "A new name (not of a write-once bucket holding objects)."
           },
           "public": {
             "type": [
               "boolean",
               "null"
             ]
+          },
+          "write_once": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Turned on at any time, never off again (409 `write_once`)."
           }
         },
         "additionalProperties": false
