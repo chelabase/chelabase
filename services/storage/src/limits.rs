@@ -211,6 +211,8 @@ pub fn until_idle<E: std::fmt::Display + Send + 'static>(
             }
         }
     })
+    // A reader may poll past the end (a sniff `peek` of a short body); `unfold` panics then.
+    .fuse()
     .boxed();
     (stream, stalled)
 }
@@ -498,6 +500,21 @@ mod tests {
         }
         assert_eq!(got.len(), 24);
         assert!(!stalled.load(Ordering::SeqCst));
+    }
+
+    /// A reader may poll again after the end (a sniff `peek` of a body shorter than its
+    /// window does): the stream stays ended instead of panicking.
+    #[tokio::test]
+    async fn an_ended_body_stays_ended() {
+        let idle = Duration::from_secs(5);
+        let (mut body, _) = until_idle(futures_util::stream::iter([Ok::<_, &str>(Bytes::from_static(b"x"))]), idle);
+        assert_eq!(body.next().await.unwrap().unwrap(), Bytes::from_static(b"x"));
+        assert!(body.next().await.is_none());
+        assert!(body.next().await.is_none());
+        let (mut failed, _) = until_idle(futures_util::stream::iter([Err::<Bytes, _>("reset")]), idle);
+        assert!(failed.next().await.unwrap().is_err());
+        assert!(failed.next().await.is_none());
+        assert!(failed.next().await.is_none());
     }
 
     /// AC 6: the cap holds concurrent buffers to its bytes; past it is 503 `busy` at once,
