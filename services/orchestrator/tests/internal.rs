@@ -2374,7 +2374,7 @@ async fn storage_upload_tokens_follow_the_app_session() {
                 id,
                 project_id: project,
                 user_id: uuid::Uuid::new_v4(),
-                zitadel_session_id: "z",
+                identity_session_id: "z",
                 refresh_hash: [1; 32],
                 expires_at: chrono::Utc::now() + life,
             })
