@@ -1650,7 +1650,7 @@ async fn storage_api_objects(fx: &Fx) {
     // The happy path: the row, the blob at its version's key, no staging left.
     let (status, _, b) = object(
         "POST",
-        &up("docs/a.txt"),
+        &up("notes/a.txt"),
         &secret,
         Some(b"hello world".to_vec().into()),
         &[("content-type", "text/plain")],
@@ -1661,7 +1661,7 @@ async fn storage_api_objects(fx: &Fx) {
     let version = made["version_id"].as_str().unwrap().to_string();
     assert_eq!(made["size"], 11);
     assert_eq!(
-        fx.value("SELECT size || ' ' || content_type || ' ' || version_id FROM storage.objects WHERE name = 'docs/a.txt'")
+        fx.value("SELECT size || ' ' || content_type || ' ' || version_id FROM storage.objects WHERE name = 'notes/a.txt'")
             .await,
         format!("11 text/plain {version}")
     );
@@ -1671,15 +1671,15 @@ async fn storage_api_objects(fx: &Fx) {
     assert_eq!(blob.etag.trim_matches('"'), etag);
 
     // Range and conditional reads, the download name, HEAD.
-    let (status, h, b) = object("GET", &up("docs/a.txt"), &secret, None, &[("range", "bytes=0-4")]).await;
+    let (status, h, b) = object("GET", &up("notes/a.txt"), &secret, None, &[("range", "bytes=0-4")]).await;
     assert_eq!((status, &b[..]), (206, &b"hello"[..]));
     assert_eq!(h["content-range"], "bytes 0-4/11");
     let tag = h["etag"].to_str().unwrap().to_string();
-    assert_eq!(object("GET", &up("docs/a.txt"), &secret, None, &[("if-none-match", &tag)]).await.0, 304);
-    let (status, h, b) = object("GET", &format!("{}?download=", up("docs/a.txt")), &secret, None, &[]).await;
+    assert_eq!(object("GET", &up("notes/a.txt"), &secret, None, &[("if-none-match", &tag)]).await.0, 304);
+    let (status, h, b) = object("GET", &format!("{}?download=", up("notes/a.txt")), &secret, None, &[]).await;
     assert_eq!((status, &b[..]), (200, &b"hello world"[..]));
     assert!(h["content-disposition"].to_str().unwrap().starts_with("attachment; filename=\"a.txt\""));
-    assert_eq!(object("HEAD", &up("docs/a.txt"), &secret, None, &[]).await.0, 200);
+    assert_eq!(object("HEAD", &up("notes/a.txt"), &secret, None, &[]).await.0, 200);
     assert_eq!(h["x-content-type-options"], "nosniff");
     // N1: a zero-byte object with a range: 200, empty.
     assert_eq!(object("POST", &up("empty"), &secret, Some(Vec::new().into()), &[]).await.0, 200);
@@ -1719,10 +1719,10 @@ async fn storage_api_objects(fx: &Fx) {
     }
 
     // Copy (a new version and blob), a cross-bucket move (metadata only), then a download.
-    let body = json!({ "bucket": "files", "from": "docs/a.txt", "to": "docs/b.txt" });
+    let body = json!({ "bucket": "files", "from": "notes/a.txt", "to": "notes/b.txt" });
     let (status, _, b) = object("POST", "/storage/v1/object/copy", &secret, Some(body.to_string().into()), &[JSON]).await;
     assert_eq!(status, 200, "{}", json_of(&b));
-    let body = json!({ "bucket": "files", "from": "docs/b.txt", "to": "moved/b.txt", "to_bucket": "other" });
+    let body = json!({ "bucket": "files", "from": "notes/b.txt", "to": "moved/b.txt", "to_bucket": "other" });
     let (status, _, b) = object("POST", "/storage/v1/object/move", &secret, Some(body.to_string().into()), &[JSON]).await;
     assert_eq!(status, 204, "{}", json_of(&b));
     let (status, _, b) = object("GET", "/storage/v1/object/other/moved/b.txt", &secret, None, &[]).await;
@@ -1730,13 +1730,13 @@ async fn storage_api_objects(fx: &Fx) {
 
     // Without upsert an existing name is 409; with it, the object is replaced and its
     // updated_at advances (schema 5's trigger).
-    assert_eq!(object("POST", &up("docs/a.txt"), &secret, Some(b"x".to_vec().into()), &[]).await.0, 409);
-    let stamped = "SELECT updated_at::text FROM storage.objects WHERE name = 'docs/a.txt'";
+    assert_eq!(object("POST", &up("notes/a.txt"), &secret, Some(b"x".to_vec().into()), &[]).await.0, 409);
+    let stamped = "SELECT updated_at::text FROM storage.objects WHERE name = 'notes/a.txt'";
     let before_upsert = fx.value(stamped).await;
     let upsert = [("x-upsert", "true")];
-    let (status, _, b) = object("PUT", &up("docs/a.txt"), &secret, Some(b"v2".to_vec().into()), &upsert).await;
+    let (status, _, b) = object("PUT", &up("notes/a.txt"), &secret, Some(b"v2".to_vec().into()), &upsert).await;
     assert_eq!(status, 200, "{}", json_of(&b));
-    assert_eq!(&object("GET", &up("docs/a.txt"), &secret, None, &[]).await.2[..], &b"v2"[..]);
+    assert_eq!(&object("GET", &up("notes/a.txt"), &secret, None, &[]).await.2[..], &b"v2"[..]);
     let after_upsert = fx.value(stamped).await;
     let advanced = fx.value(&format!("SELECT '{after_upsert}'::timestamptz > '{before_upsert}'::timestamptz")).await;
     assert_eq!(advanced, "t", "updated_at {before_upsert} -> {after_upsert}");
@@ -1788,8 +1788,8 @@ COMMIT;"
     assert_eq!(got, 404);
 
     // Delete one and many: rows only (the blobs wait for the sweeper).
-    assert_eq!(object("DELETE", &up("docs/a.txt"), &secret, None, &[]).await.0, 204);
-    assert_eq!(object("DELETE", &up("docs/a.txt"), &secret, None, &[]).await.0, 404);
+    assert_eq!(object("DELETE", &up("notes/a.txt"), &secret, None, &[]).await.0, 204);
+    assert_eq!(object("DELETE", &up("notes/a.txt"), &secret, None, &[]).await.0, 404);
     let body = json!({ "names": ["race.bin", "hidden/h.txt", "nope"] });
     let (status, _, b) = object("DELETE", "/storage/v1/object/files", &secret, Some(body.to_string().into()), &[JSON]).await;
     assert_eq!(status, 200, "{}", json_of(&b));
