@@ -11,8 +11,10 @@
 //!    current version of that name there, read as storage itself (404). An overwrite or a
 //!    delete ends the URL, and re-creating the name never revives it: a new upload is a new
 //!    version. A branch reset or restore puts the branch back where the URL was signed, so the
-//!    URL serves again until it expires (decided 2026-11-06). To revoke a link for good,
-//!    overwrite the object or delete the key that minted it.
+//!    URL serves again until it expires (decided 2026-11-06), and that holds after an overwrite
+//!    too: the overwrite only gave the row a new version. An overwrite or a delete ends a URL
+//!    until a reset or restore; only revoking the key that minted it (or the URL expiring) ends
+//!    it for good.
 //!
 //! An upload token is recorded in the control plane when minted and spent there by its one
 //! upload (on any replica, across restarts). The token carries the minting identity: the role
@@ -189,7 +191,7 @@ fn signed_url(route: &str, bucket: &str, name: &str, token: &str) -> String {
     operation_id = "signObject",
     tag = "storage",
     summary = "Create a signed download URL",
-    description = "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires; to revoke a link for good, overwrite the object or delete the key that minted it. Sign again to link to a new version.",
+    description = "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires, after an overwrite as after a delete; only revoking the key that minted it (or the URL expiring) ends it for good. Sign again to link to a new version.",
     params(("bucket" = String, Path), ("name" = String, Path), ObjectParams),
     request_body = SignBody,
     security(("bearer" = [])),
@@ -442,7 +444,8 @@ pub async fn sign_upload<S: ConnSource, M: ConnSource>(
         (status = 403, description = "`token_not_valid`: used already, another object's, its key was revoked or its role changed, or the app user's session ended; `not_allowed`", body = StorageErrorEnvelope),
         (status = 409, description = "`conflict`", body = StorageErrorEnvelope),
         (status = 408, description = "`request_timeout`: the body sent nothing for `CHELABASE_STORAGE_BODY_IDLE_SECS` (60 s by default)", body = StorageErrorEnvelope),
-        (status = 413, description = "`too_large`", body = StorageErrorEnvelope),
+        (status = 413, description = "`too_large`: over the bucket's file size limit (the URL is spent)", body = StorageErrorEnvelope),
+        (status = 415, description = "`mime_not_allowed`: the type isn't on the bucket's `allowed_mime_types` (the URL is spent)", body = StorageErrorEnvelope),
     ),
 )]
 pub async fn signed_upload<S: ConnSource, M: ConnSource>(
@@ -456,8 +459,9 @@ pub async fn signed_upload<S: ConnSource, M: ConnSource>(
     let claims = state
         .open_token(q.token.as_deref(), Purpose::Upload, &bucket, &name, &rid)
         .await?;
-    // A request refused from its headers alone is refused before the token is spent, so the
-    // corrected retry can still use the URL (`upload_as` checks it again, as for any upload).
+    // A malformed Content-Type is refused before the token is spent, so the corrected retry can
+    // still use the URL (`upload_as` checks it again, as for any upload). The bucket's limits
+    // (415, 413) need the caller's identity, which spending the token gives: they spend it.
     names::check_content_type(
         headers
             .get(header::CONTENT_TYPE)

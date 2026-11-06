@@ -804,7 +804,7 @@
           "storage"
         ],
         "summary": "Create a signed download URL",
-        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires; to revoke a link for good, overwrite the object or delete the key that minted it. Sign again to link to a new version.",
+        "description": "The caller must be able to read the object (row level security). The URL serves that version of the object without a key while it is the object's current version, until the URL expires or the key is revoked: an overwrite or a delete ends it (404), and re-creating the name never revives it. A branch reset or restore puts the branch back where the URL was signed, so the URL serves again until it expires, after an overwrite as after a delete; only revoking the key that minted it (or the URL expiring) ends it for good. Sign again to link to a new version.",
         "operationId": "signObject",
         "parameters": [
           {
@@ -1027,7 +1027,17 @@
             }
           },
           "413": {
-            "description": "`too_large`",
+            "description": "`too_large`: over the bucket's file size limit (the URL is spent)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StorageErrorEnvelope"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "`mime_not_allowed`: the type isn't on the bucket's `allowed_mime_types` (the URL is spent)",
             "content": {
               "application/json": {
                 "schema": {

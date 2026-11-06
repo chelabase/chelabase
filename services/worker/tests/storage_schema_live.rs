@@ -2954,6 +2954,36 @@ async fn storage_urls_reset_revives_live() {
     .await;
 }
 
+/// Round 3 re-audit B1: an overwrite ends a signed URL only until a reset too. The overwrite
+/// gave the row a new version; resetting the branch brings the signed version back, and the
+/// URL serves it again. Only revoking the minting key (or expiry) ends a URL for good.
+#[tokio::test]
+#[ignore = "needs the workbench stack with the storage service"]
+async fn storage_urls_reset_revives_after_overwrite_live() {
+    with_fx(|fx| Box::pin(async move {
+        let fx = &*fx;
+        let secret = objects_fixture(fx, &[("SELECT", "'true'", "NULL"), ("INSERT", "NULL", "'true'"), ("UPDATE", "'true'", "'true'")]).await;
+        let (status, _, b) = object("POST", "/storage/v1/object/files/o.txt", &secret, Some(b"overwrite-original".to_vec().into()), &[]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        let (child, _) = fx.child("urls-overwrite-reset").await;
+        let (status, body) = api("POST", &format!("/v1/databases/{}/branches/{child}/keys", fx.id), Some(json!({ "name": "urls-overwrite-reset", "role": "authenticated" }))).await;
+        assert_eq!(status, 201, "{body}");
+        let ck = body["key"].as_str().unwrap().to_string();
+        let (status, url) = mint("sign", "files/o.txt", &ck, 3600).await;
+        assert_eq!(status, 200, "{url}");
+        let (status, _, b) = object("PUT", "/storage/v1/object/files/o.txt", &ck, Some(b"overwrite-v2".to_vec().into()), &[("x-upsert", "true")]).await;
+        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(keyless("GET", &url, None).await.0, 404, "the overwrite ends the URL");
+        assert!(fx.metadata.set_branch_status(child, &[BranchStatus::Ready], BranchStatus::Resetting).await.unwrap());
+        fx.worker.handle_branch_job(BranchJob::ResetToParent { branch_id: child }).await.expect("reset job");
+        let record = fx.metadata.get_branch(child).await.unwrap().unwrap();
+        assert_eq!(record.status, BranchStatus::Ready, "{:?}", record.error);
+        let (status, _, got) = keyless("GET", &url, None).await;
+        assert_eq!((status, &got[..]), (200, &b"overwrite-original"[..]), "the reset revives the URL after an overwrite");
+    }))
+    .await;
+}
+
 /// Re-audit S1: an upload URL refused for its `Content-Type` (400) is not spent, and the
 /// corrected retry uploads.
 #[tokio::test]
