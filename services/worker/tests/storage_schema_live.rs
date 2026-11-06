@@ -3744,6 +3744,72 @@ async fn dev_token() -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
+/// A member of the demo tenant made for one test, as the e2e scripts make one
+/// (`scripts/lib/member-sign-in.sh`): invited by link, accepted (which sets the password and
+/// signs in), then granted on the project. Acting as `authenticated` needs a grant naming it
+/// (R18: a tenant admin, as the dev member is, never holds the data API's roles).
+struct Member {
+    id: String,
+    token: String,
+}
+
+impl Member {
+    /// A member with `grant` (a `PUT …/grants/{member}` body) on `fx`'s project.
+    async fn granted(fx: &Fx, grant: Value) -> Member {
+        let studio = std::env::var("CHELABASE_ENTRY_STUDIO_URL").expect("CHELABASE_ENTRY_STUDIO_URL (run through just workbench test)");
+        let email = format!("st-console-{}@example.com", Uuid::new_v4().simple());
+        let password = format!("St-pass-{}A!", &Uuid::new_v4().simple().to_string()[..8]);
+        let (status, body) = api("POST", "/v1/invites", Some(json!({ "email": email, "grants": [], "delivery": "link" }))).await;
+        assert_eq!(status, 201, "invite: {body}");
+        let id = body["member"]["id"].as_str().expect("the member id").to_string();
+        let link = body["invite_url"].as_str().expect("an invite link").to_string();
+        let param = |name: &str| {
+            link.split(['?', '&'])
+                .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+                .unwrap_or_else(|| panic!("{name} in {link}"))
+                .to_string()
+        };
+        // Accept as Studio does: the session cookie it sets buys the access token.
+        let client = reqwest::Client::new();
+        let as_studio = |path: &str| {
+            client
+                .post(format!("{}/auth/v1/{path}", gateway()))
+                .header("origin", &studio)
+                .header("x-chelabase-studio", "1")
+                .timeout(Duration::from_secs(60))
+        };
+        let res = as_studio("accept-invite")
+            .json(&json!({ "t": param("t"), "user": param("user"), "code": param("code"), "password": password }))
+            .send()
+            .await
+            .expect("accept-invite answers");
+        let cookies: Vec<String> = res
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or_default().to_string())
+            .collect();
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        assert_eq!((status, &body["next"]), (200, &json!("studio")), "accept-invite: {body}");
+        let res = as_studio("token").header("cookie", cookies.join("; ")).send().await.expect("token answers");
+        let status = res.status().as_u16();
+        let body: Value = res.json().await.unwrap_or(Value::Null);
+        assert_eq!(status, 200, "token: {body}");
+        let token = body["access_token"].as_str().expect("an access token").to_string();
+        let (status, body) = api("PUT", &format!("/v1/projects/{}/grants/{id}", fx.project), Some(grant)).await;
+        assert_eq!(status, 200, "grant: {body}");
+        Member { id, token }
+    }
+
+    /// Removes the member (the project's deletion takes its grant anyway).
+    async fn remove(self) {
+        let (status, body) = api("DELETE", &format!("/v1/members/{}", self.id), None).await;
+        assert!(status < 300, "remove the member: {status} {body}");
+    }
+}
+
 impl Fx {
     /// A console storage path on main acting as `authenticated` with the claims `{"sub": user}`.
     fn console(&self, tail: &str, user: Uuid) -> String {
@@ -3768,7 +3834,9 @@ async fn storage_console_live() {
     with_fx(|fx| Box::pin(async move {
         let fx = &*fx;
         objects_fixture(fx, &[("SELECT", "'owner = chelabase.user_id()'", "NULL"), ("INSERT", "NULL", "'owner = chelabase.user_id()'")]).await;
-        let token = dev_token().await;
+        // A Developer whose grant names `authenticated` (R18).
+        let member = Member::granted(fx, json!({ "platform_role": "developer", "pg_roles": ["authenticated"] })).await;
+        let token = member.token.clone();
         let (u1, u2) = (Uuid::new_v4(), Uuid::new_v4());
         for (user, name) in [(u1, "u1.txt"), (u2, "u2.txt")] {
             let (status, _, b) = object("POST", &fx.console(&format!("/object/files/{name}"), user), &token, Some(name.as_bytes().to_vec().into()), &[("content-type", "text/plain")]).await;
@@ -3779,15 +3847,15 @@ async fn storage_console_live() {
         for (user, mine) in [(u1, "u1.txt"), (u2, "u2.txt")] {
             let (status, _, b) = object("POST", &fx.console("/object/list/files", user), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
             assert_eq!(status, 200, "{}", json_of(&b));
-            let names: Vec<String> = json_of(&b).as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap().to_string()).collect();
+            let names: Vec<String> = json_of(&b)["items"].as_array().unwrap().iter().map(|o| o["name"].as_str().unwrap().to_string()).collect();
             assert_eq!(names, vec![mine.to_string()], "{user}");
         }
         let (status, _, got) = object("GET", &fx.console("/object/files/u1.txt", u1), &token, None, &[]).await;
         assert_eq!((status, &got[..]), (200, &b"u1.txt"[..]));
         assert_eq!(object("GET", &fx.console("/object/files/u2.txt", u1), &token, None, &[]).await.0, 404);
-        // Without a role storage never runs (the owner is never used).
+        // No role is owner mode: an Admin's only, so this Developer is refused.
         let bare = format!("/v1/databases/{}/branches/{}/storage/bucket", fx.id, fx.main);
-        assert_eq!(object("GET", &bare, &token, None, &[]).await.0, 422);
+        assert_eq!(object("GET", &bare, &token, None, &[]).await.0, 403, "owner mode is an Admin's");
         // A console URL: at most an hour; it serves without a credential.
         let sign = fx.console("/object/sign/files/u1.txt", u1);
         let (status, _, b) = object("POST", &sign, &token, Some(json!({ "expires_in": 3601 }).to_string().into()), &[JSON]).await;
@@ -3810,6 +3878,7 @@ async fn storage_console_live() {
         let (status, _, got) = object("GET", &fx.console("/object/files/big.bin", u1), &token, None, &[]).await;
         assert_eq!(status, 200);
         assert!(got[..] == part[..], "the completed object differs");
+        member.remove().await;
     }))
     .await;
 }
@@ -3865,23 +3934,25 @@ async fn storage_console_owner_live() {
         assert_eq!(status, 200, "{}", json_of(&b));
         assert_eq!(fx.value("SELECT coalesce(owner::text, 'none') FROM storage.objects WHERE name = 'o.txt'").await, "none");
         // A user acting as `authenticated` sees nothing (no policy); the owner sees it.
-        let (status, _, b) = object("POST", &fx.console("/object/list/files", Uuid::new_v4()), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
-        assert_eq!((status, json_of(&b)), (200, json!([])));
+        let member = Member::granted(fx, json!({ "platform_role": "developer", "pg_roles": ["authenticated"] })).await;
+        let (status, _, b) = object("POST", &fx.console("/object/list/files", Uuid::new_v4()), &member.token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
+        assert_eq!((status, json_of(&b)["items"].clone()), (200, json!([])));
+        member.remove().await;
         let (status, _, b) = object("POST", &fx.owner_console("/object/list/files"), &token, Some(json!({ "prefix": "" }).to_string().into()), &[JSON]).await;
         assert_eq!(status, 200, "{}", json_of(&b));
-        assert_eq!(json_of(&b)[0]["name"], "o.txt");
+        assert_eq!(json_of(&b)["items"][0]["name"], "o.txt");
         let (status, _, got) = object("GET", &fx.owner_console("/object/files/o.txt"), &token, None, &[]).await;
         assert_eq!((status, &got[..]), (200, &b"owned"[..]));
         // Copy, move, sign, delete, and a bucket of its own.
         let (status, _, b) = object("POST", &fx.owner_console("/object/copy"), &token, Some(json!({ "bucket": "files", "from": "o.txt", "to": "c.txt" }).to_string().into()), &[JSON]).await;
         assert_eq!(status, 200, "{}", json_of(&b));
         let (status, _, b) = object("POST", &fx.owner_console("/object/move"), &token, Some(json!({ "bucket": "files", "from": "c.txt", "to": "c.txt", "to_bucket": "other" }).to_string().into()), &[JSON]).await;
-        assert_eq!(status, 200, "{}", json_of(&b));
+        assert_eq!(status, 204, "{}", json_of(&b));
         let (status, _, b) = object("POST", &fx.owner_console("/object/sign/files/o.txt"), &token, Some(json!({ "expires_in": 60 }).to_string().into()), &[JSON]).await;
         assert_eq!(status, 200, "{}", json_of(&b));
         let url = format!("{}{}", gateway(), json_of(&b)["signed_url"].as_str().unwrap());
         assert_eq!(reqwest::Client::new().get(&url).send().await.unwrap().status(), 200);
-        assert_eq!(object("DELETE", &fx.owner_console("/object/other/c.txt"), &token, None, &[]).await.0, 200);
+        assert_eq!(object("DELETE", &fx.owner_console("/object/other/c.txt"), &token, None, &[]).await.0, 204);
         let (status, _, b) = object("POST", &fx.owner_console("/bucket"), &token, Some(json!({ "name": "frozen", "write_once": true }).to_string().into()), &[JSON]).await;
         assert_eq!(status, 201, "{}", json_of(&b));
         // Write-once holds for the owner too.
